@@ -29,11 +29,38 @@ export interface HistoryTab {
   readonly title: string
 }
 
+/**
+ * One tab an extension contributes. (M22)
+ *
+ * Not a [`HistoryTab`] and not stored anywhere: `ToolWindowState` lives on `Project::tool_window`
+ * in `workspace.json`, and a contributed tab has nothing durable in it. Its content is a view
+ * model its worker rebuilds from scratch on every launch, so persisting *which* one was open would
+ * mean restoring a tab whose extension may since have been disabled or uninstalled — a tab that
+ * draws a sentence about not being available, restored on every launch until somebody closes it.
+ *
+ * That is `chrome/sidebarView.ts`'s decision, arrived at the same way and for a sharper reason:
+ * there the sidebar's hidden state is not persisted because it would cross windows wrongly, here
+ * a contributed tab is not persisted because there is nothing to persist.
+ */
+export interface ExtTab {
+  /** `ext:<marketplace>.<extension>.<panel>` — the same id the rail addresses a sidebar panel by. */
+  readonly view: string
+  readonly label: string
+}
+
 /** The tab row's whole state. */
 export interface ToolWindowTabs {
   readonly open: boolean
   readonly history: readonly HistoryTab[]
-  /** `null` is the Log tab. */
+  /**
+   * Tabs contributed by enabled extensions, in registry order.
+   *
+   * Not part of the stored state — see [`ExtTab`] — so this is filled in by the host from the
+   * extension store rather than from the workspace snapshot. Defaulted, so every existing caller
+   * that builds a `ToolWindowTabs` from a `ToolWindowState` alone keeps working.
+   */
+  readonly ext?: readonly ExtTab[]
+  /** `null` is the Log tab. A `ext:…` string is a contributed tab. */
   readonly active: string | null
 }
 
@@ -101,7 +128,28 @@ export function tabRow(tabs: ToolWindowTabs): TabRow[] {
       closable: true,
     })
   }
+  // Contributed tabs last, after every history tab. (M22)
+  //
+  // Last rather than immediately after Log, because the history tabs are the ones the *user*
+  // opened and a tab appearing between two of them when an extension is enabled would move
+  // something they put there. Not closable: a contributed tab is a property of which extensions
+  // are enabled, and a close that only lasted until the next launch is a control that does not
+  // do what it says.
+  for (const tab of tabs.ext ?? []) {
+    rows.push({
+      id: tab.view,
+      label: tab.label,
+      title: tab.label,
+      active: tabs.active === tab.view,
+      closable: false,
+    })
+  }
   return rows
+}
+
+/** Whether a tab id names a contributed tab rather than a history one. */
+export function isExtTab(id: string | null): boolean {
+  return id !== null && id.startsWith('ext:')
 }
 
 /** The open History tab for this file, or `null`. Keyed on the pair, because a path alone is

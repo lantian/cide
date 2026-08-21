@@ -28,7 +28,7 @@
  * is parsed. [`FENCE_HIGHLIGHT_LIMIT_BYTES`] is where that stops being worth it; past it the
  * fence renders as plain monospace, which is what the buffer shows anyway.
  */
-import { loadGrammar, languageIdFor, type LanguageId } from '../languages'
+import { fenceAlias, loadGrammar, languageIdFor, type LanguageId } from '../languages'
 import { tokenClassFor } from '../highlight'
 import { utf8ByteLength } from '../byteSize'
 import { FENCE_HIGHLIGHT_LIMIT_BYTES } from './view'
@@ -53,23 +53,6 @@ export interface Token {
  * and shell is the closest thing to right for it. `text`, `plain` and `txt` are deliberately
  * absent: they resolve to nothing, which is exactly what they are asking for.
  */
-const FENCE_ALIASES: Readonly<Record<string, string>> = {
-  rust: 'rs',
-  typescript: 'ts',
-  javascript: 'js',
-  golang: 'go',
-  python: 'py',
-  shell: 'sh',
-  console: 'sh',
-  'shell-session': 'sh',
-  'sh-session': 'sh',
-  zsh: 'sh',
-  'c++': 'cpp',
-  objc: 'c',
-  yml: 'yaml',
-  jsonc: 'json',
-}
-
 /**
  * Which grammar a fence's info string asks for, or null.
  *
@@ -81,7 +64,14 @@ export function fenceLanguage(info: string | null): LanguageId | null {
   if (info === null) return null
   const word = info.trim().toLowerCase()
   if (word === '') return null
-  return languageIdFor(`x.${FENCE_ALIASES[word] ?? word}`)
+  // A language's own alias list first — `golang`, `console`, `c++` — then the word read as an
+  // extension, which is what makes ` ```tsx ` and a `.tsx` file agree without a second table.
+  //
+  // The alias table used to live here and mapped a word to an *extension* so it would route
+  // through `lookup` too. That indirection went in M22 with the closed language union: a language
+  // now names its own fence words in `cide_ipc::lang::builtins()`, beside the extensions it
+  // claims, and an extension's manifest can name some as well.
+  return fenceAlias(word) ?? languageIdFor(`x.${word}`)
 }
 
 /**

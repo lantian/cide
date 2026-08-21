@@ -22,7 +22,7 @@
  * member walk in `keys/dispatch.ts`, which runs outside React entirely.
  */
 import { symbols as symbolsApi } from '@/ipc/client'
-import type { FileOutline, ProjectId } from '@/ipc/client'
+import type { FileOutline, ProjectId, Symbol as OutlineSymbol } from '@/ipc/client'
 import type { OutlineNode } from './memberNav'
 
 interface Entry {
@@ -50,9 +50,55 @@ export function subscribeOutlines(listener: () => void): () => void {
   }
 }
 
-/** The outline for a path, or `null` if nothing has fetched one yet. */
+/**
+ * Outlines contributed by an extension, keyed by path. (M22)
+ *
+ * A second map rather than entries in the first, because the two answer different questions and
+ * the builtin one wins. `cide-lang` parses with tree-sitter and produces a real tree with real
+ * ranges; an extension has the text and a regex. Where cide can answer, cide answers — and where
+ * it cannot (a `.sql` file, a `.yaml` one), this is the only outline there is.
+ *
+ * The extension's id is kept beside the outline so the panel can say *whose* it is, and so a
+ * second extension publishing for the same path replaces the first's rather than interleaving.
+ */
+const contributed = new Map<string, { by: string; outline: FileOutline }>()
+
+/**
+ * Publish an outline for a path from an extension.
+ *
+ * Replaces whatever that path had. An empty symbol list is a real message — *"I looked and there
+ * is nothing"* — and not the absence of one, which is why this is never called with `undefined`.
+ */
+export function publishExtOutline(
+  path: string,
+  by: string,
+  symbols: readonly OutlineSymbol[],
+): void {
+  contributed.set(path, {
+    by,
+    outline: { kind: 'ready', language: by, symbols: [...symbols], truncated: false },
+  })
+  emit()
+}
+
+/** Forget an extension's outline for a path. */
+export function forgetExtOutline(path: string): void {
+  if (contributed.delete(path)) emit()
+}
+
+/**
+ * The outline for a path, or `null` if nothing has fetched one yet.
+ *
+ * `cide-lang`'s answer first, and an extension's only where cide has none of its own — see
+ * [`contributed`]. `unsupported` is the case that matters: it is what `cide-lang` says for every
+ * language that is not Rust or Go, which is every language an extension is likely to contribute.
+ */
 export function outlineOf(path: string): FileOutline | null {
-  return entries.get(path)?.outline ?? null
+  const own = entries.get(path)?.outline;
+  if (own !== undefined && own.kind === 'ready') return own
+  const contributed_ = contributed.get(path)
+  if (contributed_ !== undefined) return contributed_.outline
+  return own ?? null
 }
 
 /**
@@ -84,8 +130,8 @@ const NONE: readonly OutlineNode[] = Object.freeze([])
  * here would be the mistake if this were the only accessor — it is not.
  */
 export function symbolsOf(path: string): readonly OutlineNode[] {
-  const outline = entries.get(path)?.outline
-  return outline !== undefined && outline.kind === 'ready'
+  const outline = outlineOf(path)
+  return outline !== null && outline.kind === 'ready'
     ? (outline.symbols as readonly OutlineNode[])
     : NONE
 }
@@ -152,6 +198,7 @@ export function forgetOutline(path: string): void {
     timers.delete(path)
   }
   entries.delete(path)
+  contributed.delete(path)
   emit()
 }
 
@@ -160,5 +207,6 @@ export function resetOutlinesForTest(): void {
   for (const timer of timers.values()) clearTimeout(timer)
   timers.clear()
   entries.clear()
+  contributed.clear()
   inflight.clear()
 }

@@ -602,10 +602,11 @@ fn workspace_capabilities(server: Server) -> Value {
 ///   problem is a *flycheck* problem, not a file-notification one, and [`Session::run_flycheck`]
 ///   is the answer to that.
 fn declares_watched_files(server: Server) -> bool {
-    match server {
-        Server::Gopls => true,
-        Server::RustAnalyzer => false,
-    }
+    // A field on the server's row since M22, not a `match` here. The paragraphs above still say
+    // *why* the two builtins answer differently — that reasoning is not configuration and does not
+    // belong in a manifest — but the answer itself has to be something a contributed server can
+    // give, because it is a fact about that server's capabilities and cide cannot know it.
+    server.declares_watched_files()
 }
 
 #[cfg(test)]
@@ -613,7 +614,8 @@ mod tests {
     use super::*;
 
     fn started() -> Session {
-        let (session, _) = Session::new(&[std::path::PathBuf::from("/repo")], Server::RustAnalyzer);
+        let (session, _) =
+            Session::new(&[std::path::PathBuf::from("/repo")], Server::RUST_ANALYZER);
         session
     }
 
@@ -643,7 +645,8 @@ mod tests {
 
     #[test]
     fn the_handshake_declares_what_the_client_actually_does() {
-        let (_, effects) = Session::new(&[std::path::PathBuf::from("/repo")], Server::RustAnalyzer);
+        let (_, effects) =
+            Session::new(&[std::path::PathBuf::from("/repo")], Server::RUST_ANALYZER);
         let request = &sent(&effects)[0];
         let caps = &request["params"]["capabilities"];
         // Without this rust-analyzer never sends `$/progress`, and the panel shows an
@@ -691,14 +694,14 @@ mod tests {
         // dependencies and registry sources that cide's gitignore-filtered, per-root watcher does
         // not — so declaring it there would narrow what that server sees, silently, in exactly
         // the code a user cannot see to suspect.
-        let (_, gopls) = Session::new(&[std::path::PathBuf::from("/repo")], Server::Gopls);
+        let (_, gopls) = Session::new(&[std::path::PathBuf::from("/repo")], Server::GOPLS);
         let gopls = &sent(&gopls)[0]["params"]["capabilities"]["workspace"];
         assert_eq!(
             gopls["didChangeWatchedFiles"]["dynamicRegistration"],
             json!(true)
         );
 
-        let (_, ra) = Session::new(&[std::path::PathBuf::from("/repo")], Server::RustAnalyzer);
+        let (_, ra) = Session::new(&[std::path::PathBuf::from("/repo")], Server::RUST_ANALYZER);
         let ra = &sent(&ra)[0]["params"]["capabilities"]["workspace"];
         assert!(
             ra.get("didChangeWatchedFiles").is_none(),
@@ -777,7 +780,7 @@ mod tests {
             std::path::PathBuf::from("/repo/a"),
             std::path::PathBuf::from("/repo/b"),
         ];
-        let (_, effects) = Session::new(&roots, Server::Gopls);
+        let (_, effects) = Session::new(&roots, Server::GOPLS);
         let folders = sent(&effects)[0]["params"]["workspaceFolders"]
             .as_array()
             .expect("array")

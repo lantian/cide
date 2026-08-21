@@ -76,30 +76,100 @@ pub enum DiagnosticKind {
 
 /// Which analyser produced something.
 ///
-/// An enum rather than a bare string on the *report*, so the settings screen and the store
-/// agree on the set. [`Diagnostic::source`] stays a string because it carries the producer's own
-/// name (`clippy` arrives inside rust-analyzer's stream) and an unrecognised one must survive to
-/// the panel rather than be dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub enum DiagnosticSourceId {
-    RustAnalyzer,
-    Gopls,
-    TreeSitter,
-    Claude,
-}
+/// # Why this stopped being an enum in M22
+///
+/// It was four unit variants — `rustAnalyzer`, `gopls`, `treeSitter`, `claude` — and the argument
+/// for that was good: a closed set on the *report* is what lets the settings screen and the store
+/// agree on which toggles exist. [`Diagnostic::source`] stayed a string, because it carries the
+/// producer's own name (`clippy` arrives inside rust-analyzer's stream) and an unrecognised one
+/// must survive to the panel rather than be dropped.
+///
+/// The set stopped being closed when a language server could arrive from a manifest. There is no
+/// variant for `yaml-language-server` and there cannot be one, because cide is not compiled
+/// knowing about it — and the alternative, folding every contributed server into a single
+/// `Extension` variant, would put four servers behind one toggle and one *Restart* button, which
+/// is the one thing this type exists to prevent.
+///
+/// So it is a newtype over the string the enum already serialised as. The four names below are
+/// unchanged on the wire, every existing `extensions.json`, settings file and stored filter keeps
+/// working, and a contributed server is its own binary name — which is also what the *Restart*
+/// button needs to name and what `Reported by …` should say.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(export, type = "string")]
+pub struct DiagnosticSourceId(pub String);
 
 impl DiagnosticSourceId {
-    /// What the user sees. Not derived from the variant name: `rustAnalyzer` is not how anyone
-    /// writes it, and this string appears in "Reported by …" and in the settings rows.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::RustAnalyzer => "rust-analyzer",
-            Self::Gopls => "gopls",
-            Self::TreeSitter => "tree-sitter",
-            Self::Claude => "claude",
+    /// tree-sitter, which is cide's own parser and not a server.
+    pub const TREE_SITTER: &'static str = "treeSitter";
+    /// A `claude --print` one-shot inspection.
+    pub const CLAUDE: &'static str = "claude";
+
+    #[must_use]
+    pub fn tree_sitter() -> Self {
+        Self(Self::TREE_SITTER.to_string())
+    }
+
+    /// rust-analyzer, by the id it has always serialised as.
+    #[must_use]
+    pub fn rust_analyzer() -> Self {
+        Self::for_server("rust-analyzer")
+    }
+
+    /// gopls, likewise.
+    #[must_use]
+    pub fn gopls() -> Self {
+        Self::for_server("gopls")
+    }
+
+    #[must_use]
+    pub fn claude() -> Self {
+        Self(Self::CLAUDE.to_string())
+    }
+
+    /// The id a language server reports under.
+    ///
+    /// The two builtins keep the ids they have always had, because a user's saved source filters
+    /// name them and a rename would silently un-hide something they hid. Everything else is its
+    /// own binary name, which is what a person would call it.
+    #[must_use]
+    pub fn for_server(binary: &str) -> Self {
+        Self(match binary {
+            "rust-analyzer" => "rustAnalyzer".to_string(),
+            other => other.to_string(),
+        })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// What the user sees. Not derived from the id: `rustAnalyzer` is not how anyone writes it,
+    /// and this string appears in "Reported by …" and in the settings rows.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self.0.as_str() {
+            "rustAnalyzer" => "rust-analyzer".to_string(),
+            Self::TREE_SITTER => "tree-sitter".to_string(),
+            other => other.to_string(),
         }
+    }
+
+    /// Whether this source is a language server, and so has a *Restart* to offer.
+    ///
+    /// A rule rather than a list. It used to be `['rustAnalyzer', 'gopls']` in the frontend's
+    /// `model.ts`, which was a third place the set of servers was written down and would have gone
+    /// stale the first time a manifest added one.
+    #[must_use]
+    pub fn is_server(&self) -> bool {
+        self.0 != Self::TREE_SITTER && self.0 != Self::CLAUDE
+    }
+}
+
+impl std::fmt::Display for DiagnosticSourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -325,10 +395,10 @@ mod tests {
     fn every_source_id_has_a_label_that_is_not_its_variant_name() {
         // The labels are user-visible and appear in "Reported by …". Deriving them from the
         // variant would print `rustAnalyzer`, which is not how anyone writes it.
-        assert_eq!(DiagnosticSourceId::RustAnalyzer.label(), "rust-analyzer");
-        assert_eq!(DiagnosticSourceId::Gopls.label(), "gopls");
-        assert_eq!(DiagnosticSourceId::TreeSitter.label(), "tree-sitter");
-        assert_eq!(DiagnosticSourceId::Claude.label(), "claude");
+        assert_eq!(DiagnosticSourceId::rust_analyzer().label(), "rust-analyzer");
+        assert_eq!(DiagnosticSourceId::gopls().label(), "gopls");
+        assert_eq!(DiagnosticSourceId::tree_sitter().label(), "tree-sitter");
+        assert_eq!(DiagnosticSourceId::claude().label(), "claude");
     }
 
     #[test]

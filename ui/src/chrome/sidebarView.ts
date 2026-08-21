@@ -53,22 +53,45 @@
 /**
  * Every button on the activity rail. `settings` is the one with no panel behind it.
  *
- * `agents` and `tasks` joined in M18 and cost this module exactly two union members. Nothing
- * below them changed: `PanelView` is `Exclude<…, 'settings'>` and picked both up, and
+ * `agents` and `tasks` joined in M18 and cost this module exactly two union members; `extensions`
+ * and M22's whole open-ended family of contributed panels cost one more and a template literal.
+ * Nothing below them changed: `PanelView` is `Exclude<…, 'settings'>` and picked both up, and
  * `selectView`, `showPanel` and `toggleSidebar` are written as rules *over* the type rather
  * than as a branch per view, so neither of them mentions a view by name. That is the whole
  * payoff of this module existing, and it is worth stating so the next view added here is
  * added the same way — a function that grows a `if (next === 'tasks')` arm has stopped being
  * a rule and has become the ternary in `App.tsx` this file was extracted from.
  */
-export type ActivityView =
+type ExtensionView = `ext:${string}`
+
+export type ActivityView = BuiltinView | ExtensionView
+
+/** The views cide ships. */
+export type BuiltinView =
   | 'files'
   | 'git'
   | 'search'
   | 'problems'
   | 'agents'
   | 'tasks'
+  | 'extensions'
   | 'settings'
+
+/**
+ * A panel an extension contributes: `ext:<marketplace>.<extension>.<panel>`. (M22)
+ *
+ * A template-literal member rather than widening the whole union to `string`, which is what keeps
+ * `'setings'` a type error while `'ext:m.sql.statements'` is not — and which is the whole reason
+ * the union survived at all rather than becoming a bare `string`.
+ *
+ * `ext:` and not `ext.`: the command namespace an extension contributes to is dotted
+ * (`ext.m.sql.showStatements`) and this one is not, so a string in a log or a bug report says
+ * which of the two it is without any context.
+ *
+ * Every function below is written as a rule *over* the type rather than as a branch per view, so
+ * none of them mentions this by name and none of them changed to accept it. That is the whole
+ * payoff of this module existing, and M18 spent exactly two union members proving it; this spent
+ * one and a half.
 
 /** The views that actually draw a sidebar panel — everything a hidden sidebar can restore. */
 export type PanelView = Exclude<ActivityView, 'settings'>

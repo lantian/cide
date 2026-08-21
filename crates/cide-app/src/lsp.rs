@@ -218,7 +218,15 @@ impl ProjectDiagnostics {
         let handles: Arc<Mutex<Vec<LspHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
-        for server in [Server::RustAnalyzer, Server::Gopls] {
+        // Every server in the registry, not the two builtins by name. (M22)
+        //
+        // This one line is what makes a contributed language server actually run: the registry is
+        // installed from `ExtStore`'s resolved set before the first window exists, so by the time
+        // a project opens it holds rust-analyzer, gopls and whatever the enabled extensions
+        // declared. `discover::find` still refuses each of them independently — a missing binary,
+        // or a project with no marker for it — so a manifest naming a server nobody has installed
+        // costs a row in the Problems panel and nothing else.
+        for server in cide_lsp::discover::servers() {
             // On the spawn thread, not here — see the module docs. `on_spawn_thread` blocks, and
             // a discovery probe plus a `fork` is single-digit milliseconds.
             let roots_for_server = roots.clone();
@@ -314,7 +322,7 @@ impl ProjectDiagnostics {
             // the pump thread would mean a lock around the whole protocol conversation.
             let (session, _) = cide_lsp::Session::new(&self.roots, server);
             if let cide_lsp::Effect::Send(value) =
-                message(&session, uri.clone(), server.language_id())
+                message(&session, uri.clone(), &server.language_id())
             {
                 handle.send(value);
             }
@@ -743,10 +751,17 @@ impl ProjectDiagnostics {
         let mut go: Vec<&PathBuf> = Vec::new();
         let mut rust = false;
         for path in paths {
-            match owner_of(path) {
-                Some(Server::Gopls) => go.push(path),
-                Some(Server::RustAnalyzer) => rust = true,
-                None => {}
+            // `if let` rather than a `match` on the whole `Option<Server>`: since M22 a `Server` is
+            // an index into a table an extension can extend, so a `match` here would need a `_`
+            // arm and would stop being a claim about coverage. The two named servers are the two
+            // this function has a batching rule for; a contributed server's changed files reach it
+            // through `notify_server` below like everything else.
+            if let Some(server) = owner_of(path) {
+                if server == Server::GOPLS {
+                    go.push(path);
+                } else if server == Server::RUST_ANALYZER {
+                    rust = true;
+                }
             }
         }
         if go.is_empty() && !rust {
@@ -779,7 +794,7 @@ impl ProjectDiagnostics {
                     (cide_lsp::convert::path_to_uri(path), kind)
                 })
                 .collect();
-            self.notify_server(Server::Gopls, |session| {
+            self.notify_server(Server::GOPLS, |session| {
                 session.did_change_watched_files(changes.clone())
             });
         }
@@ -827,10 +842,10 @@ impl ProjectDiagnostics {
                 .to_string();
         }
 
-        if running.contains(&Server::RustAnalyzer) {
-            self.notify_server(Server::RustAnalyzer, cide_lsp::Session::run_flycheck);
+        if running.contains(&Server::RUST_ANALYZER) {
+            self.notify_server(Server::RUST_ANALYZER, cide_lsp::Session::run_flycheck);
         }
-        if running.contains(&Server::Gopls) {
+        if running.contains(&Server::GOPLS) {
             /*
              * gopls has no "re-check everything" primitive a client may call, so the honest thing
              * is to tell it what a client normally tells it: these files may have changed. It
@@ -846,11 +861,11 @@ impl ProjectDiagnostics {
                 .known_paths()
                 .into_iter()
                 .map(PathBuf::from)
-                .filter(|path| owner_of(path) == Some(Server::Gopls) && path.exists())
+                .filter(|path| owner_of(path) == Some(Server::GOPLS) && path.exists())
                 .map(|path| (cide_lsp::convert::path_to_uri(&path), 2u8))
                 .collect();
             if !changes.is_empty() {
-                self.notify_server(Server::Gopls, |session| {
+                self.notify_server(Server::GOPLS, |session| {
                     session.did_change_watched_files(changes.clone())
                 });
             }
@@ -859,11 +874,11 @@ impl ProjectDiagnostics {
         self.kick.clear();
         crate::emit::diagnostics(app, self.project);
 
-        let names: Vec<&str> = running.iter().map(|s| s.binary()).collect();
+        let names: Vec<String> = running.iter().map(|s| s.binary()).collect();
         format!(
             "Re-running {}. Results replace the current list as they arrive.",
             match names.as_slice() {
-                [one] => (*one).to_string(),
+                [one] => one.clone(),
                 _ => names.join(" and "),
             }
         )
@@ -1033,18 +1048,68 @@ impl ProjectDiagnostics {
     }
 
     /// Restart one source after it gave up.
+    /// Fold findings from something that is not a language server into this project's store. (M22)
+    ///
+    /// The road an extension's diagnostics take. Deliberately the *same* store the servers publish
+    /// into, rather than a second list merged in the panel: `DiagnosticStore` is where the source
+    /// filter, the staleness marks and the cap are applied, and a second path around it would be a
+    /// second set of answers to "how many errors are there" — which is the number on the rail.
+    ///
+    /// Replaces everything that source has said about that path, exactly as `publishDiagnostics`
+    /// does for a server. An extension that wants to clear a file publishes an empty list, which
+    /// is a real message and not the absence of one.
+    pub fn publish_external(
+        &self,
+        app: &tauri::AppHandle,
+        source: cide_ipc::DiagnosticSourceId,
+        abs_path: String,
+        items: Vec<cide_ipc::Diagnostic>,
+    ) {
+        // The relative path is derived here and not trusted from the payload. A worker is handed
+        // an absolute path and knows nothing about roots, so the `path` field it sent is a copy of
+        // `abs_path`; the panel groups on this one, and a multi-root project prefixes it with a
+        // root label. Deriving it is the same call the server path makes, so a contributed row and
+        // a rust-analyzer row for the same file land under one heading.
+        let mut items = items;
+        for item in &mut items {
+            item.path = relative(&self.roots, &item.abs_path);
+        }
+        {
+            let mut store = self.store.lock();
+            // A source that has published is a source that is running, which is what makes its row
+            // appear in the panel's footer with a Restart beside it. Without this it would report
+            // findings while its own row said nothing had looked.
+            store.set_status(source.clone(), SourceStatus::Ready);
+            store.publish(source, abs_path, items);
+        }
+        crate::emit::diagnostics(app, self.project);
+    }
+
     pub fn restart(&self, app: &tauri::AppHandle, source: cide_ipc::DiagnosticSourceId) {
-        // tree-sitter and Claude are not processes and have nothing to restart.
-        let server = match source {
-            cide_ipc::DiagnosticSourceId::RustAnalyzer => Server::RustAnalyzer,
-            cide_ipc::DiagnosticSourceId::Gopls => Server::Gopls,
-            _ => return,
+        // tree-sitter and Claude are not processes and have nothing to restart. Since M22 the
+        // reverse mapping is a registry lookup rather than a `match`, so a server that arrived
+        // from a manifest is restartable on exactly the same road as the two builtins — which is
+        // what the panel's Restart button needed, and what a `match` here would have silently
+        // refused it.
+        let Some(server) = self
+            .handles
+            .lock()
+            .iter()
+            .map(LspHandle::server)
+            .find(|s| s.source() == source)
+            .or_else(|| {
+                cide_lsp::discover::servers()
+                    .into_iter()
+                    .find(|s| s.source() == source)
+            })
+        else {
+            return;
         };
         // Drop the old handle first — its `Drop` runs the ladder — then start a new one on the
         // spawn thread. Doing it the other way round would briefly leave two servers indexing the
         // same workspace, which on rust-analyzer is 2–8 GB.
         self.handles.lock().retain(|h| h.server() != server);
-        self.store.lock().clear_source(source);
+        self.store.lock().clear_source(source.clone());
         let roots = self.roots.clone();
         let started =
             cide_core::child_env::on_spawn_thread(move || LspHandle::start(server, roots));
@@ -1198,11 +1263,52 @@ fn preview(source: &str, column: u32, end_column: u32) -> (String, u32, u32) {
 const PREVIEW_BYTES: usize = 512;
 
 /// Which server owns a path, by extension.
+/// # Why this no longer goes through `cide_lang::Lang`
+///
+/// It used to, and that one line was the coupling M22 existed to break: `Lang` is a closed enum
+/// backed by statically linked C parser tables, so *"a language cide can outline"* and *"a
+/// language cide can run a server for"* were forced to be the same set. A YAML server would have
+/// needed a tree-sitter grammar for YAML — an absurd price for a `--stdio` flag.
+///
+/// Now the path resolves to a `languageId` through the language registry, which builtins and
+/// extensions both feed, and the registry says which server claims it. Outlining is unchanged and
+/// still `Lang`'s job; the two questions are simply asked of two tables again.
 fn server_for(path: &std::path::Path) -> Option<Server> {
-    match cide_lang::Lang::of_path(path)? {
-        cide_lang::Lang::Rust => Some(Server::RustAnalyzer),
-        cide_lang::Lang::Go => Some(Server::Gopls),
+    let language = language_of(path)?;
+    cide_lsp::discover::by_language(&language)
+}
+
+/// Which language a path is, by the resolved registry.
+///
+/// The same rules `ui/src/editor/languages.ts::lookup` follows and for the same reason — a status
+/// bar that says `YAML` and a server that is never sent the file would be two answers to one
+/// question. Whole file name first, then the extension, and a leading dot makes a hidden file
+/// rather than an extension so `.gitignore` is not looked up as a `gitignore` language.
+fn language_of(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    let languages = crate::ext_state::languages();
+    for def in &languages {
+        if def
+            .filenames
+            .iter()
+            .any(|n: &String| n.eq_ignore_ascii_case(&name))
+        {
+            return Some(def.id.clone());
+        }
     }
+    let dot = name.rfind('.')?;
+    if dot == 0 {
+        return None;
+    }
+    let ext = &name[dot + 1..];
+    languages
+        .iter()
+        .find(|def| {
+            def.extensions
+                .iter()
+                .any(|e| e.ext.eq_ignore_ascii_case(ext))
+        })
+        .map(|def| def.id.clone())
 }
 
 /// Which server *cares* about a path — [`server_for`] widened to the build manifests. (M18)
@@ -1220,11 +1326,19 @@ fn owner_of(path: &std::path::Path) -> Option<Server> {
     if let Some(server) = server_for(path) {
         return Some(server);
     }
-    match path.file_name()?.to_str()? {
-        "Cargo.toml" | "Cargo.lock" => Some(Server::RustAnalyzer),
-        "go.mod" | "go.sum" | "go.work" | "go.work.sum" => Some(Server::Gopls),
-        _ => None,
+    // The build manifests, which have no `languageId` and so cannot come from the language
+    // registry. A contributed server names its own in `projectMarkers`, which is what this falls
+    // through to — so `package.json` invalidating a contributed server's view is a manifest field
+    // rather than another arm here.
+    let name = path.file_name()?.to_str()?;
+    match name {
+        "Cargo.toml" | "Cargo.lock" => return Some(Server::RUST_ANALYZER),
+        "go.mod" | "go.sum" | "go.work" | "go.work.sum" => return Some(Server::GOPLS),
+        _ => {}
     }
+    cide_lsp::discover::servers()
+        .into_iter()
+        .find(|server| server.def().project_markers.iter().any(|m| m == name))
 }
 
 /// Drain the handles, fold into the store, emit — coalesced. Pay what a disk change owes.
@@ -1253,7 +1367,7 @@ fn pump(
                 for event in handle.drain() {
                     changed = true;
                     match event {
-                        LspEvent::Status(status) => store.lock().set_status(source, status),
+                        LspEvent::Status(status) => store.lock().set_status(source.clone(), status),
                         LspEvent::Published { abs_path, items } => {
                             let rel = relative(&roots, &abs_path);
                             let converted = items
@@ -1263,11 +1377,11 @@ fn pump(
                                         item,
                                         &abs_path,
                                         &rel,
-                                        handle.server().binary(),
+                                        &handle.server().binary(),
                                     )
                                 })
                                 .collect();
-                            store.lock().publish(source, abs_path, converted);
+                            store.lock().publish(source.clone(), abs_path, converted);
                         }
                     }
                 }
@@ -1298,10 +1412,10 @@ fn pump(
         if kick.take_due() {
             let handles = handles.lock();
             for handle in handles.iter() {
-                if handle.server() != Server::RustAnalyzer {
+                if handle.server() != Server::RUST_ANALYZER {
                     continue;
                 }
-                let (session, _) = cide_lsp::Session::new(&roots, Server::RustAnalyzer);
+                let (session, _) = cide_lsp::Session::new(&roots, Server::RUST_ANALYZER);
                 if let cide_lsp::Effect::Send(value) = session.run_flycheck() {
                     handle.send(value);
                 }
@@ -1517,7 +1631,7 @@ mod tests {
     fn the_mcp_view_distinguishes_clean_from_never_looked_at() {
         let store = Arc::new(Mutex::new(DiagnosticStore::new()));
         store.lock().publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/clean.rs".into(),
             vec![],
         );
@@ -1542,7 +1656,7 @@ mod tests {
         // structural way of guaranteeing it.
         let store = Arc::new(Mutex::new(DiagnosticStore::new()));
         store.lock().publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/src/a.rs".into(),
             vec![item(1, Severity::Hint), item(2, Severity::Error)],
         );
@@ -1650,7 +1764,7 @@ mod tests {
     fn each_gesture_names_itself_in_the_no_server_sentence() {
         // One condition, two sentences. Three copies of the condition is how one of them ends up
         // naming the wrong binary.
-        let missing = Missing::NotRunning(Server::Gopls);
+        let missing = Missing::NotRunning(Server::GOPLS);
         assert!(
             missing
                 .sentence("Find usages")
@@ -1726,19 +1840,19 @@ mod tests {
         use std::path::Path;
         assert_eq!(
             owner_of(Path::new("/r/Cargo.toml")),
-            Some(Server::RustAnalyzer)
+            Some(Server::RUST_ANALYZER)
         );
         assert_eq!(
             owner_of(Path::new("/r/Cargo.lock")),
-            Some(Server::RustAnalyzer)
+            Some(Server::RUST_ANALYZER)
         );
-        assert_eq!(owner_of(Path::new("/r/go.mod")), Some(Server::Gopls));
-        assert_eq!(owner_of(Path::new("/r/go.work")), Some(Server::Gopls));
+        assert_eq!(owner_of(Path::new("/r/go.mod")), Some(Server::GOPLS));
+        assert_eq!(owner_of(Path::new("/r/go.work")), Some(Server::GOPLS));
         assert_eq!(
             owner_of(Path::new("/r/src/a.rs")),
-            Some(Server::RustAnalyzer)
+            Some(Server::RUST_ANALYZER)
         );
-        assert_eq!(owner_of(Path::new("/r/a.go")), Some(Server::Gopls));
+        assert_eq!(owner_of(Path::new("/r/a.go")), Some(Server::GOPLS));
         // And nothing else. A `.gitignore` or a `README.md` moves nothing either server has said,
         // and treating it as a change would start a `cargo check` every time a note was saved.
         assert_eq!(owner_of(Path::new("/r/.gitignore")), None);

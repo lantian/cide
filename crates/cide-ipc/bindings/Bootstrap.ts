@@ -2,6 +2,7 @@
 import type { Capabilities } from "./Capabilities";
 import type { Command } from "./Command";
 import type { ResolvedBinding } from "./ResolvedBinding";
+import type { ResolvedContributions } from "./ResolvedContributions";
 import type { WindowLabel } from "./WindowLabel";
 import type { WindowRole } from "./WindowRole";
 import type { Workspace } from "./Workspace";
@@ -12,4 +13,18 @@ import type { Workspace } from "./Workspace";
  * One call rather than several: a window that has to make four requests before it can
  * paint will show three intermediate states, and on a slow IPC path that is visible.
  */
-export type Bootstrap = { window: WindowLabel, role: WindowRole, workspace: Workspace, keymap: Array<ResolvedBinding>, commands: Array<Command>, capabilities: Capabilities, };
+export type Bootstrap = { window: WindowLabel, role: WindowRole, workspace: Workspace, keymap: Array<ResolvedBinding>, commands: Array<Command>, capabilities: Capabilities, 
+/**
+ * The resolved language, server, panel and command set — builtins merged with whatever the
+ * enabled extensions contribute. (M22)
+ *
+ * Here rather than behind its own command because it cannot be late. `foldSpecFor` is called
+ * inside the editor's mount dispatch and cannot await: a fold spec that arrives one round
+ * trip after first paint means the remembered scroll position is applied against unfolded
+ * heights and the reader lands somewhere they did not leave. The rail has the same problem
+ * in a smaller way — a button that appears a beat after the window does reads as a glitch.
+ *
+ * The *panel* set, not the panels' contents: no extension worker has started at this point
+ * and none needs to have.
+ */
+extensions: ResolvedContributions, };

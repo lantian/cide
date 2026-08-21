@@ -80,6 +80,9 @@ const PANEL_LABEL: Readonly<Record<SidebarPanel, string>> = {
   files: 'Resize the sidebar',
   git: 'Resize the git panel',
   agents: 'Resize the agents panel',
+  // Not the name of any one extension's panel, because this handle sizes all of them — the same
+  // reason `files` is "the sidebar" rather than "the file tree".
+  ext: 'Resize the extension panel',
 }
 
 /** Matches `layout/Splitter.tsx`: long enough that key repeat coalesces, short enough to feel instant. */
@@ -139,6 +142,7 @@ function painted(widths: SidebarWidths): SidebarWidths {
     files: clampSidebarWidth(widths.files, available),
     git: clampSidebarWidth(widths.git, available),
     agents: clampSidebarWidth(widths.agents, available),
+    ext: clampSidebarWidth(widths.ext, available),
   }
 }
 

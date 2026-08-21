@@ -480,6 +480,8 @@
   --w-sidebar-files: 252px;
   --w-sidebar-git: 420px;
   --w-sidebar-agents: 320px;
+  /* Every panel an extension contributes, at the explorer's width — see `SidebarSettings::ext_width`. */
+  --w-sidebar-ext: 252px;
   --w-minimap: 96px;
   --w-splitter: 6px;
   /*

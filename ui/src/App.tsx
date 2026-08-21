@@ -19,6 +19,7 @@ import {
   selectView,
   showPanel,
   toggleSidebar,
+  type ActivityView,
   type SidebarState,
 } from '@/chrome/sidebarView'
 import { registerPanelHost } from '@/chrome/panelRequests'
@@ -54,6 +55,15 @@ import {
 } from '@/sidebar/ProblemsPanel/actions'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { AgentsPanel } from '@/sidebar/AgentsPanel'
+// M22. Imported statically like every other panel: `panes/PaneBody.tsx` states the rule for panes
+// and it holds here too — a panel that renders nothing for a frame while a chunk arrives is a
+// panel the layout measures at zero.
+import { ExtensionsPanel } from '@/sidebar/ExtensionsPanel'
+import { ExtPanelHost } from '@/ext/ExtPanelHost'
+import type { PanelBinding } from '@/ipc/client'
+import { attachExtensions, useExtPanels } from '@/ext/extStore'
+import { attachEditorBridge, setBridgeProject } from '@/ext/editorBridge'
+import { ExtensionTab } from '@/ext/ExtensionTab'
 /* Straight from `model.ts` and not through the barrel, per that file's own rule: the
    barrel pulls in React and the DOM, and `model.ts` is import-free so `check:agents` can
    compile it standalone. `ProblemsPanel/model` is imported the same way two lines up. */
@@ -680,6 +690,39 @@ export function App() {
     }
   }, [adoptAgents])
 
+  /*
+   * The extension registry, attached here and not in the panel. (M22)
+   *
+   * The same rule the agents and tasks stores follow — a rail badge must stay live while the
+   * sidebar is shut — with a stronger version of it: the *workers* are started by this
+   * subscription, and an extension that only ran while somebody was looking at its panel could
+   * never contribute a diagnostic or an outline. It is also not per project: an extension is a
+   * tool the user chose, not a fact about a repository, which `cide_ext::config` argues at length.
+   */
+  const extPanels = useExtPanels()
+  useEffect(() => attachExtensions(), [])
+
+  /*
+   * The other half of the extension host: what a worker can learn about an open file, and what it
+   * can put back.
+   *
+   * `jumpTo` before `file.open`, exactly as the Problems panel's `onOpenLocation` does and for its
+   * reason: the editor for a path a worker names usually does not exist yet, so the reveal is
+   * parked and spent by the mount the open causes. Going the other way round loses it.
+   */
+  useEffect(
+    () =>
+      attachEditorBridge((path, line, column) => {
+        if (!activeProjectId) return
+        jumpTo(activeProjectId, { path, line, column })
+        void fileApi.open(activeProjectId, path).then(() => hydrate())
+      }),
+    [activeProjectId, hydrate],
+  )
+  useEffect(() => {
+    setBridgeProject(activeProjectId ?? null)
+  }, [activeProjectId])
+
   /**
    * The tab and pane the user is looking at.
    *
@@ -1067,6 +1110,26 @@ export function App() {
               agentRoster.kind === 'ready' &&
               agentRoster.runs.some((run) => run.phase === 'awaitingPermission')
             }
+            /*
+             * The buttons extensions contribute, in registry order. (M22)
+             *
+             * Only the ones a *sidebar* panel was declared for — a `bottom` panel is a tab in the
+             * tool window and has no rail button, and drawing one for it would light a rail
+             * button that opens nothing.
+             *
+             * `icon` is a 24×24 SVG path `d` validated by `cide_ext::manifest::is_svg_path` at
+             * install, which is a whitelist rather than an escape: this value goes into an
+             * attribute the rail renders, and that is the one place a manifest could otherwise
+             * put markup. A panel with no icon gets an empty path, which draws a blank button —
+             * and the manifest reader has already warned its author about exactly that.
+             */
+            extra={extPanels
+              .filter((panel) => panel.def.location === 'sidebar')
+              .map((panel) => ({
+                id: panel.view as ActivityView,
+                path: panel.def.icon ?? '',
+                label: panel.def.label,
+              }))}
             onSelect={(next) => {
               // What a click means — the lit one toggles shut, any other switches, ⚙ has no
               // panel to hide — is `selectView`'s, in `chrome/sidebarView.ts`, along with the
@@ -1285,15 +1348,49 @@ export function App() {
                 />
               </PanelBoundary>
             )}
-            {/* The sidebar's drag edge — one handle for all six panels, because there are only
-                three widths: `--w-sidebar-files` sizes the explorer, search and problems,
-                `--w-sidebar-git` sizes git, and `--w-sidebar-agents` sizes Agents and Tasks
-                together. That last pairing is `sidebarWidth.ts`'s decision and it argues it: the
-                panel a user widens to read task titles in one is the panel they are about to read
-                task titles in in the other, so a user who drags one and finds the other narrower
-                has been given two settings for one intent. Absent under `settings`, which has no
-                panel, and while the sidebar is hidden: a handle with nothing to its left is a grab
-                that resizes something the user cannot see. */}
+            {sidebar.view === 'extensions' && (
+              <PanelBoundary
+                name="Extensions"
+                onClose={() => setSidebar((st) => selectView(st, 'extensions'))}
+              >
+                <ExtensionsPanel project={activeProjectId ?? null} />
+              </PanelBoundary>
+            )}
+            {/*
+              * Every panel an extension contributes, in one branch. (M22)
+              *
+              * A literal `{sidebar.view === …` block like the eight above it rather than a loop
+              * over the contributed panels, and that is deliberate: `ui/scripts/check-boundary.mjs`
+              * finds the rail's panels by scraping this file for exactly this shape and asserts
+              * each one is wrapped. A `<PanelSlot>` loop would compile, render, and quietly take
+              * that gate with it — an unwrapped panel takes the **whole window** down when it
+              * throws, and the rail's choice is restored on launch, so it stays down.
+              *
+              * The `PanelBoundary` here is the outer of two guards and it should never fire: an
+              * extension's code runs in a worker, so what this wraps is cide's own renderer over a
+              * view model that has already been validated. It is here because "should never fire"
+              * is not a thing to leave to a comment.
+              */}
+            {sidebar.view !== null && sidebar.view.startsWith('ext:') && (
+              <PanelBoundary
+                name="an extension panel"
+                onClose={() => setSidebar((st) => selectView(st, 'files'))}
+              >
+                <ExtSidebarPanel view={sidebar.view} panels={extPanels} />
+              </PanelBoundary>
+            )}
+            {/* The sidebar's drag edge — one handle for every panel, because there are only four
+                widths: `--w-sidebar-files` sizes the explorer, search, problems and Extensions,
+                `--w-sidebar-git` sizes git, `--w-sidebar-agents` sizes Agents and Tasks together,
+                and `--w-sidebar-ext` sizes every panel an extension contributes. The Agents/Tasks
+                pairing is `sidebarWidth.ts`'s decision and it argues it: the panel a user widens to
+                read task titles in one is the panel they are about to read task titles in in the
+                other, so a user who drags one and finds the other narrower has been given two
+                settings for one intent. The contributed panels share a number for a different
+                reason — `SidebarSettings::ext_width` — which is that a per-extension width cannot
+                be a field of a fixed struct. Absent under `settings`, which has no panel, and while
+                the sidebar is hidden: a handle with nothing to its left is a grab that resizes
+                something the user cannot see. */}
             {isPanelOpen(sidebar) && (
               <SidebarSplitter
                 panel={
@@ -1301,7 +1398,9 @@ export function App() {
                     ? 'git'
                     : sidebar.view === 'agents' || sidebar.view === 'tasks'
                       ? 'agents'
-                      : 'files'
+                      : sidebar.view?.startsWith('ext:') === true
+                        ? 'ext'
+                        : 'files'
                 }
               />
             )}
@@ -1358,6 +1457,16 @@ export function App() {
                     // into it. The screen replaces the tree rather than living inside a pane.
                     tab.kind.kind === 'settings' ? (
                       <SettingsTab project={activeProject.id} section={tab.kind.section} />
+                    ) : tab.kind.kind === 'extension' ? (
+                      /*
+                       * An extension's page, replacing the pane tree the way Settings does — and
+                       * for the same reason: it is a page *about* cide rather than a document in
+                       * the project, so there is nothing for a split to split.
+                       */
+                      <ExtensionTab
+                        id={{ marketplace: tab.kind.marketplace, extension: tab.kind.extension }}
+                        name={tab.kind.name}
+                      />
                     ) : (
                     <SplitTree
                       tree={tab.tree}
@@ -1778,4 +1887,31 @@ export function App() {
       </div>
     </WindowFrame>
   )
+}
+
+
+/**
+ * One contributed sidebar panel, resolved from the rail's view id. (M22)
+ *
+ * A component rather than an inline `find`, because the lookup can fail in a way worth drawing: a
+ * panel whose extension was disabled in *another window* leaves this window's rail selection
+ * pointing at nothing, and the honest answer is a sentence rather than a blank column. `PanelView`
+ * is restored from `sidebar.last` on the next gesture.
+ */
+function ExtSidebarPanel({
+  view,
+  panels,
+}: {
+  view: string
+  panels: readonly PanelBinding[]
+}): React.JSX.Element {
+  const binding = panels.find((panel) => panel.view === view)
+  if (binding === undefined) {
+    return (
+      <div className={styles.extMissing}>
+        That panel is not available — its extension was disabled or removed.
+      </div>
+    )
+  }
+  return <ExtPanelHost binding={binding} />
 }

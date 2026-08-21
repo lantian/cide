@@ -103,6 +103,29 @@ pub use tasks::{
     Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskNew, TaskStatus,
 };
 
+// --- M22: extensions, and the marketplaces they come from ---
+//
+// Two modules for the reason `symbols` and `diagnostics` are two: `lang` is what a language *is*
+// — a tokenizer table, a fold spec, a set of extensions — and it is meaningful with no extension
+// anywhere near it, because the builtin languages are described by it too. `ext` is the
+// distribution machinery around a manifest that happens to contain some. Keeping them apart is
+// what lets `cide-lsp` and the editor depend on a language without depending on the idea of a
+// marketplace at all.
+pub mod ext;
+pub mod lang;
+
+pub use ext::{
+    Capability, ConnectRequest, ContributionSource, Contributions, ExtCommandDef, ExtProblem,
+    ExtSeverity, ExtensionPage, ExtensionRef, ExtensionSnapshot, InstallRequest,
+    InstalledExtension, LanguageBinding, Marketplace, MarketplaceEntry, MarketplaceState,
+    PanelBinding, PanelDef, PanelLocation, ResolvedContributions, ResolvedExtCommand,
+    ServerBinding,
+};
+pub use lang::{
+    FileExtension, FoldSpecDto, GrammarRule, GrammarSpecDto, LanguageDef, LanguageServerDef,
+    RuleAt, ScratchTypeDto,
+};
+
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -120,6 +143,18 @@ pub struct Bootstrap {
     pub keymap: Vec<ResolvedBinding>,
     pub commands: Vec<Command>,
     pub capabilities: Capabilities,
+    /// The resolved language, server, panel and command set — builtins merged with whatever the
+    /// enabled extensions contribute. (M22)
+    ///
+    /// Here rather than behind its own command because it cannot be late. `foldSpecFor` is called
+    /// inside the editor's mount dispatch and cannot await: a fold spec that arrives one round
+    /// trip after first paint means the remembered scroll position is applied against unfolded
+    /// heights and the reader lands somewhere they did not leave. The rail has the same problem
+    /// in a smaller way — a button that appears a beat after the window does reads as a glitch.
+    ///
+    /// The *panel* set, not the panels' contents: no extension worker has started at this point
+    /// and none needs to have.
+    pub extensions: ext::ResolvedContributions,
 }
 
 /// Whether a pane's conversation can be picked up where it left off.

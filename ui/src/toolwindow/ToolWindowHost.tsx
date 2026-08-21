@@ -24,7 +24,13 @@ import { useWorkspace } from '@/store/workspace'
 import { LogTab } from '@/gitlog/LogTab'
 import { ToolWindowView } from './ToolWindow'
 import { ToolWindowSplitter } from './ToolWindowSplitter'
-import { restoreTabs, tabRow, walkTab, type HistoryTab } from './toolWindowModel'
+import { isExtTab, restoreTabs, tabRow, walkTab, type HistoryTab } from './toolWindowModel'
+// M22. Contributed tabs are not part of `ToolWindowState` and deliberately are not stored — see
+// `ExtTab` in the model for why — so they arrive from the extension store and the active one is
+// held here, in the webview, beside the other transient gesture state.
+import { ExtPanelHost } from '@/ext/ExtPanelHost'
+import { useExtPanels } from '@/ext/extStore'
+import { useState } from 'react'
 
 export interface ToolWindowHostProps {
   project: ProjectId
@@ -33,8 +39,31 @@ export interface ToolWindowHostProps {
 export function ToolWindowHost({ project }: ToolWindowHostProps) {
   const state = useWorkspace((s) => s.boot?.workspace.projects[project]?.toolWindow ?? null)
 
+  const panels = useExtPanels().filter((panel) => panel.def.location === 'bottom')
+  /*
+   * Which contributed tab is in front, or `null` for "one of Rust's".
+   *
+   * Webview state, and it is one of the two things `store/workspace.ts`'s header says the webview
+   * legitimately owns: transient gesture state. Rust cannot hold it, because `ToolWindowState`
+   * has nowhere to put an id whose extension may not be installed on the next launch.
+   *
+   * Cleared whenever the extension that owned it goes away, so disabling an extension in another
+   * window does not leave this one showing a tab that no longer exists.
+   */
+  const [extActive, setExtActive] = useState<string | null>(null)
+  const shownExt =
+    extActive !== null && panels.some((panel) => panel.view === extActive) ? extActive : null
+
   const onActivate = useCallback(
     (id: string | null) => {
+      if (isExtTab(id)) {
+        // Never reaches Rust: `tool_window_activate` takes a `HistoryTabId`, which is a uuid, and
+        // an `ext:` id is not one. Rust's own `active` is left exactly where it was, so switching
+        // back to a contributed tab and away again returns to the history tab the user had open.
+        setExtActive(id)
+        return
+      }
+      setExtActive(null)
       void toolWindowApi.activate(project, id as HistoryTabId | null).catch(() => {})
     },
     [project],
@@ -64,13 +93,22 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
   // Repaired before it is drawn: a hand-edited `workspace.json` can hold an `active` naming no
   // tab, which would light nothing and show an empty body with no way back. `validate` refuses to
   // *write* that state; this is what stops one already on disk from reaching the screen.
-  const tabs = restoreTabs({
+  const repaired = restoreTabs({
     open: state.open,
     history: state.history as readonly HistoryTab[],
     active: state.active,
   })
+  const tabs = {
+    ...repaired,
+    ext: panels.map((panel) => ({ view: panel.view, label: panel.def.label })),
+    // A contributed tab in front wins over Rust's `active`, which stays where it was — see
+    // `onActivate`. `restoreTabs` has already repaired the stored half, and this cannot make it
+    // invalid again because `shownExt` is only ever an id in `panels`.
+    active: shownExt ?? repaired.active,
+  }
   const rows = tabRow(tabs)
   const active = tabs.history.find((t) => t.id === tabs.active) ?? null
+  const extPanel = panels.find((panel) => panel.view === shownExt) ?? null
 
   return (
     <>
@@ -87,13 +125,20 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
          * generation counter and the selection are all per question, and re-pointing would leave
          * one tab's rows on screen under another tab's heading for a frame.
          */}
-        <LogTab
-          key={active?.id ?? 'log'}
-          project={project}
-          tab={walkTab(active?.id ?? null)}
-          repo={active === null ? null : (active.repo as RepoId)}
-          path={active === null ? null : active.path}
-        />
+        {extPanel === null ? (
+          <LogTab
+            key={active?.id ?? 'log'}
+            project={project}
+            tab={walkTab(active?.id ?? null)}
+            repo={active === null ? null : (active.repo as RepoId)}
+            path={active === null ? null : active.path}
+          />
+        ) : (
+          // Keyed by the view id for the same reason `LogTab` is keyed by its tab: switching tabs
+          // remounts rather than re-points, so one extension's rows are never on screen under
+          // another's heading for a frame.
+          <ExtPanelHost key={extPanel.view} binding={extPanel} placement="bottom" />
+        )}
       </ToolWindowView>
     </>
   )

@@ -257,6 +257,30 @@ pub struct SidebarSettings {
     /// files/git split, where the two panels are read for different reasons at different times.
     #[serde(default = "default_agents_width")]
     pub agents_width: u16,
+    /// `--w-sidebar-ext`: every panel an extension contributes. (M22)
+    ///
+    /// **One number for every contributed panel**, and that is the one decision here that had a
+    /// real alternative. A width per extension would let two extensions with very different
+    /// panels each keep their own drag, which is plainly better for the user — and it cannot be
+    /// stored here, because this struct is a fixed set of fields and the extension set is not
+    /// known until `extensions.json` is read. Storing it per extension means a map keyed by an
+    /// identity pair, in a settings object that is broadcast to every window on every change, for
+    /// a number most users will never drag once.
+    ///
+    /// So: one number, defaulting to the explorer's, because a tree of rows is the shape 252px
+    /// was chosen for. If a contributed panel ever earns its own width, that is the day to add
+    /// the map.
+    ///
+    /// `#[serde(default = "…")]` for [`Self::agents_width`]'s reason, which is worth re-reading
+    /// before adding the next stored field: a missing non-defaulted field makes the whole
+    /// `sidebar` object fail to deserialise, taking every setting in the block with it.
+    #[serde(default = "default_ext_width")]
+    pub ext_width: u16,
+}
+
+/// `serde(default)` for [`SidebarSettings::ext_width`].
+fn default_ext_width() -> u16 {
+    252
 }
 
 /// `serde(default)` for [`SidebarSettings::agents_width`]. A bare literal is not a path serde
@@ -274,6 +298,7 @@ impl Default for SidebarSettings {
             files_width: 252,
             git_width: 420,
             agents_width: default_agents_width(),
+            ext_width: default_ext_width(),
         }
     }
 }
@@ -291,6 +316,7 @@ impl SidebarSettings {
             agents_width: self
                 .agents_width
                 .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
+            ext_width: self.ext_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
         }
     }
 }
@@ -1488,6 +1514,7 @@ mod tests {
                 files_width: 300,
                 git_width: 500,
                 agents_width: 340,
+                ext_width: 280,
             },
             ..Settings::default()
         };
@@ -1810,16 +1837,19 @@ mod tests {
             files_width: 4,
             git_width: 9_000,
             agents_width: 0,
+            ext_width: 9_000,
         }
         .clamped();
         assert_eq!(clamped.files_width, SIDEBAR_MIN_WIDTH);
         assert_eq!(clamped.git_width, SIDEBAR_MAX_WIDTH);
         assert_eq!(clamped.agents_width, SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamped.ext_width, SIDEBAR_MAX_WIDTH);
 
         let legal = SidebarSettings {
             files_width: 300,
             git_width: 500,
             agents_width: 340,
+            ext_width: 280,
         };
         assert_eq!(legal.clamped(), legal);
         // The defaults are inside the band, or a first launch would move the panel itself.

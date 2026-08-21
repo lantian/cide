@@ -56,4 +56,24 @@ gitWidth: number,
  * unchanged has been made to do the same work twice. That is the reverse of the
  * files/git split, where the two panels are read for different reasons at different times.
  */
-agentsWidth: number, };
+agentsWidth: number, 
+/**
+ * `--w-sidebar-ext`: every panel an extension contributes. (M22)
+ *
+ * **One number for every contributed panel**, and that is the one decision here that had a
+ * real alternative. A width per extension would let two extensions with very different
+ * panels each keep their own drag, which is plainly better for the user — and it cannot be
+ * stored here, because this struct is a fixed set of fields and the extension set is not
+ * known until `extensions.json` is read. Storing it per extension means a map keyed by an
+ * identity pair, in a settings object that is broadcast to every window on every change, for
+ * a number most users will never drag once.
+ *
+ * So: one number, defaulting to the explorer's, because a tree of rows is the shape 252px
+ * was chosen for. If a contributed panel ever earns its own width, that is the day to add
+ * the map.
+ *
+ * `#[serde(default = "…")]` for [`Self::agents_width`]'s reason, which is worth re-reading
+ * before adding the next stored field: a missing non-defaulted field makes the whole
+ * `sidebar` object fail to deserialise, taking every setting in the block with it.
+ */
+extWidth: number, };

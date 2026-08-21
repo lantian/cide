@@ -574,3 +574,51 @@ pub fn agents_changed(
         tracing::debug!(%error, "agents-changed reached no window");
     }
 }
+
+// --- extensions (M22) ------------------------------------------------------------------
+
+/// The extension registry changed: a marketplace connected or refreshed, something installed,
+/// enabled, disabled or removed.
+///
+/// # Why this one carries `rev`
+///
+/// The same test `tasks_changed` sets out, applied to a different file, and it comes out the same
+/// way. `agents_changed` carries no revision because the roster is *derived* from one in-process
+/// read plus a registry with exactly one writer, so the last one sent is by construction the
+/// newest and there is nothing for an ordering number to protect.
+///
+/// `extensions.json` has several writers. Two windows can each be installing something; a
+/// background refresh finishes on a thread of its own; and — the one that makes the difference —
+/// the user can `git pull` a marketplace clone by hand, or edit the config file, at any moment.
+/// Snapshots can therefore arrive out of order, and the receiver's only defence is a high-water
+/// mark, which is what `ExtensionSnapshot::rev` is.
+///
+/// # The whole snapshot, not a signal to re-ask
+///
+/// `workspace_changed`'s argument: it is a few kilobytes, the emitter has it in hand, and a window
+/// that answered by re-reading would be reading files that may have changed again in between —
+/// which for a directory a `git pull` can move is not a hypothetical.
+///
+/// # It is not enough on its own
+///
+/// A window that receives this has a new *panel* to draw. What it does **not** get is a new fold
+/// table: `foldSpecFor` is called inside the editor's mount dispatch and cannot await, so the
+/// language registry is read from `Bootstrap` at first paint. Enabling a language extension
+/// therefore updates the panel immediately and the open editors on their next mount — which is
+/// what the panel says out loud rather than pretending otherwise.
+pub const EXT_CHANGED: &str = "cide://ext-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtChanged {
+    snapshot: cide_ipc::ext::ExtensionSnapshot,
+}
+
+pub fn ext_changed(app: &AppHandle, snapshot: &cide_ipc::ext::ExtensionSnapshot) {
+    let payload = ExtChanged {
+        snapshot: snapshot.clone(),
+    };
+    if let Err(error) = app.emit(EXT_CHANGED, payload) {
+        tracing::debug!(%error, "ext-changed reached no window");
+    }
+}

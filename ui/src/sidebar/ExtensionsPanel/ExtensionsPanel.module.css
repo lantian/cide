@@ -1,0 +1,639 @@
+/*
+ * The Extensions panel. (M22)
+ *
+ * ## Width
+ *
+ * `--w-sidebar-files`, borrowed rather than given a token of its own, on the argument
+ * `ProblemsPanel.module.css` makes: this is the explorer's column with different rows in it, and a
+ * user who widens the tree to read long paths means the same thing when they widen this. The
+ * *contributed* panels get `--w-sidebar-ext` — a different question, and `SidebarSettings::ext_width`
+ * answers it.
+ *
+ * ## The shape of a row, and why it is a card
+ *
+ * Every other panel in this app draws a **line** per thing, because every other panel's thing is
+ * one fact: a file, a changed path, a diagnostic. An extension is five — a name, a version, what
+ * it is for, what it may do, and what you can do about it — and five facts on one 252px line is
+ * the flat wall the first version of this panel was. So a row here is a block with its own
+ * padding, separated by a hairline and lit on hover, and the five facts are laid out in it: a
+ * status dot and a name on the first line, the description on the second, the permissions it wants
+ * on the third, and the buttons last.
+ *
+ * ## Header
+ *
+ * 30px / 10.5px / uppercase, exactly as the files, problems and agents headers are, so the rule
+ * under it lands on the same row of pixels whatever the rail is showing. Connecting a marketplace
+ * lives behind the `+` in that header rather than in a field of its own: it is done once and then
+ * never again, and a permanent two-control stack above the search box was most of what made this
+ * panel look cluttered.
+ *
+ * Every size is a rung of the `--fs-ui-*` ladder and every colour is a token.
+ */
+
+.panel {
+  width: var(--w-sidebar-files);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/* --- header ------------------------------------------------------------------------------- */
+
+.header {
+  height: calc(30px * var(--ui-scale));
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-10-5);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--dim);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.headerTitle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * The header's icon buttons: `+` to connect, `⟳` to refresh.
+ *
+ * 20px square so two of them fit in the 30px header without crowding the rule under it, and
+ * `line-height: 1` so the glyph is centred by the grid rather than by a baseline that moves with
+ * the face.
+ */
+.headerAction {
+  appearance: none;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: calc(20px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-13);
+  line-height: 1;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.headerAction:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.headerAction:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.headerAction:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.headerActionOn {
+  background: var(--chrome-hi);
+  color: var(--accent);
+}
+
+/* --- the connect field, revealed by the header's `+` --------------------------------------- */
+
+.connect {
+  flex: none;
+  display: flex;
+  gap: 5px;
+  padding: 7px 10px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* --- search and filters --------------------------------------------------------------------- */
+
+.search {
+  flex: none;
+  position: relative;
+  display: flex;
+  padding: 7px 10px 5px;
+}
+
+/*
+ * The magnifier, drawn as text inside the field's padding.
+ *
+ * `pointer-events: none` so a click on the glyph lands on the input behind it — a 14px dead zone
+ * at the start of a search box is a click that looks like the panel ignored it.
+ */
+.searchIcon {
+  position: absolute;
+  left: calc(10px + 7px);
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: var(--fs-ui-10);
+  color: var(--faint);
+  pointer-events: none;
+}
+
+.input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font: inherit;
+  font-size: var(--fs-ui-11-5);
+}
+
+.searchInput {
+  padding-left: 22px;
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  background: var(--panel);
+}
+
+/*
+ * One scrolling row of chips, never a wrapping block.
+ *
+ * Seven chips wrap to three ragged lines at the default width, which pushed the first extension
+ * below the fold and was the second thing that made this panel look unfinished. A single row that
+ * scrolls keeps the panel's vertical rhythm fixed whatever the width, and the scrollbar is hidden
+ * because a 3px bar under seven 18px chips is noise — the row is short enough to drag.
+ */
+.filters {
+  flex: none;
+  display: flex;
+  gap: 3px;
+  padding: 0 10px 7px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.filters::-webkit-scrollbar {
+  display: none;
+}
+
+.chip {
+  appearance: none;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  background: var(--chrome);
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-10);
+  padding: 2px 7px;
+  border-radius: 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.chip:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.chip:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.chipOn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.chipOn:hover {
+  background: var(--accent-hi);
+  color: var(--on-accent);
+}
+
+/* Tabular, so seven counts do not jitter the chips as they change. */
+.chipCount {
+  font-size: var(--fs-ui-9);
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
+.chipOn .chipCount {
+  color: var(--on-accent);
+  opacity: 0.75;
+}
+
+/* --- the body --------------------------------------------------------------------------------- */
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding-bottom: 10px;
+}
+
+.group {
+  padding-top: 2px;
+}
+
+/*
+ * A marketplace heading. Sticky, because a long catalog scrolls past it and the answer to "where
+ * is this extension from" must not require scrolling back up — the same reason the Problems
+ * panel's file headings stick.
+ */
+.groupName {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  padding: 7px 10px 5px;
+  background: var(--panel);
+  font-size: var(--fs-ui-10);
+  font-weight: 500;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.groupTitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * `local` / `remote`: whether reaching this marketplace uses the network and the user's credential
+ * helper. On screen rather than inferred from the URL, because that is the difference between
+ * "this will use your SSH key" and "this is a directory on your disk".
+ */
+.route {
+  flex: none;
+  font-size: var(--fs-ui-8);
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  background: var(--chrome);
+  border-radius: 2px;
+  padding: 1px 4px;
+}
+
+/*
+ * The heading's own controls, dimmed until the heading is hovered.
+ *
+ * Refresh and Disconnect are rare and destructive-adjacent; drawn at full weight they compete with
+ * the extension names, which are what the panel is for. `:focus-within` is the half that keeps
+ * them reachable without a mouse — a control that only appears on hover and cannot be tabbed to is
+ * a control that does not exist for a keyboard.
+ */
+.groupActions {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 90ms ease-out;
+}
+
+.groupName:hover .groupActions,
+.groupName:focus-within .groupActions {
+  opacity: 1;
+}
+
+/* --- one extension --------------------------------------------------------------------------- */
+
+.row {
+  display: grid;
+  grid-template-columns: calc(9px * var(--ui-scale)) 1fr;
+  gap: 0 6px;
+  padding: 7px 10px 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.row:hover {
+  background: var(--panel-2);
+}
+
+/*
+ * The status dot: the row's one-glance answer.
+ *
+ * Filled accent for installed and running, a hollow ring for installed and switched off, nothing
+ * at all for a row that is merely offered, and red for one that is broken. A *shape* difference
+ * and not only a colour one, so the enabled/disabled distinction survives a monochrome display and
+ * a red-green deficiency — the same reason the git tree draws letters beside its colours.
+ */
+.dot {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: center;
+  justify-self: center;
+  width: calc(7px * var(--ui-scale));
+  height: calc(7px * var(--ui-scale));
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+
+.dotOn {
+  background: var(--accent);
+}
+
+.dotOff {
+  border: 1px solid var(--dim);
+}
+
+.dotBad {
+  background: var(--red);
+}
+
+.rowHead {
+  grid-column: 2;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+}
+
+/*
+ * The name, as a link into the extension's page.
+ *
+ * `appearance: none` and an inherited font, so a `<button>` reads as the text it replaces. The
+ * underline is on hover only: a column of underlined names is a wall.
+ */
+.nameLink {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nameLink:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.nameLink:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+.version {
+  flex: none;
+  font-size: var(--fs-ui-9-5);
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
+/*
+ * Two lines and then an ellipsis. A description is one sentence in a good manifest and a paragraph
+ * in a careless one, and a panel whose row height is decided by somebody else's prose is a panel
+ * that cannot be scanned. The whole of it is on the extension's page.
+ */
+.description {
+  grid-column: 2;
+  margin: 2px 0 0;
+  font-size: var(--fs-ui-10-5);
+  line-height: 1.45;
+  color: var(--dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/*
+ * What the extension may do, as tags rather than as prose.
+ *
+ * The first version of this panel printed the whole consent sentence on every row, which in a
+ * 252px column is four wrapped lines per extension and is why it read as a wall. The sentence is
+ * still what a person decides by — it is on the page, beside the Install button there — and this
+ * is its index: one short tag per permission, each carrying the full wording as its tooltip.
+ *
+ * `process:spawn` is toned differently because it is the one that is a real trust decision: the
+ * manifest names a binary and cide runs it against the user's project.
+ */
+.perms {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.perm {
+  font-size: var(--fs-ui-8);
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  background: var(--chrome);
+  border-radius: 2px;
+  padding: 1px 4px;
+  white-space: nowrap;
+}
+
+.permStrong {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 12%, transparent);
+}
+
+.rowActions {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* --- buttons ---------------------------------------------------------------------------------- */
+
+/*
+ * Two weights, and the difference is deliberate: the primary is the one act that changes what is
+ * on the user's disk, and it is filled so that a column of rows shows at a glance which of them
+ * are offering it.
+ */
+.primary {
+  appearance: none;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  font-size: var(--fs-ui-10);
+  padding: 2px 9px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+}
+
+.action {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-10);
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.action:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.primary:disabled,
+.action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.primary:focus-visible,
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* A resting state, not a control. Never a disabled button — see `ExtensionsPanel.tsx`. */
+.installed {
+  font-size: var(--fs-ui-10);
+  color: var(--faint);
+}
+
+/* --- notices, languages, problems ------------------------------------------------------------- */
+
+.notice {
+  margin: 0;
+  padding: 14px 12px;
+  font-size: var(--fs-ui-11);
+  line-height: 1.55;
+  color: var(--dim);
+}
+
+/* The first-launch screen: the one notice a user is meant to act on, so it gets room. */
+.empty {
+  padding: 22px 14px;
+  text-align: center;
+}
+
+.emptyTitle {
+  display: block;
+  margin-bottom: 5px;
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+}
+
+/*
+ * The Languages readout, and the Problems list under it.
+ *
+ * Separated from the catalog by a full rule rather than a hairline: they are answers about the
+ * whole registry rather than more rows, and a reader scanning the catalog should be able to see
+ * where it stops.
+ */
+.report {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 2px;
+}
+
+.langRow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0 6px;
+  padding: 4px 10px;
+}
+
+.langName {
+  font-size: var(--fs-ui-11);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.langExt {
+  grid-column: 1;
+  font-size: var(--fs-ui-9-5);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.by {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: baseline;
+  font-size: var(--fs-ui-9-5);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.instead {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: baseline;
+  font-size: var(--fs-ui-8);
+  color: var(--faint);
+  white-space: nowrap;
+  text-align: right;
+}
+
+/*
+ * A problem, with a rule down its left edge.
+ *
+ * The bar is what separates a finding from the prose above it without a heading per item, and it
+ * is the same device the Problems panel uses for a source that is unavailable.
+ */
+.problem {
+  margin: 4px 10px;
+  padding: 2px 0 2px 7px;
+  border-left: 2px solid var(--border);
+  font-size: var(--fs-ui-10);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.problemError {
+  border-left-color: var(--red);
+  color: var(--red);
+}

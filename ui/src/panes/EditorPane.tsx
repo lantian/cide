@@ -60,7 +60,8 @@ import { collapseRuns } from '@/editor/blameModel'
 import { requestLogReveal } from '@/gitlog/LogTab'
 import type { FileView } from '@/editor/position'
 import { levelFor, subscribeHighlightLevels } from '@/editor/highlightLevel'
-import { basename, isMarkdownPath } from '@/editor/languages'
+import { basename, isMarkdownPath, languageIdFor } from '@/editor/languages'
+import { noteActiveEditor } from '@/ext/editorBridge'
 import { MarkdownFrame } from '@/editor/markdown/MarkdownFrame'
 import type { MdView } from '@/editor/markdown/types'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
@@ -1124,6 +1125,19 @@ export function EditorPane({
             // The same reader on its own timer: this is what gives the language server the
             // *unsaved* text, which is the whole of what it has over `cargo check` in a terminal.
             scheduleDoc(path, read)
+            // And the extension workers, on a third timer of their own. (M22)
+            //
+            // Not folded into `scheduleOutline`: that one debounces a *round trip to Rust* and
+            // this one debounces a `postMessage` to every worker with `editor:read`, and they are
+            // sized for different costs. `noteActiveEditor` reads the text only when its timer
+            // fires, so a burst of typing is one message rather than one per keystroke — which on
+            // a megabyte file is the single most likely way an extension host makes typing slow.
+            noteActiveEditor({
+              path,
+              languageId: languageIdFor(path),
+              line: 1,
+              read,
+            })
           }}
           diagnostics={diagnostics}
           highlight={level}
@@ -1235,6 +1249,16 @@ function OutlineFeed({
     if (project === undefined) return
     fetchOutline(project as ProjectId, path, text)
   }, [project, path, text])
+
+  // The extension workers get the same seed, on the same trigger. (M22)
+  //
+  // Here rather than in `EditorPane`'s own effects for this component's stated reason: it has to
+  // re-run when the *loaded text* changes, and `EditorPane`'s effects are keyed on the path. A
+  // worker told about a path and never about its text would have nothing to outline until the
+  // user typed.
+  useEffect(() => {
+    noteActiveEditor({ path, languageId: languageIdFor(path), line: 1, read: () => text })
+  }, [path, text])
 
   useEffect(() => () => forgetOutline(path), [path])
   return null

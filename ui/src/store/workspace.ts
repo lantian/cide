@@ -9,6 +9,7 @@
  * The only genuinely local state is transient chrome: which overlay is open, whether a
  * splitter is mid-drag. Those never outlive the window and never need to agree with anyone.
  */
+import { registerLanguages } from '@/editor/languages'
 import { rememberSpawnPlan } from '@/layout/spawnPlans'
 import { reconcile, restack } from '@/keys/switcher'
 import { windowProjectsOf } from '@/keys/target'
@@ -584,6 +585,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
 
   hydrate: async () => {
     const boot = await appApi.getBootstrap()
+    // Before `set`, and before anything can render. The language table decides how a buffer folds,
+    // and `foldSpecFor` is called inside the editor's mount dispatch where it cannot await — a
+    // table that arrived one tick after the first editor would restore the remembered scroll
+    // position against unfolded heights and land the reader somewhere they did not leave. This is
+    // the whole reason the resolved set rides `Bootstrap` rather than having a command of its own.
+    for (const problem of registerLanguages(boot.extensions.languages.map((row) => row.def))) {
+      console.warn(`[cide] ${problem}`)
+    }
     set({
       boot,
       theme: boot.workspace.settings.theme,

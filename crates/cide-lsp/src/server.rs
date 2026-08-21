@@ -1029,7 +1029,7 @@ mod tests {
             let (tx, rx) = crossbeam_channel::bounded::<Value>(OUTBOX);
             let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             let requester = Requester {
-                server: Server::RustAnalyzer,
+                server: Server::RUST_ANALYZER,
                 outbox: tx,
                 next_id: Arc::new(std::sync::atomic::AtomicI64::new(REQUEST_ID_BASE)),
                 pending: Arc::clone(&pending),
@@ -1214,7 +1214,7 @@ mod tests {
             // Stop already set: `supervise` must return through the top-of-loop check.
             let stop = Arc::new(AtomicBool::new(true));
             supervise(
-                Server::RustAnalyzer,
+                Server::RUST_ANALYZER,
                 PathBuf::from("/nonexistent/never-spawned"),
                 Vec::new(),
                 rx,
@@ -1364,7 +1364,7 @@ mod tests {
         let outcome = crate::discover::find(
             // A `Server` variant cannot be invented, so this asserts the shape through the real
             // path: no roots means no project marker, which is the second probe.
-            Server::RustAnalyzer,
+            Server::RUST_ANALYZER,
             &[],
         );
         assert!(matches!(outcome, Found::Missing(_)));
@@ -1388,7 +1388,7 @@ mod tests {
         // times in five minutes" after seven seconds of pointless backoff, with the one actionable
         // line buried at the end of it.
         let reason = start_failure_reason(
-            Server::RustAnalyzer,
+            Server::RUST_ANALYZER,
             "error: Unknown binary 'rust-analyzer' in official toolchain '1.92.0-x86_64-unknown-linux-gnu'.",
         );
         assert!(reason.contains("could not start"), "{reason}");
@@ -1405,14 +1405,14 @@ mod tests {
     fn an_ordinary_start_failure_is_reported_without_the_rustup_guess() {
         // The diagnosis is appended only when the evidence is there. Attaching it to every
         // failure would send users to fix a component that was never the problem.
-        let reason = start_failure_reason(Server::Gopls, "fork/exec: permission denied");
+        let reason = start_failure_reason(Server::GOPLS, "fork/exec: permission denied");
         assert!(reason.contains("permission denied"), "{reason}");
         assert!(!reason.contains("rustup"), "{reason}");
     }
 
     #[test]
     fn a_start_failure_with_no_stderr_still_says_something() {
-        let reason = start_failure_reason(Server::Gopls, "");
+        let reason = start_failure_reason(Server::GOPLS, "");
         assert!(reason.contains("gopls could not start"), "{reason}");
     }
 

@@ -52,6 +52,53 @@ cargo build --release -p cide-app
 children orphaned by a previous crash, and refuses to start when the saved workspace would
 open more than eight windows.
 
+### `./run.sh` is a separate instance
+
+cide is developed inside cide, so a build under test and the build being used for real work
+run side by side on one desktop. They used to be the same application as far as the disk was
+concerned — one `$XDG_STATE_HOME/cide/workspace.json`, one `$XDG_CONFIG_HOME/cide`, one
+`~/.local/share/dev.cide.ide`. Every write is atomic, so nothing corrupted; there is simply no
+merge, and the last instance to flush its layout won. Closing the one under test stamped its
+tree over the one the user was working in, and the two windows were indistinguishable in a
+task switcher besides.
+
+So `./run.sh` launches the **`dev` profile**. A profile is a name that changes where the app
+looks and nothing else:
+
+| | default | `dev` |
+| --- | --- | --- |
+| state | `$XDG_STATE_HOME/cide` | `$XDG_STATE_HOME/cide-dev` |
+| config | `$XDG_CONFIG_HOME/cide` | `$XDG_CONFIG_HOME/cide-dev` |
+| Tauri identifier | `dev.cide.ide` | `dev.cide.ide.dev` |
+| window title | `cide - claude` | `[DEV] cide - claude` |
+
+`cide_core::profile` is the whole rule and `CIDE_PROFILE` is how it is set. Two functions
+carry it: `persist::xdg_dir` takes the leaf, which is why *every* durable path moves together
+— the tree, the recents, the scratches, the notes, `cide-git`'s per-repo sidecars, installed
+extensions, `keymap.json` — and `cide-app` suffixes the bundle identifier before `.build()`,
+which is what moves the four directories Tauri owns rather than we do: the WebKit storage, the
+log, the plugin store and the remembered window geometry. Both are read at runtime, so one
+field is enough.
+
+It has to be an environment variable rather than anything derived from the Tauri config,
+because `apply_graphics_overrides` reads `workspace.json` off disk *before* the application
+exists (ADR 0006) — `state_dir()` has to answer with no `AppHandle` in scope. Children inherit
+it, so `CIDE_PROFILE=dev ./target/debug/cide-headless tree` inspects the dev workspace and a
+`claude` in a dev pane stays in the dev profile.
+
+`./run.sh --profile default` opts back out and shares the real instance's state. It launches
+with `env -u CIDE_PROFILE`, which is not belt-and-braces: this script is usually run from a
+shell inside a cide pane, and without the explicit unset the child would inherit the pane's
+`CIDE_PROFILE=dev` and the escape hatch would silently not work.
+
+**A profile starts factory-fresh.** Settings live inside `workspace.json`, so a new profile has
+no installed extensions, no global agent roles, and the default keymap and theme. That is the
+intent, and it is worth knowing before it reads as a bug.
+
+What profiles do *not* separate: `.cide/tasks.json`, agent worktrees and `cide/<agent>`
+branches are per-project, inside the repository. Two instances with the same project open still
+contend there.
+
 That last guard is not hypothetical. A workspace here accumulated 242 copies of one
 directory, was left in per-project window mode, and the restore path faithfully opened a
 window for every one of them — enough to make the machine unusable. Three things now stand in
@@ -752,6 +799,10 @@ it. A `json.dump` round-trip did precisely that during development — correct v
 lines of reflow, and a file list the guard had no objection to.
 
 ### Paths stay XDG, deliberately
+
+Under a profile the leaf is `cide-<profile>`; see *`./run.sh` is a separate instance*. It is
+decided in `persist::xdg_dir` and nowhere else, so the argument below is unaffected — there is
+still one answer per instance to the question "where is my `keymap.json`".
 
 `$XDG_STATE_HOME/cide/workspace.json` and `$XDG_CONFIG_HOME/cide/keymap.json` work on macOS —
 nothing fails — but they are not the platform convention, which is
@@ -3941,6 +3992,212 @@ carried out rather than recited; a local one opens a tab; a `#fragment` scrolls 
   assertions over the parser, the sync arithmetic, the layout rules and the fence tokenizer, and
   it drives the real grammars. What no check in this repository can speak to is the picture: the
   hover reveal, the type scale, whether the two halves land where a reader expects.
+
+## Extensions, and a marketplace that is a git repository (M22), and what is not done
+
+Four things are contributable from outside the tree: **languages**, **language servers**, **UI
+panels** — a button on the activity rail, or a tab in the bottom tool window — and **logic over
+open files**. A *marketplace* is a git repository listing extensions; cide clones it, reads its
+index, and installs one at a pinned commit.
+
+`/home/…/work/cide-marketplace` is the first, and it ships two extensions: **SQL** and **YAML**.
+Both supersede a grammar cide already has, which is the point rather than a coincidence — see
+*What the two demo extensions are for*, below.
+
+### Extension code runs out of the window's realm (ADR 0010)
+
+The obvious implementation is what every comparable product does: dynamically import an
+extension's module into the window and hand it React and the DOM. It loses twice.
+
+It loses on ADR 0001, which is not a preference but the shape of this application: one webview per
+OS window, **one JavaScript main thread serving every pane**, and PTY bytes coalesced in Rust to
+≥8 KiB or 8 ms specifically so that thread stays free. Extension code there competes with xterm
+for it, and the failure is not a slow panel — it is a terminal that stutters while somebody else's
+loop runs.
+
+It loses again on the seam. `ui/src/ipc/client.ts` is the only file allowed to import
+`@tauri-apps/api`; an extension in the same realm reaches `window.__TAURI__` directly, so a
+capability system would be a convention rather than a mechanism.
+
+So: **a dedicated Web Worker per extension**, with no DOM, no Tauri and no `invoke` — genuinely
+absent, because a worker is a different realm. Everything it can do is a fixed table of requests,
+and every one is checked against the granted capabilities in `ui/src/ext/host.ts`, on the main
+thread, where the extension cannot reach the check. That last clause is the whole design.
+
+**A panel is a view model, not a component.** An extension posts a tree, a list, a table or some
+prose, and `ui/src/ext/ExtPanelView.tsx` draws it with cide's own components and tokens — so
+`check:theme` and `check:ui-scale` are true of a contributed panel whose author has never heard of
+either, and a broken extension cannot unmount the React root. The cost is stated rather than
+hidden: an extension cannot draw something cide has no component for. A chart, a canvas, a custom
+gesture: not possible, and not by omission.
+
+### The language registry stopped being closed, and that is most of the work
+
+`ui/src/editor/languages.ts` was a closed `LanguageId` union feeding four parallel tables — a
+loader map, an extension map, an exhaustive `Record<LanguageId, FoldSpec>` and a `SCRATCH_TYPES`
+array. Adding a language cost five TypeScript edits and adding a *server* for one cost five more
+in Rust.
+
+Now there is one registry with two sources. The tables come from **`cide_ipc::lang::builtins()`**,
+generated into `ui/src/editor/builtinLanguages.ts` by `cargo xtask codegen`, and an extension's
+languages merge into them. That is `cide-core::commands`' argument for commands and keys being one
+table, applied one floor down: two tables would let a language be highlightable but unfoldable, or
+foldable under a name the status bar does not use, and both would drift in silence.
+
+What did **not** move is the tokenizer. A builtin's grammar contains a *function* — Rust's
+lifetimes, Go's rune literals, Markdown's headings — and no JSON can express one, so it stays in
+`ui/src/editor/languages/<id>.ts` behind its own dynamic import. A contributed grammar gets
+`rules` instead: a regex, a tag name, and whether it is tried only at the head of a line. That is
+deliberately less than a hook and deliberately enough for the shape of hook that turns up over and
+over.
+
+**`at: "lineStart"` is not a refinement.** `data.ts` records the measurement that made it a field:
+YAML's key pattern scans to the end of the line before its lookahead can fail, so tried once per
+token a 200,000-character line took 4.8 s against 20 ms at the line head. A manifest author will
+not know that, which is exactly why it is a field with two values rather than a comment asking
+them to be careful.
+
+### `cide_lsp::Server` stopped being an enum, and one line was the reason
+
+`cide_app::lsp::server_for` derived a language server from `cide_lang::Lang`. `Lang` is closed
+because every variant costs a statically linked C parser table — so *"a language cide can
+outline"* and *"a language cide can run a server for"* were forced to be the same set, and a YAML
+server would have needed a tree-sitter grammar for YAML. That is an absurd price for a `--stdio`
+flag.
+
+`Server` is now a `Copy` index into a registry installed at startup: the two builtins plus
+whatever the enabled extensions declare. Staying `Copy` and `Ord` is what kept the change to a
+rename at the ninety-odd call sites that hold one in a map key or compare two. `server_for` asks
+the language registry for a `languageId` and the server registry for whoever claims it.
+
+The field that turned out to matter most is **`args`**, which did not exist: `server.rs` built
+`Command::new(binary)` and spawned it, and both builtins happen to speak LSP on stdio with no
+flags, so nothing noticed. `yaml-language-server` needs `--stdio` and says so in its own README.
+
+`DiagnosticSourceId` stopped being an enum for the same reason and keeps its four wire names
+unchanged, so every stored source filter still works.
+
+### What the two demo extensions are for
+
+cide already highlights `.sql` and `.yaml`. An extension that only added a language cide had never
+heard of would prove the easy half of the contribution path and leave the interesting half — **a
+builtin losing to a contribution** — untested, which is indistinguishable from a broken extension
+host until somebody notices nothing changed on screen.
+
+So both supersede a builtin, every displacement is recorded on the wire (`LanguageBinding::supersedes`),
+and the Extensions panel names the source that won. Disabling one puts the builtin back.
+
+Between them they exercise every contribution kind: a declarative language, a declarative language
+server *with arguments*, worker logic over open files, a left-sidebar panel and a bottom-panel
+tab. YAML's grammar is a rule-for-rule translation of the builtin's `hook`, which is the check
+that the rule language is sufficient rather than merely plausible.
+
+### The panel is a catalog, and an extension has a page
+
+The Extensions panel has a search box and seven filter chips — **All, Installed, Enabled,
+Disabled, Updates, Not installed, Problems** — each one a question somebody actually asks about an
+editor's extension list, and each one press. They are not a matrix of toggles: combining two
+constraints is what the search box is for, because a filter matrix is a control nobody uses
+correctly on the first try.
+
+Each chip carries its count **over the unfiltered set**, and that is the whole reason the counts
+are computed before the query rather than after: a chip reading `0` only because some *other* chip
+is selected would be a control that lies about what pressing it does. No chip is ever disabled,
+including at zero — a chip you cannot press is a count you cannot confirm, and pressing an empty
+one shows the sentence that explains it.
+
+A search that matches nothing says so, naming the text and — when both are narrowing — the filter
+too, because *"no results"* under two constraints is ambiguous about which one to relax. What the
+query does **not** touch is the Languages and Problems readouts: those are facts about the whole
+registry, and hiding *"why is my `.sql` coloured like that"* while somebody is searching would take
+the answer away exactly when they are looking for it.
+
+**Clicking an extension's name opens its page** — a workspace tab with its README, its version, the
+permissions it asks for, and Install/Enable/Remove. A tab kind and not a file tab on the
+`README.md`, because that file is not in the project: an installed extension lives under
+`$XDG_STATE_HOME` and a listed one lives in a marketplace clone, both outside every root, which is
+exactly what `cmd::file`'s refusals exist to keep out of an editor. It also has to draw more than a
+file — somebody reading a README is deciding whether to install, so the button is on the same page
+as the prose.
+
+The README goes through cide's own `parseMarkdown`/`MarkdownPreview`, which render no raw HTML at
+all, so a third party's markdown is prose, links and code and nothing in it becomes markup. Links
+go through `ext_open_link`, which accepts `http` and `https` and refuses everything else **in
+Rust** — a scheme check that lived in the component rendering the link would be one `invoke` away
+from being bypassed, which is the argument `cmd::settings`' clamps already make about a number
+input.
+
+### A third extension, because a demo inside a tool is a tool with a demo in it
+
+`showcase` contributes no language and no server. What it contributes is one of every `ViewBody`
+kind in a sidebar gallery, a bottom panel that sends **one of every host request** and prints what
+came back — refusals included, verbatim — and a README written as a reference. It asks for all five
+capabilities so that what each one answers can be shown rather than described.
+
+It exists because SQL and YAML are *tools*, and demonstrating what a panel can draw inside one of
+them would have made it a tool with a demo in it. It is also the honest place to put the two
+mistakes worth warning about: doing work while your panel is hidden, and assuming a request
+succeeded.
+
+### Trust is a list the user was shown, not a list the manifest asked for
+
+`extensions.json` records `granted` — the capabilities the install sheet displayed — and an
+install whose manifest asks for more is **refused, not upgraded**. Without that a marketplace
+could add `process:spawn` in a commit and every machine that ran a refresh would grant it
+silently. The check runs again on every load, because that file is one a user may hand-edit.
+
+The consent line is drawn beside the button and not behind one more click, in words rather than
+capability strings: `process:spawn` tells a user nothing, *"run programs on your machine"* tells
+them what they are deciding.
+
+An unknown capability **greys the extension** rather than being ignored — a restriction cide
+cannot name is one it cannot enforce, and running it anyway would run it under less restriction
+than its author declared. An unknown *key* only warns. That asymmetry is `cide-agents`', and so is
+everything else about how a bad manifest is handled: one broken manifest never stops the others
+loading, a defect greys a row rather than hiding it, and every refusal carries a path and, where
+it has one, a line.
+
+### Not done
+
+- **Two bugs found the first time it ran in a real window, and both are fixed.** A worker's script
+  URL must be **same-origin** — no header relaxes that, and it is the rule that makes `new Worker`
+  different from `importScripts` — so `new Worker('cide-ext://…')` from a `tauri://localhost` page
+  was refused at construction. Workers are now built from a same-origin `blob:` shim whose only
+  statement imports the real module, which keeps relative imports inside an extension resolving
+  against `cide-ext://`. The second bug was the first one's symptom: a module worker that fails to
+  *load* fires a plain `Event` with no `message`, and the panel printed `YAML: undefined`. The
+  error path now names the URL when there is nothing else to name. A third, found while reading:
+  a worker started *after* a file was open was never told about it, so its panel sat on "open a
+  .yaml file" over a `.yaml` file until somebody typed — which is what enabling an extension looks
+  like. A new worker is now seeded with the active editor.
+- **None of it has been confirmed on screen.** Every gate below passes and the whole install road
+  is exercised end to end by `cargo test -p cide-ext` against the real sibling marketplace — but
+  that test drives `ExtStore`, not a window. Nobody has yet watched a worker start, a rail button
+  appear, or a `.sql` file change colour. Same reason as M14, M15 and M16: `./run.sh` stops the
+  running instance.
+- **`sqls` and `yaml-language-server` have not been run.** The manifests name them, the registry
+  starts them, and `discover::find` refuses each independently — but neither binary is installed
+  on this machine, so what has been checked is that they are *registered with the right arguments*
+  and not that either one answers.
+- **Enabling a language extension does not recolour an open editor.** The fold table has to be
+  present at first paint (`foldSpecFor` runs inside the mount dispatch and cannot await), so the
+  language registry rides `Bootstrap`. A panel appears immediately; a buffer follows on its next
+  mount. The panel says so rather than pretending otherwise.
+- **There is no update-all, and no version constraint.** An extension declares a `version` string
+  that is compared for equality. A marketplace that ships a breaking change to a cide that cannot
+  run it is caught by `schema`, and nothing finer exists.
+- **Enabling an extension does not start its language server in an already-open project.** The
+  registry is updated immediately and a project picks up the new set when its
+  `ProjectDiagnostics` is next created — so a newly installed server reaches a project that is
+  reopened, and not one that is already open. The alternative was stopping every server on every
+  registry change, which costs a full rust-analyzer re-index — 2–8 GB and thirty seconds — because
+  somebody toggled a YAML extension.
+- **A worker cannot `fetch`.** `connect-src` deliberately omits `cide-ext:`, so an extension that
+  needs data ships it as a module it imports. That is a real limit and it is the conservative
+  direction to have picked first.
+- **No extension pane.** A `PaneKind` is a closed Rust enum in `workspace.json` and adding one
+  would put a derived fact in the persisted tree — the argument `PaneBody.tsx` already makes for
+  refusing `PaneKind::Image`. Contributions get a sidebar panel and a tool-window tab.
 
 ## Updating a project, and resolving a conflict (M20), and what is not done
 

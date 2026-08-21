@@ -195,9 +195,15 @@ fn remembered(kind: &TabKind) -> bool {
         // commit left it — so reopening it costs one `git_file_at_revision` and lands on exactly
         // the same bytes, because a commit is immutable. That immutability is what makes it
         // safer to reopen than a working-tree diff, which the arm above already remembers.
+        // An extension's page is remembered like a revision tab and for its reason: it is a
+        // *query* — one extension's README and what it contributes — and reopening it costs one
+        // read of a file that only changes when the user updates the extension. The one way it
+        // can come back stale is that the extension was uninstalled in between, and the page draws
+        // that state honestly rather than as an empty tab.
         TabKind::ClaudeFull { .. }
         | TabKind::File { .. }
         | TabKind::Revision { .. }
+        | TabKind::Extension { .. }
         | TabKind::Settings { .. } => true,
     }
 }

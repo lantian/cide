@@ -674,6 +674,21 @@ function viewFor(kind: TabKind): TabView {
         audit: undefined,
       }
 
+    case 'extension':
+      return {
+        // The Settings shape, because both are pages *about* cide rather than documents in the
+        // project — and a fourth shape for one more non-document tab would be a shape nobody can
+        // name. The caption carries the difference.
+        shape: styles.shapeSettings,
+        // `name` is stored on the tab kind and not looked up, so a restored tab has its caption on
+        // the frame it is restored in. `TabKind::Extension` says why at length.
+        body: <span>{kind.name}</span>,
+        closable: true,
+        dirty: false,
+        hint: `${kind.marketplace}.${kind.extension}`,
+        audit: undefined,
+      }
+
     default:
       return unhandled(kind)
   }

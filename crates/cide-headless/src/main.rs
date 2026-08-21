@@ -42,7 +42,8 @@ usage:
   cide-headless commands                  list the command registry, grouped
   cide-headless keymap                    list resolved bindings with their layer
   cide-headless tasks <root>              render a project's .cide/tasks.json
-  cide-headless agents <root>             render its subagent roles and config";
+  cide-headless agents <root>             render its subagent roles and config
+  cide-headless ext                       render marketplaces, extensions and contributions";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -60,6 +61,7 @@ fn main() {
         "keymap" => keymap(),
         "tasks" => tasks(rest),
         "agents" => agents(rest),
+        "ext" => ext(),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         other => {
             eprintln!("cide-headless: unknown subcommand `{other}`");
@@ -929,6 +931,157 @@ fn layer_name(layer: KeymapLayer) -> &'static str {
         KeymapLayer::Default => "default",
         KeymapLayer::Platform => "platform",
         KeymapLayer::User => "user",
+    }
+}
+
+/// Renders the extension registry: marketplaces, what is installed, and what it all resolves to.
+///
+/// The one subcommand here that takes no root, because extensions are not a fact about a project —
+/// `cide_ext::config`'s header argues that at length. It reads the user's real
+/// `$XDG_CONFIG_HOME/cide/extensions.json`, their real clones and their real installed trees, so
+/// what it prints is what a window would draw.
+///
+/// It is also this milestone's half of the no-tauri proof: `ExtStore::new` is the whole read path,
+/// and an `AppHandle` reached for anywhere under it stops this binary compiling.
+fn ext() {
+    let store = cide_ext::ExtStore::new();
+    emit(&render_extensions(&store.snapshot()));
+}
+
+fn render_extensions(snapshot: &cide_ipc::ext::ExtensionSnapshot) -> String {
+    let mut out = format!("rev {}\n", snapshot.rev);
+
+    out.push_str("\nmarketplaces\n");
+    if snapshot.marketplaces.is_empty() {
+        // Not "none" on its own: a fresh install has no marketplaces and that is the ordinary
+        // state, not a fault, so the line says what to do about it rather than reporting a zero.
+        out.push_str("  none connected — add one in Settings ▸ Extensions, or by path.\n");
+    } else {
+        let rows: Vec<Row> = snapshot
+            .marketplaces
+            .iter()
+            .map(|market| Row {
+                label: market.id.to_string(),
+                cells: vec![
+                    match &market.state {
+                        cide_ipc::ext::MarketplaceState::Ready { head, .. } => {
+                            head.chars().take(8).collect()
+                        }
+                        cide_ipc::ext::MarketplaceState::Working { what } => what.clone(),
+                        cide_ipc::ext::MarketplaceState::Missing => "not cloned".into(),
+                        cide_ipc::ext::MarketplaceState::Failed { error } => error.clone(),
+                    },
+                    if market.authenticated {
+                        "remote".into()
+                    } else {
+                        "local".into()
+                    },
+                    format!("{} extension(s)", market.entries.len()),
+                    market.source.clone(),
+                ],
+            })
+            .collect();
+        out.push_str(&render_rows(&rows));
+    }
+
+    out.push_str("\ninstalled\n");
+    if snapshot.extensions.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        let rows: Vec<Row> = snapshot
+            .extensions
+            .iter()
+            .map(|ext| Row {
+                label: ext.id.to_string(),
+                cells: vec![
+                    ext.version.clone(),
+                    if ext.enabled { "on" } else { "off" }.into(),
+                    // The greyed reason, which is the whole point of printing this without a
+                    // window: an extension that loaded and cannot run says so in a sentence, and
+                    // until this existed nothing outside a running window could show it.
+                    ext.unavailable.clone().unwrap_or_default(),
+                ],
+            })
+            .collect();
+        out.push_str(&render_rows(&rows));
+    }
+
+    out.push_str("\nlanguages\n");
+    let rows: Vec<Row> = snapshot
+        .resolved
+        .languages
+        .iter()
+        .map(|binding| Row {
+            label: binding.def.id.clone(),
+            cells: vec![
+                source_name(&binding.source),
+                binding
+                    .def
+                    .extensions
+                    .iter()
+                    .map(|e| format!(".{}", e.ext))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                // What it displaced, which is the answer to "why is my .sql coloured like that".
+                binding
+                    .supersedes
+                    .as_ref()
+                    .map(|prior| format!("was {}", source_name(prior)))
+                    .unwrap_or_default(),
+            ],
+        })
+        .collect();
+    out.push_str(&render_rows(&rows));
+
+    out.push_str("\nlanguage servers\n");
+    let rows: Vec<Row> = snapshot
+        .resolved
+        .servers
+        .iter()
+        .map(|binding| Row {
+            label: binding.def.binary.clone(),
+            cells: vec![
+                source_name(&binding.source),
+                binding.def.language_ids.join(" "),
+                binding.def.args.join(" "),
+            ],
+        })
+        .collect();
+    out.push_str(&render_rows(&rows));
+
+    let problems: Vec<&cide_ipc::ext::ExtProblem> = snapshot
+        .problems
+        .iter()
+        .chain(snapshot.resolved.conflicts.iter())
+        .chain(snapshot.marketplaces.iter().flat_map(|m| m.problems.iter()))
+        .chain(snapshot.extensions.iter().flat_map(|e| e.problems.iter()))
+        .collect();
+    if !problems.is_empty() {
+        out.push_str("\nproblems\n");
+        for problem in problems {
+            // Path and line, always, and in the form an editor's Go to line understands. That is
+            // `cide-agents`' rule for a malformed definition and it is the whole reason a refusal
+            // is worth printing rather than counting.
+            let at = problem
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {:?} {}{}: {}\n",
+                problem.severity,
+                problem.path.display(),
+                at,
+                problem.message
+            ));
+        }
+    }
+    out
+}
+
+fn source_name(source: &cide_ipc::ext::ContributionSource) -> String {
+    match source {
+        cide_ipc::ext::ContributionSource::Builtin => "builtin".into(),
+        cide_ipc::ext::ContributionSource::Extension { extension } => extension.to_string(),
     }
 }
 

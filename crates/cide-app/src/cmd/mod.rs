@@ -59,3 +59,12 @@ pub mod agents;
 // machinery that has to be managed, because a flag nobody holds is a flag nobody can set.
 // `git_log` itself stays beside its siblings in `git` and borrows a flag from here.
 pub mod log;
+
+// --- M22: extensions and their marketplaces ---
+// The one global registry in this crate. Its own module rather than rows in `settings` for the
+// reason `tasks` is separate from `project`: nothing here touches the workspace tree or a
+// project's settings, and the only thing it shares with either is that both are things a user
+// configures. It is also the only command module whose handlers can take seconds — a clone over
+// a network — which is why every one of them is `async` and hands its work to `spawn_blocking`
+// rather than being a synchronous handler Tauri would poll on the GTK loop.
+pub mod ext;

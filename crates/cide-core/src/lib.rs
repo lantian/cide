@@ -30,6 +30,7 @@ pub mod keymap;
 pub mod layout;
 pub mod notes;
 pub mod persist;
+pub mod profile;
 pub mod proxy;
 pub mod scratch;
 pub mod toolchain;

@@ -1,0 +1,149 @@
+/*
+ * One extension's page. (M22)
+ *
+ * Renders over a tab's pane tree, exactly as the Settings tab does, so it owns the whole tab body
+ * rather than a fixed width — this is a document to read, not a column beside one.
+ *
+ * The prose is capped at a measure rather than filling the window: a README at 1600px is a line
+ * nobody's eye can track back from, and every other long-form surface in this app (the merge
+ * explainer, the markdown preview) makes the same call.
+ *
+ * Every size is a rung of the `--fs-ui-*` ladder and every colour is a token.
+ */
+
+.tab {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.header {
+  flex: none;
+  padding: 14px 20px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+}
+
+.titleRow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--fs-ui-15);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.version {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.source {
+  margin-left: auto;
+  font-size: var(--fs-ui-10);
+  color: var(--faint);
+}
+
+.description {
+  margin: 4px 0 0;
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--dim);
+  max-width: 72ch;
+}
+
+.capabilities {
+  margin: 8px 0 0;
+  padding: 0 0 0 16px;
+  list-style: disc;
+  max-width: 72ch;
+}
+
+.capability {
+  font-size: var(--fs-ui-11);
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.primary,
+.action {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--chrome);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  padding: 3px 12px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.primary {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.primary:hover:not(:disabled),
+.action:hover:not(:disabled) {
+  background: var(--chrome-hi);
+}
+
+.primary:disabled,
+.action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.primary:focus-visible,
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.problem {
+  margin: 8px 0 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  color: var(--red);
+  max-width: 72ch;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.notice {
+  margin: 0;
+  padding: 20px;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+/*
+ * The rendered README.
+ *
+ * `MarkdownPreview.module.css` styles everything inside; this only places it. The measure cap and
+ * the padding are here so the preview component stays the same whether it is drawn in a pane, in a
+ * split, or on this page.
+ */
+.markdown {
+  padding: 16px 20px 40px;
+  max-width: 84ch;
+}

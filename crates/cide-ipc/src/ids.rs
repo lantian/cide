@@ -3,7 +3,8 @@
 //! Most of these are UUID-backed and serialise as plain strings, so the TypeScript side sees
 //! `type PaneId = string` — distinct nominal types in Rust, cheap on the wire.
 //!
-//! Three are **not** uuid-backed — [`WindowLabel`], [`AgentId`] and [`TaskId`] — and each says
+//! Five are **not** uuid-backed — [`WindowLabel`], [`AgentId`], [`TaskId`], [`MarketplaceId`]
+//! and [`ExtensionId`] — and each says
 //! at length why. The rule they share, and the one to apply to the next id added here: an id a
 //! *person* writes, or that a *model* has to quote back verbatim, cannot be a uuid. Everything
 //! cide mints for itself can and should be.
@@ -346,6 +347,94 @@ impl AsRef<str> for TaskId {
 }
 
 impl From<String> for TaskId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// A connected marketplace — a git repository that lists extensions. (M22)
+///
+/// A string the *user* chooses, not a uuid, and for the same reason [`AgentId`] is one: it is
+/// the directory name the clone lands in (`$XDG_STATE_HOME/cide/marketplaces/<id>/`), it is what
+/// `extensions.json` keys its entries by, and it is what a person types to name one marketplace
+/// apart from another in a sentence. A uuid is unreadable in all three positions, and the middle
+/// one is decisive — a config file the user is expected to hand-edit cannot key its entries by a
+/// value cide invented after the fact.
+///
+/// Derived from the repository name on connect (`cide-marketplace` → `cide-marketplace`) and
+/// disambiguated with a numeric suffix when that is taken, so the ordinary case needs no
+/// decision from the user at all.
+///
+/// Deliberately not validated here, exactly as [`AgentId`] is not. This crate is the wire shape;
+/// `cide-ext` is where a name is checked against the character set that makes it safe to
+/// `Path::join`, because that is the layer that knows the path to name in the refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(export, type = "string")]
+pub struct MarketplaceId(pub String);
+
+impl MarketplaceId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MarketplaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for MarketplaceId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for MarketplaceId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// One extension, as its manifest names itself — `sql`, `yaml`. (M22)
+///
+/// A string for [`AgentId`]'s reason and one more of its own. The author writes it in
+/// `cide-extension.json`; it is the second segment of the install path; it is the prefix of every
+/// command the extension contributes (`ext.sql.showStatements`), and **command ids are API** —
+/// a user's `keymap.json` names them, so an id cide minted per install would change under a
+/// reinstall and silently orphan every binding pointing at it.
+///
+/// Not globally unique, and not pretending to be: two marketplaces may each ship an extension
+/// called `sql`. Identity is the pair (marketplace, extension), which is why nothing here tries
+/// to make the string alone carry it — `cide-ext` reports the collision and names both manifests
+/// rather than inventing a winner.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(export, type = "string")]
+pub struct ExtensionId(pub String);
+
+impl ExtensionId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExtensionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ExtensionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ExtensionId {
     fn from(s: String) -> Self {
         Self(s)
     }

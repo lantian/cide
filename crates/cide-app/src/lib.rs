@@ -15,6 +15,13 @@ pub mod closed_tabs;
 pub mod cmd;
 pub mod edit_wait;
 pub mod emit;
+/// The `cide-ext://` scheme: an installed extension's own files, path-jailed and read-only.
+pub mod ext_assets;
+/// The extension registry: marketplaces, installs, and the contribution set they resolve to.
+///
+/// One store and not one per project — an extension is a tool the user chose, not a fact about a
+/// repository. `ext_state.rs`'s header argues it, and `cide_ext::config`'s argues the file layout.
+pub mod ext_state;
 // M8: one file index, picker and watcher per project.
 pub mod files;
 pub mod graphics;
@@ -182,7 +189,35 @@ pub fn run() {
     // still reporting PASS. A diagnostic run starts from the stated geometry instead.
     let restore_geometry = std::env::var_os("CIDE_AUDIT").is_none();
 
+    // Everything Tauri stores per application, moved onto the profile.
+    //
+    // `cide-core::persist` already moved every path this workspace computes for itself, but
+    // four locations belong to Tauri and are resolved from the bundle identifier rather than
+    // from us: the WebKit data directory (Tauri *forces* it to `LocalData/<identifier>` on
+    // Linux, so localstorage, the cache and the cookie jar all live under it),
+    // `tauri-plugin-log`'s output, `tauri-plugin-store`'s file, and
+    // `tauri-plugin-window-state`'s geometry. Two instances sharing them means two processes
+    // appending to one log and fighting over one remembered window size.
+    //
+    // Every one of those reads `config.identifier` at **runtime**, from this context — so
+    // suffixing it here is the whole fix, and it is why the plugins registered below are not
+    // a problem despite being registered first: each resolves its directory inside a `setup`
+    // hook, which needs an `AppHandle` and therefore does not run until `build` below.
+    //
+    // `tauri.conf.json` is untouched, so packaging still asserts the shipped identifier.
+    let mut context = tauri::generate_context!();
+    if cide_core::profile::active().is_some() {
+        let identifier = cide_core::profile::identifier(&context.config().identifier);
+        tracing::info!(%identifier, "running under a profile");
+        context.config_mut().identifier = identifier;
+    }
+
     let mut builder = tauri::Builder::default()
+        // `cide-ext://<marketplace>.<extension>/<path>`. Registered here rather than in `setup`
+        // because a scheme handler has to exist before the first webview is created — a window
+        // that opened first would have a renderer for which the scheme does not resolve, and the
+        // failure shows as a worker that never loads rather than as anything about registration.
+        .register_uri_scheme_protocol(cide_ext::assets::SCHEME, ext_assets::respond)
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -280,6 +315,18 @@ pub fn run() {
         // plainer reason the two above are: `tab_close` pushes to it, and a command that cannot
         // resolve its state fails rather than merely losing a record.
         .manage(closed_tabs::ClosedTabs::default())
+        // M22. Loaded here rather than in `setup` for the strongest version of the reason the
+        // workspace is: `app_get_bootstrap` reads the resolved language table out of it, and that
+        // table decides how the first editor folds. A registry that resolved to nothing for the
+        // first few hundred milliseconds would mean every restored tab mounting with no fold spec
+        // — precisely the failure `FoldSpecDto`'s note describes.
+        //
+        // Constructing it reads `extensions.json`, every marketplace clone and every installed
+        // manifest, and publishes the result into `cide-lsp`'s server registry. That is disk work
+        // on the main thread before the first window, and it is deliberate: it is bounded by the
+        // number of installed extensions, and doing it lazily would mean the first window's
+        // bootstrap raced it.
+        .manage(ext_state::ExtState::new())
         .invoke_handler(tauri::generate_handler![
             cmd::app::app_quit_requested,
             cmd::app::app_ready,
@@ -502,6 +549,19 @@ pub fn run() {
             cmd::agents::agents_draft,
             cmd::agents::agents_save,
             cmd::agents::agents_delete,
+            // --- M22: extensions and their marketplaces ---
+            cmd::ext::ext_snapshot,
+            cmd::ext::ext_reload,
+            cmd::ext::ext_connect,
+            cmd::ext::ext_disconnect,
+            cmd::ext::ext_refresh,
+            cmd::ext::ext_install,
+            cmd::ext::ext_uninstall,
+            cmd::ext::ext_set_enabled,
+            cmd::ext::ext_publish_diagnostics,
+            cmd::ext::ext_page,
+            cmd::ext::tab_open_extension,
+            cmd::ext::ext_open_link,
         ])
         .on_window_event(|window, event| {
             match event {
@@ -727,7 +787,7 @@ pub fn run() {
             restore_windows(app.handle())?;
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("failed to build the cide application")
         .run(|app, event| {
             match event {

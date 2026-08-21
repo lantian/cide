@@ -3,9 +3,23 @@
 /**
  * Which analyser produced something.
  *
- * An enum rather than a bare string on the *report*, so the settings screen and the store
- * agree on the set. [`Diagnostic::source`] stays a string because it carries the producer's own
- * name (`clippy` arrives inside rust-analyzer's stream) and an unrecognised one must survive to
- * the panel rather than be dropped.
+ * # Why this stopped being an enum in M22
+ *
+ * It was four unit variants — `rustAnalyzer`, `gopls`, `treeSitter`, `claude` — and the argument
+ * for that was good: a closed set on the *report* is what lets the settings screen and the store
+ * agree on which toggles exist. [`Diagnostic::source`] stayed a string, because it carries the
+ * producer's own name (`clippy` arrives inside rust-analyzer's stream) and an unrecognised one
+ * must survive to the panel rather than be dropped.
+ *
+ * The set stopped being closed when a language server could arrive from a manifest. There is no
+ * variant for `yaml-language-server` and there cannot be one, because cide is not compiled
+ * knowing about it — and the alternative, folding every contributed server into a single
+ * `Extension` variant, would put four servers behind one toggle and one *Restart* button, which
+ * is the one thing this type exists to prevent.
+ *
+ * So it is a newtype over the string the enum already serialised as. The four names below are
+ * unchanged on the wire, every existing `extensions.json`, settings file and stored filter keeps
+ * working, and a contributed server is its own binary name — which is also what the *Restart*
+ * button needs to name and what `Reported by …` should say.
  */
-export type DiagnosticSourceId = "rustAnalyzer" | "gopls" | "treeSitter" | "claude";
+export type DiagnosticSourceId = string;

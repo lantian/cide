@@ -19,6 +19,8 @@
     "check:detached": "node scripts/check-detached.mjs",
     "check:diff": "node scripts/check-diff-selection.mjs",
     "check:diff-render": "node scripts/check-diff-render.mjs",
+    "check:ext": "node scripts/check-ext.mjs",
+    "check:ext-render": "node scripts/check-ext-render.mjs",
     "check:editor": "node scripts/check-editor.mjs",
     "check:exit": "node scripts/check-exit-marker.mjs",
     "check:fonts": "node scripts/check-fonts.mjs",

@@ -459,46 +459,53 @@ try {
 
   // The reason there is a width *per panel* at all: one panel's drag must not move another's.
   eq(
-    withPanel({ files: 252, git: 420, agents: 320 }, 'files', 300),
-    { files: 300, git: 420, agents: 320 },
+    withPanel({ files: 252, git: 420, agents: 320, ext: 252 }, 'files', 300),
+    { files: 300, git: 420, agents: 320, ext: 252 },
     'resizing the explorer leaves the other widths where the user left them',
   )
   eq(
-    withPanel({ files: 252, git: 420, agents: 320 }, 'git', 500),
-    { files: 252, git: 500, agents: 320 },
+    withPanel({ files: 252, git: 420, agents: 320, ext: 252 }, 'git', 500),
+    { files: 252, git: 500, agents: 320, ext: 252 },
     'and resizing the git panel leaves the explorer alone',
   )
   eq(
-    withPanel({ files: 252, git: 420, agents: 320 }, 'agents', 500),
-    { files: 252, git: 420, agents: 500 },
+    withPanel({ files: 252, git: 420, agents: 320, ext: 252 }, 'agents', 500),
+    { files: 252, git: 420, agents: 500, ext: 252 },
     'and so does resizing Agents — the M18 pair has its own number, not the explorer\'s',
   )
   // The clamp is shared, deliberately: `SidebarSettings::clamped()` in Rust applies one band
   // to every field, so a third width with a band of its own would be a width Rust silently
   // moved on the next snapshot.
   eq(
-    withPanel({ files: 252, git: 420, agents: 320 }, 'agents', 9000),
-    { files: 252, git: 420, agents: SIDEBAR_MAX },
+    withPanel({ files: 252, git: 420, agents: 320, ext: 252 }, 'agents', 9000),
+    { files: 252, git: 420, agents: SIDEBAR_MAX, ext: 252 },
     'the agents width clamps to the same ceiling as the other two',
   )
   eq(
-    withPanel({ files: 252, git: 420, agents: 320 }, 'agents', 10),
-    { files: 252, git: 420, agents: SIDEBAR_MIN },
+    withPanel({ files: 252, git: 420, agents: 320, ext: 252 }, 'agents', 10),
+    { files: 252, git: 420, agents: SIDEBAR_MIN, ext: 252 },
     'and to the same floor',
   )
 
   // --- the persistence round trip --------------------------------------------------------
 
-  const widths = { files: 300, git: 500, agents: 360 }
+  const widths = { files: 300, git: 500, agents: 360, ext: 280 }
   eq(decodeWidths(encodeWidths(widths)), widths, 'a width survives encode → decode unchanged')
   eq(
-    decodeWidths(encodeWidths({ files: SIDEBAR_MIN, git: SIDEBAR_MAX, agents: SIDEBAR_MAX })),
-    { files: SIDEBAR_MIN, git: SIDEBAR_MAX, agents: SIDEBAR_MAX },
+    decodeWidths(
+      encodeWidths({
+        files: SIDEBAR_MIN,
+        git: SIDEBAR_MAX,
+        agents: SIDEBAR_MAX,
+        ext: SIDEBAR_MIN,
+      }),
+    ),
+    { files: SIDEBAR_MIN, git: SIDEBAR_MAX, agents: SIDEBAR_MAX, ext: SIDEBAR_MIN },
     'and so do both ends of the band — a clamp on the way back must not move a legal value',
   )
   eq(
     JSON.parse(encodeWidths(widths)),
-    { filesWidth: 300, gitWidth: 500, agentsWidth: 360 },
+    { filesWidth: 300, gitWidth: 500, agentsWidth: 360, extWidth: 280 },
     'the cache is written under the same wire names Rust stores, so the two can be compared by eye',
   )
 
@@ -508,18 +515,18 @@ try {
   eq(decodeWidths('[1,2]'), SIDEBAR_DEFAULT, 'nor must a value of the wrong shape')
   eq(decodeWidths('"252"'), SIDEBAR_DEFAULT, 'nor a bare string')
   eq(
-    decodeWidths('{"filesWidth":"300","gitWidth":500,"agentsWidth":360}'),
-    { files: SIDEBAR_DEFAULT.files, git: 500, agents: 360 },
+    decodeWidths('{"filesWidth":"300","gitWidth":500,"agentsWidth":360,"extWidth":280}'),
+    { files: SIDEBAR_DEFAULT.files, git: 500, agents: 360, ext: 280 },
     'a field of the wrong type falls back on its own without taking the others with it',
   )
   eq(
-    decodeWidths('{"gitWidth":500,"agentsWidth":360}'),
-    { files: SIDEBAR_DEFAULT.files, git: 500, agents: 360 },
+    decodeWidths('{"gitWidth":500,"agentsWidth":360,"extWidth":280}'),
+    { files: SIDEBAR_DEFAULT.files, git: 500, agents: 360, ext: 280 },
     'a missing field takes its default — the shape a cache written by an older build has',
   )
   eq(
-    decodeWidths('{"filesWidth":9000,"gitWidth":1,"agentsWidth":9000}'),
-    { files: SIDEBAR_MAX, git: SIDEBAR_MIN, agents: SIDEBAR_MAX },
+    decodeWidths('{"filesWidth":9000,"gitWidth":1,"agentsWidth":9000,"extWidth":9000}'),
+    { files: SIDEBAR_MAX, git: SIDEBAR_MIN, agents: SIDEBAR_MAX, ext: SIDEBAR_MAX },
     'a cache edited by hand is clamped rather than trusted, and by the same band for every panel',
   )
 
@@ -537,8 +544,8 @@ try {
   const preM18 = '{"filesWidth":300,"gitWidth":500}'
   eq(
     decodeWidths(preM18),
-    { files: 300, git: 500, agents: SIDEBAR_DEFAULT.agents },
-    'a cache written before the agents width existed keeps its two widths and defaults the third',
+    { files: 300, git: 500, agents: SIDEBAR_DEFAULT.agents, ext: SIDEBAR_DEFAULT.ext },
+    'a cache written before the agents width existed keeps its two widths and defaults the rest',
   )
   ok(
     Number.isFinite(decodeWidths(preM18).agents),
@@ -556,13 +563,13 @@ try {
     'a window that has not heard from Rust yet shows the defaults, not zero',
   )
   eq(
-    widthsFromSettings({ filesWidth: 9000, gitWidth: 1, agentsWidth: 9000 }),
-    { files: SIDEBAR_MAX, git: SIDEBAR_MIN, agents: SIDEBAR_MAX },
+    widthsFromSettings({ filesWidth: 9000, gitWidth: 1, agentsWidth: 9000, extWidth: 1 }),
+    { files: SIDEBAR_MAX, git: SIDEBAR_MIN, agents: SIDEBAR_MAX, ext: SIDEBAR_MIN },
     'and a hand-edited workspace.json is clamped on the way in, every field by the same band',
   )
   eq(
     toStored(widths),
-    { filesWidth: 300, gitWidth: 500, agentsWidth: 360 },
+    { filesWidth: 300, gitWidth: 500, agentsWidth: 360, extWidth: 280 },
     'the patch shape matches SettingsPatch',
   )
   eq(
@@ -571,6 +578,7 @@ try {
       ['--w-sidebar-files', '300px'],
       ['--w-sidebar-git', '500px'],
       ['--w-sidebar-agents', '360px'],
+      ['--w-sidebar-ext', '280px'],
     ],
     'the declarations carry units — a unitless custom property is silently invalid in a width',
   )
@@ -591,10 +599,11 @@ try {
 
   eq(
     Object.keys(SIDEBAR_TOKEN),
-    ['files', 'git', 'agents'],
-    'the panels that own a width: the explorer (with search and problems), git, and M18\'s ' +
-      'Agents (with Tasks) — three widths for five-plus views, because a shared column keeps ' +
-      'a shared number',
+    ['files', 'git', 'agents', 'ext'],
+    'the panels that own a width: the explorer (with search and problems), git, M18\'s ' +
+      'Agents (with Tasks), and M22\'s one number for every contributed panel — four widths ' +
+      'for a set of views that is no longer even finite, because a shared column keeps a ' +
+      'shared number',
   )
   eq(
     Object.keys(SIDEBAR_DEFAULT),
@@ -667,6 +676,24 @@ try {
     'and agents_width carries #[serde(default = …)], without which every pre-M18 ' +
       'workspace.json fails to deserialise its whole `sidebar` block on the first launch ' +
       'after the upgrade — the Rust half of the same degradation `decodeWidths` does for the cache',
+  )
+  // M22's width, the same three ways. A contributed panel is the first sidebar view whose set is
+  // not known at build time, so this is the one number where a drift would show up as "the panel
+  // some extension I installed opens at the wrong width", which nobody would report as a bug in
+  // cide.
+  eq(
+    Number(/fn default_ext_width\(\)\s*->\s*u16\s*\{\s*(\d+)/.exec(rust)?.[1] ?? null),
+    SIDEBAR_DEFAULT.ext,
+    'default_ext_width() is the token, SIDEBAR_DEFAULT.ext and Rust agreeing on one number',
+  )
+  ok(
+    /ext_width:\s*default_ext_width\(\)/.test(rust),
+    'SidebarSettings::default() uses that fn rather than a second copy of the number',
+  )
+  ok(
+    /#\[serde\(default\s*=\s*"default_ext_width"\)\]/.test(rust),
+    'and ext_width carries #[serde(default = …)], for the reason agents_width does — a stored ' +
+      'field without one takes the whole `sidebar` block down on the first launch after upgrade',
   )
 
   const windowsRs = readFileSync('../crates/cide-app/src/windows.rs', 'utf8')

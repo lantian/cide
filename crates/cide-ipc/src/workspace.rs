@@ -682,6 +682,32 @@ pub enum TabKind {
     Settings {
         section: SettingsSection,
     },
+    /// One extension's page: its README, what it contributes, and what it asks for. (M22)
+    ///
+    /// # Why a tab kind and not a file tab on its `README.md`
+    ///
+    /// Because the file is not in the project. An installed extension lives under
+    /// `$XDG_STATE_HOME`, and one that is only *listed* lives in a marketplace clone — both
+    /// outside every root, which is exactly what `cmd::file`'s refusals exist to keep out of an
+    /// editor. Widening that for this would widen it for everything.
+    ///
+    /// It also has to draw more than a file: the version, the capabilities the extension asks
+    /// for, and the Install button, which are the things a person reading a README is deciding
+    /// about.
+    ///
+    /// # Why `name` is stored
+    ///
+    /// [`TabKind::title`] is a pure function of the variant — it cannot read a registry — and the
+    /// tab strip needs a caption on the frame the tab is restored in, before any snapshot has
+    /// arrived. Storing the display name is what keeps a restored tab from reading `sql` in a
+    /// strip where everything else is capitalised, and it costs a string that goes stale only if
+    /// an extension is renamed.
+    Extension {
+        marketplace: MarketplaceId,
+        extension: ExtensionId,
+        /// What the extension calls itself. See the note above.
+        name: String,
+    },
 }
 
 impl TabKind {
@@ -706,6 +732,7 @@ impl TabKind {
                 path.rsplit('/').next().unwrap_or(path.as_str())
             ),
             Self::Settings { .. } => "Settings".into(),
+            Self::Extension { name, .. } => name.clone(),
         }
     }
 }

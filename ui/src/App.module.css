@@ -230,3 +230,21 @@
   background: var(--chrome-hi);
   color: var(--text);
 }
+
+/*
+ * A contributed sidebar panel whose extension went away. (M22)
+ *
+ * Reachable when the rail's selection points at a panel another window has just disabled. A
+ * sentence rather than a blank column, on the rule every empty state in this app follows: nothing
+ * on screen and no explanation is the one thing a user cannot act on.
+ */
+.extMissing {
+  width: var(--w-sidebar-ext);
+  flex: none;
+  padding: 12px 10px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.5;
+  color: var(--dim);
+}

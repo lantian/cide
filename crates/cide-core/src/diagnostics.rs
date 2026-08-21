@@ -175,7 +175,7 @@ impl DiagnosticStore {
                 }
                 marked |= self
                     .dirty
-                    .entry(*id)
+                    .entry(id.clone())
                     .or_default()
                     .insert(abs_path.to_string());
             }
@@ -186,9 +186,9 @@ impl DiagnosticStore {
     /// Forget every staleness mark. (M18)
     ///
     /// Is this source's finding for this path known to be out of date?
-    fn is_dirty(&self, source: DiagnosticSourceId, abs_path: &str) -> bool {
+    fn is_dirty(&self, source: &DiagnosticSourceId, abs_path: &str) -> bool {
         self.dirty
-            .get(&source)
+            .get(source)
             .is_some_and(|marks| marks.contains(abs_path))
     }
 
@@ -250,11 +250,10 @@ impl DiagnosticStore {
     ///
     /// See the module docs for why the filter is applied here and nowhere else.
     pub fn snapshot(&self, settings: &InspectionSettings, cap: usize) -> DiagnosticsSnapshot {
-        let enabled: Vec<(DiagnosticSourceId, &SourceState)> = self
+        let enabled: Vec<(&DiagnosticSourceId, &SourceState)> = self
             .sources
             .iter()
-            .filter(|(id, _)| settings.shows_source(id.label()))
-            .map(|(id, state)| (*id, state))
+            .filter(|(id, _)| settings.shows_source(&id.label()))
             .collect();
 
         if enabled.is_empty() {
@@ -276,7 +275,7 @@ impl DiagnosticStore {
                 state
                     .by_path
                     .iter()
-                    .map(move |(abs_path, found)| (self.is_dirty(*id, abs_path), found))
+                    .map(move |(abs_path, found)| (self.is_dirty(id, abs_path), found))
             })
             .flat_map(|(stale, found)| found.iter().map(move |d| (stale, d)))
             .filter(|(_, d)| {
@@ -306,7 +305,7 @@ impl DiagnosticStore {
 
         // A source that is `Unavailable` is not waiting for anything — it is *not running*, which
         // is an answer. Only a `Scanning` one keeps the snapshot out of `Ready`.
-        let scanning: Vec<&str> = enabled
+        let scanning: Vec<String> = enabled
             .iter()
             .filter(|(_, s)| matches!(s.status, SourceStatus::Scanning { .. }))
             .map(|(id, _)| id.label())
@@ -319,7 +318,7 @@ impl DiagnosticStore {
             };
         }
 
-        let ready: Vec<(DiagnosticSourceId, &SourceState)> = enabled
+        let ready: Vec<(&DiagnosticSourceId, &SourceState)> = enabled
             .iter()
             .filter(|(_, s)| matches!(s.status, SourceStatus::Ready))
             .copied()
@@ -345,9 +344,9 @@ impl DiagnosticStore {
         self.sources
             .iter()
             .map(|(id, state)| SourceReport {
-                id: *id,
-                label: id.label().to_string(),
-                status: if settings.shows_source(id.label()) {
+                id: id.clone(),
+                label: id.label(),
+                status: if settings.shows_source(&id.label()) {
                     state.status.clone()
                 } else {
                     // A source the user switched off is not "unavailable" in the sense of broken.
@@ -367,10 +366,10 @@ impl DiagnosticStore {
 }
 
 /// `rust-analyzer` / `rust-analyzer and gopls` / `rust-analyzer, gopls and tree-sitter`.
-fn join(labels: &[&str]) -> String {
+fn join(labels: &[String]) -> String {
     match labels {
         [] => String::new(),
-        [one] => (*one).to_string(),
+        [one] => one.clone(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
@@ -381,15 +380,15 @@ fn join(labels: &[&str]) -> String {
 /// workspace. So "tree-sitter found nothing" is a claim about a handful of buffers, and rendering
 /// it as `No problems found` would be a statement about forty thousand unopened files that
 /// nothing has read. When it is the only source that answered, the label says so.
-fn ready_label(ready: &[(DiagnosticSourceId, &SourceState)]) -> String {
-    let labels: Vec<&str> = ready.iter().map(|(id, _)| id.label()).collect();
+fn ready_label(ready: &[(&DiagnosticSourceId, &SourceState)]) -> String {
+    let labels: Vec<String> = ready.iter().map(|(id, _)| id.label()).collect();
     if labels == ["tree-sitter"] {
         return "tree-sitter (open files only)".to_string();
     }
     join(&labels)
 }
 
-fn join_reasons(sources: &[(DiagnosticSourceId, &SourceState)]) -> String {
+fn join_reasons(sources: &[(&DiagnosticSourceId, &SourceState)]) -> String {
     let reasons: Vec<String> = sources
         .iter()
         .filter_map(|(_, s)| match &s.status {
@@ -414,9 +413,9 @@ fn no_enabled_source_reason(
                 Go needs gopls on PATH."
             .to_string();
     }
-    let off: Vec<&str> = sources
+    let off: Vec<String> = sources
         .keys()
-        .map(|id| id.label())
+        .map(DiagnosticSourceId::label)
         .filter(|label| !settings.shows_source(label))
         .collect();
     format!(
@@ -459,9 +458,9 @@ mod tests {
 
     fn ready_store() -> DiagnosticStore {
         let mut store = DiagnosticStore::new();
-        store.set_status(DiagnosticSourceId::RustAnalyzer, SourceStatus::Ready);
+        store.set_status(DiagnosticSourceId::rust_analyzer(), SourceStatus::Ready);
         store.publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/src/a.rs".into(),
             vec![
                 item("src/a.rs", Severity::Error, "rust-analyzer", "boom"),
@@ -476,9 +475,9 @@ mod tests {
         // The distinction `getDiagnostics{uri}` answers differently, and the one a "tidy up empty
         // entries" pass would delete.
         let mut store = DiagnosticStore::new();
-        store.set_status(DiagnosticSourceId::RustAnalyzer, SourceStatus::Ready);
+        store.set_status(DiagnosticSourceId::rust_analyzer(), SourceStatus::Ready);
         store.publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/clean.rs".into(),
             vec![],
         );
@@ -492,7 +491,7 @@ mod tests {
     fn a_republish_replaces_rather_than_appends() {
         let mut store = ready_store();
         store.publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/src/a.rs".into(),
             vec![item(
                 "src/a.rs",
@@ -510,7 +509,7 @@ mod tests {
         // has answered must not render as either "no problems" or "nothing to show".
         let mut store = ready_store();
         store.set_status(
-            DiagnosticSourceId::Gopls,
+            DiagnosticSourceId::gopls(),
             SourceStatus::Scanning {
                 detail: "Loading packages".into(),
             },
@@ -531,7 +530,7 @@ mod tests {
         // for the life of the session.
         let mut store = ready_store();
         store.set_status(
-            DiagnosticSourceId::Gopls,
+            DiagnosticSourceId::gopls(),
             SourceStatus::Unavailable {
                 reason: "gopls is not on PATH.".into(),
             },
@@ -547,7 +546,7 @@ mod tests {
     fn everything_unavailable_is_unavailable_and_names_the_reasons() {
         let mut store = DiagnosticStore::new();
         store.set_status(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             SourceStatus::Unavailable {
                 reason: "rust-analyzer is not on PATH.".into(),
             },
@@ -606,9 +605,9 @@ mod tests {
         // tree-sitter only sees open buffers. "No problems found" over a workspace of 40,000
         // unopened files would be a claim nothing has checked.
         let mut store = DiagnosticStore::new();
-        store.set_status(DiagnosticSourceId::TreeSitter, SourceStatus::Ready);
+        store.set_status(DiagnosticSourceId::tree_sitter(), SourceStatus::Ready);
         store.publish(
-            DiagnosticSourceId::TreeSitter,
+            DiagnosticSourceId::tree_sitter(),
             "/repo/open.rs".into(),
             vec![],
         );
@@ -623,7 +622,7 @@ mod tests {
     #[test]
     fn a_language_server_beside_tree_sitter_drops_the_qualifier() {
         let mut store = ready_store();
-        store.set_status(DiagnosticSourceId::TreeSitter, SourceStatus::Ready);
+        store.set_status(DiagnosticSourceId::tree_sitter(), SourceStatus::Ready);
         let snapshot = store.snapshot(&InspectionSettings::default(), EMIT_CAP);
         let DiagnosticsSnapshot::Ready { source, .. } = &snapshot else {
             panic!("{snapshot:?}");
@@ -634,7 +633,7 @@ mod tests {
     #[test]
     fn the_emit_cap_keeps_the_worst_problems_and_reports_what_it_dropped() {
         let mut store = DiagnosticStore::new();
-        store.set_status(DiagnosticSourceId::RustAnalyzer, SourceStatus::Ready);
+        store.set_status(DiagnosticSourceId::rust_analyzer(), SourceStatus::Ready);
         let mut items: Vec<Diagnostic> = (0..50)
             .map(|i| {
                 item(
@@ -651,7 +650,11 @@ mod tests {
             "rust-analyzer",
             "the one that matters",
         ));
-        store.publish(DiagnosticSourceId::RustAnalyzer, "/repo/all".into(), items);
+        store.publish(
+            DiagnosticSourceId::rust_analyzer(),
+            "/repo/all".into(),
+            items,
+        );
 
         let snapshot = store.snapshot(&InspectionSettings::default(), 3);
         let DiagnosticsSnapshot::Ready {
@@ -669,9 +672,9 @@ mod tests {
     #[test]
     fn a_ready_source_with_nothing_is_a_reportable_zero() {
         let mut store = DiagnosticStore::new();
-        store.set_status(DiagnosticSourceId::RustAnalyzer, SourceStatus::Ready);
+        store.set_status(DiagnosticSourceId::rust_analyzer(), SourceStatus::Ready);
         store.publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/a.rs".into(),
             vec![],
         );
@@ -689,7 +692,7 @@ mod tests {
         // and its default must not be `Ready`. A `Ready` default would make the very first
         // publish of a partial result read as a complete answer.
         let mut store = DiagnosticStore::new();
-        store.publish(DiagnosticSourceId::Gopls, "/repo/a.go".into(), vec![]);
+        store.publish(DiagnosticSourceId::gopls(), "/repo/a.go".into(), vec![]);
         let snapshot = store.snapshot(&InspectionSettings::default(), EMIT_CAP);
         assert!(
             matches!(snapshot, DiagnosticsSnapshot::Scanning { .. }),
@@ -700,7 +703,7 @@ mod tests {
     #[test]
     fn clearing_a_source_forgets_it_entirely() {
         let mut store = ready_store();
-        store.clear_source(DiagnosticSourceId::RustAnalyzer);
+        store.clear_source(DiagnosticSourceId::rust_analyzer());
         assert!(!store.has_looked_at("/repo/src/a.rs"));
         assert!(store.known_paths().is_empty());
     }
@@ -742,7 +745,7 @@ mod tests {
         let mut store = ready_store();
         store.mark_dirty(["/repo/src/a.rs"]);
         store.publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/src/a.rs".into(),
             vec![item("src/a.rs", Severity::Error, "rust-analyzer", "boom")],
         );
@@ -758,16 +761,16 @@ mod tests {
         // second's rows, which is *under*-reporting — a row that is silently wrong about its line
         // number, which is exactly the defect being fixed.
         let mut store = ready_store();
-        store.set_status(DiagnosticSourceId::TreeSitter, SourceStatus::Ready);
+        store.set_status(DiagnosticSourceId::tree_sitter(), SourceStatus::Ready);
         store.publish(
-            DiagnosticSourceId::TreeSitter,
+            DiagnosticSourceId::tree_sitter(),
             "/repo/src/a.rs".into(),
             vec![item("src/a.rs", Severity::Error, "tree-sitter", "unclosed")],
         );
         store.mark_dirty(["/repo/src/a.rs"]);
 
         store.publish(
-            DiagnosticSourceId::TreeSitter,
+            DiagnosticSourceId::tree_sitter(),
             "/repo/src/a.rs".into(),
             vec![item("src/a.rs", Severity::Error, "tree-sitter", "unclosed")],
         );
@@ -799,10 +802,10 @@ mod tests {
         // name paths the new server may never mention, and nothing could ever clear them.
         let mut store = ready_store();
         store.mark_dirty(["/repo/src/a.rs"]);
-        store.clear_source(DiagnosticSourceId::RustAnalyzer);
-        store.set_status(DiagnosticSourceId::RustAnalyzer, SourceStatus::Ready);
+        store.clear_source(DiagnosticSourceId::rust_analyzer());
+        store.set_status(DiagnosticSourceId::rust_analyzer(), SourceStatus::Ready);
         store.publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/src/b.rs".into(),
             vec![item("src/b.rs", Severity::Error, "rust-analyzer", "boom")],
         );
@@ -837,7 +840,7 @@ mod tests {
         // source's mark comes down, which is why this counts rather than asserting zero — the
         // path is known to more than one source and the others have not spoken yet.
         store.publish(
-            DiagnosticSourceId::RustAnalyzer,
+            DiagnosticSourceId::rust_analyzer(),
             "/repo/src/a.rs".into(),
             Vec::new(),
         );
@@ -849,8 +852,8 @@ mod tests {
 
     #[test]
     fn joining_labels_reads_like_a_sentence() {
-        assert_eq!(join(&["a"]), "a");
-        assert_eq!(join(&["a", "b"]), "a and b");
-        assert_eq!(join(&["a", "b", "c"]), "a, b and c");
+        assert_eq!(join(&["a".into()]), "a");
+        assert_eq!(join(&["a".into(), "b".into()]), "a and b");
+        assert_eq!(join(&["a".into(), "b".into(), "c".into()]), "a, b and c");
     }
 }

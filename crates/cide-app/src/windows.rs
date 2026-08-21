@@ -239,7 +239,7 @@ pub fn create(
     let (initial_width, initial_height) = forced.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
     let builder = WebviewWindowBuilder::new(app, label.as_str(), url)
-        .title(title)
+        .title(os_title(title))
         // We draw the titlebar ourselves — traffic lights, project tabs and the icon
         // cluster all live in one 34px bar. The cost is that the window manager no longer
         // provides resize borders, snap or double-click-to-maximize, so the frontend
@@ -759,6 +759,30 @@ pub fn awaiting_among(sessions: &BTreeSet<SessionId>) -> usize {
 /// task switcher or a window list, and that is the one place where the left of the string is
 /// the part that survives truncation. Zero adds nothing at all: a permanent `Awaiting: 0` in
 /// every task bar entry is noise that would teach the user to stop reading the field.
+/// Every OS window title, with this instance's profile marker in front of it.
+///
+/// Applied at the **boundary** — the two functions below that hand a string to the toolkit —
+/// rather than in [`title_with`], `title_for` or `shell_title` where the titles are composed.
+/// That is deliberate twice over. It makes it structurally impossible for a title path to
+/// miss the marker, including the placeholder a window is built with before the first
+/// `retitle` reaches it; and it keeps the composition functions pure, so their tests go on
+/// asserting about `Awaiting: N` and nothing else.
+///
+/// It cannot double up, and the reason is worth stating because the opposite would be
+/// invisible until someone saw `[DEV] [DEV] cide`: nothing in this app ever reads a title
+/// back off a window. The one title that *is* persisted and restored — a detached pane's,
+/// which `lib.rs` reads out of `project.detached[pane].title` on launch — is the domain
+/// `Pane::title` that `cmd::pane` wrote, never the string the desktop was shown.
+pub(crate) fn os_title(title: &str) -> String {
+    let prefix = cide_core::profile::title_prefix();
+    if prefix.is_empty() {
+        // The overwhelmingly common case, and a `String` either way, so this only avoids a
+        // second allocation — not a reason to branch, but not a reason to pretend otherwise.
+        return title.to_string();
+    }
+    format!("{prefix}{title}")
+}
+
 pub fn title_with(base: &str, count: usize) -> String {
     if count == 0 {
         base.to_string()
@@ -887,7 +911,7 @@ pub fn set_title(app: &AppHandle, label: &WindowLabel, title: &str) {
     let Some(window) = app.get_webview_window(label.as_str()) else {
         return;
     };
-    if let Err(error) = window.set_title(title) {
+    if let Err(error) = window.set_title(&os_title(title)) {
         // Worth a line but not worth failing a command over: the title is a courtesy, and a
         // window that went away between the lookup and the call is the ordinary case during a
         // close.
@@ -1002,6 +1026,103 @@ mod tests {
 
     fn hex(c: Color) -> String {
         format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
+    }
+
+    /// `os_title` is exactly "the profile marker, then the title", for every title.
+    ///
+    /// Asserted against `title_prefix()` rather than against a literal, and that is not
+    /// laziness: this test binary inherits whatever `CIDE_PROFILE` the terminal running
+    /// `cargo test` had, and a terminal inside a profiled cide has one. An assertion spelling
+    /// out `"atlas"` passes at a desk and fails in a dev pane — which is the environment the
+    /// person most likely to run it is sitting in. `cide-core`'s `prefix_for` tests pin what
+    /// the marker itself looks like for a given profile, including that it is empty by
+    /// default; this pins that titles are composed from it and nothing else.
+    #[test]
+    fn every_os_title_is_the_marker_then_the_title() {
+        use super::os_title;
+        let marker = cide_core::profile::title_prefix();
+
+        for title in ["atlas", "Awaiting: 1 — atlas", ""] {
+            assert_eq!(os_title(title), format!("{marker}{title}"));
+        }
+    }
+
+    /// Every string that reaches the desktop goes through [`os_title`], and only once.
+    ///
+    /// A source assertion because nothing else can see it. `os_title` can be perfect and an
+    /// instance still be unmarked in the task switcher if one call site forgot it — and the
+    /// forgetting is silent, because an unprefixed title is a perfectly valid title. This is
+    /// the same shape as the focus wiring pinned below and as
+    /// `ui/scripts/check-awaiting.mjs`: a correct mechanism reaching no surface.
+    ///
+    /// The count matters as much as the presence. Applying it in `title_with` or `title_for`
+    /// *as well* would double the marker, and `the_marker_is_not_idempotent_by_design` says
+    /// why that would not be quietly absorbed.
+    #[test]
+    fn the_marker_is_applied_at_every_boundary_and_only_there() {
+        // Everything *above* `#[cfg(test)]`, in both files. Searching the whole of
+        // `windows.rs` would make this assertion satisfy itself: the needles below are string
+        // literals living in this very file, so `contains` would find them in the test module
+        // and pass however the call sites were rewritten. Verified by deleting the marker from
+        // `create` and watching this fail.
+        let production = |source: &'static str| {
+            source
+                .split_once("\n#[cfg(test)]")
+                .map(|(before, _)| before)
+                .expect("both files carry a test module")
+        };
+        let windows = production(include_str!("windows.rs"));
+        let lifecycle = production(include_str!("lifecycle.rs"));
+
+        assert!(
+            windows.contains(".title(os_title(title))"),
+            "the window builder must mark the title it is created with. A window is built \
+             before the first `retitle` reaches it, and on a fresh workspace it may be built \
+             and never retitled at all"
+        );
+        assert!(
+            windows.contains("window.set_title(&os_title(title))"),
+            "`set_title` is the single applier `retitle` drives, so it is the one that marks \
+             every subsequent title for the life of the window"
+        );
+        assert!(
+            lifecycle.contains(r#"os_title("Closing cide")"#),
+            "the shutdown dialog is a raw gtk::Window rather than a Tauri one, so it does not \
+             pass through `set_title` above and has to mark itself. It is also exactly when \
+             two instances are easiest to confuse: two identical dialogs, one of which is \
+             taking down the session you were working in"
+        );
+
+        // Marked at the boundary and nowhere upstream. `title_with` and `announce` compose
+        // the *base*; if either learned about the profile the marker would land twice.
+        for composer in ["fn title_with(", "fn announce("] {
+            let body = windows.split_once(composer).expect("the composer exists").1;
+            let body = &body[..body.find("\n}\n").expect("the composer ends")];
+            assert!(
+                !body.contains("os_title") && !body.contains("title_prefix"),
+                "{composer} must stay a pure composer of the base title. Marking here as well \
+                 as at the boundary is how a title becomes `[DEV] [DEV] cide`"
+            );
+        }
+    }
+
+    /// Applying it twice must *not* be absorbed.
+    ///
+    /// Stated as a test because the tempting "safety net" — having `os_title` return early if
+    /// the title already starts with the marker — would be a bug that hides a bug. A project
+    /// legitimately named `DEV` would stop being marked, and a real double-application
+    /// somewhere would go unnoticed instead of being obvious on screen. Correctness comes
+    /// from applying it at the boundary exactly once, which the source assertion below pins.
+    #[test]
+    fn the_marker_is_not_idempotent_by_design() {
+        use super::os_title;
+
+        if cide_core::profile::title_prefix().is_empty() {
+            // No marker to double up; the invariant is vacuous for the default instance.
+            assert_eq!(os_title(&os_title("atlas")), "atlas");
+            return;
+        }
+        assert_ne!(os_title(&os_title("atlas")), os_title("atlas"));
     }
 
     /// The user asked for `Awaiting: X` "to see in the task bar", so the two things that

@@ -1,0 +1,30 @@
+[package]
+name = "cide-ext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Extensions, and the git repositories they are distributed in.
+#
+# Discovers, validates, installs and merges what a `cide-extension.json` declares. It runs no
+# extension code — the worker that does lives in the webview, on the far side of a structured
+# clone — and it links neither tauri nor `cide-fs`.
+#
+# `cide-git` is deliberately *not* a dependency, and the reason is the one `cide-agents/harness.rs`
+# gives for refusing the same thing: the moment this crate reaches for a repository it becomes
+# untestable in exactly the place where the ordering rules live. `market.rs` forks the user's own
+# `git` binary, which is also what `cide-git::push` does for anything authenticated, so the
+# dependency would buy a wrapper around a `Command` and cost a test that can run anywhere.
+[dependencies]
+cide-ipc = { workspace = true }
+cide-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+# No dev-dependencies, deliberately, on `cide-tasks`' rule: its tests build scratch directories
+# from `std::env::temp_dir()` keyed by pid, and adding a temp-dir crate here would be the
+# workspace's first for something eight lines already do.

@@ -3622,3 +3622,155 @@ export const agentDefs = {
   delete: (project: ProjectId, agent: AgentId, scope: AgentScope) =>
     invoke<AgentRoster>('agents_delete', { project, agent, scope }),
 }
+
+// ---------------------------------------------------------------------------------------
+// M22: extensions and their marketplaces.
+//
+// Appended in its own block with its own imports, on this file's house rule: appending cannot
+// reach inside an object literal that was closed a thousand lines ago, and a feature whose seam
+// is contiguous is a feature whose seam is greppable.
+// ---------------------------------------------------------------------------------------
+
+import type {
+  Capability,
+  Diagnostic,
+  ExtensionPage,
+  ExtensionRef,
+  ExtensionSnapshot,
+  MarketplaceId,
+} from './generated'
+
+/**
+ * The extension registry.
+ *
+ * Every mutation answers with the **whole snapshot**, so nothing here is followed by a read. That
+ * is `tasks`' rule and the argument is stronger here: installing an extension changes the language
+ * registry, and a panel that re-asked would draw "not installed" for a frame beside a `.sql` file
+ * that has already changed colour.
+ */
+export const ext = {
+  /** Everything the Extensions panel draws. */
+  snapshot: () => invoke<ExtensionSnapshot>('ext_snapshot'),
+
+  /**
+   * Re-read `extensions.json`, every clone and every installed tree.
+   *
+   * Cheap and called freely — the store reads the disk on every ask for `cide-agents`' reason: a
+   * clone directory is one the user can `git pull` by hand, so a cached answer is wrong for as
+   * long as nobody happens to invalidate it.
+   */
+  reload: () => invoke<ExtensionSnapshot>('ext_reload'),
+
+  /**
+   * Connect a marketplace by git URL or local path, and clone it.
+   *
+   * Slow — a clone over a network — and deliberately not given a progress channel: the marketplace
+   * row carries a `Working` state for exactly this, and a second mechanism for saying "something
+   * is happening" would be a second thing that can be left switched on.
+   */
+  connect: (source: string) => invoke<ExtensionSnapshot>('ext_connect', { req: { source } }),
+
+  /** Forget a marketplace, and uninstall everything that came from it. */
+  disconnect: (marketplace: MarketplaceId) =>
+    invoke<ExtensionSnapshot>('ext_disconnect', { marketplace }),
+
+  /** Fetch a marketplace and re-read its index. Never rejects; a failure is a row in the list. */
+  refresh: (marketplace: MarketplaceId) =>
+    invoke<ExtensionSnapshot>('ext_refresh', { marketplace }),
+
+  /**
+   * Install or update one extension.
+   *
+   * `granted` is what the user was **shown**, echoed back. Rust refuses the install if the
+   * manifest has since changed, which is the whole of the consent mechanism: without it a
+   * marketplace could add `process:spawn` between the sheet being drawn and the button being
+   * pressed, and the user would have approved a different extension from the one that installed.
+   */
+  install: (id: ExtensionRef, granted: readonly Capability[]) =>
+    invoke<ExtensionSnapshot>('ext_install', { req: { ...id, granted } }),
+
+  /** Remove an installed extension. Its marketplace stays connected. */
+  uninstall: (extension: ExtensionRef) =>
+    invoke<ExtensionSnapshot>('ext_uninstall', { extension }),
+
+  /** Switch one on or off. A disabled extension keeps its row, its files and its reason. */
+  setEnabled: (extension: ExtensionRef, enabled: boolean) =>
+    invoke<ExtensionSnapshot>('ext_set_enabled', { extension, enabled }),
+
+  /**
+   * Fold an extension's findings for one file into the project's diagnostics.
+   *
+   * The same store the language servers publish into — `DiagnosticStore` is where the source
+   * filter, the staleness marks and the cap are applied, and a second path around it would be a
+   * second answer to "how many errors are there", which is the number on the activity rail.
+   *
+   * The source id is derived in Rust from `extension`, never taken from the payload: an extension
+   * publishing under `rustAnalyzer` would have its findings filtered, grouped and restarted as
+   * somebody else's.
+   */
+  /** One extension's page: its catalog row, its installed row, and its README. */
+  page: (extension: ExtensionRef) => invoke<ExtensionPage>('ext_page', { extension }),
+
+  /**
+   * Open this extension's page as a workspace tab, or activate the one it already has.
+   *
+   * `name` is the caption, stored on the tab kind so a restored tab has one before any snapshot
+   * arrives — `TabKind::Extension` says why at length.
+   */
+  openTab: (project: ProjectId, extension: ExtensionRef, name: string) =>
+    invoke<TabId>('tab_open_extension', { project, extension, name }),
+
+  /**
+   * Open a link from an extension's README in the user's browser.
+   *
+   * `http` and `https` only, and **Rust decides that**, not this file: a README is markdown
+   * somebody else wrote, and a scheme check that lived in the component rendering the link would
+   * be one `invoke` away from being bypassed.
+   */
+  openLink: (url: string) => invoke<void>('ext_open_link', { url }),
+
+  publishDiagnostics: (
+    project: ProjectId,
+    extension: ExtensionRef,
+    absPath: string,
+    items: readonly Diagnostic[],
+  ) =>
+    invoke<void>('ext_publish_diagnostics', { project, extension, absPath, items }),
+}
+
+/**
+ * The registry changed, in this window or another.
+ *
+ * Its own exported object rather than a member of `events`, on this file's append-only rule.
+ */
+export const extEvents = {
+  onChanged: (handler: (snapshot: ExtensionSnapshot) => void) =>
+    listen<{ snapshot: ExtensionSnapshot }>('cide://ext-changed', (event) =>
+      handler(event.payload.snapshot),
+    ),
+}
+
+/**
+ * The URL an installed extension's file is served from.
+ *
+ * A scheme registered in `cide-app`, jailed to the installed directory and refused outright for a
+ * disabled extension. Built here rather than in the worker host, so the one place a path out of a
+ * manifest becomes a URL is the file that owns the seam.
+ *
+ * # Two spellings, one on each side of a platform split
+ *
+ * Tauri serves a custom scheme as `<scheme>://localhost/…` on Linux and Android and as
+ * `http://<scheme>.localhost/…` on macOS and Windows. The *host* is therefore not ours to use, and
+ * the identity pair lives in the path — see `cide_ext::assets::split_path`, which says the same
+ * from the other end.
+ *
+ * Detected the way `@tauri-apps/api`'s own `convertFileSrc` does, off the user agent, because the
+ * platform plugin's answer is asynchronous and this is called while a worker is being constructed.
+ */
+export function extAssetUrl(id: ExtensionRef, path: string): string {
+  const clean = path.replace(/^\/+/, '')
+  const tail = `${id.marketplace}/${id.extension}/${clean}`
+  const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent
+  const windowsOrMac = /Windows|Macintosh|Mac OS X/.test(ua)
+  return windowsOrMac ? `http://cide-ext.localhost/${tail}` : `cide-ext://localhost/${tail}`
+}

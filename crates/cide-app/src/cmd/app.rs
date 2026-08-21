@@ -38,7 +38,11 @@ pub fn app_ready(app: AppHandle, window: Window) {
 /// workspace, the keymap and the command list will render three intermediate states on the
 /// way, and on the slow IPC path that is visible as flicker.
 #[tauri::command]
-pub fn app_get_bootstrap(window: Window, state: State<'_, WorkspaceState>) -> Bootstrap {
+pub fn app_get_bootstrap(
+    window: Window,
+    state: State<'_, WorkspaceState>,
+    extensions: State<'_, crate::ext_state::ExtState>,
+) -> Bootstrap {
     let workspace = state.snapshot();
     let label = WindowLabel(window.label().to_string());
 
@@ -53,15 +57,37 @@ pub fn app_get_bootstrap(window: Window, state: State<'_, WorkspaceState>) -> Bo
             active: None,
         });
 
+    let resolved = extensions.snapshot().resolved;
+
     Bootstrap {
         window: label,
         role,
         workspace,
         keymap: keymap::resolve(&user_keymap()),
-        commands: commands::registry().to_vec(),
+        commands: {
+            // Builtins, then whatever the enabled extensions contribute. One list and not two,
+            // on `cide-core::commands`' own rule: two tables would let a command be bindable but
+            // unlistable, and both would drift silently. `Command::id` is a plain `String`
+            // precisely so this concatenation is possible — every extension row is
+            // `ext.<marketplace>.<extension>.<id>`, which `ui/src/keys/dispatch.ts` handles with
+            // one prefixed `case`.
+            let mut rows = commands::registry().to_vec();
+            rows.extend(
+                resolved
+                    .commands
+                    .iter()
+                    .map(|row| commands::extension_command(&row.id, &row.title, &row.keywords)),
+            );
+            rows
+        },
         // Read from the workspace this window already holds, so the version in the header is
         // the version of the binary this workspace's panes will actually spawn.
         capabilities: capabilities(&state.with(|ws| ws.settings.claude.cli.binary.clone())),
+        // Here rather than behind a command of its own, and the reason is one line of the editor:
+        // `foldSpecFor` runs inside the mount dispatch and cannot await, so a fold table that
+        // arrived a round trip after first paint would restore a remembered scroll position
+        // against unfolded heights. See `cide_ipc::lang::FoldSpecDto`.
+        extensions: resolved,
     }
 }
 
@@ -321,13 +347,17 @@ mod tests {
             let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!("cide-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            // `persist::config_dir` appends `cide` to `XDG_CONFIG_HOME`, so the file this
-            // writes lives one level below the directory handed over.
-            std::fs::create_dir_all(dir.join("cide")).expect("temp config dir");
             let previous = std::env::var_os("XDG_CONFIG_HOME");
             // SAFETY: `ENV_LOCK` is held for the lifetime of this guard, and it is the only
             // thing in this binary that writes the environment.
             unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+            // Created *after* the override is in place and *through* `persist`, rather than
+            // by appending a known leaf here. `config_dir` appends `cide` — or `cide-<profile>`
+            // when `CIDE_PROFILE` is set, which is the normal case for a `cargo test` run from
+            // a terminal inside a profiled cide. Reconstructing the path made this helper
+            // write one directory and the code under test read another, and the symptom was a
+            // keymap-override test failing as though the override logic were broken.
+            std::fs::create_dir_all(cide_core::persist::config_dir()).expect("temp config dir");
             Self {
                 dir,
                 previous,
@@ -336,7 +366,7 @@ mod tests {
         }
 
         fn write_keymap(&self, contents: &str) {
-            std::fs::write(self.dir.join("cide").join("keymap.json"), contents).expect("write");
+            std::fs::write(cide_core::persist::keymap_path(), contents).expect("write");
         }
     }
 

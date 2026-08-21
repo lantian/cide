@@ -26,8 +26,22 @@ with nothing on that port gives a white window and a connection error. `run.sh` 
 workspace flushes), reaps orphaned `claude` children, and refuses to start when the saved
 workspace would open more than eight windows.
 
+**`./run.sh` launches the `dev` profile, not your real instance.** cide is developed inside
+cide, so the two run side by side; before profiles they shared one `workspace.json` and one
+Tauri app directory, and whichever exited last stamped its layout over the other's. A profile
+moves the whole footprint — `$XDG_STATE_HOME/cide-dev` and `$XDG_CONFIG_HOME/cide-dev`, and a
+suffixed bundle identifier so the WebKit storage, the log and the remembered window geometry
+move with it — and prefixes the OS window title with `[DEV] ` so a task switcher tells them
+apart. `cide_core::profile` is the whole rule; `CIDE_PROFILE` is how it is set, and children
+inherit it, so `cide-headless tree` in a profiled pane inspects that profile's workspace.
+
+A profile starts **factory-fresh** — settings live inside `workspace.json`, so a new one has no
+installed extensions, no global agent roles and the default keymap. That is the point, and it
+is the first thing to remember before filing "my extensions are gone".
+
 ```sh
 ./run.sh --release        # embeds ui/dist, needs no dev server (run `pnpm --dir ui build` first)
+./run.sh --profile <name> # run under another profile; `default` shares the real instance's state
 ./run.sh --fresh          # start from an empty workspace (moves the old one to .bak)
 ./run.sh --bench          # CIDE_BENCH=1        IPC transport gate (M0), prints and exits
 ./run.sh --audit-chrome   # CIDE_AUDIT=1        48 chrome dimensions vs the design mock, both themes
@@ -101,6 +115,9 @@ Which check covers what you touched:
 | terminal file links, `cmd/file.rs`'s refusals | `check:paths`, `check:outside-open` |
 | `windows/`, detach and re-dock | `check:detached`, `check:window-controls` |
 | `cide-lang`, `cide-lsp`, symbol navigation, diagnostics | `check:outline`, `check:problems`, `check:commands`, `check:keys` |
+| `ext/`, `sidebar/ExtensionsPanel/`, `cide-ext`, a manifest field | `check:ext`, `check:ext-render`, `check:boundary`, `check:sidebar`, plus `cargo test -p cide-ext` — the manifest refusal table, the path jail, the git route, and, against `../cide-marketplace`, the whole install road |
+| **a `TabKind` variant** | `check:tab-overflow`, `check:tab-drag`, plus `cargo test -p cide-app` — a variant is four arms, and the two that get forgotten are `chrome/TabStrip.tsx`'s (a `never` there is a compile error, which is the point) and `closed_tabs::remembered`'s (a miss there is a tab Ctrl+Shift+T silently will not reopen) |
+| **a language table, a fold spec, a scratch row, `cide_ipc::lang::builtins`** | `cargo --locked xtask codegen`, then `check:editor` — `ui/src/editor/builtinLanguages.ts` is **generated** from Rust and `codegen --check` is the gate. One registry feeds builtins and extensions alike, so a table edited in the wrong place is a language an extension can no longer supersede |
 | **added, renamed or moved any file** | `check:casing` — a name differing from a sibling's only in case is one path on macOS, and it cost a Mac build once (see README's Platforms) |
 
 ## Architecture
@@ -129,7 +146,11 @@ crates/
   cide-tasks/     `.cide/tasks.json`: one owning store, a repairing loader, a stale-file merge.
   cide-agents/    `.cide/` roles and config, and the `cide_task_*` MCP vocabulary. Spawns nothing yet.
   cide-lang/      tree-sitter over Rust and Go: what a file declares. No tauri, no cide-fs.
-  cide-lsp/       an LSP *client* — rust-analyzer and gopls. Threads, not tokio (see its lib.rs).
+  cide-lsp/       an LSP *client*. Threads, not tokio (see its lib.rs). Since M22 the server set
+                  is a registry, not an enum: builtins plus whatever an extension declares.
+  cide-ext/       extensions and the git repositories they come from: manifests, marketplaces,
+                  installs, and the merge that decides which contribution wins. Runs no
+                  extension code — that is a Worker in the webview (ADR 0010).
   cide-hook/      second binary: bridges a Claude hook to the running IDE over a unix socket.
   cide-headless/  third binary: proves the core links without tauri
                   (`cide-headless tree|commands|keymap|tasks|agents`).
@@ -137,8 +158,11 @@ crates/
 
 `docs/adr/` records the decisions that a refactor would otherwise undo — read 0001 (no
 multiwebview), 0002 (Rust owns state), 0003 (xterm owns VT) before changing anything
-structural, and 0009 (real sequencer state) before touching how a conflict is landed: it
-reverses an argument still written out at length in `cide-git/src/replay.rs`.
+structural, 0009 (real sequencer state) before touching how a conflict is landed (it reverses an
+argument still written out at length in `cide-git/src/replay.rs`), and 0010 (extensions out of
+realm) before touching anything under `ui/src/ext/`: it is why a contributed panel is a *view
+model* rather than a React component, and why a capability check that moved into the worker would
+be a check the extension could delete.
 
 ### The state loop
 
@@ -177,6 +201,15 @@ survive-a-window-close, and the stacked-vs-per-project window setting the same m
 3. `ui/src/ipc/client.ts` is the frontend's only seam to `invoke`/`listen`; that is what keeps
    the surface greppable. `ui/src/chrome/WindowFrame.tsx` is the one documented exception, for
    window controls, which are not commands.
+
+`cargo xtask codegen` writes a **second** generated file since M22:
+**`ui/src/editor/builtinLanguages.ts`**, from `cide_ipc::lang::builtins()`. A language's *routing*
+— which extensions it claims, what the status bar calls it, how it folds, whether the scratch
+picker offers it — has one home, in Rust, because the same table is merged with what an extension
+contributes and two copies would drift. What is *not* there is the tokenizer: a builtin's grammar
+contains a function (Rust's lifetimes, Markdown's headings) and stays in
+`ui/src/editor/languages/<id>.ts`. A contributed one carries `rules` instead — see
+`cide_ipc::lang::GrammarRule`.
 
 ### Commands and keys are one registry
 
@@ -241,6 +274,10 @@ that resume depends on; signals arrive through a self-pipe because taking the wo
 a handler deadlocks whenever the interrupted thread already held it.
 
 ### On disk
+
+Under a profile every path below has `cide-<profile>` where it says `cide` — one leaf, decided
+in `cide_core::persist::xdg_dir` and nowhere else, so an instance's whole footprint moves or
+none of it does. Inspect a profile's with `CIDE_PROFILE=<name> ./target/debug/cide-headless tree`.
 
 - `$XDG_STATE_HOME/cide/workspace.json` — the tree. Written atomically, 500 ms debounce; reads
   never fail, because a broken layout must not become a launch loop. Inspect without a GUI:

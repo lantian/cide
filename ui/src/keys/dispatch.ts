@@ -55,6 +55,10 @@ import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
+// M22. The one seam into the extension host from the key layer: `invoke` posts to a worker and
+// answers whether one was there to hear it, which is what makes a contributed command reportable
+// as unavailable rather than silently inert.
+import { invoke as invokeExtension } from '@/ext/host'
 import { explain, pullReport, pushReport, type RepoFetch, type RepoPush } from '@/chrome/branchModel'
 import {
   divergenceOf,
@@ -1935,7 +1939,42 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (!requestPanel('tasks')) return unmet(command, 'this window has no sidebar')
         return
 
+      case 'sidebar.extensions':
+        if (!requestPanel('extensions')) return unmet(command, 'this window has no sidebar')
+        return
+
       default:
+        /*
+         * A command an extension contributed. (M22)
+         *
+         * One arm with a prefix test, and it is what keeps `check:commands`' rule true for a set
+         * that does not exist at build time: *every id is either handled here or carries an
+         * `unavailable` reason*, and the alternative — listed-and-silently-inert — is the state
+         * that once described 24 of 37 commands.
+         *
+         * `ext.<marketplace>.<extension>.<id>`, built by `cide_ext::manifest::command_id` and
+         * refused at install unless every segment is a shape that can be a stable prefix. Split
+         * on the first three dots and nothing else: the extension's own id may contain dots,
+         * because `cide-core`'s builtin ids do (`sidebar.git`, `file.reveal`) and an author will
+         * reach for that on the first try.
+         *
+         * A worker that is not running answers `false`, and that becomes an `unmet` the palette
+         * shows — rather than a command that appears to succeed and does nothing, which is the
+         * failure this whole arm exists to avoid.
+         */
+        if (command.startsWith('ext.')) {
+          const parts = command.slice('ext.'.length).split('.')
+          const marketplace = parts[0]
+          const extension = parts[1]
+          const id = parts.slice(2).join('.')
+          if (marketplace === undefined || extension === undefined || id === '') {
+            return unmet(command, 'that extension command id is malformed')
+          }
+          if (!invokeExtension({ marketplace, extension }, id)) {
+            return unmet(command, 'that extension is not running')
+          }
+          return
+        }
         // Not a registered command at all: see `DispatchDeps.fallback`.
         deps.fallback(command, args)
     }

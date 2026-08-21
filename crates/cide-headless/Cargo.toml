@@ -23,3 +23,8 @@ cide-pty = { workspace = true }
 # binary building the same way one in `cide-core` does.
 cide-tasks = { workspace = true }
 cide-agents = { workspace = true }
+# M22's crate, linked for the same reason and after the same mistake: `tasks` and `agents` are in
+# this list because M18 added two crates the proof never linked, and for a milestone the guard
+# covered less than it claimed to. `ext` calls the real `ExtStore::new`, so an `AppHandle` reached
+# for anywhere in `cide-ext` stops this binary building.
+cide-ext = { workspace = true }

@@ -26,7 +26,7 @@ import styles from './ActivityRail.module.css'
  */
 export type { ActivityView }
 
-interface RailItem {
+export interface RailItem {
   id: ActivityView
   /**
    * The item's icon, as an inline path in a 24×24 viewBox, stroked not filled and drawn at
@@ -185,6 +185,18 @@ const TOOLWINDOW_PATH =
   'M6 4h12a2.5 2.5 0 0 1 2.5 2.5v11a2.5 2.5 0 0 1-2.5 2.5H6a2.5 2.5 0 0 1-2.5-2.5v-11'
   + 'A2.5 2.5 0 0 1 6 4ZM3.5 14.5h17'
 
+/*
+ * Four blocks with one lifted clear of the others: Extensions. (M22)
+ *
+ * A jigsaw piece is the conventional mark and it is the wrong one at 20px — the tab and the
+ * socket are the whole silhouette and both are smaller than the stroke, so it arrives as a blob.
+ * Three blocks in an L with a fourth floating above the gap reads as "a thing that plugs in" at
+ * this size, and is distinguishable at a glance from the ticked box and the panel below it,
+ * which are the two other rounded rectangles in this rail.
+ */
+const EXTENSIONS_PATH =
+  'M4.5 4.5h6v6h-6ZM4.5 13.5h6v6h-6ZM13.5 13.5h6v6h-6ZM16.5 3v7M13 6.5h7'
+
 const ITEMS: readonly RailItem[] = [
   { id: 'files', path: FILES_PATH, label: 'Files' },
   { id: 'git', path: GIT_PATH, label: 'Git' },
@@ -199,6 +211,16 @@ const ITEMS: readonly RailItem[] = [
    */
   { id: 'agents', path: AGENTS_PATH, label: 'Agents' },
   { id: 'tasks', path: TASKS_PATH, label: 'Tasks' },
+  /*
+   * M22's manager panel, and the *contributed* panels arrive separately through the `extra` prop
+   * below rather than by being pushed onto this array. Two reasons, and the second is the real
+   * one: this array is a module constant that `chrome/layoutAudit.ts` drives with fixed props,
+   * and a set that changed when an extension was enabled would make the audit's measurements
+   * depend on what the developer running it happens to have installed. The first is simply that
+   * this file may not import the extension store — every value in this component is a prop, which
+   * is the rule its header states.
+   */
+  { id: 'extensions', path: EXTENSIONS_PATH, label: 'Extensions' },
   { id: 'settings', path: SETTINGS_PATH, label: 'Settings', bottom: true },
 ]
 
@@ -305,6 +327,20 @@ export interface ActivityRailProps {
    */
   toolWindowOpen?: boolean | undefined
   onToggleToolWindow?: (() => void) | undefined
+  /**
+   * Buttons contributed by extensions, in registry order. (M22)
+   *
+   * Inserted immediately before the spacer, so they sit under Extensions and above the pinned
+   * Settings — the position M18's two took for the same reason, which `ITEMS` records: appending
+   * after Settings would put buttons *below* the flexible gap, a change that looks right in the
+   * diff and wrong on screen.
+   *
+   * A prop and not a module constant, because unlike every other button here the set is not known
+   * until `extensions.json` has been read. Optional, so `chrome/layoutAudit.ts` and every fixture
+   * keep driving this component with fixed props and measure a rail that does not depend on what
+   * the developer running the audit has installed.
+   */
+  extra?: readonly RailItem[] | undefined
 }
 
 export function ActivityRail({
@@ -317,7 +353,20 @@ export function ActivityRail({
   onSelect,
   toolWindowOpen,
   onToggleToolWindow,
+  extra,
 }: ActivityRailProps) {
+  /*
+   * The builtins, with the contributed buttons spliced in ahead of the spacer.
+   *
+   * `SPACER_AT` is a `findIndex` over `ITEMS`, so the splice has to happen before the index is
+   * used or the gap lands in the middle of the extension buttons. Recomputed rather than
+   * adjusted, which is one line and cannot be off by one.
+   */
+  const items: readonly RailItem[] =
+    extra === undefined || extra.length === 0
+      ? ITEMS
+      : [...ITEMS.slice(0, SPACER_AT), ...extra, ...ITEMS.slice(SPACER_AT)]
+  const spacerAt = items.findIndex((item) => item.bottom === true)
   /*
    * Keyed by view id so the loop stays layout-only; more entries land here, not in JSX.
    *
@@ -400,7 +449,7 @@ export function ActivityRail({
         aria-orientation="vertical"
         aria-label="Sidebar panels"
       >
-      {ITEMS.map((item, i) => {
+      {items.map((item, i) => {
         const selected = item.id === active
         const badge = badges[item.id]
         const name = badge === undefined ? item.label : `${item.label} — ${badge.name}`
@@ -408,7 +457,7 @@ export function ActivityRail({
           <Fragment key={item.id}>
             {/* Hidden from the accessibility tree: a tablist should own nothing but tabs,
                 and this filler carries no meaning. */}
-            {i === SPACER_AT && <div className={styles.spacer} aria-hidden="true" />}
+            {i === spacerAt && <div className={styles.spacer} aria-hidden="true" />}
             <button
               type="button"
               role="tab"

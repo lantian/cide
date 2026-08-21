@@ -21,7 +21,7 @@
  * shared by every view that is the same column with different rows in it. See
  * [`SIDEBAR_TOKEN`] for which views share which, and why.
  */
-export type SidebarPanel = 'files' | 'git' | 'agents'
+export type SidebarPanel = 'files' | 'git' | 'agents' | 'ext'
 
 /**
  * Which custom property each panel's width is stored in.
@@ -49,6 +49,7 @@ export const SIDEBAR_TOKEN: Readonly<Record<SidebarPanel, string>> = {
   files: '--w-sidebar-files',
   git: '--w-sidebar-git',
   agents: '--w-sidebar-agents',
+  ext: '--w-sidebar-ext',
 }
 
 /**
@@ -65,6 +66,10 @@ export const SIDEBAR_DEFAULT: Readonly<Record<SidebarPanel, number>> = {
   files: 252,
   git: 420,
   agents: 320,
+  // One number for every contributed panel, defaulting to the explorer's because a tree of rows
+  // is the shape 252px was chosen for. `SidebarSettings::ext_width` argues why it is not a width
+  // per extension, and what would have to change for it to become one. (M22)
+  ext: 252,
 }
 
 /**
@@ -117,6 +122,8 @@ export interface SidebarWidths {
   files: number
   git: number
   agents: number
+  /** Every panel an extension contributes. One number for all of them — see [`SIDEBAR_DEFAULT`]. */
+  ext: number
 }
 
 /**
@@ -133,6 +140,8 @@ export interface StoredSidebar {
    * the boot cache, and [`decodeWidths`] takes a `Partial<StoredSidebar>` for exactly that.
    */
   agentsWidth: number
+  /** Added in M22, non-optional here for [`StoredSidebar.agentsWidth`]'s reason. */
+  extWidth: number
 }
 
 /**
@@ -202,12 +211,18 @@ export function widthsFromSettings(sidebar: StoredSidebar | null | undefined): S
     files: clampSidebarWidth(sidebar.filesWidth),
     git: clampSidebarWidth(sidebar.gitWidth),
     agents: clampSidebarWidth(sidebar.agentsWidth),
+    ext: clampSidebarWidth(sidebar.extWidth),
   }
 }
 
 /** The patch shape, for `settings.set({ sidebar })`. Every width, per the patch-per-field rule. */
 export function toStored(widths: SidebarWidths): StoredSidebar {
-  return { filesWidth: widths.files, gitWidth: widths.git, agentsWidth: widths.agents }
+  return {
+    filesWidth: widths.files,
+    gitWidth: widths.git,
+    agentsWidth: widths.agents,
+    extWidth: widths.ext,
+  }
 }
 
 /**
@@ -221,6 +236,7 @@ export function widthDeclarations(widths: SidebarWidths): [property: string, val
     [SIDEBAR_TOKEN.files, `${widths.files}px`],
     [SIDEBAR_TOKEN.git, `${widths.git}px`],
     [SIDEBAR_TOKEN.agents, `${widths.agents}px`],
+    [SIDEBAR_TOKEN.ext, `${widths.ext}px`],
   ]
 }
 
@@ -276,7 +292,7 @@ export function decodeWidths(raw: string | null | undefined): SidebarWidths {
   try {
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return { ...SIDEBAR_DEFAULT }
-    const { filesWidth, gitWidth, agentsWidth } = parsed as Partial<StoredSidebar>
+    const { filesWidth, gitWidth, agentsWidth, extWidth } = parsed as Partial<StoredSidebar>
     return {
       files: typeof filesWidth === 'number' ? clampSidebarWidth(filesWidth) : SIDEBAR_DEFAULT.files,
       git: typeof gitWidth === 'number' ? clampSidebarWidth(gitWidth) : SIDEBAR_DEFAULT.git,
@@ -291,6 +307,9 @@ export function decodeWidths(raw: string | null | undefined): SidebarWidths {
       // field reads as 320, one frame before the snapshot from Rust replaces it anyway.
       agents:
         typeof agentsWidth === 'number' ? clampSidebarWidth(agentsWidth) : SIDEBAR_DEFAULT.agents,
+      // And the same guard again for M22's width, for the reason spelled out above: every cache
+      // line written before it holds three widths and no `extWidth`.
+      ext: typeof extWidth === 'number' ? clampSidebarWidth(extWidth) : SIDEBAR_DEFAULT.ext,
     }
   } catch {
     // A half-written or hand-edited line must not stop the app from booting.

@@ -18,13 +18,33 @@
 #
 # `--release` skips all of that: a release build embeds `frontendDist`, so it needs no server.
 #
+# --- the dev profile ---------------------------------------------------------------------
+#
+# This script launches under the `dev` profile by default, which is what makes it safe to run
+# beside an installed cide you are using for real work. A profile moves the whole footprint:
+# `$XDG_STATE_HOME/cide-dev` and `$XDG_CONFIG_HOME/cide-dev` instead of `.../cide`, a separate
+# Tauri bundle identifier so the WebKit storage, the log and the remembered window geometry
+# move too, and a `[DEV] ` prefix on the window title so the two are distinguishable in a task
+# switcher. Without it both instances write one `workspace.json`, and the last one to exit
+# stamps its layout over the other's.
+#
+# Consequence worth knowing before you report it as a bug: **a profile starts factory-fresh.**
+# Settings live inside `workspace.json`, so a new profile has no installed extensions, no
+# global agent roles, the default keymap and the default theme. That is the point, but it is
+# surprising the first time.
+#
+# `--profile default` opts back out and shares the real instance's state.
+#
 #   ./run.sh                      # normal launch (starts Vite if it is not already up)
 #   ./run.sh --release            # build and run the release binary; no dev server
+#   ./run.sh --profile <name>     # run under a named profile ("default" = the real instance)
 #   ./run.sh --bench              # IPC transport gate (M0), prints and exits
 #   ./run.sh --audit-chrome       # chrome vs the design mock (M3), prints and exits
 #   ./run.sh --audit-panes        # pane host registry under churn (M4)
 #   ./run.sh --audit-windows      # detach/re-dock and window modes (M5)
 #   ./run.sh --input-probe        # trace every keyboard emitter into the log (see below)
+#   ./run.sh --webgl-renderer     # opt back in to xterm's WebGL renderer (see below)
+#   ./run.sh --inspect            # console into the Rust log + WebKit inspector on :9222
 #   ./run.sh --fresh              # start from an empty workspace
 #   ./run.sh --on-top             # keep the window above others, for screenshots
 #
@@ -32,17 +52,30 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
-WORKSPACE="${XDG_STATE_HOME:-$HOME/.local/state}/cide/workspace.json"
 MAX_WINDOWS=8
 DEV_PORT=1420
+
+# Printed for an unknown option. Content-addressed rather than a line range: this used to be
+# `sed -n '20,29p'`, which silently drifted the moment a line was added above it — by the time
+# it was replaced it was already omitting two implemented flags.
+usage() { sed -n '/^#   \.\/run\.sh/p' "$0" >&2; }
 
 env_flags=()
 fresh=0
 release=0
+# The whole point of this script: an instance that is not the one you work in. `--profile
+# default` is the way back out.
+profile=dev
 
-for arg in "$@"; do
-  case "$arg" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --release)        release=1 ;;
+    # A value flag, which is why this loop shifts rather than iterating `$@` directly. Both
+    # spellings, because `--profile=x` is what anyone scripting it will reach for.
+    --profile)
+      [ $# -ge 2 ] || { echo "--profile needs a name" >&2; usage; exit 2; }
+      profile="$2"; shift ;;
+    --profile=*)      profile="${1#--profile=}" ;;
     --bench)          env_flags+=(CIDE_BENCH=1) ;;
     --audit-chrome)   env_flags+=(CIDE_AUDIT=1) ;;
     --audit-panes)    env_flags+=(CIDE_AUDIT_PANES=1) ;;
@@ -61,9 +94,25 @@ for arg in "$@"; do
     --inspect)        env_flags+=(CIDE_CONSOLE_BRIDGE=1 WEBKIT_INSPECTOR_SERVER=127.0.0.1:9222) ;;
     --on-top)         env_flags+=(CIDE_ON_TOP=1) ;;
     --fresh)          fresh=1 ;;
-    *) echo "unknown option: $arg" >&2; sed -n '20,29p' "$0" >&2; exit 2 ;;
+    *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
+  shift
 done
+
+# `default` is the reserved "no profile" name, matching `cide_core::profile`. Normalised to an
+# empty string here so every test below is `[ -n "$profile" ]` rather than two spellings.
+[ "$profile" = default ] && profile=""
+
+# Computed *after* the parse loop, and that ordering is load-bearing: `--fresh` renames this
+# file, so a `WORKSPACE` resolved before `--profile` was read would move the real instance's
+# layout aside when the user asked to reset a profile's.
+if [ -n "$profile" ]; then
+  env_flags+=("CIDE_PROFILE=$profile")
+  STATE_LEAF="cide-$profile"
+else
+  STATE_LEAF="cide"
+fi
+WORKSPACE="${XDG_STATE_HOME:-$HOME/.local/state}/$STATE_LEAF/workspace.json"
 
 if [ "$release" = 1 ]; then
   BIN=./target/release/cide
@@ -75,7 +124,32 @@ fi
 
 # Matched on the exact binary path rather than the word "cide", which would also match this
 # script, an editor holding the source, and the agent session that started it.
-mapfile -t running < <(pgrep -f "^${BIN}$" 2>/dev/null || true)
+mapfile -t candidates < <(pgrep -f "^${BIN}$" 2>/dev/null || true)
+
+# Which profile a running process belongs to, read from its own environment.
+#
+# The binary path alone is no longer enough. It does separate this script from an installed
+# build — `^./target/debug/cide$` cannot match an AppImage — but `./run.sh` and
+# `./run.sh --profile default` are the *same* path, and killing across that line is exactly
+# what the profile exists to prevent. `grep -qxF` because the match must be exact: without
+# `-x` the profile `dev` matches a process running `dev2`. An unreadable `environ` is a pid
+# that died between `pgrep` and here, which is not a match.
+in_this_profile() {
+  local env_file="/proc/$1/environ"
+  [ -r "$env_file" ] || return 1
+  if [ -n "$profile" ]; then
+    tr '\0' '\n' < "$env_file" 2>/dev/null | grep -qxF "CIDE_PROFILE=$profile"
+  else
+    # The default profile is the *absence* of the variable, so this is the mirror image.
+    ! tr '\0' '\n' < "$env_file" 2>/dev/null | grep -q '^CIDE_PROFILE='
+  fi
+}
+
+running=()
+strangers=()
+for pid in "${candidates[@]}"; do
+  if in_this_profile "$pid"; then running+=("$pid"); else strangers+=("$pid"); fi
+done
 
 if [ "${#running[@]}" -gt 0 ]; then
   echo "[run] stopping ${#running[@]} running instance(s): ${running[*]}"
@@ -84,16 +158,33 @@ if [ "${#running[@]}" -gt 0 ]; then
   # finish writing the transcript that makes its conversation resumable.
   kill -TERM "${running[@]}" 2>/dev/null
 
+  # Polled with `kill -0` over the collected pids rather than by re-running `pgrep`, because
+  # a fresh `pgrep` cannot express the profile filter and would wait on processes this run
+  # has deliberately left alone.
   for _ in $(seq 1 40); do
-    pgrep -f "^${BIN}$" >/dev/null 2>&1 || break
+    alive=0
+    for pid in "${running[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" = 0 ] && break
     sleep 0.25
   done
 
-  if pgrep -f "^${BIN}$" >/dev/null 2>&1; then
+  survivors=()
+  for pid in "${running[@]}"; do kill -0 "$pid" 2>/dev/null && survivors+=("$pid"); done
+  if [ "${#survivors[@]}" -gt 0 ]; then
     echo "[run] did not exit on SIGTERM; sending SIGKILL"
-    pkill -KILL -f "^${BIN}$" 2>/dev/null
+    kill -KILL "${survivors[@]}" 2>/dev/null
     sleep 1
   fi
+fi
+
+# Warned about, never killed — leaving them alone is the whole point. But the build below
+# rewrites `target/debug/cide-hook` underneath them, and a running instance resolves the hook
+# by path on every spawn. A stale-shape hook reports into a newer IDE with no error and no log
+# line; see the note on `cide-hook` in the build section. So this has to be said out loud.
+if [ "${#strangers[@]}" -gt 0 ]; then
+  echo "[run] NOTE: ${#strangers[@]} instance(s) of $BIN are running under another profile: ${strangers[*]}"
+  echo "[run] They are being left alone, but rebuilding will replace the cide-hook they spawn."
+  echo "[run] Restart them once this build finishes if their hooks start misbehaving."
 fi
 
 # A `claude` reparented to init is one the app failed to reap. Left alone they accumulate
@@ -109,7 +200,7 @@ fi
 if [ "$fresh" = 1 ]; then
   if [ -f "$WORKSPACE" ]; then
     mv "$WORKSPACE" "$WORKSPACE.bak"
-    echo "[run] --fresh: previous workspace moved to $WORKSPACE.bak"
+    echo "[run] --fresh: previous ${profile:-default} workspace moved to $WORKSPACE.bak"
   fi
 elif [ -f "$WORKSPACE" ]; then
   windows=$(python3 -c "
@@ -120,10 +211,17 @@ except Exception:
     print(0)
 " 2>/dev/null || echo 0)
   if [ "$windows" -gt "$MAX_WINDOWS" ]; then
-    echo "[run] REFUSING: the saved workspace records $windows windows (cap $MAX_WINDOWS)."
+    echo "[run] REFUSING: the ${profile:-default} profile's saved workspace records $windows windows (cap $MAX_WINDOWS)."
     echo "[run] Opening it would put that many windows on screen."
-    echo "[run] Inspect it with:  ./target/debug/cide-headless tree"
-    echo "[run] Or start clean:   ./run.sh --fresh"
+    # `cide-headless` links `cide-core`, so it reads whichever profile it is told to — the
+    # hint has to carry it or it prints the wrong workspace and reads as a contradiction.
+    if [ -n "$profile" ]; then
+      echo "[run] Inspect it with:  CIDE_PROFILE=$profile ./target/debug/cide-headless tree"
+      echo "[run] Or start clean:   ./run.sh --profile $profile --fresh"
+    else
+      echo "[run] Inspect it with:  ./target/debug/cide-headless tree"
+      echo "[run] Or start clean:   ./run.sh --profile default --fresh"
+    fi
     exit 1
   fi
 fi
@@ -223,9 +321,18 @@ fi
 
 # --- launch ----------------------------------------------------------------------------
 
-echo "[run] starting ${env_flags[*]:-} $BIN"
+echo "[run] starting ${env_flags[*]:-} $BIN  (profile: ${profile:-default})"
 # Not `exec`: this shell has to outlive the app to stop the dev server it started.
-env "${env_flags[@]}" "$BIN"
+# `env -u CIDE_PROFILE` rather than simply omitting it from `env_flags`, and this is not
+# belt-and-braces. This script is very often launched from a shell *inside* a cide pane, and a
+# child of a profiled instance inherits `CIDE_PROFILE=dev` from it. Without the explicit unset,
+# `./run.sh --profile default` run from a dev pane — the single most likely way anyone reaches
+# for the escape hatch — would silently come up in the dev profile anyway.
+if [ -n "$profile" ]; then
+  env "${env_flags[@]}" "$BIN"
+else
+  env -u CIDE_PROFILE "${env_flags[@]}" "$BIN"
+fi
 status=$?
 echo "[run] cide exited with status $status"
 exit "$status"

@@ -551,13 +551,16 @@ eq(fences.fenceLanguage('nosuchlang'), null, 'and so does something nobody has h
 /*
  * Every alias resolves. A dead entry here is a fence that silently stops being coloured, which
  * nothing else in this repository would notice.
+ *
+ * Read out of the language table rather than out of `fenceTokens.ts`, which is where a
+ * `FENCE_ALIASES` map lived until M22. A language now names its own fence words beside the
+ * extensions it claims — one place per language instead of two — so the list to sweep is every
+ * `fenceAliases` entry in `BUILTIN_LANGUAGES`, plus whatever an extension adds at runtime, which
+ * this check cannot see and `cide-ext`'s own tests cover instead.
  */
-const aliasSource = readFileSync(join('src', 'editor', 'markdown', 'fenceTokens.ts'), 'utf8')
-const aliasBlock = aliasSource.slice(
-  aliasSource.indexOf('const FENCE_ALIASES'),
-  aliasSource.indexOf('}', aliasSource.indexOf('const FENCE_ALIASES')),
+const aliases = require(join(out, 'editor/builtinLanguages.js')).BUILTIN_LANGUAGES.flatMap(
+  (lang) => lang.fenceAliases,
 )
-const aliases = [...aliasBlock.matchAll(/^\s+'?([\w+-]+)'?:\s*'([\w+]+)',/gm)].map((m) => m[1])
 ok(aliases.length >= 10, `the alias table was found and scanned (${aliases.length} entries)`)
 eq(
   aliases.filter((word) => fences.fenceLanguage(word) === null),

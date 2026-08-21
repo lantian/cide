@@ -78,7 +78,7 @@ fn a_real_rust_analyzer_indexes_this_workspace_and_reaches_ready() {
         .expect("workspace root")
         .to_path_buf();
 
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![root]).expect("start rust-analyzer");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![root]).expect("start rust-analyzer");
 
     // 180s: rust-analyzer on a workspace this size is 30–120s to first useful output on a warm
     // cache and slower on a cold one. A shorter timeout makes this test flaky rather than fast.
@@ -163,7 +163,7 @@ fn a_real_rust_analyzer_reports_a_type_error_we_introduce() {
     )
     .expect("write");
 
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
     let (found, seen) = wait_for(&handle, Duration::from_secs(180), |events| {
         events.iter().any(|e| {
             matches!(e, LspEvent::Published { items, .. } if items.iter().any(|d| d.message.contains("mismatched types")))
@@ -196,7 +196,7 @@ fn a_real_gopls_reports_on_a_module() {
     )
     .expect("write");
 
-    let handle = LspHandle::start(Server::Gopls, vec![dir.clone()]).expect("start gopls");
+    let handle = LspHandle::start(Server::GOPLS, vec![dir.clone()]).expect("start gopls");
     let (found, seen) = wait_for(&handle, Duration::from_secs(120), |events| {
         events
             .iter()
@@ -222,7 +222,7 @@ fn dropping_the_handle_stops_the_server() {
     // rust-analyzer is 1–4 GB the user never asked for, and `Drop` is the only thing between
     // them and it.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![root]).expect("start");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![root]).expect("start");
     // Let it get as far as spawning before pulling the rug out — stopping during the handshake is
     // the interesting case, because that is when the shutdown request has nowhere to go.
     std::thread::sleep(Duration::from_millis(500));
@@ -266,7 +266,7 @@ fn an_on_disk_edit_alone_never_refreshes_diagnostics() {
     .expect("write");
     std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> u32 { \"nope\" }\n").expect("write");
 
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
     let broken = |events: &[LspEvent]| {
         events.iter().any(|e| {
             matches!(e, LspEvent::Published { items, .. } if items.iter().any(|d| d.message.contains("mismatched types")))
@@ -322,7 +322,7 @@ fn a_real_rust_analyzer_resolves_a_definition() {
     )
     .expect("write");
 
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
     let (up, seen) = wait_for(&handle, Duration::from_secs(180), ready);
     assert!(
         up,
@@ -336,7 +336,7 @@ fn a_real_rust_analyzer_resolves_a_definition() {
     // The file has to be open before the server will answer about it — the same prerequisite
     // `docSync.ts` exists to satisfy in the app.
     let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RUST_ANALYZER);
     let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
     if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
         handle.send(message);
@@ -407,7 +407,7 @@ fn a_real_rust_analyzer_finds_the_usages_of_a_declaration() {
     )
     .expect("write");
 
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
     let (up, seen) = wait_for(&handle, Duration::from_secs(180), ready);
     assert!(
         up,
@@ -427,7 +427,7 @@ fn a_real_rust_analyzer_finds_the_usages_of_a_declaration() {
     );
 
     let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RUST_ANALYZER);
     let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
     if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
         handle.send(message);
@@ -529,7 +529,7 @@ fn a_flycheck_kick_refreshes_diagnostics_an_on_disk_edit_alone_would_not() {
      * sending it safe and also what makes it invisible when it breaks.
      */
     let dir = broken_rust_crate("flycheck");
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
     let (saw_error, seen) = wait_for(&handle, Duration::from_secs(180), saw_mismatch);
     assert!(
         saw_error,
@@ -547,7 +547,7 @@ fn a_flycheck_kick_refreshes_diagnostics_an_on_disk_edit_alone_would_not() {
     // for the answer.
     let _ = handle.drain();
 
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RUST_ANALYZER);
     let cide_lsp::Effect::Send(kick) = session.run_flycheck() else {
         panic!("run_flycheck must be a Send effect")
     };
@@ -601,10 +601,10 @@ fn rust_analyzer_answers_go_to_implementation() {
     )
     .expect("write");
 
-    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
     let (_, seen) = wait_for(&handle, Duration::from_secs(180), ready);
     let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RUST_ANALYZER);
     let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
     if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
         handle.send(message);
@@ -702,10 +702,10 @@ fn gopls_goes_to_the_implementation_rather_than_the_interface() {
     )
     .expect("write");
 
-    let handle = LspHandle::start(Server::Gopls, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::GOPLS, vec![dir.clone()]).expect("start");
     let (_, seen) = wait_for(&handle, Duration::from_secs(120), ready);
     let uri = cide_lsp::convert::path_to_uri(&dir.join("probe.go"));
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::Gopls);
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::GOPLS);
     let text = std::fs::read_to_string(dir.join("probe.go")).expect("read");
     if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "go", 1, text) {
         handle.send(message);
@@ -804,7 +804,7 @@ fn gopls_re_diagnoses_a_file_it_was_told_changed_on_disk() {
     )
     .expect("write");
 
-    let handle = LspHandle::start(Server::Gopls, vec![dir.clone()]).expect("start");
+    let handle = LspHandle::start(Server::GOPLS, vec![dir.clone()]).expect("start");
     let broken = |events: &[LspEvent]| {
         events.iter().any(|e| {
             matches!(e, LspEvent::Published { items, .. } if items.iter().any(|d| d.message.contains("undefinedName")))
@@ -828,7 +828,7 @@ fn gopls_re_diagnoses_a_file_it_was_told_changed_on_disk() {
     .expect("write");
     let _ = handle.drain();
 
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::Gopls);
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::GOPLS);
     // `2` is LSP's `FileChangeType::Changed`. This is byte-for-byte what
     // `ProjectDiagnostics::files_changed` sends from the watcher thread.
     let cide_lsp::Effect::Send(notice) = session.did_change_watched_files(vec![(

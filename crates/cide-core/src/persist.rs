@@ -31,13 +31,27 @@ pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 ///
 /// State rather than config because `workspace.json` is written by the app, not edited by
 /// the user, and putting it in the config directory invites it into dotfile repositories.
+///
+/// Under a profile the leaf is `cide-<profile>` instead — see [`crate::profile`]. That is the
+/// whole of how a second instance keeps its own everything, because every durable path in the
+/// app is built from this function or [`config_dir`].
 pub fn state_dir() -> PathBuf {
-    xdg_dir(std::env::var_os("XDG_STATE_HOME"), ".local/state")
+    xdg_dir(
+        std::env::var_os("XDG_STATE_HOME"),
+        ".local/state",
+        crate::profile::dir_leaf(),
+    )
 }
 
 /// Where user-authored config goes: `$XDG_CONFIG_HOME/cide`, else `~/.config/cide`.
+///
+/// Profile-aware on the same terms as [`state_dir`].
 pub fn config_dir() -> PathBuf {
-    xdg_dir(std::env::var_os("XDG_CONFIG_HOME"), ".config")
+    xdg_dir(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        ".config",
+        crate::profile::dir_leaf(),
+    )
 }
 
 /// The persisted workspace tree.
@@ -66,18 +80,30 @@ pub fn recent_path() -> PathBuf {
     state_dir().join("recent.json")
 }
 
-/// Resolve one XDG base directory, appending `cide`.
+/// Resolve one XDG base directory, appending the instance's directory name.
 ///
 /// A relative value is ignored, as the spec requires: it would resolve against the working
 /// directory and scatter a `.local/state/cide` into whatever project the user launched from.
-fn xdg_dir(configured: Option<OsString>, fallback: &str) -> PathBuf {
+///
+/// `leaf` comes from [`crate::profile::dir_leaf`], and the two callers above are the *only*
+/// place in the workspace that decides it. Every state and config path — the workspace tree,
+/// the recents, the scratches, the notes, `cide-git`'s per-repo sidecars, the installed
+/// extensions, `keymap.json` — is built from those two functions, so one instance's whole
+/// footprint moves or none of it does. A third site spelling the leaf out would be a file the
+/// profile silently failed to separate.
+///
+/// It is a *parameter* rather than read here so this function stays a pure mapping that a test
+/// can pin. Reading the profile inside would make the assertions below depend on the ambient
+/// `CIDE_PROFILE` — and the environment `cargo test` inherits is precisely the one where a
+/// profile is likely to be set, because the terminal is running inside a profiled cide.
+fn xdg_dir(configured: Option<OsString>, fallback: &str, leaf: &str) -> PathBuf {
     if let Some(configured) = configured {
         let base = PathBuf::from(configured);
         if base.is_absolute() {
-            return base.join("cide");
+            return base.join(leaf);
         }
     }
-    home().join(fallback).join("cide")
+    home().join(fallback).join(leaf)
 }
 
 /// The user's home directory.
@@ -2569,15 +2595,21 @@ mod tests {
     #[test]
     fn an_absolute_xdg_override_is_honoured_and_a_relative_one_ignored() {
         assert_eq!(
-            xdg_dir(Some("/srv/state".into()), ".local/state"),
+            xdg_dir(Some("/srv/state".into()), ".local/state", "cide"),
             PathBuf::from("/srv/state/cide")
         );
         // A relative override would resolve against the working directory, so the default
         // wins instead.
         assert!(
-            xdg_dir(Some("relative/state".into()), ".local/state").ends_with(".local/state/cide")
+            xdg_dir(Some("relative/state".into()), ".local/state", "cide")
+                .ends_with(".local/state/cide")
         );
-        assert!(xdg_dir(None, ".local/state").ends_with(".local/state/cide"));
+        assert!(xdg_dir(None, ".local/state", "cide").ends_with(".local/state/cide"));
+        // A profile changes the leaf and nothing else about the resolution.
+        assert_eq!(
+            xdg_dir(Some("/srv/state".into()), ".local/state", "cide-dev"),
+            PathBuf::from("/srv/state/cide-dev")
+        );
     }
 
     #[test]

@@ -1,0 +1,232 @@
+/*
+ * A contributed panel. (M22)
+ *
+ * ## One stylesheet for every extension
+ *
+ * There is no per-extension CSS and there will not be. An extension posts a view model and cide
+ * draws it, so every contributed panel in the product is styled by this file — which is what makes
+ * `check:theme` and `check:ui-scale` true of a panel whose author has never heard of either.
+ *
+ * ## Width, and why it is the explorer's
+ *
+ * `--w-sidebar-ext` exists so a contributed panel can be resized independently, and it *defaults*
+ * to the files width because a tree of rows is the shape the explorer's 252px was chosen for. The
+ * alternative — borrowing `--w-sidebar-files` outright, as `ProblemsPanel.module.css` does — was
+ * rejected for one reason: two extensions with very different panels would have to share a drag,
+ * and neither author can do anything about it.
+ *
+ * ## Header
+ *
+ * 30px / 10.5px / uppercase, exactly as the files, problems and agents headers are, so the
+ * horizontal rule under it lands on the same row of pixels whatever the rail is showing.
+ *
+ * Every size is a rung of the `--fs-ui-*` ladder and every colour is a token: a bare `font-size:
+ * 11px` here would be a label that silently stops following the UI font size, and it would look
+ * right at the default, which is where the work happens.
+ */
+
+.panel {
+  width: var(--w-sidebar-ext);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/* In the bottom tool window the panel fills its tab rather than owning a width. */
+.docked {
+  width: auto;
+  flex: 1 1 auto;
+  border-right: none;
+}
+
+.header {
+  height: calc(30px * var(--ui-scale));
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-10-5);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.action {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-10-5);
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.action:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: calc(22px * var(--ui-scale));
+  padding: 0 10px 0 0;
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: default;
+  width: 100%;
+}
+
+.clickable {
+  cursor: pointer;
+}
+
+.row:hover {
+  background: var(--chrome-hi);
+}
+
+.twisty {
+  flex: none;
+  width: calc(12px * var(--ui-scale));
+  color: var(--dim);
+  font-size: var(--fs-ui-9);
+  text-align: center;
+}
+
+.icon {
+  flex: none;
+  width: calc(14px * var(--ui-scale));
+  text-align: center;
+  color: var(--dim);
+  font-size: var(--fs-ui-10);
+}
+
+.label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail {
+  margin-left: auto;
+  padding-left: 8px;
+  color: var(--dim);
+  font-size: var(--fs-ui-10-5);
+  white-space: nowrap;
+}
+
+.toneDim {
+  color: var(--dim);
+}
+
+.toneAccent {
+  color: var(--accent);
+}
+
+.toneError {
+  color: var(--red);
+}
+
+.toneWarning {
+  color: var(--yellow);
+}
+
+.notice {
+  padding: 12px 10px;
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.failed {
+  color: var(--red);
+}
+
+.truncated {
+  padding: 6px 10px;
+  font-size: var(--fs-ui-10-5);
+  color: var(--dim);
+  font-style: italic;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-ui-11-5);
+}
+
+.table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--dim);
+  font-size: var(--fs-ui-10-5);
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+.table td {
+  padding: 3px 10px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 0;
+}
+
+.markdown {
+  padding: 10px;
+  font-size: var(--fs-ui-12);
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}

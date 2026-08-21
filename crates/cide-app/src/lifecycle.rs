@@ -689,7 +689,9 @@ mod notice {
         use gtk::prelude::*;
 
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
-        window.set_title("Closing cide");
+        // Through `os_title` like every other window: this is the last thing on screen during
+        // a shutdown, and it is precisely when two instances are easiest to confuse.
+        window.set_title(&crate::windows::os_title("Closing cide"));
         window.set_default_size(420, -1);
         window.set_resizable(false);
         // There is nothing to cancel: by the time this is on screen the workspace is written

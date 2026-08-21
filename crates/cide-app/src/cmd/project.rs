@@ -1008,6 +1008,22 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
     match (open, wanted) {
         (TabKind::File { path: a, .. }, TabKind::File { path: b, .. }) => a == b,
         (TabKind::Settings { .. }, TabKind::Settings { .. }) => true,
+        // An extension page is a singleton *per extension*, not per project: two of them are two
+        // different READMEs, and a user comparing SQL against YAML wants both open. The `name` is
+        // deliberately not part of the identity — it is a caption, and an extension that renamed
+        // itself between the tab opening and a refresh must not become a second tab.
+        (
+            TabKind::Extension {
+                marketplace: ma,
+                extension: ea,
+                ..
+            },
+            TabKind::Extension {
+                marketplace: mb,
+                extension: eb,
+                ..
+            },
+        ) => ma == mb && ea == eb,
         (TabKind::Diff { spec: a, .. }, TabKind::Diff { spec: b, .. }) => {
             match (&a.origin, &b.origin) {
                 (

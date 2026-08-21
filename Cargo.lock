@@ -602,6 +602,7 @@ dependencies = [
  "cide-claude",
  "cide-core",
  "cide-deps",
+ "cide-ext",
  "cide-fs",
  "cide-git",
  "cide-ide-mcp",
@@ -680,6 +681,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cide-ext"
+version = "0.2.0"
+dependencies = [
+ "cide-core",
+ "cide-ipc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "cide-fs"
 version = "0.2.0"
 dependencies = [
@@ -717,6 +731,7 @@ version = "0.2.0"
 dependencies = [
  "cide-agents",
  "cide-core",
+ "cide-ext",
  "cide-ipc",
  "cide-pty",
  "cide-tasks",

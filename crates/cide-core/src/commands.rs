@@ -136,6 +136,38 @@ pub fn registry() -> &'static [Command] {
 ///
 /// A linear scan: the table is a few dozen entries and lookups happen on keystrokes a
 /// human made, so a map would buy nothing and cost a second structure to keep in step.
+/// The group every contributed command is listed under. (M22)
+///
+/// One group and not one per extension, which was the other option and loses on the palette's own
+/// terms: the group is a heading in a flat, fuzzy-matched list, and eleven headings with one row
+/// each is a list with eleven headings. The extension's identity is in the id, which the palette
+/// matches on, and in the row's title, which its author wrote.
+pub const EXTENSIONS: &str = "Extensions";
+
+/// A palette row for a command an extension contributes.
+///
+/// Not in [`registry`] and it cannot be: that is a `OnceLock<Vec<Command>>` handed out as
+/// `&'static [Command]`, and the extension set changes while the app is running. `Bootstrap`
+/// concatenates the two, which works because `Command::id` has always been a plain `String` rather
+/// than an enum — a decision made long before there was anything to contribute, and the one that
+/// made this cost a function instead of a redesign.
+///
+/// **Ids are API.** A user's `keymap.json` may name one of these, so an extension renaming a
+/// command id orphans every binding pointing at it — the same rule the builtin ids follow, and the
+/// reason `cide_ext::manifest` refuses an id it cannot make a stable prefix out of.
+///
+/// No `when` clause. A `when` may only name a flag in [`CONTEXT_FLAGS`], and a manifest naming one
+/// would be naming an internal vocabulary it cannot see the definition of; a flag nobody sets is
+/// false for ever and the command silently vanishes from the palette. Availability for a
+/// contributed command is instead a fact about its extension — whether the worker is running —
+/// which the frontend answers at dispatch.
+#[must_use]
+pub fn extension_command(id: &str, title: &str, keywords: &[String]) -> Command {
+    let mut command = Command::new(id, title, EXTENSIONS);
+    command.keywords = keywords.to_vec();
+    command
+}
+
 pub fn by_id(id: &str) -> Option<&'static Command> {
     registry().iter().find(|command| command.id == id)
 }
@@ -1198,6 +1230,17 @@ fn build() -> Vec<Command> {
         Command::new("sidebar.tasks", "Show tasks sidebar", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["todo", "board", "tracker", "backlog"]),
+        /*
+         * The extension manager. (M22)
+         *
+         * `shellWindow` and **not** `projectOpen`, unlike the four sidebar rows above it. An
+         * extension is global — it is installed once and wanted in every project — so the panel
+         * that installs one has to be reachable from a window with nothing open, which is exactly
+         * the state a user is in the first time they go looking for it.
+         */
+        Command::new("sidebar.extensions", "Show extensions sidebar", VIEW)
+            .when("shellWindow")
+            .keywords(&["marketplace", "plugins", "install", "language support"]),
         /*
          * Re-run the analysers. (M18)
          *

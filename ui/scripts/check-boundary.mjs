@@ -95,6 +95,34 @@ try {
         + 'whole window and, because the rail\'s choice is restored on launch, keeps doing it',
     )
   }
+  /*
+   * The contributed panels, which are one branch and not one per panel. (M22)
+   *
+   * `sidebar.view` is `ext:<marketplace>.<extension>.<panel>` for anything an extension declared,
+   * so the set is not known at build time and cannot be a literal comparison like the eight above.
+   * The branch is still a literal `{sidebar.view … &&` block in `App.tsx` rather than a
+   * `<PanelSlot>` loop, deliberately, so this file's scrape keeps working — and this is the
+   * assertion that makes that deliberate rather than incidental.
+   *
+   * It matters more than the others, not less: those panels are cide's own code, and this one
+   * draws a view model that arrived from a third party.
+   */
+  const extAt = app.search(/\{sidebar\.view !== null && sidebar\.view\.startsWith\('ext:'\) &&/)
+  ok(
+    extAt > 0,
+    "the branch that draws an extension's panel was found in App.tsx — if this moved into a "
+      + 'loop or a component, every assertion in this file stopped covering it',
+  )
+  if (extAt > 0) {
+    const rest = app.slice(extAt + 1, extAt + 600)
+    ok(
+      /<PanelBoundary/.test(rest),
+      'and it is wrapped in a PanelBoundary. This is the one panel in the product whose content '
+        + 'comes from somebody else, so an unguarded throw there is the version of this bug a '
+        + 'user cannot fix by editing their own code',
+    )
+  }
+
   const toolAt = app.indexOf('<ToolWindowHost')
   ok(toolAt > 0, 'the tool window is rendered from App.tsx')
   ok(
@@ -138,7 +166,10 @@ try {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)
   }
-  console.log(`panel boundary: ok (${checked} checks, ${views.length} panels wrapped)`)
+  console.log(
+    `panel boundary: ok (${checked} checks, ${views.length} panels wrapped, plus the `
+      + 'contributed ones and the tool window)',
+  )
 } finally {
   rmSync(out, { recursive: true, force: true })
 }
