@@ -54,6 +54,23 @@ pub fn config_dir() -> PathBuf {
     )
 }
 
+/// Where regenerable caches go: `$XDG_CACHE_HOME/cide`, else `~/.cache/cide`.
+///
+/// Profile-aware on the same terms as [`state_dir`], and that is the point of it existing here
+/// rather than at its first consumer: the bundled rust-analyzer's disk index is written to a
+/// subdirectory of this, and an index shared between the real instance and a `[DEV]` profile
+/// would be two servers writing one cache — the exact collision profiles exist to prevent.
+///
+/// Cache and not state, per the XDG spec's own line: everything under here can be deleted and
+/// the only cost is recomputing it. Nothing in cide may keep the *sole* copy of anything here.
+pub fn cache_dir() -> PathBuf {
+    xdg_dir(
+        std::env::var_os("XDG_CACHE_HOME"),
+        ".cache",
+        crate::profile::dir_leaf(),
+    )
+}
+
 /// The persisted workspace tree.
 pub fn workspace_path() -> PathBuf {
     state_dir().join("workspace.json")
@@ -99,8 +116,8 @@ pub fn recent_path() -> PathBuf {
 /// A relative value is ignored, as the spec requires: it would resolve against the working
 /// directory and scatter a `.local/state/cide` into whatever project the user launched from.
 ///
-/// `leaf` comes from [`crate::profile::dir_leaf`], and the two callers above are the *only*
-/// place in the workspace that decides it. Every state and config path — the workspace tree,
+/// `leaf` comes from [`crate::profile::dir_leaf`], and the three callers above are the *only*
+/// place in the workspace that decides it. Every state, config and cache path — the workspace tree,
 /// the recents, the scratches, the notes, `cide-git`'s per-repo sidecars, the installed
 /// extensions, `keymap.json` — is built from those two functions, so one instance's whole
 /// footprint moves or none of it does. A third site spelling the leaf out would be a file the
@@ -2624,6 +2641,13 @@ mod tests {
             xdg_dir(Some("/srv/state".into()), ".local/state", "cide-dev"),
             PathBuf::from("/srv/state/cide-dev")
         );
+        // The cache variant resolves on the same terms — including the profiled leaf, which is
+        // what keeps a `[DEV]` instance's rust-analyzer index out of the real instance's.
+        assert_eq!(
+            xdg_dir(Some("/srv/cache".into()), ".cache", "cide-dev"),
+            PathBuf::from("/srv/cache/cide-dev")
+        );
+        assert!(xdg_dir(None, ".cache", "cide").ends_with(".cache/cide"));
     }
 
     #[test]

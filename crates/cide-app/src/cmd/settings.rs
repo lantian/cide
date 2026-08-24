@@ -57,7 +57,16 @@ pub fn settings_set(
 ) -> Result<Settings, CoreError> {
     // Read before the patch, so the comparisons below are against what the windows are
     // actually wearing rather than against the value we just wrote.
-    let (was_theme, was_explorer) = state.with(|ws| (ws.settings.theme, ws.settings.explorer));
+    let (was_theme, was_explorer, was_binaries, was_working_set, was_memory_limit) =
+        state.with(|ws| {
+            (
+                ws.settings.theme,
+                ws.settings.explorer,
+                ws.settings.inspections.server_binaries.clone(),
+                ws.settings.inspections.server_index_working_set_pct,
+                ws.settings.inspections.server_memory_limit_mb,
+            )
+        });
     state.update(|ws| {
         apply_patch(&mut ws.settings, patch);
         // Settings are not part of any structural invariant, but they are part of the tree,
@@ -81,7 +90,64 @@ pub fn settings_set(
     if settings.explorer != was_explorer {
         reindex_open_projects(&app, crate::files::visibility_of(&settings));
     }
+    // A server whose Builtin/System choice moved is running the wrong binary right now, in
+    // every project that has it — the choice is global. Restarting is the honest reaction and
+    // the expensive one (a rust-analyzer restart is a re-index), which is why it happens only
+    // for servers whose *effective* choice changed: writing `Builtin` into a map where absence
+    // already meant Builtin restarts nothing.
+    for binary in rebinaried(&was_binaries, &settings.inspections.server_binaries) {
+        if let Some(registry) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
+            registry.restart_everywhere(&app, cide_ipc::DiagnosticSourceId::for_server(&binary));
+        }
+    }
+    // The working-set percentage is baked into the handshake (`initializationOptions`), so a
+    // running server keeps yesterday's caps until it restarts — the same shape as a binary
+    // choice, and the same honest-but-expensive reaction. rust-analyzer alone, by name: the
+    // tuning only ever reaches the shipped rust-analyzer (see `cide_lsp::config`), and
+    // restarting gopls over a knob it never sees would be pure cost. With the disk index this
+    // restart is a warm load, which is what makes a settings row acceptable at all.
+    if was_working_set != settings.inspections.server_index_working_set_pct
+        && let Some(registry) = app.try_state::<crate::lsp::DiagnosticsRegistry>()
+    {
+        registry.restart_everywhere(
+            &app,
+            cide_ipc::DiagnosticSourceId::for_server("rust-analyzer"),
+        );
+    }
+    // The memory limit is two mechanisms with two lifetimes. The watchdog half reads the
+    // setting live on every tick — no reaction needed. The `GOMEMLIMIT` half is baked into
+    // the shipped gopls's *environment* at spawn (see `cide_lsp::config::extra_env`), so a
+    // running gopls keeps yesterday's soft limit until it restarts — without this, the row
+    // half-lies. gopls alone, by name: rust-analyzer never receives the variable, and its
+    // restart would be pure cost even now that it is a warm load.
+    if was_memory_limit != settings.inspections.server_memory_limit_mb
+        && let Some(registry) = app.try_state::<crate::lsp::DiagnosticsRegistry>()
+    {
+        registry.restart_everywhere(&app, cide_ipc::DiagnosticSourceId::for_server("gopls"));
+    }
     Ok(settings)
+}
+
+/// The binaries whose *effective* choice differs between two settings values.
+///
+/// Effective, via [`cide_ipc::InspectionSettings::binary_choice`]'s absent-means-default rule:
+/// the map gaining an explicit entry that spells the default out is not a change, and dropping
+/// one back to absence is not either. Pure, so the rule is testable without a Tauri state.
+fn rebinaried(
+    before: &std::collections::BTreeMap<String, cide_ipc::settings::ServerBinaryChoice>,
+    after: &std::collections::BTreeMap<String, cide_ipc::settings::ServerBinaryChoice>,
+) -> Vec<String> {
+    let effective =
+        |map: &std::collections::BTreeMap<_, cide_ipc::settings::ServerBinaryChoice>,
+         key: &String| { map.get(key).copied().unwrap_or_default() };
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|binary| effective(before, binary) != effective(after, binary))
+        .cloned()
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect()
 }
 
 /// Walk every open project again, because *Show hidden files* or *Show ignored files* moved.
@@ -1349,6 +1415,45 @@ pub fn app_open_log_dir(app: tauri::AppHandle) -> Result<String, String> {
 mod tests {
     use super::*;
     use cide_ipc::{SIDEBAR_MAX_WIDTH, SidebarSettings, Theme, WindowMode};
+
+    #[test]
+    fn only_an_effective_binary_choice_change_restarts_a_server() {
+        use cide_ipc::settings::ServerBinaryChoice;
+        let map = |entries: &[(&str, ServerBinaryChoice)]| {
+            entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        // The move that matters, in both directions.
+        assert_eq!(
+            rebinaried(
+                &map(&[]),
+                &map(&[("rust-analyzer", ServerBinaryChoice::System)])
+            ),
+            vec!["rust-analyzer".to_string()]
+        );
+        assert_eq!(
+            rebinaried(
+                &map(&[("rust-analyzer", ServerBinaryChoice::System)]),
+                &map(&[])
+            ),
+            vec!["rust-analyzer".to_string()]
+        );
+        // Spelling the default out is not a change — absent already means Builtin, and a
+        // restart is a re-index nobody asked for.
+        assert!(
+            rebinaried(
+                &map(&[]),
+                &map(&[("rust-analyzer", ServerBinaryChoice::Builtin)])
+            )
+            .is_empty()
+        );
+        // An unrelated patch of the same map restarts nothing.
+        let held = map(&[("rust-analyzer", ServerBinaryChoice::System)]);
+        assert!(rebinaried(&held, &held.clone()).is_empty());
+    }
 
     /// A launch configuration with nothing but the binary set — every injection at its
     /// shipped default, which is what these verdict tests are about.

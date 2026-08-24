@@ -176,6 +176,25 @@ fn run(
         match rx.recv_timeout(TICK) {
             Ok(Ok(events)) => {
                 for event in events {
+                    // A read is not a change. `cargo check` opens every source file in the
+                    // workspace, and under inotify each open/read/close-for-read arrives
+                    // here as an `EventKind::Access(..)`. Treating those as changes closed
+                    // a loop that ran a workspace's check for ever: the check reads the
+                    // sources → "hundreds of files changed" → the LSP kick re-runs the
+                    // check → it reads them all again — with the kernel never once
+                    // reporting a write, which is what made it read as a haunting rather
+                    // than a bug. The one access kind that *is* a mutation signal is
+                    // `Close(Write)` — how some editors' saves surface — so it stays.
+                    if matches!(
+                        event.kind,
+                        notify::EventKind::Access(kind)
+                            if !matches!(
+                                kind,
+                                notify::event::AccessKind::Close(notify::event::AccessMode::Write)
+                            )
+                    ) {
+                        continue;
+                    }
                     for path in &event.paths {
                         let is_dir = path.is_dir();
                         // `watchable`, not `admits`: with *show ignored files* on, the tree

@@ -51,6 +51,7 @@
 //!   nothing left to talk to.
 
 pub mod codec;
+pub mod config;
 pub mod convert;
 pub mod discover;
 pub mod server;

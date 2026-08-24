@@ -1222,6 +1222,63 @@ pub struct InspectionSettings {
     /// Debounce for that note, clamped to [`MIN_PUSH_DEBOUNCE_MS`]..=[`MAX_PUSH_DEBOUNCE_MS`]
     /// where the patch lands rather than on read.
     pub push_debounce_ms: u32,
+    /// Restart a language server whose resident memory crosses this many MiB. `0` means
+    /// never — the shipped default, deliberately: until the bundled rust-analyzer's disk
+    /// index makes a restart a warm load, a restart is a full re-index, and a limit that
+    /// ships on would trade the user's memory problem for a CPU one they did not choose.
+    ///
+    /// One number for every server rather than a per-server map: the value is a statement
+    /// about *this machine's* memory, not about any server, and rust-analyzer is the only
+    /// server that meaningfully approaches it today. Non-zero values are floored at
+    /// [`MIN_SERVER_MEMORY_LIMIT_MB`] where the patch lands — a hand-edited 10 would be a
+    /// restart loop indistinguishable from a broken server.
+    pub server_memory_limit_mb: u32,
+    /// Scale the bundled rust-analyzer's resident index working set, as a percentage of its
+    /// compiled per-query LRU caps. `0` means the shipped defaults — the fork keeps owning
+    /// the per-query ratios, and this stays a statement about *this machine's* memory, the
+    /// same framing as [`Self::server_memory_limit_mb`].
+    ///
+    /// One percentage rather than four cap fields, deliberately: the wire contract to the
+    /// fork *is* four per-query keys (`cide.diskIndex.lru.*`, produced in
+    /// `cide_lsp::config::rust_analyzer_options` and nowhere else), but a stored percentage
+    /// keeps meaning "half the default working set" across a fork retune, where four stored
+    /// absolute numbers would silently pin stale ratios. Non-zero values are clamped to
+    /// [`MIN_INDEX_WORKING_SET_PCT`]..=[`MAX_INDEX_WORKING_SET_PCT`] where the patch lands.
+    /// Only a Builtin/Override rust-analyzer ever sees the result — a stock PATH server's
+    /// handshake is provenance-gated to carry nothing of cide's.
+    pub server_index_working_set_pct: u32,
+    /// Which build of a language server runs, keyed by the server's binary name.
+    ///
+    /// **A server absent from this map runs [`ServerBinaryChoice::Builtin`]** — the same
+    /// absent-means-default rule as [`Self::sources`], and for the same reason: a server this
+    /// map has never heard of must get the shipped behaviour, not a surprise.
+    ///
+    /// A map keyed by binary name rather than a `rust_analyzer: …` field, deliberately: the
+    /// choice exists because cide bundles a forked rust-analyzer, and the moment a bundled
+    /// gopls follows it the second server must cost a row in the UI and nothing in the DTO.
+    /// Only names in `cide_lsp::discover`'s bundled table ever consult this; for everything
+    /// else there is no bundled build and the map is dead weight ignored.
+    pub server_binaries: std::collections::BTreeMap<String, ServerBinaryChoice>,
+}
+
+/// Which build of a language server cide runs — see [`InspectionSettings::server_binaries`].
+///
+/// Two variants and not a path: a settings field that accepted an arbitrary binary path would
+/// be a spawn-anything surface in a file extensions can ask cide to patch. The developer's
+/// escape hatch for pointing at a work-in-progress build is the `CIDE_RA_PATH` environment
+/// variable, which outranks both of these and never touches disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ServerBinaryChoice {
+    /// The build cide ships beside its own binary — the forked rust-analyzer — when one is
+    /// there. A dev build ships none, and then this behaves exactly like [`Self::System`],
+    /// which is what lets it be the default without breaking `./run.sh`.
+    #[default]
+    Builtin,
+    /// The user's own installation, resolved from `PATH` — exactly what every server got
+    /// before the bundled build existed.
+    System,
 }
 
 /// The four severities, as toggles.
@@ -1247,6 +1304,24 @@ pub const MIN_PUSH_DEBOUNCE_MS: u32 = 500;
 
 /// The ceiling. Past half a minute the note is about a state the user has already moved on from.
 pub const MAX_PUSH_DEBOUNCE_MS: u32 = 30_000;
+
+/// The floor under a non-zero [`InspectionSettings::server_memory_limit_mb`].
+///
+/// rust-analyzer's baseline on a modest workspace is past a gigabyte; a limit below this is
+/// not a policy, it is a restart loop, and the panel would show a server for ever
+/// "starting" with nothing anywhere saying why.
+pub const MIN_SERVER_MEMORY_LIMIT_MB: u32 = 256;
+
+/// The floor under a non-zero [`InspectionSettings::server_index_working_set_pct`].
+///
+/// A quarter of the default working set is already an aggressive machine; below that the
+/// caps stop being a working set and become thrash — every request re-faulting the same few
+/// def maps through the disk tier.
+pub const MIN_INDEX_WORKING_SET_PCT: u32 = 25;
+
+/// The ceiling. Past four times the defaults the caps are effectively off, and "off" is a
+/// state the fork already has (a cap of 0) — not a large number pretending to be one.
+pub const MAX_INDEX_WORKING_SET_PCT: u32 = 400;
 
 impl Default for SeverityFilter {
     /// Hand-written, and this is the `resume_all_on_launch` lesson applied before it bites
@@ -1277,6 +1352,11 @@ impl Default for InspectionSettings {
             default_highlight_level: HighlightLevel::default(),
             push_to_claude: false,
             push_debounce_ms: 2_000,
+            server_memory_limit_mb: 0,
+            server_index_working_set_pct: 0,
+            // Empty, not seeded: absent means Builtin, and seeding a row would make the
+            // default a stored fact that survives a future change of default.
+            server_binaries: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1306,7 +1386,29 @@ impl InspectionSettings {
         self.push_debounce_ms = self
             .push_debounce_ms
             .clamp(MIN_PUSH_DEBOUNCE_MS, MAX_PUSH_DEBOUNCE_MS);
+        // Zero is "off" and passes; anything else meets the floor. See the constant.
+        if self.server_memory_limit_mb != 0 {
+            self.server_memory_limit_mb =
+                self.server_memory_limit_mb.max(MIN_SERVER_MEMORY_LIMIT_MB);
+        }
+        // Same zero-is-off rule as the memory limit above.
+        if self.server_index_working_set_pct != 0 {
+            self.server_index_working_set_pct = self
+                .server_index_working_set_pct
+                .clamp(MIN_INDEX_WORKING_SET_PCT, MAX_INDEX_WORKING_SET_PCT);
+        }
         self
+    }
+
+    /// The effective choice for one server's binary — absent means [`ServerBinaryChoice`]'s
+    /// default. The one reader of [`Self::server_binaries`], so "absent means Builtin" is a
+    /// rule with a single implementation rather than a convention three call sites repeat.
+    #[must_use]
+    pub fn binary_choice(&self, binary: &str) -> ServerBinaryChoice {
+        self.server_binaries
+            .get(binary)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -1815,6 +1917,66 @@ mod tests {
             ..InspectionSettings::default()
         };
         assert_eq!(huge.clamped().push_debounce_ms, MAX_PUSH_DEBOUNCE_MS);
+    }
+
+    #[test]
+    fn a_memory_limit_is_off_at_zero_and_floored_otherwise() {
+        // Zero is a state, not a small number: the watchdog is off, and clamping it up would
+        // turn a default nobody chose into restarts nobody asked for.
+        assert_eq!(
+            InspectionSettings::default()
+                .clamped()
+                .server_memory_limit_mb,
+            0
+        );
+        // A hand-edited 10 is not a policy, it is a restart loop — the panel would show a
+        // server for ever "starting" with nothing anywhere saying why.
+        let tiny = InspectionSettings {
+            server_memory_limit_mb: 10,
+            ..InspectionSettings::default()
+        };
+        assert_eq!(
+            tiny.clamped().server_memory_limit_mb,
+            MIN_SERVER_MEMORY_LIMIT_MB
+        );
+        let sane = InspectionSettings {
+            server_memory_limit_mb: 4096,
+            ..InspectionSettings::default()
+        };
+        assert_eq!(sane.clamped().server_memory_limit_mb, 4096);
+    }
+
+    #[test]
+    fn a_working_set_pct_is_default_at_zero_and_clamped_otherwise() {
+        // Zero is "the fork's defaults", not a tiny working set — clamping it up would
+        // silently replace the shipped tuning with the floor.
+        assert_eq!(
+            InspectionSettings::default()
+                .clamped()
+                .server_index_working_set_pct,
+            0
+        );
+        let tiny = InspectionSettings {
+            server_index_working_set_pct: 5,
+            ..InspectionSettings::default()
+        };
+        assert_eq!(
+            tiny.clamped().server_index_working_set_pct,
+            MIN_INDEX_WORKING_SET_PCT
+        );
+        let huge = InspectionSettings {
+            server_index_working_set_pct: 10_000,
+            ..InspectionSettings::default()
+        };
+        assert_eq!(
+            huge.clamped().server_index_working_set_pct,
+            MAX_INDEX_WORKING_SET_PCT
+        );
+        let sane = InspectionSettings {
+            server_index_working_set_pct: 50,
+            ..InspectionSettings::default()
+        };
+        assert_eq!(sane.clamped().server_index_working_set_pct, 50);
     }
 
     #[test]

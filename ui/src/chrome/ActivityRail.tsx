@@ -186,6 +186,17 @@ export interface ActivityRailProps {
    */
   errors?: number | null | undefined
   /**
+   * Whether any analyser is working right now, for a busy dot on the warning triangle. (M25)
+   *
+   * A boolean and not a count, because "how many analysers are scanning" is not a number a
+   * user acts on — the fact is "cide is still looking", and it matters exactly when the
+   * user is waiting on the answer. Drawn as a small pulsing dot **only when the error pill
+   * is absent**: the pill is the call to action and wins the one badge slot a 42px button
+   * has; while both are true the accessible name still says both, because a screen reader
+   * has no such space constraint.
+   */
+  busy?: boolean | undefined
+  /**
    * Subagent runs that are live — running, or stopped waiting for the user — for the badge on
    * the hexagon.
    * (M18)
@@ -252,6 +263,7 @@ export function ActivityRail({
   active,
   changed,
   errors,
+  busy,
   agents,
   agentsAwaiting,
   tasks,
@@ -357,7 +369,12 @@ export function ActivityRail({
       {items.map((item, i) => {
         const selected = item.id === active
         const badge = badges[item.id]
-        const name = badge === undefined ? item.label : `${item.label} — ${badge.name}`
+        const busyHere = item.id === 'problems' && busy === true
+        let name = badge === undefined ? item.label : `${item.label} — ${badge.name}`
+        if (busyHere) {
+          // The name carries the busy fact even when the pill claims the visual slot.
+          name = badge === undefined ? `${item.label} — analysing…` : `${name}, analysing…`
+        }
         return (
           <Fragment key={item.id}>
             {/* Hidden from the accessibility tree: a tablist should own nothing but tabs,
@@ -381,6 +398,11 @@ export function ActivityRail({
                   : { name: item.icon ?? EXTENSION_FALLBACK })}
                 size={RAIL_ICON}
               />
+              {busyHere && badge === undefined && (
+                /* The pulsing busy dot, in the pill's anchor corner. `aria-hidden` for the
+                   badge's reason: the name above already says "analysing…". */
+                <span className={styles.busyDot} data-audit="problemsBusy" aria-hidden="true" />
+              )}
               {badge !== undefined && (
                 /*
                  * `aria-hidden`, and it is not cosmetic. The badge used to be a 6px dot with

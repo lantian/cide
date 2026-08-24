@@ -84,6 +84,7 @@ import {
   branch as branchApi,
   claudeSend,
   diag,
+  diagnostics,
   file as fileApi,
   fs as fsApi,
   git as gitApi,
@@ -1842,6 +1843,21 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         const project = activeProjectOf(boot())
         if (project === null) return unmet(command, 'no open project')
         refreshDiagnostics(project.id)
+        return
+      }
+
+      case 'problems.invalidateCaches': {
+        /*
+         * Stop every analyser, delete every server's on-disk cache, start them again. The
+         * heavyweight sibling of `problems.refresh` above, and deliberately fire-and-forget
+         * from here: the call blocks server-side for as long as the shutdown ladders take,
+         * and the Problems panel's own status rows ("Scanning…") are the progress surface —
+         * the same one a plain restart uses. Global on purpose — the caches are per server,
+         * not per project — so no `project` argument, but the clause still gates the palette
+         * row: with nothing open there is nothing to rebuild into.
+         */
+        if (activeProjectOf(boot()) === null) return unmet(command, 'no open project')
+        void diagnostics.invalidateCaches()
         return
       }
 

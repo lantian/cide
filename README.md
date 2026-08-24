@@ -750,10 +750,16 @@ derived from `AppInfo`, so it has to be changed by hand when the other two are.
 ### `--tarball`: the binary one, which promises the opposite
 
 `cargo xtask package --tarball --run` writes
-`target/release/bundle/tarball/cide-0.1.0-linux-x86_64.tar.gz` — 8.1 MiB against the AppImage's
-86.5 MiB, unpacking into `cide-0.1.0/` with `bin/cide`, `bin/cide-hook`, the desktop entry, the
-six `hicolor` icon sizes, `README.md` and `LICENSE`. It is for the person who wants the program
+`target/release/bundle/tarball/cide-0.1.0-linux-x86_64.tar.gz`, unpacking into `cide-0.1.0/` with
+`bin/cide`, `bin/cide-hook`, `bin/cide-rust-analyzer` (cide's own rust-analyzer build, from the
+sibling fork pinned by `packaging/rust-analyzer.lock` — M25), the desktop entry, the six
+`hicolor` icon sizes, `README.md` and `LICENSE`. It is for the person who wants the program
 without a package manager, without root, and without an AppImage's runtime.
+
+Before M25 this archive was 8.1 MiB against the AppImage's 86.5 MiB — a tenth the size, because
+it carried no WebKitGTK. The bundled rust-analyzer (a ~50 MiB release binary) ends that ratio:
+both archives grow by the same absolute amount, and the tarball's remaining advantage is the
+runtime it still does not carry, not a headline size.
 
 **Read it against `--src` above, because every promise inverts.** That one is `git archive`, so
 its checksum follows from the commit and anyone can reproduce it from the tag; this one contains
@@ -5899,6 +5905,194 @@ Ctrl+Tab's switcher can still reach a torn-out tab from the shell — deliberate
 "go to where I was", and choosing one raises its window — while `tab.next`/`tab.prev` step over
 it, because a positional walk should match the strip on screen. Sizing: the new window opens at
 the tab panel's measured size, or `DETACHED_WIDTH×HEIGHT` when nothing measured.
+
+## cide's own rust-analyzer: the bundled fork (M25), and what is not verified
+
+rust-analyzer keeps its entire index in memory — 2–8 GB per project on real workspaces — and
+cide, until now, had no say: no `initializationOptions`, `workspace/configuration` answered
+`{}`, the binary came from PATH alone, and `Server::args()` was declared in M22 and never
+applied to a spawn. The decision (ADR 0011) is to fork rust-analyzer, give the fork a
+disk-backed index, and ship it inside cide. The fork lives in `../forks/rust-analyzer`
+(branch `cide`, cut from an upstream release tag) — never a workspace member — and its
+cide-side infrastructure is what this milestone builds:
+
+- **Discovery is a ladder** (`cide_lsp::discover::locate`): `CIDE_RA_PATH` (a developer
+  override that wins alone, and refuses rather than falls through when broken) → the
+  `cide-rust-analyzer` sidecar beside `current_exe()` → PATH. Two names on purpose: the
+  registry keeps saying `rust-analyzer` (panel rows, source ids, the extension-conflict rule),
+  the shipped file is `cide-rust-analyzer` so the tarball's "put `bin/` on PATH" can never
+  shadow the user's own build.
+- **A start failure falls down the ladder** (`server::next_candidate`): a bundled build that
+  dies before its handshake is retried as the next rung, so a broken sidecar degrades to
+  exactly the pre-M25 behaviour. A crash *after* the handshake never advances — it would dodge
+  the crash budget, and an OOM would only repeat harder on the stock build.
+- **Settings → Inspections → "rust-analyzer build"** chooses Built-in vs System per server
+  (`InspectionSettings::server_binaries`, absent = Built-in); flipping it restarts the server
+  in every open project. The map is keyed by binary name so a future bundled gopls is one more
+  row and no DTO change.
+- **Only the shipped build is configured** (`cide_lsp::config`): provenance-gated
+  `initializationOptions` + real `workspace/configuration` answers, carrying the two-repo
+  contract — today only `cide.diskIndex.dir`, the per-profile cache directory
+  (`persist::cache_dir()/rust-analyzer`; cide names and creates it, the fork owns its
+  contents). A stock PATH server gets byte-for-byte the old handshake.
+- **Packaging**: `packaging/rust-analyzer.lock` pins URL+rev for xtask preflight (absent
+  sibling = failure with the clone command; wrong rev = warning), the generated Flatpak
+  manifest (a pinned git source), and release.yml (both build jobs fetch the pin, with an
+  actions/cache on the fork's target dir). The AppImage/deb carry it as a second Tauri
+  sidecar in `tauri.bundle.conf.json`; the tarball installs `bin/cide-rust-analyzer`.
+
+**Phase 1 is implemented in the fork** — six commits on `../forks/rust-analyzer`'s `cide`
+branch, plus a **second fork beside it, `../forks/salsa`** (three commits on 0.28.2, and the
+manifest's `../salsa` path patch is why the pair stays siblings of each other), wired through the
+`[patch.crates-io]` line upstream left commented for exactly this. What persists, in the
+order it landed: every salsa input (per-type serde that re-validates invariants as
+deserialize errors; `ProcMacros` through a placeholder codec whose restore-time re-set under
+a new revision is a soundness requirement — live expander channels restore from nothing);
+item trees plus the whole macro-expansion interned world they stand on (`SyntaxContext`'s
+hand-expanded `PERSIST = false` stubs became real codecs, `MacroCallId` and `tt::TopSubtree`
+round-trip — the latter as its flat token stream so the varint encoding stays an
+implementation detail); and **def maps** — the sixteen `impl_intern_key!` ids, the tracked
+structs `ModuleId`/`BlockId`, and `ItemScope`'s eighteen fields, with struct-keyed maps as
+ordered pairs (JSON map keys must be strings and a derive fails at *serialize* time — the
+worst place) and `Name` as its bare string. The salsa fork is what makes the tracked-struct
+half sound: deleted slots and the free list (the only record of a dead slot's generation)
+round-trip, and restored-memo validation no longer panics on ingredients whose lazy typed
+init has not run. The **LSP lifecycle** works end to end: restore in `GlobalState::new` with
+the VFS pre-seeded from the snapshot's id→path table (FileIds are interner insertion order,
+so replay makes them line up), save at shutdown and on the idle-GC tick, validity keyed on a
+hand-bumped format version + build stamp + linked-projects fingerprint, and every failure
+path deleting the snapshot and starting cold.
+
+Measured on a tiny crate + sysroot (1,428 modules, debug build): the warm def-map walk went
+**11.0 s → 2.6 s → 4.7 ms** across the three slices; the LSP twice-through test logs
+`disk index saved` then `disk index restored` with zero panics. Baseline to beat on this
+workspace, stock release build: 5.45 GiB peak RSS, 66 s cold analysis. Phase 2's cide side
+is in: the RSS watchdog (Settings → Inspections → memory limit, off by default, floored at
+256 MiB), with upstream's dead runtime-LRU plumbing documented rather than configured at a
+no-op. `cachePriming` was off in the Phase-2 contract (it only warmed caches a restart
+would drop) and is **on again since the disk index landed**: primed memos flow into the
+snapshot and the memo tier, and priming's `$/progress` is the one honest per-module
+progress feed — `Indexing 12/21 (libc)` with a true fraction — which is what drives the
+Problems panel's determinate bar and the rail's busy dot.
+
+**Phase 3 — the memory is bounded, not just restorable.** The four heavy persisted queries
+carry `lru` caps in the fork (item trees 512/256, def maps 128/256), and eviction stopped
+meaning "recompute later": the salsa fork gained a process-global `MemoStore` — eviction
+serializes a persistable memo into it before dropping the value, and a fetch that finds
+nothing usable in RAM consults it before executing. The store is `memos.redb` beside the
+snapshot (redb, `Durability::None` — a cache, not a database), and it rides the snapshot's
+validity decision: deleted unless this process also restored the snapshot and the build
+stamp matches, because its keys are positional ingredient indices and its values carry
+revision numbers no other epoch can verify. Two hard-won rules (ADR 0011, Decision 5): a
+stored memo is reinstalled **only when it shallow-verifies** — deep verification walks edges
+that may name ids of non-persisted ingredients restored as untyped placeholder pages, which
+is a panic on the full cide corpus, and its economics are re-parsing the substrate the
+reload was meant to skip; and **the LSP's idle save runs before GC and the LRU sweep**, so
+the snapshot keeps the whole resident set and the store serves only what pressure pushed out
+between saves. Measured on this workspace (release, 514 crates): the harness's deliberate
+worst case — evict, *then* save — walks warm in 9.0 s with 38k of 87k fetches served from
+the store; the LSP's save-first order keeps the millisecond-class walk.
+
+Four follow-up tracks ran in parallel worktrees and merged:
+
+- **Inference does not persist, and now the code says why**: `InferenceResult` is saturated
+  with `rustc_type_ir` types interned in a process-global GC arena — not salsa ids — ~25
+  mutually recursive external generic types with no serde surface; persisting them is
+  rustc's `TyEncoder` rewritten by hand, a project and not a pass (the same wall stops MIR
+  bodies, layouts and `TraitImpls`). What landed instead is the bounded half: `lru` caps on
+  the six heaviest hir-ty queries (infer 2048, MIR 512/512/256, layouts 1024), which the
+  GC tick's existing `collect_ty_garbage` turns into real arena releases.
+- **The store expires and compacts**: a save-generation epoch persisted in the store itself,
+  `put`s stamped in-transaction, `get` hits batched in memory and flushed at the sweep;
+  entries untouched for 12 generations (~1 h at the save cadence) age out, and
+  `Database::compact()` shrinks the file — which required learning that redb pins every
+  `Durability::None` commit until a durable one lands, so the sweep's commit is the one
+  fsync per save.
+- **The snapshot and store values moved from JSON to named MessagePack** — the two salsa
+  blockers (an unknown-length `serialize_seq`, a borrowed map key) were two lines fixed at
+  the source, not worked around. Named mode over compact struct-as-array deliberately: array
+  mode silently breaks any type whose Serialize/Deserialize halves disagree in authorship,
+  and this codebase is full of hand-written halves. 458 → 384 MB, save 884 → 826 ms, load
+  2.2 → 1.9 s, oracle byte-identical; `snapshot.db.json` became `snapshot.db` and format 2's
+  orphan is deleted on upgrade.
+- **The def-map/item-tree caps are runtime-configurable**: Settings → Inspections → "index
+  working set" — one percentage (25–400, 0 = fork defaults) scaling the four compiled caps,
+  carried as `cide.diskIndex.lru.{fileItemTree,blockItemTree,crateDefMap,blockDefMap}` in
+  the same one-producer-one-consumer contract as the cache dir, applied at host
+  construction on both the fresh and restored paths, restarting the server on change. A
+  percentage rather than four absolutes so a stored "half the default" keeps meaning that
+  across a fork retune.
+
+**Not done / not verified, named:** the **symbol index** deliberately does not persist —
+cide never sends `workspace/symbol`, so in cide the index has no consumer; it is also the
+hardest layer (`'db` lifetime, `SyntaxNodePtr`s whose byte offsets silently go stale against
+changed text), and a payoff-free hard problem is a cut, not a debt. The snapshot is JSON
+(salsa's format needs a self-describing serializer with borrowed map keys; a compact format
+is a small upstream-shaped salsa patch away). Neither fork has a remote yet:
+`packaging/rust-analyzer.lock` still pins the upstream tag, so a package built today ships a
+stock-behaving binary under the cide name — the lock moves when the forks get remotes, and
+preflight now also demands the salsa fork when the manifest patches to it. hir-def's 500
+tests and the roundtrip oracles are green, but no full editing session has run against a
+restored index yet, and inference/`hir-ty` memos (the largest remaining recompute on warm
+start) are unexplored territory — explored now: it cannot persist (the `rustc_type_ir`
+wall above), so its ceiling is caps + GC, not disk. The macOS release job has never built
+either fork. The hir-ty caps (unlike the def-map four) are still compile-time constants,
+and the 2048 infer cap has not been tested against interactive latency on a large
+single-file body — the live soak should watch for infer thrash. MessagePack's −16% says
+most snapshot bytes are field names and per-entry structure; a stricter format is reachable
+now that the salsa preconditions are fixed, but needs the mixed Serialize/Deserialize pairs
+audited first.
+
+## The second bundled server: gopls (M26), and what is not verified
+
+The rust-analyzer road (M25) shaped everything "per-server" on the claim that a bundled
+gopls would later cost a row, not a mechanism. M26 is that claim tested: the ladder, the
+pre-handshake fallback, the Built-in/System settings map, the restart reaction and the RSS
+watchdog all took the second server unchanged. What M26 adds:
+
+- **The row**: `("gopls", "cide-gopls", "CIDE_GOPLS_PATH")` in `discover::BUNDLED`, a
+  second Segmented row in Settings → Inspections → "Language server builds", and packaging —
+  `packaging/gopls.lock` pins golang/tools at a gopls release tag (v0.23.0, two releases
+  ahead of a typical distribution's), `../forks/tools` is the checkout (branch `cide`, a
+  fork with no patches *yet*), preflight gains the go-toolchain verdict (absent go fails;
+  old go only warns, because `GOTOOLCHAIN=auto` downloads what the module demands), and the
+  AppImage/deb/tarball/flatpak all carry `cide-gopls` (built `CGO_ENABLED=0`, static).
+  release.yml's copy-pasted fork blocks became a `checkout-fork` composite action — four
+  uses, one shape.
+- **The env lane**: gopls is configured through its environment, not the handshake —
+  `cide_lsp::config::extra_env` is the second half of the provenance-gated contract, and the
+  shipped gopls gets `GOPLSCACHE = <profile cache>/gopls`: per-profile, cide names the
+  directory, gopls owns the contents and the eviction budget (its file cache self-collects).
+  A System gopls keeps its machine-global cache — shared with the user's other editors, not
+  cide's to move.
+
+**Phase 1 — the metadata graph persists.** Upstream gopls has kept its *derived*
+per-package indexes on disk since v0.12, but the **metadata graph** — the whole-workspace
+`go list` result — was recomputed on every start. The measurement gate ran at three scales
+and decided the patch: tools (659 packages) and any-sync (867) warm-start fine on upstream's
+caches alone, but kubernetes (5,771 packages) still paid **~5.7 s of blocking `go list` on
+every warm start** — the filecache halves the heap and does nothing for the wall. So the
+fork now carries its one patch: the graph is saved into gopls's own filecache (a
+`"metagraph"` kind, inside `GOPLSCACHE`, under gopls's own budget and GC) keyed by the view
+definition, the go env, and the contents of every go.mod/go.sum/go.work; a key match
+**serves the seeded graph immediately and still runs the real load in the background**,
+reconciling changed, deleted and added packages through the ordinary invalidation machinery
+— so a `.go` file that moved while gopls was down is caught one `go list` later, off the
+critical path, and a touched go.mod is a different key and an honest cold start. Every
+failure path converges on the cold load. Measured: kubernetes warm initial load
+**5.2 s → 0.495 s** (10.5×, identical package counts, stats-run peak RSS 4.8 GB → 654 MB);
+any-sync **850 ms → 86 ms**. One found-the-hard-way rule is documented in the fork:
+`TypesSizes` cannot ride through gob (go/types' unexported `gcSizes`), so it is stripped at
+encode, reconstructed at decode, and a graph with any *other* sizes is refused outright.
+
+**What is not done:** the in-memory cache caps (the second Phase-1 target) were deliberately
+not attempted — the metadata graph was the measured wall. `packaging/gopls.lock` still pins
+the upstream tag while the fork now diverges from it, so preflight correctly warns and a
+package built today ships *stock* gopls under the cide name — the lock moves when the fork
+gets a remote, same as rust-analyzer's. The end-to-end run (`CIDE_GOPLS_PATH=… ./run.sh` on a Go project:
+Problems populating, the per-profile cache filling) has not been watched on screen. No
+packaged bundle carrying both sidecars has been built with `--run`. The flatpak golang SDK
+extension is stated in the manifest but a flatpak build has not been attempted.
 
 ## The look and feel (M23), and what is not verified
 

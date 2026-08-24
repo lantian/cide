@@ -282,6 +282,33 @@ pub fn which(binary: &str) -> Option<PathBuf> {
     None
 }
 
+/// The executable called `name` sitting in cide's own directory, or `None`.
+///
+/// How a bundled sidecar is found. The precedent is `cide-hook`, which `cide-app` locates with
+/// `current_exe().parent()` because the bundler puts every `externalBin` beside the main binary
+/// — and that lookup could stay in `cide-app` because only `cide-app` spawns the hook. This one
+/// cannot: `cide-lsp` needs it for the bundled rust-analyzer and must not depend on the app
+/// crate, so it lives here, beside [`which`], which is the other half of the same question
+/// ("where is this server's binary").
+///
+/// Deliberately **not** folded into [`search_paths`]: the bundled directory would then be
+/// searched for *every* binary — `git`, `cargo`, the user's `claude` — and appending it is not
+/// safe either, because the one binary this exists for must *beat* PATH, not lose to it. The
+/// callers that want the bundled-first rule ask this function first, explicitly, for the one
+/// name they mean.
+pub fn sibling_binary(name: &str) -> Option<PathBuf> {
+    sibling_binary_in(std::env::current_exe().ok()?.as_path(), name)
+}
+
+/// [`sibling_binary`] over an exe path handed in rather than read from the process.
+///
+/// Pure for the reason [`child_path_from`] is: a test cannot relocate `current_exe`, but it can
+/// hand in a path next to a file it created.
+pub fn sibling_binary_in(exe: &Path, name: &str) -> Option<PathBuf> {
+    let candidate = exe.parent()?.join(name);
+    is_executable(&candidate).then_some(candidate)
+}
+
 /// Is this an executable *file*?
 ///
 /// `pub` since M16 for [`crate::claude_cli::resolve`], which has to answer the same question
@@ -547,6 +574,28 @@ mod tests {
     #[test]
     fn a_binary_that_does_not_exist_is_not_found() {
         assert!(which("cide-no-such-binary-anywhere").is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_sibling_binary_is_found_beside_the_exe_and_only_when_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("sibling");
+        let exe = dir.join("cide");
+        std::fs::write(&exe, "").expect("write");
+        let sidecar = dir.join("cide-rust-analyzer");
+        std::fs::write(&sidecar, "").expect("write");
+
+        // Present but not executable: a half-copied sidecar must read as "not bundled", so the
+        // ladder falls through to PATH rather than spawning something that cannot run.
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(sibling_binary_in(&exe, "cide-rust-analyzer"), None);
+
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(sibling_binary_in(&exe, "cide-rust-analyzer"), Some(sidecar));
+        // And a name nothing shipped is simply absent — the dev-build case, every day.
+        assert_eq!(sibling_binary_in(&exe, "cide-no-such-sidecar"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -118,15 +118,15 @@ try {
     null,
     'no source yields null counts, which is what makes the status bar print `✗ —` and not `✗ 0`',
   )
-  eq(
+  deep(
     statusBarCounts(scanning()),
-    null,
-    'a source that has not answered yet has pending counts, not zero ones',
+    { errors: 0, warnings: 0, pending: true },
+    'a source that has not answered yet counts what it has, marked pending',
   )
   deep(
     statusBarCounts(ready([])),
-    { errors: 0, warnings: 0 },
-    'zero becomes reportable only once something actually looked',
+    { errors: 0, warnings: 0, pending: false },
+    'zero becomes a settled figure only once something actually looked',
   )
 
   eq(checked(NO_SOURCE), false, 'nothing looked')
@@ -233,7 +233,7 @@ try {
 
   deep(
     statusBarCounts(ready(mixed)),
-    { errors: 2, warnings: 1 },
+    { errors: 2, warnings: 1, pending: false },
     'the status bar sees errors and warnings only',
   )
 
@@ -299,11 +299,14 @@ try {
   // --- M12: partial answers, the emit cap, and the filter. --------------------------------
 
   /*
-   * The most important assertion in this file after the no-source one, and the reason the
-   * `scanning` arm was allowed to carry items at all. A partial answer is **still not a count**:
-   * rust-analyzer indexing while gopls has already found three errors must show the three rows
-   * and must *not* let the status bar print a figure, because the figure would be wrong the
-   * moment rust-analyzer finished.
+   * A partial answer now counts, **marked pending** — a reversal, and the old argument is
+   * kept here because it was half right. The figure may indeed grow the moment the indexing
+   * server finishes; the pending flag is how the bar qualifies it ("3 errors so far — still
+   * indexing"). What the old rule actually shipped was worse than a growing figure: `null`
+   * shares the bar's dash slot with `unavailable`, whose tooltip says "no language server is
+   * running" — so one server stuck in `scanning` (a leaked progress token holds the whole
+   * snapshot there for ever) made the bar dead and lying while the editor visibly underlined
+   * the very diagnostics being counted.
    */
   const partial = {
     kind: 'scanning',
@@ -314,7 +317,11 @@ try {
       at('src/b.rs', 3, 1, 'error', 'three'),
     ],
   }
-  eq(statusBarCounts(partial), null, 'a partial answer yields no counts, however many items it has')
+  deep(
+    statusBarCounts(partial),
+    { errors: 3, warnings: 0, pending: true },
+    'a partial answer reports the rows it can see, and says they are still growing',
+  )
   eq(checked(partial), false, 'and is still not "checked"')
   eq(metaFigure(partial), '—', 'and still withholds the header digit')
   eq(headline(partial).tone, 'unknown', 'and is still toned unknown')
@@ -353,7 +360,7 @@ try {
   eq(noHints.hidden, 1, 'and is counted rather than forgotten')
   deep(
     statusBarCounts(noHints.snapshot),
-    { errors: 1, warnings: 0 },
+    { errors: 1, warnings: 0, pending: false },
     'the bar reads the *filtered* snapshot, so it cannot disagree with the panel',
   )
 

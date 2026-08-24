@@ -56,6 +56,7 @@ use cide_ipc::{DiagnosticsSnapshot, InspectionSettings, ProjectId, SourceStatus}
 use cide_lsp::{LspEvent, LspHandle, Server};
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use tauri::Manager;
 
 /// Trailing debounce on the emit. See the module docs.
 const COALESCE: Duration = Duration::from_millis(250);
@@ -122,6 +123,62 @@ impl DiagnosticsRegistry {
         let diagnostics = Arc::new(ProjectDiagnostics::start(app.clone(), project, roots));
         self.projects.insert(project, Arc::clone(&diagnostics));
         diagnostics
+    }
+
+    /// Restart one source in every open project. (M25)
+    ///
+    /// The reaction to the Settings row that flips a server between the bundled build and the
+    /// system one: the choice is global — it is not stored per project — so a change means
+    /// every project running that server is running the wrong binary. The restart itself is
+    /// [`ProjectDiagnostics::restart`], the same road the panel's Restart button takes, which
+    /// is what makes the settings row cost nothing new in mechanism.
+    pub fn restart_everywhere(&self, app: &tauri::AppHandle, source: cide_ipc::DiagnosticSourceId) {
+        // Collected first for `sync_all`'s reason: `restart` blocks on the spawn thread, and a
+        // `DashMap` iterator held over that blocks `ensure` and `close` behind it.
+        let projects: Vec<Arc<ProjectDiagnostics>> =
+            self.projects.iter().map(|entry| entry.clone()).collect();
+        for project in projects {
+            project.restart(app, source.clone());
+        }
+    }
+
+    /// Stop every server, delete every server's on-disk cache, start them again. (M25)
+    ///
+    /// The palette's *Invalidate index caches and restart* — the way back when a disk index
+    /// has gone wrong in a way a plain restart cannot fix, because a restart *restores the
+    /// snapshot*, which is the thing the user is trying to be rid of.
+    ///
+    /// Order is load-bearing twice over. Every handle must be **dead** before anything is
+    /// deleted: the bundled rust-analyzer saves its index on shutdown, so a delete racing a
+    /// dying server gets the snapshot re-created behind it — and `LspHandle`'s `Drop` joins
+    /// the whole shutdown ladder, so `stop_servers` returning is the proof of death. And
+    /// every project must have stopped before anything restarts, because the cache
+    /// directory is **per server, not per project**: a survivor in another project would
+    /// re-save what was just deleted, and a restarted server would restore it.
+    pub fn invalidate_caches(&self, app: &tauri::AppHandle) {
+        // Collected first for `sync_all`'s reason: the ladders and the respawns block, and a
+        // `DashMap` iterator held over that blocks `ensure` and `close` behind it.
+        let projects: Vec<Arc<ProjectDiagnostics>> =
+            self.projects.iter().map(|entry| entry.clone()).collect();
+        for project in &projects {
+            project.stop_servers();
+        }
+        for server in cide_lsp::discover::servers() {
+            // One leaf per server under the profile's cache dir — the same naming rule
+            // `cide_lsp::config` uses when it hands the directory to the server. Deleting a
+            // dir that was never created is a fine answer; anything else is worth a line in
+            // the log, because a half-deleted index is exactly what this command exists to
+            // never leave behind.
+            let dir = cide_core::persist::cache_dir().join(server.binary());
+            if let Err(error) = std::fs::remove_dir_all(&dir)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%error, dir = %dir.display(), "invalidate: cache dir not fully removed");
+            }
+        }
+        for project in &projects {
+            project.sync(app);
+        }
     }
 
     /// Stop this project's servers. Dropping the entry runs each handle's shutdown ladder.
@@ -240,7 +297,13 @@ impl ProjectDiagnostics {
         // so by the time a project opens it holds rust-analyzer, gopls and whatever the enabled
         // extensions declared. `sync_servers` is the same walk, and it runs again whenever that
         // set changes — see its own note for why an already-open project must not be left behind.
-        sync_servers(&store, &handles, &roots);
+        sync_servers(
+            &store,
+            &handles,
+            &roots,
+            &binary_choices(&app),
+            server_tuning(&app),
+        );
 
         let kick = Arc::new(Kick::default());
         let pump = std::thread::Builder::new()
@@ -1050,7 +1113,13 @@ impl ProjectDiagnostics {
     /// `Server` a running session holds still resolves to the row it was minted for.
     pub fn sync(&self, app: &tauri::AppHandle) {
         let before = self.handles.lock().len();
-        sync_servers(&self.store, &self.handles, &self.roots);
+        sync_servers(
+            &self.store,
+            &self.handles,
+            &self.roots,
+            &binary_choices(app),
+            server_tuning(app),
+        );
         if self.handles.lock().len() != before {
             crate::emit::diagnostics(app, self.project);
         }
@@ -1113,24 +1182,109 @@ impl ProjectDiagnostics {
         else {
             return;
         };
-        // Drop the old handle first — its `Drop` runs the ladder — then start a new one on the
-        // spawn thread. Doing it the other way round would briefly leave two servers indexing the
-        // same workspace, which on rust-analyzer is 2–8 GB.
-        self.handles.lock().retain(|h| h.server() != server);
-        self.store.lock().clear_source(source.clone());
-        let roots = self.roots.clone();
-        let started =
-            cide_core::child_env::on_spawn_thread(move || LspHandle::start(server, roots));
-        match started {
-            Ok(handle) => self.handles.lock().push(handle),
-            Err(error) => self.store.lock().set_status(
-                source,
-                SourceStatus::Unavailable {
-                    reason: error.to_string(),
-                },
-            ),
+        respawn(
+            app,
+            self.project,
+            &self.store,
+            &self.handles,
+            &self.roots,
+            server,
+        );
+    }
+
+    /// Drop every handle and wait each shutdown ladder out — returning is the proof the
+    /// processes are gone, which is what [`DiagnosticsRegistry::invalidate_caches`] needs
+    /// before it deletes anything the dying servers might still write.
+    ///
+    /// The handles are taken in one short lock and dropped outside it: a ladder can take
+    /// seconds, and the pump's watchdog takes this same lock on its tick.
+    pub fn stop_servers(&self) {
+        let dropped: Vec<LspHandle> = std::mem::take(&mut *self.handles.lock());
+        for handle in dropped {
+            let source = handle.server().source();
+            drop(handle);
+            self.store.lock().clear_source(source);
         }
-        crate::emit::diagnostics(app, self.project);
+    }
+}
+
+/// Drop one server's handle and start a fresh one, on the spawn thread.
+///
+/// The shared tail of [`ProjectDiagnostics::restart`] (the panel's Restart button, the
+/// settings row's Builtin/System flip) and the memory watchdog in [`pump`] — a free function
+/// because the pump holds the pieces, not the `ProjectDiagnostics`. Order is load-bearing:
+/// the old handle drops **first** (its `Drop` runs the shutdown ladder), or two servers
+/// briefly index the same workspace, which on rust-analyzer is 2–8 GB.
+///
+/// The binary choice is read fresh, not captured at project open: a respawn that used
+/// yesterday's choice would make the settings row a lie.
+fn respawn(
+    app: &tauri::AppHandle,
+    project: ProjectId,
+    store: &Arc<Mutex<DiagnosticStore>>,
+    handles: &Arc<Mutex<Vec<LspHandle>>>,
+    roots: &[PathBuf],
+    server: Server,
+) {
+    let source = server.source();
+    handles.lock().retain(|h| h.server() != server);
+    store.lock().clear_source(source.clone());
+    let roots = roots.to_vec();
+    let choice = binary_choices(app)
+        .get(&server.binary())
+        .copied()
+        .unwrap_or_default();
+    let tuning = server_tuning(app);
+    let started = cide_core::child_env::on_spawn_thread(move || {
+        LspHandle::start_with(server, roots, choice, tuning)
+    });
+    match started {
+        Ok(handle) => {
+            // The same gap `sync_servers` covers, and it was missed here: `clear_source`
+            // above emptied the row, and without this the emit below broadcasts a store
+            // with no source at all — which the whole chain renders as "no language server
+            // is running" until the new session's own `Scanning` arrives. A watchdog or
+            // settings-change respawn made that a recurring flash, not a one-shot.
+            store.lock().set_status(
+                source,
+                SourceStatus::Scanning {
+                    detail: format!("restarting {}", server.binary()),
+                    percentage: None,
+                },
+            );
+            handles.lock().push(handle);
+        }
+        Err(error) => store.lock().set_status(
+            source,
+            SourceStatus::Unavailable {
+                reason: error.to_string(),
+            },
+        ),
+    }
+    crate::emit::diagnostics(app, project);
+}
+
+/// A process's resident memory, from `/proc/<pid>/statm`. `None` off Linux, and for any pid
+/// that is gone — which the watchdog treats as an ordinary answer, because it races the
+/// supervisor zeroing the pid slot by design.
+fn resident_memory_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        // The page size is a runtime fact, but not one that changes: 4096 everywhere cide
+        // has ever run. `sysconf` would cost a libc call per poll to defend against a
+        // hypothetical huge-page-default kernel, where this number being wrong makes the
+        // limit proportionally wrong, not the mechanism.
+        Some(resident_pages * 4096)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No `/proc` — the watchdog simply never fires. README's Platforms section records
+        // this as one of the macOS gaps: the honest alternative is `proc_pidinfo`, which
+        // needs a Mac in front of the person writing it.
+        let _ = pid;
+        None
     }
 }
 
@@ -1278,10 +1432,40 @@ const PREVIEW_BYTES: usize = 512;
 /// dropped — whose `Drop` runs the shutdown ladder — and its findings cleared, because a source
 /// that is no longer running must not leave a stale list behind under a row that says nothing is
 /// wrong.
+/// The user's say over which build each server runs, read from stored settings.
+///
+/// Read fresh at every call rather than held anywhere: the value lives in the workspace's
+/// settings, a spawn is rare, and a cached copy is a copy that survives the settings write it
+/// exists to honour. Before the workspace state exists (tests, early startup) the answer is
+/// the default for everything — which is also what an empty map means.
+fn binary_choices(
+    app: &tauri::AppHandle,
+) -> std::collections::BTreeMap<String, cide_ipc::settings::ServerBinaryChoice> {
+    app.try_state::<crate::workspace_state::WorkspaceState>()
+        .map(|state| state.with(|ws| ws.settings.inspections.server_binaries.clone()))
+        .unwrap_or_default()
+}
+
+/// The handshake tuning, read fresh like [`binary_choices`] and for the same reasons. The
+/// default (all zeros) is "the fork's own defaults", which is also what early startup and
+/// tests get before workspace state exists.
+fn server_tuning(app: &tauri::AppHandle) -> cide_lsp::config::Tuning {
+    app.try_state::<crate::workspace_state::WorkspaceState>()
+        .map(|state| {
+            state.with(|ws| cide_lsp::config::Tuning {
+                index_working_set_pct: ws.settings.inspections.server_index_working_set_pct,
+                memory_limit_mb: ws.settings.inspections.server_memory_limit_mb,
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn sync_servers(
     store: &Arc<Mutex<DiagnosticStore>>,
     handles: &Arc<Mutex<Vec<LspHandle>>>,
     roots: &[PathBuf],
+    choices: &std::collections::BTreeMap<String, cide_ipc::settings::ServerBinaryChoice>,
+    tuning: cide_lsp::config::Tuning,
 ) {
     let wanted = cide_lsp::discover::servers();
 
@@ -1296,6 +1480,7 @@ fn sync_servers(
         gone.iter().map(LspHandle::server).collect()
     };
     for server in dropped {
+        tracing::info!(binary = %server.binary(), "sync: dropped a server no longer wanted");
         store.lock().clear_source(server.source());
     }
 
@@ -1304,14 +1489,30 @@ fn sync_servers(
         if running.contains(&server) {
             continue;
         }
+        // Not applicable is not "unavailable": a server whose project marker exists nowhere
+        // under these roots gets **no row in the panel at all**, where one whose project is
+        // here but whose binary is missing keeps its actionable sentence. A Rust workspace
+        // listing gopls as a dim row was reporting cide's server table, not the workspace —
+        // and `clear_source` rather than skip, because the marker can *go away* (a `go.mod`
+        // deleted mid-session) and the row from that earlier life must go with it.
+        if !cide_lsp::discover::applicable(server, roots) {
+            store.lock().clear_source(server.source());
+            continue;
+        }
         // On the spawn thread, not here — see the module docs. `on_spawn_thread` blocks, and a
         // discovery probe plus a `fork` is single-digit milliseconds.
         let roots_for_server = roots.to_vec();
+        let choice = choices.get(&server.binary()).copied().unwrap_or_default();
         let started = cide_core::child_env::on_spawn_thread(move || {
-            LspHandle::start(server, roots_for_server)
+            LspHandle::start_with(server, roots_for_server, choice, tuning)
         });
         match started {
             Ok(handle) => {
+                tracing::info!(
+                    binary = %server.binary(),
+                    root = ?roots.first(),
+                    "sync: started a server"
+                );
                 // Deliberately *not* `Ready`: nothing has answered yet. `Session::new` emits its
                 // own `Scanning` the moment it writes `initialize`, and this is only what the
                 // store says in the gap before that arrives.
@@ -1319,6 +1520,7 @@ fn sync_servers(
                     server.source(),
                     SourceStatus::Scanning {
                         detail: format!("starting {}", server.binary()),
+                        percentage: None,
                     },
                 );
                 handles.lock().push(handle);
@@ -1430,6 +1632,9 @@ fn pump(
     // one did. See the module docs for why both are needed.
     let mut first_dirty: Option<Instant> = None;
     let mut last_change: Option<Instant> = None;
+    // When the memory watchdog last read /proc. Starts "just ran" so a project open is not
+    // immediately followed by a check of servers that have not indexed anything yet.
+    let mut last_watchdog = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
         let mut changed = false;
@@ -1442,7 +1647,19 @@ fn pump(
                 for event in handle.drain() {
                     changed = true;
                     match event {
-                        LspEvent::Status(status) => store.lock().set_status(source.clone(), status),
+                        LspEvent::Status(status) => {
+                            // The one line that says what the panel was told, because the
+                            // panel is the end of a four-hop pipe (server → session → store
+                            // → webview) and "the bar shows X but the label says Y" has
+                            // already cost one evening of guessing at which hop lied.
+                            tracing::debug!(
+                                project = ?project,
+                                source = %source,
+                                status = ?status,
+                                "diagnostics status"
+                            );
+                            store.lock().set_status(source.clone(), status)
+                        }
                         LspEvent::Published { abs_path, items } => {
                             let rel = relative(&roots, &abs_path);
                             let converted = items
@@ -1515,8 +1732,67 @@ fn pump(
             crate::emit::diagnostics(&app, project);
         }
 
+        /*
+         * The memory watchdog. (M25, phase 2 of ADR 0011)
+         *
+         * Every WATCHDOG_EVERY, read each live server's resident memory from /proc and
+         * respawn any that crossed the user's limit. In the pump rather than a thread of its
+         * own because everything a respawn needs already lives here, and because this thread
+         * already owns the discipline the handles lock demands — collected under the lock,
+         * acted on after it, exactly like the drain above, since `respawn` takes the same
+         * lock itself.
+         *
+         * The limit is read fresh from settings on every check, so flipping the setting
+         * needs no plumbing and no restart. Zero — the shipped default — costs one atomic
+         * load and a map read per interval. A watchdog respawn deliberately does NOT count
+         * against the supervisor's three-crashes-in-five-minutes budget: a fresh supervisor
+         * starts with a fresh budget by construction. What bounds a *thrashing* limit (a
+         * workspace whose index simply needs more than the user allowed) is the interval
+         * itself: at worst one re-index per WATCHDOG_EVERY, visible in the panel as the
+         * server re-scanning, with the memory genuinely released in between. The disk index
+         * (phase 1) is what turns that worst case from a re-index into a warm load.
+         */
+        if last_watchdog.elapsed() >= WATCHDOG_EVERY {
+            last_watchdog = now;
+            let limit_mb = watchdog_limit_mb(&app);
+            if limit_mb > 0 {
+                let over: Vec<(Server, u64)> = {
+                    let handles = handles.lock();
+                    handles
+                        .iter()
+                        .filter_map(|handle| {
+                            let rss = resident_memory_bytes(handle.pid()?)?;
+                            (rss > u64::from(limit_mb) * 1024 * 1024)
+                                .then_some((handle.server(), rss))
+                        })
+                        .collect()
+                };
+                for (server, rss) in over {
+                    tracing::warn!(
+                        server = server.binary(),
+                        resident_mib = rss / (1024 * 1024),
+                        limit_mib = limit_mb,
+                        "over the memory limit; restarting",
+                    );
+                    respawn(&app, project, &store, &handles, &roots, server);
+                }
+            }
+        }
+
         std::thread::sleep(TICK);
     }
+}
+
+/// How often the watchdog reads `/proc`. Frequent enough that a runaway indexer is caught
+/// inside a minute, rare enough that the cost rounds to zero against the 100 ms tick.
+const WATCHDOG_EVERY: Duration = Duration::from_secs(10);
+
+/// The user's memory limit, in MiB, `0` for off — read fresh so a settings change needs no
+/// plumbing. Absent state (tests, early startup) reads as off, which is also the default.
+fn watchdog_limit_mb(app: &tauri::AppHandle) -> u32 {
+    app.try_state::<crate::workspace_state::WorkspaceState>()
+        .map(|state| state.with(|ws| ws.settings.inspections.server_memory_limit_mb))
+        .unwrap_or(0)
 }
 
 /// An absolute path as the panel groups it: relative to its root, forward slashes.

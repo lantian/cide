@@ -171,3 +171,38 @@
 .badgeError {
   background: var(--red);
 }
+
+/*
+ * The analyser busy dot, on the warning triangle while something is scanning and there is
+ * no error pill to show. (M25)
+ *
+ * Anchored where the pill sits so the two states occupy one visual slot — the component
+ * guarantees they are never drawn together. `--yellow` is the token the Problems panel's
+ * own scanning dot uses, so "working" is one colour on both surfaces. The pulse is
+ * opacity-only (paint, never geometry, per check:motion's rule) and turns into a steady
+ * dot under reduced motion — a busy state that must still be visible, just not moving.
+ */
+.busyDot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--yellow);
+  animation: rail-busy-pulse var(--dur-sweep) ease-in-out infinite;
+  /* Reduced motion pauses at the 0% frame — full opacity, a steady dot. The busy fact must
+     stay visible; only the throb goes. */
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes rail-busy-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+

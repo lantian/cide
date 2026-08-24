@@ -755,6 +755,83 @@ function Inspections({ settings, patch }: SectionProps) {
         </Note>
       </Group>
 
+      <Group title="Language server builds">
+        <Row
+          label="Which rust-analyzer runs"
+          hint="Changing this restarts rust-analyzer, which re-indexes every open project."
+          control={
+            <Segmented
+              label="Which rust-analyzer build runs"
+              value={inspections.serverBinaries['rust-analyzer'] ?? 'builtin'}
+              onChange={(choice) =>
+                set({
+                  serverBinaries: { ...inspections.serverBinaries, 'rust-analyzer': choice },
+                })
+              }
+              options={[
+                { value: 'builtin', label: 'Built-in' },
+                { value: 'system', label: 'System (PATH)' },
+              ]}
+            />
+          }
+        />
+        <Row
+          label="Which gopls runs"
+          hint="Changing this restarts gopls. The built-in gopls keeps its file cache inside cide’s per-profile cache directory; a System gopls keeps its own machine-global one."
+          control={
+            <Segmented
+              label="Which gopls build runs"
+              value={inspections.serverBinaries['gopls'] ?? 'builtin'}
+              onChange={(choice) =>
+                set({
+                  serverBinaries: { ...inspections.serverBinaries, 'gopls': choice },
+                })
+              }
+              options={[
+                { value: 'builtin', label: 'Built-in' },
+                { value: 'system', label: 'System (PATH)' },
+              ]}
+            />
+          }
+        />
+        <Note title="Built-in is the build cide ships">
+          cide ships its own rust-analyzer — extended to keep its index on disk instead of only
+          in memory — and its own pinned gopls, newer than most distributions carry. When no
+          bundled build is present — every build run from source — Built-in quietly behaves
+          like System, so these rows cost nothing until a packaged cide ships the sidecars.
+          System always runs whatever your PATH resolves, exactly as before, and is never sent
+          cide’s configuration.
+        </Note>
+        <Row
+          label="Memory limit (MiB)"
+          hint="Restart a language server whose resident memory crosses this. 0 turns the watchdog off — the default, because a restart re-indexes until the disk index makes it a warm load. Values under 256 are raised to 256. The built-in gopls also gets this as a soft limit (GOMEMLIMIT, at 75%), so its GC compresses the heap before the watchdog would restart it; changing the value restarts gopls to apply that."
+          control={
+            <NumberField
+              label="Language server memory limit in MiB"
+              value={inspections.serverMemoryLimitMb}
+              min={0}
+              max={65536}
+              step={256}
+              onChange={(serverMemoryLimitMb) => set({ serverMemoryLimitMb })}
+            />
+          }
+        />
+        <Row
+          label="Index working set (%)"
+          hint="Scale how much of the built-in rust-analyzer’s index stays in memory, as a percentage of its defaults — the rest lives on disk and reloads on demand. 0 keeps the shipped tuning. Values are kept between 25 and 400, and changing this restarts rust-analyzer (a warm load from the disk index). Only the built-in build listens; a System build has no disk index."
+          control={
+            <NumberField
+              label="Index working set as a percentage of the built-in defaults"
+              value={inspections.serverIndexWorkingSetPct}
+              min={0}
+              max={400}
+              step={25}
+              onChange={(serverIndexWorkingSetPct) => set({ serverIndexWorkingSetPct })}
+            />
+          }
+        />
+      </Group>
+
       <Group title="Highlighting">
         <Row
           label="Default level"

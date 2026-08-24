@@ -430,3 +430,66 @@
 .sourceScanning {
   color: var(--yellow);
 }
+
+/*
+ * The progress bar under a scanning source's detail line.
+ *
+ * Yellow because the dot beside it is: one colour per state, and the state is "working",
+ * which `.sourceScanning` already spells. The track is `--border-soft` — visible on the
+ * panel in both themes without claiming attention the way an accent would.
+ */
+.sourceProgress {
+  display: block;
+  position: relative;
+  overflow: hidden;
+  height: 3px;
+  margin-top: var(--sp-2);
+  border-radius: var(--r-full);
+  background: var(--border-soft);
+}
+
+.sourceProgressFill {
+  display: block;
+  height: 100%;
+  width: 100%;
+  border-radius: var(--r-full);
+  background: var(--yellow);
+  /* The fill is a scale, not a width, so the transition names transform — check:motion's
+     geometry rule is mechanical and right: a `width` here would pass a reviewer ("it is a
+     3px fill!") and still teach the codebase the wrong spelling. The component sets the
+     `scaleX` inline per report (not through a custom property: check:theme requires every
+     `var()` a stylesheet reads to be a declared token, and per-element state is not one);
+     the ease keeps the jumps between reports from reading as flicker. */
+  transform-origin: left;
+  transform: scaleX(0);
+  transition: transform var(--dur-2) ease-out;
+}
+
+/*
+ * The indeterminate sweep: a 40% segment crossing the track, for the phases that report no
+ * number (`cargo check` above all). Transform-only, so it composites without layout or
+ * paint of the row around it.
+ */
+.sourceProgressSweep {
+  display: block;
+  height: 100%;
+  width: 40%;
+  border-radius: var(--r-full);
+  background: var(--yellow);
+  animation: problems-sweep var(--dur-sweep) linear infinite;
+  /* Reduced motion pauses at the 0% frame — the segment resting at the track's left edge,
+     a static "busy" mark. That is why the sweep starts *inside* the track and exits right,
+     rather than entering from off-screen left: paused-at-0% must show something. */
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes problems-sweep {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    /* 250% of the segment's own 40% width: fully past the track's right edge, so the loop
+       jump happens while nothing is visible. */
+    transform: translateX(250%);
+  }
+}

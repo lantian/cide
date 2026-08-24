@@ -442,6 +442,26 @@ pub async fn diagnostics_refresh(
 /// The panel's only recovery gesture, and the reason the three-crashes rule can be as strict as
 /// it is: giving up permanently is tolerable when the user has a way back that is not "restart
 /// the application".
+/// Stop every analyser, delete every server's on-disk cache, start them all again.
+///
+/// The nuclear option next to [`diagnostics_restart`]'s per-server one, and the difference is
+/// the point: a restart of the bundled rust-analyzer *restores its disk index*, so when the
+/// index itself is the problem, restarting reproduces it. The ordering that makes the delete
+/// safe lives in `DiagnosticsRegistry::invalidate_caches`, not here.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn diagnostics_invalidate_caches(app: tauri::AppHandle) -> Result<(), String> {
+    // Joins every shutdown ladder and spawns every replacement, so: the blocking pool. The
+    // registry is re-fetched from the handle inside the closure because `State` borrows the
+    // command's lifetime and the closure needs `'static`.
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager as _;
+        let registry = app.state::<DiagnosticsRegistry>();
+        registry.invalidate_caches(&app);
+    })
+    .await
+    .map_err(|error| format!("the invalidation did not finish: {error}"))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn diagnostics_restart(
     app: tauri::AppHandle,

@@ -901,6 +901,13 @@ export const diagnostics = {
   /** Restart one analyser after it gave up. The panel's only recovery gesture. */
   restart: (projectId: ProjectId, source: DiagnosticSourceId) =>
     invoke<void>('diagnostics_restart', { project: projectId, source }),
+
+  /**
+   * Stop every analyser, delete every server's on-disk cache, start them all again — the
+   * palette's "Invalidate index caches". Global, not per project: the caches are per
+   * server, and a survivor in another project would re-save what was just deleted.
+   */
+  invalidateCaches: () => invoke<void>('diagnostics_invalidate_caches', {}),
 }
 
 /**

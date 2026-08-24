@@ -78,6 +78,14 @@ import { ctrlLink, wordTargetAt } from './ctrlLink'
 import { trailNames, type OutlineNode } from './memberNav'
 import { lintRanges, type LintSource } from './lintMap'
 import { lintGutter, setDiagnostics } from '@codemirror/lint'
+
+/*
+ * One extension value for every editor's lint gutter, for the same reason `blame.ts` keeps
+ * one: `Compartment.reconfigure` compares extension identity, and a fresh `lintGutter()`
+ * per effect run reads as a configuration change — the gutter is torn down and rebuilt,
+ * detaching the marker element any open gutter popup is anchored to.
+ */
+const LINT_GUTTER = lintGutter()
 import { blameExtension, setBlame } from './blame'
 import type { BlameMarker } from './blameModel'
 import { useSendToClaude } from './useSendToClaude'
@@ -439,6 +447,14 @@ export function EditorSurface({
   const viewRef = useRef<EditorView | null>(null)
   /** The live view's lint compartment, so the push effect can reconfigure it. */
   const lintSlotRef = useRef<Compartment | null>(null)
+  /*
+   * The last diagnostics actually dispatched into this view, as a serialized fingerprint.
+   * A ref and not state: it exists to *suppress* renders' side effects, and its doc-position
+   * validity is tied to the view's document, so every code path that replaces the document
+   * (open, revert) must reset it to null or the first publish after a reopen is skipped as
+   * "unchanged" against ranges computed for the previous text.
+   */
+  const lintFingerprintRef = useRef<string | null>(null)
   /** The same, for the blame column. (M18) */
   const blameSlotRef = useRef<Compartment | null>(null)
   /** This buffer's hold on the status bar, for the trail effect below. See `statusReadout.ts`. */
@@ -1235,6 +1251,9 @@ export function EditorSurface({
     }
     baseline = view.state.doc
     viewRef.current = view
+    // A fresh view is a fresh document: the fingerprint from the last one describes ranges
+    // in text this view has never held, and keeping it would skip the first publish.
+    lintFingerprintRef.current = null
     const stopPolarity = watchPolarity(view, polarity)
     lintSlotRef.current = lintSlot
     blameSlotRef.current = blameSlot
@@ -1584,6 +1603,7 @@ export function EditorSurface({
     return () => {
       viewRef.current = null
       lintSlotRef.current = null
+      lintFingerprintRef.current = null
       blameSlotRef.current = null
       saveHandleCb.current?.(null)
       scrollHandleCb.current?.(null)
@@ -1690,8 +1710,24 @@ export function EditorSurface({
     const slot = lintSlotRef.current
     if (view === null || slot === null) return
     const on = highlight !== 'none'
-    view.dispatch({ effects: slot.reconfigure(on ? [lintGutter()] : []) })
+    // The stable module-level extension, not a fresh `lintGutter()` per run: a new extension
+    // value makes the reconfigure tear the gutter's DOM down and rebuild it, which detaches
+    // the marker element an open gutter popup is anchored to — the popup's own window-level
+    // hover tracker then measures a detached node as a 0×0 rect and closes it on the next
+    // mouse move. `blame.ts` documents the identical lesson for its column.
+    view.dispatch({ effects: slot.reconfigure(on ? [LINT_GUTTER] : []) })
     const ranges = on ? lintRanges(diagnostics ?? [], view.state.doc) : []
+    /*
+     * Skip the dispatch when nothing changed. `@codemirror/lint`'s hover tooltip hides on
+     * **every** `setDiagnostics` transaction (its `hideOn` checks the effect, not the
+     * content), and the diagnostics snapshot republishes project-wide on every server
+     * status tick — roughly once a second while anything is indexing. Without this guard
+     * the popup a user is reading (or mousing towards, to copy the message) is closed by
+     * an identical repaint within the second: the "tooltip flashes and disappears" bug.
+     */
+    const fingerprint = JSON.stringify(ranges)
+    if (fingerprint === lintFingerprintRef.current) return
+    lintFingerprintRef.current = fingerprint
     /*
      * Wrapped, for the reason `registerReveal`'s handler is: this runs inside an effect with no
      * error boundary above it, and a `dispatch` that throws unmounts the React root and takes

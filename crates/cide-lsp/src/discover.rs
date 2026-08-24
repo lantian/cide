@@ -75,6 +75,10 @@ static REGISTRY: std::sync::RwLock<Vec<Row>> = std::sync::RwLock::new(Vec::new()
 ///
 /// Returns the handles for `defs`, in the order given.
 pub fn install(defs: Vec<cide_ipc::lang::LanguageServerDef>) -> Vec<Server> {
+    tracing::info!(
+        binaries = ?defs.iter().map(|d| d.binary.as_str()).collect::<Vec<_>>(),
+        "server registry install"
+    );
     let Ok(mut registry) = REGISTRY.write() else {
         return Vec::new();
     };
@@ -262,24 +266,190 @@ pub enum Found {
     Missing(String),
 }
 
-/// Both probes, in the order that gives the more useful sentence first.
-pub fn find(server: Server, roots: &[PathBuf]) -> Found {
-    let Some(binary) = which(&server.binary()) else {
-        return Found::Missing(format!(
-            "{} is not on PATH. Install it with `{}`.{}",
-            server.binary(),
-            server.install_hint(),
-            extra_paths_hint(server),
-        ));
+/// The servers cide ships its own build of, and what the shipped file is called.
+///
+/// Registry name → sidecar file name, and the two are different **on purpose**. The registry
+/// keeps saying `rust-analyzer` — it is what the Problems panel prints, what
+/// `DiagnosticSourceId::for_server` keys on, and what `cide_ext::contribute`'s conflict rule
+/// guards — while the file beside cide's binary is `cide-rust-analyzer`, because the tarball's
+/// contract is "put `bin/` on your PATH" and a file there named `rust-analyzer` would shadow
+/// the user's own for every shell on the machine. That is the toolchain-selection decision
+/// `cide_core::toolchain`'s append-never-prepend note says cide must never make.
+///
+/// A const table rather than a `LanguageServerDef` field, also on purpose: a manifest field
+/// would let an extension name an arbitrary sibling binary — `cide` itself, say — as its
+/// server, and nothing needs the generality. cide ships what cide ships.
+///
+/// The third column is the developer override: an environment variable naming a build to use
+/// **instead of everything**, so the fork can be run from its own `target/release` without
+/// packaging a sidecar first. Set and broken is a refusal, not a fall-through — an override
+/// that silently degraded to PATH would have the developer debugging the wrong binary.
+const BUNDLED: &[(&str, &str, &str)] = &[
+    ("rust-analyzer", "cide-rust-analyzer", "CIDE_RA_PATH"),
+    ("gopls", "cide-gopls", "CIDE_GOPLS_PATH"),
+];
+
+/// Where a resolved binary came from. Decides whether cide's own configuration is sent — see
+/// `session::Session::with_init_options`: the shipped build is configured, a stock one gets
+/// byte-for-byte the handshake it always got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// The env override in [`BUNDLED`]'s third column — a developer's own build of the fork.
+    Override,
+    /// The sidecar shipped beside cide's own binary.
+    Bundled,
+    /// The user's own installation, from `PATH` — how every server resolved before M25.
+    SystemPath,
+}
+
+/// One way to run a server. [`locate`] returns them best-first.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub path: PathBuf,
+    pub provenance: Provenance,
+}
+
+/// Every way this server's binary can be run, best first — or the sentence for why none can.
+///
+/// The ladder: env override (wins alone), the bundled sidecar, `PATH`. `choice` is the user's
+/// say over the middle rung — [`ServerBinaryChoice::System`] skips it, nothing else changes —
+/// and the override outranks the setting because it exists precisely for testing a build the
+/// setting does not know about.
+///
+/// More than one candidate is returned when more than one exists, and the caller is expected
+/// to try them **in order**: a bundled build that dies before its handshake falls back to the
+/// system one (see `server::supervise_lives`), so a broken sidecar degrades to exactly the
+/// behaviour cide had before it shipped one.
+///
+/// The project-marker probe still gates everything: with no `Cargo.toml` there is nothing to
+/// analyse, whichever binary exists.
+pub fn locate(
+    server: Server,
+    roots: &[PathBuf],
+    choice: cide_ipc::settings::ServerBinaryChoice,
+) -> Result<Vec<Candidate>, String> {
+    let binary = server.binary();
+    let bundled_row = BUNDLED.iter().find(|(name, _, _)| *name == binary);
+    let probes = Probes {
+        override_env: bundled_row.and_then(|(_, _, env)| {
+            let value = PathBuf::from(std::env::var_os(env)?);
+            Some(if cide_core::toolchain::is_executable(&value) {
+                Ok(value)
+            } else {
+                Err(value)
+            })
+        }),
+        bundled: bundled_row
+            .and_then(|(_, sidecar, _)| cide_core::toolchain::sibling_binary(sidecar)),
+        system: which(&binary),
+    };
+    let candidates = match ladder(probes, choice) {
+        Ok(candidates) => candidates,
+        Err(Refusal::BrokenOverride(value)) => {
+            let env = bundled_row.map(|(_, _, env)| *env).unwrap_or_default();
+            return Err(format!(
+                "{env} is set to {}, which is not an executable file, so {binary} was not \
+                 started. Unset it to fall back to the bundled or installed build.",
+                value.display(),
+            ));
+        }
+        Err(Refusal::NothingFound) => {
+            return Err(format!(
+                "{binary} is not on PATH. Install it with `{}`.{}",
+                server.install_hint(),
+                extra_paths_hint(server),
+            ));
+        }
     };
     if !roots.iter().any(|root| has_marker(server, root)) {
-        return Found::Missing(format!(
-            "No {} project under this project's roots, so {} was not started.",
+        return Err(format!(
+            "No {} project under this project's roots, so {binary} was not started.",
             server.project_kind(),
-            server.binary(),
         ));
     }
-    Found::Ready(binary)
+    Ok(candidates)
+}
+
+/// What the three probes said, before any rule is applied. See [`ladder`].
+struct Probes {
+    /// The override variable's verdict, when it is set at all: `Ok` the executable it names,
+    /// `Err` the broken value — kept for the sentence, because "CIDE_RA_PATH is set to <what>"
+    /// is the difference between a ten-second fix and an hour in the log.
+    override_env: Option<Result<PathBuf, PathBuf>>,
+    /// The sidecar beside cide's own binary, when it exists and can run.
+    bundled: Option<PathBuf>,
+    /// `PATH`, via [`which`].
+    system: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum Refusal {
+    /// The override is set and names something that cannot run. Deliberately **not** a
+    /// fall-through: an explicit override that silently degraded would have its author
+    /// debugging a binary they were not running.
+    BrokenOverride(PathBuf),
+    NothingFound,
+}
+
+/// The resolution rule, pure over facts already probed — for the reason
+/// `cide_core::toolchain::child_path_from` is: `set_var` is unsafe in edition 2024, so a test
+/// that had to arrange the environment could not be written safely at all.
+fn ladder(
+    probes: Probes,
+    choice: cide_ipc::settings::ServerBinaryChoice,
+) -> Result<Vec<Candidate>, Refusal> {
+    if let Some(verdict) = probes.override_env {
+        return match verdict {
+            // Alone, not first: everything below exists to be fallen back to, and the one
+            // thing an override must never do is quietly become something else.
+            Ok(path) => Ok(vec![Candidate {
+                path,
+                provenance: Provenance::Override,
+            }]),
+            Err(value) => Err(Refusal::BrokenOverride(value)),
+        };
+    }
+    let mut candidates = Vec::new();
+    if choice == cide_ipc::settings::ServerBinaryChoice::Builtin
+        && let Some(path) = probes.bundled
+    {
+        candidates.push(Candidate {
+            path,
+            provenance: Provenance::Bundled,
+        });
+    }
+    if let Some(path) = probes.system {
+        candidates.push(Candidate {
+            path,
+            provenance: Provenance::SystemPath,
+        });
+    }
+    if candidates.is_empty() {
+        return Err(Refusal::NothingFound);
+    }
+    Ok(candidates)
+}
+
+/// Both probes, in the order that gives the more useful sentence first.
+///
+/// [`locate`] with the default binary choice, folded to its first candidate — kept because
+/// "which one binary would run" is the question the tests and the throwaway callers ask, and
+/// the ladder behind it answers identically for every server without a bundled build.
+pub fn find(server: Server, roots: &[PathBuf]) -> Found {
+    match locate(
+        server,
+        roots,
+        cide_ipc::settings::ServerBinaryChoice::default(),
+    ) {
+        Ok(candidates) => Found::Ready(
+            candidates
+                .into_iter()
+                .next()
+                .map(|candidate| candidate.path)
+                .unwrap_or_default(),
+        ),
+        Err(reason) => Found::Missing(reason),
+    }
 }
 
 /// Only mentioned when the toolchain's own directory exists but is not on `PATH`, because that is
@@ -307,6 +477,19 @@ fn extra_paths_hint(server: Server) -> String {
     String::new()
 }
 
+/// Whether this server has anything to look at under `root` — its project marker
+/// (`Cargo.toml`, `go.mod`) exists somewhere the walk reaches.
+///
+/// `pub` since M25 for one caller beyond [`locate`]: `cide-app`'s `sync_servers` asks it
+/// *before* attempting a start, because the answer decides whether the server appears in
+/// the Problems panel at all. A server with no project here is not "unavailable" — that
+/// word is for something the user might fix — it is simply not applicable, and a Rust
+/// workspace listing gopls as a greyed row was reporting a fact about cide's server table,
+/// not about the workspace.
+pub fn applicable(server: Server, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| has_marker(server, root))
+}
+
 fn has_marker(server: Server, root: &Path) -> bool {
     let markers = server.project_markers();
     // No markers means any root will do — see `Server::project_markers`.
@@ -320,6 +503,20 @@ fn has_marker(server: Server, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applicability_is_the_marker_and_nothing_else() {
+        let dir = temp("applicable");
+        // A Rust project: gopls has no business here, rust-analyzer does.
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+        let roots = vec![dir.clone()];
+        assert!(applicable(Server::RUST_ANALYZER, &roots));
+        assert!(!applicable(Server::GOPLS, &roots));
+        // The marker appearing is the whole test for a mixed repo.
+        std::fs::write(dir.join("go.mod"), "module t\n").unwrap();
+        assert!(applicable(Server::GOPLS, &roots));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let dir =
@@ -404,6 +601,141 @@ mod tests {
     // `search_paths` into `cide_core::toolchain`, where the function now lives. It is asserted
     // there rather than restated here, because two copies of one claim is how one of them stops
     // being true.
+
+    // --- the ladder ---------------------------------------------------------------------
+    //
+    // Driven through the pure rule over pre-probed facts, because the real probes read the
+    // environment and `set_var` is unsafe in edition 2024 — the same reason
+    // `cide_core::toolchain::child_path_from` is pure.
+
+    fn probed(
+        override_env: Option<Result<&str, &str>>,
+        bundled: Option<&str>,
+        system: Option<&str>,
+    ) -> Probes {
+        Probes {
+            override_env: override_env
+                .map(|verdict| verdict.map(PathBuf::from).map_err(PathBuf::from)),
+            bundled: bundled.map(PathBuf::from),
+            system: system.map(PathBuf::from),
+        }
+    }
+
+    fn shape(candidates: &[Candidate]) -> Vec<(Provenance, &str)> {
+        candidates
+            .iter()
+            .map(|c| (c.provenance, c.path.to_str().unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn an_override_wins_alone_rather_than_first() {
+        // Everything below the override exists to be fallen back to; the override itself must
+        // never quietly become something else, so it is the *only* candidate.
+        let got = ladder(
+            probed(
+                Some(Ok("/fork/ra")),
+                Some("/app/cide-rust-analyzer"),
+                Some("/usr/bin/ra"),
+            ),
+            cide_ipc::settings::ServerBinaryChoice::Builtin,
+        )
+        .expect("resolved");
+        assert_eq!(shape(&got), vec![(Provenance::Override, "/fork/ra")]);
+    }
+
+    #[test]
+    fn a_broken_override_refuses_rather_than_falling_through() {
+        // A developer whose CIDE_RA_PATH points at a typo must hear that, not silently debug
+        // the PATH build for an hour.
+        let refusal = ladder(
+            probed(
+                Some(Err("/fork/typo")),
+                Some("/app/cide-rust-analyzer"),
+                Some("/usr/bin/ra"),
+            ),
+            cide_ipc::settings::ServerBinaryChoice::Builtin,
+        );
+        assert!(matches!(refusal, Err(Refusal::BrokenOverride(_))));
+    }
+
+    #[test]
+    fn the_bundled_build_beats_path_and_path_remains_the_fallback() {
+        let got = ladder(
+            probed(None, Some("/app/cide-rust-analyzer"), Some("/usr/bin/ra")),
+            cide_ipc::settings::ServerBinaryChoice::Builtin,
+        )
+        .expect("resolved");
+        assert_eq!(
+            shape(&got),
+            vec![
+                (Provenance::Bundled, "/app/cide-rust-analyzer"),
+                (Provenance::SystemPath, "/usr/bin/ra"),
+            ],
+            "the system build must stay on the list — a bundled build that fails to start \
+             falls back to it"
+        );
+    }
+
+    #[test]
+    fn with_nothing_bundled_the_ladder_is_exactly_the_old_behaviour() {
+        // Every dev build (no sidecar beside a debug binary), and any future server that has
+        // no bundled row: PATH, alone.
+        let got = ladder(
+            probed(None, None, Some("/usr/bin/some-ls")),
+            cide_ipc::settings::ServerBinaryChoice::Builtin,
+        )
+        .expect("resolved");
+        assert_eq!(
+            shape(&got),
+            vec![(Provenance::SystemPath, "/usr/bin/some-ls")]
+        );
+    }
+
+    #[test]
+    fn the_bundled_table_names_both_shipped_servers() {
+        // The strings are contracts, not configuration: the sidecar file name meets
+        // packaging's install step, and the env var is what a developer types. A rename on
+        // either side of those meetings is silent breakage, so pin them here.
+        assert_eq!(
+            BUNDLED,
+            [
+                ("rust-analyzer", "cide-rust-analyzer", "CIDE_RA_PATH"),
+                ("gopls", "cide-gopls", "CIDE_GOPLS_PATH"),
+            ]
+        );
+    }
+
+    #[test]
+    fn choosing_system_skips_a_bundled_build_that_exists() {
+        let got = ladder(
+            probed(None, Some("/app/cide-rust-analyzer"), Some("/usr/bin/ra")),
+            cide_ipc::settings::ServerBinaryChoice::System,
+        )
+        .expect("resolved");
+        assert_eq!(shape(&got), vec![(Provenance::SystemPath, "/usr/bin/ra")]);
+    }
+
+    #[test]
+    fn choosing_system_with_nothing_on_path_is_missing_not_a_quiet_fallback() {
+        // The user said System; running the bundled build anyway would be the settings row
+        // lying. The Missing sentence names the install command, which is the remedy they
+        // asked for.
+        let refusal = ladder(
+            probed(None, Some("/app/cide-rust-analyzer"), None),
+            cide_ipc::settings::ServerBinaryChoice::System,
+        );
+        assert!(matches!(refusal, Err(Refusal::NothingFound)));
+    }
+
+    #[test]
+    fn nothing_anywhere_is_nothing_found() {
+        let refusal = ladder(
+            probed(None, None, None),
+            cide_ipc::settings::ServerBinaryChoice::Builtin,
+        );
+        assert!(matches!(refusal, Err(Refusal::NothingFound)));
+    }
 
     #[test]
     fn each_server_knows_its_own_language_id_and_source() {

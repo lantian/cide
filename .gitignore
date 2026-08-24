@@ -42,3 +42,6 @@
 .DS_Store
 Thumbs.db
 /NOTES.md
+
+# Personal launch environment for run.sh (CIDE_RA_PATH, CIDE_GOPLS_PATH, ...)
+.env

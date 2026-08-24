@@ -247,8 +247,14 @@ pub enum SourceStatus {
     Unavailable { reason: String },
     /// Started, and has not finished its first pass. `detail` is the progress line, because
     /// "Waiting for rust-analyzer" with nothing after it for two minutes is indistinguishable
-    /// from a hang.
-    Scanning { detail: String },
+    /// from a hang. `percentage` is the most recent `$/progress` report's number when the
+    /// server sent one (rust-analyzer's indexing phases do, its `cargo check` does not) —
+    /// `None` means "busy, length unknown", which the panel draws as an indeterminate bar
+    /// rather than a bar frozen at zero.
+    Scanning {
+        detail: String,
+        percentage: Option<u8>,
+    },
     /// Answered. Note that this is reached when the last `$/progress` token ends **and** the
     /// handshake completed — never "when a diagnostic has been seen". A clean Rust workspace
     /// publishes nothing at all, and a ready-requires-a-diagnostic rule would leave it

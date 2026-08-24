@@ -892,6 +892,14 @@
    */
   --dur-1: 90ms;
   --dur-2: 140ms;
+  /* One cycle of a looping indicator (the indeterminate progress sweep, the rail's busy
+     pulse). Deliberately NOT zeroed by the reduced-motion block below — an infinite
+     animation at 0.01ms strobes, the exact opposite of the request. Loops answer reduced
+     motion through `--motion-loop` instead: every looping `animation` must set
+     `animation-play-state: var(--motion-loop)` and design its 0% frame as the sensible
+     static state, because paused shows the 0% frame for ever. */
+  --dur-sweep: 1200ms;
+  --motion-loop: running;
   /* Fast out of the gate, settling at the end — the standard "entering" curve. */
   --ease-out: cubic-bezier(0.2, 0, 0, 1);
 
@@ -1106,5 +1114,8 @@ strong {
   :root {
     --dur-1: 0.01ms;
     --dur-2: 0.01ms;
+    /* Loops pause rather than shorten — see `--motion-loop`'s declaration. A paused loop
+       renders its 0% frame, which each loop designs to be its static "still true" look. */
+    --motion-loop: paused;
   }
 }

@@ -1260,6 +1260,28 @@ fn build() -> Vec<Command> {
          * here requires one, and the id is rebindable regardless — a chord spent on a control most
          * users press once a week is a chord taken from every terminal pane in every window.
          */
+        // The nuclear neighbour of `problems.refresh`: stop every analyser, delete every
+        // server's on-disk cache (the bundled rust-analyzer's disk index above all), start
+        // them again. Distinct from a restart on purpose — a restart *restores* the disk
+        // index, so when the index itself has gone wrong, restarting reproduces the problem.
+        // IntelliJ users will look for this under the words "invalidate caches".
+        Command::new(
+            "problems.invalidateCaches",
+            "Invalidate index caches and restart analysers",
+            VIEW,
+        )
+        .when("projectOpen")
+        .keywords(&[
+            "invalidate",
+            "caches",
+            "index",
+            "rebuild",
+            "clear",
+            "reindex",
+            "corrupt",
+            "lsp",
+            "rust-analyzer",
+        ]),
         Command::new("problems.refresh", "Re-run code analysis", VIEW)
             .when("projectOpen")
             // "rerun" and "refresh" are what a user types; "stale" is what they are looking at

@@ -78,6 +78,7 @@ impl SourceState {
             // A source that has been mentioned but has not reported is not "ready with nothing".
             status: SourceStatus::Scanning {
                 detail: "starting".to_string(),
+                percentage: None,
             },
             by_path: BTreeMap::new(),
         }
@@ -512,6 +513,7 @@ mod tests {
             DiagnosticSourceId::gopls(),
             SourceStatus::Scanning {
                 detail: "Loading packages".into(),
+                percentage: None,
             },
         );
 

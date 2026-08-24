@@ -1,0 +1,51 @@
+# Restore-cache + pinned checkout for one of cide's fork siblings, parameterised on the
+# lock file that pins it. Extracted when the gopls checkout would have made four verbatim
+# copies of this block across the linux and macos jobs.
+#
+# The order is load-bearing: the cache restores before the checkout because `git init`
+# tolerates a directory already holding `target/` (or any build output), while `git clone`
+# would refuse the non-empty directory outright. init+fetch rather than clone for the same
+# reason, and because a depth-1 fetch of one rev works for a tag and a commit id alike and
+# skips the fork's whole history.
+name: checkout-fork
+description: Check out a fork sibling at the revision its lock pins, with a build cache
+inputs:
+  lock:
+    description: The lock file (shell-sourceable CIDE_<NAME>_URL/_REV pair)
+    required: true
+  url-var:
+    description: The lock's URL variable name
+    required: true
+  rev-var:
+    description: The lock's revision variable name
+    required: true
+  dest:
+    description: Where the checkout lives, relative to the workspace
+    required: true
+  cache-path:
+    description: The build-output directory to cache, relative to the workspace
+    required: true
+  cache-prefix:
+    description: Cache key prefix, so two forks never share entries
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Cache the fork build
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.cache-path }}
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(inputs.lock) }}
+    - name: Check out the fork at the pinned revision
+      shell: bash
+      run: |
+        set -euo pipefail
+        . "${{ inputs.lock }}"
+        url="${!URL_VAR}"
+        rev="${!REV_VAR}"
+        git init "${{ inputs.dest }}"
+        git -C "${{ inputs.dest }}" fetch --depth 1 "$url" "$rev"
+        git -C "${{ inputs.dest }}" checkout --detach FETCH_HEAD
+      env:
+        URL_VAR: ${{ inputs.url-var }}
+        REV_VAR: ${{ inputs.rev-var }}

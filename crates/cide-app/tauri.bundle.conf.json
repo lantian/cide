@@ -1,6 +1,10 @@
 {
   "bundle": {
-    "externalBin": ["../../target/release/cide-hook"],
+    "externalBin": [
+      "../../target/release/cide-hook",
+      "../../target/release/cide-rust-analyzer",
+      "../../target/release/cide-gopls"
+    ],
     "linux": {
       "appimage": {
         "files": {

@@ -35,6 +35,37 @@ move with it — and prefixes the OS window title with `[DEV] ` so a task switch
 apart. `cide_core::profile` is the whole rule; `CIDE_PROFILE` is how it is set, and children
 inherit it, so `cide-headless tree` in a profiled pane inspects that profile's workspace.
 
+**The rust-analyzer fork** (ADR 0011) lives in `../forks/rust-analyzer`, branch `cide` —
+never a workspace member — and since Phase 1 it drags its sibling **`../forks/salsa`**, a
+patched 0.28.2 wired through `[patch.crates-io]` (the manifest's `../salsa` resolves relative
+to the fork, so the pair must stay siblings of each other), which the disk
+index's tracked-struct restore cannot exist without — and, since Phase 3, its LRU-evicted-memo
+disk tier (`memos.redb` beside the snapshot, reloading only what shallow-verifies — ADR 0011,
+Decision 5). A dev build has no bundled sidecar, so it
+runs the PATH rust-analyzer with zero setup; to run the fork instead, build it once in the
+sibling and launch with `CIDE_RA_PATH=$HOME/work/forks/rust-analyzer/target/release/rust-analyzer
+./run.sh` — the override outranks both the bundled binary and PATH, and refuses (rather than
+falls through) when it points at nothing executable. To carry the overrides on every launch
+without retyping them, put plain `KEY=value` lines in **`.env`** at the repo root — run.sh
+sources it (allexport) when present, a missing file is simply an empty one, and it is
+gitignored because the paths in it are one machine's. Packaging any bundle requires both
+forks; preflight prints the clone command for a missing `../forks/rust-analyzer` and fails on
+a missing `../forks/salsa` whenever the fork's manifest patches to it. **Each fork carries its
+own `CLAUDE.md`** — the rust-analyzer one is the merge-survival guide (what must outlive an
+upstream rebase, and the six invariants that break with no compile error), the salsa one is a
+porting guide (its history shares no ancestor with upstream, so "merge latest" there is a
+re-application, never a `git merge`). Read them before touching either repo.
+
+**The gopls checkout** (ADR 0011, Decision 6) is the third fork: `../forks/tools`
+(golang/tools — gopls is its `gopls/` module), branch `cide` from the tag
+`packaging/gopls.lock` pins, built as the `cide-gopls` sidecar with the host's `go`
+(`GOTOOLCHAIN=auto` fetches the toolchain the module demands). **No cide patches yet** — it
+builds stock gopls under the cide name; its `CLAUDE.md` records the planned patch surface
+(persist the metadata graph, cap the in-memory layer) and the measure-first gate. Dev
+override: `CIDE_GOPLS_PATH=$HOME/work/forks/tools/gopls/cide-gopls ./run.sh`. The shipped
+gopls is configured through the **env lane** (`cide_lsp::config::extra_env` — `GOPLSCACHE`
+into the per-profile cache dir), not `initializationOptions`.
+
 A profile starts **factory-fresh** — settings live inside `workspace.json`, so a new one has no
 installed extensions, no global agent roles and the default keymap. That is the point, and it
 is the first thing to remember before filing "my extensions are gone".
@@ -82,7 +113,7 @@ pnpm --dir ui build
   entry through Vite) and asserts on the output. Adding a `check:foo` script to
   `ui/package.json` is enough — CI enumerates them rather than listing them. Several modules
   are import-free *so that* their check can compile them standalone; keep them that way.
-- Icon drift: `scripts/gen-icons.sh --check`. Packaging: `cargo xtask package [--appimage|--deb|--flatpak|--tarball|--app|--dmg|--src] [--check|--write|--run]` — without `--run` it only prints a plan. Naming no target means everything *this host* is responsible for; naming a bundle the host cannot build (`--dmg` on Linux) is a preflight failure, because nothing here cross-compiles. `--src` is the exception and the cheap one: `git archive` of HEAD into `target/release/bundle/src/cide-<version>-src.tar.gz`, byte-reproducible, buildable on any host but in the **Linux** default set only, so a release matrix uploads one source tarball rather than two that differ. It refuses a dirty tree — a tarball cut from one is a false claim about a commit. `--tarball` is the *binary* one and makes the opposite promise: `target/release/bundle/tarball/cide-<version>-linux-<arch>.tar.gz`, the two binaries plus the desktop entry, icons, README and LICENSE under a `cide-<version>/` prefix — a tenth the size of the AppImage because it carries no runtime, so it needs the host's WebKitGTK 4.1, and it is compiled output so nothing about its bytes is reproducible. Linux only. `./build.sh` is the wrapper for daily use: one artefact for the host (AppImage on Linux, `.dmg` on macOS), then installs it into `$CIDE_INSTALL_DIR` (default `~/bin`, Linux only — a `.dmg` is opened, not put on PATH). `--all` for the host's whole default set, `--plan` to build nothing, `--no-install` to stop after building. **Releases are `.github/workflows/release.yml`**, dispatched by hand with a version: it cuts `release/v<version>` from master, writes that version into the four files that carry it (Cargo.toml, tauri.conf.json, ui/package.json, and the regenerated flatpak metainfo — they drifted before it existed), tags, builds every artefact through `cargo xtask package`, and publishes one GitHub release with a SHA256SUMS.
+- Icon drift: `scripts/gen-icons.sh --check`. Packaging: `cargo xtask package [--appimage|--deb|--flatpak|--tarball|--app|--dmg|--src] [--check|--write|--run]` — without `--run` it only prints a plan. Naming no target means everything *this host* is responsible for; naming a bundle the host cannot build (`--dmg` on Linux) is a preflight failure, because nothing here cross-compiles. `--src` is the exception and the cheap one: `git archive` of HEAD into `target/release/bundle/src/cide-<version>-src.tar.gz`, byte-reproducible, buildable on any host but in the **Linux** default set only, so a release matrix uploads one source tarball rather than two that differ. It refuses a dirty tree — a tarball cut from one is a false claim about a commit. `--tarball` is the *binary* one and makes the opposite promise: `target/release/bundle/tarball/cide-<version>-linux-<arch>.tar.gz`, the three binaries (`cide`, `cide-hook`, and since M25 `cide-rust-analyzer` — cide's own rust-analyzer build from the sibling fork pinned by `packaging/rust-analyzer.lock`) plus the desktop entry, icons, README and LICENSE under a `cide-<version>/` prefix. It carries no WebKitGTK, so it needs the host's 4.1 — but the bundled rust-analyzer means it is no longer "a tenth the size of the AppImage"; both archives carry the same ~50 MiB fork. Compiled output, so nothing about its bytes is reproducible. Linux only. **Every packaged target now needs `../forks/rust-analyzer` checked out at the pinned rev** — preflight fails with the clone command when it is absent. `./build.sh` is the wrapper for daily use: one artefact for the host (AppImage on Linux, `.dmg` on macOS), then installs it into `$CIDE_INSTALL_DIR` (default `~/bin`, Linux only — a `.dmg` is opened, not put on PATH). `--all` for the host's whole default set, `--plan` to build nothing, `--no-install` to stop after building. **Releases are `.github/workflows/release.yml`**, dispatched by hand with a version: it cuts `release/v<version>` from master, writes that version into the four files that carry it (Cargo.toml, tauri.conf.json, ui/package.json, and the regenerated flatpak metainfo — they drifted before it existed), tags, builds every artefact through `cargo xtask package`, and publishes one GitHub release with a SHA256SUMS.
 - **Linux is the only platform cide has ever run on.** `README.md`'s Platforms section is the record: what a `cfg` arm does on macOS instead, which guarantees have no equivalent there (`PR_SET_PDEATHSIG` above all), and what still needs a Mac. The `macos` CI job is advisory until it has passed once.
 - **The macOS arms type-check from here for nine of the twelve crates, and it is worth doing before touching a `cfg`-gated one.** `README.md`'s *Type-checking for macOS from Linux* has the command; it uses `scripts/darwin-cc.sh` and `DOCS_RS=1`. **`cide-app`, `cide-git` and `xtask` are excluded** — `git2` is `vendored-openssl`, so they build OpenSSL for Darwin and that needs a real cross toolchain. So it covers `cide-core`'s `child_env` arms and every other domain crate, and it does *not* cover the crate that links tauri: the two errors a Mac reported in M16 were both in `cide-app` and this would have caught neither. It proves nothing about linking or runtime, and it is not a substitute for the `macos` CI job.
 
@@ -124,6 +155,7 @@ Which check covers what you touched:
 | terminal file links, `cmd/file.rs`'s refusals | `check:paths`, `check:outside-open` |
 | `windows/`, detach and re-dock | `check:detached`, `check:window-controls` |
 | `cide-lang`, `cide-lsp`, symbol navigation, diagnostics | `check:outline`, `check:problems`, `check:commands`, `check:keys` |
+| **the bundled servers — `discover`'s ladder/`BUNDLED` table, `cide-lsp/src/config.rs` (both lanes: `init_options` and `extra_env`), `toolchain::sibling_binary`, the Builtin/System settings, `packaging/{rust-analyzer,gopls}.lock`** | `cargo test -p cide-lsp` (ladder + config + session + env lane), `cargo test -p cide-core` (sibling lookup, cache dir), `cargo test -p xtask` (lock formats, fork/gopls steps, go verdict, manifest), `check:menus`; the real fallback path only under `cargo test -p cide-lsp -- --ignored a_broken_first_candidate`. The `initializationOptions` keys are a **two-repo contract** with `../forks/rust-analyzer`'s config module — one producer each side (`cide_lsp::config::rust_analyzer_options`), and a rename on either side degrades silently to defaults, so move both in one review; `extra_env`'s `GOPLSCACHE` is the same discipline against upstream gopls's own variable (ADR 0011) |
 | `ext/`, `sidebar/ExtensionsPanel/`, `cide-ext`, a manifest field | `check:ext`, `check:ext-render`, `check:boundary`, `check:sidebar`, plus `cargo test -p cide-ext` — the manifest refusal table, the path jail, the git route, and, against `../cide-marketplace`, the whole install road |
 | **a `SettingsSection` variant** | `check:ext` — the nav is the Rust enum's order, and a variant costs three things: the variant, a `SECTIONS` entry and a `case` in `renderSection`. The third is the one that gets forgotten, and it used to compile: the switch returns `ReactNode`, `undefined` is one, so the nav row opened a blank page. There is a `never` guard on it now |
 | **a `TabKind` variant** | `check:tab-overflow`, `check:tab-drag`, plus `cargo test -p cide-app` — a variant is four arms, and the two that get forgotten are `chrome/TabStrip.tsx`'s (a `never` there is a compile error, which is the point) and `closed_tabs::remembered`'s (a miss there is a tab Ctrl+Shift+T silently will not reopen) |

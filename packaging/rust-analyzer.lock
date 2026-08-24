@@ -1,0 +1,11 @@
+# The rust-analyzer fork pin. Read by three consumers, none of which may drift:
+#   - `cargo xtask package` preflight (xtask/src/package.rs, parse_ra_lock)
+#   - the generated Flatpak manifest (regenerate with `cargo xtask package --write`)
+#   - .github/workflows/release.yml, which sources this file as shell
+#
+# CIDE_RA_REV may be an upstream release tag or a 40-hex commit on the fork's `cide`
+# branch. Until the fork diverges from upstream, the URL is upstream and the rev is the
+# release tag the `cide` branch was cut from — a package then ships a stock rust-analyzer
+# under the cide-rust-analyzer name, which is Phase 0's contract exactly.
+CIDE_RA_URL=https://github.com/rust-lang/rust-analyzer
+CIDE_RA_REV=2026-08-24

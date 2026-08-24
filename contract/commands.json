@@ -38,6 +38,7 @@
   "diagnostics_did_save",
   "diagnostics_get",
   "diagnostics_implementations",
+  "diagnostics_invalidate_caches",
   "diagnostics_probe",
   "diagnostics_refresh",
   "diagnostics_restart",

@@ -403,6 +403,36 @@ function SourceLine({
       <span className={styles.sourceText}>
         <span className={styles.sourceLabel}>{source.label}</span>
         <p className={styles.sourceDetail}>{source.detail}</p>
+        {/*
+          * The bar, only while scanning. Determinate when the server sent a percentage
+          * (rust-analyzer's indexing phases do), an indeterminate sweep when it did not
+          * (`cargo check` reports no number) — a bar frozen at 0% would be indistinguishable
+          * from the hang the detail line above exists to rule out. The `aria-valuenow` is
+          * likewise absent in the sweep case: that is how a screen reader says
+          * "indeterminate", not a gap.
+          */}
+        {source.status === 'scanning' && (
+          <span
+            className={styles.sourceProgress}
+            role="progressbar"
+            aria-label={`${source.label} analysis progress`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            {...(source.percentage !== null ? { 'aria-valuenow': source.percentage } : {})}
+            data-audit="problemsProgress"
+          >
+            <span
+              className={
+                source.percentage !== null ? styles.sourceProgressFill : styles.sourceProgressSweep
+              }
+              style={
+                source.percentage !== null
+                  ? { transform: `scaleX(${source.percentage / 100})` }
+                  : undefined
+              }
+            />
+          </span>
+        )}
       </span>
       {/*
         * Restart, only for the sources that are processes.

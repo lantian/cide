@@ -28,6 +28,7 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.node22
+  - org.freedesktop.Sdk.Extension.golang
 command: cide
 
 finish-args:
@@ -54,7 +55,7 @@ modules:
   - name: cide
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin:/usr/lib/sdk/golang/bin
       env:
         CARGO_HOME: /run/build/cide/cargo
     build-commands:
@@ -71,15 +72,39 @@ modules:
       - npm --prefix ui install --no-audit --no-fund
       - npm --prefix ui run build
       - cargo build --release --locked -p cide-app -p cide-hook -p cide-headless
+      # cide's rust-analyzer fork, from the pinned git source below. `env` on the one command
+      # rather than build-options: those profile settings are upstream's own dist choices for
+      # the fork, and putting them in the module environment would silently re-profile cide's
+      # own release build above.
+      - env CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CFG_RELEASE=2026-08-24+cide cargo build --release --locked --manifest-path rust-analyzer-fork/Cargo.toml -p rust-analyzer
+      # cide's gopls, from its own pinned git source. Built in the checkout's gopls/ module
+      # directory; CGO off because gopls is pure Go and static is simpler; the -X stamp is
+      # logs-only, same rule as CFG_RELEASE above.
+      - cd gopls-fork/gopls && env CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags "-X main.version=gopls/v0.23.0+cide" -o cide-gopls .
       - install -Dm755 target/release/cide /app/bin/cide
       # cide-hook must sit beside the main binary: `cmd::session::hook_settings` locates it
       # relative to `current_exe`, because the child's cwd is the project root and its PATH
       # is the user's.
       - install -Dm755 target/release/cide-hook /app/bin/cide-hook
       - install -Dm755 target/release/cide-headless /app/bin/cide-headless
+      # The fork sits beside the main binary too — `cide_core::toolchain::sibling_binary` —
+      # and under its cide name, so it can never shadow a rust-analyzer of the user's own.
+      - install -Dm755 rust-analyzer-fork/target/release/rust-analyzer /app/bin/cide-rust-analyzer
+      - install -Dm755 gopls-fork/gopls/cide-gopls /app/bin/cide-gopls
       - install -Dm644 crates/cide-app/icons/128x128.png /app/share/icons/hicolor/128x128/apps/dev.cide.ide.png
       - install -Dm644 packaging/flatpak/dev.cide.ide.desktop /app/share/applications/dev.cide.ide.desktop
       - install -Dm644 packaging/flatpak/dev.cide.ide.metainfo.xml /app/share/metainfo/dev.cide.ide.metainfo.xml
     sources:
       - type: dir
         path: ../..
+      # The fork, at exactly the revision packaging/rust-analyzer.lock pins. A git source
+      # rather than a second dir source so a Flatpak build cannot silently package whatever
+      # the sibling checkout happens to hold.
+      - type: git
+        url: https://github.com/rust-lang/rust-analyzer
+        tag: 2026-08-24
+        dest: rust-analyzer-fork
+      - type: git
+        url: https://github.com/golang/tools
+        tag: gopls/v0.23.0
+        dest: gopls-fork

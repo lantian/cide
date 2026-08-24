@@ -380,6 +380,40 @@ jobs:
 
       - uses: ./.github/actions/install-tauri-cli
 
+      # Both fork siblings, at exactly their pinned revisions — so a release never sees the
+      # "HEAD differs from the pin" warning a local build may choose to live with. The
+      # cache-then-init ordering and the init+fetch choice live in the composite action.
+      # A cold rust-analyzer release build is ~10 minutes and the pins move rarely, so the
+      # caches carry most of the cost.
+      - name: Check out the rust-analyzer fork at the pinned revision
+        uses: ./.github/actions/checkout-fork
+        with:
+          lock: packaging/rust-analyzer.lock
+          url-var: CIDE_RA_URL
+          rev-var: CIDE_RA_REV
+          dest: ../forks/rust-analyzer
+          cache-path: ../forks/rust-analyzer/target
+          cache-prefix: ra-fork
+
+      # gopls builds with Go; the version comes from the checkout's own go.mod after the
+      # checkout below, so setup-go installs a floor and GOTOOLCHAIN=auto (the default)
+      # fetches whatever the pinned module actually demands.
+      - name: Set up Go for the gopls sidecar
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Check out the gopls sources at the pinned revision
+        uses: ./.github/actions/checkout-fork
+        with:
+          lock: packaging/gopls.lock
+          url-var: CIDE_GOPLS_URL
+          rev-var: CIDE_GOPLS_REV
+          dest: ../forks/tools
+          cache-path: ~/go/pkg/mod
+          cache-prefix: gopls-mod
+
       # One command for three artefacts. --deb is deliberately not here: the AppImage is the
       # Linux channel (docs/adr/0007) and the tarball is the no-runtime alternative; a .deb
       # nobody has installed from is a promise this release page should not make yet.
@@ -427,6 +461,41 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - uses: ./.github/actions/install-tauri-cli
+
+      # The forks, exactly as the linux job does them — see the comments there.
+      # Both fork siblings, at exactly their pinned revisions — so a release never sees the
+      # "HEAD differs from the pin" warning a local build may choose to live with. The
+      # cache-then-init ordering and the init+fetch choice live in the composite action.
+      # A cold rust-analyzer release build is ~10 minutes and the pins move rarely, so the
+      # caches carry most of the cost.
+      - name: Check out the rust-analyzer fork at the pinned revision
+        uses: ./.github/actions/checkout-fork
+        with:
+          lock: packaging/rust-analyzer.lock
+          url-var: CIDE_RA_URL
+          rev-var: CIDE_RA_REV
+          dest: ../forks/rust-analyzer
+          cache-path: ../forks/rust-analyzer/target
+          cache-prefix: ra-fork
+
+      # gopls builds with Go; the version comes from the checkout's own go.mod after the
+      # checkout below, so setup-go installs a floor and GOTOOLCHAIN=auto (the default)
+      # fetches whatever the pinned module actually demands.
+      - name: Set up Go for the gopls sidecar
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Check out the gopls sources at the pinned revision
+        uses: ./.github/actions/checkout-fork
+        with:
+          lock: packaging/gopls.lock
+          url-var: CIDE_GOPLS_URL
+          rev-var: CIDE_GOPLS_REV
+          dest: ../forks/tools
+          cache-path: ~/go/pkg/mod
+          cache-prefix: gopls-mod
 
       # --dmg alone, and that is not a typo: tauri's dmg bundler runs the .app bundler first,
       # so naming both would not add anything. --src is absent for a different reason — the

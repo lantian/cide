@@ -52,6 +52,19 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
+# Personal environment, if the developer keeps one. `.env` is gitignored and holds the
+# variables a launch here should carry every time without retyping them — above all
+# `CIDE_RA_PATH` and `CIDE_GOPLS_PATH`, the fork overrides (see CLAUDE.md). Sourced with
+# allexport so plain `KEY=value` lines export without each needing its own `export`.
+# A missing file is simply an empty one; a present file is trusted like the script itself,
+# because both are the developer's own working tree.
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
 MAX_WINDOWS=8
 DEV_PORT=1420
 

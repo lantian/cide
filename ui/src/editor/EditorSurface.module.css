@@ -915,8 +915,16 @@
 /*
  * The hover tooltip. Styled from the same tokens as `Overlay.module.css`'s card, so a diagnostic
  * popover and a picker read as one surface.
+ *
+ * TWO selectors, because CodeMirror builds the two popups differently and the first year of
+ * this rule silently styled only one of them: the *gutter* popup is a top-level
+ * `ul.cm-tooltip.cm-tooltip-lint`, while hovering the squiggle itself nests that `ul` as a
+ * section inside a `div.cm-tooltip.cm-tooltip-hover` host — which therefore fell through to
+ * CodeMirror's base-theme grey box with no max-width, and a long rustc message rendered as
+ * one enormous unstyled strip.
  */
-.body :global(.cm-tooltip.cm-tooltip-lint) {
+.body :global(.cm-tooltip.cm-tooltip-lint),
+.body :global(.cm-tooltip.cm-tooltip-hover) {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
@@ -928,9 +936,23 @@
   padding: 2px;
 }
 
+/* The nested section must not double the card up. */
+.body :global(.cm-tooltip-hover .cm-tooltip-lint) {
+  background: transparent;
+  border: none;
+}
+
 .body :global(.cm-diagnostic) {
   border-left: 2px solid transparent;
   padding: 4px 8px;
+  /*
+   * The reason people mouse into this popup at all: to select the message and paste it into
+   * a search or a commit. CodeMirror keeps hover tooltips open while the pointer is inside
+   * them (and the dispatch guard in `EditorSurface.tsx` stopped the once-a-second repaint
+   * that used to close them first), so the remaining piece is letting the text be text.
+   */
+  user-select: text;
+  cursor: text;
 }
 
 .body :global(.cm-diagnostic-error) {

@@ -3,4 +3,4 @@
 /**
  * What one analyser is doing.
  */
-export type SourceStatus = { "kind": "unavailable", reason: string, } | { "kind": "scanning", detail: string, } | { "kind": "ready" };
+export type SourceStatus = { "kind": "unavailable", reason: string, } | { "kind": "scanning", detail: string, percentage: number | null, } | { "kind": "ready" };

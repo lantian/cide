@@ -47,7 +47,7 @@ import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
 import { SearchPanel } from '@/sidebar/SearchPanel'
 import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
-import { ALL_VISIBLE, applyFilters, statusBarCounts } from '@/sidebar/ProblemsPanel/model'
+import { ALL_VISIBLE, anyScanning, applyFilters, statusBarCounts } from '@/sidebar/ProblemsPanel/model'
 import {
   isDiagnosticSourceId,
   refreshDiagnostics,
@@ -1150,6 +1150,11 @@ export function App() {
             active={sidebar.view}
             changed={auditMode() ? AUDIT_GIT_CHANGES : gitChanged}
             errors={statusBarCounts(diagnostics.snapshot)?.errors ?? null}
+            /* "Something is looking right now" — the panel-model rule (`anyScanning`), not a
+               local re-derivation: the first pass and a later re-index report it through
+               different arms of the snapshot, and this is the one place that must not
+               disagree with the panel about whether work is happening. */
+            busy={anyScanning(diagnostics.snapshot)}
             /* `openCount` answers `null` for every board arm but `ready` — including `absent`,
                because a project with no tracker has no count, it has no tracker. The rail draws
                nothing for `null` and nothing for `0`, and those are two different claims: nobody

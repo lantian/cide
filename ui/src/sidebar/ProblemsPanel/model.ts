@@ -176,7 +176,10 @@ export interface SourceReport {
 /** What one analyser is doing. The same three states as the snapshot, one level down. */
 export type SourceStatus =
   | { kind: 'unavailable'; reason: string }
-  | { kind: 'scanning'; detail: string }
+  // `percentage` optional rather than required: pre-M25 fixtures and extension-published
+  // snapshots omit it, and an absent number means the same thing as a null one — busy,
+  // length unknown.
+  | { kind: 'scanning'; detail: string; percentage?: number | null }
   | { kind: 'ready' }
 
 /**
@@ -274,14 +277,41 @@ export function countBySeverity(items: readonly Diagnostic[]): SeverityCounts {
 }
 
 /** The status bar's `Diagnostics | null`, derived from the same snapshot the panel renders. */
+/**
+ * Whether any analyser is currently working, for the rail's busy dot and nothing else.
+ *
+ * True when the snapshot itself is still `scanning` (the first pass, before anything has
+ * answered) **or** any listed source reports `scanning` (a later pass: `ready` overall
+ * while rust-analyzer re-indexes after a branch switch). The two arms cover different
+ * sessions of the same fact — "something is looking right now" — and either alone misses
+ * the other's case.
+ */
+export function anyScanning(snapshot: DiagnosticsSnapshot | null): boolean {
+  if (snapshot === null) return false
+  if (snapshot.kind === 'scanning') return true
+  return (snapshot.sources ?? []).some((source) => source.status.kind === 'scanning')
+}
+
 export function statusBarCounts(
   snapshot: DiagnosticsSnapshot,
-): { errors: number; warnings: number } | null {
-  // Both non-`ready` states collapse to `null`. A scanning source has counts *pending*, not
-  // zero, and the bar's `✗ —` is exactly the right thing to show while it starts up.
-  if (snapshot.kind !== 'ready') return null
-  const counts = countBySeverity(snapshot.items)
-  return { errors: counts.error, warnings: counts.warning }
+): { errors: number; warnings: number; pending: boolean } | null {
+  // `scanning` counts too, marked pending. It used to collapse to `null` like `unavailable`
+  // on the argument that counts are *pending*, not zero — but the two states then shared
+  // the bar's `✗ —` slot AND its "no language server is running" tooltip, so a server that
+  // was merely indexing (or stuck indexing — one leaked progress token holds the whole
+  // snapshot at `scanning` for ever) read as a server that did not exist, while the editor
+  // visibly underlined the diagnostics it was publishing. Servers stream diagnostics while
+  // they scan; showing the live counts with a pending flag is both more honest and immune
+  // to a stuck scan. `null` now means exactly "nothing is looking": unavailable, or no
+  // source at all — the one state the sentence in the tooltip is true for.
+  if (snapshot.kind !== 'ready' && snapshot.kind !== 'scanning') return null
+  // `items` is optional off the `ready` arm — a scanning snapshot may not have published yet.
+  const counts = countBySeverity(snapshot.items ?? [])
+  return {
+    errors: counts.error,
+    warnings: counts.warning,
+    pending: snapshot.kind === 'scanning',
+  }
 }
 
 /** True only when something actually looked. The panel gates every count on this. */
@@ -506,6 +536,13 @@ export interface SourceRow {
   /** One line under the label: the progress detail, the reason, or a count. */
   detail: string
   status: SourceStatus['kind']
+  /**
+   * The server's own progress number while `scanning`, `null` when it did not send one —
+   * rust-analyzer's indexing phases do, its `cargo check` does not. The row draws a
+   * determinate bar for a number and an indeterminate sweep for `null`; drawing a bar
+   * frozen at 0% for the sweep case is the "is it hung?" this field exists to answer.
+   */
+  percentage: number | null
   /** Whether this source is a process cide can start again. See [`NOT_A_PROCESS`]. */
   restartable: boolean
 }
@@ -546,6 +583,7 @@ export function sourceRows(snapshot: DiagnosticsSnapshot): SourceRow[] {
     label: report.label,
     detail: sourceDetail(report),
     status: report.status.kind,
+    percentage: report.status.kind === 'scanning' ? (report.status.percentage ?? null) : null,
     restartable: restartable(report.id),
   }))
 }

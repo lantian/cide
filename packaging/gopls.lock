@@ -1,0 +1,6 @@
+# The gopls pin: which revision of golang/tools (gopls is its gopls/ module) a package
+# carries as the cide-gopls sidecar. Shell-sourceable, like rust-analyzer.lock — release.yml
+# sources it, xtask parses it, the generated flatpak manifest embeds it. Move it only when a
+# newer gopls has been built and the packaged result exercised.
+CIDE_GOPLS_URL=https://github.com/golang/tools
+CIDE_GOPLS_REV=gopls/v0.23.0

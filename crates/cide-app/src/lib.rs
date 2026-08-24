@@ -530,6 +530,7 @@ pub fn run() {
             cmd::diagnostics::diagnostics_implementations,
             cmd::diagnostics::diagnostics_refresh,
             cmd::diagnostics::diagnostics_restart,
+            cmd::diagnostics::diagnostics_invalidate_caches,
             // --- M18: the git tool window ---
             cmd::toolwindow::tool_window_set_layout,
             cmd::toolwindow::tool_window_activate,

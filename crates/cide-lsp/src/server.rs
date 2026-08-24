@@ -24,7 +24,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde_json::Value;
 
 use crate::codec;
-use crate::discover::{Found, Server};
+use crate::discover::{Candidate, Server};
 use crate::session::{Effect, Session};
 
 /// How long to wait for `shutdown`'s reply, then for the process to exit on its own.
@@ -439,6 +439,9 @@ pub struct LspHandle {
     pending: Pending,
     /// See [`Capability`] and [`Caps`]. Written by the supervisor, read by whoever is about to ask.
     caps: Arc<Caps>,
+    /// The live child's pid, `0` between lives. Written by the supervisor per life; see
+    /// [`LspHandle::pid`].
+    pid: Arc<std::sync::atomic::AtomicU32>,
     supervisor: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -449,27 +452,60 @@ impl LspHandle {
     /// long-lived `cide-spawn` thread via `child_env::on_spawn_thread`, which is the whole reason
     /// that function exists. See the crate docs.
     pub fn start(server: Server, roots: Vec<PathBuf>) -> Result<Self, LspError> {
-        let binary = match crate::discover::find(server, &roots) {
-            Found::Ready(path) => path,
-            Found::Missing(reason) => return Err(LspError::Unavailable(reason)),
-        };
+        Self::start_with(
+            server,
+            roots,
+            cide_ipc::settings::ServerBinaryChoice::default(),
+            crate::config::Tuning::default(),
+        )
+    }
+
+    /// [`Self::start`], with the user's say over which build runs.
+    ///
+    /// `choice` reaches `discover::locate`, whose ladder it steers; everything after that is
+    /// identical. A separate constructor rather than a widened `start` so the tests and the
+    /// throwaway callers that mean "the default" keep saying nothing.
+    pub fn start_with(
+        server: Server,
+        roots: Vec<PathBuf>,
+        choice: cide_ipc::settings::ServerBinaryChoice,
+        tuning: crate::config::Tuning,
+    ) -> Result<Self, LspError> {
+        let candidates =
+            crate::discover::locate(server, &roots, choice).map_err(LspError::Unavailable)?;
+        if let Some(first) = candidates.first() {
+            // The one place the resolution is stated. Without this line, "which build am I
+            // actually running" has no answer short of `ls /proc/<pid>/exe` — and that is the
+            // first question both a bug report about the fork and a bug report blaming the
+            // fork need answered.
+            tracing::info!(
+                server = server.binary(),
+                path = %first.path.display(),
+                provenance = ?first.provenance,
+                fallbacks = candidates.len() - 1,
+                "resolved"
+            );
+        }
 
         let (outbox_tx, outbox_rx) = crossbeam_channel::bounded::<Value>(OUTBOX);
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<LspEvent>();
         let stop = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let caps = Arc::new(Caps::default());
+        let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let supervisor = {
             let stop = Arc::clone(&stop);
             let roots = roots.clone();
             let pending = Arc::clone(&pending);
             let caps = Arc::clone(&caps);
+            let pid = Arc::clone(&pid);
             std::thread::Builder::new()
                 .name(format!("cide-lsp-{}", server.binary()))
                 .spawn(move || {
                     supervise(
-                        server, binary, roots, outbox_rx, event_tx, stop, pending, caps,
+                        server, candidates, roots, tuning, outbox_rx, event_tx, stop, pending,
+                        caps, pid,
                     )
                 })
                 .map_err(|error| LspError::Spawn {
@@ -486,8 +522,23 @@ impl LspHandle {
             next_id: Arc::new(std::sync::atomic::AtomicI64::new(REQUEST_ID_BASE)),
             pending,
             caps,
+            pid,
             supervisor: Some(supervisor),
         })
+    }
+
+    /// The live child's pid, or `None` between lives. (M25)
+    ///
+    /// For the memory watchdog and nothing else: a pid is only a valid subject for
+    /// `/proc/<pid>` while the child runs, and the supervisor zeroes this the moment a life
+    /// ends — so a reader may still race a just-died process, and must treat "no such
+    /// process" as an ordinary answer, never an error. Signalling through this pid would be
+    /// a bug (the shutdown ladder owns the process); reading is all it is for.
+    pub fn pid(&self) -> Option<u32> {
+        match self.pid.load(Ordering::Acquire) {
+            0 => None,
+            pid => Some(pid),
+        }
     }
 
     /// Does this server answer `textDocument/references`? `None` while it is still starting.
@@ -605,20 +656,39 @@ fn start_failure_reason(server: Server, stderr: &str) -> String {
     reason
 }
 
+/// After a life ends in failure: the rung to try next, if advancing is right at all.
+///
+/// Pure, and separate from the supervisor's match, because the rule packs two decisions that
+/// must not drift apart under future edits:
+///
+/// * **Only a death *before* the handshake advances.** A start failure is a statement about
+///   the binary — wrong libc, missing component, a shim — and the next rung is a different
+///   binary, so trying it can help. A crash *after* the handshake is a statement about the
+///   work: an OOM-killed rust-analyzer would only OOM harder as the stock build indexing the
+///   same workspace, and advancing there would also dodge the crash budget — three crashes in
+///   five minutes must stop the restarts, not tour the ladder.
+/// * **The ladder is finite and one-directional.** No wrap-around: when the last rung fails
+///   to start, the answer is the sentence, not the first rung again.
+fn next_candidate(at: usize, total: usize, ever_handshook: bool) -> Option<usize> {
+    (!ever_handshook && at + 1 < total).then_some(at + 1)
+}
+
 /// The supervisor thread: spawn, pump, restart, give up.
 #[allow(clippy::too_many_arguments)]
 fn supervise(
     server: Server,
-    binary: PathBuf,
+    candidates: Vec<Candidate>,
     roots: Vec<PathBuf>,
+    tuning: crate::config::Tuning,
     outbox: Receiver<Value>,
     events: Sender<LspEvent>,
     stop: Arc<AtomicBool>,
     pending: Pending,
     caps: Arc<Caps>,
+    pid: Arc<std::sync::atomic::AtomicU32>,
 ) {
     supervise_lives(
-        server, binary, roots, &outbox, &events, &stop, &pending, &caps,
+        server, candidates, roots, tuning, &outbox, &events, &stop, &pending, &caps, &pid,
     );
     /*
      * The last word on every waiter, wherever the supervisor exited.
@@ -641,20 +711,30 @@ fn supervise(
 #[allow(clippy::too_many_arguments)]
 fn supervise_lives(
     server: Server,
-    binary: PathBuf,
+    candidates: Vec<Candidate>,
     roots: Vec<PathBuf>,
+    tuning: crate::config::Tuning,
     outbox: &Receiver<Value>,
     events: &Sender<LspEvent>,
     stop: &Arc<AtomicBool>,
     pending: &Pending,
     caps: &Arc<Caps>,
+    pid: &std::sync::atomic::AtomicU32,
 ) {
     let mut crashes: Vec<Instant> = Vec::new();
+    // Which rung of the ladder this and every following life runs. Only ever advanced by
+    // `next_candidate`, i.e. only on a failure to *start* — see the match below.
+    let mut at = 0usize;
 
     loop {
         if stop.load(Ordering::Acquire) {
             return;
         }
+        let Some(candidate) = candidates.get(at) else {
+            // Unreachable while `locate` refuses to return an empty ladder; a legible stop
+            // beats an index panic on a supervisor thread if that ever changes.
+            return;
+        };
 
         /*
          * Back to "nobody has said yet" before every life, not only the first.
@@ -670,7 +750,13 @@ fn supervise_lives(
         // Every exit inside `run_once` ends this life, so the waiters go here — once, around the
         // call, rather than at each of its four exits, which is how one of them gets missed.
         // `supervise` above repeats it for the paths that never reach this line at all.
-        let outcome = run_once(server, &binary, &roots, outbox, events, stop, pending, caps);
+        let outcome = run_once(
+            server, candidate, &roots, tuning, outbox, events, stop, pending, caps, pid,
+        );
+        // The life is over, whatever `outcome` says, so the pid must not outlive it: a
+        // watchdog reading a stale pid would measure whatever process the kernel has since
+        // handed that number to.
+        pid.store(0, Ordering::Release);
         cancel_pending(pending, RequestError::ServerGone);
         match outcome {
             Ok(()) => return,
@@ -684,12 +770,52 @@ fn supervise_lives(
             // often a **symlink to rustup**, which passes every "is it on PATH and executable"
             // probe and then exits with `Unknown binary 'rust-analyzer' in official toolchain`.
             // That sentence is what the user needs, immediately and on its own.
+            //
+            // Since M25 there is one thing left to try before saying so: the next rung of the
+            // ladder. A bundled fork that cannot start on this machine (wrong glibc, corrupt
+            // copy, a fork bug in its first lines) falls back to the user's own build, and the
+            // failure degrades to exactly the behaviour cide had before it shipped a fork.
+            // **Only a start failure advances.** A crash *after* the handshake never does —
+            // see `next_candidate` for why that asymmetry is the whole design.
             Err(Failure {
                 reason,
                 ever_handshook: false,
             }) => {
+                if let Some(next) = next_candidate(at, candidates.len(), false) {
+                    tracing::warn!(
+                        server = server.binary(),
+                        failed = %candidate.path.display(),
+                        next = %candidates[next].path.display(),
+                        %reason,
+                        "start failure; trying the next rung of the ladder",
+                    );
+                    let _ = events.send(LspEvent::Status(SourceStatus::Scanning {
+                        percentage: None,
+                        detail: format!(
+                            "{} could not start; falling back to {}",
+                            candidate.path.display(),
+                            candidates[next].path.display(),
+                        ),
+                    }));
+                    at = next;
+                    continue;
+                }
+                let mut sentence = start_failure_reason(server, &reason);
+                if candidates.len() > 1 {
+                    // Every rung was tried and the sentence above describes only the last. A
+                    // user reading "could not start" while a working build sits on their PATH
+                    // deserves to know it was tried too.
+                    sentence.push_str(&format!(
+                        " (every build was tried: {})",
+                        candidates
+                            .iter()
+                            .map(|c| c.path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ));
+                }
                 let _ = events.send(LspEvent::Status(SourceStatus::Unavailable {
-                    reason: start_failure_reason(server, &reason),
+                    reason: sentence,
                 }));
                 return;
             }
@@ -718,6 +844,7 @@ fn supervise_lives(
                 );
                 let _ = events.send(LspEvent::Status(SourceStatus::Scanning {
                     detail: format!("restarting {}", server.binary()),
+                    percentage: None,
                 }));
                 /*
                  * Wait out the backoff, discarding anything queued for the session that just
@@ -757,21 +884,24 @@ fn supervise_lives(
     }
 }
 
-/// One life of one server. `Ok(())` means an orderly stop; `Err` means it died.
-#[allow(clippy::too_many_arguments)]
-fn run_once(
-    server: Server,
-    binary: &PathBuf,
-    roots: &[PathBuf],
-    outbox: &Receiver<Value>,
-    events: &Sender<LspEvent>,
-    stop: &AtomicBool,
-    pending: &Pending,
-    caps: &Arc<Caps>,
-) -> Result<(), Failure> {
+/// The spawn, everything about it and nothing else — so a test can hold the `Command`.
+///
+/// `args` was the M22 field that never reached the spawn: `Server::args()` existed, both
+/// builtins were flagless, and `run_once` built `Command::new(binary)` with nothing after it —
+/// so a contributed `yaml-language-server` hung waiting for `--stdio` and nothing in any test
+/// could see it. The `Command` is built in a free function now precisely so the assertion
+/// "what a server declares is what it is spawned with" is a unit test over `get_args`, not a
+/// hope.
+fn build_command(
+    binary: &std::path::Path,
+    args: &[String],
+    cwd: &std::path::Path,
+    extra_env: &[(String, String)],
+) -> Command {
     let mut command = Command::new(binary);
     command
-        .current_dir(roots.first().cloned().unwrap_or_else(std::env::temp_dir))
+        .args(args)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -787,12 +917,43 @@ fn run_once(
     // stopped`. `prepare_command` now appends `cide_core::toolchain::extra_dirs` — the same
     // directories `discover::find` searched — so the server searches the list cide searched.
     cide_core::child_env::prepare_command(&mut command);
+    // cide's per-server variables (`config::extra_env` — provenance-gated, like the init
+    // options) go after `prepare_command`, the same last-writer-wins ordering rule its own
+    // PATH pass follows: what cide states deliberately must not be undone by the scrub.
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
     cide_core::child_env::arm(&mut command);
+    command
+}
+
+/// One life of one server. `Ok(())` means an orderly stop; `Err` means it died.
+#[allow(clippy::too_many_arguments)]
+fn run_once(
+    server: Server,
+    candidate: &Candidate,
+    roots: &[PathBuf],
+    tuning: crate::config::Tuning,
+    outbox: &Receiver<Value>,
+    events: &Sender<LspEvent>,
+    stop: &AtomicBool,
+    pending: &Pending,
+    caps: &Arc<Caps>,
+    pid: &std::sync::atomic::AtomicU32,
+) -> Result<(), Failure> {
+    let cwd = roots.first().cloned().unwrap_or_else(std::env::temp_dir);
+    let mut command = build_command(
+        &candidate.path,
+        &server.args(),
+        &cwd,
+        &crate::config::extra_env(server, candidate.provenance, tuning),
+    );
 
     let mut child: Child = command.spawn().map_err(|e| Failure {
         reason: e.to_string(),
         ever_handshook: false,
     })?;
+    pid.store(child.id(), Ordering::Release);
     let mut stdin = child.stdin.take().ok_or_else(|| Failure {
         reason: "no stdin".into(),
         ever_handshook: false,
@@ -859,7 +1020,14 @@ fn run_once(
             })?
     };
 
-    let (mut session, initial) = Session::new(roots, server);
+    // The one call site where provenance exists and a `Session` is born, which is what makes
+    // the gate in `config::init_options` airtight: a stock PATH server cannot receive cide's
+    // configuration because nothing else ever constructs the live session.
+    let (mut session, initial) = Session::with_init_options(
+        roots,
+        server,
+        crate::config::init_options(server, candidate.provenance, tuning),
+    );
     // When a held-back `Ready` becomes believable. See `READY_SETTLE`.
     let mut ready_at: Option<Instant> = None;
     let write = |stdin: &mut std::process::ChildStdin,
@@ -1215,13 +1383,18 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(true));
             supervise(
                 Server::RUST_ANALYZER,
-                PathBuf::from("/nonexistent/never-spawned"),
+                vec![Candidate {
+                    path: PathBuf::from("/nonexistent/never-spawned"),
+                    provenance: crate::discover::Provenance::SystemPath,
+                }],
                 Vec::new(),
+                crate::config::Tuning::default(),
                 rx,
                 events,
                 stop,
                 Arc::clone(&pending),
                 Arc::new(Caps::default()),
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
             );
 
             assert_eq!(
@@ -1367,7 +1540,69 @@ mod tests {
             Server::RUST_ANALYZER,
             &[],
         );
-        assert!(matches!(outcome, Found::Missing(_)));
+        assert!(matches!(outcome, crate::discover::Found::Missing(_)));
+    }
+
+    #[test]
+    fn the_arguments_a_server_declares_are_the_arguments_it_is_spawned_with() {
+        // The M22 gap: `Server::args()` existed, nothing applied it, and both builtins being
+        // flagless meant nothing noticed. `yaml-language-server` needs `--stdio` and hangs
+        // silently without it.
+        let flagged = build_command(
+            std::path::Path::new("/usr/bin/yaml-language-server"),
+            &["--stdio".to_string()],
+            std::path::Path::new("/repo"),
+            &[],
+        );
+        let args: Vec<_> = flagged.get_args().map(|a| a.to_os_string()).collect();
+        assert_eq!(args, ["--stdio"]);
+        assert_eq!(
+            flagged.get_current_dir(),
+            Some(std::path::Path::new("/repo"))
+        );
+        // And the builtins, which declare none, must gain none — a flag invented here would
+        // reach every rust-analyzer on every machine.
+        let bare = build_command(
+            std::path::Path::new("/usr/bin/rust-analyzer"),
+            &[],
+            std::path::Path::new("/repo"),
+            &[],
+        );
+        assert_eq!(bare.get_args().count(), 0);
+    }
+
+    #[test]
+    fn extra_env_reaches_the_spawn_and_wins_over_the_scrub() {
+        // The env lane end to end: what `config::extra_env` states must be on the spawned
+        // command, and must survive `prepare_command`'s passes — which is why it is applied
+        // after them (last writer wins on `Command::env`).
+        let command = build_command(
+            std::path::Path::new("/app/cide-gopls"),
+            &[],
+            std::path::Path::new("/repo"),
+            &[("GOPLSCACHE".to_owned(), "/cache/cide/gopls".to_owned())],
+        );
+        let stated = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("GOPLSCACHE"))
+            .and_then(|(_, value)| value);
+        assert_eq!(stated, Some(std::ffi::OsStr::new("/cache/cide/gopls")));
+    }
+
+    #[test]
+    fn only_a_failure_to_start_advances_the_ladder_and_only_downwards() {
+        // The two decisions `next_candidate` packs, pinned separately from the supervisor's
+        // match so a future edit to either cannot silently drop one.
+        //
+        // A start failure with a rung left: advance.
+        assert_eq!(next_candidate(0, 2, false), Some(1));
+        // A start failure on the last rung: the sentence, not a wrap-around.
+        assert_eq!(next_candidate(1, 2, false), None);
+        // A crash after the handshake never advances — an OOM-killed fork would only OOM
+        // harder as the stock build, and advancing would dodge the crash budget.
+        assert_eq!(next_candidate(0, 2, true), None);
+        // One rung is the pre-M25 world exactly.
+        assert_eq!(next_candidate(0, 1, false), None);
     }
 
     #[test]
@@ -1459,5 +1694,104 @@ mod tests {
         // slow server's flush, the ladder would degenerate into "signal immediately".
         assert!(GRACE >= Duration::from_secs(1));
         assert!(KILL_AFTER <= GRACE);
+    }
+
+    /// The whole ladder against a real server: rung one is a script that cannot start, rung
+    /// two is the machine's own rust-analyzer, and the session must still reach `Ready`.
+    ///
+    /// `#[ignore]` for `tests/real_servers.rs`'s reasons: it spawns the real binary, needs it
+    /// on PATH, and costs a real (if tiny) index. Run it deliberately:
+    /// `cargo test -p cide-lsp -- --ignored a_broken_first_candidate`.
+    #[test]
+    #[ignore = "spawns the real rust-analyzer; needs it on PATH"]
+    fn a_broken_first_candidate_falls_back_to_the_real_server() {
+        let Some(real) = cide_core::toolchain::which("rust-analyzer") else {
+            panic!("rust-analyzer is not on PATH; this test needs the real one");
+        };
+
+        let dir = std::env::temp_dir().join(format!("cide-lsp-ladder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"ladder\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write");
+        std::fs::write(dir.join("src/lib.rs"), "pub fn one() -> u32 { 1 }\n").expect("write");
+
+        // The broken rung: executable, spawnable, and gone before any handshake.
+        let broken = dir.join("broken-rust-analyzer");
+        std::fs::write(&broken, "#!/bin/sh\nexit 1\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let (outbox_tx, outbox_rx) = crossbeam_channel::bounded::<Value>(OUTBOX);
+        let (events_tx, events_rx) = crossbeam_channel::unbounded::<LspEvent>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let candidates = vec![
+            Candidate {
+                path: broken,
+                provenance: crate::discover::Provenance::Bundled,
+            },
+            Candidate {
+                path: real,
+                provenance: crate::discover::Provenance::SystemPath,
+            },
+        ];
+
+        let supervisor = {
+            let stop = Arc::clone(&stop);
+            let pending = Arc::clone(&pending);
+            let roots = vec![dir.clone()];
+            std::thread::spawn(move || {
+                supervise(
+                    Server::RUST_ANALYZER,
+                    candidates,
+                    roots,
+                    crate::config::Tuning::default(),
+                    outbox_rx,
+                    events_tx,
+                    stop,
+                    pending,
+                    Arc::new(Caps::default()),
+                    Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                )
+            })
+        };
+
+        // Ready must arrive through the fallback. Sixty seconds is generous for an empty
+        // crate; the point is that `Unavailable` must NOT arrive — that would mean the ladder
+        // reported the broken rung instead of advancing past it.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut ready = false;
+        'wait: while Instant::now() < deadline {
+            for event in events_rx.try_iter() {
+                match event {
+                    LspEvent::Status(SourceStatus::Ready) => {
+                        ready = true;
+                        break 'wait;
+                    }
+                    LspEvent::Status(SourceStatus::Unavailable { reason }) => {
+                        panic!("the ladder gave up instead of falling back: {reason}");
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        stop.store(true, Ordering::Release);
+        drop(outbox_tx);
+        let _ = supervisor.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            ready,
+            "the session never reached Ready through the fallback"
+        );
     }
 }

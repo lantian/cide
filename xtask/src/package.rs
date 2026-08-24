@@ -237,6 +237,43 @@ const APP_PACKAGE: &str = "cide-app";
 /// agree; `the_sidecar_path_matches_the_checked_in_config` asserts they do.
 const HOOK_SIDECAR_DIR: &str = "target/release";
 
+/// The third binary: cide's own build of rust-analyzer. (M25)
+///
+/// Named `cide-rust-analyzer` on disk, never `rust-analyzer`, because the tarball's contract
+/// is "put `bin/` on your PATH" — a file there called `rust-analyzer` would shadow the user's
+/// own for every shell on the machine. `cide_lsp::discover`'s bundled table maps the registry
+/// name to this file name; the two crates meet only on this string.
+const RA_BIN: &str = "cide-rust-analyzer";
+
+/// Where the fork is checked out, relative to the workspace root: under `../forks/`, beside
+/// the salsa fork its manifest patches to (`../salsa` *from the fork*, so the two must stay
+/// siblings of each other wherever the pair lives). **Not** a workspace member — 400k lines
+/// of rust-analyzer joining every `cargo build --workspace` was the option that lost — so
+/// nothing in CI needs it; only a packaging run does, and preflight is where its absence is
+/// reported.
+const RA_FORK_DIR: &str = "../forks/rust-analyzer";
+
+/// The pin: which fork revision a package carries, checked into **this** repository.
+///
+/// Shell-sourceable `KEY=VALUE` lines (`CIDE_RA_URL`, `CIDE_RA_REV`) so release.yml can
+/// `. packaging/rust-analyzer.lock` while this module parses the same bytes — one pin, three
+/// consumers (preflight, the generated flatpak manifest, the release workflow), zero copies.
+const RA_LOCK: &str = "packaging/rust-analyzer.lock";
+
+/// The fourth binary: cide's own build of gopls. (M26)
+///
+/// Same two-name rule as [`RA_BIN`], same reason: `bin/` on PATH must never shadow the
+/// user's own `gopls`.
+const GOPLS_BIN: &str = "cide-gopls";
+
+/// Where the gopls fork is checked out: the golang/tools repository (gopls is its `gopls/`
+/// module), branch `cide`, beside the other forks. Like [`RA_FORK_DIR`], never a workspace
+/// member, needed only by packaging runs.
+const GOPLS_FORK_DIR: &str = "../forks/tools";
+
+/// The gopls pin, [`RA_LOCK`]'s twin: `CIDE_GOPLS_URL` / `CIDE_GOPLS_REV`, shell-sourceable.
+const GOPLS_LOCK: &str = "packaging/gopls.lock";
+
 /// The `cargo-tauri` major version this configuration requires.
 ///
 /// `tauri.conf.json` is a v2 schema and the workspace links tauri 2.x. A v1 `cargo-tauri`
@@ -533,6 +570,95 @@ impl AppInfo {
             .iter()
             .any(|p| Path::new(p).file_name().is_some_and(|n| n == HOOK_BIN))
     }
+
+    /// Whether `bundle.externalBin` carries the rust-analyzer fork. Same matching rule as
+    /// [`Self::bundles_the_hook`], and the same stakes: a bundle without it installs, runs,
+    /// and silently falls back to the user's PATH rust-analyzer — which works, so nobody
+    /// notices the feature the package exists to ship is not in it.
+    fn bundles_the_fork(&self) -> bool {
+        self.external_bin
+            .iter()
+            .any(|p| Path::new(p).file_name().is_some_and(|n| n == RA_BIN))
+    }
+
+    /// Whether `bundle.externalBin` carries the gopls build. Same rule, same silent-fallback
+    /// stakes as [`Self::bundles_the_fork`].
+    fn bundles_the_gopls(&self) -> bool {
+        self.external_bin
+            .iter()
+            .any(|p| Path::new(p).file_name().is_some_and(|n| n == GOPLS_BIN))
+    }
+}
+
+/// A fork pin — the shape both [`RA_LOCK`] and [`GOPLS_LOCK`] state (each with its own key
+/// names, one parser).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaLock {
+    pub url: String,
+    pub rev: String,
+}
+
+/// Parse [`RA_LOCK`]'s bytes. Pure, so the format has a test.
+///
+/// `KEY=VALUE`, one per line, `#` comments and blank lines ignored — the subset of shell that
+/// is also trivially a config format, because release.yml sources the same file. Unknown keys
+/// are ignored rather than refused: the file may grow (a `CIDE_RA_BRANCH` hint, say) and an
+/// old xtask refusing a new lock would couple the two directions of update for no safety.
+fn parse_ra_lock(text: &str) -> Option<RaLock> {
+    parse_lock(text, "CIDE_RA_URL", "CIDE_RA_REV")
+}
+
+/// [`GOPLS_LOCK`]'s parser — same format, its own key names, so sourcing both locks in one
+/// shell (release.yml does) cannot have one clobber the other.
+fn parse_gopls_lock(text: &str) -> Option<RaLock> {
+    parse_lock(text, "CIDE_GOPLS_URL", "CIDE_GOPLS_REV")
+}
+
+fn parse_lock(text: &str, url_key: &str, rev_key: &str) -> Option<RaLock> {
+    let mut url = None;
+    let mut rev = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            if key == url_key {
+                url = Some(value.trim().to_string());
+            } else if key == rev_key {
+                rev = Some(value.trim().to_string());
+            }
+        }
+    }
+    Some(RaLock {
+        url: url.filter(|u| !u.is_empty())?,
+        rev: rev.filter(|r| !r.is_empty())?,
+    })
+}
+
+/// Read and parse [`RA_LOCK`], or say what is wrong with it in a sentence.
+pub fn read_ra_lock(root: &Path) -> Result<RaLock> {
+    let path = root.join(RA_LOCK);
+    let text = fs::read_to_string(&path).context(format!("reading {}", path.display()))?;
+    parse_ra_lock(&text).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} does not state both CIDE_RA_URL and CIDE_RA_REV",
+            path.display()
+        )
+    })
+}
+
+/// Read and parse [`GOPLS_LOCK`], or say what is wrong with it in a sentence.
+pub fn read_gopls_lock(root: &Path) -> Result<RaLock> {
+    let path = root.join(GOPLS_LOCK);
+    let text = fs::read_to_string(&path).context(format!("reading {}", path.display()))?;
+    parse_gopls_lock(&text).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} does not state both CIDE_GOPLS_URL and CIDE_GOPLS_REV",
+            path.display()
+        )
+    })
 }
 
 /// Every icon file the requested targets could need, each with the config that names it.
@@ -788,6 +914,10 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
         // missing names a path with a target triple in it that reads like a cross-compilation
         // problem.
         steps.extend(sidecar_steps(triple));
+        // The fork, for the same reason: it is not a workspace member, so no step below would
+        // ever produce it, and the bundler needs its `-<triple>` copy to resolve externalBin.
+        steps.extend(fork_steps(Some(triple), ra_rev(root).as_deref()));
+        steps.extend(gopls_steps(Some(triple), gopls_rev(root).as_deref()));
 
         let mut env = Vec::new();
         if targets.appimage {
@@ -850,6 +980,9 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
         if targets.bundles().is_none() {
             steps.extend(frontend_build_step(info));
             steps.push(release_binaries_step());
+            // No triple copy: that name exists for the bundler, and this plan has none.
+            steps.extend(fork_steps(None, ra_rev(root).as_deref()));
+            steps.extend(gopls_steps(None, gopls_rev(root).as_deref()));
         }
         steps.extend(tarball_steps(info, triple));
     }
@@ -980,6 +1113,350 @@ fn sidecar_path(triple: &str) -> String {
     format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}-{triple}")
 }
 
+/// Build the rust-analyzer fork from the sibling checkout. (M25)
+///
+/// Leaves the binary at `target/release/cide-rust-analyzer` — where the tarball stage and a
+/// `current_exe().parent()` lookup both expect the name — and, when `triple` is given, makes
+/// the `-<triple>` copy the Tauri bundler resolves `externalBin` through. The triple copy is
+/// conditional for `release_binaries_step`'s reason inverted: a tarball-only plan with a
+/// bundler-shaped file in it is a plan that has to be explained.
+///
+/// The build runs **in the sibling checkout**, against the fork's own lockfile and workspace.
+/// The two `CARGO_PROFILE_*` variables are upstream's own dist settings (`xtask/src/dist.rs`
+/// in the fork), stated here because this plan wants a bare binary rather than upstream's
+/// zipped dist layout — and stated as env, not profile edits in the fork, so a rebase never
+/// has to carry them. `CFG_RELEASE` is the same trick applied to identity: the fork's
+/// `version.rs` reads it with `option_env!`, so `<rev>+cide` in `--version` output costs zero
+/// diff in the fork. It is only ever for logs and bug reports — provenance in `cide-lsp` is
+/// decided by *where the binary came from*, never by parsing this string.
+fn fork_steps(triple: Option<&str>, rev: Option<&str>) -> Vec<Step> {
+    let mut build_env = vec![
+        ("CARGO_PROFILE_RELEASE_LTO".into(), "thin".into()),
+        ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS".into(), "1".into()),
+    ];
+    if let Some(rev) = rev {
+        build_env.push(("CFG_RELEASE".into(), format!("{rev}+cide")));
+    }
+    let mut steps = vec![
+        Step {
+            program: "cargo".into(),
+            args: vec![
+                "build".into(),
+                "--release".into(),
+                "--locked".into(),
+                "-p".into(),
+                "rust-analyzer".into(),
+            ],
+            cwd: RA_FORK_DIR.into(),
+            env: build_env,
+            optional: false,
+        },
+        Step {
+            program: "install".into(),
+            args: vec![
+                "-m755".into(),
+                format!("{RA_FORK_DIR}/target/release/rust-analyzer"),
+                format!("{HOOK_SIDECAR_DIR}/{RA_BIN}"),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+            optional: false,
+        },
+    ];
+    if let Some(triple) = triple {
+        steps.push(Step {
+            program: "install".into(),
+            args: vec![
+                "-m755".into(),
+                format!("{HOOK_SIDECAR_DIR}/{RA_BIN}"),
+                ra_sidecar_path(triple),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+            optional: false,
+        });
+    }
+    steps
+}
+
+/// Where the suffixed copy of the fork goes, mirroring [`sidecar_path`].
+fn ra_sidecar_path(triple: &str) -> String {
+    format!("{HOOK_SIDECAR_DIR}/{RA_BIN}-{triple}")
+}
+
+/// The pinned rev for the version stamp, or `None` when the lock is unreadable.
+///
+/// `Option` rather than an error because `plan` also runs for the printed no-`--run` plan and
+/// for tests against roots that hold no lock — preflight is where an unreadable lock fails,
+/// and a plan that merely lacks the stamp is still an honest plan.
+fn ra_rev(root: &Path) -> Option<String> {
+    read_ra_lock(root).ok().map(|lock| lock.rev)
+}
+
+/// The fork's preflight: the pin, the sibling checkout, and whether the two agree.
+///
+/// Absence is a **failure** and not `../cide-marketplace`'s skip, deliberately: the
+/// marketplace tests skip because a test run without the sibling still proves everything it
+/// claims to, while a bundle built without the fork ships without it — and the product then
+/// falls back to the user's PATH rust-analyzer, which works, so nobody ever notices what the
+/// package is missing. A wrong-rev checkout is only a warning, because a local `--run` on a
+/// work-in-progress fork is a legitimate thing to do; release.yml always checks out the exact
+/// pinned rev, so a release build never sees the warning.
+fn fork_verdicts(root: &Path) -> Vec<Verdict> {
+    let lock = match read_ra_lock(root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return vec![Verdict::Fail(format!(
+                "{RA_LOCK} could not be read ({error}). It pins which fork revision a package \
+                 carries, and a package built from \"whatever is checked out\" is a claim \
+                 nobody can reproduce"
+            ))];
+        }
+    };
+    let fork = root.join(RA_FORK_DIR);
+    if !fork.join("Cargo.toml").exists() {
+        return vec![Verdict::Fail(format!(
+            "the rust-analyzer fork is not checked out at {RA_FORK_DIR}. Run: \
+             git clone {url} {RA_FORK_DIR} && git -C {RA_FORK_DIR} checkout {rev}",
+            url = lock.url,
+            rev = lock.rev,
+        ))];
+    }
+    // The fork's disk index rides a patched salsa: when its manifest carries the sibling
+    // path patch, the build needs the salsa fork too, and dying inside cargo's patch
+    // resolution twenty minutes into a bundler run is the failure this sentence pre-empts.
+    // `../salsa` in the manifest resolves relative to the *fork*, so that is where the check
+    // looks — resolving it against this repository was a latent bug that only worked while
+    // everything happened to be siblings.
+    if std::fs::read_to_string(fork.join("Cargo.toml"))
+        .is_ok_and(|manifest| manifest.contains("salsa = { path = \"../salsa\" }"))
+        && !fork.join("../salsa/Cargo.toml").exists()
+    {
+        return vec![Verdict::Fail(format!(
+            "the rust-analyzer fork patches salsa to its sibling ../salsa, which is not \
+             checked out. Clone the salsa fork beside the rust-analyzer fork (as \
+             {RA_FORK_DIR}/../salsa) first",
+        ))];
+    }
+
+    // HEAD against the pin, both resolved to commits **in the sibling**, so a tag in the lock
+    // compares as the commit it names rather than as a string.
+    let head = git_commit(&fork, "HEAD");
+    let pinned = git_commit(&fork, &format!("{}^{{commit}}", lock.rev));
+    vec![match (head, pinned) {
+        (Some(head), Some(pinned)) if head == pinned => Verdict::Ok(format!(
+            "{RA_FORK_DIR} is at the pinned fork revision ({})",
+            lock.rev
+        )),
+        (Some(head), Some(_)) => Verdict::Warn(format!(
+            "{RA_FORK_DIR} is at {} but {RA_LOCK} pins {} — fine for a local build, but this \
+             package will not match what a release run would produce",
+            &head[..head.len().min(12)],
+            lock.rev,
+        )),
+        _ => Verdict::Warn(format!(
+            "could not compare {RA_FORK_DIR}'s HEAD with the pinned revision {} — is {} \
+             fetched there?",
+            lock.rev, lock.rev,
+        )),
+    }]
+}
+
+/// Build the gopls sidecar from the pinned checkout and put it where the bundler looks.
+///
+/// `go build` in the module directory, not `go install pkg@version`: the install form needs
+/// the network to even resolve the version and packages whatever the proxy serves, while the
+/// checkout is the same auditable, patchable sibling the rust-analyzer fork established —
+/// and it becomes an actual fork the day gopls needs a patch, with zero packaging change.
+/// `CGO_ENABLED=0` because gopls is pure Go and a static binary sidesteps the AppImage/
+/// tarball glibc coupling entirely. The `-ldflags -X` stamps the pin into `gopls version`
+/// output — logs only; provenance is decided by where the binary came from, same as the
+/// rust-analyzer rule.
+fn gopls_steps(triple: Option<&str>, rev: Option<&str>) -> Vec<Step> {
+    let mut args = vec!["build".to_string(), "-trimpath".to_string()];
+    if let Some(rev) = rev {
+        args.push("-ldflags".into());
+        args.push(format!("-X main.version={rev}+cide"));
+    }
+    args.extend(["-o".to_string(), GOPLS_BIN.to_string(), ".".to_string()]);
+    let mut steps = vec![
+        Step {
+            program: "go".into(),
+            args,
+            // The gopls module lives in the tools repository's `gopls/` directory.
+            cwd: format!("{GOPLS_FORK_DIR}/gopls"),
+            env: vec![("CGO_ENABLED".into(), "0".into())],
+            optional: false,
+        },
+        Step {
+            program: "install".into(),
+            args: vec![
+                "-m755".into(),
+                format!("{GOPLS_FORK_DIR}/gopls/{GOPLS_BIN}"),
+                format!("{HOOK_SIDECAR_DIR}/{GOPLS_BIN}"),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+            optional: false,
+        },
+    ];
+    if let Some(triple) = triple {
+        steps.push(Step {
+            program: "install".into(),
+            args: vec![
+                "-m755".into(),
+                format!("{HOOK_SIDECAR_DIR}/{GOPLS_BIN}"),
+                gopls_sidecar_path(triple),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+            optional: false,
+        });
+    }
+    steps
+}
+
+/// Where the suffixed copy of the gopls build goes, mirroring [`ra_sidecar_path`].
+fn gopls_sidecar_path(triple: &str) -> String {
+    format!("{HOOK_SIDECAR_DIR}/{GOPLS_BIN}-{triple}")
+}
+
+/// The pinned gopls rev for the version stamp, or `None` when the lock is unreadable.
+fn gopls_rev(root: &Path) -> Option<String> {
+    read_gopls_lock(root).ok().map(|lock| lock.rev)
+}
+
+/// The gopls checkout's preflight: [`fork_verdicts`]'s shapes, plus the Go toolchain.
+///
+/// Absence of the checkout is a failure for the same reason the rust-analyzer fork's is: the
+/// package would build, ship without the sidecar, and fall back to the user's PATH gopls —
+/// which works, so nobody notices. The Go toolchain check is the one new shape, and an *old*
+/// `go` only warns: since 1.21 the go command auto-downloads the toolchain a module's `go`
+/// directive demands (`GOTOOLCHAIN=auto`), so an older host go still builds the pin — it
+/// just needs the network once to fetch the newer toolchain.
+fn gopls_verdicts(root: &Path) -> Vec<Verdict> {
+    let lock = match read_gopls_lock(root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return vec![Verdict::Fail(format!(
+                "{GOPLS_LOCK} could not be read ({error}). It pins which gopls revision a \
+                 package carries, and a package built from \"whatever is checked out\" is a \
+                 claim nobody can reproduce"
+            ))];
+        }
+    };
+    let checkout = root.join(GOPLS_FORK_DIR);
+    if !checkout.join("gopls/go.mod").exists() {
+        return vec![Verdict::Fail(format!(
+            "the gopls checkout is not at {GOPLS_FORK_DIR}. Run: \
+             git clone {url} {GOPLS_FORK_DIR} && git -C {GOPLS_FORK_DIR} checkout {rev}",
+            url = lock.url,
+            rev = lock.rev,
+        ))];
+    }
+    let mut out = vec![go_toolchain_verdict(
+        which("go").as_deref(),
+        go_version_line().as_deref(),
+        go_directive(&checkout.join("gopls/go.mod")).as_deref(),
+    )];
+    let head = git_commit(&checkout, "HEAD");
+    let pinned = git_commit(&checkout, &format!("{}^{{commit}}", lock.rev));
+    out.push(match (head, pinned) {
+        (Some(head), Some(pinned)) if head == pinned => Verdict::Ok(format!(
+            "{GOPLS_FORK_DIR} is at the pinned gopls revision ({})",
+            lock.rev
+        )),
+        (Some(head), Some(_)) => Verdict::Warn(format!(
+            "{GOPLS_FORK_DIR} is at {} but {GOPLS_LOCK} pins {} — fine for a local build, but \
+             this package will not match what a release run would produce",
+            &head[..head.len().min(12)],
+            lock.rev,
+        )),
+        _ => Verdict::Warn(format!(
+            "could not compare {GOPLS_FORK_DIR}'s HEAD with the pinned revision {} — is {} \
+             fetched there?",
+            lock.rev, lock.rev,
+        )),
+    });
+    out
+}
+
+/// The Go-toolchain verdict, pure over pre-probed facts so the missing-tool sentences are
+/// testable on a machine that has the tool — the same shape as `frontend_verdicts`.
+fn go_toolchain_verdict(
+    go: Option<&Path>,
+    version_line: Option<&str>,
+    directive: Option<&str>,
+) -> Verdict {
+    let Some(go) = go else {
+        return Verdict::Fail(
+            "`go` is not on PATH, and the gopls sidecar is built with it. Install Go \
+             (https://go.dev/dl) or your distribution's `go` package"
+                .into(),
+        );
+    };
+    let host = version_line.and_then(parse_go_version);
+    let needed = directive.and_then(parse_go_version);
+    match (host, needed) {
+        (Some(host), Some(needed)) if host < needed => Verdict::Warn(format!(
+            "the host go is {} but the pinned gopls needs {} — `GOTOOLCHAIN=auto` will \
+             download the newer toolchain during the build, which needs the network once",
+            render_go_version(host),
+            render_go_version(needed),
+        )),
+        _ => Verdict::Ok(format!("go is available at {}", go.display())),
+    }
+}
+
+/// `"go version go1.25.5 linux/amd64"`, or `None` when `go` cannot be run.
+fn go_version_line() -> Option<String> {
+    let out = Command::new("go").arg("version").output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The `go 1.26.0` directive out of a `go.mod`, as its bare version string.
+fn go_directive(go_mod: &Path) -> Option<String> {
+    let text = fs::read_to_string(go_mod).ok()?;
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("go ")
+            .map(|version| version.trim().to_string())
+    })
+}
+
+/// `"go1.25.5"`, `"1.26.0"`, or a whole `go version` line → a comparable triple.
+fn parse_go_version(text: &str) -> Option<(u32, u32, u32)> {
+    let token = text.split_whitespace().find(|word| {
+        word.trim_start_matches("go")
+            .starts_with(|c: char| c.is_ascii_digit())
+    })?;
+    let mut parts = token.trim_start_matches("go").split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn render_go_version((major, minor, patch): (u32, u32, u32)) -> String {
+    format!("{major}.{minor}.{patch}")
+}
+
+/// One revision resolved to a commit id in a checkout, or `None` for anything else.
+fn git_commit(repo: &Path, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", rev])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
 /// Run `build.beforeBuildCommand` the way `cargo tauri build` would, for a plan that has no
 /// `cargo tauri build` in it.
 ///
@@ -1100,6 +1577,19 @@ fn tarball_steps(info: &AppInfo, triple: &str) -> Vec<Step> {
         "-m755",
         format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}"),
         format!("{root}/bin/{HOOK_BIN}"),
+    );
+    // The rust-analyzer fork, under the same roof rule: `cide_core::toolchain::sibling_binary`
+    // looks for `cide-rust-analyzer` beside `cide`. Its distinct file name is what makes
+    // "put bin/ on your PATH" safe — see RA_BIN.
+    install(
+        "-m755",
+        format!("{HOOK_SIDECAR_DIR}/{RA_BIN}"),
+        format!("{root}/bin/{RA_BIN}"),
+    );
+    install(
+        "-m755",
+        format!("{HOOK_SIDECAR_DIR}/{GOPLS_BIN}"),
+        format!("{root}/bin/{GOPLS_BIN}"),
     );
 
     // The generated desktop entry rather than one written here: it is derived from `AppInfo` and
@@ -1415,6 +1905,31 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
                  binaries. Sessions would run with no hooks and nothing would report an error"
             ))
         });
+        out.push(if info.bundles_the_fork() {
+            Verdict::Ok(format!(
+                "{TAURI_BUNDLE_CONF} ships {RA_BIN} as a sidecar (bundle.externalBin)"
+            ))
+        } else {
+            // The same failure class as the hook's, with a quieter symptom: the product falls
+            // back to the user's PATH rust-analyzer, which works, so the missing binary is
+            // invisible until somebody asks why their index is not on disk.
+            Verdict::Fail(format!(
+                "{TAURI_BUNDLE_CONF} has no `{RA_BIN}` in bundle.externalBin, so the package \
+                 would ship without cide's rust-analyzer and silently fall back to PATH"
+            ))
+        });
+        out.extend(fork_verdicts(root));
+        out.push(if info.bundles_the_gopls() {
+            Verdict::Ok(format!(
+                "{TAURI_BUNDLE_CONF} ships {GOPLS_BIN} as a sidecar (bundle.externalBin)"
+            ))
+        } else {
+            Verdict::Fail(format!(
+                "{TAURI_BUNDLE_CONF} has no `{GOPLS_BIN}` in bundle.externalBin, so the \
+                 package would ship without cide's gopls and silently fall back to PATH"
+            ))
+        });
+        out.extend(gopls_verdicts(root));
         // The mirror image, and the more expensive mistake of the two: `tauri-build` acts on
         // `bundle.externalBin` on every cargo invocation, so the same key in the *base* config
         // fails `cargo build --workspace` on any tree that has not already produced a release
@@ -1449,6 +1964,10 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
         // `cargo build`, with "Unable to find your web assets" and no hint that `pnpm install`
         // was the missing step.
         out.extend(frontend_checks(root, info));
+        // And both forks, which the tarball carries as `bin/` binaries with no bundler
+        // involved — so the externalBin question does not apply but the checkout ones do.
+        out.extend(fork_verdicts(root));
+        out.extend(gopls_verdicts(root));
     }
 
     if targets.appimage {
@@ -1477,7 +1996,24 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
                     .into(),
             ),
         });
-        for (relative, expected) in generated(info) {
+        let generated_set = match (read_ra_lock(root), read_gopls_lock(root)) {
+            (Ok(ra), Ok(gopls)) => generated(info, &ra, &gopls),
+            (Err(error), _) => {
+                out.push(Verdict::Fail(format!(
+                    "{RA_LOCK} could not be read ({error}), so the generated manifest cannot \
+                     be checked — it embeds the fork pin"
+                )));
+                Vec::new()
+            }
+            (_, Err(error)) => {
+                out.push(Verdict::Fail(format!(
+                    "{GOPLS_LOCK} could not be read ({error}), so the generated manifest \
+                     cannot be checked — it embeds the gopls pin"
+                )));
+                Vec::new()
+            }
+        };
+        for (relative, expected) in generated_set {
             let path = root.join(&relative);
             out.push(match fs::read_to_string(&path) {
                 Ok(current) if current == expected => Verdict::Ok(format!("{relative} in sync")),
@@ -2309,9 +2845,9 @@ fn which(program: &str) -> Option<PathBuf> {
 /// same reason as the manifest: all three restate the app id and version, and a package whose
 /// `.desktop` names a different id than its manifest installs and then does not appear in any
 /// launcher, with nothing failing.
-pub fn generated(info: &AppInfo) -> Vec<(String, String)> {
+pub fn generated(info: &AppInfo, ra: &RaLock, gopls: &RaLock) -> Vec<(String, String)> {
     vec![
-        (manifest_path(info), flatpak_manifest(info)),
+        (manifest_path(info), flatpak_manifest(info, ra, gopls)),
         (
             format!("{FLATPAK_DIR}/{}.desktop", info.identifier),
             desktop_entry(info),
@@ -2324,7 +2860,9 @@ pub fn generated(info: &AppInfo) -> Vec<(String, String)> {
 }
 
 fn write_generated(root: &Path, info: &AppInfo) -> Result<()> {
-    for (relative, contents) in generated(info) {
+    let ra = read_ra_lock(root)?;
+    let gopls = read_gopls_lock(root)?;
+    for (relative, contents) in generated(info, &ra, &gopls) {
         let path = root.join(&relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context(format!("creating {}", parent.display()))?;
@@ -2336,8 +2874,10 @@ fn write_generated(root: &Path, info: &AppInfo) -> Result<()> {
 }
 
 fn check_generated(root: &Path, info: &AppInfo) -> Result<()> {
+    let ra = read_ra_lock(root)?;
+    let gopls = read_gopls_lock(root)?;
     let mut stale = Vec::new();
-    for (relative, expected) in generated(info) {
+    for (relative, expected) in generated(info, &ra, &gopls) {
         match fs::read_to_string(root.join(&relative)) {
             Ok(current) if current == expected => {}
             Ok(_) => stale.push(format!("  changed  {relative}")),
@@ -2353,7 +2893,10 @@ fn check_generated(root: &Path, info: &AppInfo) -> Result<()> {
             stale.join("\n")
         );
     }
-    println!("package: {} packaging files in sync", generated(info).len());
+    println!(
+        "package: {} packaging files in sync",
+        generated(info, &ra, &gopls).len()
+    );
     Ok(())
 }
 
@@ -2426,7 +2969,18 @@ fn metainfo(info: &AppInfo) -> String {
 ///
 /// Deterministic: the same `AppInfo` always yields the same bytes, which is what lets
 /// `--check` be a gate.
-pub fn flatpak_manifest(info: &AppInfo) -> String {
+/// Which key a Flatpak git source pins the fork with.
+///
+/// `commit:` for a 40-hex id, `tag:` for anything else. flatpak-builder refuses a tag name
+/// under `commit:` and a commit id under `tag:`, so the manifest has to say which one the
+/// lock holds — and the lock deliberately accepts both, because a fork pinned to an upstream
+/// release tag and one pinned to a `cide`-branch commit are both legitimate states.
+fn ra_source_key(rev: &str) -> &'static str {
+    let is_commit = rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit());
+    if is_commit { "commit" } else { "tag" }
+}
+
+pub fn flatpak_manifest(info: &AppInfo, ra: &RaLock, gopls: &RaLock) -> String {
     format!(
         r#"# GENERATED FILE — DO NOT EDIT.
 #
@@ -2458,6 +3012,7 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.node22
+  - org.freedesktop.Sdk.Extension.golang
 command: {command}
 
 finish-args:
@@ -2484,7 +3039,7 @@ modules:
   - name: cide
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin:/usr/lib/sdk/golang/bin
       env:
         CARGO_HOME: /run/build/cide/cargo
     build-commands:
@@ -2501,23 +3056,55 @@ modules:
       - npm --prefix ui install --no-audit --no-fund
       - npm --prefix ui run build
       - cargo build --release --locked -p cide-app -p cide-hook -p cide-headless
+      # cide's rust-analyzer fork, from the pinned git source below. `env` on the one command
+      # rather than build-options: those profile settings are upstream's own dist choices for
+      # the fork, and putting them in the module environment would silently re-profile cide's
+      # own release build above.
+      - env CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CFG_RELEASE={ra_rev}+cide cargo build --release --locked --manifest-path rust-analyzer-fork/Cargo.toml -p rust-analyzer
+      # cide's gopls, from its own pinned git source. Built in the checkout's gopls/ module
+      # directory; CGO off because gopls is pure Go and static is simpler; the -X stamp is
+      # logs-only, same rule as CFG_RELEASE above.
+      - cd gopls-fork/gopls && env CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags "-X main.version={gopls_rev}+cide" -o {gopls_bin} .
       - install -Dm755 target/release/cide /app/bin/{command}
       # cide-hook must sit beside the main binary: `cmd::session::hook_settings` locates it
       # relative to `current_exe`, because the child's cwd is the project root and its PATH
       # is the user's.
       - install -Dm755 target/release/cide-hook /app/bin/cide-hook
       - install -Dm755 target/release/cide-headless /app/bin/cide-headless
+      # The fork sits beside the main binary too — `cide_core::toolchain::sibling_binary` —
+      # and under its cide name, so it can never shadow a rust-analyzer of the user's own.
+      - install -Dm755 rust-analyzer-fork/target/release/rust-analyzer /app/bin/{ra_bin}
+      - install -Dm755 gopls-fork/gopls/{gopls_bin} /app/bin/{gopls_bin}
       - install -Dm644 crates/cide-app/icons/128x128.png /app/share/icons/hicolor/128x128/apps/{id}.png
       - install -Dm644 packaging/flatpak/{id}.desktop /app/share/applications/{id}.desktop
       - install -Dm644 packaging/flatpak/{id}.metainfo.xml /app/share/metainfo/{id}.metainfo.xml
     sources:
       - type: dir
         path: ../..
+      # The fork, at exactly the revision packaging/rust-analyzer.lock pins. A git source
+      # rather than a second dir source so a Flatpak build cannot silently package whatever
+      # the sibling checkout happens to hold.
+      - type: git
+        url: {ra_url}
+        {ra_key}: {ra_rev}
+        dest: rust-analyzer-fork
+      - type: git
+        url: {gopls_url}
+        {gopls_key}: {gopls_rev}
+        dest: gopls-fork
 "#,
         conf = TAURI_CONF,
         id = info.identifier,
         runtime = GNOME_RUNTIME,
         command = info.product_name,
+        ra_bin = RA_BIN,
+        ra_url = ra.url,
+        ra_key = ra_source_key(&ra.rev),
+        ra_rev = ra.rev,
+        gopls_bin = GOPLS_BIN,
+        gopls_url = gopls.url,
+        gopls_key = ra_source_key(&gopls.rev),
+        gopls_rev = gopls.rev,
     )
 }
 
@@ -2705,6 +3292,221 @@ mod tests {
         BeforeBuild {
             script: "pnpm build".into(),
             cwd: Some("../../ui".into()),
+        }
+    }
+
+    /// A fork pin, spelled out here rather than read from `packaging/rust-analyzer.lock` so
+    /// the manifest tests assert the generator's shape, not the pin of the week.
+    fn ra_lock() -> RaLock {
+        RaLock {
+            url: "https://github.com/rust-lang/rust-analyzer".into(),
+            rev: "2026-08-24".into(),
+        }
+    }
+
+    fn gopls_lock() -> RaLock {
+        RaLock {
+            url: "https://github.com/golang/tools".into(),
+            rev: "gopls/v0.23.0".into(),
+        }
+    }
+
+    #[test]
+    fn the_checked_in_fork_lock_parses() {
+        // The same claim `the_real_config_is_readable` makes about tauri.conf.json: the
+        // generator restates this file's contents, so a malformed lock must fail here rather
+        // than as a preflight surprise on somebody's release run.
+        let lock = read_ra_lock(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+            .expect("packaging/rust-analyzer.lock");
+        assert!(lock.url.starts_with("https://"), "{lock:?}");
+        assert!(!lock.rev.is_empty());
+    }
+
+    #[test]
+    fn the_checked_in_gopls_lock_parses() {
+        let lock = read_gopls_lock(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+            .expect("packaging/gopls.lock");
+        assert!(lock.url.starts_with("https://"), "{lock:?}");
+        // The rev is a gopls release tag in golang/tools, whose tag namespace is prefixed.
+        assert!(lock.rev.starts_with("gopls/"), "{lock:?}");
+    }
+
+    #[test]
+    fn the_two_locks_use_distinct_key_names() {
+        // release.yml sources both files into one shell; shared key names would have the
+        // second `source` silently clobber the first pin.
+        let text =
+            "CIDE_RA_URL=https://a\nCIDE_RA_REV=1\nCIDE_GOPLS_URL=https://b\nCIDE_GOPLS_REV=2\n";
+        let ra = parse_ra_lock(text).expect("ra keys");
+        let gopls = parse_gopls_lock(text).expect("gopls keys");
+        assert_eq!((ra.url.as_str(), ra.rev.as_str()), ("https://a", "1"));
+        assert_eq!((gopls.url.as_str(), gopls.rev.as_str()), ("https://b", "2"));
+    }
+
+    #[test]
+    fn the_gopls_build_is_static_stamped_and_lands_where_the_bundler_looks() {
+        let steps = gopls_steps(Some(LINUX), Some("gopls/v0.23.0"));
+        let build = &steps[0];
+        assert_eq!(build.program, "go");
+        assert_eq!(build.cwd, format!("{GOPLS_FORK_DIR}/gopls"));
+        assert!(
+            build.env.contains(&("CGO_ENABLED".into(), "0".into())),
+            "{build:?}"
+        );
+        assert!(
+            build
+                .args
+                .iter()
+                .any(|a| a == "-X main.version=gopls/v0.23.0+cide"),
+            "the stamp is logs-only but it should be there: {:?}",
+            build.args
+        );
+        // And without a readable lock, the stamp is simply absent — an honest plan, not an
+        // error (preflight is where the unreadable lock fails).
+        let unstamped = gopls_steps(None, None);
+        assert!(
+            !unstamped[0].args.iter().any(|a| a.starts_with("-X")),
+            "{unstamped:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.args.iter().any(|a| a == &gopls_sidecar_path(LINUX))),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_go_fails_and_an_old_go_only_warns() {
+        // Old-but-present is a warning because `GOTOOLCHAIN=auto` (the default since 1.21)
+        // downloads the toolchain the module's `go` directive demands — the build still
+        // works, it just needs the network once.
+        assert!(matches!(
+            go_toolchain_verdict(None, None, None),
+            Verdict::Fail(_)
+        ));
+        let old = go_toolchain_verdict(
+            Some(Path::new("/usr/bin/go")),
+            Some("go version go1.25.5 linux/amd64"),
+            Some("1.26.0"),
+        );
+        match old {
+            Verdict::Warn(sentence) => {
+                assert!(
+                    sentence.contains("1.25.5") && sentence.contains("1.26.0"),
+                    "{sentence}"
+                );
+            }
+            other => panic!("expected a warning, got {other:?}"),
+        }
+        assert!(matches!(
+            go_toolchain_verdict(
+                Some(Path::new("/usr/bin/go")),
+                Some("go version go1.26.1 linux/amd64"),
+                Some("1.26.0"),
+            ),
+            Verdict::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn the_lock_format_is_the_shell_sourceable_subset() {
+        // release.yml sources this file; the parser reads the same bytes. Comments, blank
+        // lines and unknown keys pass through, and a missing half is a refusal rather than a
+        // half-pin.
+        let lock = parse_ra_lock(
+            "# comment\n\nCIDE_RA_URL=https://example.com/fork\nCIDE_RA_REV=2026-08-24\nFUTURE=x\n",
+        )
+        .expect("parses");
+        assert_eq!(lock.url, "https://example.com/fork");
+        assert_eq!(lock.rev, "2026-08-24");
+        assert!(parse_ra_lock("CIDE_RA_URL=https://example.com/fork\n").is_none());
+        assert!(parse_ra_lock("CIDE_RA_REV=\nCIDE_RA_URL=x\n").is_none());
+    }
+
+    #[test]
+    fn a_tag_and_a_commit_pin_through_different_flatpak_keys() {
+        // flatpak-builder refuses a tag under `commit:` and vice versa, so the generator has
+        // to tell them apart — and a 39- or 41-character near-sha is a tag, not a commit.
+        assert_eq!(ra_source_key("2026-08-24"), "tag");
+        assert_eq!(
+            ra_source_key("0123456789abcdef0123456789abcdef01234567"),
+            "commit"
+        );
+        assert_eq!(
+            ra_source_key("0123456789abcdef0123456789abcdef0123456"),
+            "tag"
+        );
+    }
+
+    #[test]
+    fn the_manifest_builds_and_installs_the_fork_at_the_pin() {
+        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
+        assert!(
+            manifest.contains("/app/bin/cide-rust-analyzer"),
+            "{manifest}"
+        );
+        assert!(manifest.contains("url: https://github.com/rust-lang/rust-analyzer"));
+        // The fixture rev is a tag, so the source pins through `tag:`.
+        assert!(manifest.contains("tag: 2026-08-24"));
+        assert!(manifest.contains("dest: rust-analyzer-fork"));
+        assert!(manifest.contains("url: https://github.com/golang/tools"));
+        assert!(manifest.contains("dest: gopls-fork"));
+        assert!(manifest.contains("org.freedesktop.Sdk.Extension.golang"));
+    }
+
+    #[test]
+    fn the_tarball_carries_the_fork_beside_the_other_binaries() {
+        let steps = tarball_steps(&info(), LINUX);
+        let installs_fork = steps.iter().any(|s| {
+            s.program == "install" && s.args.iter().any(|a| a.ends_with(&format!("bin/{RA_BIN}")))
+        });
+        assert!(installs_fork, "{steps:?}");
+    }
+
+    #[test]
+    fn the_tarball_carries_the_gopls_build_too() {
+        let steps = tarball_steps(&info(), LINUX);
+        let installs = steps.iter().any(|s| {
+            s.program == "install"
+                && s.args
+                    .iter()
+                    .any(|a| a.ends_with(&format!("bin/{GOPLS_BIN}")))
+        });
+        assert!(installs, "{steps:?}");
+    }
+
+    #[test]
+    fn a_bundler_plan_builds_the_gopls_sidecar_before_the_bundler_runs() {
+        let steps = plan(Path::new("/nonexistent"), &info(), Targets::LINUX, LINUX);
+        let copy = steps
+            .iter()
+            .position(|s| s.args.iter().any(|a| a == &gopls_sidecar_path(LINUX)));
+        let bundler = steps
+            .iter()
+            .position(|s| s.args.first().is_some_and(|a| a == "tauri"));
+        match (copy, bundler) {
+            (Some(copy), Some(bundler)) => assert!(copy < bundler, "{steps:?}"),
+            _ => panic!("the plan is missing the gopls copy or the bundler: {steps:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bundler_plan_builds_the_fork_before_the_bundler_runs() {
+        // The bundler resolves externalBin at its own start; a fork step after it is a fork
+        // the bundle silently does not carry.
+        let steps = plan(Path::new("/nonexistent"), &info(), Targets::LINUX, LINUX);
+        let fork_copy = steps
+            .iter()
+            .position(|s| s.args.iter().any(|a| a == &ra_sidecar_path(LINUX)));
+        let bundler = steps
+            .iter()
+            .position(|s| s.args.first().is_some_and(|a| a == "tauri"));
+        match (fork_copy, bundler) {
+            (Some(fork_copy), Some(bundler)) => {
+                assert!(fork_copy < bundler, "{steps:?}");
+            }
+            _ => panic!("the plan is missing the fork copy or the bundler: {steps:?}"),
         }
     }
 
@@ -3004,7 +3806,15 @@ mod tests {
             "x86_64-unknown-linux-gnu",
         );
         assert!(steps.iter().all(|s| s.program != "curl"), "{steps:?}");
-        assert!(steps.iter().all(|s| s.env.is_empty()), "{steps:?}");
+        // Not `env.is_empty()` any more: the fork build step legitimately carries its two
+        // CARGO_PROFILE_* settings. What a deb-only plan must not carry is the AppImage
+        // runtime override, which is what this test was always about.
+        assert!(
+            steps
+                .iter()
+                .all(|s| s.env.iter().all(|(k, _)| k != LDAI_RUNTIME_FILE)),
+            "{steps:?}"
+        );
     }
 
     #[test]
@@ -3270,12 +4080,15 @@ mod tests {
     #[test]
     fn the_manifest_is_byte_stable() {
         // `--check` is only a gate if a no-op run produces identical bytes.
-        assert_eq!(flatpak_manifest(&info()), flatpak_manifest(&info()));
+        assert_eq!(
+            flatpak_manifest(&info(), &ra_lock(), &gopls_lock()),
+            flatpak_manifest(&info(), &ra_lock(), &gopls_lock())
+        );
     }
 
     #[test]
     fn the_manifest_names_the_real_binaries_and_id() {
-        let manifest = flatpak_manifest(&info());
+        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
         assert!(manifest.contains("app-id: dev.cide.ide"));
         assert!(manifest.contains("/app/bin/cide-hook"));
         assert!(manifest.contains("command: cide"));
@@ -3285,7 +4098,7 @@ mod tests {
     fn the_manifest_vendors_rather_than_taking_libgit2_from_the_runtime() {
         // Adding a libgit2 or openssl module would silently take precedence over the
         // vendored build and tie the package to the runtime's ABI.
-        let manifest = flatpak_manifest(&info());
+        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
         assert!(
             !manifest.contains("name: libgit2"),
             "libgit2 is vendored; it must not also be a module"
@@ -3300,7 +4113,7 @@ mod tests {
         // manifest's first build command, so the whole channel failed on it, and nothing in
         // this repository would have noticed — flatpak-builder is the only thing that reads
         // this file.
-        let manifest = flatpak_manifest(&info());
+        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
         assert!(
             !manifest.contains("npm --prefix ui ci"),
             "npm ci needs a package-lock.json this repository does not have"
@@ -3312,7 +4125,7 @@ mod tests {
     fn the_flatpak_can_reach_the_host_cli() {
         // Without both of these the app installs, launches, and then fails to spawn a single
         // Claude pane — the one failure mode that makes this channel worthless.
-        let manifest = flatpak_manifest(&info());
+        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
         assert!(manifest.contains("--filesystem=host"));
         assert!(manifest.contains("--talk-name=org.freedesktop.Flatpak"));
     }
@@ -3359,7 +4172,10 @@ mod tests {
 
     #[test]
     fn the_generated_set_is_the_manifest_plus_its_two_companions() {
-        let paths: Vec<String> = generated(&info()).into_iter().map(|(p, _)| p).collect();
+        let paths: Vec<String> = generated(&info(), &ra_lock(), &gopls_lock())
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
         assert_eq!(
             paths,
             [
@@ -3376,8 +4192,8 @@ mod tests {
         // and the metainfo. If `generated` stopped writing one, the build would fail deep
         // inside flatpak-builder with a missing-file error naming a path nobody recognises.
         let info = info();
-        let manifest = flatpak_manifest(&info);
-        for (path, _) in generated(&info) {
+        let manifest = flatpak_manifest(&info, &ra_lock(), &gopls_lock());
+        for (path, _) in generated(&info, &ra_lock(), &gopls_lock()) {
             if path.ends_with(".yml") {
                 continue;
             }

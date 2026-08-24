@@ -37,6 +37,8 @@ import styles from './StatusBar.module.css'
 export interface Diagnostics {
   errors: number
   warnings: number
+  /** Something is still scanning: the counts are live but may grow. */
+  pending?: boolean
 }
 
 export interface StatusBarProps {
@@ -255,14 +257,22 @@ export function StatusBar({
           <>
             <span
               className={`${styles.errors} ${styles.stat}`}
-              title={`${diagnostics.errors} errors`}
+              title={
+                diagnostics.pending
+                  ? `${diagnostics.errors} errors so far — still indexing`
+                  : `${diagnostics.errors} errors`
+              }
             >
               <Icon name="circle-x" size={1} />
               {diagnostics.errors}
             </span>
             <span
               className={`${styles.warnings} ${styles.stat}`}
-              title={`${diagnostics.warnings} warnings`}
+              title={
+                diagnostics.pending
+                  ? `${diagnostics.warnings} warnings so far — still indexing`
+                  : `${diagnostics.warnings} warnings`
+              }
             >
               <Icon name="triangle-alert" size={1} />
               {diagnostics.warnings}

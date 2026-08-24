@@ -25,8 +25,6 @@
 //! ready-requires-a-diagnostic rule would leave it `Scanning` for ever: the mirror image of the
 //! failure `cide_core::diagnostics` exists to prevent, and just as much of a lie.
 
-use std::collections::BTreeSet;
-
 use cide_ipc::SourceStatus;
 use serde_json::{Value, json};
 
@@ -57,15 +55,40 @@ enum Phase {
     Stopping,
 }
 
+/// What one work-done token last said. See `Session::progress` for why this is per-token.
+#[derive(Default)]
+struct TokenProgress {
+    /// From `begin`, held for the token's life — `report`s carry no title.
+    title: String,
+    /// The last `report`'s message, if it had one.
+    message: Option<String>,
+    /// The last report's percentage — per-report, so a phase that stops reporting the
+    /// number stops claiming one.
+    percentage: Option<u8>,
+    /// Recency stamp from `Session::progress_tick`, for `status()`'s tie-break.
+    updated_at: u64,
+}
+
 pub struct Session {
     phase: Phase,
-    /// Work-done tokens the server has begun and not ended.
+    /// Work-done tokens the server has begun and not ended, each with what it last said.
     ///
-    /// A set rather than a counter: `$/progress` `end` names its token, and a server that ends one
-    /// twice — or ends one it never began, which rust-analyzer has done across versions — would
-    /// drive a counter negative and leave the source `Ready` while it was still indexing.
-    progress: BTreeSet<String>,
-    /// The most recent progress line, for [`SourceStatus::Scanning::detail`].
+    /// A map keyed by token rather than a counter: `$/progress` `end` names its token, and a
+    /// server that ends one twice — or ends one it never began, which rust-analyzer has done
+    /// across versions — would drive a counter negative and leave the source `Ready` while it
+    /// was still indexing.
+    ///
+    /// **Per-token, not last-writer-wins, and that is the bug this shape fixed.** rust-analyzer
+    /// runs several tokens at once — a second `cachePriming` round after build scripts land,
+    /// `cargo check` alongside it — and a single `(detail, percentage)` pair updated by
+    /// whichever report arrived last showed priming's 40% wearing cargo check's name, then
+    /// "cargo check" holding a bar at 100% after priming ended. `status()` chooses *one*
+    /// token's whole story instead: see [`Session::status`].
+    progress: std::collections::BTreeMap<String, TokenProgress>,
+    /// Monotonic update stamp for [`TokenProgress::updated_at`] — recency, not time.
+    progress_tick: u64,
+    /// The most recent progress line, kept only as the text shown before any token has said
+    /// anything ("starting…" territory) — every real display line comes from a token.
     detail: String,
     initialize_id: i64,
     next_id: i64,
@@ -79,6 +102,17 @@ pub struct Session {
     /// that was never going to arrive. The whole value rather than a handful of booleans, so the
     /// next question anybody asks of it costs a reader and not a field.
     capabilities: Value,
+    /// cide's configuration for this server, or `None` for "say nothing".
+    ///
+    /// `None` for every server except the build cide ships (see `crate::config::init_options`),
+    /// and the distinction is load-bearing: a stock server the user installed must get
+    /// byte-for-byte the handshake it always got, because cide has no idea what version it is
+    /// or which keys it would misread. Sent twice, deliberately — as `initializationOptions`
+    /// in the handshake and again as the `workspace/configuration` answer — because
+    /// rust-analyzer reads the first at startup and *re-asks* through the second on
+    /// `workspace/didChangeConfiguration`, and two different answers would be two different
+    /// servers depending on when it asked.
+    init_options: Option<Value>,
 }
 
 impl Session {
@@ -86,29 +120,46 @@ impl Session {
     ///
     /// Returns the request to write, so the caller never has to know the handshake's shape.
     pub fn new(roots: &[std::path::PathBuf], server: Server) -> (Self, Vec<Effect>) {
+        Self::with_init_options(roots, server, None)
+    }
+
+    /// [`Session::new`], with cide's configuration for this server.
+    ///
+    /// The widened constructor rather than a setter, because the value is written into the
+    /// `initialize` request and that request is built here — a setter could only ever be
+    /// called too late.
+    pub fn with_init_options(
+        roots: &[std::path::PathBuf],
+        server: Server,
+        init_options: Option<Value>,
+    ) -> (Self, Vec<Effect>) {
         let mut session = Self {
             phase: Phase::Initializing,
-            progress: BTreeSet::new(),
+            progress: std::collections::BTreeMap::new(),
+            progress_tick: 0,
             detail: format!("starting {}", server.binary()),
             initialize_id: 1,
             next_id: 2,
             last_status: None,
             capabilities: Value::Null,
+            init_options,
         };
         let request = json!({
             "jsonrpc": "2.0",
             "id": session.initialize_id,
             "method": "initialize",
-            "params": initialize_params(roots, server),
+            "params": initialize_params(roots, server, session.init_options.as_ref()),
         });
         let effects = vec![
             Effect::Send(request),
             Effect::Status(SourceStatus::Scanning {
                 detail: session.detail.clone(),
+                percentage: None,
             }),
         ];
         session.last_status = Some(SourceStatus::Scanning {
             detail: session.detail.clone(),
+            percentage: None,
         });
         (session, effects)
     }
@@ -149,19 +200,29 @@ impl Session {
         match (method, &id) {
             // --- server → client *requests*: every one must be answered ---
             ("workspace/configuration", Some(id)) => {
-                // One `{}` per requested item — server defaults. Answering with the wrong *shape*
-                // (a bare object rather than an array) is as bad as not answering: rust-analyzer
+                // One object per requested item. Answering with the wrong *shape* (a bare
+                // object rather than an array) is as bad as not answering: rust-analyzer
                 // rejects it and stalls the same way.
+                //
+                // The object is `{}` — server defaults — unless cide configured this server at
+                // start, in which case it is that same configuration again. A known
+                // simplification, stated and pinned by test: rust-analyzer requests its whole
+                // section as one item, and the one object cide holds *is* that section. A
+                // hypothetical server asking for several distinct sections would get the same
+                // answer for each, which is wrong in general — but every server cide configures
+                // is one it ships, so the shape of the request is part of the same contract as
+                // the keys inside it.
+                let answer = self.init_options.clone().unwrap_or_else(|| json!({}));
                 let count = params
                     .get("items")
                     .and_then(Value::as_array)
                     .map_or(1, Vec::len);
-                let result: Vec<Value> = (0..count).map(|_| json!({})).collect();
+                let result: Vec<Value> = (0..count).map(|_| answer.clone()).collect();
                 effects.push(Effect::Send(response(id.clone(), json!(result))));
             }
             ("window/workDoneProgress/create", Some(id)) => {
                 if let Some(token) = params.get("token").and_then(token_string) {
-                    self.progress.insert(token);
+                    self.progress.entry(token).or_default();
                 }
                 effects.push(Effect::Send(response(id.clone(), Value::Null)));
                 self.push_status(&mut effects);
@@ -231,27 +292,29 @@ impl Session {
             .unwrap_or("");
         match kind {
             "begin" | "report" => {
-                self.progress.insert(token);
-                // `title` on begin, `message` on report. Both are what the panel shows instead of
-                // an unqualified "Waiting for rust-analyzer" — which, for the two minutes a large
-                // workspace takes, is indistinguishable from a hang.
-                let title = value
-                    .and_then(|v| v.get("title"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let message = value
+                self.progress_tick += 1;
+                let tick = self.progress_tick;
+                let entry = self.progress.entry(token).or_default();
+                entry.updated_at = tick;
+                // `title` arrives on begin and holds for the token's life; `message` and
+                // `percentage` are per-report. The percentage is taken per report even when
+                // absent: a phase that stops sending the number has stopped being
+                // measurable, and holding the old one would show a bar stuck at its last
+                // value — the exact "is it hung?" the field answers.
+                if let Some(title) = value.and_then(|v| v.get("title")).and_then(Value::as_str)
+                    && !title.is_empty()
+                {
+                    entry.title = title.to_owned();
+                }
+                entry.message = value
                     .and_then(|v| v.get("message"))
                     .and_then(Value::as_str)
-                    .unwrap_or("");
-                let detail = [title, message]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(" — ");
-                if !detail.is_empty() {
-                    self.detail = detail;
-                }
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_owned);
+                entry.percentage = value
+                    .and_then(|v| v.get("percentage"))
+                    .and_then(Value::as_u64)
+                    .and_then(|p| u8::try_from(p.min(100)).ok());
             }
             "end" => {
                 self.progress.remove(&token);
@@ -318,11 +381,54 @@ impl Session {
         // Ready needs *both*: the handshake done, and nothing in flight. See the module docs for
         // why "a diagnostic has arrived" is not part of it.
         if self.phase == Phase::Running && self.progress.is_empty() {
-            SourceStatus::Ready
-        } else {
-            SourceStatus::Scanning {
-                detail: self.detail.clone(),
+            return SourceStatus::Ready;
+        }
+        // One token's whole story, never a collage. With several in flight the displayed
+        // line and the displayed number must come from the *same* token, or the panel shows
+        // one phase's percentage wearing another's name — the measurable token wins because
+        // a fraction is strictly more informative than a spinner, and recency breaks ties
+        // so two determinate phases hand over cleanly.
+        // Three tiers: a measurable token, then a token with *words*, then anything. A token
+        // that exists but has not spoken — `window/workDoneProgress/create` pre-registers
+        // one before its `begin` arrives, and flycheck re-creates its token on every
+        // restart — must not win on recency alone: it has nothing to show, and the fallback
+        // line below is the constructor's "starting …", which on a server that has been
+        // running for minutes is a lie the panel then flashes once a second.
+        let spoke = self
+            .progress
+            .values()
+            .filter(|t| t.percentage.is_some())
+            .max_by_key(|t| t.updated_at)
+            .or_else(|| {
+                self.progress
+                    .values()
+                    .filter(|t| !t.title.is_empty() || t.message.is_some())
+                    .max_by_key(|t| t.updated_at)
+            })
+            .or_else(|| self.progress.values().max_by_key(|t| t.updated_at));
+        match spoke {
+            Some(token) => {
+                let detail = [token.title.as_str(), token.message.as_deref().unwrap_or("")]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" — ");
+                SourceStatus::Scanning {
+                    // A token that has not spoken yet (created, no begin) has no words; the
+                    // pre-token line ("starting …") is better than an empty row.
+                    detail: if detail.is_empty() {
+                        self.detail.clone()
+                    } else {
+                        detail
+                    },
+                    percentage: token.percentage,
+                }
             }
+            None => SourceStatus::Scanning {
+                detail: self.detail.clone(),
+                percentage: None,
+            },
         }
     }
 
@@ -483,7 +589,11 @@ fn publish(params: &Value) -> Option<Effect> {
 /// Because exactly one capability must differ between them, and getting that one wrong trades a
 /// stale-diagnostics bug for a wrong-answer bug, which is worse. See
 /// [`declares_watched_files`].
-fn initialize_params(roots: &[std::path::PathBuf], server: Server) -> Value {
+fn initialize_params(
+    roots: &[std::path::PathBuf],
+    server: Server,
+    init_options: Option<&Value>,
+) -> Value {
     let folders: Vec<Value> = roots
         .iter()
         .map(|root| {
@@ -493,7 +603,7 @@ fn initialize_params(roots: &[std::path::PathBuf], server: Server) -> Value {
             })
         })
         .collect();
-    json!({
+    let mut params = json!({
         "processId": std::process::id(),
         "clientInfo": { "name": "cide", "version": env!("CARGO_PKG_VERSION") },
         "rootUri": roots.first().map(|r| crate::convert::path_to_uri(r)),
@@ -561,7 +671,15 @@ fn initialize_params(roots: &[std::path::PathBuf], server: Server) -> Value {
                 "implementation": { "dynamicRegistration": false, "linkSupport": false },
             },
         },
-    })
+    });
+    // Absent, not `null` — the same "we did not say" versus "we said no" discipline
+    // `workspace_capabilities` spells out. A server cide has no configuration for must see the
+    // handshake it saw before this key existed, byte for byte; `initializationOptions: null`
+    // is a statement, and one some servers deserialize differently from silence.
+    if let Some(options) = init_options {
+        params["initializationOptions"] = options.clone();
+    }
+    params
 }
 
 /// The `capabilities.workspace` object, which is the one part that differs per server.
@@ -611,6 +729,56 @@ fn declares_watched_files(server: Server) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The bug as reported: priming at 40% running beside "cargo check", and the panel
+    /// showing the number from one token under the name of the other. One token's whole
+    /// story, and the measurable token wins.
+    #[test]
+    fn concurrent_tokens_never_mix_their_stories() {
+        let (mut session, _) =
+            Session::new(&[std::path::PathBuf::from("/tmp")], Server::RUST_ANALYZER);
+        let progress = |token: &str, kind: &str, extra: serde_json::Value| {
+            let mut value = serde_json::json!({ "kind": kind });
+            for (k, v) in extra.as_object().unwrap() {
+                value[k] = v.clone();
+            }
+            serde_json::json!({ "token": token, "value": value })
+        };
+        session.on_progress(&progress(
+            "check",
+            "begin",
+            serde_json::json!({ "title": "cargo check" }),
+        ));
+        session.on_progress(&progress(
+            "prime",
+            "begin",
+            serde_json::json!({ "title": "Indexing", "message": "2/5 (serde)", "percentage": 40 }),
+        ));
+        // A later cargo-check report must not steal the display from the measurable token.
+        session.on_progress(&progress("check", "report", serde_json::json!({})));
+        let SourceStatus::Scanning { detail, percentage } = session.status() else {
+            panic!("two tokens in flight is Scanning");
+        };
+        assert_eq!(percentage, Some(40));
+        assert!(
+            detail.contains("Indexing") && detail.contains("serde"),
+            "got {detail:?}"
+        );
+        assert!(
+            !detail.contains("cargo check"),
+            "the number's own token names the line"
+        );
+
+        // Priming ends: cargo check's own story takes over — its name, and *no* number,
+        // because a bar holding priming's 100% under "cargo check" was the second half of
+        // the report.
+        session.on_progress(&progress("prime", "end", serde_json::json!({})));
+        let SourceStatus::Scanning { detail, percentage } = session.status() else {
+            panic!("one token in flight is Scanning");
+        };
+        assert_eq!(percentage, None);
+        assert!(detail.contains("cargo check"), "got {detail:?}");
+    }
     use super::*;
 
     fn started() -> Session {
@@ -852,6 +1020,46 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfigured_session_sends_no_initialization_options_at_all() {
+        // Absent, not `null`. Every server cide did not ship must see the handshake it saw
+        // before the key existed, byte for byte — `initializationOptions: null` is a statement,
+        // and one some servers deserialize differently from silence.
+        let (_, effects) =
+            Session::new(&[std::path::PathBuf::from("/repo")], Server::RUST_ANALYZER);
+        let params = &sent(&effects)[0]["params"];
+        assert!(params.get("initializationOptions").is_none(), "{params}");
+    }
+
+    #[test]
+    fn a_configured_session_states_its_options_in_the_handshake_and_again_when_asked() {
+        // Both halves of the pipe the shipped rust-analyzer is configured through. The same
+        // object twice, deliberately: rust-analyzer reads `initializationOptions` at startup
+        // and *re-asks* via `workspace/configuration` on `didChangeConfiguration`, and two
+        // different answers would be two different servers depending on when it asked.
+        let options = json!({ "cide": { "diskIndex": { "dir": "/cache/cide/rust-analyzer" } } });
+        let (mut session, effects) = Session::with_init_options(
+            &[std::path::PathBuf::from("/repo")],
+            Server::RUST_ANALYZER,
+            Some(options.clone()),
+        );
+        assert_eq!(
+            sent(&effects)[0]["params"]["initializationOptions"],
+            options
+        );
+
+        session.on_message(&json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}}));
+        let effects = session.on_message(&json!({
+            "jsonrpc": "2.0", "id": 42, "method": "workspace/configuration",
+            "params": { "items": [{"section": "rust-analyzer"}] },
+        }));
+        // The known simplification, pinned: rust-analyzer requests its whole section as one
+        // item and the one object cide holds *is* that section. Several items get the same
+        // object each — wrong for a hypothetical multi-section server, right for every server
+        // cide configures, and the comment in `on_message` is where that scope is argued.
+        assert_eq!(sent(&effects)[0]["result"], json!([options]));
+    }
+
+    #[test]
     fn a_work_done_progress_create_request_is_answered() {
         let mut session = running();
         let effects = session.on_message(&json!({
@@ -894,7 +1102,7 @@ mod tests {
             "jsonrpc": "2.0", "method": "$/progress",
             "params": { "token": "t", "value": { "kind": "begin", "title": "Indexing" } },
         }));
-        let SourceStatus::Scanning { detail } = status(&effects).expect("status") else {
+        let SourceStatus::Scanning { detail, .. } = status(&effects).expect("status") else {
             panic!("{effects:?}");
         };
         assert_eq!(detail, "Indexing");
