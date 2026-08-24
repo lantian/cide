@@ -99,12 +99,12 @@ export const RAIL_WIDTH = 46
 /**
  * The handle's own width: `--w-splitter`, the same token the pane dividers use.
  *
- * In the ceiling because the handle is a real flex item in the same row — it takes its 6px
+ * In the ceiling because the handle is a real flex item in the same row — it takes its width
  * out of the workspace, not out of the panel. Leaving it out made [`MIN_WORKSPACE`] a
  * promise the arithmetic broke by exactly this much, which is the kind of drift a comment
  * hides rather than fixes. `check-sidebar.mjs` pins it to the token's value.
  */
-export const SPLITTER_WIDTH = 6
+export const SPLITTER_WIDTH = 3
 
 /**
  * What the workspace keeps for itself, whatever the sidebar asks for.

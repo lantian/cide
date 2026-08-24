@@ -860,16 +860,15 @@ try {
   // has no chrome line to lean on, and the leaves on a flush edge drop that side of the frame
   // border through `--pane-edge-*` — both ends of that seam are pinned below.
   //
-  // Tied to `--w-splitter` rather than asserted as a literal, because the two numbers are one
-  // decision: a splitter that stops being 6px leaves the edge out of step with the middle.
+  // The right pad is spelled as a `calc()` over the token rather than a matching literal,
+  // because the two numbers are one decision: when the track was halved to 3px the padding
+  // was a literal, and it had to be found and moved by hand. Now a splitter that changes
+  // width moves this edge with it by construction, and the assertion pins the expression.
   const splitCss = css('src/layout/SplitTree.module.css')
   const canvasPad = /\.canvas \{[^}]*padding:\s*([^;]+);/.exec(splitCss)?.[1]?.trim()
-  const splitter = Number(
-    /--w-splitter:\s*(\d+)px/.exec(readFileSync('src/styles/tokens.css', 'utf8'))?.[1] ?? NaN,
-  )
   eq(
     canvasPad,
-    `0 ${splitter / 2}px 0 0`,
+    '0 calc(var(--w-splitter) / 2) 0 0',
     'the tree canvas pads by half a splitter on the right edge only — the other three sit ' +
       'flush against chrome that already draws the seam, lining panes up with the tab strip',
   )

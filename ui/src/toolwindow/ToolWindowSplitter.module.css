@@ -1,21 +1,21 @@
 /*
  * The tool window's drag edge — the horizontal twin of `chrome/SidebarSplitter.module.css`.
  *
- * Sized off `--w-splitter` used as a *height*, so it is the same 6px gutter the pane grid and the
- * sidebar use: this is one resize system, and an edge that was 4px here while a pane divider was
- * 6px would read as two. A real flex item rather than an absolutely positioned overlay, for the
+ * Sized off `--w-splitter` used as a *height*, so it is the same gutter the pane grid and the
+ * sidebar use: this is one resize system, and an edge wider or narrower here than a pane divider
+ * would read as two. A real flex item rather than an absolutely positioned overlay, for the
  * reason `SplitTree.module.css` gives — a track that *is* the gap needs no compensating margin
- * and cannot overlap a terminal's hit area. It is also why `toolWindowHeight.ts` subtracts these
- * six pixels from the ceiling.
+ * and cannot overlap a terminal's hit area. It is also why `toolWindowHeight.ts` subtracts this
+ * height from the ceiling.
  */
 .splitter {
   flex: none;
   height: var(--w-splitter);
   /*
    * The workspace's colour, not the gutter's. The panel already draws a 1px `--border` on its top
-   * edge; a second 6px bar above it would be a band the design does not have, and it would be at
-   * its most obvious in the light theme. So the strip reads as the bottom-most 6px of the pane
-   * area until it is pointed at, and the seam stays the panel's own border.
+   * edge; a second bar above it would be a band the design does not have, and it would be at
+   * its most obvious in the light theme. So the strip reads as the bottom-most sliver of the
+   * pane area until it is pointed at, and the seam stays the panel's own border.
    */
   background: var(--panel-2);
   cursor: row-resize;
@@ -33,9 +33,9 @@
 }
 
 /*
- * The visible track is 6px; a 6px pointer target is a poor one. This widens it to 11px without
- * moving anything — the pseudo-element is out of flow, so it costs no layout and cannot change
- * the panel's height.
+ * The visible track is `--w-splitter`; a target that thin is a poor one. This widens it by
+ * 5px — 8px at the current 3px track — without moving anything: the pseudo-element is out of
+ * flow, so it costs no layout and cannot change the panel's height.
  *
  * Asymmetric on purpose: 3px up into the pane area, but only 2px down over the panel, so the grab
  * area stops short of the panel's own 1px border and of its tab row's hit targets.

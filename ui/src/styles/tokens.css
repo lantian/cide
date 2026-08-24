@@ -743,7 +743,14 @@
   /* Every panel an extension contributes, at the explorer's width — see `SidebarSettings::ext_width`. */
   --w-sidebar-ext: 252px;
   --w-minimap: 96px;
-  --w-splitter: 6px;
+  /*
+   * The one gutter width: the pane dividers, the sidebar's drag edge and the tool window's are
+   * all this token, and the pane canvas pads its window-facing edge by half of it. 6px from the
+   * mock originally; halved at the user's request — the visible line thins, while every
+   * splitter's pointer target stays widened past it by its own `::before` (8-9px), so the grab
+   * area gave up only what the track itself did.
+   */
+  --w-splitter: 3px;
   /*
    * The git tool window: the bottom panel holding the commit log and per-file history. (M18)
    *

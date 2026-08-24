@@ -78,11 +78,11 @@ export const CHROME_HEIGHT = HEADER_HEIGHT + TABSTRIP_HEIGHT + STATUS_HEIGHT
  * `--w-splitter`, used here as a height.
  *
  * Subtracted by [`toolWindowCeiling`] because the handle is a **real flex item in the same
- * column**, so its six pixels come out of the pane area just as the panel's do. Leaving it out
+ * column**, so its pixels come out of the pane area just as the panel's do. Leaving it out
  * under-delivers [`MIN_PANES`] by exactly that much — the same drift `SPLITTER_WIDTH`'s comment
  * records for the horizontal case.
  */
-export const SPLITTER_HEIGHT = 6
+export const SPLITTER_HEIGHT = 3
 
 /**
  * What the pane grid keeps, whatever the tool window asks for.

@@ -1,8 +1,8 @@
 /*
  * The sidebar's drag edge.
  *
- * Sized off `--w-splitter` so it is the same 6px gutter the pane grid uses — this is one
- * resize system, and a sidebar edge that was 4px while a pane divider was 6px would read as
+ * Sized off `--w-splitter` so it is the same gutter the pane grid uses — this is one
+ * resize system, and a sidebar edge wider or narrower than a pane divider would read as
  * two. It is a real flex item rather than an absolutely positioned overlay, for the reason
  * `SplitTree.module.css` gives: a track that *is* the gap needs no compensating margin on
  * either side and cannot overlap a terminal's hit area.
@@ -14,10 +14,10 @@
    * The workspace's colour, not the gutter's `--border-soft`.
    *
    * The panel already draws a 1px `--border` on its right edge and the mock has exactly one
-   * seam there; a second 6px bar beside it would be a band the design does not have, and it
+   * seam there; a second bar beside it would be a band the design does not have, and it
    * would be at its most obvious in the light theme, where `--border-soft` against white is
-   * the most visible. So the strip reads as the left-most 6px of the editor background until
-   * it is pointed at, and the seam stays the panel's own border.
+   * the most visible. So the strip reads as the left-most sliver of the editor background
+   * until it is pointed at, and the seam stays the panel's own border.
    */
   background: var(--panel-2);
   cursor: col-resize;
@@ -35,9 +35,9 @@
 }
 
 /*
- * The visible track is 6px; a 6px pointer target is a poor one. This widens it to 11px
- * without moving anything — the pseudo-element is out of flow, so it costs no layout and
- * cannot change the panel's width.
+ * The visible track is `--w-splitter`; a target that thin is a poor one. This widens it by
+ * 5px — 8px at the current 3px track — without moving anything: the pseudo-element is out of
+ * flow, so it costs no layout and cannot change the panel's width.
  *
  * Asymmetric on purpose: 3px into the workspace, but only 2px back over the panel, so the
  * grab area stops short of the panel's own 1px border and of the scrollbar that can sit

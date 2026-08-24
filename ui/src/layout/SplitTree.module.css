@@ -3,7 +3,7 @@
  *
  * A whole chain of same-axis splits is one `display: grid` with `2n - 1` tracks —
  * `f0 fr var(--w-splitter) f1 fr …` — which is why a splitter is a real grid track rather
- * than an absolutely positioned overlay: the track *is* the 6px gap, so the panes either
+ * than an absolutely positioned overlay: the track *is* the gap, so the panes either
  * side need no compensating margin and nothing overlaps a terminal's hit area. It is also
  * why a vertical divider is exactly as tall as its own row: it is a track of that row's
  * grid, and that grid's box is one row tall.
@@ -22,10 +22,10 @@
  * The tree itself. One stretched cell, so the root node fills whatever is left over the
  * strip whether it is a leaf or a chain.
  *
- * # The 3px is the outer half of the gutter system
+ * # The half-splitter is the outer half of the gutter system
  *
- * A splitter track is 6px, which is really two 3px half-gutters back to back: each pane gives
- * up 3px to the space between it and its neighbour. At the *edges* of the tree there was no
+ * A splitter track is really two half-gutters back to back: each pane gives up half of
+ * `--w-splitter` to the space between it and its neighbour. At the *edges* of the tree there was no
  * neighbour and therefore no half-gutter, so the outermost pane's frame sat flush against the
  * app's own chrome — the tab strip's `border-bottom`, the sidebar's `border-right`, the status
  * bar's `border-top`, each a 1px `--border` line. Two 1px borders touching read as one 2px
@@ -45,8 +45,8 @@
  * Padding on the canvas rather than a margin on the leaf, because the leaf's box is a grid
  * *track* and a margin there would come out of the `fr` fractions the splitters commit — the
  * ratio would silently stop meaning what it says, which is the thing `min-*: 0` below is also
- * there to prevent. The canvas's own background resolves to `.tree`'s `--panel-2`, so the new
- * 3px is the same ground the gutters already show.
+ * there to prevent. The canvas's own background resolves to `.tree`'s `--panel-2`, so the
+ * padding is the same ground the gutters already show.
  *
  * It costs one terminal refit at load and none afterwards: nothing about this changes when a
  * pane is focused, split or maximized.
@@ -55,9 +55,9 @@
  *
  * The paragraph above earned the gutter on the premise "no neighbour, no half-gutter", and
  * that premise turned out to be false on three of the four edges, where the app's own chrome
- * is the neighbour and already draws the seam: the sidebar splitter's 6px `--panel-2` strip
+ * is the neighbour and already draws the seam: the sidebar splitter's `--panel-2` strip
  * (plus the sidebar's `border-right`) on the left, the tab strip's `border-bottom` above, and
- * the add-row strip's / status bar's `border-top` below. On those edges the 3px here plus the
+ * the add-row strip's / status bar's `border-top` below. On those edges the padding plus the
  * frame's 1px border put a lone `--border` line a few pixels in from the chrome's own seam,
  * floating against nothing, and pushed a pane's content out of line with the tab strip's tabs
  * — the user circled the left one in a screenshot, then pointed out that top and bottom carry
@@ -66,14 +66,17 @@
  * the chrome seam stays the only line.
  *
  * The right edge keeps the half-gutter: it meets the bare window edge, which draws nothing,
- * so it is the one edge where the original argument still holds.
+ * so it is the one edge where the original argument still holds. Spelled as a `calc()` over
+ * the token rather than the number, because the two are one decision — a splitter that
+ * changes width must move this edge with it, and it already failed to once when both were
+ * literals. `check:rows` pins the expression.
  */
 .canvas {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   display: grid;
-  padding: 0 3px 0 0;
+  padding: 0 calc(var(--w-splitter) / 2) 0 0;
 }
 
 /*
@@ -95,6 +98,9 @@
  * layer hit-testing over live terminals, and this is the only control in the tab that acts
  * on the *tab* rather than on a pane. Sized off `--w-splitter` so it reads as part of the
  * gutter system, and coloured only from tokens, so both themes are covered by construction.
+ * The multiplier went 2 → 4 when the token halved: the strip is a labelled click target, and
+ * its buttons' 11px text would have overruled a 6px floor anyway — this keeps the floor the
+ * 12px it has always been rather than letting it ride on the label's line box.
  */
 .addRow {
   flex: 0 0 auto;
@@ -102,7 +108,7 @@
   justify-content: flex-end;
   align-items: stretch;
   gap: 1px;
-  min-height: calc(var(--w-splitter) * 2);
+  min-height: calc(var(--w-splitter) * 4);
   background: var(--panel-2);
   border-top: 1px solid var(--border-soft);
 }
@@ -187,9 +193,12 @@
 }
 
 /*
- * The visual track is 6px because the mock says so, but a 6px pointer target is a poor one.
- * This widens the hit area to 12px without moving anything: the pseudo-element is out of
- * flow, so it costs no layout and cannot change a track size.
+ * The visual track is `--w-splitter`, but a track that thin is a poor pointer target. This
+ * widens the hit area by 3px each side — 9px at the current 3px track — without moving
+ * anything: the pseudo-element is out of flow, so it costs no layout and cannot change a
+ * track size. The 3px reach is a number other files lean on — `PaneTitleBar.module.css`'s
+ * cluster keeps its close button 2px in from the frame edge *because* this reaches 3px past
+ * the track — so it stays put while the track itself changes.
  */
 .splitter::before {
   content: '';
