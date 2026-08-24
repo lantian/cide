@@ -124,8 +124,28 @@
    * Two layers, both far softer than the beige theme's single 0.18 drop. On white a heavy
    * shadow reads as the surface peeling; the hairline does the "this is above you" work and
    * the wide one only grounds it.
+   *
+   * # Why there are three of them
+   *
+   * There was one, and fifteen rules read it: a drag ghost, a speed-search box, a context
+   * menu, a command palette and a modal all lifted off the page by exactly the same amount.
+   * That is not a depth cue, it is a decoration — if everything floats equally then nothing
+   * is on top of anything. The three rungs are the three heights this app actually has:
+   *
+   *   --shadow-1  a hairline lift, attached to something on screen — a dropdown under its
+   *               button, the blame popup, a drag ghost following the pointer
+   *   --shadow-2  a free-floating surface the pointer summoned — menus, pickers, the switcher
+   *   --shadow-3  a modal, with a scrim under it. This is the old `--shadow`, unchanged.
+   *
+   * All three keep the two-layer structure for the reason above: the 1px hairline is what
+   * says "above", the wide layer only grounds it, and on white a single heavy drop still
+   * reads as the surface peeling however far it is scaled back.
    */
-  --shadow:
+  --shadow-1:
+    0 1px 2px rgba(24, 16, 12, 0.05), 0 3px 8px rgba(24, 16, 12, 0.07);
+  --shadow-2:
+    0 1px 2px rgba(24, 16, 12, 0.06), 0 8px 22px rgba(24, 16, 12, 0.1);
+  --shadow-3:
     0 1px 2px rgba(24, 16, 12, 0.06), 0 18px 44px rgba(24, 16, 12, 0.12);
 
   /*
@@ -240,7 +260,15 @@
    */
   --ignored: #8f8256;
   --sel: #2b3a55;
-  --shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  /*
+   * The same three rungs; see the light block for what each height means. Dark keeps the
+   * single wide drop it always had at every rung, because on #111113 a 1px hairline layer is
+   * invisible — there is no lighter ground for it to darken. `--shadow-3` is the value this
+   * theme has always shipped, unchanged.
+   */
+  --shadow-1: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 12px 30px rgba(0, 0, 0, 0.48);
+  --shadow-3: 0 24px 60px rgba(0, 0, 0, 0.55);
 
   /*
    * The same six gradient tokens, so a CSS module that uses one is not writing a
@@ -361,14 +389,41 @@
   /*
    * The chrome's type scale — everything that is not a buffer or a terminal.
    *
-   * # Why fourteen tokens and one multiplier
+   * # Six rungs, and why it was fourteen
    *
-   * There is no single "UI font size" in this app's design. The mock draws chrome at fourteen
-   * sizes between 8px and 20px, and the *ratios* between them are the design: a tab's label at
-   * 12.5px over its project path at 10.5px is a hierarchy, and `chrome/layoutAudit.ts` measures
-   * four of those numbers against the mock directly. So the setting moves one multiplier and
-   * every size keeps its place, rather than being fourteen settings or one size that flattens
-   * the hierarchy the moment it is touched.
+   * There is no single "UI font size" in this app's design: a tab's label over its project
+   * path is a hierarchy, and the *ratios* are what the setting has to preserve. So the setting
+   * moves one multiplier and every size keeps its place, rather than being one size that
+   * flattens the hierarchy the moment it is touched. That part has not changed.
+   *
+   * What changed is how many sizes there are. This ladder had **fourteen** rungs between 8px
+   * and 20px, transcribed from `Grount IDE.dc.html` with half-pixel steps, and the paragraph
+   * here used to argue that all fourteen were the design. Two things retired that argument:
+   *
+   *  1. **The mock is gone.** It was never in this repository, and the transcription in
+   *     `chrome/layoutAudit.ts` was all that survived of it. There is no document left to be
+   *     faithful to, so "the mock draws fourteen sizes" stopped being a reason for anything.
+   *  2. **Fourteen sizes is not a hierarchy.** 76 declarations sat at 10.5px and 135 at or
+   *     below it, and adjacent surfaces differed by half a pixel — which no reader perceives
+   *     as rank, only as inconsistency. The 10.5px UPPERCASE panel header repeated across six
+   *     panels was the most-reported symptom, and it was the bottom of a scale with nowhere
+   *     lower to go.
+   *
+   * Six rungs, each with a job, and the bottom of the scale lifted off 8px:
+   *
+   *     11  micro      counts, badges, chips, key hints — glanced at, never read
+   *     12  secondary  paths, panel headers, hints, the status bar
+   *     13  body       tree rows, tab labels, menu items, buttons
+   *     14  emphasis   dialog titles, the picker input
+   *     16  section    group headings
+   *     20  display    the resume splash, empty states
+   *
+   * One mapping in that collapse was **forced rather than chosen**, and it must not be
+   * "simplified" back: the old 11.5 went to 12 and the old 12.5 to 13, keeping them one rung
+   * apart, because `check-theme.mjs` asserts a usage-file heading is strictly larger than the
+   * source lines under it. Sending both to 12 fails that gate, and its failure message is the
+   * user's own words from when it last shipped that way: "it doesn't see where is filename and
+   * where is code".
    *
    * `--ui-scale` is `settings.uiFontSize / 13`, computed in `settings/fontScale.ts` and written
    * on `<html>` by `paintUiScale` — and written a whole module graph earlier than that by
@@ -380,39 +435,36 @@
    *
    * # Why the number is in the name
    *
-   * `--fs-ui-11-5` is 11.5px *at the default 13*, not 11.5px. The name is the design size, not
-   * the painted one. That reads wrong for about a second and then earns its keep: the design
-   * number stays greppable, the mock's figures stay visible in every stylesheet that uses one,
-   * and `check-theme.mjs` can still compare two rules' sizes the way it does for the Find
-   * usages heading. A semantic ladder (`--fs-sm`, `--fs-md`) was the alternative and lost —
-   * fourteen sizes do not map onto five names without rounding some of them, and rounding them
-   * is silently redrawing the mock.
+   * `--fs-ui-12` is 12px *at the default 13*, not 12px. The name is the design size, not the
+   * painted one. That reads wrong for about a second and then earns its keep: the design number
+   * stays greppable, and `check-theme.mjs` can still compare two rules' sizes the way it does
+   * for the Find usages heading. A semantic ladder (`--fs-sm`, `--fs-md`) is now a much closer
+   * call than it was at fourteen rungs, and it still loses: a name has to be re-argued every
+   * time a rule is written, where a number is just read off.
    *
    * # The set is closed
    *
-   * These fourteen are exactly the sizes the stylesheets ask for; `check-ui-scale.mjs` asserts
-   * the two sets are equal in both directions and that no bare `font-size: <n>px` survives
-   * outside the code surfaces. That gate is the only thing standing between this and the state
-   * it replaced, which was 405 literals in 51 files agreeing with nothing.
+   * These six are exactly the sizes the stylesheets ask for; `check-ui-scale.mjs` asserts the
+   * two sets are equal in both directions and that no bare `font-size: <n>px` survives outside
+   * the code surfaces. That gate is the only thing standing between this and the state it
+   * replaced, which was 405 literals in 51 files agreeing with nothing.
    *
-   * **Not the same as `--fs-code`.** `--fs-ui-12-5` and `--fs-code` are both 12.5px at their
-   * defaults and follow different settings: the tab strip's 12.5 is this scale's, the editor
-   * buffer's is `settings.editor.fontSize`'s. They look like one number and are two.
+   * **Not the same as `--fs-code`.** `--fs-ui-13` and the editor's size can coincide and follow
+   * different settings: the tab strip's is this scale's, the editor buffer's is
+   * `settings.editor.fontSize`'s. They can look like one number and are two.
    */
   --ui-scale: 1;
-  --fs-ui-8: calc(8px * var(--ui-scale));
-  --fs-ui-9: calc(9px * var(--ui-scale));
-  --fs-ui-9-5: calc(9.5px * var(--ui-scale));
-  --fs-ui-10: calc(10px * var(--ui-scale));
-  --fs-ui-10-5: calc(10.5px * var(--ui-scale));
+  /* micro:     counts, badges, chips, key hints — glanced at, never read */
   --fs-ui-11: calc(11px * var(--ui-scale));
-  --fs-ui-11-5: calc(11.5px * var(--ui-scale));
+  /* secondary: paths, panel headers, hints, the status bar */
   --fs-ui-12: calc(12px * var(--ui-scale));
-  --fs-ui-12-5: calc(12.5px * var(--ui-scale));
+  /* body:      tree rows, tab labels, menu items, buttons */
   --fs-ui-13: calc(13px * var(--ui-scale));
+  /* emphasis:  dialog titles, the picker input */
   --fs-ui-14: calc(14px * var(--ui-scale));
-  --fs-ui-15: calc(15px * var(--ui-scale));
-  --fs-ui-18: calc(18px * var(--ui-scale));
+  /* section titles */
+  --fs-ui-16: calc(16px * var(--ui-scale));
+  /* display */
   --fs-ui-20: calc(20px * var(--ui-scale));
 
   /*
@@ -433,11 +485,27 @@
    * again: they are *persisted*, dragged by the user and stored in `SidebarSettings` /
    * `ToolWindowState`, so scaling them would fight the saved value on every launch.
    */
-  --h-header: calc(34px * var(--ui-scale));
-  --h-rail: 42px;
-  --h-tabstrip: calc(30px * var(--ui-scale));
-  --h-status: calc(24px * var(--ui-scale));
-  --h-panetitle: calc(26px * var(--ui-scale));
+  --h-header: calc(38px * var(--ui-scale));
+  --h-rail: 46px;
+  --h-tabstrip: calc(34px * var(--ui-scale));
+  /*
+   * Every sidebar panel's header row, and it is **the same number as `--h-tabstrip` on
+   * purpose**.
+   *
+   * `App.module.css`'s `.upper` is a flex *row* — sidebar panel | splitter | content — so a
+   * panel header's top edge and the tab strip's top edge are the same line across the whole
+   * window. They matched at 30/30 by coincidence, each stylesheet having written its own
+   * literal. Moving the strip to 34 and leaving the headers at 30 puts a visible step down the
+   * sidebar seam, which is why this is a token rather than six more literals: the two now
+   * cannot drift apart without somebody editing a line that says why they may not.
+   *
+   * Read by all six panels — explorer, search, problems, tasks, agents, extensions — and by
+   * `GitPanel.module.css`, whose own comment already gave the same reason for matching the
+   * explorer: so the two sidebars swap without the content below them moving by a pixel.
+   */
+  --h-panelheader: calc(34px * var(--ui-scale));
+  --h-status: calc(26px * var(--ui-scale));
+  --h-panetitle: calc(28px * var(--ui-scale));
   /*
    * The find bar's height, and the one number two stylesheets have to agree on. (M16)
    *
@@ -503,9 +571,177 @@
    */
   --h-toolwindow: 260px;
   /* The tool window's own tab row: Log, then one closable tab per file history. */
-  --h-toolwindow-tabs: calc(28px * var(--ui-scale));
+  --h-toolwindow-tabs: calc(32px * var(--ui-scale));
   /* The commit list ⇄ details divider's starting share of the Log tab, as a width. */
   --w-log-details: 420px;
+
+  /*
+   * ===================================================================================
+   * Shape, space, motion and icons.
+   * ===================================================================================
+   *
+   * **The design mock is gone, and that is the context for everything below.**
+   * `Grount IDE.dc.html` was never in this repository — only a transcription of it was, and
+   * `chrome/layoutAudit.ts`'s numbers were all of that transcription that survived. As of
+   * this milestone those numbers are this app's own specification rather than a copy of
+   * somebody else's, and the four families here are things the mock never had at all. A
+   * future reader who finds the mock should treat it as history, not as a target they are
+   * failing to hit.
+   */
+
+  /*
+   * Corner radius, as five rungs.
+   *
+   * There were 186 `border-radius` declarations across **twelve** distinct values, with 3px
+   * (65), 5px (41) and 4px (40) used interchangeably for the same kinds of box. Three
+   * near-identical radii is not a design, it is what happens when every stylesheet picks one:
+   * a 4px button inside a 3px input inside a 5px panel has no relationship a reader can see,
+   * only a mismatch they can feel.
+   *
+   * The rungs are the four kinds of box this app actually draws, plus a pill:
+   *
+   *   --r-1  chips, swatches, tags, small inputs        (was 1/2/3/4px)
+   *   --r-2  buttons, segmented items, rows, fields     (was 5/6px)
+   *   --r-3  panels, popovers, rail buttons             (was 8/9px)
+   *   --r-4  modals, menus, overlay cards               (was 10px)
+   *   --r-full  pills and badges                        (was 7/999px)
+   *
+   * Everything moved *up*: the old scale topped out at 9px outside modals, which is the sharp,
+   * hard-edged look this milestone was asked to fix.
+   *
+   * **`50%` is deliberately not a rung.** Eight declarations use it, and every one is a real
+   * circle — the traffic lights, the commit-graph dot, the toggle knob. "Half of whatever this
+   * box turns out to be" is not expressible as a length, and a 999px pill is not the same
+   * shape: on a box that is wider than it is tall, `--r-full` gives a stadium and `50%` gives
+   * an ellipse. Leave all eight alone.
+   */
+  --r-1: 4px;
+  --r-2: 6px;
+  --r-3: 8px;
+  --r-4: 12px;
+  --r-full: 999px;
+
+  /*
+   * The spacing step, as seven rungs on a 4px grid with a 2px and a 6px half-step.
+   *
+   * The literals these replace were an eleven-value set with no rhythm — `3px 8px`,
+   * `5px 10px`, `7px 13px`, `9px 14px 7px`, `12px 18px` — where 7, 9, 11, 13 and 18 all
+   * appeared and none of them related to any other. That is the second half of why the chrome
+   * reads as unresolved: nothing lines up with anything one panel over.
+   *
+   * **Unscaled, and that is not an oversight.** `--ui-scale` moves text and the boxes drawn
+   * around text; it does not move icons, borders or splitter widths (see `--h-rail` below for
+   * the full rule). Today's horizontal paddings are already bare px for exactly that reason,
+   * so these tokens are a rename rather than a behaviour change. `check-ui-scale.mjs`'s
+   * literal-first assertion also makes the alternative unwritable:
+   * `calc(var(--sp-4) * var(--ui-scale))` is not `<design>px * var(--ui-scale)` and is refused.
+   *
+   * The snapping rule used when the sweep landed, recorded because the scale has no 10 or 14
+   * and the old literals were full of both: horizontal padding on a **chrome bar** rounds up
+   * (10→12, 14→16); padding **inside a small control** rounds down (10→8, 5→4). A bar has room
+   * it was not using; a control does not.
+   */
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 24px;
+
+  /*
+   * Motion. Two durations and one curve, and a very short list of where they may be used.
+   *
+   * This app had **six** `transition` declarations in sixty-two stylesheets, five of them
+   * `opacity`-only. Every hover, every press, every menu opening snapped. That is most of what
+   * "it feels cheap" means, and it is the cheapest thing here to fix.
+   *
+   * # The rule, which is a correctness rule and not a taste one
+   *
+   * Transition **only** `background-color`, `border-color`, `color`, `box-shadow`, `opacity`,
+   * `outline-color`, `fill`, `stroke`, and `transform` where transform is not doing layout.
+   * Never a geometry property. Never `transition: all` — that spelling is banned as a word,
+   * because it is the only way to reach either hazard below by accident.
+   *
+   * **Hazard 1 — the splitter drag.** `layout/Splitter.tsx` writes `gridTemplateColumns`
+   * straight onto the DOM node on every `pointermove`, and `layout/resizeGesture.ts` defers the
+   * expensive reactions (xterm's `fit()`, a `session_resize` that reflows the scrollback on the
+   * IPC thread, a minimap repaint) to `pointerup`. A transition on a pane box's `width`,
+   * `height`, `flex` or `inset` turns every pointer sample into an animation the
+   * `ResizeObserver`s keep firing on *after* the gesture has already flushed, and the deferral
+   * stops being the last word. `check:resize` cannot see this — the module still queues once
+   * and still cancels; the CSS is outside its world.
+   *
+   * **Hazard 2 — the terminal renderer.** `layout/TabContent.module.css` hides inactive tabs
+   * with `visibility: hidden` as a hard switch, and `layout/paneHosts.ts`'s `repaintHost`
+   * repairs a stalled xterm by nudging `el.style.bottom` from `0px` to `1px` and back two
+   * frames later — a genuine layout change, which is the only thing that forces WebKit to
+   * recompute the clip rect the renderer's IntersectionObserver is measured against. A
+   * transition on `bottom`, `inset` or `all` anywhere on a pane host or its ancestors
+   * *interpolates that nudge*, so the repair arrives smeared over the duration or never
+   * arrives, and the watchdog logs a fix that did nothing.
+   *
+   * Neither failure throws and neither changes a pixel in any snapshot. `check:motion` is the
+   * fence; this comment is why it exists.
+   *
+   * # Reduced motion
+   *
+   * Handled by redefining the two durations at the bottom of this file rather than by a
+   * `* { transition: none !important }` sweep — which would also reach CodeMirror's and
+   * xterm's own transitions, which nothing here tests. So **every transition in this app must
+   * read `--dur-1` or `--dur-2`**; a literal duration is a rule that ignores the setting.
+   */
+  --dur-1: 90ms;
+  --dur-2: 140ms;
+  /* Fast out of the gate, settling at the end — the standard "entering" curve. */
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+
+  /*
+   * The icon box, as four sizes.
+   *
+   * **These are box sizes — a `width` and a `height` on an `<svg>` or an `<img>`. Never a
+   * `font-size`.** `check-ui-scale.mjs`'s first assertion refuses a `font-size` that is not a
+   * ladder rung or the code scale, so `font-size: var(--icon-2)` does not compile past the
+   * gate; and the deeper reason is in `chrome/ActivityRail.tsx`, which measured it: what a
+   * *character* puts on screen is its ink inside its em box, a ratio belonging to whichever
+   * face fontconfig picked — seven glyphs at seven font sizes produced ink between 0.53em and
+   * 0.82em. Sizing a glyph and sizing a drawn mark are not the same act.
+   *
+   * Unscaled, like `--h-rail` and for its reason: an SVG does not grow with a type scale.
+   *
+   * The stroke that goes with each box lives in `icons/Icon.module.css`, not here, and it is
+   * *not* constant: a 24-unit grid at `stroke-width: 2` renders 2px at 24px and 1.08px at 13px,
+   * which is exactly why the rail's mark and the git log's toggle look like different weights
+   * today. Each box gets the stroke that lands its on-screen width in a 0.29px band around
+   * 1.5px. `--icon-3` keeps `stroke-width: 2` so the activity rail — the one icon nobody
+   * complained about — does not move.
+   */
+  --icon-0: 12px;
+  --icon-1: 14px;
+  --icon-2: 16px;
+  --icon-3: 20px;
+
+  /*
+   * The focus ring, in two forms, because one of them is unusable in half the app.
+   *
+   * There were 64 rules spelling `outline: 1px solid var(--accent)`, fifteen of them with
+   * `outline-offset: -2px`. A 1px rectangle floating two pixels inside a square tab reads as a
+   * rendering artefact rather than as focus, and the offset is there because the strips that
+   * hold those controls (`.tabs`, `.strip`, the rail) all `overflow: hidden`, which clips an
+   * outward outline away entirely.
+   *
+   * So: an outward 2px ring where there is room for one, and an **inset box-shadow** where
+   * there is not. The shadow is drawn inside the element's own padding box, so no ancestor's
+   * clipping can bisect it, and — unlike `outline-offset` — it follows the element's own
+   * `border-radius`, which now that radii are 6 and 8 rather than 3 is the difference between a
+   * ring and a box drawn near a ring.
+   *
+   * **`--focus-inset` composes.** Four elements already own an inset `box-shadow` of their own
+   * — `FileTree`'s `.rowCurrent` and its drop states, `ChangesTree`'s, and `PaneTitleBar`'s —
+   * so a focus rule there must *append* to the existing shadow, never assign over it.
+   */
+  --focus-ring: 2px solid var(--accent);
+  --focus-inset: inset 0 0 0 2px var(--accent);
 }
 
 * {
@@ -639,11 +875,37 @@ strong {
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   border: 2px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--dim);
   background-clip: content-box;
+}
+
+/*
+ * Reduced motion, for the whole app, in one rule.
+ *
+ * It works by zeroing the two duration tokens rather than by `* { transition: none !important }`,
+ * and the difference is not stylistic:
+ *
+ *  - A wildcard `!important` also reaches CodeMirror's and xterm's own transitions, which this
+ *    app did not author and nothing here tests. Redefining our tokens reaches exactly our rules.
+ *  - `0.01ms` rather than `none` because a zero-duration transition still fires `transitionend`,
+ *    where `transition: none` fires nothing at all. Nothing listens for it today; a future
+ *    reveal or dismiss that does would deadlock under reduced motion, and that is a bug written
+ *    into the app months before anyone triggers it.
+ *
+ * This is why every transition in `ui/src` must read `--dur-1` or `--dur-2` and never a
+ * literal. `layout/PaneTitleBar.module.css` used to carry its own scoped block for its reveal;
+ * that block is gone and its transition reads the token, so the special case folded into the
+ * general rule. The reveal is still the most motion-sensitive thing in the app — it is a
+ * control cluster that appears under the pointer — which is what the scoped block was saying.
+ */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0.01ms;
+    --dur-2: 0.01ms;
+  }
 }

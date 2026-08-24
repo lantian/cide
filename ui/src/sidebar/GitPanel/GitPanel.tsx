@@ -44,6 +44,8 @@ import { Toolbar } from './Toolbar'
 import { allRepos, canCommit, repoOf, summarize } from './model'
 import { useGitDiffTabOpen } from './openDiffTabs'
 import type { GitPanelActions, GitPanelModel } from './useGitPanel'
+import { Icon } from '@/icons/Icon'
+
 import styles from './GitPanel.module.css'
 
 type PanelTab = 'commit' | 'shelf'
@@ -153,7 +155,10 @@ export function GitPanelView({
         {/* The branch belongs in the header of a commit window; with several repos it is
             per-repo and the tree's own rows carry it instead. */}
         {repos.length === 1 && repos[0] !== undefined && repos[0].branch.head !== '' && (
-          <span className={styles.branch}>⑂ {repos[0].branch.head}</span>
+          <span className={styles.branch}>
+            <Icon name="git-branch" size={0} />
+            <span className={styles.branchName}>{repos[0].branch.head}</span>
+          </span>
         )}
       </div>
 

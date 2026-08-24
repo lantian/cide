@@ -130,9 +130,7 @@ export function PasteConfirm({ ask, onAnswer, onCancel }: PasteConfirmProps) {
             <li className={styles.groupLabel}>Would be overwritten</li>
             {collision.sample.map((rel) => (
               <li key={rel} className={styles.row}>
-                <span className={styles.mark} aria-hidden="true">
-                  ●
-                </span>
+<span className={styles.mark} aria-hidden="true" />
                 <span className={styles.name}>{rel}</span>
               </li>
             ))}

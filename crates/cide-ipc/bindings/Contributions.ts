@@ -3,8 +3,9 @@ import type { ExtCommandDef } from "./ExtCommandDef";
 import type { LanguageDef } from "./LanguageDef";
 import type { LanguageServerDef } from "./LanguageServerDef";
 import type { PanelDef } from "./PanelDef";
+import type { SettingDef } from "./SettingDef";
 
 /**
  * Everything one extension declares.
  */
-export type Contributions = { languages: Array<LanguageDef>, languageServers: Array<LanguageServerDef>, panels: Array<PanelDef>, commands: Array<ExtCommandDef>, };
+export type Contributions = { languages: Array<LanguageDef>, languageServers: Array<LanguageServerDef>, panels: Array<PanelDef>, commands: Array<ExtCommandDef>, settings: Array<SettingDef>, };

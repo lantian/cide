@@ -1,17 +1,26 @@
 /**
- * The commit tool window's icon toolbar: `↻ ↺ ↻ ⤓ ◫ ◉ ⌃ ⌄`.
+ * The commit tool window's icon toolbar.
  *
- * The glyphs are the mock's literal characters — no icon font or SVG set is bundled to
- * substitute for them, exactly as in the activity rail. `↻` appears twice in the mock and
- * that is not a transcription slip: IDEA's toolbar carries both "refresh the changes view"
- * and "update the project from the remote", and they share a circular-arrow icon there
- * too. They are told apart by tooltip, which is why every button here has one and why the
- * tooltip is also the accessible name.
+ * It was the mock's eight literal characters — `↻ ↺ ↻ ⤓ ◫ ◉ ⌃ ⌄` — and this header used to say
+ * that no icon font or SVG set was bundled to substitute for them, "exactly as in the activity
+ * rail". The rail stopped being an argument for that the moment it drew paths instead, and this
+ * toolbar was the worst-off surface left behind: `◫` and `◉` resolve to whatever face fontconfig
+ * hands over, `⤓` frequently to nothing at all, and every one of them sat at a different optical
+ * weight from the one beside it.
  *
- * `◉` is the one stateful button: IDEA's "use Git staging area instead of changelists"
+ * **The duplicate `↻` is gone, and it was never really a design.** IDEA's toolbar does carry
+ * both "refresh the changes view" and "update the project from the remote" on a circular arrow,
+ * and this file faithfully copied that — but the reason two actions could share one mark here
+ * was that there was no set to draw a second mark from. There is now: refresh keeps
+ * `refresh-cw`, and update takes `arrow-down-to-line`, which is what it does. The tooltips stay,
+ * because they are still the accessible name.
+ *
+ * `circle-dot` is the one stateful button: IDEA's "use Git staging area instead of changelists"
  * mode (§1). It is a toggle, so it gets `aria-pressed` rather than a click handler that
  * silently flips something invisible.
  */
+import { Icon, type IconName } from '@/icons/Icon'
+
 import styles from './Toolbar.module.css'
 
 export interface ToolbarProps {
@@ -53,13 +62,13 @@ export interface ToolbarProps {
 export function Toolbar(props: ToolbarProps) {
   const { hasSelection } = props
   const items: {
-    glyph: string
+    icon: IconName
     label: string
     onClick: () => void
     disabled?: boolean
     pressed?: boolean
   }[] = [
-    { glyph: '↻', label: 'Refresh changes', onClick: props.onRefresh },
+    { icon: 'refresh-cw', label: 'Refresh changes', onClick: props.onRefresh },
     {
       /*
        * IDEA's ↺ is Rollback — discard the change entirely. This calls `git_unstage`
@@ -71,13 +80,13 @@ export function Toolbar(props: ToolbarProps) {
        * glyph to it before this panel has a confirmation dialog would make the most
        * destructive command in the surface the easiest one to hit by accident.
        */
-      glyph: '↺',
+      icon: 'undo-2',
       label: 'Unstage selected changes',
       onClick: props.onUnstage,
       disabled: !hasSelection,
     },
     {
-      glyph: '↻',
+      icon: 'arrow-down-to-line',
       label:
         props.onUpdate === undefined
           ? 'Update project — not available in this view'
@@ -92,7 +101,7 @@ export function Toolbar(props: ToolbarProps) {
        * every other route starts from right-clicking a changelist row. A feature reachable only
        * from something the user has to create first is not reachable.
        */
-      glyph: '＋',
+      icon: 'plus',
       label:
         props.onNewChangelist !== undefined
           ? 'New changelist'
@@ -103,25 +112,25 @@ export function Toolbar(props: ToolbarProps) {
       onClick: props.onNewChangelist ?? (() => {}),
       disabled: props.onNewChangelist === undefined,
     },
-    { glyph: '⤓', label: 'Shelve selected changes', onClick: props.onShelve, disabled: !hasSelection },
-    { glyph: '◫', label: 'Show diff', onClick: props.onShowDiff, disabled: !hasSelection },
+    { icon: 'archive', label: 'Shelve selected changes', onClick: props.onShelve, disabled: !hasSelection },
+    { icon: 'columns-2', label: 'Show diff', onClick: props.onShowDiff, disabled: !hasSelection },
     {
-      glyph: '◉',
+      icon: 'circle-dot',
       label: 'Use Git staging area instead of changelists',
       onClick: () => props.onStagingArea(!props.stagingArea),
       pressed: props.stagingArea,
     },
-    { glyph: '⌃', label: 'Collapse all', onClick: props.onCollapseAll },
-    { glyph: '⌄', label: 'Expand all', onClick: props.onExpandAll },
+    { icon: 'chevrons-down-up', label: 'Collapse all', onClick: props.onCollapseAll },
+    { icon: 'chevrons-up-down', label: 'Expand all', onClick: props.onExpandAll },
   ]
 
   return (
     <div className={styles.bar} role="toolbar" aria-label="Changes" data-audit="gitToolbar">
       {items.map((item, i) => (
         <button
-          // Index is part of the key on purpose: `↻` genuinely appears twice, so the glyph
-          // alone is not unique and React would warn about duplicate keys.
-          key={`${item.glyph}-${i}`}
+          // Index is kept in the key even though the marks are now distinct: it costs nothing,
+          // and a future toolbar that does repeat one would otherwise warn about duplicate keys.
+          key={`${item.icon}-${i}`}
           type="button"
           className={styles.button}
           title={item.label}
@@ -131,7 +140,7 @@ export function Toolbar(props: ToolbarProps) {
           disabled={item.disabled === true}
           onClick={item.onClick}
         >
-          <span aria-hidden="true">{item.glyph}</span>
+          <Icon name={item.icon} />
         </button>
       ))}
     </div>

@@ -32,6 +32,14 @@
  */
 import type { PanelView } from './viewModel'
 
+/**
+ * Every contributed setting's current value, keyed by the id its manifest gave it.
+ *
+ * `boolean | string | number` and nothing else — the four `SettingKind`s produce exactly these
+ * three, and a worker can read one without a type check because cide has already coerced it.
+ */
+export type SettingValues = Readonly<Record<string, boolean | string | number>>
+
 /** The capability strings, spelled as the manifest spells them. Mirrors `cide_ipc::ext::Capability`. */
 export type CapabilityName =
   | 'editor:read'
@@ -62,7 +70,27 @@ export type HostNote =
       readonly version: string
       readonly capabilities: readonly CapabilityName[]
       readonly panels: readonly { readonly id: string; readonly label: string }[]
+      /**
+       * Every setting this extension declared, at its current value.
+       *
+       * Complete and already coerced — the defaults with the user's changes layered on, each one
+       * through `SettingDef::coerce`. So a worker never has to know what its own defaults are, and
+       * never has to handle a value of the wrong type: a hand-edited `extensions.json` holding a
+       * string where a number was declared arrives here as the number.
+       *
+       * On `ready` rather than fetched, because a worker's *first* decision often depends on one
+       * and a request would mean drawing a panel before the answer arrived.
+       */
+      readonly settings: SettingValues
     }
+  /**
+   * A setting changed, from the Settings page or from another window.
+   *
+   * The **whole** set, not the one key that moved, on `cide://ext-changed`'s own argument: it is a
+   * handful of scalars, the sender has them in hand, and a worker that had to merge one key into a
+   * copy it was holding is a worker with two sources for one fact.
+   */
+  | { readonly kind: 'settings'; readonly settings: SettingValues }
   /** The active editor changed, or its text did. Only with `editor:read`. */
   | {
       readonly kind: 'editor'

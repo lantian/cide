@@ -90,6 +90,22 @@ impl DiagnosticsRegistry {
         self.projects.get(&project).map(|entry| entry.clone())
     }
 
+    /// Bring every open project's servers into line with the registry. (M22)
+    ///
+    /// Called when the enabled extension set changes — see `ext_state::publish`. Every project,
+    /// because an extension is global: it is not installed *for* a project, so a set that changed
+    /// while three are open has changed for all three.
+    pub fn sync_all(&self, app: &tauri::AppHandle) {
+        // Collected before iterating, and not held across the calls: `sync` spawns on another
+        // thread and can take milliseconds, and a `DashMap` iterator held over that blocks every
+        // `ensure` and `close` behind it.
+        let projects: Vec<Arc<ProjectDiagnostics>> =
+            self.projects.iter().map(|entry| entry.clone()).collect();
+        for project in projects {
+            project.sync(app);
+        }
+    }
+
     /// Start whatever servers this project has work for, or record why not.
     ///
     /// Idempotent: a second call for a project that already has an entry returns it. Called from
@@ -220,46 +236,11 @@ impl ProjectDiagnostics {
 
         // Every server in the registry, not the two builtins by name. (M22)
         //
-        // This one line is what makes a contributed language server actually run: the registry is
-        // installed from `ExtStore`'s resolved set before the first window exists, so by the time
-        // a project opens it holds rust-analyzer, gopls and whatever the enabled extensions
-        // declared. `discover::find` still refuses each of them independently — a missing binary,
-        // or a project with no marker for it — so a manifest naming a server nobody has installed
-        // costs a row in the Problems panel and nothing else.
-        for server in cide_lsp::discover::servers() {
-            // On the spawn thread, not here — see the module docs. `on_spawn_thread` blocks, and
-            // a discovery probe plus a `fork` is single-digit milliseconds.
-            let roots_for_server = roots.clone();
-            let started = cide_core::child_env::on_spawn_thread(move || {
-                LspHandle::start(server, roots_for_server)
-            });
-            match started {
-                Ok(handle) => {
-                    // Deliberately *not* `Ready`: nothing has answered yet. `Session::new` emits
-                    // its own `Scanning` the moment it writes `initialize`, and this is only what
-                    // the store says in the gap before that arrives.
-                    store.lock().set_status(
-                        server.source(),
-                        SourceStatus::Scanning {
-                            detail: format!("starting {}", server.binary()),
-                        },
-                    );
-                    handles.lock().push(handle);
-                }
-                Err(error) => {
-                    // Not an error the user has to act on unless they wanted that language: "no
-                    // Cargo project under this project's roots" is the ordinary answer for a Go
-                    // repository. The sentence is carried either way, and the panel decides how
-                    // loudly to say it.
-                    store.lock().set_status(
-                        server.source(),
-                        SourceStatus::Unavailable {
-                            reason: error.to_string(),
-                        },
-                    );
-                }
-            }
-        }
+        // The registry is installed from `ExtStore`'s resolved set before the first window exists,
+        // so by the time a project opens it holds rust-analyzer, gopls and whatever the enabled
+        // extensions declared. `sync_servers` is the same walk, and it runs again whenever that
+        // set changes — see its own note for why an already-open project must not be left behind.
+        sync_servers(&store, &handles, &roots);
 
         let kick = Arc::new(Kick::default());
         let pump = std::thread::Builder::new()
@@ -1048,6 +1029,33 @@ impl ProjectDiagnostics {
     }
 
     /// Restart one source after it gave up.
+    /// Start any newly contributed server, and drop any that is no longer contributed. (M22)
+    ///
+    /// # Why this exists
+    ///
+    /// Without it, installing an extension that contributes a language server did nothing until
+    /// the project was reopened — the servers were chosen once, when `ProjectDiagnostics` was
+    /// created. That is not a limitation a user can see and work around; it is the feature
+    /// appearing to be broken. `sqls` reported nothing, had no row in the Problems footer, and
+    /// therefore had no Restart button either, which is three symptoms of one cause.
+    ///
+    /// # What it deliberately does not do
+    ///
+    /// It does not restart anything that is already running. A server keeps its handle if it is
+    /// still contributed, so enabling a YAML extension does not cost a rust-analyzer re-index —
+    /// which on a large workspace is minutes and several gigabytes, and was the objection to the
+    /// simpler "stop everything and start again".
+    ///
+    /// Safe to call with sessions live because `cide_lsp::discover`'s table is append-only: a
+    /// `Server` a running session holds still resolves to the row it was minted for.
+    pub fn sync(&self, app: &tauri::AppHandle) {
+        let before = self.handles.lock().len();
+        sync_servers(&self.store, &self.handles, &self.roots);
+        if self.handles.lock().len() != before {
+            crate::emit::diagnostics(app, self.project);
+        }
+    }
+
     /// Fold findings from something that is not a language server into this project's store. (M22)
     ///
     /// The road an extension's diagnostics take. Deliberately the *same* store the servers publish
@@ -1263,6 +1271,73 @@ fn preview(source: &str, column: u32, end_column: u32) -> (String, u32, u32) {
 const PREVIEW_BYTES: usize = 512;
 
 /// Which server owns a path, by extension.
+/// Bring a project's running servers into line with the registry.
+///
+/// Additive and subtractive, never a restart: a server already running is left exactly alone, one
+/// that is newly contributed is started, and one that has stopped being contributed has its handle
+/// dropped — whose `Drop` runs the shutdown ladder — and its findings cleared, because a source
+/// that is no longer running must not leave a stale list behind under a row that says nothing is
+/// wrong.
+fn sync_servers(
+    store: &Arc<Mutex<DiagnosticStore>>,
+    handles: &Arc<Mutex<Vec<LspHandle>>>,
+    roots: &[PathBuf],
+) {
+    let wanted = cide_lsp::discover::servers();
+
+    // Gone first, so a server whose extension was just disabled has released its child before a
+    // replacement for the same binary is spawned.
+    let dropped: Vec<Server> = {
+        let mut held = handles.lock();
+        let (keep, gone): (Vec<LspHandle>, Vec<LspHandle>) = std::mem::take(&mut *held)
+            .into_iter()
+            .partition(|handle| wanted.contains(&handle.server()));
+        *held = keep;
+        gone.iter().map(LspHandle::server).collect()
+    };
+    for server in dropped {
+        store.lock().clear_source(server.source());
+    }
+
+    let running: Vec<Server> = handles.lock().iter().map(LspHandle::server).collect();
+    for server in wanted {
+        if running.contains(&server) {
+            continue;
+        }
+        // On the spawn thread, not here — see the module docs. `on_spawn_thread` blocks, and a
+        // discovery probe plus a `fork` is single-digit milliseconds.
+        let roots_for_server = roots.to_vec();
+        let started = cide_core::child_env::on_spawn_thread(move || {
+            LspHandle::start(server, roots_for_server)
+        });
+        match started {
+            Ok(handle) => {
+                // Deliberately *not* `Ready`: nothing has answered yet. `Session::new` emits its
+                // own `Scanning` the moment it writes `initialize`, and this is only what the
+                // store says in the gap before that arrives.
+                store.lock().set_status(
+                    server.source(),
+                    SourceStatus::Scanning {
+                        detail: format!("starting {}", server.binary()),
+                    },
+                );
+                handles.lock().push(handle);
+            }
+            Err(error) => {
+                // Not an error the user has to act on unless they wanted that language: "no Cargo
+                // project under this project's roots" is the ordinary answer for a Go repository.
+                // The sentence is carried either way, and the panel decides how loudly to say it.
+                store.lock().set_status(
+                    server.source(),
+                    SourceStatus::Unavailable {
+                        reason: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// # Why this no longer goes through `cide_lang::Lang`
 ///
 /// It used to, and that one line was the coupling M22 existed to break: `Lang` is a closed enum

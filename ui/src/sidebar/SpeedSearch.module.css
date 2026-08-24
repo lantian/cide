@@ -27,11 +27,11 @@
   max-width: calc(100% - 12px);
   padding: 3px 8px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-3);
   background: var(--panel-2);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   /* A readout, never a target: a click that landed here instead of on the row underneath would
      move the caret out of the tree and end the search the click was aimed at. */
   pointer-events: none;

@@ -61,11 +61,11 @@
   height: calc(20px * var(--ui-scale));
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--panel);
   color: var(--text);
   font-family: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -93,6 +93,6 @@
 }
 
 .action:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }

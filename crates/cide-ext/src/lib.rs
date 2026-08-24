@@ -335,6 +335,10 @@ impl ExtStore {
                     version,
                     commit,
                     enabled: true,
+                    // Empty: every setting reads as its default until the user changes one. An
+                    // install that wrote today's defaults would pin them for ever — see
+                    // `config::Installed::settings`.
+                    settings: Default::default(),
                     granted,
                 });
             }
@@ -356,6 +360,65 @@ impl ExtStore {
             Ok(())
         })?;
         let _ = install::uninstall(&install_path(&id.marketplace, &id.extension));
+        Ok(snapshot)
+    }
+
+    /// Change one of an extension's settings.
+    ///
+    /// The value is **coerced against the declared kind before it is stored** — clamped to a
+    /// number's band, refused if it names a choice that does not exist, defaulted if it is the
+    /// wrong type outright. That is the same call `scan` makes when reading, so the spin control,
+    /// a hand-edited `extensions.json` and an update that narrowed a range all get one answer.
+    /// A clamp that lived only in the Settings page would be one `invoke` away from being
+    /// bypassed, which is the argument `cide_ipc::settings`' own clamps already make.
+    ///
+    /// A value equal to the default **removes** the key rather than storing it. Storing it would
+    /// pin the user to today's default for ever, having never chosen it — see
+    /// [`config::Installed::settings`].
+    pub fn set_setting(
+        &self,
+        id: &ExtensionRef,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<ExtensionSnapshot> {
+        // The definition, read before the lock the write takes: `scan`'s snapshot is what knows
+        // what an extension declares, and a caller may name a setting that no longer exists.
+        let def = {
+            let inner = self.inner.lock();
+            inner
+                .snapshot
+                .extensions
+                .iter()
+                .find(|e| e.id == *id)
+                .and_then(|e| {
+                    e.contributes
+                        .settings
+                        .iter()
+                        .find(|def| def.id == key)
+                        .cloned()
+                })
+        };
+        let Some(def) = def else {
+            return Err(ExtError::Refused(format!(
+                "`{id}` has no setting called `{key}`."
+            )));
+        };
+        let coerced = def.coerce(Some(&value));
+        let is_default = coerced == def.coerce(None);
+
+        let (_, snapshot) = self.update(|config| {
+            let row = config
+                .installed
+                .iter_mut()
+                .find(|i| i.marketplace == id.marketplace && i.extension == id.extension)
+                .ok_or_else(|| ExtError::NoExtension(id.extension.clone()))?;
+            if is_default {
+                row.settings.remove(key);
+            } else {
+                row.settings.insert(key.to_string(), coerced);
+            }
+            Ok(())
+        })?;
         Ok(snapshot)
     }
 
@@ -541,6 +604,16 @@ fn scan(config: &ExtConfig) -> Scan {
                     problems.push(error(&path.join(manifest::EXT_FILE), None, message.clone()));
                     unavailable.get_or_insert(message);
                 }
+                // Resolved here and nowhere else: the defaults with the user's changes layered
+                // on, every one through `SettingDef::coerce`. A reader — the Settings page, a
+                // worker — never has to know what a default is or what a stored value of the
+                // wrong type means.
+                let settings = read
+                    .contributes
+                    .settings
+                    .iter()
+                    .map(|def| (def.id.clone(), def.coerce(row.settings.get(&def.id))))
+                    .collect();
                 out.extensions.push(InstalledExtension {
                     id,
                     name: read.name,
@@ -550,6 +623,7 @@ fn scan(config: &ExtConfig) -> Scan {
                     commit: row.commit.clone(),
                     capabilities: granted,
                     contributes: read.contributes,
+                    settings,
                     // Resolved through the same jail `cide-ext://` uses, so a `main` that leaves
                     // the installed directory is `None` — a declarative extension — rather than a
                     // URL the protocol handler would refuse at load time with nothing on screen
@@ -576,6 +650,9 @@ fn scan(config: &ExtConfig) -> Scan {
                     commit: row.commit.clone(),
                     capabilities: row.granted_caps(),
                     contributes: Default::default(),
+                    // Nothing declares them, so nothing resolves. The stored values survive in
+                    // `extensions.json` and come back if the extension is installed again.
+                    settings: Default::default(),
                     main: None,
                     path,
                     unavailable: Some(format!(

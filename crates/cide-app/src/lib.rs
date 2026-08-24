@@ -558,6 +558,7 @@ pub fn run() {
             cmd::ext::ext_install,
             cmd::ext::ext_uninstall,
             cmd::ext::ext_set_enabled,
+            cmd::ext::ext_set_setting,
             cmd::ext::ext_publish_diagnostics,
             cmd::ext::ext_page,
             cmd::ext::tab_open_extension,

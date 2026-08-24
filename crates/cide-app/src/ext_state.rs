@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 use cide_ext::ExtStore;
 use cide_ipc::ext::ExtensionSnapshot;
 use cide_ipc::lang::LanguageDef;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 /// The resolved language table, for callers with no `State` in reach.
 ///
@@ -117,12 +117,24 @@ impl ExtState {
     }
 }
 
-/// Publish a new snapshot: mirror it, and tell every window.
+/// Publish a new snapshot: mirror it, bring every project's servers into line, and tell every
+/// window.
 ///
-/// The one place both happen, so a command cannot do half of it. `cide://ext-changed` carries the
-/// whole snapshot **and** its `rev` — see `emit.rs`, where the choice between carrying one and not
-/// is argued for this event specifically.
+/// The one place all three happen, so a command cannot do part of it.
+///
+/// The middle step is the one that was missing and it is worth naming: without it, installing an
+/// extension that contributes a language server did **nothing** until the project was reopened,
+/// because the servers were chosen once when `ProjectDiagnostics` was created. `sqls` then had no
+/// row in the Problems footer, published no findings, and offered no Restart — three symptoms of
+/// one cause, and none of them anything a user could work out. `ProjectDiagnostics::sync` is
+/// additive: a server already running is left alone, so this costs no re-index.
+///
+/// `cide://ext-changed` carries the whole snapshot **and** its `rev` — see `emit.rs`, where the
+/// choice between carrying one and not is argued for this event specifically.
 pub fn publish(app: &AppHandle, snapshot: &ExtensionSnapshot) {
     install(snapshot);
+    if let Some(diagnostics) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
+        diagnostics.sync_all(app);
+    }
     crate::emit::ext_changed(app, snapshot);
 }

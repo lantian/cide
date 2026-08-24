@@ -17,6 +17,8 @@
  */
 import { useState } from 'react'
 
+import { Icon } from '@/icons/Icon'
+
 import styles from './ExtensionsPanel.module.css'
 import {
   CAPABILITY_PROSE,
@@ -87,7 +89,7 @@ export function ExtensionsPanelView(props: ExtensionsPanelViewProps): React.JSX.
               for (const group of model.groups) onRefresh(group.id)
             }}
           >
-            ⟳
+            <Icon name="refresh-cw" size={1} />
           </button>
         )}
         {onConnect !== undefined && (
@@ -133,7 +135,7 @@ export function ExtensionsPanelView(props: ExtensionsPanelViewProps): React.JSX.
         <>
           <div className={styles.search}>
             <span className={styles.searchIcon} aria-hidden="true">
-              ⌕
+              <Icon name="search" size={1} />
             </span>
             <input
               className={`${styles.input} ${styles.searchInput}`}

@@ -50,10 +50,20 @@ export function refreshDiagnostics(project: ProjectId): void {
  * await, because a rust-analyzer restart on a large workspace is minutes of re-indexing and the
  * panel's own row will sit at `Starting…` for all of it.
  */
-export function restartDiagnosticSource(project: ProjectId, source: DiagnosticSourceId): void {
+export function restartDiagnosticSource(
+  project: ProjectId,
+  source: DiagnosticSourceId,
+  label?: string,
+): void {
+  // The row's own label, which came from Rust with the report. It used to be a ternary special-
+  // casing `rustAnalyzer`, which was the whole set of ids whose id and label differ — until an
+  // extension could contribute a server, and a notice reading "Restarting sqls" happened to be
+  // right while "Restarting rustAnalyzer" would have come back the moment anything else needed a
+  // display name. Passing the label removes the guess.
+  //
   // `ok`, and the wait is a `hint`: the restart is a gesture that worked, and the minutes of
   // re-indexing behind it are the thing the user has to know rather than the outcome itself.
-  notify(`Restarting ${source === 'rustAnalyzer' ? 'rust-analyzer' : source}.`, {
+  notify(`Restarting ${label ?? source}.`, {
     kind: 'ok',
     hint: 'It re-indexes from scratch, which can take a while.',
   })
@@ -61,13 +71,21 @@ export function restartDiagnosticSource(project: ProjectId, source: DiagnosticSo
 }
 
 /**
- * Is this string one of the source ids `restart` accepts?
+ * Is this string a source id `restart` can act on?
  *
- * The panel's `SourceRow.id` is a plain `string` — `model.ts` cannot import the wire enum, because
- * it imports nothing — so the narrowing happens here, at the one place the two meet. A membership
- * test and not a cast: the value originates in another process, and a cast would be a promise
- * about it that nothing checks.
+ * # Why this stopped being a membership test
+ *
+ * It was `=== 'rustAnalyzer' || === 'gopls' || …`, which was a complete list right up until an
+ * extension could contribute a language server. `sqls` then reported findings into the panel, the
+ * footer drew no Restart for it, and — the half that would have survived fixing only the footer —
+ * this guard would have swallowed the click in silence. A closed list on an open set fails by
+ * doing nothing, which is the failure mode with no symptom.
+ *
+ * `DiagnosticSourceId` is a `string` on the wire now (`cide_ipc::diagnostics` says why at length),
+ * so there is no enum left to narrow to and the honest test is the one property the id must have:
+ * it is not empty. The *set* is guarded where it can be — `sourceRows` decides which rows offer a
+ * Restart at all, and Rust refuses an id that names no running server.
  */
 export function isDiagnosticSourceId(value: string): value is DiagnosticSourceId {
-  return value === 'rustAnalyzer' || value === 'gopls' || value === 'treeSitter' || value === 'claude'
+  return value !== ''
 }

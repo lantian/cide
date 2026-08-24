@@ -15,7 +15,8 @@ been checked.
 
 **Status: M0, M1, M3 and M4 complete; M5 code complete, its audit unrun.** The workspace
 builds and runs, real `claude` processes render in xterm panes, the domain core owns the
-workspace tree, the shell chrome matches the design mock to within a pixel in both themes,
+workspace tree, the shell chrome matches the dimensions `chrome/layoutAudit.ts` records in
+both themes,
 and the pinned Claude tab tiles into a recursive split tree whose panes hold live sessions.
 Panes detach into their own windows, quitting saves the workspace, and relaunching resumes
 each project's primary conversation. Four automated gates guard the seams: the IPC transport
@@ -4139,6 +4140,60 @@ them would have made it a tool with a demo in it. It is also the honest place to
 mistakes worth warning about: doing work while your panel is hidden, and assuming a request
 succeeded.
 
+### `sqls` reports no problems, and that is not a configuration mistake
+
+Driven by hand over stdio, `sqls` advertises no `diagnosticProvider` and sends no
+`publishDiagnostics` at all — not for a syntax error, not for anything. It is a completion, hover
+and go-to-definition server. cide was faithfully showing nothing because there was nothing.
+
+That is a bad outcome even though it is correct: a `.sql` file with an unterminated string showed
+a clean Problems panel, which is a *claim* rather than a silence, and it is the same failure the
+panel's `null`-versus-`0` discipline exists to prevent one level up.
+
+So the SQL extension reports four findings of its own — an unterminated string, block comment,
+dollar-quoted body or bracket, each on the line that opened it. They cost nothing: the statement
+splitter already tracks all four, because it has to in order to avoid cutting a statement in half.
+Every dialect agrees they are errors, so there are no false positives, and anything beyond them
+needs a parser and a dialect, which is the line that extension has already decided not to cross.
+
+**A contributed server now starts in an already-open project.** It did not, and that was three
+symptoms of one cause: `sqls` had no row in the Problems footer, published nothing, and therefore
+offered no Restart either. `ProjectDiagnostics::sync` is additive — a server already running keeps
+its handle — so enabling a YAML extension costs no rust-analyzer re-index, which was the objection
+to the simpler "stop everything and start again".
+
+The Restart button had a second bug behind that one, and it would have survived fixing the first:
+`RESTARTABLE` in `ProblemsPanel/model.ts` was `['rustAnalyzer', 'gopls']`, a complete list right up
+until an extension could contribute a server — and `isDiagnosticSourceId` was a matching closed
+list that would have swallowed the click in silence. Both are rules now. A closed list over an
+open set fails by doing nothing, which is the failure mode with no symptom.
+
+### An extension may contribute settings, and they go in Settings
+
+`contributes.settings` is a list of `{ id, label, description, kind }`, and `SettingKind` is four
+members — `toggle`, `text`, `number` with an optional band, and `choice`. They appear under
+**Settings ▸ Extensions**, drawn with cide's own `controls.tsx` rows: the same bargain a
+contributed *panel* makes by being a view model, and it buys the same three things — correct in
+both palettes, covered by `check:ui-scale`, and an extension cannot ship CSS. The cost is the same
+too, and stated: an extension cannot have a setting cide has no control for.
+
+**The worker reads a value with no fallback and no type check.** cide sends the complete, coerced
+set — the defaults with the user's changes layered on, each one the declared type, a number already
+clamped to its band and a choice already known to be in its list. A hand-edited `extensions.json`
+holding `"rows": "lots"` arrives as the default and one holding `9000` arrives as the maximum,
+because `SettingDef::coerce` is the single place a value is decided and every road goes through it
+— the control, the hand edit, and an update that narrowed a range. Values arrive on `ready` and
+again as a `settings` note, always the whole set, so there is nothing to merge.
+
+Only the **differences** from the defaults are stored. Writing the whole resolved set would pin
+every existing user to the defaults that were current when they installed, having never chosen
+them — so an author who improves one in an update reaches everybody who left it alone.
+
+Adding the section found a hole worth recording: `renderSection` is a `switch` returning
+`ReactNode`, `undefined` is a valid `ReactNode`, and a `SettingsSection` variant with no `case`
+therefore compiled and opened a **blank page** with no error anywhere. It has a `never` guard now,
+the same one `chrome/TabStrip.tsx` puts on `TabKind`.
+
 ### Trust is a list the user was shown, not a list the manifest asked for
 
 `extensions.json` records `granted` — the capabilities the install sheet displayed — and an
@@ -4159,7 +4214,7 @@ it has one, a line.
 
 ### Not done
 
-- **Two bugs found the first time it ran in a real window, and both are fixed.** A worker's script
+- **Four bugs found the first time it ran in a real window, and all four are fixed.** A worker's script
   URL must be **same-origin** — no header relaxes that, and it is the rule that makes `new Worker`
   different from `importScripts` — so `new Worker('cide-ext://…')` from a `tauri://localhost` page
   was refused at construction. Workers are now built from a same-origin `blob:` shim whose only
@@ -4170,15 +4225,24 @@ it has one, a line.
   a worker started *after* a file was open was never told about it, so its panel sat on "open a
   .yaml file" over a `.yaml` file until somebody typed — which is what enabling an extension looks
   like. A new worker is now seeded with the active editor.
+
+  The fourth was the worst, because everything about it looked fine. `Capability` carried
+  `rename_all = "camelCase"`, so the **wire** said `editorRead` while `Capability::as_str` — what
+  a manifest is parsed against — said `editor:read`. The frontend compared against the manifest
+  spelling, so `capabilities.has('editor:read')` was false for every extension ever installed: no
+  worker was ever told about an open file and **every host request was refused**. Both panels sat
+  on "open a .sql file" over an open `.sql` file. There is one spelling now — serde is told to use
+  `as_str`'s — and the check that should have caught it was comparing the frontend's list against
+  `as_str`'s table, which is both sides of a two-sided agreement and neither of them the wire. It
+  compares against `generated.ts` now.
 - **None of it has been confirmed on screen.** Every gate below passes and the whole install road
   is exercised end to end by `cargo test -p cide-ext` against the real sibling marketplace — but
   that test drives `ExtStore`, not a window. Nobody has yet watched a worker start, a rail button
   appear, or a `.sql` file change colour. Same reason as M14, M15 and M16: `./run.sh` stops the
   running instance.
-- **`sqls` and `yaml-language-server` have not been run.** The manifests name them, the registry
-  starts them, and `discover::find` refuses each independently — but neither binary is installed
-  on this machine, so what has been checked is that they are *registered with the right arguments*
-  and not that either one answers.
+- **`yaml-language-server` has not been run** — it is not installed on this machine, so what has
+  been checked is that it is registered with the right arguments (`--stdio`) and not that it
+  answers. `sqls` **has** been run, by hand, and the finding is in the section above.
 - **Enabling a language extension does not recolour an open editor.** The fold table has to be
   present at first paint (`foldSpecFor` runs inside the mount dispatch and cannot await), so the
   language registry rides `Bootstrap`. A panel appears immediately; a buffer follows on its next
@@ -4186,12 +4250,6 @@ it has one, a line.
 - **There is no update-all, and no version constraint.** An extension declares a `version` string
   that is compared for equality. A marketplace that ships a breaking change to a cide that cannot
   run it is caught by `schema`, and nothing finer exists.
-- **Enabling an extension does not start its language server in an already-open project.** The
-  registry is updated immediately and a project picks up the new set when its
-  `ProjectDiagnostics` is next created — so a newly installed server reaches a project that is
-  reopened, and not one that is already open. The alternative was stopping every server on every
-  registry change, which costs a full rust-analyzer re-index — 2–8 GB and thirty seconds — because
-  somebody toggled a YAML extension.
 - **A worker cannot `fetch`.** `connect-src` deliberately omits `cide-ext:`, so an extension that
   needs data ships it as a module it imports. That is a real limit and it is the conservative
   direction to have picked first.
@@ -5168,6 +5226,78 @@ while mounted, and that no terminal lost its element. A failure names the cycle 
 Current result: `PASS — 103 panes, no terminal re-opened beyond its eviction allowance, no
 host destroyed while mounted`.
 
+## The look and feel (M23), and what is not verified
+
+The report was "look and feel is bad — font style, font size, icons, across all components", with
+UX explicitly out of scope. The diagnosis was not an absent design system: `tokens.css` is 649
+lines of argued custom properties with documented AA ratios per token. It was that the system had
+been transcribed from a mock that was small, sharp-cornered and motionless — plus one area that
+was genuinely broken.
+
+**Icons were the broken one.** There were three unrelated systems: 190 vendored Material file
+icons drawn as `<img>`; **three** hand-written inline SVGs on three different grids, whose strokes
+rendered at 1.67px, 1.08px and 1.0px; and **about a hundred and thirty Unicode characters** across
+forty files. `⑂` (U+2442) shipped in the branch indicator despite a note two files away recording
+that no UI font carries it; `↻` meant two different actions in one git toolbar; `×` and `✕` both
+meant close inside `PaneTitleBar.tsx`. `chrome/ActivityRail.tsx` had already measured why this can
+never be tuned away — a glyph's ink is a property of whichever face fontconfig picked, and seven
+rail glyphs spanned 0.53em to 0.82em — and had fixed it for the rail alone, stating "this
+application bundles no UI icon set" as policy. That policy is reversed here, in the three comments
+that carried it.
+
+The set is **Lucide, ISC, vendored as data** by `ui/scripts/vendor-ui-icons.mjs` at a pinned
+revision, mirroring `vendor-icons.mjs`. No runtime dependency: it emits `src/icons/iconPaths.ts`,
+one 24×24 path `d` per mark. Lucide's envelope is already what `RailIcon` drew, attribute for
+attribute, so the rail did not move.
+
+**Every icon is flattened to a single `d`, and that is the load-bearing decision.** An extension
+contributes a rail icon as one path string validated by `cide_ext::manifest::is_svg_path`; if the
+built-in set were element lists, `<Icon>` would need two render paths and the one exercised only
+by untrusted input would be the least-tested. The vendor script asserts upstream's envelope on
+every file and refuses any icon with a filled child. The conversion was verified rather than
+assumed: **all 71 flattened marks were rasterised at 192×192 and compared pixel-for-pixel against
+upstream's own multi-element SVG.** One bug was caught that way — Lucide paths often open with a
+relative `m`, which SVG treats as absolute only while it is the first command in its own `d`;
+concatenated after another subpath it silently displaces the mark, and `arrow-down` came out with
+its head 12px off.
+
+The rest of the sweep, in one commit:
+
+- **The type ladder collapsed from fourteen rungs to six** (see the section below).
+- **Radius**: 186 declarations across twelve ad-hoc values → five rungs. The 3/4/5px trio that
+  produced the sharp, unresolved look became 4/6/8, with 12px for modals and menus. `50%` stayed
+  literal: eight real circles, and "half of whatever this box is" is not a length.
+- **Spacing**: an eleven-value set with no rhythm → a seven-rung scale, unscaled, because
+  `--ui-scale` moves text and the boxes around text and not gutters.
+- **Elevation**: one `--shadow` read by fifteen rules — a drag ghost and a modal lifting off the
+  page by the same amount — became three heights.
+- **Motion**: the app had **six** transitions in sixty-two stylesheets. It has eighty-odd, all
+  reading `--dur-1`/`--dur-2` so one media query answers `prefers-reduced-motion` for all of them.
+- **Focus**: 64 rules spelling `outline: 1px solid var(--accent)` became two tokens — an outward
+  2px ring, and an inset `box-shadow` for the strips that `overflow: hidden` would clip.
+- **The six identical sidebar panel headers** — 10.5px UPPERCASE at 0.09em — became 12px sentence
+  case, along with nineteen more sites of the same idiom.
+- **`CommitBox`'s 104px textarea** stopped being permanently accent-outlined; the accent moved to
+  `:focus`.
+
+**Two new gates**, because nothing in the repository watched either family. `check:ui-icons`
+asserts the set is exactly what the app draws, that every mark is a legal extension icon, that
+each size preset's rendered stroke lands in 1.4–1.8px, and that no Unicode symbol is still being
+drawn outside a per-file allowlist with a stated reason — implemented over the TypeScript AST so
+that the hundreds of comments quoting the old glyphs are invisible to it. `check:motion` bans
+`transition: all`, bans every non-paint property, fences off the four files where a transition
+would break the splitter drag or `repaintHost`'s 1px nudge, and requires exactly one
+`prefers-reduced-motion` block.
+
+**What is not verified.** Every gate passes, including the full `check:*` suite, `tsc`, the Rust
+workspace and a production build. **`./run.sh --audit-chrome` and `--audit-panes` have not been
+re-run** — both need a display this environment does not have. The audit's 48 expectations were
+re-derived from the stylesheets they measure rather than from a run, so the first person with a
+screen should run both and record the result. Colour and mark fidelity still want a human eye, and
+so does the one deliberate density change nothing can check: the tab strip, git toolbar, git log
+rows and git segmented control all grew, and whether that reads as comfortable or as loose is not
+a thing a script can answer.
+
 ## The chrome font size (M19)
 
 The app had two font-size settings and both were for code — the editor's buffer and the
@@ -5181,18 +5311,17 @@ the log, the tabs and the menus could only be built by rewriting all 405 onto on
 band **9–20**, half-pixel steps) and everything else is derived from one unitless multiplier,
 `--ui-scale`, written on `<html>`.
 
-**Why a multiplier and not a size.** There is no single chrome size in the design. The mock
-draws at fourteen sizes between 8px and 20px and the *ratios* between them are the design — a
-tab's 12.5px label over its 10.5px path is a hierarchy, and the chrome audit below measures four
-of those numbers directly. One multiplier moves all fourteen and keeps every ratio. `tokens.css`
-carries the ladder, each rung `calc(<design>px * var(--ui-scale))`, and the number in the token's
-name is the design size rather than the painted one.
+**Why a multiplier and not a size.** There is no single chrome size in the design. The *ratios*
+between the sizes are the design — a tab's label over its path is a hierarchy, and the chrome
+audit below measures several of those numbers directly. One multiplier moves them all and keeps
+every ratio. `tokens.css` carries the ladder, each rung `calc(<design>px * var(--ui-scale))`, and
+the number in the token's name is the design size rather than the painted one.
 
 **What scales and what does not.** Text, and the boxes drawn around text: row heights, the
 header, tab strip, status bar, pane title and find bar tokens, and pixel line-heights. Not
-icons — `--h-rail` and the 28px and 16px icon boxes stay put, because an SVG does not grow with
-a type scale. Not borders. Not the sidebar widths or the tool window height, which are dragged
-by the user and persisted, and would fight the saved value.
+icons — `--h-rail` and the `--icon-*` boxes stay put, because an SVG does not grow with a type
+scale. Not borders. Not the sidebar widths or the tool window height, which are dragged by the
+user and persisted, and would fight the saved value.
 
 **The three things that CSS could not reach**, each of which would have been a silent half-fix:
 
@@ -5224,6 +5353,21 @@ read design numbers straight out of the stylesheets), that the ladder and its re
 same set in both directions, and that the four copies of the base size — Rust, `fontScale.ts`,
 `tokens.css`, `theme-boot.js` — agree. They are four because none can import another.
 
+**The ladder was fourteen rungs and is now six (M23).** It ran from 8px to 20px in half-pixel
+steps, transcribed from the mock, and this section used to argue that all fourteen were the
+design. Two things retired that argument. The mock is gone — it was never in this repository, and
+`chrome/layoutAudit.ts` held the only surviving copy — so "the mock draws fourteen sizes" stopped
+being a reason for anything. And fourteen sizes is not a hierarchy: 76 declarations sat at 10.5px
+and 135 at or below it, adjacent surfaces differed by half a pixel, and no reader perceives that
+as rank. The six are 11 (micro), 12 (secondary), 13 (body), 14 (emphasis), 16 (section) and 20
+(display).
+
+One mapping in that collapse was **forced rather than chosen** and must not be "simplified" back:
+the old 11.5 went to 12 and the old 12.5 to 13, keeping them one rung apart, because
+`check-theme.mjs` asserts a usage-file heading is strictly larger than the source lines under it.
+Sending both to 12 fails that gate, and its failure message is the user's own words from when it
+last shipped that way — *"it doesn't see where is filename and where is code"*.
+
 **The editor and the terminal are untouched.** `--fs-code`, `--lh-code`, `--fs-term` and
 `--term-line-height` ship as flat literals with no `--ui-scale` term, and `.cm-scroller` reads
 only `--fs-code`. Two declarations moved the other way while the sweep was in the file: the
@@ -5238,9 +5382,9 @@ for. The chrome audit below has not been re-run to a clean result since the swee
 
 ## The chrome audit
 
-M3's stated acceptance criterion is a screenshot diff against the design mock at 1440x900 in
-both themes. Neither side of that diff is obtainable here — the mock is a template needing a
-runtime this repo does not have, and KDE Wayland will not raise a shell-launched window for a
+M3's stated acceptance criterion was a screenshot diff against the design mock at 1440x900 in
+both themes. Neither side of that diff was ever obtainable here — the mock is a template needing
+a runtime this repo does not have, and KDE Wayland will not raise a shell-launched window for a
 capture tool. What survives is the geometry, so the check became data:
 
 ```
@@ -5249,14 +5393,23 @@ CIDE_AUDIT=1 ./target/debug/cide
 
 It resizes to a viewport of exactly 1440x900 (correcting for the compositor's invisible
 window border, which is 52px on this desktop), renders a fixture covering every chrome state
-a live app would not show on its own, and measures 48 dimensions against the mock's stated
-values in each theme. An element that is missing reports as a **failure**, not a skip — a
-check that silently disappears is indistinguishable from one that passes.
+a live app would not show on its own, and measures 48 dimensions in each theme. An element that
+is missing reports as a **failure**, not a skip — a check that silently disappears is
+indistinguishable from one that passes.
 
-Current result: `PASS — 48 dimensions within ±2px of the mock` in both dark and light, every
-delta exactly zero, with both self-hosted fonts confirmed loaded.
+**Those 48 numbers are no longer the mock's, and as of M23 they are not a transcription of
+anything.** The mock was never in this repository; `chrome/layoutAudit.ts` was the only
+surviving copy of it, and the redesign redrew about twenty of its rows deliberately — the chrome
+it specified was small, sharp-cornered and motionless. Every changed row was edited even where
+the ±2px tolerance would have hidden the change, which is roughly half of them: a stale
+`expected` turns the file from a specification into a rubber stamp, and it is the only tool in
+the repository that can see these numbers at all.
 
-The half that is not automated is colour and glyph fidelity, which still wants a human eye.
+Current result at the time of writing: **not re-run since M23.** The gates below all pass, the
+values in the table were derived from the stylesheets they measure, and the audit needs a
+display this environment does not have. Run `./run.sh --audit-chrome` and record what it says.
+
+The half that is not automated is colour and mark fidelity, which still wants a human eye.
 
 ## Layout
 

@@ -12,5 +12,22 @@
  * tries — the rule `cide_agents::dispatch_refusal` follows for `bypassPermissions`, and for its
  * reason: refusing at load makes the row *vanish*, and a user cannot grant a permission to
  * something they cannot see.
+ *
+ * # One spelling, and it is the manifest's
+ *
+ * Every variant carries an explicit `#[serde(rename)]` so the value on the wire is the value an
+ * author writes in `cide-extension.json` — `editor:read`, not `editorRead`.
+ *
+ * It was `rename_all = "camelCase"` for exactly as long as it took to run, and the failure is
+ * worth recording because nothing in the build could see it. The *manifest* spelling came from
+ * [`Capability::as_str`] and the *wire* spelling came from serde, the frontend compared against
+ * the manifest one, and so `capabilities.has('editor:read')` was false for every extension ever
+ * installed: no worker was told about an open file, and every host request was refused. Two
+ * panels drew "open a .sql file" over an open `.sql` file, and the check that should have caught
+ * it was comparing the frontend's list against `as_str`'s table — both sides of a two-sided
+ * agreement, neither of them the wire.
+ *
+ * So `as_str` is now the *only* spelling, serde is told to use it, and `check-ext.mjs` compares
+ * against `generated.ts` — the artefact that actually crosses the boundary.
  */
-export type Capability = "editorRead" | "editorWrite" | "fsRead" | "gitRead" | "processSpawn";
+export type Capability = "editor:read" | "editor:write" | "fs:read" | "git:read" | "process:spawn";

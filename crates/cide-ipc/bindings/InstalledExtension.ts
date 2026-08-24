@@ -7,6 +7,11 @@ import type { MarketplaceId } from "./MarketplaceId";
 
 /**
  * An installed extension.
+ *
+ * `Eq` is deliberately absent from here down: a [`SettingKind::Number`] carries an `f64`, so
+ * nothing containing a [`Contributions`] can be `Eq`. `PartialEq` is what every caller actually
+ * uses — comparing two snapshots, asserting one in a test — and the difference only matters to a
+ * `HashMap` key, which none of these is.
  */
 export type InstalledExtension = { name: string, version: string, description: string, 
 /**
@@ -18,6 +23,15 @@ enabled: boolean,
  * The marketplace commit this copy was taken at. What an update compares against.
  */
 commit: string, capabilities: Array<Capability>, contributes: Contributions, 
+/**
+ * Every contributed setting's current value, keyed by [`SettingDef::id`].
+ *
+ * **Resolved, not stored**: the defaults with whatever the user changed layered on top, every
+ * one already through [`SettingDef::coerce`]. So a reader — the Settings page, the worker —
+ * never has to know what a default is or what happens when a stored value is the wrong type.
+ * The *stored* half, which is only the differences, is `extensions.json`'s.
+ */
+settings: Record<string, boolean | string | number>, 
 /**
  * The directory the code was copied into. Shown in the panel; also the jail
  * `cide-ext://` resolves against.

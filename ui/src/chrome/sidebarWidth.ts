@@ -94,7 +94,7 @@ export const SIDEBAR_MIN = 180
 export const SIDEBAR_MAX = 640
 
 /** The activity rail's width: `--h-rail`, used as a width because the rail is square. */
-export const RAIL_WIDTH = 42
+export const RAIL_WIDTH = 46
 
 /**
  * The handle's own width: `--w-splitter`, the same token the pane dividers use.

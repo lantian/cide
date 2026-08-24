@@ -80,6 +80,7 @@ import { fs as fsApi } from '@/ipc/client'
  * a reader of this file would connect to an import.
  */
 import { FileIcon } from '@/icons/FileIcon'
+import { Icon } from '@/icons/Icon'
 import type { IconTheme } from '@/icons/iconFor'
 import styles from './ChangesTree.module.css'
 
@@ -611,7 +612,9 @@ export function ChangesTree({
             onKeyDown={(e) => onKeyDown(e, row, index)}
           >
             <span className={styles.twisty} aria-hidden="true">
-              {row.expandable ? (open ? '▾' : '▸') : ''}
+              {row.expandable ? (
+                <Icon name={open ? 'chevron-down' : 'chevron-right'} size={1} />
+              ) : null}
             </span>
 
             {/*

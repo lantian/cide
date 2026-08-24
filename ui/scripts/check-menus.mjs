@@ -864,17 +864,36 @@ try {
    * a font stack or a type scale. `--shadow` is in the set and is deliberately *not* exempt
    * below: it is a colour wearing a dimension's name, and the two themes really do differ.
    *
-   * The chrome type scale joins them as a family rather than as fourteen entries: `--ui-scale`
+   * The chrome type scale joins them as a family rather than as six entries: `--ui-scale`
    * is the chrome font size's multiplier and `--fs-ui-<n>` are the rungs built out of it, all
    * declared once beside `--font-ui`. Matched by shape so a new rung does not have to be added
    * here as well as to `tokens.css` — `check-ui-scale.mjs` is what holds that ladder to its
    * readers, and it is the script that would notice a rung nobody uses.
+   *
+   * The shape rule now covers five more families for the same reason, and the reason is worth
+   * stating because the alternative failed loudly: a radius, a spacing step, a duration, an
+   * easing curve and an icon box are all measurements, and a menu is the most obvious place in
+   * the app to want a corner radius and a hover transition. Listed by name in `dimensions`
+   * instead, every new rung would have to be added here too, and the first one that was not
+   * would fail with "`--r-2` is defined in the light theme" — a message that points at the
+   * palette when the token was never a colour at all.
+   *
+   * `--shadow-*` is deliberately NOT in either list: it is a colour wearing a dimension's name.
+   * The light theme's is a two-layer hairline and the dark theme's a single wide drop, so the
+   * two themes really do differ and both must declare every rung of it. It used to sit in
+   * `dimensions` with a `!== '--shadow'` carve-out immediately undoing that membership; falling
+   * straight through says the same thing without the double negative.
    */
-  const dimensions = new Set(['--font-ui', '--font-mono', '--shadow'])
-  const scaleToken = (token) => token === '--ui-scale' || token.startsWith('--fs-ui-')
+  const dimensions = new Set(['--font-ui', '--font-mono'])
+  const scaleToken = (token) =>
+    token === '--ui-scale'
+    || token === '--ease-out'
+    || ['--fs-ui-', '--r-', '--sp-', '--dur-', '--icon-', '--focus-'].some((prefix) =>
+      token.startsWith(prefix),
+    )
   for (const token of used) {
     if (scaleToken(token)) continue
-    if (dimensions.has(token) && token !== '--shadow') continue
+    if (dimensions.has(token)) continue
     ok(light.includes(`${token}:`), `${token} is defined in the light theme, which is default`)
     ok(dark.includes(`${token}:`), `${token} is defined in the dark theme`)
   }

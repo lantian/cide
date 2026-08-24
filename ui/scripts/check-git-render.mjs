@@ -125,7 +125,7 @@ try {
 
   // --- the external-staging guard --------------------------------------------------------
 
-  eq(byName.guard.guard, '⚠ Staging changed outside cide Reload Overwrite', 'the guard bar')
+  eq(byName.guard.guard, 'Staging changed outside cide Reload Overwrite', 'the guard bar')
   eq(
     byName.guard.rows,
     byName.mock.rows,
@@ -155,7 +155,7 @@ try {
   )
   eq(
     byName.multi.guard,
-    '⚠ Staging changed outside cide · hub-core Reload Overwrite',
+    'Staging changed outside cide · hub-core Reload Overwrite',
     'with more than one root the bar names the repo whose index moved',
   )
 
@@ -170,7 +170,7 @@ try {
    */
   eq(
     byName.conflict.mergeBar,
-    '⚔ Merging origin/hub-provider-config into hub-provider-config · 1 of 3 resolved Resolve conflicts… Resolve simple Continue Abort',
+    'Merging origin/hub-provider-config into hub-provider-config · 1 of 3 resolved Resolve conflicts… Resolve simple Continue Abort',
     'the merge bar names both sides, counts the resolutions, and offers every verb',
   )
   eq(

@@ -25,6 +25,8 @@ import { projectTabEntries } from './menuModel'
 import { ProjectMenu } from './ProjectMenu'
 import { RowControls } from './RowControls'
 import { currentUserAgent, windowControlLayout } from './windowControls'
+import { Icon } from '@/icons/Icon'
+
 import styles from './AppHeader.module.css'
 
 /**
@@ -226,7 +228,7 @@ export function AppHeader({
 
       <div className={styles.actions}>
         <button type="button" className={styles.action} title="Toggle theme" onClick={onToggleTheme}>
-          ◐
+          <Icon name="sun-moon" size={1} />
         </button>
         {/*
          * ⊞ and ⧉ are disabled when no host supplied a handler, rather than drawn live and
@@ -245,7 +247,7 @@ export function AppHeader({
           disabled={onSplit === undefined}
           onClick={onSplit}
         >
-          ⊞
+          <Icon name="columns-2" size={1} />
         </button>
         <button
           type="button"
@@ -256,7 +258,7 @@ export function AppHeader({
           disabled={onDetach === undefined}
           onClick={onDetach}
         >
-          ⧉
+          <Icon name="picture-in-picture-2" size={1} />
         </button>
       </div>
 
@@ -418,7 +420,7 @@ function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItem
         title={`Close ${project.name}`}
         onClick={() => onClose?.(project.id)}
       >
-        ×
+        <Icon name="x" size={1} />
       </button>
     </div>
   )

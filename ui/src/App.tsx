@@ -1292,10 +1292,15 @@ export function App() {
                   onRestartSource={
                     activeProjectId === null
                       ? undefined
-                      : (id) => {
-                          // Narrowed rather than cast: `SourceRow.id` is a plain string because
-                          // `model.ts` imports nothing, so this is where the wire enum is re-asserted.
-                          if (isDiagnosticSourceId(id)) restartDiagnosticSource(activeProjectId, id)
+                      : (id, label) => {
+                          // Checked rather than cast: `SourceRow.id` is a plain string because
+                          // `model.ts` imports nothing, so this is where the two meet. The set is
+                          // open since M22 — an extension may contribute a server — so what is
+                          // asserted here is the one property the id must have, and `sourceRows`
+                          // is what decides which rows offer the button at all.
+                          if (isDiagnosticSourceId(id)) {
+                            restartDiagnosticSource(activeProjectId, id, label)
+                          }
                         }
                   }
                   onOpenLocation={(path, line, column) => {

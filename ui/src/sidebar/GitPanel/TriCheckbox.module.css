@@ -28,7 +28,7 @@
   align-items: center;
   justify-content: center;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: var(--panel-2);
   color: var(--bg);
   font-size: 0;

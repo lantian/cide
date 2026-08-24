@@ -52,6 +52,7 @@
   "ext_refresh",
   "ext_reload",
   "ext_set_enabled",
+  "ext_set_setting",
   "ext_snapshot",
   "ext_uninstall",
   "file_note_position",

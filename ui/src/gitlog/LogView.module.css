@@ -97,12 +97,12 @@
   overflow-y: auto;
   box-sizing: border-box;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-3);
   /* `--panel`, not `--panel-2`: the list floats over the commit list and needs to read as
      a surface above it, and `--panel` is the lighter of the two in the light theme and the
      lighter in the dark one too — the contrast goes the right way in both. */
   background: var(--panel);
-  box-shadow: 0 6px 18px rgb(0 0 0 / 35%);
+  box-shadow: var(--shadow-1);
 }
 
 .branchRow {
@@ -110,14 +110,18 @@
   width: 100%;
   padding: 3px 8px;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: none;
   color: var(--text);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   text-align: left;
   white-space: nowrap;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .branchRow:hover {
@@ -143,29 +147,29 @@
 .branch {
   flex: none;
   max-width: 180px;
-  height: calc(22px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
   box-sizing: border-box;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: var(--panel-2);
   color: var(--text);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 .input {
   flex: 1;
   min-width: 60px;
   max-width: 220px;
-  height: calc(22px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
   box-sizing: border-box;
   padding: 0 7px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 .input::placeholder {
@@ -181,15 +185,19 @@
 .clear,
 .refresh {
   flex: none;
-  height: calc(22px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--chrome);
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .clear:hover,
@@ -209,11 +217,11 @@
   margin-top: 8px;
   padding: 3px 8px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--chrome);
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -261,8 +269,8 @@
   text-overflow: ellipsis;
   padding: 0 5px;
   border: 1px solid var(--border);
-  border-radius: 3px;
-  font-size: var(--fs-ui-10);
+  border-radius: var(--r-1);
+  font-size: var(--fs-ui-11);
   line-height: calc(14px * var(--ui-scale));
 }
 
@@ -270,12 +278,16 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  height: calc(22px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
   padding: 0 10px;
   cursor: pointer;
   font-size: var(--fs-ui-12);
   color: var(--text);
   white-space: nowrap;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .row:hover {
@@ -299,7 +311,7 @@
   position: relative;
   flex: none;
   width: 84px;
-  height: calc(22px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
   align-self: stretch;
 }
 
@@ -353,7 +365,7 @@
   top: 4px;
   margin-left: -4px;
   color: var(--faint);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   line-height: calc(14px * var(--ui-scale));
 }
 
@@ -405,11 +417,11 @@
   appearance: none;
   margin: 0;
   padding: 0 5px;
-  border-radius: 3px;
+  border-radius: var(--r-1);
   border: 1px solid var(--border);
   background: none;
   font: inherit;
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   line-height: calc(14px * var(--ui-scale));
   color: var(--dim);
 }
@@ -448,8 +460,8 @@ button.chip:hover {
 /* Inside, not around: the chip is 16px tall in a 22px row and an outset ring would collide with
    the oid beside it. The same offset `.fileRow` uses further down, for the same reason. */
 button.chip:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .head {
@@ -473,13 +485,13 @@ button.chip:focus-visible {
 .note {
   padding: 12px;
   color: var(--dim);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   white-space: normal;
 }
 
 .note {
   color: var(--faint);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 .more {
@@ -489,11 +501,15 @@ button.chip:focus-visible {
   padding: 5px;
   background: var(--chrome);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .more:hover:not(:disabled) {
@@ -511,7 +527,7 @@ button.chip:focus-visible {
   overflow: auto;
   min-width: 0;
   padding: 12px;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   color: var(--text);
   /* The message is prose the user will want to copy — a hash out of a revert line, a ticket
      number. The list beside it is not, so the selection is enabled here and nowhere else. */
@@ -542,11 +558,11 @@ button.chip:focus-visible {
   align-items: center;
   gap: 6px;
   width: 100%;
-  padding: 1px 6px;
+  padding: var(--sp-2) var(--sp-3);
   box-sizing: border-box;
   background: transparent;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   color: inherit;
   font: inherit;
   text-align: left;
@@ -569,8 +585,8 @@ button.chip:focus-visible {
 }
 
 .fileRow:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -613,11 +629,11 @@ button.chip:focus-visible {
   box-sizing: border-box;
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text-hi);
   font-family: inherit;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
 }
 
 .promptInput::placeholder {
@@ -625,7 +641,7 @@ button.chip:focus-visible {
 }
 
 .promptInput:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: -1px;
   border-color: var(--accent);
 }
@@ -639,11 +655,11 @@ button.chip:focus-visible {
   height: calc(28px * var(--ui-scale));
   box-sizing: border-box;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text-hi);
   font-family: inherit;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
 }
 
 .promptFooter {
@@ -657,14 +673,18 @@ button.chip:focus-visible {
 
 .promptButton {
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: 1;
   padding: 7px 13px;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   border: 1px solid var(--border);
   background: var(--chrome-hi);
   color: var(--text);
   cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .promptButton:hover:not(:disabled) {
@@ -673,7 +693,7 @@ button.chip:focus-visible {
 }
 
 .promptButton:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -729,9 +749,12 @@ button.chip:focus-visible {
  */
 .swap {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
   padding: 2px 7px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--chrome);
   color: var(--dim);
   font: inherit;
@@ -746,8 +769,8 @@ button.chip:focus-visible {
 }
 
 .swap:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /*
@@ -782,7 +805,7 @@ button.chip:focus-visible {
   max-height: calc(260px * var(--ui-scale));
   overflow: auto;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
 }
 
@@ -798,6 +821,10 @@ button.chip:focus-visible {
   font-size: var(--fs-ui-12);
   text-align: left;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .compareRow:hover {
@@ -806,8 +833,8 @@ button.chip:focus-visible {
 }
 
 .compareRow:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /* The hash column: fixed width and tabular, so the subjects beside it line up into a column the
@@ -835,7 +862,7 @@ button.chip:focus-visible {
 .compareError {
   flex: none;
   color: var(--red);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 /*
@@ -917,11 +944,11 @@ button.chip:focus-visible {
   padding: 2px 6px;
   box-sizing: border-box;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: none;
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   text-align: left;
   white-space: nowrap;
   cursor: pointer;
@@ -951,7 +978,7 @@ button.chip:focus-visible {
 .twisty {
   flex: none;
   width: 9px;
-  font-size: var(--fs-ui-9);
+  font-size: var(--fs-ui-11);
   line-height: 1;
   text-align: center;
 }

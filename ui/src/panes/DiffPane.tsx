@@ -25,6 +25,8 @@ import {
 } from '@/editor/diffViewMode'
 import { lineEditKeymap } from '@/editor/editorKeys'
 import type { DiffView } from '@/ipc/client'
+import { Icon } from '@/icons/Icon'
+
 import styles from './DiffPane.module.css'
 
 export interface DiffPaneProps {
@@ -149,7 +151,9 @@ function pathLabel(oldPath: string, newPath: string): ReactNode {
   return (
     <>
       <span className={styles.path}>{oldPath}</span>
-      <span className={styles.arrow}>→</span>
+      <span className={styles.arrow}>
+        <Icon name="arrow-right" size={0} />
+      </span>
       <span className={styles.path}>{newPath}</span>
     </>
   )

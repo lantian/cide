@@ -50,10 +50,10 @@
   position: relative;
   border: 0;
   padding: 0;
-  border-radius: 10px;
+  border-radius: var(--r-4);
   background: var(--border);
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background-color var(--dur-1) var(--ease-out);
 }
 
 .pillOn {
@@ -66,7 +66,7 @@
 }
 
 .pill:focus-visible {
-  outline: 1px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -81,7 +81,7 @@
      against both the --border track and the --accent one. A hardcoded white would vanish
      into the light theme's pale track. */
   background: var(--text-hi);
-  transition: transform 120ms ease;
+  transition: transform var(--dur-1) var(--ease-out);
 }
 
 .pillOn .knob {
@@ -93,7 +93,7 @@
 .segmented {
   display: inline-flex;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-2);
   overflow: hidden;
   background: var(--panel-2);
 }
@@ -108,6 +108,10 @@
   font-family: inherit;
   font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .segment + .segment {
@@ -125,8 +129,8 @@
 }
 
 .segment:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /* --- numeric field --- */
@@ -136,7 +140,7 @@
   height: calc(24px * var(--ui-scale));
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   /* Counters and measurements are mono throughout this app. */
@@ -149,6 +153,39 @@
   border-color: var(--accent);
 }
 
+/*
+ * A free-text field. (M22)
+ *
+ * Beside `.number` and deliberately unlike it in two ways. It is wide, because what goes in one is
+ * a path, a URL or a name rather than a measurement — and it is **not** mono: `.number`'s comment
+ * says counters and measurements are mono throughout this app, and prose is not a measurement.
+ *
+ * Only an extension's settings use it today. Nothing in cide's own eight sections takes free text
+ * that is not already a specialised control (`ClaudeCliSection`'s path picker, `ProxySection`'s
+ * URL), which is why this arrived with the section that needed it rather than before.
+ */
+.text {
+  width: 220px;
+  max-width: 100%;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+}
+
+.text:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.text:disabled {
+  opacity: 0.5;
+}
+
 /* --- grouping --- */
 
 .group {
@@ -156,9 +193,9 @@
 }
 
 .groupTitle {
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--faint);
   margin: 0 0 6px;
 }
@@ -167,7 +204,7 @@
 .note {
   border: 1px solid var(--border);
   border-left: 2px solid var(--accent);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel);
   padding: 10px 12px;
   font-size: var(--fs-ui-12);
@@ -193,7 +230,7 @@
   height: calc(24px * var(--ui-scale));
   padding: 0 11px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   font-family: inherit;
@@ -212,7 +249,7 @@
 }
 
 .action:focus-visible {
-  outline: 1px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 2px;
 }
 

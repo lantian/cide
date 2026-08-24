@@ -4,7 +4,7 @@
  * focus ring, so the two surfaces do not read as coming from different applications.
  */
 .bar {
-  height: calc(28px * var(--ui-scale));
+  height: calc(30px * var(--ui-scale));
   flex: none;
   display: flex;
   align-items: center;
@@ -16,19 +16,23 @@
 }
 
 .button {
-  width: 22px;
-  height: calc(22px * var(--ui-scale));
+  width: 26px;
+  height: calc(26px * var(--ui-scale));
   flex: none;
   display: grid;
   place-items: center;
   border: 0;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: inherit;
   font-family: inherit;
   font-size: var(--fs-ui-13);
   cursor: pointer;
   padding: 0;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover:not(:disabled) {
@@ -49,6 +53,6 @@
 }
 
 .button:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }

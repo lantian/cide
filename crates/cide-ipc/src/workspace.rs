@@ -897,6 +897,18 @@ pub enum SettingsSection {
     /// under a font size makes it undiscoverable. Named for IDEA's own tree node — the sidebar
     /// panel keeps "Problems", so the two surfaces are not both called the same thing.
     Inspections,
+    /// What the installed extensions are configured with. (M22)
+    ///
+    /// Its own section rather than a group under something that exists, on the argument `Agents`
+    /// makes for itself two variants down: the rows here are not cide's settings at all. They are
+    /// declared by third-party manifests, they are stored in `extensions.json` rather than in
+    /// `workspace.json`, and none of them rides `SettingsPatch`. A page of somebody else's
+    /// controls under a heading about cide's own would be a category error, and it would grow
+    /// without bound as extensions are installed.
+    ///
+    /// Between `Inspections` and `Agents`, which is where it sits in the nav — the two before it
+    /// are about what analyses your code, and this is about what else is running inside cide.
+    Extensions,
     /// The subagent roles this project and this user define, edited as a form. (M18)
     ///
     /// # Why a section, rather than a group under something that exists

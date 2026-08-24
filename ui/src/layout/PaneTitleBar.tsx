@@ -75,6 +75,8 @@ import { useWorkspace } from '@/store/workspace'
 import { chainAround } from './SplitTree'
 import { paneSessionId } from './paneHosts'
 import { acknowledge, useAwaiting } from '@/panes/awaiting'
+import { Icon } from '@/icons/Icon'
+
 import styles from './PaneTitleBar.module.css'
 
 /**
@@ -579,7 +581,7 @@ export function PaneFrame({
                   title="Minimize window"
                   aria-label="Minimize window"
                 >
-                  ─
+                  <Icon name="minus" size={1} />
                 </button>
                 <button
                   type="button"
@@ -589,7 +591,7 @@ export function PaneFrame({
                   aria-label={isMaximized ? 'Restore window' : 'Maximize window'}
                   aria-pressed={isMaximized}
                 >
-                  ▢
+                  <Icon name="square" size={1} />
                 </button>
                 <button
                   type="button"
@@ -602,7 +604,7 @@ export function PaneFrame({
                   title="Close window — the pane returns to its tab and its session keeps running"
                   aria-label="Close window; the pane returns to its tab"
                 >
-                  ✕
+                  <Icon name="x" size={1} />
                 </button>
               </>
             ) : (
@@ -627,7 +629,10 @@ export function PaneFrame({
                       if (anchor !== null) tileMenu.openFor(anchor)
                     }}
                   >
-                    ⊞<span className={styles.caret} aria-hidden="true">▾</span>
+                    <Icon name="square-plus" size={1} />
+                    <span className={styles.caret} aria-hidden="true">
+                      <Icon name="chevron-down" size={0} />
+                    </span>
                   </button>
                 )}
                 <button
@@ -638,7 +643,7 @@ export function PaneFrame({
                   aria-pressed={maximized}
                   onClick={onMaximize}
                 >
-                  ⛶
+                  <Icon name="maximize" size={1} />
                 </button>
                 {/* `aria-disabled`, not `disabled`, for the reason spelled out on the close
                     button. */}
@@ -660,7 +665,7 @@ export function PaneFrame({
                   aria-disabled={!detachable}
                   onClick={detachable ? onDetach : undefined}
                 >
-                  ⧉
+                  <Icon name="picture-in-picture-2" size={1} />
                 </button>
                 {/*
                  * `aria-disabled` rather than `disabled`: a disabled button swallows
@@ -678,7 +683,7 @@ export function PaneFrame({
                   aria-disabled={!closable}
                   onClick={closable ? onClose : undefined}
                 >
-                  ×
+                  <Icon name="x" size={1} />
                 </button>
               </>
             )}

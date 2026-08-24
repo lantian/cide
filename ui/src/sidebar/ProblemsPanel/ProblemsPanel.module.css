@@ -21,18 +21,41 @@
   overflow: hidden;
 }
 
+  /*
+   * The panel header, identical in all six sidebar panels.
+   *
+   * It was 10.5px UPPERCASE at 0.09em of tracking in `--dim`, and it was the most dated thing
+   * in the app: a tiny, wide-set, all-caps label is the 2011 section-header signature, and it
+   * appeared here six times plus nineteen more places. Four declarations changed and each
+   * earns its line:
+   *
+   *   10.5px -> 12px      10.5px is under the readable floor for a proportional face, and it
+   *                       was the bottom rung of a scale with nowhere lower to go.
+   *   0.09em -> 0         tracking is what you add to small caps to keep them from setting
+   *                       solid. With no caps there is nothing to loosen.
+   *   uppercase -> none   the label in the TSX is already sentence case — `Project`, `Search`,
+   *                       `Problems`. `text-transform` was doing all of the shouting.
+   *   --dim -> --text/500 a header quieter than the rows beneath it is not a header. `--dim`
+   *                       was compensating for the fact that tracked-out caps already pull the
+   *                       eye; take the caps away and it just looks unfinished.
+   *
+   * The height is `--h-panelheader`, which is the same token value as `--h-tabstrip` and must
+   * stay so — see its comment in `tokens.css`: these two edges are the same line across the
+   * window, and a 4px step down the sidebar seam is what happens when they drift.
+   */
 .header {
-  height: calc(30px * var(--ui-scale));
+  height: var(--h-panelheader);
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 10px;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-5);
   border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--dim);
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -49,7 +72,7 @@
 .headerMeta {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-11);
   letter-spacing: 0;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
@@ -71,7 +94,7 @@
    paragraphs under it are the reasoning. */
 .claim {
   margin: 0;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   font-weight: 500;
   color: var(--text-hi);
 }
@@ -92,7 +115,7 @@
 
 .detail {
   margin: 4px 0 0;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--faint);
 }
@@ -105,9 +128,9 @@
 
 .noteHead {
   margin: 12px 0 0;
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--dim);
 }
 
@@ -120,7 +143,7 @@
   /* The marker sits in the padding; 16px keeps the text flush with the paragraphs above so
      the block reads as one column rather than two indents. */
   padding-left: 16px;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.55;
   color: var(--faint);
 }
@@ -128,7 +151,7 @@
 .note code,
 .list code {
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   color: var(--text);
 }
 
@@ -177,7 +200,7 @@
 
 .groupCount {
   flex: none;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -188,11 +211,11 @@
   width: 100%;
   padding: 2px 4px;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   text-align: left;
 }
 
@@ -213,8 +236,8 @@
 }
 
 .rowButton:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .glyph {
@@ -251,14 +274,14 @@
 .code {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
 .where {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
@@ -281,7 +304,7 @@
 
 .staleNote {
   margin: 0 0 1px;
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   line-height: 1.4;
   color: var(--faint);
   font-style: italic;
@@ -317,9 +340,9 @@
 .footerTitle {
   flex: 1;
   min-width: 0;
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--dim);
 }
 
@@ -332,11 +355,11 @@
   flex: none;
   padding: 2px 8px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -346,8 +369,8 @@
 }
 
 .action:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .action:disabled {
@@ -376,7 +399,7 @@
 
 .sourceDetail {
   margin: 1px 0 0;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--faint);
   overflow-wrap: anywhere;
@@ -384,11 +407,19 @@
 
 /* The status dot. Three states, three tokens, and `unavailable` is dim rather than red for the
    same reason `.claimUnknown` is: not running is not broken. */
+/*
+ * The source's status dot.
+ *
+ * A filled dot is a shape, not an icon: the stroke set has no filled primitive, so `circle`
+ * would draw a ring and read as "empty" where the meaning is "this source reported".
+ */
 .sourceDot {
   flex: none;
-  width: 12px;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
+  width: 8px;
+  height: 8px;
+  margin: 0 2px;
+  border-radius: 50%;
+  background: currentColor;
   color: var(--faint);
 }
 

@@ -36,7 +36,7 @@
 
 .title {
   margin: 0;
-  font-size: var(--fs-ui-15);
+  font-size: var(--fs-ui-16);
   font-weight: 500;
   color: var(--text);
 }
@@ -48,7 +48,7 @@
 
 .source {
   margin-left: auto;
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -89,13 +89,21 @@
   font: inherit;
   font-size: var(--fs-ui-11);
   padding: 3px 12px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .primary {
   border-color: var(--accent-dim);
   color: var(--accent);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .primary:hover:not(:disabled),
@@ -111,8 +119,8 @@
 
 .primary:focus-visible,
 .action:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .problem {

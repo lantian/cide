@@ -154,7 +154,7 @@ export function strategyAsk(repos: readonly RepoDivergence[]): PullStrategyAsk |
   return {
     title,
     body: counts,
-    mark: '↻',
+    mark: 'refresh-cw',
     split: false,
     choices: [
       {

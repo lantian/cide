@@ -15,6 +15,8 @@ import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
 import { groupDigits } from '@/overlays/format'
 import { events, type ProjectId } from '@/ipc/client'
+import { Icon } from '@/icons/Icon'
+
 import styles from './FileTree.module.css'
 
 export interface ExplorerProps {
@@ -237,15 +239,19 @@ export function Explorer({
             className={styles.headerWarn}
             title="Too many changes to tag every row; files further down the tree are shown untagged."
           >
-            †
+            <Icon name="asterisk" size={1} />
           </span>
         )}
         {/*
-          * *Select opened file*. IDEA's own crosshair, as a literal Unicode glyph — this
-          * application bundles no UI icon set, and `ActivityRail.tsx` and `GitPanel/Toolbar.tsx`
-          * both state that as policy rather than as a gap. U+2316 POSITION INDICATOR; `◎`
-          * (U+25CE) is the fallback if a font somewhere renders it as tofu, and nothing in this
-          * repository checks glyph coverage — `check-fonts.mjs` is size arithmetic.
+          * *Select opened file*. IDEA's own crosshair.
+          *
+          * It was `⌖` (U+2316 POSITION INDICATOR) as a literal character, and this comment used
+          * to say that the application bundled no UI icon set and that `ActivityRail.tsx` and
+          * `GitPanel/Toolbar.tsx` stated that as policy rather than as a gap. It also recorded
+          * that `◎` (U+25CE) was the fallback "if a font somewhere renders it as tofu", and that
+          * **nothing in this repository checked glyph coverage** — which is the sentence that
+          * made the policy untenable: a fallback nobody can verify is a hope. `check-ui-icons.mjs`
+          * exists now, and the mark is drawn rather than typed.
           *
           * `title` and `aria-label` carry the same sentence, and it changes with the state:
           * a disabled control that says only "Select opened file" leaves the user to guess why
@@ -268,7 +274,7 @@ export function Explorer({
             }
             onClick={onSelectOpened}
           >
-            ⌖
+            <Icon name="crosshair" size={1} />
           </button>
         )}
       </div>

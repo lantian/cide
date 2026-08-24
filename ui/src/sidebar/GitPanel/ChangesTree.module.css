@@ -83,8 +83,8 @@
 /* Keyboard focus has to be visible in a tree whose selection is drawn as checkboxes: the
    ticks say what will be committed, and only this says what Space will act on. */
 .row:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .groupRow {
@@ -147,6 +147,17 @@
  * arrow the machine had, at a foreign width and baseline. The long version of the argument is
  * in `sidebar/FileTree.module.css`.
  */
+/*
+ * The disclosure column.
+ *
+ * The mark inside it is a drawn chevron now, and the two `::before` rules that used to build a
+ * triangle out of `clip-path` are gone with the character that gated them. That character —
+ * `▾`/`▸` in the TSX, hidden by `font-size: 0` — was never rendered: it existed only so
+ * `:not(:empty)` could tell a foldable row from a leaf. Rendering `null` says the same thing
+ * without a codepoint standing in for a boolean, and it makes this tree draw the same mark as
+ * the git log, the search panel, the extension panel and the editor's fold gutter, which is the
+ * whole point of there being a set.
+ */
 .twisty {
   width: 9px;
   flex: none;
@@ -156,7 +167,6 @@
   /* Full row height, as in the explorer: a flex item is as tall as its content, and with the
      glyph gone that is the 4px of the triangle. */
   align-self: stretch;
-  font-size: 0;
   color: var(--faint);
 }
 
@@ -166,23 +176,6 @@
    heights were 7 and 5 while this row was 23 and both axes wanted odd; the row is 24 now, so
    they went even, and the widths did not move. `:not(:empty)` keeps the arrow off the rows
    that are not expandable; they render the span empty. */
-[aria-expanded='false'] > .twisty:not(:empty)::before,
-[aria-expanded='true'] > .twisty:not(:empty)::before {
-  content: '';
-  background: currentColor;
-}
-
-[aria-expanded='false'] > .twisty:not(:empty)::before {
-  width: 5px;
-  height: calc(6px * var(--ui-scale));
-  clip-path: polygon(0 0, 0 100%, 100% 50%);
-}
-
-[aria-expanded='true'] > .twisty:not(:empty)::before {
-  width: 7px;
-  height: calc(4px * var(--ui-scale));
-  clip-path: polygon(0 0, 100% 0, 50% 100%);
-}
 
 /*
  * The box's hit target, padded out to a comfortable size without changing the 12px the
@@ -473,9 +466,9 @@
   gap: 1px;
   padding: 4px 8px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-3);
   background: var(--chrome);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
 }
 
 .ghostLoad {

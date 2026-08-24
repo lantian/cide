@@ -41,7 +41,13 @@ export interface ProblemsDigest {
    * glance, and nothing else in this digest would notice.
    */
   glyphClasses: number[]
-  /** One entry per row: the glyph character actually printed. */
+  /**
+   * One entry per row: the name of the mark actually drawn.
+   *
+   * Was the printed character. A drawn mark has no text node, so this reads `data-icon` — which
+   * is a better fact than the glyph was: it survives a redraw and says *which mark* rather than
+   * which codepoint.
+   */
   glyphs: string[]
   /** `button` when a host wired `onOpenLocation`, `div` when it did not, `null` with no rows. */
   rowTag: 'button' | 'div' | null
@@ -216,7 +222,9 @@ function digest(story: string, html: string): ProblemsDigest {
     glyphClasses: [...html.matchAll(/class="([^"]*glyph[^"]*)"/g)].map(
       (m) => (m[1] ?? '').trim().split(/\s+/).filter(Boolean).length,
     ),
-    glyphs: [...html.matchAll(/class="[^"]*glyph[^"]*"[^>]*>([^<]*)</g)].map((m) => m[1] ?? ''),
+    glyphs: [...html.matchAll(/class="[^"]*glyph[^"]*"[^>]*>\s*<svg[^>]*data-icon="([^"]*)"/g)].map(
+      (m) => m[1] ?? '',
+    ),
     rowTag: rowTag(html),
     unclassed: unclassed(html),
     staleGroups: [

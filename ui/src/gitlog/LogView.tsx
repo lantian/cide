@@ -74,6 +74,8 @@ import {
   type LogReveal,
   type SelectMods,
 } from './logModel'
+import { Icon } from '@/icons/Icon'
+
 import styles from './LogView.module.css'
 
 /**
@@ -805,7 +807,7 @@ export function ChangedFileList({
             onClick={() => onToggleDir?.(row.dir)}
           >
             <span className={styles.twisty} aria-hidden="true">
-              {row.collapsed ? '▸' : '▾'}
+              <Icon name={row.collapsed ? 'chevron-right' : 'chevron-down'} size={1} />
             </span>
             {/* The folder icon comes from the same table the file tree's does, so a directory
                 heading here and the same directory over there are the same picture. `iconFor`
@@ -907,7 +909,7 @@ export function RangeDetails({
             title="Read the two revisions the other way round"
             onClick={onSwap}
           >
-            ⇄ Swap
+            <Icon name="arrow-left-right" size={1} /> Swap
           </button>
         )}
       </div>
@@ -1216,7 +1218,7 @@ function FilterBar({
         disabled={busy}
         onClick={onRefresh}
       >
-        ↻
+        <Icon name="refresh-cw" size={1} />
       </button>
     </div>
   )

@@ -567,11 +567,15 @@ try {
   )
   eq(
     clean.mark,
-    '↗',
-    'the glyph is not the removal dash: nothing here is deleted, and `−` over files that are ' +
-      'about to be stashed and put back is a sentence the dialog contradicts',
+    'arrow-up-right',
+    'the mark is not the removal dash: nothing here is deleted, and a minus over files that ' +
+      'are about to be stashed and put back is a sentence the dialog contradicts',
   )
-  eq(blocked.mark, '↗', 'both cases, or the two halves of one gesture would look like two gestures')
+  eq(
+    blocked.mark,
+    'arrow-up-right',
+    'both cases, or the two halves of one gesture would look like two gestures',
+  )
   ok(
     clean.confirmLabel !== blocked.confirmLabel && blocked.confirmLabel.toLowerCase().includes('stash'),
     'and the button says when a stash is part of the deal',
@@ -590,7 +594,7 @@ try {
     'abbreviated, never the full forty',
   )
   eq(moved.files, [], 'no files are at stake: what is at stake is a ref other people may have')
-  eq(moved.mark, '→', 'a move, not a removal and not a departure')
+  eq(moved.mark, 'arrow-right', 'a move, not a removal and not a departure')
   ok(moved.confirmLabel.includes('v1.2.0'), 'the button names the tag it is about to move')
 
   // --- which side of a merge ------------------------------------------------------------------------

@@ -112,7 +112,7 @@ const ABSENT_SENTENCE = 'No task tracker in this project.'
  * The digest carries a button's **text**, not its attributes, so the assertions below reach the
  * control through the word beside its glyph rather than through `title` — which is the other
  * reason that word is drawn at all (`AgentsPanel.module.css` gives the first). The run rows'
- * own pause and resume are bare glyphs, `'⏸'` and `'▶'`, so a label carrying a word is the
+ * own pause and resume are bare marks — `pause` and `play` — so a label carrying a word is the
  * header's by construction and the two cannot be confused for one another here.
  */
 const INTEGRATE = 'Integrate'
@@ -142,8 +142,15 @@ const CONFIGURE_ALL = 'Configure subagents in Settings'
  */
 const DELETE_LABEL = 'Delete task'
 const DELETE_CONFIRM = 'Confirm delete'
-const RESUME_ALL = '▶ Resume'
-const PAUSE_ALL = '⏸ Pause'
+/*
+ * The scope buttons carry a word beside their mark, and the row buttons carry the mark alone.
+ * That distinction is the thing being asserted, so it survived the move from characters to
+ * drawn marks — only the way it is spelled changed. An SSR'd `<Icon>` has no text node, so the
+ * mark's name comes off `data-icon` (see `icons/Icon.tsx`) and the button's *text* is now just
+ * the word.
+ */
+const RESUME_ALL = 'Resume'
+const PAUSE_ALL = 'Pause'
 
 let failed = 0
 const fail = (what, detail) => {
@@ -247,7 +254,7 @@ try {
     )
     ok(
       d.roles?.every((r) => r.glyph.length > 0),
-      'with a glyph in the dot column — an empty cell reads as a rendering fault',
+      'with a mark in the dot column — an empty cell reads as a rendering fault',
     )
     ok(
       d.dispatches > 0,
@@ -477,9 +484,12 @@ try {
     eq(d.rows?.length, 2, 'a phase nobody recognises does not blank the panel, or drop its row')
     eq(d.roles?.length, 2, 'both roles are still listed')
     eq(d.meta, '1', 'nor zero the header figure, which still counts the run beside it')
-    ok(d.glyphs?.includes('?'), 'the unknown phase gets the fallback glyph')
     ok(
-      d.roles?.some((r) => r.glyph === '?' && r.status === 'Unknown'),
+      d.glyphs?.includes('circle-slash'),
+      'the unknown phase gets the fallback mark — a "no such thing" sign rather than nothing',
+    )
+    ok(
+      d.roles?.some((r) => r.glyph === 'circle-slash' && r.status === 'Unknown'),
       'and its role summarises as Unknown rather than as nothing',
     )
     ok(
@@ -491,8 +501,8 @@ try {
 
   {
     const d = a('role-paused')
-    ok(d.buttons?.includes('▶'), 'a paused run offers Resume')
-    ok(!d.buttons?.includes('⏸'), 'and not Pause as well — the row draws one or the other')
+    ok(d.icons?.includes('play'), 'a paused run offers Resume')
+    ok(!d.icons?.includes('pause'), 'and not Pause as well — the row draws one or the other')
     eq(d.meta, '1', 'a paused run still holds its slot, so it still counts as live')
     ok(
       d.buttons?.includes(RESUME_ALL),
@@ -583,7 +593,7 @@ try {
     ok(d.buttons?.includes(RESUME_ALL), 'with both meaningful, Resume wins the header slot')
     ok(!d.buttons?.includes(PAUSE_ALL), 'and Pause is not drawn beside it')
     eq(
-      d.buttons?.filter((b) => b === '⏸').length,
+      d.icons?.filter((i) => i === 'pause').length,
       1,
       'the awaiting run keeps its own per-run pause, which is the scope that was never in ' +
         'question — the header withheld the *project* one, not every way to freeze anything',
@@ -1084,8 +1094,8 @@ try {
     eq(d.rows?.length, 4, 'a status nobody recognises does not drop the task from the tracker')
     eq(d.meta, '4', 'nor zero the header count')
     ok(
-      d.rows?.some((r) => r.includes('|?|t-18|')),
-      'the unknown status gets the fallback glyph rather than an empty marker cell',
+      d.rows?.some((r) => r.includes('|circle-slash|t-18|')),
+      'the unknown status gets the fallback mark rather than an empty marker cell',
     )
     ok(
       d.groups?.some((g) => g.startsWith('Todo|2')),

@@ -19,11 +19,15 @@
   padding: 12px;
   text-align: left;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--r-4);
   background: var(--panel);
   color: inherit;
   font-family: inherit;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .card:hover {
@@ -37,7 +41,7 @@
 }
 
 .card:focus-visible {
-  outline: 1px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -85,7 +89,7 @@
      art at a fixed grid, and scaling the parts independently of each other would distort the
      picture rather than enlarge it. The card's label above it scales like any other text. */
   height: 74px;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   border: 1px solid var(--border-soft);
   padding: 9px;
@@ -101,7 +105,7 @@
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   overflow: hidden;
   background: var(--bg);
 }
@@ -122,7 +126,7 @@
   height: 6px;
   flex: 1;
   min-width: 0;
-  border-radius: 1px;
+  border-radius: var(--r-1);
   background: var(--border);
 }
 

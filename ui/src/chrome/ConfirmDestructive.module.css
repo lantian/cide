@@ -46,7 +46,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   color: var(--text);
   cursor: default;
 }
@@ -60,7 +60,7 @@
 
 .body {
   margin: 0;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
@@ -96,7 +96,7 @@
 
 .name {
   flex: none;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   color: var(--text-hi);
 }
 
@@ -142,14 +142,18 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: 1;
   padding: 7px 13px;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   border: 1px solid var(--border);
   background: var(--chrome-hi);
   color: var(--text);
   cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover {
@@ -158,7 +162,7 @@
 }
 
 .button:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -185,6 +189,10 @@
 
 .buttonDanger {
   color: var(--red);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .buttonDanger:hover {

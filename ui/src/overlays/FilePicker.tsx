@@ -29,6 +29,7 @@ import {
 } from '@/ipc/client'
 import styles from './Overlay.module.css'
 import { scaledRow, useUiScale } from '@/settings/useUiScale'
+import { Icon } from '@/icons/Icon'
 
 /**
  * The last path component, which is what the row draws large.
@@ -236,7 +237,7 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
   return (
     <ModalShell
       label="Go to file"
-      prompt="›"
+      prompt={<Icon name="chevron-right" size={1} />}
       value={query}
       placeholder="Search files by name"
       counter={failed ? undefined : matchCounter(matched, total)}

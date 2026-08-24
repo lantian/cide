@@ -21,6 +21,8 @@ import { useCallback } from 'react'
 import type { SplitIntent } from '@/ipc/generated'
 import { useWorkspace } from '@/store/workspace'
 import { rowGate, rowTarget } from './menuModel'
+import { Icon } from '@/icons/Icon'
+
 import styles from './AppHeader.module.css'
 
 /**
@@ -99,7 +101,7 @@ export function RowControls({ onAddRow }: RowControlsProps) {
           disabled={reason !== null}
           onClick={() => add(intent)}
         >
-          <span aria-hidden="true">⊞</span> {label}
+          <Icon name="rows-2" size={1} /> {label}
         </button>
       ))}
     </div>

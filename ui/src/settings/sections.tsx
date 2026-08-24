@@ -41,6 +41,7 @@ import {
   ToggleRow,
 } from './controls'
 import { AgentsSection } from './AgentsSection'
+import { ExtensionSettings } from './ExtensionSettings'
 // The band, from the module the arithmetic lives in, rather than two literals typed here.
 // `check-ui-scale.mjs` pins that module against Rust's `MIN_UI_FONT_SIZE`/`MAX_UI_FONT_SIZE`,
 // so importing it is what makes this input's clamp the same clamp `settings_set` applies —
@@ -100,6 +101,16 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     title: 'Agents',
     description:
       'The subagent roles this project and you define. Each one is a file — a system prompt plus the switches a run is spawned with — not a cide setting, so saving one changes the project, not your preferences.',
+  },
+  {
+    // Between Inspections and Agents, which is where `SettingsSection::Extensions` sits in the
+    // Rust enum, and the nav is that enum's order. Like `agents` below, and unlike the eight
+    // around them, none of these rows is a cide setting: they are declared by third-party
+    // manifests and stored in `extensions.json`. The description says so.
+    id: 'extensions',
+    title: 'Extensions',
+    description:
+      'Settings the installed extensions declare. Each one belongs to the extension that declared it and is stored with your extension list, not with your cide preferences — so it follows you between projects and disappears if you remove the extension.',
   },
   {
     id: 'git',
@@ -616,6 +627,11 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       return <Files {...props} />
     case 'inspections':
       return <Inspections {...props} />
+    case 'extensions':
+      // No props, for `agents`' reason one case down and one of its own: nothing here rides
+      // `SettingsPatch` or `workspace.json`. These values are declared by third-party manifests
+      // and stored in `extensions.json`, so the component reads the extension store directly.
+      return <ExtensionSettings />
     case 'agents':
       // No props: roles belong to a *project*, and `SectionProps` carries global settings.
       // The component takes the project from the store the way `KeymapSection` takes the
@@ -625,7 +641,21 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       return <Git {...props} />
     case 'terminal':
       return <Terminal {...props} />
+    default:
+      // A `SettingsSection` variant with no case here.
+      //
+      // Without this the switch simply falls off the end and returns `undefined`, which React
+      // renders as nothing at all — a nav row that opens a blank page, with no error anywhere.
+      // That is exactly what happened when `extensions` was added, and `tsc` was silent because
+      // `ReactNode` includes `undefined`. `never` makes the next one a compile error, which is
+      // the same guard `chrome/TabStrip.tsx` puts on `TabKind` and for the same reason.
+      return unhandled(id)
   }
+}
+
+/** Turns a future `SettingsSection` variant into a compile error rather than a blank page. */
+function unhandled(section: never): never {
+  throw new Error(`unhandled settings section: ${JSON.stringify(section)}`)
 }
 
 /**

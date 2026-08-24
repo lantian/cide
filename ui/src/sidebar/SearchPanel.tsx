@@ -46,7 +46,7 @@ import { copyText } from './copyText'
 import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
 import { groupDigits } from '@/overlays/format'
 import type { ProjectId } from '@/ipc/client'
-import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
+import { Icon, FileIcon, useIconTheme, type IconName, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
 import styles from './SearchPanel.module.css'
 import { scaledRow, useUiScale } from '@/settings/useUiScale'
@@ -168,19 +168,19 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
         <div className={styles.toggles} role="group" aria-label="Search options">
           <Toggle
             label="Match case"
-            glyph="Aa"
+            icon="case-sensitive"
             on={query.caseSensitive}
             onClick={() => useSearch.getState().setQuery({ caseSensitive: !query.caseSensitive })}
           />
           <Toggle
             label="Whole word"
-            glyph="ab"
+            icon="whole-word"
             on={query.wholeWord}
             onClick={() => useSearch.getState().setQuery({ wholeWord: !query.wholeWord })}
           />
           <Toggle
             label="Regular expression"
-            glyph=".*"
+            icon="regex"
             on={query.mode === 'regex'}
             onClick={() =>
               useSearch.getState().setQuery({ mode: query.mode === 'regex' ? 'literal' : 'regex' })
@@ -468,7 +468,7 @@ function FileHeading({
       onMouseDown={pressHandler(row, onAct)}
     >
       <span className={styles.twisty} aria-hidden="true">
-        {row.collapsed ? '▸' : '▾'}
+        <Icon name={row.collapsed ? 'chevron-right' : 'chevron-down'} size={1} />
       </span>
       {/*
        * The same vendored Material icon the file tree draws, keyed off the basename of the
@@ -536,14 +536,23 @@ function basename(rel: string): string {
   return cut < 0 ? rel : rel.slice(cut + 1)
 }
 
+/*
+ * One of the three find options.
+ *
+ * The marks were the literal strings `"Aa"`, `"ab"` and `".*"` — text pretending to be icons,
+ * which is what every editor drew before there were icons for them. Lucide carries
+ * `case-sensitive`, `whole-word` and `regex` precisely *because* they are VS Code's three find
+ * toggles, so this is the one conversion in the app where the replacement is the mark the user
+ * already recognises rather than a new one they have to learn.
+ */
 function Toggle({
   label,
-  glyph,
+  icon,
   on,
   onClick,
 }: {
   label: string
-  glyph: string
+  icon: IconName
   on: boolean
   onClick: () => void
 }) {
@@ -553,13 +562,13 @@ function Toggle({
       className={on ? `${styles.toggle} ${styles.toggleOn}` : styles.toggle}
       data-audit="searchToggle"
       /* `aria-pressed` rather than a checkbox: these are three independent switches on a
-         toolbar, and the glyph is the only visible label. */
+         toolbar, and the mark is the only visible label. */
       aria-pressed={on}
       aria-label={label}
       title={label}
       onClick={onClick}
     >
-      {glyph}
+      <Icon name={icon} size={1} />
     </button>
   )
 }

@@ -57,11 +57,11 @@ export const TOOL_MAX = 900
  * the live scale, which is why [`toolWindowCeiling`] takes one rather than summing them flat.
  */
 /** `--h-header`. */
-export const HEADER_HEIGHT = 34
+export const HEADER_HEIGHT = 38
 /** `--h-tabstrip`. */
-export const TABSTRIP_HEIGHT = 30
+export const TABSTRIP_HEIGHT = 34
 /** `--h-status`. */
-export const STATUS_HEIGHT = 24
+export const STATUS_HEIGHT = 26
 
 /**
  * The chrome above and below the pane area, which the tool window shares the column with.
@@ -100,7 +100,7 @@ export const MIN_PANES = 200
  * static [`TOOL_MAX`] applies and the viewport does not constrain anything.
  *
  * **The floor wins on a short window**, and that is the decision rather than an accident of
- * `Math.max`: at this app's narrowest legal window (`MIN_HEIGHT` is 420 in
+ * `Math.max`: at this app's narrowest legal window (`MIN_HEIGHT` is 430 in
  * `crates/cide-app/src/windows.rs`) the room left after the chrome, the splitter and
  * [`MIN_PANES`] is 126px, which is above [`TOOL_MIN`] — so the band is never empty. Were it ever
  * to go negative, a 40px tool window is not a compromise, it is a broken panel, and the user can

@@ -131,9 +131,9 @@
   align-items: center;
   gap: 1px;
   padding: 2px;
-  border-radius: 4px;
+  border-radius: var(--r-2);
   opacity: 0;
-  transition: opacity 80ms linear;
+  transition: opacity var(--dur-1) var(--ease-out);
 }
 
 .switch[data-corner='top'] {
@@ -175,10 +175,14 @@
   height: 22px;
   padding: 0;
   border: none;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .switchButton:hover {

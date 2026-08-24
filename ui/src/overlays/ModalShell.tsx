@@ -7,7 +7,7 @@
  * virtualizer here. It is headless, so the exact row markup the mock states survives —
  * a component library that renders the rows for us would not.
  */
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import styles from './Overlay.module.css'
 
@@ -15,7 +15,15 @@ export interface ModalShellProps {
   /** Accessible name for the dialog, e.g. `Go to file`. */
   label: string
   /** `›` for the picker, `>` for the palette. */
-  prompt: string
+  /**
+   * The sigil at the head of the input.
+   *
+   * A `ReactNode`, because these split two ways and only one of them is text. `>` and `#` are
+   * **query syntax** — what a user types to get that mode, as in every other palette — and stay
+   * ASCII. The file picker's, the usages popup's and the structure picker's were `› ⌕ ⌗`, which
+   * were standing in for icons because there were none; those are drawn marks now.
+   */
+  prompt: ReactNode
   /** The palette's `>` is drawn in `--accent`; the picker's `›` is not. */
   promptAccent?: boolean | undefined
   value: string

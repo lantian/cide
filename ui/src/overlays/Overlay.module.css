@@ -54,8 +54,8 @@
   flex-direction: column;
   background: var(--chrome);
   border: 1px solid var(--border);
-  border-radius: 9px;
-  box-shadow: var(--shadow);
+  border-radius: var(--r-4);
+  box-shadow: var(--shadow-3);
   /* The list's rows are square-cornered; without this they paint over the card's radius. */
   overflow: hidden;
 }
@@ -151,7 +151,7 @@
 .counter {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
@@ -189,8 +189,8 @@
 .badge {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.04em;
+  font-size: var(--fs-ui-11);
+  letter-spacing: 0;
   /* A fixed box so the filenames line up whatever the badge says — `TOML` is four glyphs
      and `·` is one, and without this the second column would jitter down the list. */
   width: 34px;
@@ -225,7 +225,7 @@
 .name {
   flex: none;
   color: var(--text);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
 }
 
 .rowSelected .name {
@@ -274,7 +274,7 @@
   text-align: right;
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
 }
 
 /* Command palette: the group sits right-aligned, before the key chip. */
@@ -291,11 +291,11 @@
 .chip {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-11);
   line-height: calc(15px * var(--ui-scale));
   padding: 0 5px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   color: var(--dim);
 }
 
@@ -322,7 +322,7 @@
 .status {
   padding: 16px 14px;
   color: var(--dim);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
 }
 
 /* Reserved for the frame after `picker_open` resolves but before the first frame lands. */
@@ -419,7 +419,7 @@
   direction: rtl;
   text-align: left;
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   font-weight: var(--w-bold);
   color: var(--text-hi);
 }
@@ -429,7 +429,7 @@
 .usageCount {
   flex: none;
   color: var(--faint);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
 }
 
@@ -458,7 +458,7 @@
   text-overflow: ellipsis;
   white-space: pre;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--dim);
 }
 
@@ -479,7 +479,7 @@
 .usageSummary {
   padding: 8px 14px;
   color: var(--faint);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 /* --- M16: the file picker's library scope --- */
@@ -501,7 +501,7 @@
   padding: 0 6px;
   line-height: calc(18px * var(--ui-scale));
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: transparent;
   color: var(--faint);
   font: inherit;
@@ -544,7 +544,7 @@
   padding-left: 10px;
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   white-space: nowrap;
 }
 

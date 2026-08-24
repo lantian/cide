@@ -83,10 +83,18 @@ pub const DEFAULT_HEIGHT: f64 = 900.0;
 pub const DETACHED_WIDTH: f64 = 900.0;
 pub const DETACHED_HEIGHT: f64 = 640.0;
 
-/// Smallest size at which the chrome still lays out: the 42px rail plus a 252px sidebar
+/// Smallest size at which the chrome still lays out: the 46px rail plus a 252px sidebar
 /// plus a usable content column, and enough height for header + tab strip + status bar.
+///
+/// `MIN_HEIGHT` rose from 420 with the chrome itself: the header, tab strip and status bar
+/// grew by 4, 4 and 2 pixels, and `ui/src/toolwindow/toolWindowHeight.ts` subtracts all three
+/// from this number to decide how much room the panes keep. Left at 420, those ten pixels
+/// would have come out of the pane area instead — the tool window would have been allowed to
+/// squeeze the panes below their own floor, on short windows only, which is exactly where
+/// nobody looks for it. `check-toolwindow.mjs` asserts the sum, so the two move together or
+/// the build stops.
 pub const MIN_WIDTH: f64 = 720.0;
-pub const MIN_HEIGHT: f64 = 420.0;
+pub const MIN_HEIGHT: f64 = 430.0;
 
 pub fn create_shell(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let label = WindowLabel::shell();

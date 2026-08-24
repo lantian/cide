@@ -103,7 +103,7 @@ export function outsideAsk(reason: unknown): OutsideAsk | null {
         'path before opening it.',
     files: moved ? [refusal.path, target] : [refusal.path],
     confirmLabel: 'Open anyway',
-    mark: '↗',
+    mark: 'arrow-up-right',
     target,
   }
 }

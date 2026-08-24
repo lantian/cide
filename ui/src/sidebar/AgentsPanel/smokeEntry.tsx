@@ -67,8 +67,16 @@ export interface AgentsDigest {
   staleActions: string[]
   /** How many `<button>` elements the first stale bar contains. Must be exactly two. */
   staleBarButtons: number
-  /** Every phase glyph drawn, in order — the fallback `?` included. */
+  /** Every phase mark drawn, in order, by name — the fallback `circle-slash` included. */
   glyphs: string[]
+  /**
+   * Every mark in the subtree, by name, phase marks and control marks alike.
+   *
+   * Separate from {@link glyphs}, which is only the phase column. A row's pause/resume button is
+   * a bare mark with no text, so "does this row offer Resume" cannot be asked of the button
+   * list any more — it is asked here.
+   */
+  icons: string[]
   /**
    * Elements the panel hooks for the audit but forgot to style, plus every class attribute
    * carrying the literal token `undefined`.
@@ -86,7 +94,7 @@ export interface AgentsRoleDigest {
   id: string
   /** The summary phase, or `'none'` for a role with nothing active. Off `data-phase`. */
   phase: string
-  /** The summary glyph. Never empty, for any input. */
+  /** The summary mark's name. Never empty, for any input. */
   glyph: string
   /** What the row says the subagent is doing, in words. */
   status: string
@@ -114,7 +122,8 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
   const roles: AgentsRoleDigest[] = all(html, 'agentsRole').map((role) => ({
     id: attr(role, 'data-role'),
     phase: attr(role, 'data-phase'),
-    glyph: text(/data-audit="agentsRoleGlyph"[^>]*>([^<]*)</.exec(role)?.[1] ?? ''),
+    glyph:
+      /data-audit="agentsRoleGlyph"[^>]*>\s*<svg[^>]*data-icon="([^"]*)"/.exec(role)?.[1] ?? '',
     status: text(/data-audit="agentsRoleStatus"[^>]*>([^<]*)</.exec(role)?.[1] ?? ''),
     runs: count(role, 'data-audit="agentsRow"'),
     opens: count(role, 'data-audit="agentsOpen"'),
@@ -145,7 +154,10 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
       (m) => text(m[1] ?? ''),
     ),
     staleBarButtons: count(bars[0] ?? '', '<button'),
-    glyphs: [...html.matchAll(/data-audit="agentsGlyph"[^>]*>([^<]*)</g)].map((m) => m[1] ?? ''),
+    icons: [...html.matchAll(/data-icon="([^"]*)"/g)].map((m) => m[1] ?? ''),
+    glyphs: [
+      ...html.matchAll(/data-audit="agentsGlyph"[^>]*>\s*<svg[^>]*data-icon="([^"]*)"/g),
+    ].map((m) => m[1] ?? ''),
     unclassed: unclassed(html),
   }
 }

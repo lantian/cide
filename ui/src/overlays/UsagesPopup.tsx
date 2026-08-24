@@ -29,7 +29,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { groupHits, splitHighlight } from '@/sidebar/SearchModel'
 import { basename } from '@/editor/languages'
-import { FileIcon, useIconTheme } from '@/icons'
+import { Icon, FileIcon, useIconTheme } from '@/icons'
 import styles from './Overlay.module.css'
 import { Hint, ModalShell } from './ModalShell'
 import { matchCounter } from './format'
@@ -177,7 +177,7 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
   return (
     <ModalShell
       label={usagesLabel(name, kind)}
-      prompt="⌕"
+      prompt={<Icon name="search" size={1} />}
       value={query}
       placeholder="Filter by file or line"
       onChange={setQuery}

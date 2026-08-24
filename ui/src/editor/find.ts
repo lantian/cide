@@ -48,6 +48,9 @@ import {
 import type { Extension } from '@codemirror/state'
 import { searchBindings } from './editorKeys'
 import { countLabel, tally, type MatchSpan, type Tally } from './findMatches'
+import { iconElement } from '../icons/iconElement'
+import type { IconName } from '../icons/iconPaths'
+
 import styles from './EditorSurface.module.css'
 
 /**
@@ -72,11 +75,14 @@ export function countMatches(view: EditorView, query: SearchQuery): Tally | null
   return tally(matchSpans(view, query), { from, to })
 }
 
-function button(label: string, title: string, onClick: () => void): HTMLButtonElement {
+function button(mark: IconName, title: string, onClick: () => void): HTMLButtonElement {
   const el = document.createElement('button')
   el.type = 'button'
   el.className = styles.findButton ?? ''
-  el.textContent = label
+  // `iconElement` and not `textContent`: there is no component tree inside a CodeMirror panel,
+  // and the alternative is that this bar keeps drawing characters while the rest of the app
+  // does not — which is the two-systems state the icon set exists to end.
+  el.append(iconElement(mark, 1))
   el.title = title
   // `mousedown` rather than `click`, and prevented: a click on a button steals focus from
   // the input, and the next keystroke would go nowhere.
@@ -124,10 +130,10 @@ class FindPanel implements Panel {
     this.count = document.createElement('span')
     this.count.className = styles.findCount ?? ''
 
-    this.caseToggle = button('Aa', 'Match case', () => {
+    this.caseToggle = button('case-sensitive', 'Match case', () => {
       this.commit({ caseSensitive: !getSearchQuery(this.view.state).caseSensitive })
     })
-    this.regexpToggle = button('.*', 'Regular expression', () => {
+    this.regexpToggle = button('regex', 'Regular expression', () => {
       this.commit({ regexp: !getSearchQuery(this.view.state).regexp })
     })
 
@@ -140,9 +146,9 @@ class FindPanel implements Panel {
       // CodeMirror's bindings, not `cide-core::commands`', so they carry no palette row and no
       // shortcut chip — see the note in `codeMenu.tsx` about why that is deliberate. The bar is
       // therefore the one surface that can tell a user the keys exist.
-      button('↑', 'Previous match (Shift+F3, Shift+Enter)', () => findPrevious(this.view)),
-      button('↓', 'Next match (F3, Enter)', () => findNext(this.view)),
-      button('×', 'Close (Escape)', () => closeSearchPanel(this.view)),
+      button('chevron-up', 'Previous match (Shift+F3, Shift+Enter)', () => findPrevious(this.view)),
+      button('chevron-down', 'Next match (F3, Enter)', () => findNext(this.view)),
+      button('x', 'Close (Escape)', () => closeSearchPanel(this.view)),
     )
   }
 

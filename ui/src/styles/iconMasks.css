@@ -1,0 +1,15 @@
+/*
+ * GENERATED — do not hand-edit. `node ui/scripts/vendor-ui-icons.mjs` writes this file.
+ *
+ * The marks that CSS has to draw, because their site is a `content:` rule rather than a
+ * component: the CodeMirror lint gutter and the markdown preview's external-link marker. Used
+ * as `mask-image`, with the colour coming from the element's `background-color` — see the
+ * script for why that is the only form that keeps a token colour.
+ */
+:root {
+  --icon-circle-x: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%23000%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%2012a10%2010%200%201%200%2020%200a10%2010%200%201%200%20-20%200ZM15%209l-6%206M9%209l6%206%22%2F%3E%3C%2Fsvg%3E");
+  --icon-triangle-alert: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%23000%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M21.73%2018l-8-14a2%202%200%200%200-3.48%200l-8%2014A2%202%200%200%200%204%2021h16a2%202%200%200%200%201.73-3M12%209v4M12%2017h.01%22%2F%3E%3C%2Fsvg%3E");
+  --icon-info: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%23000%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%2012a10%2010%200%201%200%2020%200a10%2010%200%201%200%20-20%200ZM12%2016v-4M12%208h.01%22%2F%3E%3C%2Fsvg%3E");
+  --icon-minus: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%23000%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%2012h14%22%2F%3E%3C%2Fsvg%3E");
+  --icon-arrow-up-right: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%23000%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M7%207h10v10M7%2017%2017%207%22%2F%3E%3C%2Fsvg%3E");
+}

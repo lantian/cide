@@ -43,18 +43,41 @@
 
 /* --- header ------------------------------------------------------------------------------- */
 
+  /*
+   * The panel header, identical in all six sidebar panels.
+   *
+   * It was 10.5px UPPERCASE at 0.09em of tracking in `--dim`, and it was the most dated thing
+   * in the app: a tiny, wide-set, all-caps label is the 2011 section-header signature, and it
+   * appeared here six times plus nineteen more places. Four declarations changed and each
+   * earns its line:
+   *
+   *   10.5px -> 12px      10.5px is under the readable floor for a proportional face, and it
+   *                       was the bottom rung of a scale with nowhere lower to go.
+   *   0.09em -> 0         tracking is what you add to small caps to keep them from setting
+   *                       solid. With no caps there is nothing to loosen.
+   *   uppercase -> none   the label in the TSX is already sentence case — `Project`, `Search`,
+   *                       `Problems`. `text-transform` was doing all of the shouting.
+   *   --dim -> --text/500 a header quieter than the rows beneath it is not a header. `--dim`
+   *                       was compensating for the fact that tracked-out caps already pull the
+   *                       eye; take the caps away and it just looks unfinished.
+   *
+   * The height is `--h-panelheader`, which is the same token value as `--h-tabstrip` and must
+   * stay so — see its comment in `tokens.css`: these two edges are the same line across the
+   * window, and a 4px step down the sidebar seam is what happens when they drift.
+   */
 .header {
-  height: calc(30px * var(--ui-scale));
+  height: var(--h-panelheader);
   flex: none;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 6px 0 10px;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-3) 0 var(--sp-5);
   border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--dim);
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -81,7 +104,7 @@
   width: calc(20px * var(--ui-scale));
   height: calc(20px * var(--ui-scale));
   border: none;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font: inherit;
@@ -103,8 +126,8 @@
 }
 
 .headerAction:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .headerActionOn {
@@ -143,7 +166,7 @@
   left: calc(10px + 7px);
   top: 50%;
   transform: translateY(-50%);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   pointer-events: none;
 }
@@ -154,10 +177,10 @@
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   padding: 3px 7px;
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 .searchInput {
@@ -169,8 +192,8 @@
 }
 
 .input:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
   background: var(--panel);
 }
 
@@ -206,11 +229,15 @@
   background: var(--chrome);
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   padding: 2px 7px;
-  border-radius: 10px;
+  border-radius: var(--r-4);
   cursor: pointer;
   white-space: nowrap;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .chip:hover {
@@ -219,14 +246,18 @@
 }
 
 .chip:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .chipOn {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--on-accent);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .chipOn:hover {
@@ -236,7 +267,7 @@
 
 /* Tabular, so seven counts do not jitter the chips as they change. */
 .chipCount {
-  font-size: var(--fs-ui-9);
+  font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
   color: var(--faint);
 }
@@ -274,10 +305,10 @@
   margin: 0;
   padding: 7px 10px 5px;
   background: var(--panel);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   font-weight: 500;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--faint);
 }
 
@@ -294,11 +325,11 @@
  */
 .route {
   flex: none;
-  font-size: var(--fs-ui-8);
-  letter-spacing: 0.06em;
+  font-size: var(--fs-ui-11);
+  letter-spacing: 0;
   color: var(--faint);
   background: var(--chrome);
-  border-radius: 2px;
+  border-radius: var(--r-2);
   padding: 1px 4px;
 }
 
@@ -315,7 +346,7 @@
   display: flex;
   gap: 2px;
   opacity: 0;
-  transition: opacity 90ms ease-out;
+  transition: opacity var(--dur-1) var(--ease-out);
 }
 
 .groupName:hover .groupActions,
@@ -409,14 +440,14 @@
 }
 
 .nameLink:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
-  border-radius: 2px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--r-2);
 }
 
 .version {
   flex: none;
-  font-size: var(--fs-ui-9-5);
+  font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
   color: var(--faint);
 }
@@ -429,7 +460,7 @@
 .description {
   grid-column: 2;
   margin: 2px 0 0;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--dim);
   display: -webkit-box;
@@ -458,11 +489,11 @@
 }
 
 .perm {
-  font-size: var(--fs-ui-8);
-  letter-spacing: 0.04em;
+  font-size: var(--fs-ui-11);
+  letter-spacing: 0;
   color: var(--faint);
   background: var(--chrome);
-  border-radius: 2px;
+  border-radius: var(--r-2);
   padding: 1px 4px;
   white-space: nowrap;
 }
@@ -493,9 +524,9 @@
   background: var(--accent);
   color: var(--on-accent);
   font: inherit;
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   padding: 2px 9px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   cursor: pointer;
 }
 
@@ -510,10 +541,14 @@
   background: transparent;
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   padding: 2px 6px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .action:hover:not(:disabled) {
@@ -529,13 +564,13 @@
 
 .primary:focus-visible,
 .action:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* A resting state, not a control. Never a disabled button — see `ExtensionsPanel.tsx`. */
 .installed {
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -592,7 +627,7 @@
 
 .langExt {
   grid-column: 1;
-  font-size: var(--fs-ui-9-5);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -603,7 +638,7 @@
   grid-column: 2;
   grid-row: 1;
   align-self: baseline;
-  font-size: var(--fs-ui-9-5);
+  font-size: var(--fs-ui-11);
   color: var(--accent);
   white-space: nowrap;
 }
@@ -612,7 +647,7 @@
   grid-column: 2;
   grid-row: 2;
   align-self: baseline;
-  font-size: var(--fs-ui-8);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   white-space: nowrap;
   text-align: right;
@@ -628,7 +663,7 @@
   margin: 4px 10px;
   padding: 2px 0 2px 7px;
   border-left: 2px solid var(--border);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   line-height: 1.5;
   color: var(--dim);
 }

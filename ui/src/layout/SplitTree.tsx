@@ -330,8 +330,8 @@ function walk(node: LayoutNode, ctx: WalkContext, style: CSSProperties | undefin
 
 /** What the two `+ row` buttons ask for. Named here so the audit can assert on them. */
 const ROW_INTENTS: ReadonlyArray<{ label: string; name: string; intent: SplitIntent }> = [
-  { label: '⊞ bash row', name: 'Add a row with a shell', intent: { kind: 'shell' } },
-  { label: '⊞ claude row', name: 'Add a row with a Claude session', intent: { kind: 'newClaude' } },
+  { label: 'bash row', name: 'Add a row with a shell', intent: { kind: 'shell' } },
+  { label: 'claude row', name: 'Add a row with a Claude session', intent: { kind: 'newClaude' } },
 ]
 
 export function SplitTree({

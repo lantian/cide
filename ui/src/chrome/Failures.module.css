@@ -77,8 +77,8 @@
      unrecognised kind falls back to: a grey edge is visibly wrong, which a missing rule on a
      class table would not be. */
   border-left: 3px solid var(--border);
-  border-radius: 6px;
-  box-shadow: var(--shadow);
+  border-radius: var(--r-3);
+  box-shadow: var(--shadow-2);
 }
 
 /*
@@ -116,7 +116,7 @@
 .text {
   margin: 0;
   color: var(--text);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: 1.45;
   /* A message from Rust can carry a path with no spaces in it. */
   overflow-wrap: anywhere;
@@ -125,7 +125,7 @@
 .hint {
   margin: 0;
   color: var(--dim);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -143,11 +143,15 @@
 
 .summary {
   color: var(--dim);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   cursor: pointer;
   /* The marker is the affordance; without a list-style reset Chromium draws a bullet too. */
   list-style: none;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .summary::-webkit-details-marker {
@@ -167,9 +171,9 @@
 }
 
 .summary:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
-  border-radius: 3px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--r-1);
 }
 
 .detail {
@@ -221,12 +225,16 @@
   border: 0;
   background: transparent;
   color: var(--faint);
-  font-size: var(--fs-ui-15);
+  font-size: var(--fs-ui-16);
   line-height: 1;
   padding: 2px 4px;
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: var(--r-1);
   flex: 0 0 auto;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .dismiss:hover {
@@ -235,6 +243,6 @@
 }
 
 .dismiss:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }

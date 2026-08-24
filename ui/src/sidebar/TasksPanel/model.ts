@@ -110,11 +110,18 @@ export const TONES: readonly Tone[] = ['idle', 'busy', 'attention', 'done']
  * `Record<string, string | undefined>` is a trap, because an `undefined` check does not catch
  * `'constructor'`, whose lookup returns a function.
  */
+/*
+ * Icon names, kept as `string` for the reason this module is import-free — see `AgentsPanel`'s
+ * table, which carries the full argument. `asIcon` narrows at the render site.
+ *
+ * `eye` for review rather than another circle: review is the one status that is a *request to a
+ * person*, and it should not read as another automatic state in the same family.
+ */
 const STATUS_GLYPH: Record<TaskStatus, string> = {
-  todo: '·',
-  doing: '▸',
-  review: '◆',
-  done: '✓',
+  todo: 'circle',
+  doing: 'circle-dot',
+  review: 'eye',
+  done: 'circle-check',
 }
 
 const STATUS_LABEL: Record<TaskStatus, string> = {
@@ -136,7 +143,7 @@ const STATUS_TONE: Record<TaskStatus, Tone> = {
  * may be the empty string, and an empty glyph is a row whose marker column silently collapses —
  * which reads as "this task has no state" rather than "cide does not know this state".
  */
-const UNKNOWN_GLYPH = '?'
+const UNKNOWN_GLYPH = 'circle-slash'
 const UNKNOWN_LABEL = 'Unknown'
 const UNKNOWN_TONE: Tone = 'idle'
 

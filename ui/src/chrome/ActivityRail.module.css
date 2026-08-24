@@ -12,8 +12,8 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 8px 0;
-  gap: 2px;
+  padding: var(--sp-4) 0;
+  gap: var(--sp-2);
   color: var(--dim);
 }
 
@@ -30,16 +30,27 @@
 }
 
 .item {
-  /* Fixed, like the rail that holds it: 28px of SVG in a 42px `--h-rail` gutter, none of which
-     is text. The badge below is the one thing here that carries a glyph, and it scales. */
-  width: 28px;
-  height: 28px;
+  /*
+   * Fixed, like the rail that holds it: a 32px button in a 46px `--h-rail` gutter, none of
+   * which is text. The badge below is the one thing here that carries a glyph, and it scales.
+   *
+   * 32 from 28, and the mark inside it stays 20px (`ICON_PX`, and `--icon-3`). The button grew
+   * and the drawing did not, on purpose: 28px was small for a primary navigation target, and
+   * this is the one set of icons in the app nobody has complained about — growing the artwork
+   * as well would have been a second change with no report behind it. The extra four pixels
+   * become clear space, six a side instead of four.
+   */
+  width: 32px;
+  height: 32px;
   /* A column flex item shrinks by default; the spacer's zero basis means a short window
-     would take the whole deficit out of these boxes and break the mock's 28px. */
+     would take the whole deficit out of these boxes. */
   flex: none;
   display: grid;
   place-items: center;
-  border-radius: 5px;
+  border-radius: var(--r-3);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
   cursor: pointer;
   /* Anchors the git badge, which the mock positions against the button box. */
   position: relative;
@@ -86,8 +97,8 @@
 /* The icons are the only affordance in this rail, so focus has to be visible. Drawn
    inside the 28px box, matching the header and tab strip, so it cannot widen the rail. */
 .item:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /* Pushes the trailing items (settings) to the bottom of the rail. */
@@ -103,14 +114,14 @@
  * it worth drawing.
  *
  * Absolutely positioned, so it cannot widen the rail whatever it says. The arithmetic, since
- * `chrome/layoutAudit.ts` asserts this box to ±2px: the rail is `var(--h-rail)` = 42px with a
- * 28px button centred in it, so the button spans 7px…35px and `right: -2px` puts the pill's
- * right edge at 37px. At `min-width: 18px` a one- or two-digit pill starts at 19px and a
- * three-glyph `99+` — 3 × 9px monospace plus 6px of padding, about 22px — starts at 15px.
+ * `chrome/layoutAudit.ts` asserts this box to ±2px: the rail is `var(--h-rail)` = 46px with a
+ * 32px button centred in it, so the button spans 7px…39px and `right: -2px` puts the pill's
+ * right edge at 41px. At `min-width: 20px` a one- or two-digit pill starts at 21px and a
+ * three-glyph `99+` — 3 × 6.6px monospace plus 8px of padding, about 28px — starts at 13px.
  * Both are inside the rail with room to spare, and `model.badgeText` caps the text at three
  * glyphs precisely so that stays true.
  *
- * `min-width` is 18px rather than the 14px the height suggests for a reason worth stating: it
+ * `min-width` is 20px rather than the 16px the height suggests for a reason worth stating: it
  * is above the width of two digits at this size, so **one and two digits measure the same
  * box**. That makes the audited dimension a property of this stylesheet rather than of
  * JetBrains Mono's advance width, and a font swap can therefore not turn a layout assertion
@@ -123,17 +134,22 @@
   position: absolute;
   top: 0;
   right: -2px;
-  min-width: 18px;
-  height: calc(14px * var(--ui-scale));
-  padding: 0 3px;
+  /*
+   * 20x16, from 18x14: the count went from 9px to 11px when the ladder lost its sub-11px
+   * rungs, and a 14px pill around an 11px digit is the corner-to-corner state the tab strip's
+   * chip was twice reported for. Same family, same floor — see `TabStrip.module.css`.
+   */
+  min-width: 20px;
+  height: calc(16px * var(--ui-scale));
+  padding: 0 var(--sp-2);
   box-sizing: border-box;
-  border-radius: 7px;
+  border-radius: var(--r-full);
   background: var(--accent);
   color: var(--on-accent);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-9);
+  font-size: var(--fs-ui-11);
   /* The line box is the pill: matching `height` centres the digits with no flex container. */
-  line-height: calc(14px * var(--ui-scale));
+  line-height: calc(16px * var(--ui-scale));
   text-align: center;
   /* Digits are the whole content, so a tracked-out font would shift the box between 9 and 10
      changed files. Monospace plus zero tracking keeps one- and two-digit pills stable. */

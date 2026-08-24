@@ -115,6 +115,8 @@ import {
 } from './model'
 import { ActivityRow, RunRow, TONE_CLASS, cx } from './RunRow'
 import type { ProjectId } from '@/ipc/client'
+import { Icon, asIcon } from '@/icons/Icon'
+
 import styles from './AgentsPanel.module.css'
 
 /**
@@ -687,7 +689,7 @@ function ScopeControl({
         {/* Hidden from the accessible name so it reads "Resume …" rather than "▶ Resume …".
             The word beside it is not decoration — see the stylesheet. */}
         <span className={styles.headerActionGlyph} aria-hidden="true">
-          ▶
+          <Icon name="play" size={1} />
         </span>
         Resume
       </button>
@@ -704,7 +706,7 @@ function ScopeControl({
         onClick={onPauseAll}
       >
         <span className={styles.headerActionGlyph} aria-hidden="true">
-          ⏸
+          <Icon name="pause" size={1} />
         </span>
         Pause
       </button>
@@ -825,7 +827,7 @@ function RoleLine({
           data-tone={role.tone}
           aria-hidden="true"
         >
-          {role.glyph}
+          <Icon name={asIcon(role.glyph)} size={1} />
         </span>
         <span className={styles.roleName} title={def.id}>
           {def.label}

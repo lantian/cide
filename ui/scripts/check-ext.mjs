@@ -73,10 +73,28 @@ try {
       + 'first half is a panel that renders nothing, and the second is a branch nothing can reach',
   )
 
-  const icons = [...renderer.matchAll(/^\s{2}([a-z]+): '.*',$/gm)].map((m) => m[1])
+  /*
+   * Every `NodeIcon` has a row in the renderer's table, and every row but `none` names a mark.
+   *
+   * `none` is the one member that is legitimately blank, and it is spelled `null` rather than
+   * `''` since the table stopped holding characters — an extension that says `icon: 'none'` gets
+   * a row with an empty icon column, which is different from a row whose mark failed to resolve.
+   * The rest must name something: a `NodeIcon` with no entry draws nothing at all, which looks
+   * exactly like the `none` case and is not one.
+   */
+  const marks = new Map(
+    [...renderer.matchAll(/^\s{2}([a-z]+): (null|'[a-z-]+'),$/gm)].map((m) => [m[1], m[2]]),
+  )
   for (const icon of view.NODE_ICONS) {
-    ok(icons.includes(icon), `the \`${icon}\` icon has a glyph — an icon with none draws nothing`)
+    ok(marks.has(icon), `the \`${icon}\` icon has a row in the table — one with none draws nothing`)
+    if (icon !== 'none') {
+      ok(
+        marks.get(icon) !== 'null',
+        `and \`${icon}\` names a mark rather than being blank — only \`none\` may be blank`,
+      )
+    }
   }
+  eq(marks.get('none'), 'null', '`none` is the blank one, and it is the only blank one')
   for (const tone of view.NODE_TONES) {
     ok(
       tone === 'normal' || renderer.includes(`styles.tone${tone[0].toUpperCase()}${tone.slice(1)}`),
@@ -105,19 +123,98 @@ try {
     )
   }
 
-  // The Rust enum is the authority; this is the copy the worker sees.
-  const rust = readFileSync(
-    resolve(UI, '..', 'crates', 'cide-ipc', 'src', 'ext.rs'),
-    'utf8',
+  /*
+   * The capability names, pinned against **the wire** rather than against the Rust source.
+   *
+   * This assertion used to scrape `Capability::as_str`'s match arms out of `ext.rs`, and it
+   * passed while the feature was completely broken. `as_str` is the *manifest* spelling; serde's
+   * `rename_all = "camelCase"` was producing a different *wire* spelling; the frontend compared
+   * against the manifest one; and so `capabilities.has('editor:read')` was false for every
+   * extension ever installed — no worker was told about an open file and every host request was
+   * refused. Both sides of the check agreed, and neither of them was the thing that crosses the
+   * boundary.
+   *
+   * `generated.ts` is that thing. There is now one spelling and this is what holds it to one.
+   */
+  const generated = readFileSync(join(UI, 'src', 'ipc', 'generated.ts'), 'utf8')
+  const wire = /export type Capability = ([^;]+);/.exec(generated)?.[1] ?? ''
+  eq(
+    [...wire.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort(),
+    [...protocol.CAPABILITIES].sort(),
+    'the capability names the worker is told about are exactly the ones that cross the wire — a '
+      + 'name in one and not the other is a permission that can be granted and never checked',
   )
+
+  // And the manifest spelling is the same string, so what an author writes is what arrives.
+  const rust = readFileSync(resolve(UI, '..', 'crates', 'cide-ipc', 'src', 'ext.rs'), 'utf8')
   const declared = [...rust.matchAll(/Self::\w+ => "([a-z:]+)",/g)].map((m) => m[1])
   eq(
-    [...protocol.CAPABILITIES].sort(),
     [...new Set(declared)].sort(),
-    'the capability names the worker is told about are exactly `cide_ipc::ext::Capability`\'s — '
-      + 'a name in one and not the other is a permission that can be granted and never checked, '
-      + 'or checked and never granted',
+    [...protocol.CAPABILITIES].sort(),
+    "`Capability::as_str` — what a manifest is parsed against — is the same set again, so an "
+      + 'author writing `editor:read` and a host checking for it are talking about one string',
   )
+
+  /*
+   * Settings: the four kinds, and the fact that the *page* covers every one of them.
+   *
+   * `SettingKind` is a Rust union and `renderSection` is a TypeScript switch, so a kind added
+   * without a control would compile, install, and draw a row with nothing in it — the same shape
+   * of failure a `ViewBody` kind with no renderer has, one screen over.
+   */
+  const kinds = [...generated.matchAll(/export type SettingKind = ([\s\S]*?);/g)][0]?.[1] ?? ''
+  const declaredKinds = [...kinds.matchAll(/"type": "(\w+)"/g)].map((m) => m[1]).sort()
+  eq(
+    declaredKinds,
+    ['choice', 'number', 'text', 'toggle'],
+    'the setting kinds are the four the Settings page has controls for',
+  )
+  const settingsSection = readFileSync(
+    join(UI, 'src', 'settings', 'ExtensionSettings.tsx'),
+    'utf8',
+  )
+  for (const kind of declaredKinds) {
+    ok(
+      settingsSection.includes(`case '${kind}':`),
+      `\`${kind}\` has a control in ExtensionSettings — a kind with none draws a row with nothing `
+        + 'in it, and nothing in the build would notice',
+    )
+  }
+
+  /*
+   * And the section is wired all the way through.
+   *
+   * Three places, and the middle one is the one that was missed when this was written: the Rust
+   * enum, a `SECTIONS` entry for the nav, and a `case` in `renderSection`. Without the last, the
+   * nav row opens a blank page — `renderSection` returns `ReactNode`, `undefined` is a valid one,
+   * and `tsc` said nothing. There is a `never` guard on that switch now and this is its sibling.
+   */
+  const sections = readFileSync(join(UI, 'src', 'settings', 'sections.tsx'), 'utf8')
+  ok(/id: 'extensions'/.test(sections), 'the Extensions section is in the nav')
+  ok(/case 'extensions':/.test(sections), 'and `renderSection` draws it')
+  ok(
+    /function unhandled\(section: never\)/.test(sections),
+    'and the switch is exhaustive by a `never`, so the next section variant is a compile error '
+      + 'rather than a nav row that opens nothing',
+  )
+
+  /*
+   * Every `SettingsSection` the Rust enum has, in the nav and in the switch.
+   *
+   * The `never` guard above catches a *missing* case at compile time, and this catches the other
+   * half it cannot see: a variant with a `case` but no `SECTIONS` entry is a section that renders
+   * fine and has no way to reach it. Both halves have to hold, and only one of them is a type.
+   */
+  const wireSections = /export type SettingsSection = ([^;]+);/.exec(generated)?.[1] ?? ''
+  const everySection = [...wireSections.matchAll(/"([^"]+)"/g)].map((m) => m[1])
+  ok(everySection.length >= 10, `the section list was found (saw ${everySection.length})`)
+  for (const section of everySection) {
+    ok(
+      sections.includes(`id: '${section}'`),
+      `\`${section}\` has a nav entry — a section with a case and no entry cannot be reached`,
+    )
+    ok(sections.includes(`case '${section}':`), `and \`${section}\` has a case`)
+  }
 
   // --- the host validates before it destructures ----------------------------------------------
 

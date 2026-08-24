@@ -55,7 +55,7 @@
 
 .body {
   margin: 0;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
@@ -92,9 +92,9 @@
 
 .groupLabel {
   padding: 8px 18px 4px;
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--faint);
 }
 
@@ -108,11 +108,22 @@
 
 /* Red rather than the accent `CloseConfirm` uses for its dirty dot: these rows are not "at
    risk if you continue", they are the exact files the button below destroys. */
+/*
+ * A filled dot, drawn in CSS rather than as an icon.
+ *
+ * Lucide has no filled primitive — every mark in the set is a stroke — so `circle` here would
+ * draw a *ring*, which reads as "empty" exactly where the meaning is "full". A filled dot is a
+ * shape, not an icon, and this app already draws its shapes this way: `AppHeader`'s project dot
+ * and `TabStrip`'s dirty marker are both boxes with a radius.
+ */
 .mark {
   flex: none;
-  width: 10px;
-  font-size: var(--fs-ui-10);
-  line-height: calc(18px * var(--ui-scale));
+  /* The row's first column: an 8px dot, centred vertically by the row's `align-items`. */
+  width: 8px;
+  height: 8px;
+  margin: 0 1px;
+  border-radius: 50%;
+  background: currentColor;
   color: var(--red);
 }
 
@@ -122,13 +133,13 @@
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--text-hi);
 }
 
 .more {
   padding-left: 37px;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--faint);
 }
 
@@ -161,14 +172,18 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: 1;
   padding: 7px 13px;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   border: 1px solid var(--border);
   background: var(--chrome-hi);
   color: var(--text);
   cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover {
@@ -177,7 +192,7 @@
 }
 
 .button:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -205,6 +220,10 @@
 
 .buttonDanger {
   color: var(--red);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .buttonDanger:hover {
@@ -218,7 +237,7 @@
   flex: none;
   margin: 0;
   padding: 0 18px 14px;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: calc(16px * var(--ui-scale));
   color: var(--faint);
 }

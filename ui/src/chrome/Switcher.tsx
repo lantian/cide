@@ -36,6 +36,8 @@ import { useSwitcher } from '@/keys/switcherStore'
 import { useWorkspace } from '@/store/workspace'
 import { hintFor, selection } from '@/keys/switcher'
 import type { Project, Tab } from '@/ipc/client'
+import { Icon, type IconName } from '@/icons/Icon'
+
 import styles from './Switcher.module.css'
 
 export function Switcher() {
@@ -80,7 +82,7 @@ export function Switcher() {
             >
               {row.dot === null ? (
                 <span className={styles.mark} aria-hidden="true">
-                  {row.mark}
+                  {row.mark === '' ? null : <Icon name={row.mark} size={1} />}
                 </span>
               ) : (
                 <span className={styles.dot} style={{ background: row.dot }} aria-hidden="true" />
@@ -100,10 +102,16 @@ export function Switcher() {
   )
 }
 
-/** One row's contents. `dot` is a project's colour; a tab draws a text `mark` instead. */
+/**
+ * One row's contents. `dot` is a project's colour; a tab draws a `mark` instead.
+ *
+ * `IconName | ''` rather than `IconName | null` because a project row genuinely has no mark and
+ * the empty string is what the dot-or-mark branch below already tests for. The marks were
+ * `◆ ▤ ± ⚙ ·` — five characters from five different parts of Unicode, at five apparent weights.
+ */
 interface Row {
   dot: string | null
-  mark: string
+  mark: IconName | ''
   name: string
   detail: string
 }
@@ -125,24 +133,24 @@ function tabRow(tab: Tab | undefined): Row | null {
   if (tab === undefined) return null
   switch (tab.kind.kind) {
     case 'claudeHome':
-      return { dot: null, mark: '◆', name: 'Claude', detail: 'console' }
+      return { dot: null, mark: 'message-square', name: 'Claude', detail: 'console' }
     case 'claudeFull':
-      return { dot: null, mark: '◆', name: tab.kind.title, detail: 'session' }
+      return { dot: null, mark: 'message-square', name: tab.kind.title, detail: 'session' }
     case 'file':
-      return { dot: null, mark: '▤', name: basename(tab.kind.path), detail: tab.kind.path }
+      return { dot: null, mark: 'file', name: basename(tab.kind.path), detail: tab.kind.path }
     case 'diff':
       return {
         dot: null,
-        mark: '±',
+        mark: 'file-diff',
         name: tab.kind.spec.title,
         detail: tab.kind.spec.newPath,
       }
     case 'settings':
-      return { dot: null, mark: '⚙', name: 'Settings', detail: '' }
+      return { dot: null, mark: 'settings', name: 'Settings', detail: '' }
     default:
       // A `TabKind` variant added later. A row that says *something* beats a popup with a hole
       // in it, and `TabStrip.viewFor` is where the compiler is made to care.
-      return { dot: null, mark: '·', name: 'Tab', detail: '' }
+      return { dot: null, mark: 'circle-slash', name: 'Tab', detail: '' }
   }
 }
 

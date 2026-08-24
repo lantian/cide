@@ -85,6 +85,8 @@ import {
   type TaskView,
   type Tone,
 } from './model'
+import { Icon } from '@/icons/Icon'
+
 import styles from './TasksPanel.module.css'
 
 /**
@@ -173,13 +175,19 @@ export const DELETE_CONFIRM = 'Confirm delete'
 /**
  * The row's unarmed control, which is a glyph rather than a word.
  *
- * 320px, and the row already carries a status glyph, an id, a title and an agent chip. A word
- * there would either push the title out or wrap the row. The glyph carries `title` and
+ * 320px, and the row already carries a status mark, an id, a title and an agent chip. A word
+ * there would either push the title out or wrap the row. The mark carries `title` and
  * `aria-label` with the whole sentence, and the *armed* state is a word — so the destructive
  * label appears exactly when the destructive press is available, which is also the property the
  * render check pins.
  */
-export const DELETE_GLYPH = '×'
+/*
+ * A bin, not the `×` this used to be: `×` is *close* everywhere else in the app — the tab strip,
+ * the pane cluster, every dialog — and a delete that wears the close mark is the one confusion a
+ * destructive control cannot afford. Two different actions may not share a picture now that
+ * there is a set to draw two from.
+ */
+export const DELETE_ICON = 'trash-2' as const
 
 /**
  * The delete gesture: **at most one button, and the conditions in one function.**
@@ -210,7 +218,7 @@ export function DeleteControl({
    */
   label: string
   armed: boolean
-  /** The row's control is a glyph, the card's a word. See [`DELETE_GLYPH`]. */
+  /** The row's control is a mark, the card's a word. See [`DELETE_ICON`]. */
   compact: boolean
   onDeleteArm?: ((task: string) => void) | undefined
   onDelete?: ((task: string) => void) | undefined
@@ -245,7 +253,7 @@ export function DeleteControl({
         aria-label={`Delete ${label}. ${DELETE_TITLE}`}
         onClick={() => onDeleteArm(task)}
       >
-        {compact ? DELETE_GLYPH : DELETE_LABEL}
+        {compact ? <Icon name={DELETE_ICON} size={1} /> : DELETE_LABEL}
       </button>
     )
   }
@@ -504,7 +512,7 @@ export function TaskDetail(props: TaskDetailProps) {
           aria-label="Close task"
           onClick={() => run(closeCard(task, editing, 'dismiss'))}
         >
-          ×
+          <Icon name="x" size={1} />
         </button>
       </div>
 
@@ -958,7 +966,7 @@ function FieldRow({
           }
           onClick={() => run(open ? cancelEdit() : beginEdit(task, editing, field))}
         >
-          {open ? 'Cancel' : '✎'}
+          {open ? 'Cancel' : <Icon name="pencil" size={1} />}
         </button>
       </div>
 

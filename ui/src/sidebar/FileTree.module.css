@@ -19,18 +19,41 @@
   border-right: 1px solid var(--border);
 }
 
+  /*
+   * The panel header, identical in all six sidebar panels.
+   *
+   * It was 10.5px UPPERCASE at 0.09em of tracking in `--dim`, and it was the most dated thing
+   * in the app: a tiny, wide-set, all-caps label is the 2011 section-header signature, and it
+   * appeared here six times plus nineteen more places. Four declarations changed and each
+   * earns its line:
+   *
+   *   10.5px -> 12px      10.5px is under the readable floor for a proportional face, and it
+   *                       was the bottom rung of a scale with nowhere lower to go.
+   *   0.09em -> 0         tracking is what you add to small caps to keep them from setting
+   *                       solid. With no caps there is nothing to loosen.
+   *   uppercase -> none   the label in the TSX is already sentence case — `Project`, `Search`,
+   *                       `Problems`. `text-transform` was doing all of the shouting.
+   *   --dim -> --text/500 a header quieter than the rows beneath it is not a header. `--dim`
+   *                       was compensating for the fact that tracked-out caps already pull the
+   *                       eye; take the caps away and it just looks unfinished.
+   *
+   * The height is `--h-panelheader`, which is the same token value as `--h-tabstrip` and must
+   * stay so — see its comment in `tokens.css`: these two edges are the same line across the
+   * window, and a 4px step down the sidebar seam is what happens when they drift.
+   */
 .header {
-  height: calc(30px * var(--ui-scale));
+  height: var(--h-panelheader);
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 10px;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-5);
   border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--dim);
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -46,7 +69,7 @@
 .headerMeta {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-11);
   letter-spacing: 0;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
@@ -59,7 +82,7 @@
 .headerWarn {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   letter-spacing: 0;
   color: var(--yellow);
   cursor: help;
@@ -84,7 +107,7 @@
   display: grid;
   place-items: center;
   border: 0;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: inherit;
   /* Not the header's own: that is 10.5px uppercase with 0.09em tracking, which would draw the
@@ -114,8 +137,8 @@
 }
 
 .headerAction:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .scroll {
@@ -246,8 +269,8 @@
    selection that vanished while its own menu was open would be pointing at nothing. The
    focus ring goes on the scroll container instead, which is the thing that is focused. */
 .scroll:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /* The inline rename box, in place of `.name`. Same font and size as the row it replaces, so
@@ -261,7 +284,7 @@
   height: calc(18px * var(--ui-scale));
   padding: 0 3px;
   border: 1px solid var(--accent);
-  border-radius: 2px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   /* Follows `.row`, and has to: this input is drawn *over* the row it renames, so any
@@ -290,7 +313,7 @@
   padding: 5px 8px;
   border-top: 1px solid var(--border);
   background: var(--panel-2);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   /* A path relative to the root runs past 252px long before a repository is large. */
   overflow-wrap: anywhere;
@@ -326,6 +349,17 @@
  * cover (U+2191/U+2193 are the only arrows in range) — those are *stroked* arrows, not
  * disclosure triangles, and they would have changed what the control looks like it does.
  */
+/*
+ * The disclosure column.
+ *
+ * The mark inside it is a drawn chevron now, and the two `::before` rules that used to build a
+ * triangle out of `clip-path` are gone with the character that gated them. That character —
+ * `▾`/`▸` in the TSX, hidden by `font-size: 0` — was never rendered: it existed only so
+ * `:not(:empty)` could tell a foldable row from a leaf. Rendering `null` says the same thing
+ * without a codepoint standing in for a boolean, and it makes this tree draw the same mark as
+ * the git log, the search panel, the extension panel and the editor's fold gutter, which is the
+ * whole point of there being a set.
+ */
 .twisty {
   flex: none;
   width: 11px;
@@ -340,7 +374,6 @@
    * height to hit. Stretched, the column is the full 11×24 of the gutter.
    */
   align-self: stretch;
-  font-size: 0;
   color: var(--faint);
 }
 
@@ -366,23 +399,7 @@
  * is on every directory row, but the row only fills the span for `isDir && hasChildren`, and
  * a triangle on a folder whose twisty does nothing invites the click that does nothing.
  */
-[aria-expanded='false'] > .twisty:not(:empty)::before,
-[aria-expanded='true'] > .twisty:not(:empty)::before {
-  content: '';
-  background: currentColor;
-}
 
-[aria-expanded='false'] > .twisty:not(:empty)::before {
-  width: 5px;
-  height: calc(6px * var(--ui-scale));
-  clip-path: polygon(0 0, 0 100%, 100% 50%);
-}
-
-[aria-expanded='true'] > .twisty:not(:empty)::before {
-  width: 7px;
-  height: calc(4px * var(--ui-scale));
-  clip-path: polygon(0 0, 100% 0, 50% 100%);
-}
 
 /*
  * There is no `.glyph` here any more. The row draws a `<FileIcon>`, which brings its own 15px
@@ -499,7 +516,7 @@
 .notice {
   padding: 12px 10px;
   color: var(--dim);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
 }
 
@@ -525,7 +542,7 @@
   border-top: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--red);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   /* Long paths and libgit2 messages both run past 252px; wrapping beats a clipped reason. */
   overflow-wrap: anywhere;
@@ -547,7 +564,7 @@
   border-top: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--dim);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   overflow-wrap: anywhere;
   cursor: pointer;
@@ -627,7 +644,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--faint);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 /*
@@ -738,9 +755,9 @@
   gap: 1px;
   padding: 4px 8px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-3);
   background: var(--chrome);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
 }
 
 .ghostLoad {

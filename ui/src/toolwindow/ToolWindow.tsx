@@ -10,6 +10,8 @@
  */
 import type { ReactNode } from 'react'
 import type { TabRow } from './toolWindowModel'
+import { Icon } from '@/icons/Icon'
+
 import styles from './ToolWindow.module.css'
 
 export interface ToolWindowViewProps {
@@ -69,7 +71,7 @@ export function ToolWindowView({
                 data-audit="toolWindowTabClose"
                 onClick={() => onClose(row.id as string)}
               >
-                ✕
+                <Icon name="x" size={1} />
               </button>
             )}
           </div>
@@ -83,7 +85,7 @@ export function ToolWindowView({
           data-audit="toolWindowHide"
           onClick={onHide}
         >
-          ⌄
+          <Icon name="panel-bottom-close" size={1} />
         </button>
       </div>
       <div className={styles.body} data-audit="toolWindowBody">

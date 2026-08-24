@@ -56,6 +56,8 @@ import {
   type RunRow as RunRowData,
   type Tone,
 } from './model'
+import { Icon, asIcon } from '@/icons/Icon'
+
 import styles from './AgentsPanel.module.css'
 
 /**
@@ -153,7 +155,7 @@ export function ActivityRow({
           data-tone={row.tone}
           aria-hidden="true"
         >
-          {row.glyph}
+          <Icon name={asIcon(row.glyph)} size={1} />
         </span>
         <TaskLink row={row} onRevealTask={onRevealTask} />
         {/* `title` carries the phase in words, because the dot at the head of the line is the
@@ -209,7 +211,7 @@ export function RunRow({
           data-tone={row.tone}
           aria-hidden="true"
         >
-          {row.glyph}
+          <Icon name={asIcon(row.glyph)} size={1} />
         </span>
         {/* The label was copied at dispatch, never joined against the roster at render time:
             a row that re-derives its name renames itself when a config file changes and
@@ -345,7 +347,7 @@ function RunControls({
           title="Freeze this run. It keeps its worktree and its place in the queue."
           aria-label="Pause this run"
         >
-          ⏸
+          <Icon name="pause" size={1} />
         </button>
       )}
       {canResume && onResume !== undefined && (
@@ -357,7 +359,7 @@ function RunControls({
           title="Continue this run."
           aria-label="Resume this run"
         >
-          ▶
+          <Icon name="play" size={1} />
         </button>
       )}
       {canStop && onStop !== undefined && (
@@ -369,7 +371,7 @@ function RunControls({
           title="End this run. Its transcript stays readable in Recent."
           aria-label="Stop this run"
         >
-          ⏹
+          <Icon name="square" size={1} />
         </button>
       )}
     </span>
@@ -419,7 +421,10 @@ function StaleBar({
   if (row.staleTurn === null) return null
   return (
     <div className={styles.staleBar} data-audit="agentsStaleBar">
-      <span className={styles.staleText}>⚠ {row.staleTurn}</span>
+      <span className={styles.staleText}>
+        <Icon name="triangle-alert" size={0} />
+        {row.staleTurn}
+      </span>
       {onRetryTurn !== undefined && (
         <button
           type="button"

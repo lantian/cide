@@ -37,7 +37,7 @@
      many. Scaled, because the chip's *height and glyph* are and this is the only one of the
      three that is a width — left fixed, the reserve would stop holding `9+` the moment the
      chrome font size went up, and the `overflow: hidden` below would eat the `+`. */
-  --awaiting-w: calc(16px * var(--ui-scale));
+  --awaiting-w: calc(18px * var(--ui-scale));
   display: flex;
   align-items: center;
   gap: var(--tab-gap);
@@ -106,7 +106,7 @@
   bottom: 0;
   width: 2px;
   background: var(--accent);
-  border-radius: 1px;
+  border-radius: var(--r-1);
   pointer-events: none;
 }
 
@@ -119,25 +119,33 @@
 
 /* Shape classes carry the per-kind metrics. The gap and the padding travel as custom
    properties so the buttons inside reuse the one value instead of restating it. */
+/*
+ * The three kinds of tab, and what actually differs between them.
+ *
+ * They carried three gap/padding pairs — 8/13, 9/12 and 9/12 — and three sizes. Nobody can see a
+ * one-pixel difference in a gap, so those numbers were not a design, they were three authors.
+ * All three now take the same spacing and the same size; the file tab keeps `--font-mono`,
+ * because a path and a title *are* different things and the face is what says so.
+ */
 .shapeClaude {
-  --tab-gap: 8px;
-  --tab-pad: 13px;
+  --tab-gap: var(--sp-4);
+  --tab-pad: var(--sp-5);
   padding-right: 0px;
   font-weight: 500;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
 }
 
 .shapeFile {
-  --tab-gap: 9px;
-  --tab-pad: 12px;
+  --tab-gap: var(--sp-4);
+  --tab-pad: var(--sp-5);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
+  font-size: var(--fs-ui-13);
 }
 
 .shapeSettings {
-  --tab-gap: 9px;
-  --tab-pad: 12px;
-  font-size: var(--fs-ui-12-5);
+  --tab-gap: var(--sp-4);
+  --tab-pad: var(--sp-5);
+  font-size: var(--fs-ui-13);
 }
 
 /*
@@ -206,37 +214,43 @@
   flex: none;
   width: var(--awaiting-w);
   /*
-   * 16x15, not 13x13, and a pill rather than a rounded square.
+   * 18x16, not 13x13, and a pill rather than a rounded square.
    *
    * At 13px square with a 9.5px digit the ink filled the box corner to corner: reported as
    * "missing padding", which is exactly what it was — there is no padding property to add,
    * because the box is a fixed reserve and the glyph is centred in whatever is left. So the
    * fix is to leave more, and the number to change is the reserve.
    *
+   * It grew a second time, from 16x15, when the type ladder lost its sub-11px rungs: the digit
+   * went from 9.5px to 11px, `9+` went from 11.4px of advance to 13.2px, and the slack fell to
+   * 2.8px — back under the 3px floor, by two tenths of a pixel. `check:awaiting` caught it,
+   * which is the whole reason that gate derives the number instead of pinning it.
+   *
    * `--awaiting-w` is what makes that safe. It is read here AND by `.labelPinned`'s
    * margin/padding pair, so the space the label reaches over grows with the chip and the tab
    * does not shift when the marker appears — which is the one thing this marker may not do.
    * The height is not shared and is set beside it; they are a visual pair, not a layout one.
    *
-   * Still comfortably inside the 30px strip, and **wider** than the two mono digits `9+` needs
-   * — JetBrains Mono advances 0.6em, so 12px at this size against a 16px box — which is what
+   * Still comfortably inside the strip, and **wider** than the two mono digits `9+` needs
+   * — JetBrains Mono advances 0.6em, so 13.2px at this size against an 18px box — which is what
    * stops the clip below ever engaging. `check:awaiting` computes that from these declarations
    * rather than trusting this sentence, because the sentence was written backwards once and
    * still read as an argument.
    */
-  height: calc(15px * var(--ui-scale));
+  height: calc(16px * var(--ui-scale));
   /* Clip rather than `min-width`. If a fallback font ever makes `9+` wider than the box, a
      clipped `+` is a cosmetic loss; `min-width` would let the box grow, which moves the tab
      and every tab after it — the one thing this marker may not do. */
   overflow: hidden;
-  /* A pill: half the height, so the shape says "badge" rather than "small filled square",
-     which is what 3px on a 13px box read as. */
-  border-radius: 8px;
+  /* A pill, so the shape says "badge" rather than "small filled square", which is what 3px on
+     a 13px box read as. `--r-full` rather than half the height: on a box wider than it is tall
+     they are the same stadium, and this one no longer has to be re-derived when it grows. */
+  border-radius: var(--r-full);
   pointer-events: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
-  line-height: calc(15px * var(--ui-scale));
+  line-height: calc(16px * var(--ui-scale));
   text-align: center;
   letter-spacing: 0;
 }
@@ -265,17 +279,36 @@
   font-weight: 600;
 }
 
+/*
+ * The close button, and the size jump that is no longer here.
+ *
+ * `.close` took `font: inherit` and `.closeDirty` overrode it to 14px, so **the button's box
+ * changed size between clean and dirty** — under the pointer, on the keystroke that dirties the
+ * buffer. The file used to note it in passing ("a file going dirty swaps a 12px `×` for a 14px
+ * `•`"); it was a real defect and it is fixed by both states being a fixed 20px box with a
+ * 14px mark or an 8px dot centred in it.
+ *
+ * The negative margin still lets the button reach over the tab's right padding so its edge is
+ * the tab's edge — but with a fixed-width box the reach is `--sp-2 - --tab-pad`, not the whole
+ * padding: the button now has a width of its own to account for.
+ */
 .close {
-  display: flex;
-  align-items: center;
-  height: 100%;
-  margin-right: calc(-1 * var(--tab-pad));
-  padding: 0 var(--tab-pad) 0 0;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-right: calc(var(--sp-2) - var(--tab-pad));
+  padding: 0;
+  border-radius: var(--r-1);
   background: transparent;
   border: 0;
   color: var(--faint);
   font: inherit;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .close:hover {
@@ -287,31 +320,37 @@
 .closeDirty,
 .closeDirty:hover {
   color: var(--accent);
-  font-size: var(--fs-ui-14);
-  line-height: 1;
+}
+
+/* The unsaved marker. A shape, not an icon — see the note at its call site in `TabStrip.tsx`. */
+.dirtyDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .swatch {
-  width: 13px;
-  height: calc(13px * var(--ui-scale));
-  border-radius: 3px;
+  width: 14px;
+  height: calc(14px * var(--ui-scale));
+  border-radius: var(--r-1);
   background: var(--accent);
   flex: none;
 }
 
 .pinned {
-  font-size: var(--fs-ui-9-5);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   padding: 0 4px;
   line-height: calc(13px * var(--ui-scale));
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   flex: none;
 }
 
 .badge {
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-11);
   flex: none;
 }
 
@@ -401,7 +440,7 @@
   /* Not `font: inherit`. The tabs' shape classes set 12-12.5px, and `▾` at that size reads as a
      misplaced character rather than a control; 9px is what the header's caret uses. */
   font-family: inherit;
-  font-size: var(--fs-ui-9);
+  font-size: var(--fs-ui-11);
   line-height: 1;
   cursor: pointer;
 }
@@ -415,6 +454,6 @@
 /* Nothing in this strip has a border to hang focus on, and the tabs box clips its overflow,
    so an outset ring on the last tab would be cut in half. The ring is drawn inside. */
 .strip button:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }

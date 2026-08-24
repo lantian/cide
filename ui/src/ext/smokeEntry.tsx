@@ -12,8 +12,10 @@
  */
 import { renderToStaticMarkup } from 'react-dom/server'
 
+import type { Capability, InstalledExtension } from '@/ipc/client'
 import { ExtPanelView } from './ExtPanelView'
 import { ExtensionTab } from './ExtensionTab'
+import { ExtensionSettingsView } from '@/settings/ExtensionSettings'
 import type { PanelView } from './viewModel'
 import { ExtensionsPanelView } from '@/sidebar/ExtensionsPanel/ExtensionsPanel'
 import {
@@ -74,6 +76,17 @@ const VIEWS: Readonly<Record<string, PanelView>> = {
   markdown: { body: { kind: 'markdown', text: '# Heading\n\nSome prose.' } },
 }
 
+/**
+ * The capability list the fixtures use, typed as the **wire** enum.
+ *
+ * `EntryIn.capabilities` is `readonly string[]`, because `model.ts` imports nothing — so a fixture
+ * could hold any string at all, and for a while it held the manifest spelling while the wire
+ * carried a different one. Binding it to `Capability` here means a rename on either side is a
+ * compile error in this file rather than an extension that installs and never receives an editor
+ * note.
+ */
+const ASKS: readonly Capability[] = ['editor:read', 'editor:write', 'process:spawn']
+
 const MARKET: MarketRowIn = {
   id: 'cide-marketplace',
   name: 'cide extensions',
@@ -86,7 +99,7 @@ const MARKET: MarketRowIn = {
       name: 'SQL',
       version: '0.1.0',
       description: 'SQL syntax, an outline of statements, and sqls.',
-      capabilities: ['editor:read', 'editor:write', 'process:spawn'],
+      capabilities: [...ASKS],
       updateAvailable: false,
     },
     {
@@ -94,7 +107,7 @@ const MARKET: MarketRowIn = {
       name: 'YAML',
       version: '0.1.0',
       description: 'YAML syntax, a document outline, and yaml-language-server.',
-      capabilities: ['editor:read', 'editor:write', 'process:spawn'],
+      capabilities: [...ASKS],
       installed: '0.0.9',
       updateAvailable: true,
     },
@@ -109,7 +122,7 @@ const INSTALLED: InstalledIn[] = [
     name: 'YAML',
     version: '0.0.9',
     enabled: true,
-    capabilities: ['editor:read', 'editor:write', 'process:spawn'],
+    capabilities: ASKS,
     problems: [],
   },
 ]
@@ -230,6 +243,79 @@ stories.push({
   story: 'page',
   html: renderToStaticMarkup(
     <ExtensionTab id={{ marketplace: 'cide-marketplace', extension: 'sql' }} name="SQL" />,
+  ),
+})
+
+/*
+ * The Settings ▸ Extensions page, with one setting of every kind.
+ *
+ * The *view*, with props, and not the store-reading host: zustand's `useSyncExternalStore` reads
+ * `getInitialState` on a server pass, so a component that took its rows from the store would
+ * render the empty screen here whatever this fixture put in it. `ExtensionSettings.tsx`'s header
+ * says the same from the other end.
+ */
+const SHOWCASE: InstalledExtension = {
+  marketplace: 'cide-marketplace',
+  extension: 'showcase',
+  name: 'Showcase',
+  version: '0.1.0',
+  description: '',
+  enabled: true,
+  commit: 'abc',
+  capabilities: [...ASKS],
+  main: 'main.js',
+  path: '/tmp/showcase',
+  problems: [],
+  // Resolved values, which is the shape Rust actually sends: complete, and already coerced.
+  settings: { greeting: 'Hello', rows: 6, density: 'detailed', log: false },
+  contributes: {
+    languages: [],
+    languageServers: [],
+    panels: [],
+    commands: [],
+    settings: [
+      {
+        id: 'greeting',
+        label: 'Greeting',
+        description: 'A text setting.',
+        kind: { type: 'text', default: 'Hello', placeholder: 'Say something' },
+      },
+      { id: 'rows', label: 'Rows in the list', kind: { type: 'number', default: 6, min: 1, max: 20 } },
+      {
+        id: 'density',
+        label: 'Detail',
+        kind: {
+          type: 'choice',
+          default: 'detailed',
+          choices: [
+            { value: 'plain', label: 'Plain' },
+            { value: 'detailed', label: 'Detailed' },
+          ],
+        },
+      },
+      { id: 'log', label: 'Log every note', kind: { type: 'toggle', default: false } },
+    ],
+  },
+}
+
+stories.push({
+  story: 'settings',
+  html: renderToStaticMarkup(
+    <ExtensionSettingsView extensions={[SHOWCASE]} onChange={() => {}} />,
+  ),
+})
+// Nothing installed at all, and nothing installed *with settings*, are two different sentences
+// and only one of them suggests installing something.
+stories.push({
+  story: 'settings-none',
+  html: renderToStaticMarkup(<ExtensionSettingsView extensions={[]} />),
+})
+stories.push({
+  story: 'settings-nothing-to-configure',
+  html: renderToStaticMarkup(
+    <ExtensionSettingsView
+      extensions={[{ ...SHOWCASE, contributes: { ...SHOWCASE.contributes, settings: [] } }]}
+    />,
   ),
 })
 

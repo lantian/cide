@@ -73,7 +73,7 @@
   height: 28px;
   display: grid;
   place-items: center;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   cursor: pointer;
   font-size: var(--fs-ui-14);
 }
@@ -127,26 +127,26 @@
   border-bottom: 2px solid var(--accent);
   color: var(--text-hi);
   font-weight: 500;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   font-family: inherit;
 }
 
 .tabSwatch {
   width: 13px;
   height: calc(13px * var(--ui-scale));
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: var(--accent);
   display: inline-block;
 }
 
 .pinned {
-  font-size: var(--fs-ui-9-5);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   padding: 0 4px;
   line-height: calc(13px * var(--ui-scale));
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
 }
 
 /* The bench overlay — M0 only. */
@@ -168,8 +168,8 @@
   overflow: auto;
   background: var(--chrome);
   border: 1px solid var(--border);
-  border-radius: 9px;
-  box-shadow: var(--shadow);
+  border-radius: var(--r-4);
+  box-shadow: var(--shadow-3);
   padding: 16px 20px;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
@@ -208,8 +208,8 @@
   bottom: 38px;
   z-index: 20;
   padding: 5px 10px;
-  border-radius: 5px;
-  font-size: var(--fs-ui-11-5);
+  border-radius: var(--r-2);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
   background: var(--chrome);
   border: 1px solid var(--border);
@@ -244,7 +244,7 @@
   padding: 12px 10px;
   background: var(--panel);
   border-right: 1px solid var(--border);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
 }

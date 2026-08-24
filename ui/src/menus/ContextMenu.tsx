@@ -41,6 +41,8 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { Icon } from '@/icons/Icon'
+
 import styles from './ContextMenu.module.css'
 import {
   activeItem,
@@ -564,7 +566,7 @@ export function ContextMenu({
             >
               {hasToggle && (
                 <span className={styles.check} aria-hidden="true">
-                  {entry.checked === true ? '✓' : ''}
+                  {entry.checked === true ? <Icon name="check" size={0} /> : null}
                 </span>
               )}
               <span className={styles.label}>{entry.label}</span>
@@ -572,7 +574,7 @@ export function ContextMenu({
               {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}
               {entry.submenu !== null && (
                 <span className={styles.chevron} aria-hidden="true">
-                  ›
+                  <Icon name="chevron-right" size={1} />
                 </span>
               )}
             </button>
@@ -632,7 +634,7 @@ export function ContextMenu({
               >
                 {subHasToggle && (
                   <span className={styles.check} aria-hidden="true">
-                    {entry.checked === true ? '✓' : ''}
+                    {entry.checked === true ? <Icon name="check" size={0} /> : null}
                   </span>
                 )}
                 <span className={styles.label}>{entry.label}</span>

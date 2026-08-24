@@ -94,24 +94,45 @@ pub struct ExtProblem {
 /// tries — the rule `cide_agents::dispatch_refusal` follows for `bypassPermissions`, and for its
 /// reason: refusing at load makes the row *vanish*, and a user cannot grant a permission to
 /// something they cannot see.
+///
+/// # One spelling, and it is the manifest's
+///
+/// Every variant carries an explicit `#[serde(rename)]` so the value on the wire is the value an
+/// author writes in `cide-extension.json` — `editor:read`, not `editorRead`.
+///
+/// It was `rename_all = "camelCase"` for exactly as long as it took to run, and the failure is
+/// worth recording because nothing in the build could see it. The *manifest* spelling came from
+/// [`Capability::as_str`] and the *wire* spelling came from serde, the frontend compared against
+/// the manifest one, and so `capabilities.has('editor:read')` was false for every extension ever
+/// installed: no worker was told about an open file, and every host request was refused. Two
+/// panels drew "open a .sql file" over an open `.sql` file, and the check that should have caught
+/// it was comparing the frontend's list against `as_str`'s table — both sides of a two-sided
+/// agreement, neither of them the wire.
+///
+/// So `as_str` is now the *only* spelling, serde is told to use it, and `check-ext.mjs` compares
+/// against `generated.ts` — the artefact that actually crosses the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum Capability {
     /// Read the text, path and language of files open in the editor, and be told when they
     /// change. Does **not** include reading the disk.
+    #[serde(rename = "editor:read")]
     EditorRead,
     /// Contribute decorations, diagnostics and an outline back to an open file.
+    #[serde(rename = "editor:write")]
     EditorWrite,
     /// Read files under a project root, gitignore-filtered, through the host. Never absolute
     /// paths, never outside a root — the host resolves and refuses, not the extension.
+    #[serde(rename = "fs:read")]
     FsRead,
     /// Ask for git status and history through the host. Read-only; there is no `git:write`, and
     /// there will not be one until something needs it badly enough to argue for it here.
+    #[serde(rename = "git:read")]
     GitRead,
     /// Run a process. What a `languageServers` contribution needs, and the one capability whose
     /// grant is a real trust decision — the manifest names a binary and cide runs it against the
     /// user's project.
+    #[serde(rename = "process:spawn")]
     ProcessSpawn,
 }
 
@@ -207,8 +228,146 @@ pub struct ExtCommandDef {
     pub keywords: Vec<String>,
 }
 
+/// One choice in a [`SettingKind::Choice`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SettingChoice {
+    /// What is stored and what the worker reads.
+    pub value: String,
+    /// What the Settings page shows. Defaults to `value` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub label: Option<String>,
+}
+
+/// What kind of value a setting holds, and therefore what control edits it.
+///
+/// Four, and the set is closed for the reason [`crate::ext::PanelDef`] draws from a fixed icon
+/// table: a setting cide has no control for is a setting the user cannot change, and the answer to
+/// a genuinely missing kind is to add one here — where it gets a control, a theme and a check —
+/// rather than to open a hole for arbitrary markup.
+///
+/// The `default` is part of the *kind* rather than a field beside it, because a default has to
+/// have the kind's type and a separate field could not be made to. It is also what a setting reads
+/// as before the user has ever touched it, so an extension always has a value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
+#[ts(export)]
+pub enum SettingKind {
+    Toggle {
+        default: bool,
+    },
+    Text {
+        default: String,
+        /// Shown in an empty field. Not a default — a placeholder the user never replaces stores
+        /// the empty string, which is the distinction a settings screen most often gets wrong.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        placeholder: Option<String>,
+    },
+    Number {
+        default: f64,
+        /// Clamped to this band on the way in, wherever the value came from. A hand-edited
+        /// `extensions.json` goes through the same coercion the spin control does — a clamp that
+        /// lives only in the UI is one `invoke` away from being bypassed, which is the argument
+        /// `cide_ipc::settings`' own clamps already make.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        min: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        max: Option<f64>,
+    },
+    Choice {
+        default: String,
+        choices: Vec<SettingChoice>,
+    },
+}
+
+/// One setting an extension contributes to the Settings page.
+///
+/// # Why an extension may have settings at all
+///
+/// Because the alternative is each one inventing its own. An extension that needed a number would
+/// otherwise put a field in its own panel, or read a file of its own, or ask the user to edit
+/// JSON — three surfaces cide cannot theme, cannot validate and cannot show in the one place a
+/// person looks for *configure the thing*.
+///
+/// # Global, not per project
+///
+/// Stored in `extensions.json` beside the grant that installed the extension, on the same argument
+/// `cide_ext::config`'s header makes for the install itself: an extension is a *tool*, chosen once
+/// and wanted everywhere, and a per-project copy would mean setting it again in every checkout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SettingDef {
+    /// Unique within the extension. What the worker reads it by, and the key it is stored under —
+    /// so, like a command id, it is API and must not be renamed once shipped.
+    pub id: String,
+    /// The control's label. A noun phrase, sentence case.
+    pub label: String,
+    /// One line under the label. Absent is fine for a setting whose label says everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
+    pub kind: SettingKind,
+}
+
+impl SettingDef {
+    /// The value this setting reads as, given whatever was stored for it.
+    ///
+    /// **Total, and never fails.** A stored value of the wrong type, out of band, or naming a
+    /// choice that no longer exists falls back to the default — which is the conservative
+    /// direction and the only one that keeps an extension's promise that a setting always has a
+    /// value of the declared type. `extensions.json` is a file the user may hand-edit and a
+    /// marketplace may change a `choices` list in an update, so both of those are ordinary rather
+    /// than exotic.
+    ///
+    /// The one place a value is decided, so the spin control, the hand edit and the update all get
+    /// the same answer.
+    #[must_use]
+    pub fn coerce(&self, stored: Option<&serde_json::Value>) -> serde_json::Value {
+        match &self.kind {
+            SettingKind::Toggle { default } => serde_json::Value::Bool(
+                stored
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(*default),
+            ),
+            SettingKind::Text { default, .. } => serde_json::Value::String(
+                stored
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(default)
+                    .to_string(),
+            ),
+            SettingKind::Number { default, min, max } => {
+                let raw = stored
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(*default);
+                // Non-finite before the clamp: `NaN.clamp` panics, and a `NaN` can arrive from a
+                // hand-edited file through `serde_json`'s arbitrary-precision path.
+                let value = if raw.is_finite() { raw } else { *default };
+                let value = min.map_or(value, |low| value.max(low));
+                let value = max.map_or(value, |high| value.min(high));
+                serde_json::Number::from_f64(value)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+            }
+            SettingKind::Choice { default, choices } => {
+                let wanted = stored.and_then(serde_json::Value::as_str);
+                let known = wanted.filter(|value| choices.iter().any(|c| c.value == *value));
+                serde_json::Value::String(known.unwrap_or(default).to_string())
+            }
+        }
+    }
+}
+
 /// Everything one extension declares.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct Contributions {
@@ -216,6 +375,7 @@ pub struct Contributions {
     pub language_servers: Vec<LanguageServerDef>,
     pub panels: Vec<PanelDef>,
     pub commands: Vec<ExtCommandDef>,
+    pub settings: Vec<SettingDef>,
 }
 
 // ==========================================================================================
@@ -325,7 +485,12 @@ pub struct ResolvedExtCommand {
 }
 
 /// An installed extension.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+///
+/// `Eq` is deliberately absent from here down: a [`SettingKind::Number`] carries an `f64`, so
+/// nothing containing a [`Contributions`] can be `Eq`. `PartialEq` is what every caller actually
+/// uses — comparing two snapshots, asserting one in a test — and the difference only matters to a
+/// `HashMap` key, which none of these is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct InstalledExtension {
@@ -341,6 +506,14 @@ pub struct InstalledExtension {
     pub commit: String,
     pub capabilities: Vec<Capability>,
     pub contributes: Contributions,
+    /// Every contributed setting's current value, keyed by [`SettingDef::id`].
+    ///
+    /// **Resolved, not stored**: the defaults with whatever the user changed layered on top, every
+    /// one already through [`SettingDef::coerce`]. So a reader — the Settings page, the worker —
+    /// never has to know what a default is or what happens when a stored value is the wrong type.
+    /// The *stored* half, which is only the differences, is `extensions.json`'s.
+    #[ts(type = "Record<string, boolean | string | number>")]
+    pub settings: std::collections::BTreeMap<String, serde_json::Value>,
     /// The directory the code was copied into. Shown in the panel; also the jail
     /// `cide-ext://` resolves against.
     #[ts(type = "string")]
@@ -438,7 +611,7 @@ pub struct Marketplace {
 ///
 /// One snapshot rather than four calls, on `Bootstrap`'s argument: a panel that has to make
 /// several requests before it can paint shows several intermediate states.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ExtensionSnapshot {
@@ -467,7 +640,7 @@ pub struct ExtensionSnapshot {
 /// a tab restored from the reopen stack after the user disconnected. The tab says so; it does not
 /// close itself, because a tab that vanished when it was activated would be worse than one that
 /// explains.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ExtensionPage {

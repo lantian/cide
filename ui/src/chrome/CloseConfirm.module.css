@@ -37,7 +37,7 @@
 
 .body {
   margin: 0;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
@@ -61,9 +61,9 @@
 
 .groupLabel {
   padding: 8px 18px 4px;
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--faint);
 }
 
@@ -77,11 +77,22 @@
 
 /* The mark carries the meaning: `●` is the tab strip's dirty dot, so the row and the tab
    the user is looking at are marked the same way. */
+/*
+ * A filled dot, drawn in CSS rather than as an icon.
+ *
+ * Lucide has no filled primitive — every mark in the set is a stroke — so `circle` here would
+ * draw a *ring*, which reads as "empty" exactly where the meaning is "full". A filled dot is a
+ * shape, not an icon, and this app already draws its shapes this way: `AppHeader`'s project dot
+ * and `TabStrip`'s dirty marker are both boxes with a radius.
+ */
 .mark {
   flex: none;
-  width: 10px;
-  font-size: var(--fs-ui-10);
-  line-height: calc(18px * var(--ui-scale));
+  /* The row's first column: an 8px dot, centred vertically by the row's `align-items`. */
+  width: 8px;
+  height: 8px;
+  margin: 0 1px;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .markUnsaved {
@@ -90,11 +101,13 @@
 
 .markSession {
   color: var(--yellow);
+  /* Square, not round: the shape is what tells a session from an unsaved file. */
+  border-radius: var(--r-1);
 }
 
 .name {
   flex: none;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   color: var(--text-hi);
 }
 
@@ -126,14 +139,18 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: 1;
   padding: 7px 13px;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   border: 1px solid var(--border);
   background: var(--chrome-hi);
   color: var(--text);
   cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover {
@@ -142,7 +159,7 @@
 }
 
 .button:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -172,6 +189,10 @@
 
 .buttonDanger {
   color: var(--red);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .buttonDanger:hover {

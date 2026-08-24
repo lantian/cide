@@ -26,6 +26,8 @@ import { useContextMenu } from '@/menus'
 import { projectMenu, type RecentEntry } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { recentEntries } from './menuModel'
+import { Icon } from '@/icons/Icon'
+
 import styles from './AppHeader.module.css'
 
 export function ProjectMenu() {
@@ -121,7 +123,7 @@ export function ProjectMenu() {
         aria-expanded={isOpen}
         onClick={openRecents}
       >
-        ▾
+        <Icon name="chevron-down" size={1} />
       </button>
       {menu}
     </div>

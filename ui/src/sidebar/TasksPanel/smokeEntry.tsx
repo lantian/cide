@@ -73,7 +73,7 @@ export interface TasksDigest {
   writeControls: number
   /** Group headings, in the order drawn: `<label>|<count>`. */
   groups: string[]
-  /** One entry per list row: `<status>|<glyph>|<id>|<title>`. */
+  /** One entry per list row: `<status>|<icon name>|<id>|<title>`. */
   rows: string[]
   /** Each chip's class attribute, verbatim. Hashed, but stable within one bundle. */
   chipClasses: string[]
@@ -187,7 +187,10 @@ function digest(
    * in the row, so a reordered row cannot make this silently digest the id as the title.
    */
   const rows = all(html, 'tasksRow').map((row) => {
-    const glyph = text(/data-audit="tasksGlyph"[^>]*>([^<]*)</.exec(row)?.[1] ?? '')
+    // The mark's name off `data-icon`, not its text: a drawn mark has no text node. See
+    // `icons/Icon.tsx` for why the attribute is there.
+    const glyph =
+      /data-audit="tasksGlyph"[^>]*>\s*<svg[^>]*data-icon="([^"]*)"/.exec(row)?.[1] ?? ''
     const status = /data-audit="tasksGlyph"[^>]*data-status="([^"]*)"/.exec(row)?.[1] ?? ''
     const title = text(/class="[^"]*taskTitle[^"]*"[^>]*>([^<]*)</.exec(row)?.[1] ?? '')
     return `${status}|${glyph}|${attr(row, 'data-task')}|${title}`

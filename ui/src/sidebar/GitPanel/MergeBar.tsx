@@ -16,6 +16,8 @@ import type { MergeState } from '@/ipc/client'
 // carry the same three parts (a glyph, a sentence, a row of equal-weight actions) and must not
 // drift apart visually. The one thing this bar overrides is the glyph's colour — see
 // `.glyphConflict` — because yellow means *two views disagree* and this is not that.
+import { Icon } from '@/icons/Icon'
+
 import styles from './GuardBar.module.css'
 
 export interface MergeBarProps {
@@ -56,7 +58,7 @@ export function MergeBar({
   return (
     <div className={styles.bar} role="status" data-audit="mergeBar">
       <span className={`${styles.glyph} ${styles.glyphConflict}`} aria-hidden="true">
-        ⚔
+        <Icon name="swords" size={1} />
       </span>
       <span className={styles.text} data-audit="mergeBarText">
         {what}

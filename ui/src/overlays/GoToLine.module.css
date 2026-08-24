@@ -43,8 +43,8 @@
 
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 9px;
-  box-shadow: var(--shadow);
+  border-radius: var(--r-4);
+  box-shadow: var(--shadow-2);
   overflow: hidden;
 }
 
@@ -54,10 +54,10 @@
   padding: 9px 14px 7px;
   border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   font-weight: 500;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--faint);
 }
 
@@ -74,13 +74,13 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   /* Mono, and `tabular-nums`, because the content is a number the user is comparing with the
      line count in the note underneath. */
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   font-variant-numeric: tabular-nums;
 }
 
@@ -94,7 +94,7 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 12px;
   border: 1px solid var(--accent);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--accent);
   color: var(--on-accent);
   font-family: var(--font-ui);

@@ -26,6 +26,8 @@
  */
 import { RangeSet, StateEffect, StateField } from '@codemirror/state'
 import { EditorView, GutterMarker, gutter } from '@codemirror/view'
+import { iconElement } from '../icons/iconElement'
+import type { IconName } from '../icons/iconPaths'
 
 /**
  * One region's controls in one side pane: which region, on which line.
@@ -65,7 +67,7 @@ const chevronField = StateField.define<RangeSet<GutterMarker>>({
 class ChevronMarker extends GutterMarker {
   constructor(
     readonly id: string,
-    readonly glyph: string,
+    readonly glyph: IconName,
     readonly answered: boolean,
     readonly act: () => (id: string, what: 'accept' | 'ignore' | 'revert') => void,
   ) {
@@ -93,7 +95,7 @@ class ChevronMarker extends GutterMarker {
     wrap.className = 'cm-mergeChevronPair'
     if (this.answered) {
       wrap.appendChild(
-        this.button('↺', 'cm-mergeRevert', 'revert', 'Undo this side and ask about it again'),
+        this.button('undo-2', 'cm-mergeRevert', 'revert', 'Undo this side and ask about it again'),
       )
       return wrap
     }
@@ -108,13 +110,13 @@ class ChevronMarker extends GutterMarker {
     // IDEA's `X`. Rejecting is a decision, not the absence of one: it settles this side, its
     // buttons go, and the base stands for the block unless the other side is taken.
     wrap.appendChild(
-      this.button('✕', 'cm-mergeIgnore', 'ignore', 'Reject this block and keep the base'),
+      this.button('x', 'cm-mergeIgnore', 'ignore', 'Reject this block and keep the base'),
     )
     return wrap
   }
 
   private button(
-    glyph: string,
+    mark: IconName,
     className: string,
     what: 'accept' | 'ignore' | 'revert',
     title: string,
@@ -122,7 +124,7 @@ class ChevronMarker extends GutterMarker {
     const button = document.createElement('button')
     button.type = 'button'
     button.className = className
-    button.textContent = glyph
+    button.append(iconElement(mark, 1))
     button.title = title
     button.setAttribute('data-audit', `merge-${what}`)
     // `mousedown` rather than `click`, and prevented: a click in a gutter otherwise moves the
@@ -156,7 +158,7 @@ export function conflictGutter(which: 'ours' | 'theirs'): ReturnType<typeof gutt
       markers: (view) => view.state.field(chevronField),
       // Nothing here depends on the *line*, only on the pushed set, so no `lineMarker`.
       initialSpacer: () =>
-        new ChevronMarker('', which === 'ours' ? '»' : '«', false, () => () => {}),
+        new ChevronMarker('', which === 'ours' ? 'chevrons-right' : 'chevrons-left', false, () => () => {}),
     }),
   ]
 }
@@ -169,7 +171,7 @@ export function setGutter(
   act: () => (id: string, what: 'accept' | 'ignore' | 'revert') => void,
 ): void {
   const doc = view.state.doc
-  const glyph = which === 'ours' ? '»' : '«'
+  const glyph = which === 'ours' ? 'chevrons-right' : 'chevrons-left'
   const ranges = chevrons
     .map((c) => {
       const line = Math.min(Math.max(c.line + 1, 1), doc.lines)

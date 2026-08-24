@@ -32,6 +32,7 @@ import { basename, matchCounter, symbolBadge } from './format'
 import { listAction } from './listKeys'
 import { searchCommands } from './score'
 import { scaledRow, useUiScale } from '@/settings/useUiScale'
+import { Icon } from '@/icons/Icon'
 
 /** Fixed, so the virtualizer never has to measure. The same height every picker row uses. */
 const ROW_HEIGHT = 26
@@ -147,7 +148,7 @@ export function StructurePicker({ project, onDismiss, onGoTo }: StructurePickerP
   return (
     <ModalShell
       label={path === null ? 'File structure' : `File structure — ${basename(path)}`}
-      prompt="⌗"
+      prompt={<Icon name="list-tree" size={1} />}
       value={query}
       onChange={setQuery}
       onKeyDown={onKeyDown}

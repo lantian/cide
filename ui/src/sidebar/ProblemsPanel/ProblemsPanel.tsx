@@ -60,14 +60,22 @@ import {
   type Severity,
   type SourceRow,
 } from './model'
+import { Icon, type IconName } from '@/icons/Icon'
+
 import styles from './ProblemsPanel.module.css'
 
-/** The mock has no problems row, so the glyphs follow the status bar's `✗` / `⚠` family. */
-const SEVERITY_GLYPH: Record<Severity, string> = {
-  error: '✗',
-  warning: '⚠',
-  info: 'ℹ',
-  hint: '·',
+/**
+ * The severity marks, and they are deliberately the status bar's and the editor gutter's.
+ *
+ * A user reading the margin of a file, the status bar's counters and this panel is looking at
+ * one alphabet in three places — which was already the intent when all three were `✗ ⚠ ℹ ·`, and
+ * is now literally true: `styles/iconMasks.css` draws the gutter from the same vendored paths.
+ */
+const SEVERITY_ICON: Record<Severity, IconName> = {
+  error: 'circle-x',
+  warning: 'triangle-alert',
+  info: 'info',
+  hint: 'minus',
 }
 
 /*
@@ -93,9 +101,9 @@ const SEVERITY_CLASS: Record<Severity, string | undefined> = {
  * the raw severity still visible in the row's title, which is the honest way to show a row we
  * do not know how to categorise.
  */
-function severityLook(severity: Severity): { glyph: string; className: string | undefined } {
-  if (!isSeverity(severity)) return { glyph: '·', className: styles.hint }
-  return { glyph: SEVERITY_GLYPH[severity], className: SEVERITY_CLASS[severity] }
+function severityLook(severity: Severity): { icon: IconName; className: string | undefined } {
+  if (!isSeverity(severity)) return { icon: 'minus', className: styles.hint }
+  return { icon: SEVERITY_ICON[severity], className: SEVERITY_CLASS[severity] }
 }
 
 export interface ProblemsPanelProps {
@@ -149,7 +157,8 @@ export interface ProblemsPanelProps {
    * Separate from [`onRefresh`] and labelled separately, because they cost two different things:
    * a re-run is seconds, a restart is minutes of re-indexing on a large workspace.
    */
-  onRestartSource?: ((id: string) => void) | undefined
+  /** The row's `label` travels with its id, so the notice need not guess a display name. */
+  onRestartSource?: ((id: string, label: string) => void) | undefined
 }
 
 export function ProblemsPanel({
@@ -217,15 +226,15 @@ export function ProblemsPanel({
               <p className={styles.noteHead}>Why this is not a clean bill of health</p>
               <p className={styles.detail}>
                 An empty problems list normally means “checked, nothing wrong”. Here it means
-                nobody checked. The status bar says the same thing with <code>✗ —</code> rather
-                than <code>✗ 0</code>.
+                nobody checked. The status bar says the same thing by showing a dash beside its
+                error mark rather than a zero.
               </p>
               <p className={styles.noteHead}>What still catches errors today</p>
               <ul className={styles.list}>
                 {/* Named concretely so the answer is actionable rather than reassuring. */}
                 <li>The terminal — <code>cargo check</code>, <code>tsc --noEmit</code>, your test run.</li>
                 <li>Claude, which reads compiler output from the panes it is given.</li>
-                <li>Git, for what changed; the ⑂ panel, not this one.</li>
+                <li>Git, for what changed; the Git panel, not this one.</li>
               </ul>
               <p className={styles.noteHead}>What would fill this panel</p>
               <p className={styles.detail}>
@@ -276,7 +285,7 @@ export function ProblemsPanel({
                     const body = (
                       <>
                         <span className={`${styles.glyph} ${look.className}`} aria-hidden="true">
-                          {look.glyph}
+                          <Icon name={look.icon} size={1} />
                         </span>
                         <span className={styles.message}>{item.message}</span>
                         {item.code !== undefined && (
@@ -380,7 +389,7 @@ function SourceLine({
   onRestart,
 }: {
   source: SourceRow
-  onRestart?: ((id: string) => void) | undefined
+  onRestart?: ((id: string, label: string) => void) | undefined
 }) {
   // Same membership-before-lookup discipline as `severityLook`: `status` is a string that came
   // from another process, and a prototype key would hand back a function that `className`
@@ -390,9 +399,7 @@ function SourceLine({
     : undefined
   return (
     <div className={styles.source} data-audit="problemsSource" data-source={source.id}>
-      <span className={`${styles.sourceDot} ${dotClass ?? ''}`} aria-hidden="true">
-        ●
-      </span>
+      <span className={`${styles.sourceDot} ${dotClass ?? ''}`} aria-hidden="true" />
       <span className={styles.sourceText}>
         <span className={styles.sourceLabel}>{source.label}</span>
         <p className={styles.sourceDetail}>{source.detail}</p>
@@ -411,7 +418,7 @@ function SourceLine({
           type="button"
           className={styles.action}
           data-audit="problemsRestart"
-          onClick={() => onRestart(source.id)}
+          onClick={() => onRestart(source.id, source.label)}
           title={`Stop ${source.label} and start it again. Slower than Re-run — it re-indexes the workspace from scratch.`}
         >
           Restart

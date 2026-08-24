@@ -1,11 +1,24 @@
 /**
- * The dimensional half of M3's acceptance criterion, expressed as data.
+ * The chrome's dimensions, expressed as data and read back off the live DOM.
  *
- * The criterion is a screenshot diff against the mock at 1440x900 in both themes. Neither
- * side of that diff is obtainable here: the mock is a template that needs a runtime we do
- * not have, and on KDE Wayland the app window cannot reliably be raised for a capture. What
- * survives without either is the geometry itself — every number the mock states, read back
- * off the live DOM and compared at the tolerance the milestone sets.
+ * # What these numbers are, which changed
+ *
+ * They began as M3's acceptance criterion: a screenshot diff against `Grount IDE.dc.html` at
+ * 1440x900 in both themes. Neither side of that diff was ever obtainable here — the mock was a
+ * template needing a runtime this repo does not have, and on KDE Wayland the window cannot
+ * reliably be raised for a capture — so what survived was the geometry, transcribed here.
+ *
+ * **The mock is gone**, and it was never in this repository; this table was the only surviving
+ * copy of it. As of M23 these numbers are therefore *cide's own specification* rather than a
+ * transcription of somebody else's, and about twenty of them were deliberately redrawn: the
+ * chrome was small, sharp-cornered and motionless, which is what the redesign was asked to fix.
+ * A future reader who finds the mock should treat it as history, not as a target this file is
+ * failing to hit.
+ *
+ * Every changed row was edited even where the ±2px tolerance would have hidden the change —
+ * roughly half of them would have passed untouched. A stale `expected` is the same class of lie
+ * as a missing hook: it makes the file a rubber stamp rather than a specification, and this is
+ * the only tool in the repository that can see these numbers at all.
  *
  * Elements are located through `data-audit` attributes rather than CSS Module class names,
  * because module class names are hashed at build time and change whenever a rule moves. The
@@ -16,7 +29,7 @@
  * failure mode this file exists to prevent.
  */
 
-/** The milestone's stated allowance: every dimension within 2px of the mock. */
+/** The stated allowance: every dimension within 2px of the value recorded here. */
 export const TOLERANCE = 2
 
 export interface AuditRow {
@@ -110,14 +123,17 @@ function containerGap(axis: 'x' | 'y'): Measure {
 }
 
 /**
- * Every dimension the mock states, in the order the chrome is stacked.
+ * Every dimension this chrome is specified at, in the order it is stacked.
  *
- * Fractional expectations (10.5, 12.5, 9.5) are the mock's own values, not roundings — the
- * chip and path label are deliberately off the integer grid.
+ * There are no fractional expectations left. There used to be three — 10.5, 12.5 and 9.5 — and
+ * they were the mock's own values rather than roundings: the path label and the pinned chip sat
+ * deliberately off the integer grid. The type ladder they came from had fourteen rungs with
+ * half-pixel steps between them, which is not a hierarchy anyone perceives, and it collapsed to
+ * six whole ones. See the ladder's comment in `styles/tokens.css`.
  */
 const CHECKS: readonly Check[] = [
   // Header.
-  { element: 'header', property: 'height', expected: 34, selector: hook('header'), measure: boxHeight },
+  { element: 'header', property: 'height', expected: 38, selector: hook('header'), measure: boxHeight },
   {
     element: 'header',
     property: 'borderBottomWidth',
@@ -153,14 +169,14 @@ const CHECKS: readonly Check[] = [
   {
     element: 'projectTab',
     property: 'paddingLeft',
-    expected: 14,
+    expected: 12,
     selector: hook('projectTab'),
     measure: style('padding-left'),
   },
   {
     element: 'projectTab',
     property: 'paddingRight',
-    expected: 14,
+    expected: 12,
     selector: hook('projectTab'),
     measure: style('padding-right'),
   },
@@ -174,7 +190,7 @@ const CHECKS: readonly Check[] = [
   {
     element: 'projectTab',
     property: 'columnGap',
-    expected: 9,
+    expected: 8,
     selector: hook('projectTab'),
     measure: containerGap('x'),
   },
@@ -196,13 +212,13 @@ const CHECKS: readonly Check[] = [
   {
     element: 'projectPath',
     property: 'fontSize',
-    expected: 10.5,
+    expected: 12,
     selector: hook('projectPath'),
     measure: style('font-size'),
   },
 
   // Activity rail. The mock's 42 is a width here even though the token is named --h-rail.
-  { element: 'rail', property: 'width', expected: 42, selector: hook('rail'), measure: boxWidth },
+  { element: 'rail', property: 'width', expected: 46, selector: hook('rail'), measure: boxWidth },
   {
     element: 'rail',
     property: 'borderRightWidth',
@@ -217,19 +233,19 @@ const CHECKS: readonly Check[] = [
     selector: hook('rail'),
     measure: style('padding-top'),
   },
-  { element: 'railIcon', property: 'width', expected: 28, selector: hook('railIcon'), measure: boxWidth },
-  { element: 'railIcon', property: 'height', expected: 28, selector: hook('railIcon'), measure: boxHeight },
+  { element: 'railIcon', property: 'width', expected: 32, selector: hook('railIcon'), measure: boxWidth },
+  { element: 'railIcon', property: 'height', expected: 32, selector: hook('railIcon'), measure: boxHeight },
   {
     element: 'railIcon',
     property: 'borderRadius',
-    expected: 5,
+    expected: 8,
     selector: hook('railIcon'),
     measure: style('border-top-left-radius'),
   },
   {
     element: 'railIcon',
     property: 'gap',
-    expected: 2,
+    expected: 4,
     selector: hook('railIcon'),
     measure: siblingGap(hook('railIcon'), 'y'),
   },
@@ -245,11 +261,11 @@ const CHECKS: readonly Check[] = [
    * lets it be asserted at all. `AUDIT_GIT_CHANGES` only has to stay under the `99+` cap,
    * which widens the box to about 22px.
    */
-  { element: 'gitBadge', property: 'width', expected: 18, selector: hook('gitBadge'), measure: boxWidth },
-  { element: 'gitBadge', property: 'height', expected: 14, selector: hook('gitBadge'), measure: boxHeight },
+  { element: 'gitBadge', property: 'width', expected: 20, selector: hook('gitBadge'), measure: boxWidth },
+  { element: 'gitBadge', property: 'height', expected: 16, selector: hook('gitBadge'), measure: boxHeight },
 
   // Console tab strip.
-  { element: 'tabStrip', property: 'height', expected: 30, selector: hook('tabStrip'), measure: boxHeight },
+  { element: 'tabStrip', property: 'height', expected: 34, selector: hook('tabStrip'), measure: boxHeight },
   {
     element: 'tabStrip',
     property: 'borderBottomWidth',
@@ -260,14 +276,14 @@ const CHECKS: readonly Check[] = [
   {
     element: 'consoleTab',
     property: 'paddingLeft',
-    expected: 13,
+    expected: 12,
     selector: hook('consoleTab'),
     measure: style('padding-left'),
   },
   {
     element: 'consoleTab',
     property: 'paddingRight',
-    expected: 13,
+    expected: 12,
     selector: hook('consoleTab'),
     measure: style('padding-right'),
   },
@@ -288,7 +304,7 @@ const CHECKS: readonly Check[] = [
   {
     element: 'consoleTab',
     property: 'fontSize',
-    expected: 12.5,
+    expected: 13,
     selector: hook('consoleTab'),
     measure: style('font-size'),
   },
@@ -302,21 +318,21 @@ const CHECKS: readonly Check[] = [
   {
     element: 'consoleSwatch',
     property: 'width',
-    expected: 13,
+    expected: 14,
     selector: hook('consoleSwatch'),
     measure: boxWidth,
   },
   {
     element: 'consoleSwatch',
     property: 'height',
-    expected: 13,
+    expected: 14,
     selector: hook('consoleSwatch'),
     measure: boxHeight,
   },
   {
     element: 'pinnedChip',
     property: 'fontSize',
-    expected: 9.5,
+    expected: 11,
     selector: hook('pinnedChip'),
     measure: style('font-size'),
   },
@@ -346,21 +362,21 @@ const CHECKS: readonly Check[] = [
   {
     element: 'fileTab',
     property: 'columnGap',
-    expected: 9,
+    expected: 8,
     selector: hook('fileTab'),
     measure: containerGap('x'),
   },
   {
     element: 'fileTab',
     property: 'fontSize',
-    expected: 12,
+    expected: 13,
     selector: hook('fileTab'),
     measure: style('font-size'),
   },
   {
     element: 'fileTabBadge',
     property: 'fontSize',
-    expected: 10.5,
+    expected: 11,
     selector: hook('fileTabBadge'),
     measure: style('font-size'),
   },
@@ -375,7 +391,7 @@ const CHECKS: readonly Check[] = [
   {
     element: 'statusBar',
     property: 'height',
-    expected: 24,
+    expected: 26,
     selector: hook('statusBar'),
     measure: boxHeight,
   },
@@ -389,7 +405,7 @@ const CHECKS: readonly Check[] = [
   {
     element: 'statusBar',
     property: 'columnGap',
-    expected: 16,
+    expected: 12,
     selector: hook('statusBar'),
     measure: containerGap('x'),
   },
@@ -417,7 +433,7 @@ const CHECKS: readonly Check[] = [
   {
     element: 'statusBar',
     property: 'fontSize',
-    expected: 11,
+    expected: 12,
     selector: hook('statusBar'),
     measure: style('font-size'),
   },
@@ -535,8 +551,8 @@ export function formatAuditReport(report: AuditReport): string {
 
   lines.push(
     report.failures === 0
-      ? `PASS — ${report.rows.length} dimensions within ±${TOLERANCE}px of the mock.`
-      : `FAIL — ${report.failures} of ${report.rows.length} dimensions outside ±${TOLERANCE}px of the mock.`,
+      ? `PASS — ${report.rows.length} dimensions within ±${TOLERANCE}px of spec.`
+      : `FAIL — ${report.failures} of ${report.rows.length} dimensions outside ±${TOLERANCE}px of spec.`,
   )
   return lines.join('\n')
 }

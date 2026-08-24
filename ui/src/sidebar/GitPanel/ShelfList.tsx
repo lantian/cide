@@ -39,7 +39,7 @@ export function ShelfList({
     return (
       <div className={styles.list}>
         <p className={styles.empty}>
-          Nothing shelved. Use ⤓ in the toolbar to shelve the ticked files, or right-click a
+          Nothing shelved. Use Shelve in the toolbar to shelve the ticked files, or right-click a
           changelist and shelve the whole group.
         </p>
       </div>

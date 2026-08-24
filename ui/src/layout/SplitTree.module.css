@@ -108,8 +108,8 @@
 }
 
 .addRowButton:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /*

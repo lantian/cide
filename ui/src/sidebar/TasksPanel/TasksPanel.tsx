@@ -74,6 +74,8 @@ import {
 import { phaseGlyph, type RunPhase } from '@/sidebar/AgentsPanel/model'
 import { DeleteControl, TONE_CLASS, chipClass, cx } from './TaskDetail'
 import type { ProjectId } from '@/ipc/client'
+import { Icon, asIcon } from '@/icons/Icon'
+
 import styles from './TasksPanel.module.css'
 
 export interface TasksPanelViewProps {
@@ -502,7 +504,7 @@ function TaskLine({
         data-status={task.status}
         aria-hidden="true"
       >
-        {statusGlyph(task.status)}
+        <Icon name={asIcon(statusGlyph(task.status))} size={1} />
       </span>
       <span className={styles.taskId}>{task.id}</span>
       <span className={styles.taskTitle}>{task.title}</span>
@@ -522,7 +524,7 @@ function TaskLine({
               for. */}
           {chip.lit && (
             <span className={styles.chipDot} aria-hidden="true">
-              {phaseGlyph((chip.phase ?? '') as RunPhase)}
+              <Icon name={asIcon(phaseGlyph((chip.phase ?? '') as RunPhase))} size={0} />
             </span>
           )}
           <span className={styles.chipLabel}>{chip.label}</span>

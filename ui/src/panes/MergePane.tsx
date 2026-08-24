@@ -83,6 +83,8 @@ import { afterResolve } from '@/chrome/conflictsStore'
 import { useSettings } from '@/settings/useSettings'
 import { paint, paintedField } from './mergeDecorations'
 import { conflictGutter, setGutter } from './mergeGutter'
+import { Icon, type IconName } from '@/icons/Icon'
+
 import styles from './MergePane.module.css'
 
 export interface MergePaneViewProps {
@@ -155,7 +157,7 @@ export function MergePaneView(props: MergePaneViewProps) {
    * unreachable.
    */
   const accepted = (side: Side) => decision !== null && decision.taken.includes(side)
-  const acceptButton = (side: Side, glyph: string) => {
+  const acceptButton = (side: Side, mark: IconName) => {
     // Only for a side that deleted the current block, and only while it is still asking. Every
     // other block has its own chevron in the gutter, which is where the gesture belongs.
     const empty =
@@ -170,7 +172,7 @@ export function MergePaneView(props: MergePaneViewProps) {
         data-audit={`mergeAccept-${side}`}
         title={`This side deletes block ${position}. Accept it to remove those lines.`}
       >
-        {glyph} {accepted(side) ? 'Deleted' : 'Delete'}
+        <Icon name={mark} size={1} /> {accepted(side) ? 'Deleted' : 'Delete'}
       </button>
     )
   }
@@ -206,7 +208,7 @@ export function MergePaneView(props: MergePaneViewProps) {
               disabled={busy || doc.regions.length < 2}
               title="Previous block"
             >
-              ‹
+              <Icon name="chevron-left" size={1} />
             </button>
             <button
               type="button"
@@ -215,7 +217,7 @@ export function MergePaneView(props: MergePaneViewProps) {
               disabled={busy || doc.regions.length < 2}
               title="Next block"
             >
-              ›
+              <Icon name="chevron-right" size={1} />
             </button>
             <button
               type="button"
@@ -302,7 +304,7 @@ export function MergePaneView(props: MergePaneViewProps) {
           <Pane
             label={file.ourLabel}
             audit="mergePaneOurs"
-            control={acceptButton('ours', '»')}
+            control={acceptButton('ours', 'chevrons-right')}
             mount={(el) => props.mountEditors?.(el, 'ours')}
             fallback={file.ours ?? null}
           />
@@ -316,7 +318,7 @@ export function MergePaneView(props: MergePaneViewProps) {
           <Pane
             label={file.theirLabel}
             audit="mergePaneTheirs"
-            control={acceptButton('theirs', '«')}
+            control={acceptButton('theirs', 'chevrons-left')}
             mount={(el) => props.mountEditors?.(el, 'theirs')}
             fallback={file.theirs ?? null}
           />

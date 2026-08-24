@@ -117,15 +117,15 @@
      `.tabOpen` has to reach over it too, and two literals that must agree is one too many.
      Scaled with the chip's height and glyph — see `TabStrip.module.css` for the failure a
      fixed reserve would reintroduce. */
-  --awaiting-w: calc(13px * var(--ui-scale));
+  --awaiting-w: calc(18px * var(--ui-scale));
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--sp-4);
   height: 100%;
   /* Tabs overflow the strip rather than squashing: the container clips, and a shrunk tab
      would eat its own padding and break the measured widths. */
   flex: none;
-  padding: 0 14px;
+  padding: 0 var(--sp-5);
   border-top: 2px solid transparent;
   color: var(--dim);
   cursor: pointer;
@@ -188,6 +188,10 @@
   font: inherit;
   letter-spacing: inherit;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .tabClose:hover {
@@ -198,7 +202,7 @@
   width: 8px;
   height: calc(8px * var(--ui-scale));
   flex: none;
-  border-radius: 2px;
+  border-radius: var(--r-1);
 }
 
 /*
@@ -247,17 +251,24 @@
 .awaiting {
   flex: none;
   width: var(--awaiting-w);
-  height: calc(13px * var(--ui-scale));
+  /*
+   * 18x16, matching `TabStrip.module.css`'s chip exactly — the same marker on the other tab
+   * row, so a user who learns the shape in one strip reads it in the other. Both grew here:
+   * this one was 13x13 with a 9.5px digit, which is 2px of slack against the 3px floor
+   * `check:awaiting` holds the tab strip's to. That gate does not derive this one, so this
+   * comment is the only thing recording that the two are a pair.
+   */
+  height: calc(16px * var(--ui-scale));
   /* Clip rather than `min-width`: if a fallback font ever makes `9+` wider than the box, a
      clipped `+` is a cosmetic loss where a grown box moves every tab after it. */
   overflow: hidden;
-  border-radius: 3px;
+  border-radius: var(--r-full);
   pointer-events: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-9-5);
+  font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
   font-weight: 400;
-  line-height: calc(13px * var(--ui-scale));
+  line-height: calc(16px * var(--ui-scale));
   text-align: center;
   letter-spacing: 0;
 }
@@ -282,7 +293,7 @@
 
 .path {
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   color: var(--faint);
   font-weight: 400;
 }
@@ -310,7 +321,7 @@
   height: calc(22px * var(--ui-scale));
   margin: 0 10px 0 8px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   /* So the two halves' hover fills are clipped to the pill rather than squaring off its
      rounded corners. */
   overflow: hidden;
@@ -337,6 +348,10 @@
   font-size: var(--fs-ui-14);
   line-height: 1;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .add:hover {
@@ -357,7 +372,7 @@
   border: 0;
   color: var(--faint);
   font-family: inherit;
-  font-size: var(--fs-ui-9);
+  font-size: var(--fs-ui-11);
   line-height: 1;
   cursor: pointer;
 }
@@ -386,10 +401,10 @@
 .rowButton {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
   height: calc(22px * var(--ui-scale));
   padding: 0 8px;
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: transparent;
   border: 0;
   color: var(--dim);
@@ -397,6 +412,10 @@
   font-size: var(--fs-ui-11);
   white-space: nowrap;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .rowButton:hover:not(:disabled) {
@@ -436,13 +455,17 @@
   flex: none;
   display: grid;
   place-items: center;
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: transparent;
   border: 0;
   color: inherit;
   font-family: inherit;
   font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .action:hover:not(:disabled) {
@@ -472,6 +495,6 @@
    ring is drawn inside the control because the tab strip clips its overflow, and an
    outset ring on the first or last tab would be cut in half. */
 .header button:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }

@@ -496,7 +496,7 @@ export function detachConfirm(row: CommitRowLike, blockers: readonly string[]): 
         : `${quoted(row.summary)} — these files differ between your tree and ${at}, so checking out would overwrite them. cide stashes them first and puts them back afterwards; if the restore fails they are still in \`git stash list\`.`,
     files: blockers,
     confirmLabel: blockers.length === 0 ? `Check out ${at}` : 'Stash and check out',
-    mark: '↗',
+    mark: 'arrow-up-right',
   }
 }
 
@@ -520,7 +520,7 @@ export function forceTagConfirm(name: string, existing: string, target: string):
     body: `${name} already points at ${short(existing)}. Forcing it moves the tag to ${short(target)}. Anyone who has already fetched ${name} keeps the old one until they fetch with --force, and nothing warns them — which is why git makes you ask twice.`,
     files: [],
     confirmLabel: `Move ${name}`,
-    mark: '→',
+    mark: 'arrow-right',
   }
 }
 

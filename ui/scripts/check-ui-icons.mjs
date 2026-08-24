@@ -1,0 +1,356 @@
+/**
+ * The fence around the vendored UI icon set, and around the app's return to drawn marks.
+ *
+ * # What it is guarding
+ *
+ * This app drew its icons as Unicode characters until M23 — roughly a hundred and thirty of
+ * them across forty files — and `chrome/ActivityRail.tsx` records why that could never be made
+ * to work: what a character puts on screen is its ink inside its em box, and that ratio belongs
+ * to whichever face fontconfig picked, not to us. Measured on this host, seven rail glyphs
+ * spanned 0.53em to 0.82em of ink. The rail was converted to paths and the argument stopped
+ * there; everything else kept drawing characters, so `⑂` shipped in the branch indicator
+ * despite a note two files away saying no UI font carries it, `↻` meant two different actions
+ * in one toolbar, and `×` and `✕` both meant close in the same file.
+ *
+ * The risky part is not the conversion. It is the next component: one `<span>✓</span>` written
+ * in good faith by somebody who has never read this file, on a host where that glyph happens to
+ * render, in a codebase where a hundred sibling comments still quote the old characters.
+ *
+ * # The five things it asserts
+ *
+ *   1. **Every name the source draws exists in the generated set.** A missing name renders an
+ *      empty `<path>`: no error, no log, an empty box, and invisible in review.
+ *   2. **No dead entries.** Unlike `public/icons/`, where an unused Material icon is a file
+ *      nobody fetches, an unreferenced entry here is bytes in the JS bundle that every window
+ *      parses on every launch. Drop it from `ICONS` in `vendor-ui-icons.mjs` and re-run.
+ *   3. **Every mark is a legal *extension* icon.** The vendored set and an extension's
+ *      contributed `d` have to be the same kind of value, or `<Icon>` needs two render paths
+ *      and the one exercised only by untrusted input becomes the least-tested one. This runs a
+ *      port of `cide_ext::manifest::is_svg_path` over every generated path.
+ *   4. **The stroke stays in band at every size.** A 24-unit grid at a fixed `stroke-width`
+ *      renders 2px at 24px and 1.08px at 13px, which is the 55% spread the app shipped with
+ *      before the sizes were pitched against each other. Below ~1.4px WebKit stops resolving a
+ *      line and starts antialiasing a smear.
+ *   5. **No rendered Unicode symbol survives** outside a per-file allowlist of things that are
+ *      genuinely text.
+ *
+ * # How (5) avoids firing on prose
+ *
+ * By walking the TypeScript AST and visiting **only** string literals, template parts and JSX
+ * text. Comments are never visited, which removes the entire false-positive class at a stroke:
+ * this repository discusses its own glyphs at length — the rail's ink table, the twisty
+ * arithmetic, the merge gutter's reasoning — and a gate that fired on that would be switched
+ * off within a week. `node_modules/typescript` is already a dependency of every check here, so
+ * there is no new tool and no hand-rolled comment stripper to get wrong on a `//` inside a
+ * regex literal.
+ *
+ * Run: `pnpm --dir ui run check:ui-icons`
+ */
+import { readFileSync, readdirSync } from 'node:fs'
+import { join, relative, resolve } from 'node:path'
+import ts from 'typescript'
+
+const SRC = resolve('src')
+let failed = 0
+const ok = (cond, what) => {
+  if (!cond) {
+    console.error(`FAIL ${what}`)
+    failed++
+  }
+}
+const eq = (actual, expected, what) => {
+  const a = JSON.stringify(actual)
+  const b = JSON.stringify(expected)
+  if (a !== b) {
+    console.error(`FAIL ${what}\n  actual:   ${a}\n  expected: ${b}`)
+    failed++
+  }
+}
+
+/* -- the generated set --------------------------------------------------------------------- */
+
+const generated = readFileSync(join(SRC, 'icons/iconPaths.ts'), 'utf8')
+const PATHS = new Map(
+  [...generated.matchAll(/^ {2}'([\w-]+)': '([^']*)',/gm)].map((m) => [m[1], m[2]]),
+)
+ok(PATHS.size > 0, 'iconPaths.ts holds a set at all — a parse that finds nothing passes vacuously')
+
+/**
+ * The JavaScript half of `cide_ext::manifest::is_svg_path`.
+ *
+ * Restated rather than imported: the authority is Rust, and this is the mirror whose whole job
+ * is to prove the generated set lives inside the space an extension's icon has to live in. The
+ * vendor script runs the same predicate before writing; this runs it on the committed file, so
+ * a hand-edit is caught even though the script is only run by hand.
+ */
+const isSvgPath = (d) =>
+  d.length > 0
+  && d.length <= 4096
+  && /^[A-Za-z0-9.,\-+ \t\n\r]*$/.test(d)
+  && [...d].filter((c) => /[A-Za-z]/.test(c)).every((c) => 'MmLlHhVvCcSsQqTtAaZz'.includes(c))
+
+for (const [name, d] of PATHS) {
+  ok(isSvgPath(d), `\`${name}\` is a value an extension could also have supplied (is_svg_path)`)
+}
+
+/* -- what the source draws ----------------------------------------------------------------- */
+
+function sources(dir, ext) {
+  const out = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) out.push(...sources(path, ext))
+    else if (ext.some((e) => entry.name.endsWith(e))) out.push(path)
+  }
+  return out
+}
+
+/**
+ * Two sets, because there are two kinds of evidence.
+ *
+ * **Precise** — `<Icon name="…">`, `iconElement('…')`, `asIcon('…')`, and a CSS `var(--icon-…)`.
+ * Every one of these is unambiguously a mark, so a name here that is not in the set is a typo
+ * and a failure.
+ *
+ * **Loose** — any string literal, in a file that imports the icon API, that happens to equal a
+ * name in the set. This exists only to keep the dead-entry check honest: a mark can reach
+ * `<Icon>` through a `const`, a `Record`, a prop called `icon` or a helper called `button`, and
+ * enumerating those shapes syntactically is a losing game. Filtering to known names means a
+ * typo *cannot* be caught this way, which is exactly why the precise set is separate.
+ */
+const referenced = new Set()
+const loose = new Set()
+/** Every non-ASCII symbol actually rendered, as `file -> Set<char>`. */
+const symbols = new Map()
+
+/**
+ * Characters that are prose, everywhere, and never an icon.
+ *
+ * `·` is here only when it is *spaced* — see the check below. Spaced, it is the separator this
+ * app uses between clauses in a status line; unspaced, it was a bullet standing in for a mark.
+ */
+const PROSE = new Set(['—', '–', '…', '’', '‘', '“', '”', '‑', ' ', '×', '·', '→', '←', '›', '−', '±'])
+
+/**
+ * Per-file exemptions, each with the reason it is not an icon.
+ *
+ * Keyed on file **and** character, so `⋯` can be text in the commit graph and still a failure in
+ * the branch indicator. A dead entry is itself a failure: `check-theme.mjs` states the principle
+ * — "an exemption for a slot that would pass anyway is a dead one, and a dead exemption is how
+ * the next regression walks past this gate".
+ */
+const ALLOWED = [
+  {
+    file: 'keys/chords.ts',
+    chars: '⌃⌥⇧⌘↑↓⏎⇥␣⌫⌦',
+    why: 'Key caps. The chip is a fixed badge at the right edge of a 620px row, and the spelled '
+      + 'out form is more than twice the width of the widest symbol — the file says so above '
+      + 'MODIFIER_SYMBOLS. They compose (⌃⇧P), they are what is printed on the keyboard, and '
+      + 'they have to line-break and select as text.',
+  },
+  {
+    file: 'keys/switcher.ts',
+    chars: '↑↓',
+    why: 'KEY_CAPS — the same argument as chords.ts.',
+  },
+  {
+    file: 'overlays/CommandPalette.tsx',
+    chars: '↑↓⏎⌃',
+    why: '`<Hint keys="↑↓">navigate</Hint>` — a key hint in a mono footer chip. `ModalShell.tsx` '
+      + 'states the rule: the glyph is mono and dim, the words are not.',
+  },
+  {
+    file: 'overlays/FilePicker.tsx',
+    chars: '↑↓⏎⇧⌥',
+    why: 'Key hints in the footer — see CommandPalette.',
+  },
+  { file: 'overlays/SymbolPicker.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
+  { file: 'overlays/StructurePicker.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
+  { file: 'overlays/UsagesPopup.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
+  { file: 'panes/GitDiffPane.tsx', chars: '⏎', why: 'A key hint beside a staging control.' },
+  {
+    file: 'chrome/branchModel.ts',
+    chars: '↑↓',
+    why: 'The ahead/behind summary *sentence* — a title and an accessible name, not a control. '
+      + 'The branch selector draws the same two counts as marks; this is the text a screen '
+      + 'reader gets, and an icon has nothing to say to one.',
+  },
+  {
+    file: 'editor/blameModel.ts',
+    chars: '↳',
+    why: 'The blame popup\'s "this line came from" continuation, inside a sentence.',
+  },
+  {
+    file: 'gitlog/LogView.tsx',
+    chars: '⋯',
+    why: "GraphCell's lane-bundle label, absolutely positioned inside a 10px lane column. Any "
+      + 'mark is wider than the lane it would have to sit in.',
+  },
+  {
+    file: 'panes/RevisionPane.tsx',
+    chars: '⌫',
+    why: '`⌫ Back` — a key hint, matching chords.ts.',
+  },
+]
+
+for (const file of sources(SRC, ['.ts', '.tsx'])) {
+  const rel = relative(SRC, file)
+  const text = readFileSync(file, 'utf8')
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TSX)
+
+  const note = (raw) => {
+    for (const ch of raw) {
+      if (ch.codePointAt(0) <= 0x7f) continue
+      if (/[\p{L}\p{N}]/u.test(ch)) continue
+      if (PROSE.has(ch)) continue
+      if (!symbols.has(rel)) symbols.set(rel, new Set())
+      symbols.get(rel).add(ch)
+    }
+  }
+
+  /*
+   * `AgentsPanel/model.ts` and `TasksPanel/model.ts` are named rather than detected, and the
+   * reason is the same one their own headers give: they are **import-free on purpose**, because
+   * `check-agents.mjs` compiles each standalone with no `--rootDir` and imports the output
+   * directly. They cannot import the icon API even for a type, so their phase and status tables
+   * hold plain strings and `asIcon` narrows at the render site. Without these two lines every
+   * mark only they name reads as dead.
+   */
+  const TABLE_FILES = ['sidebar/AgentsPanel/model.ts', 'sidebar/TasksPanel/model.ts']
+  const usesIcons =
+    TABLE_FILES.includes(rel) || /from '(@\/icons[\w/]*|\.\.?\/[\w/.]*icons?[\w/]*)'/.test(text)
+
+  const walk = (node) => {
+    // --- names the app draws -------------------------------------------------------------
+    if (
+      ts.isJsxAttribute(node)
+      && node.name.getText() === 'name'
+      && node.initializer
+      // On an `<Icon>` and nothing else: `name` is an ordinary prop name, and a rail item, a
+      // settings row and an agent role all have one.
+      && node.parent?.parent?.tagName?.getText() === 'Icon'
+    ) {
+      const init = node.initializer
+      const lit = ts.isStringLiteral(init)
+        ? init
+        : ts.isJsxExpression(init) && init.expression && ts.isStringLiteral(init.expression)
+          ? init.expression
+          : null
+      if (lit) referenced.add(lit.text)
+      // `name={cond ? 'a' : 'b'}` — the shape every twisty uses.
+      if (ts.isJsxExpression(init) && init.expression && ts.isConditionalExpression(init.expression)) {
+        for (const branch of [init.expression.whenTrue, init.expression.whenFalse]) {
+          if (ts.isStringLiteral(branch)) referenced.add(branch.text)
+        }
+      }
+    }
+    if (ts.isCallExpression(node) && /^(iconElement|asIcon)$/.test(node.expression.getText())) {
+      const [first] = node.arguments
+      if (first && ts.isStringLiteral(first)) referenced.add(first.text)
+    }
+    // --- symbols actually rendered ---------------------------------------------------------
+    if (
+      ts.isStringLiteral(node)
+      || ts.isNoSubstitutionTemplateLiteral(node)
+      || ts.isTemplateHead(node)
+      || ts.isTemplateMiddle(node)
+      || ts.isTemplateTail(node)
+      || ts.isJsxText(node)
+    ) {
+      note(node.text)
+      if (usesIcons && PATHS.has(node.text)) loose.add(node.text)
+    }
+    ts.forEachChild(node, walk)
+  }
+  walk(sf)
+}
+
+// CSS reaches the set through the generated mask file rather than through `<Icon>`.
+const masks = readFileSync(join(SRC, 'styles/iconMasks.css'), 'utf8')
+const declaredMasks = new Set([...masks.matchAll(/--icon-([\w-]+):/g)].map((m) => m[1]))
+const usedMasks = new Set()
+for (const file of sources(SRC, ['.css'])) {
+  if (relative(SRC, file) === 'styles/iconMasks.css') continue
+  for (const m of readFileSync(file, 'utf8').matchAll(/var\(--icon-([a-z][\w-]*)\)/g)) {
+    // `--icon-0` … `--icon-3` are box sizes in tokens.css, not marks.
+    if (/^\d/.test(m[1])) continue
+    usedMasks.add(m[1])
+  }
+}
+for (const name of usedMasks) {
+  ok(declaredMasks.has(name), `\`--icon-${name}\` is emitted into iconMasks.css by the vendor script`)
+  referenced.add(name)
+}
+for (const name of declaredMasks) {
+  ok(usedMasks.has(name), `\`--icon-${name}\` has a reader — a mask nothing draws is dead weight`)
+}
+
+/* -- 1 and 2: the set is exactly what the app draws ----------------------------------------- */
+
+const missing = [...referenced].filter((n) => !PATHS.has(n)).sort()
+eq(
+  missing,
+  [],
+  'every mark the source names is in the generated set. A name that is not renders an empty '
+    + '`<path>`: no error, no log, an empty box, and nothing in a screenshot of a state that '
+    + 'happens not to be showing it',
+)
+const dead = [...PATHS.keys()].filter((n) => !referenced.has(n) && !loose.has(n)).sort()
+eq(
+  dead,
+  [],
+  'and nothing is vendored that the app never draws — an unreferenced entry is bytes every '
+    + "window parses on every launch. Remove it from `ICONS` in `vendor-ui-icons.mjs` and re-run",
+)
+
+/* -- 4: the stroke stays in band ------------------------------------------------------------ */
+
+const iconCss = readFileSync(join(SRC, 'icons/Icon.module.css'), 'utf8')
+const tokens = readFileSync(join(SRC, 'styles/tokens.css'), 'utf8')
+for (const m of iconCss.matchAll(/\[data-size='(\d)'\][^{]*\{([^}]*)\}/g)) {
+  const rung = m[1]
+  const stroke = Number(/stroke-width:\s*([\d.]+)/.exec(m[2])?.[1])
+  const box = Number(new RegExp(`--icon-${rung}:\\s*(\\d+)px`).exec(tokens)?.[1])
+  ok(Number.isFinite(stroke) && Number.isFinite(box), `--icon-${rung} has a box and a stroke`)
+  if (!Number.isFinite(stroke) || !Number.isFinite(box)) continue
+  // Rounded before comparing: 2.8 × 12 / 24 is 1.3999999999999997 in binary floating
+  // point, and a band this gate states to one decimal place must not be decided by the
+  // seventeenth.
+  const drawn = Math.round(((stroke * box) / 24) * 1000) / 1000
+  ok(
+    drawn >= 1.4 && drawn <= 1.8,
+    `--icon-${rung} draws its stroke at ${drawn.toFixed(3)}px, inside 1.4–1.8. A 24-unit grid `
+      + 'at one stroke-width renders 2px at 24px and 1.08px at 13px, which is the spread this '
+      + 'app shipped with; below ~1.4px WebKit antialiases a line into a grey smear',
+  )
+}
+
+/* -- 5: nothing is still drawing a character ------------------------------------------------ */
+
+for (const [file, chars] of [...symbols].sort()) {
+  const entry = ALLOWED.find((a) => a.file === file)
+  const spare = [...chars].filter((c) => entry === undefined || !entry.chars.includes(c))
+  ok(
+    spare.length === 0,
+    `${file} draws no Unicode symbol as an icon (found ${spare.join(' ')}). Marks come from `
+      + '`<Icon>`; if these are genuinely text, add a `why` to ALLOWED in this script',
+  )
+}
+for (const entry of ALLOWED) {
+  const drawn = symbols.get(entry.file)
+  const unused = [...entry.chars].filter((c) => drawn === undefined || !drawn.has(c))
+  eq(
+    unused,
+    [],
+    `every character allowed in ${entry.file} is still drawn there — a dead exemption is how `
+      + 'the next regression walks past this gate',
+  )
+}
+
+if (failed) {
+  console.error(`\n${failed} icon check(s) failed`)
+  process.exit(1)
+}
+console.log(
+  `ui icons: ok (${PATHS.size} marks, ${declaredMasks.size} masks, ${ALLOWED.length} text exemptions)`,
+)

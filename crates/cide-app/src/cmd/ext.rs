@@ -234,6 +234,27 @@ fn source_of(extension: &ExtensionRef) -> cide_ipc::DiagnosticSourceId {
     cide_ipc::DiagnosticSourceId(format!("ext:{extension}"))
 }
 
+/// Change one of an extension's settings.
+///
+/// The value is coerced against the declared kind **in Rust** — see `ExtStore::set_setting`. The
+/// Settings page's controls are shaped by the same declaration, so in practice they agree; the
+/// coercion is there for the two roads that do not go through a control at all, which are a
+/// hand-edited `extensions.json` and an update that narrowed a range.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn ext_set_setting(
+    app: tauri::AppHandle,
+    state: State<'_, ExtState>,
+    extension: ExtensionRef,
+    key: String,
+    value: serde_json::Value,
+) -> Result<ExtensionSnapshot> {
+    let store = state.store();
+    let snapshot =
+        blocking(move || store.set_setting(&extension, &key, value).map_err(refused)).await?;
+    ext_state::publish(&app, &snapshot);
+    Ok(snapshot)
+}
+
 /// One extension's page: its catalog row, its installed row, and its README.
 ///
 /// A read, so it takes no project and mutates nothing. It is not on the snapshot because a README

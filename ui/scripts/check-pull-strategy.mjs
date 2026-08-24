@@ -252,7 +252,11 @@ try {
     !ask.choices[1].files.some((f) => f.includes('aaaaaaa1')),
     'and never the incoming ones, which are at risk under neither answer',
   )
-  eq(ask.mark, '↻', 'the glyph is not the removal dash: nothing is removed under either answer')
+  eq(
+    ask.mark,
+    'refresh-cw',
+    'the mark is not the removal dash: nothing is removed under either answer',
+  )
   eq(ask.split, false, 'entries are commits, not paths — see ConfirmState.split')
   ok(!JSON.stringify(ask).includes('[object Object]'), 'nothing renders as [object Object]')
   ok(

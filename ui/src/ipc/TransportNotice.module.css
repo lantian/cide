@@ -22,7 +22,7 @@
   padding: 7px 12px;
   background: var(--panel);
   border-top: 1px solid var(--border);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
   font-size: var(--fs-ui-12);
   color: var(--text);
 }
@@ -49,12 +49,16 @@
   flex: none;
   padding: 3px 9px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-2);
   background: var(--chrome);
   color: var(--dim);
   font: inherit;
   font-size: var(--fs-ui-11);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .dismiss:hover {
@@ -63,6 +67,6 @@
 }
 
 .dismiss:focus-visible {
-  outline: 1px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 2px;
 }

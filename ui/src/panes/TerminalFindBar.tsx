@@ -46,6 +46,8 @@ import {
   type FindResults,
 } from '@/terminal/findModel'
 import { closeTerminalFind, useTerminalFind } from '@/terminal/findStore'
+import { Icon } from '@/icons/Icon'
+
 import styles from './TerminalFindBar.module.css'
 
 export interface TerminalFindBarProps {
@@ -283,7 +285,7 @@ export function TerminalFindBar({ paneId }: TerminalFindBarProps): React.ReactEl
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => run('previous', query, false)}
       >
-        ↑
+        <Icon name="chevron-up" size={1} />
       </button>
       <button
         type="button"
@@ -293,7 +295,7 @@ export function TerminalFindBar({ paneId }: TerminalFindBarProps): React.ReactEl
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => run('next', query, false)}
       >
-        ↓
+        <Icon name="chevron-down" size={1} />
       </button>
       <button
         type="button"
@@ -302,7 +304,7 @@ export function TerminalFindBar({ paneId }: TerminalFindBarProps): React.ReactEl
         onMouseDown={(event) => event.preventDefault()}
         onClick={close}
       >
-        ✕
+        <Icon name="x" size={1} />
       </button>
     </div>
   )

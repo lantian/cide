@@ -46,6 +46,8 @@ import {
   type Fate,
   type InjectionKey,
 } from './claudeCli'
+import { Icon } from '@/icons/Icon'
+
 import styles from './ClaudeCliSection.module.css'
 
 export interface ClaudeCliSectionProps {
@@ -564,7 +566,7 @@ function Add({ label, onClick }: { label: string; onClick: () => void }) {
 function Remove({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <button type="button" className={styles.remove} aria-label={label} onClick={onClick}>
-      ×
+      <Icon name="x" size={1} />
     </button>
   )
 }

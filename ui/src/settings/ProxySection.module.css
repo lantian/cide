@@ -52,7 +52,7 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   /* A URL is a machine string: mono, like every path and counter in this app. */
@@ -82,7 +82,7 @@
 .readout {
   margin: 0;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel);
   padding: 8px 10px;
   /* A long proxy URL must scroll inside the box rather than widening the settings pane. */

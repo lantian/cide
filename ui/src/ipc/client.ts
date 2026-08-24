@@ -3708,6 +3708,17 @@ export const ext = {
    * publishing under `rustAnalyzer` would have its findings filtered, grouped and restarted as
    * somebody else's.
    */
+  /**
+   * Change one of an extension's settings.
+   *
+   * The value is coerced against the declared kind **in Rust** — clamped to a number's band,
+   * refused if it names a choice that does not exist — so the answer this resolves with is the
+   * value that was actually stored, not the one that was sent. The Settings page re-renders from
+   * it for exactly that reason.
+   */
+  setSetting: (extension: ExtensionRef, key: string, value: boolean | string | number) =>
+    invoke<ExtensionSnapshot>('ext_set_setting', { extension, key, value }),
+
   /** One extension's page: its catalog row, its installed row, and its README. */
   page: (extension: ExtensionRef) => invoke<ExtensionPage>('ext_page', { extension }),
 

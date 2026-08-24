@@ -24,6 +24,7 @@ import { Facet, StateField, type EditorState, type Extension, type StateEffect, 
 import type { EditorView } from '@codemirror/view'
 
 import { enclosing, foldAtLine, scanFolds, within, type FoldRange, type FoldSpec } from './foldRanges'
+import { iconElement } from '../icons/iconElement'
 
 /** A plain `{from, to}`, which is what CodeMirror's fold effects carry. */
 interface Span {
@@ -124,19 +125,19 @@ export function foldExtensions(spec: FoldSpec): Extension {
 function placeholder(_view: EditorView, onclick: (event: Event) => void): HTMLElement {
   const element = document.createElement('span')
   element.className = 'cm-foldPlaceholder'
-  element.textContent = '⋯'
+  element.append(iconElement('ellipsis', 1))
   element.title = 'Expand'
   element.setAttribute('aria-label', 'folded code')
   element.onclick = onclick
   return element
 }
 
-/** The gutter chevron. A glyph and not CodeMirror's SVG, matching what the lint gutter does. */
+/** The gutter chevron. Drawn, not CodeMirror's SVG, and the same mark every other tree uses. */
 function marker(open: boolean): HTMLElement {
   const element = document.createElement('span')
   element.className = 'cm-cide-foldMarker'
   element.dataset['open'] = open ? 'true' : 'false'
-  element.textContent = open ? '⌄' : '›'
+  element.append(iconElement(open ? 'chevron-down' : 'chevron-right', 1))
   element.title = open ? 'Collapse' : 'Expand'
   return element
 }

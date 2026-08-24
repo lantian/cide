@@ -427,7 +427,7 @@
   /* A long title clips itself rather than reaching across the pane it is labelling. */
   max-width: 70%;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   pointer-events: none;
 }
 
@@ -464,7 +464,7 @@
   padding: 0 3px;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 80ms linear;
+  transition: opacity var(--dur-1) var(--ease-out);
 }
 
 /*
@@ -479,7 +479,7 @@
   position: absolute;
   inset: 0;
   z-index: -1;
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--panel);
   opacity: 0.82;
 }
@@ -544,11 +544,17 @@
   pointer-events: auto;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .reveal {
-    transition: none;
-  }
-}
+/*
+ * The reveal used to carry its own `@media (prefers-reduced-motion: reduce) { transition: none }`
+ * here, and it was the only such block in the app. It is gone because `styles/tokens.css` now
+ * zeroes `--dur-1` and `--dur-2` under that query for every rule at once, and the transition
+ * above reads the token.
+ *
+ * Why this cluster in particular cared enough to have its own block, kept because it is still
+ * true: these are controls that *appear under the pointer* on hover. A fade there is the one
+ * piece of motion in the app that a user with vestibular sensitivity meets without asking for
+ * it, which is exactly the case the media query exists for.
+ */
 
 
 
@@ -635,7 +641,7 @@
   justify-content: center;
   width: 22px;
   height: 22px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   border: 0;
   color: inherit;
@@ -663,8 +669,8 @@
  * say so — this is the other half of "what does a user who cannot hover do".
  */
 .action:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /*
@@ -685,7 +691,7 @@
 /* Smaller and dimmer than the glyph it hangs off: it is a hint about the control, not a
    second control. It brightens with its parent because it is inside the button. */
 .caret {
-  font-size: var(--fs-ui-8);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -735,7 +741,7 @@
   justify-content: center;
   width: 22px;
   height: 22px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   border: 0;
   color: var(--dim);
@@ -751,8 +757,8 @@
 }
 
 .control:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /*

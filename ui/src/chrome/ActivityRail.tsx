@@ -14,6 +14,7 @@
 import { Fragment } from 'react'
 import { badgeLabel, badgeText } from '@/sidebar/GitPanel/model'
 import { groupDigits } from '@/overlays/format'
+import { Icon, type IconName, type IconSize } from '@/icons/Icon'
 import type { ActivityView } from './sidebarView'
 import styles from './ActivityRail.module.css'
 
@@ -29,14 +30,20 @@ export type { ActivityView }
 export interface RailItem {
   id: ActivityView
   /**
-   * The item's icon, as an inline path in a 24×24 viewBox, stroked not filled and drawn at
-   * [`ICON_PX`].
+   * The item's mark: a name from the vendored set, or a raw 24×24 path.
    *
-   * Required, for every item, and the note above the drawings below is why: this was once
+   * Two fields because there are genuinely two provenances. A built-in item names a mark and is
+   * checked at compile time; an **extension** supplies `path`, a raw `d` that
+   * `cide_ext::manifest::is_svg_path` has already validated on the Rust side and which no
+   * TypeScript union could ever narrow. `<Icon>` collapses both to one `<path>`, so the code
+   * that draws an extension's icon is the same code that draws every built-in one.
+   *
+   * One of the two is required, and the note above the drawings below is why: this was once
    * `glyph` plus a per-item `size`, and a rail whose marks are characters is a rail whose sizes
    * belong to whatever face fontconfig picked.
    */
-  path: string
+  icon?: IconName
+  path?: string
   label: string
   /* Renders after the flexible spacer, pinned to the foot of the rail. */
   bottom?: boolean
@@ -59,149 +66,79 @@ export interface RailItem {
  *
  * — 0.53 to 0.82 em of ink, so ⚙ drew nearly twice the mark ≡ did while their font sizes
  * differed by 3px, and the seven `size` values were doing almost nothing. Equalising *upwards*
- * by font size is arithmetically impossible in a 28px button: to reach 15px of ink ⌕ would need
+ * by font size is arithmetically impossible in a 28px button (the size then): to reach 15px of ink ⌕ would need
  * a 28px font and ≡ a 26px one, in a box that is 28px including its hover background.
  *
- * So the rail draws its own marks. `GIT_PATH` had already been converted for a different reason
- * — U+2442 is in no UI font — and the comment on it argued *against* converting the rest, on
- * the grounds that half glyphs and half paths is two icon systems to keep optically matched
- * rather than one. That argument now points the other way: eight paths is one system, every
- * mark is the same box, and the size on screen is a number in this file instead of a property
- * of the fonts on the user's machine. It is still not a bundled icon set — `Explorer.tsx` cites
- * that policy and it is intact — it is eight hand-written paths on one 24×24 grid.
+ * So the rail drew its own marks: eight hand-written paths on one 24×24 grid, `fill="none"`,
+ * `stroke="currentColor"`, `stroke-width="2"`, round cap and join. `GIT_PATH` had already been
+ * converted for a different reason — U+2442 is in no UI font — and the comment on it argued
+ * *against* converting the rest, on the grounds that half glyphs and half paths is two icon
+ * systems to keep optically matched rather than one. That argument pointed the other way as
+ * soon as the drawings existed: eight paths is one system, and the size on screen became a
+ * number in this file instead of a property of the fonts on the user's machine.
  *
- * Measured the same way afterwards, all eight ink boxes are **16×16 px, each centred on its
- * button's centre to the pixel**. Be clear about what that is worth: it is one host's
+ * **And then it pointed further.** The eight paths fixed the rail and left the git toolbar, the
+ * pane title bar, the status bar, six panel headers and every dialog still drawing characters —
+ * so the app had exactly the two-systems problem this comment was written to avoid, one rail
+ * larger. This file used to end by saying "it is still not a bundled icon set, and `Explorer.tsx`
+ * cites that policy". That policy is reversed: `ui/src/icons/iconPaths.ts` is a vendored Lucide
+ * set, ISC, pinned by revision, and `Explorer.tsx` and `GitPanel/Toolbar.tsx` say so too now.
+ *
+ * The rail lost nothing in the move. Lucide's envelope is the one above, attribute for
+ * attribute — the eight paths were drawn to that convention in the first place — and `--icon-3`
+ * is pitched at the 1.667px stroke this rail already had. What it gained is that the same marks
+ * are now available to the other thirty-odd surfaces, and that a name is checked at compile
+ * time where a `d` string never was.
+ *
+ * Measured after the hand-drawn conversion, all eight ink boxes were **16×16 px, each centred on
+ * its button's centre to the pixel**. Be clear about what that is worth: it was one host's
  * rendering, taken with a throwaway script, and **nothing in `ui/scripts/` can measure a mark**
  * — every check there is a standalone `tsc` compile or an SSR render into a string, and
- * `./run.sh --audit-chrome` measures the 28px box and the 2px gaps, never what is inside them.
- * What has *gone* is the exposure: a path draws identically on a host whose fontconfig answers
- * with other faces, which is a thing no glyph in this rail could ever promise.
+ * `./run.sh --audit-chrome` measures the button box and the gaps, never what is inside them.
+ * The vendored set was checked differently and more strongly: every flattened path was
+ * rasterised at 192×192 and compared pixel-for-pixel against upstream's own multi-element SVG.
+ * What has *gone*, either way, is the exposure: a path draws identically on a host whose
+ * fontconfig answers with other faces, which is a thing no glyph in this rail could ever promise.
  */
 
 /*
- * The drawn box, in CSS pixels, for every icon in the rail.
+ * The rung every mark in this rail is drawn at.
  *
- * 20 in a 28px button leaves 4px of clear space on every side — clear of the button's 5px
- * corner radius, and enough that the 14px badge pill overlaps a corner of a mark rather than
- * its middle. The marks below fill about 19 of the 24 grid units, so 20px of box is 16px of
- * ink: larger than the *largest* glyph this rail ever drew (⚙, at 14px) and more than twice
- * the smallest (≡, at 7px).
+ * `--icon-3` is 20px, and 20 in a 32px button leaves 6px of clear space on every side — clear of
+ * the button's 8px corner radius, and enough that the 16px badge pill overlaps a corner of a
+ * mark rather than its middle. Lucide's marks fill about 19 of the 24 grid units, so 20px of box
+ * is roughly 16px of ink: larger than the *largest* glyph this rail ever drew (⚙, at 14px) and
+ * more than twice the smallest (≡, at 7px).
  *
- * 24 was the alternative and it is better arithmetic — the viewBox would map 1:1 onto device
- * pixels, so the 2px stroke would be exactly 2px instead of the 1.667px it is at 5/6 scale —
- * but it leaves 2px of margin, and at that size the badge sits on top of a mark instead of
- * beside it. Half-integer coordinates are used for straight runs to keep what alignment 5/6
- * scaling still allows.
+ * The button grew from 28 to 32 and this **deliberately did not follow**. 24 has always been the
+ * better arithmetic — the viewBox would map 1:1 onto device pixels, so the stroke would be
+ * exactly 2px instead of the 1.667px it is at 5/6 scale — and at a 32px button the old objection
+ * to it (2px of margin, with the badge landing on a mark rather than beside it) no longer holds.
+ * It is still 20, because this is the one icon set in the app nobody has ever reported: the
+ * complaints were "too small" and "all different sizes", both about a rail of *characters*, and
+ * both already answered. Growing the artwork now would be a change with no report behind it, on
+ * the only surface that was already right. That 1.667px stroke is also what `Icon.module.css`
+ * pitches every other size to match, so leaving it makes the rail the reference the rest of the
+ * app is measured against rather than an exception to it.
  */
-const ICON_PX = 20
+const RAIL_ICON: IconSize = 3
 
-/*
- * The Git branch mark: two nodes on a trunk, a third on a limb that leaves and rejoins — the
- * shape every git UI uses, so it needs no learning.
+/**
+ * What a contributed panel draws when its manifest supplies no icon.
  *
- * **Unchanged**, and it is the reference the other seven were drawn to match: 24×24 viewBox,
- * `fill="none"`, `strokeWidth` 2, round caps and joins, stroked with `currentColor` so the
- * active and inactive rail colours apply to a drawing exactly as they applied to text. Its ink
- * measures 16×16 before and after this change, because it was already a path at 20px — which
- * is the other reason `ICON_PX` is 20: the one icon nobody complained about does not move.
+ * `cide_ext::manifest` already warns the *author* that "its button will be blank", which is the
+ * right thing to tell them and no help at all to the user looking at an empty 32px button on
+ * their rail. A jigsaw piece reads as "something plugged in" and is distinct from the manager
+ * panel's own mark — which is why it is `puzzle` and not `blocks`: an extension wearing the
+ * Extensions button's icon looks like a second Extensions panel.
  */
-const GIT_PATH =
-  'M6 3v12M6 21a2 2 0 1 0 0-4 2 2 0 0 0 0 4M6 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4'
-  + 'M18 9a2 2 0 1 0 0-4 2 2 0 0 0 0 4M18 7c0 4-4 5-6 6'
-
-/*
- * A document with a turned corner and two lines of text: the file tree.
- *
- * The corner is what makes it a document rather than a card, and it is the only notched
- * silhouette in the rail — which matters, because three of these eight marks are rectangles and
- * the rail has no labels. The two rules are 4.5 units apart so that at 20px they are two
- * strokes with a visible gap rather than one thick one, and the lower one is shorter, which is
- * how a paragraph ends.
- */
-const FILES_PATH = 'M15 3.5H4V20.5H20V8.5ZM15 3.5v5h5M8 12h8M8 16.5h5'
-
-/*
- * A magnifier: a circle of radius 6.5 with a handle off its lower right.
- *
- * The circle alone would leave this mark smaller than its straight-edged neighbours, which is
- * the usual optical problem with a round shape in a square grid; the handle runs out to the
- * corner so the whole mark fills the same 19 units as the rest. That correction belongs inside
- * the viewBox — never in a per-item size — because one `ICON_PX` for everything is the entire
- * point of this file's icons.
- */
-const SEARCH_PATH = 'M10 3.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13M15 15L20.5 20.5'
-
-/*
- * A warning triangle with a bang: Problems. The only triangle in the rail.
- *
- * The dot is a zero-length subpath — `h.01` under a round cap — which is how a 2-unit dot is
- * drawn in a set where every mark is one stroked path. It sits 2.5 units below the stem: any
- * closer and the two round caps merge into a single bar at 20px, which is the failure mode of
- * every exclamation mark drawn at this size.
- */
-const PROBLEMS_PATH = 'M12 3.5L20.5 20.5H3.5ZM12 9v4M12 17.5h.01'
-
-/*
- * A hexagon: Agents. It keeps the silhouette the ⌬ (benzene ring) it replaces had, which was
- * the one thing about that glyph worth keeping, and nothing else in the rail is six-sided.
- */
-const AGENTS_PATH = 'M8 3.5h8l4.5 8.5-4.5 8.5H8l-4.5-8.5Z'
-
-/*
- * A ticked box: Tasks, and again the silhouette of the ☑ it replaces.
- *
- * The tick is inset from the box on every side by more than the stroke is wide, so the two do
- * not touch anywhere — a tick that meets the box reads as a scribble at this size rather than
- * as a tick.
- */
-const TASKS_PATH =
-  'M6 3.5h12a2.5 2.5 0 0 1 2.5 2.5v12a2.5 2.5 0 0 1-2.5 2.5H6a2.5 2.5 0 0 1-2.5-2.5V6'
-  + 'a2.5 2.5 0 0 1 2.5-2.5ZM8 12l3 3 5-6'
-
-/*
- * A cog: Settings. Eight teeth standing about two units proud of the root circle, and a bore.
- *
- * Drawn as one closed toothed outline rather than as a rim with eight radial strokes, which was
- * tried first and is a third of the path data. The reason is what it draws: a ring with rays is
- * Feather's *sun*, and a sun in a rail means brightness. The outline reads as a cog at 20px —
- * verified in the snapshot, because this is exactly the mark the "simplify rather than
- * reproduce" rule warns can arrive as a blob.
- */
-const SETTINGS_PATH =
-  'M13.6 3.5h-3.2l-.5 2.4-2.1 1.2-2.3-.8-1.6 2.8 1.8 1.6v2.6l-1.8 1.6 1.6 2.8 2.3-.8'
-  + 'l2.1 1.2.5 2.4h3.2l.5-2.4 2.1-1.2 2.3.8 1.6-2.8-1.8-1.6v-2.6l1.8-1.6-1.6-2.8-2.3.8-2.1-1.2Z'
-  + 'M12 9.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5'
-
-/*
- * A panel with a divided region at its foot: the git tool window, which is exactly that — a
- * strip across the bottom of the workspace.
- *
- * The divider sits low, five and a half units off the bottom, so the region it marks off is the
- * one the tool window occupies. That low line is also what tells this apart from the ticked box
- * two buttons above it, since both are rounded rectangles and the rail has no labels.
- */
-const TOOLWINDOW_PATH =
-  'M6 4h12a2.5 2.5 0 0 1 2.5 2.5v11a2.5 2.5 0 0 1-2.5 2.5H6a2.5 2.5 0 0 1-2.5-2.5v-11'
-  + 'A2.5 2.5 0 0 1 6 4ZM3.5 14.5h17'
-
-/*
- * Four blocks with one lifted clear of the others: Extensions. (M22)
- *
- * A jigsaw piece is the conventional mark and it is the wrong one at 20px — the tab and the
- * socket are the whole silhouette and both are smaller than the stroke, so it arrives as a blob.
- * Three blocks in an L with a fourth floating above the gap reads as "a thing that plugs in" at
- * this size, and is distinguishable at a glance from the ticked box and the panel below it,
- * which are the two other rounded rectangles in this rail.
- */
-const EXTENSIONS_PATH =
-  'M4.5 4.5h6v6h-6ZM4.5 13.5h6v6h-6ZM13.5 13.5h6v6h-6ZM16.5 3v7M13 6.5h7'
+const EXTENSION_FALLBACK: IconName = 'puzzle'
 
 const ITEMS: readonly RailItem[] = [
-  { id: 'files', path: FILES_PATH, label: 'Files' },
-  { id: 'git', path: GIT_PATH, label: 'Git' },
-  { id: 'search', path: SEARCH_PATH, label: 'Search' },
-  { id: 'problems', path: PROBLEMS_PATH, label: 'Problems' },
+  { id: 'files', icon: 'file-text', label: 'Files' },
+  { id: 'git', icon: 'git-branch', label: 'Git' },
+  { id: 'search', icon: 'search', label: 'Search' },
+  { id: 'problems', icon: 'triangle-alert', label: 'Problems' },
   /*
    * M18's two, and they go *before* the bottom-anchored Settings rather than after it:
    * `SPACER_AT` is a `findIndex` for the first `bottom` item, so inserting ahead of it moves the
@@ -209,8 +146,8 @@ const ITEMS: readonly RailItem[] = [
    * to the foot. Appending after Settings instead would have put two buttons below the flexible
    * gap — the kind of change that looks right in the diff and wrong on screen.
    */
-  { id: 'agents', path: AGENTS_PATH, label: 'Agents' },
-  { id: 'tasks', path: TASKS_PATH, label: 'Tasks' },
+  { id: 'agents', icon: 'hexagon', label: 'Agents' },
+  { id: 'tasks', icon: 'square-check-big', label: 'Tasks' },
   /*
    * M22's manager panel, and the *contributed* panels arrive separately through the `extra` prop
    * below rather than by being pushed onto this array. Two reasons, and the second is the real
@@ -220,41 +157,9 @@ const ITEMS: readonly RailItem[] = [
    * this file may not import the extension store — every value in this component is a prop, which
    * is the rule its header states.
    */
-  { id: 'extensions', path: EXTENSIONS_PATH, label: 'Extensions' },
-  { id: 'settings', path: SETTINGS_PATH, label: 'Settings', bottom: true },
+  { id: 'extensions', icon: 'blocks', label: 'Extensions' },
+  { id: 'settings', icon: 'settings', label: 'Settings', bottom: true },
 ]
-
-/**
- * The one drawing surface in this rail, so its two call sites cannot drift apart in box size,
- * stroke weight or cap shape — the same reason the spans it replaces shared a class, and the
- * same argument: two rail buttons that draw their icon differently is a worse rail than one
- * that draws every icon wrongly.
- *
- * `currentColor` is what makes the rail's inherited `--dim`, `.item:hover`'s `--text` and
- * `.itemActive`'s `--accent` apply to a drawing exactly as they applied to a character. `aria-hidden`, because
- * each button's `aria-label` is already its whole accessible name.
- *
- * The `<svg>` is the button's only child and `.item` is a `place-items: center` grid, so it is
- * blockified and centred as a box — no line box, no baseline, and therefore none of the
- * per-face vertical drift that `ActivityRail.module.css` used to have a rule about.
- */
-function RailIcon({ path }: { path: string }) {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      width={ICON_PX}
-      height={ICON_PX}
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d={path} />
-    </svg>
-  )
-}
 
 /* The spacer belongs immediately before the first pinned item, wherever the array puts it. */
 const SPACER_AT = ITEMS.findIndex((item) => item.bottom === true)
@@ -470,7 +375,12 @@ export function ActivityRail({
               data-audit="railIcon"
               onClick={() => onSelect?.(item.id)}
             >
-              <RailIcon path={item.path} />
+              <Icon
+                {...(item.path !== undefined && item.path !== ''
+                  ? { d: item.path }
+                  : { name: item.icon ?? EXTENSION_FALLBACK })}
+                size={RAIL_ICON}
+              />
               {badge !== undefined && (
                 /*
                  * `aria-hidden`, and it is not cosmetic. The badge used to be a 6px dot with
@@ -519,7 +429,7 @@ export function ActivityRail({
             it is the same 28px box with the same mark in it, and one component is what keeps
             that true. It was the worst offender before — ≡ at 14px drew 7×8 of ink against
             ⚙'s 14×14, which is the report this change answers. */}
-        <RailIcon path={TOOLWINDOW_PATH} />
+        <Icon name="panel-bottom" size={RAIL_ICON} />
       </button>
     </div>
   )

@@ -29,6 +29,8 @@ import { branch as branchApi, file as fileApi, type ConflictSide } from '@/ipc/c
 import { explain } from './branchModel'
 import { notify } from './notices'
 import { afterResolve, useConflicts } from './conflictsStore'
+import { Icon } from '@/icons/Icon'
+
 import styles from './ConflictsDialog.module.css'
 
 export function ConflictsDialog() {
@@ -89,7 +91,7 @@ export function ConflictsDialog() {
                 className={`${styles.mark} ${entry.resolved ? styles.markDone : ''}`}
                 aria-hidden="true"
               >
-                {entry.resolved ? '✓' : '⚔'}
+                <Icon name={entry.resolved ? 'check' : 'swords'} size={1} />
               </span>
               <span className={styles.name}>{name}</span>
               <span className={styles.where}>{dir}</span>

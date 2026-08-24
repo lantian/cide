@@ -16,6 +16,8 @@
  */
 import { useMemo, useState } from 'react'
 
+import { Icon, type IconName } from '@/icons/Icon'
+
 import styles from './ExtPanel.module.css'
 import {
   type NodeIcon,
@@ -42,20 +44,24 @@ export interface ExtPanelViewProps {
  * The glyph for each icon name.
  *
  * Text and not SVG, and that is a decision rather than a shortcut. The rail's icons are 24x24
- * paths because they are chrome the design mock specifies to the pixel; a row icon is a 14px
- * column beside a label, where a glyph is legible, themeable by `color`, and — the point — cannot
- * be supplied by an extension, because this table is the only way to get one.
+ * paths because they are chrome specified to the pixel; a row icon is a 14px column beside a
+ * label, themeable by `color`, and — the point — **cannot be supplied by an extension**, because
+ * this table is the only way to get one. That last clause is why the table survives the move to
+ * drawn marks unchanged in shape: an extension still names a member of a closed set, and the set
+ * is what decides what the name draws. What it no longer does is depend on the host's fonts —
+ * `warning` and `info` were the ASCII stand-ins `!` and `i` precisely because no glyph could be
+ * relied on, and they are real marks now.
  */
-const GLYPH: Readonly<Record<NodeIcon, string>> = {
-  none: '',
-  file: '·',
-  folder: '▸',
-  symbol: '◆',
-  error: '✕',
-  warning: '!',
-  info: 'i',
-  run: '▶',
-  check: '✓',
+const MARK: Readonly<Record<NodeIcon, IconName | null>> = {
+  none: null,
+  file: 'file',
+  folder: 'folder',
+  symbol: 'diamond',
+  error: 'circle-x',
+  warning: 'triangle-alert',
+  info: 'info',
+  run: 'play',
+  check: 'check',
 }
 
 const TONE: Readonly<Record<NodeTone, string | undefined>> = {
@@ -206,9 +212,16 @@ export function ExtPanelView(props: ExtPanelViewProps): React.JSX.Element {
               }}
             >
               <span className={styles.twisty}>
-                {hasChildren ? (open ? '▾' : '▸') : ''}
+                {hasChildren ? (
+                  <Icon name={open ? 'chevron-down' : 'chevron-right'} size={1} />
+                ) : null}
               </span>
-              <span className={styles.icon}>{GLYPH[row.icon ?? 'none']}</span>
+              <span className={styles.icon}>
+                {(() => {
+                  const mark = MARK[row.icon ?? 'none']
+                  return mark === null ? null : <Icon name={mark} size={1} />
+                })()}
+              </span>
               <span className={styles.label}>{row.label}</span>
               {row.detail !== undefined && <span className={styles.detail}>{row.detail}</span>}
             </button>

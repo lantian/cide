@@ -385,8 +385,21 @@ const digests: LogDigest[] = LOG_STORIES.map((story) => {
        renders its text, so nothing else would notice. */
     /* Anchored on the row's audit hook and a following `<img>`, not on the `<img>` being the
        first child: a file row now leads with an empty twisty span, which is its indentation. */
-    fileIcons: (html.match(/data-audit="logFile"[\s\S]{0,1500}?<img/g) ?? []).length,
-    dirIcons: (html.match(/data-audit="logFileDir"[\s\S]{0,200}?<img/g) ?? []).length,
+    /*
+     * An `<img>` reached from a row's hook without crossing another hook on the way.
+     *
+     * These were fixed character windows — 1500 and 200 — and the 200 broke the day the folder
+     * heading's twisty stopped being the character `▾` and became a drawn mark, which is about
+     * 250 characters of `<svg>` sitting between the hook and the icon. The window said "0 folder
+     * icons" for markup that had two, which is the worst kind of wrong: a *fewer-icons* failure
+     * from a change that added something.
+     *
+     * Bounded by the markup instead of by a character count. `(?:(?!data-audit=)[\s\S])*?`
+     * refuses to cross the next hook, so the match is "the icon belonging to this row" by
+     * construction and stays true however much is drawn inside it.
+     */
+    fileIcons: (html.match(/data-audit="logFile"(?:(?!data-audit=)[\s\S])*?<img/g) ?? []).length,
+    dirIcons: (html.match(/data-audit="logFileDir"(?:(?!data-audit=)[\s\S])*?<img/g) ?? []).length,
     /* Every heading is a disclosure and reports whether it is open. A folded directory whose
        `aria-expanded` never changes is a control that does nothing for anyone not looking at
        the twisty. */

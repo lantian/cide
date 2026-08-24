@@ -67,7 +67,7 @@
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--dim);
   white-space: nowrap;
   overflow: hidden;
@@ -115,10 +115,14 @@
   line-height: 1;
   padding: 4px 7px;
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: var(--r-1);
   background: transparent;
   color: var(--dim);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .side:hover:not(:disabled) {
@@ -156,7 +160,7 @@
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel-2);
   color: var(--yellow);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 .link {
@@ -209,7 +213,7 @@
   background: none;
   color: var(--blue);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   text-align: left;
   white-space: nowrap;
   overflow: hidden;
@@ -229,10 +233,14 @@
   line-height: 1;
   padding: 4px 8px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .hunkAction:hover:not(:disabled) {
@@ -255,10 +263,10 @@
   justify-content: center;
   padding: 0;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: var(--panel-2);
   color: var(--text-hi);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   line-height: 1;
   cursor: pointer;
 }
@@ -434,10 +442,10 @@
   align-items: center;
   justify-content: center;
   border: 1px solid var(--border);
-  border-radius: 2px;
+  border-radius: var(--r-1);
   background: var(--panel-2);
   color: var(--text-hi);
-  font-size: var(--fs-ui-9);
+  font-size: var(--fs-ui-11);
   line-height: 1;
   cursor: pointer;
 }
@@ -587,7 +595,7 @@
 .count {
   margin-right: auto;
   color: var(--dim);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 .kind {
@@ -601,10 +609,14 @@
   line-height: 1;
   padding: 6px 10px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover:not(:disabled) {
@@ -621,6 +633,10 @@
   border-color: var(--accent);
   background: var(--accent);
   color: var(--bg);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .primary:hover:not(:disabled) {

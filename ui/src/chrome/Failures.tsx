@@ -51,6 +51,8 @@ import {
   subscribe,
   type Notice,
 } from './notices'
+import { Icon } from '@/icons/Icon'
+
 import styles from './Failures.module.css'
 
 export function Failures(): React.ReactNode {
@@ -140,7 +142,7 @@ function Toast({ notice }: { notice: Notice }) {
         aria-label="Dismiss"
         onClick={() => dismiss(notice.id)}
       >
-        ×
+        <Icon name="x" size={1} />
       </button>
     </div>
   )

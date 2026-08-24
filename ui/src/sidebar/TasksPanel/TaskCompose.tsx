@@ -50,6 +50,8 @@ import {
   type TaskDraft,
 } from './model'
 import { cx } from './TaskDetail'
+import { Icon } from '@/icons/Icon'
+
 import styles from './TasksPanel.module.css'
 
 export interface TaskComposeProps {
@@ -162,7 +164,7 @@ export function TaskCompose({
             if (closeCompose(draft, 'cancel')) onCancel()
           }}
         >
-          ×
+          <Icon name="x" size={1} />
         </button>
       </div>
 

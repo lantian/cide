@@ -92,7 +92,7 @@
   border-top: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--dim);
 }
 
@@ -119,13 +119,17 @@
   flex: none;
   padding: 3px 8px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--chrome-hi);
   color: var(--text);
   font-family: var(--font-ui);
   font-size: var(--fs-ui-11);
   line-height: 1;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover {
@@ -134,8 +138,8 @@
 }
 
 .button:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* The two states that are not a picture. Deliberately the same shape as `EditorPane`'s. */

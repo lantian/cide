@@ -30,18 +30,41 @@
   overflow: hidden;
 }
 
+  /*
+   * The panel header, identical in all six sidebar panels.
+   *
+   * It was 10.5px UPPERCASE at 0.09em of tracking in `--dim`, and it was the most dated thing
+   * in the app: a tiny, wide-set, all-caps label is the 2011 section-header signature, and it
+   * appeared here six times plus nineteen more places. Four declarations changed and each
+   * earns its line:
+   *
+   *   10.5px -> 12px      10.5px is under the readable floor for a proportional face, and it
+   *                       was the bottom rung of a scale with nowhere lower to go.
+   *   0.09em -> 0         tracking is what you add to small caps to keep them from setting
+   *                       solid. With no caps there is nothing to loosen.
+   *   uppercase -> none   the label in the TSX is already sentence case — `Project`, `Search`,
+   *                       `Problems`. `text-transform` was doing all of the shouting.
+   *   --dim -> --text/500 a header quieter than the rows beneath it is not a header. `--dim`
+   *                       was compensating for the fact that tracked-out caps already pull the
+   *                       eye; take the caps away and it just looks unfinished.
+   *
+   * The height is `--h-panelheader`, which is the same token value as `--h-tabstrip` and must
+   * stay so — see its comment in `tokens.css`: these two edges are the same line across the
+   * window, and a 4px step down the sidebar seam is what happens when they drift.
+   */
 .header {
-  height: calc(30px * var(--ui-scale));
+  height: var(--h-panelheader);
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 10px;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-5);
   border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--dim);
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
   /* Written twice: WebKitGTK 2.52 drops the unprefixed property outright. See
      `ui/scripts/check-css-prefix.mjs`, which is the gate that keeps the pair together. */
   -webkit-user-select: none;
@@ -61,7 +84,7 @@
 .headerMeta {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-11);
   letter-spacing: 0;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
@@ -93,11 +116,11 @@
   gap: 4px;
   padding: 0 6px;
   border: 0;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: inherit;
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   letter-spacing: 0;
   text-transform: none;
   cursor: pointer;
@@ -109,8 +132,8 @@
 }
 
 .headerAction:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /*
@@ -150,7 +173,7 @@
 /* The one claim the panel makes, sized above the paragraphs that explain it. */
 .claim {
   margin: 0;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   font-weight: 500;
   color: var(--text-hi);
 }
@@ -163,7 +186,7 @@
 
 .detail {
   margin: 6px 0 0;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--faint);
 }
@@ -175,8 +198,8 @@
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-left: 2px solid var(--accent);
-  border-radius: 3px;
-  font-size: var(--fs-ui-11-5);
+  border-radius: var(--r-1);
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--text);
 }
@@ -187,7 +210,7 @@
   display: block;
   margin-top: 4px;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   color: var(--text-hi);
   overflow-wrap: anywhere;
 }
@@ -208,11 +231,11 @@
   flex: none;
   padding: 3px 9px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -222,8 +245,8 @@
 }
 
 .action:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* The one affirmative control on the disabled screen. Accent-bordered rather than
@@ -298,11 +321,11 @@
 .link {
   padding: 2px 4px;
   border: none;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--faint);
   font-family: inherit;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   text-decoration: underline;
   cursor: pointer;
 }
@@ -312,8 +335,8 @@
 }
 
 .link:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* --- Sections. ---------------------------------------------------------------------- */
@@ -334,9 +357,9 @@
   display: flex;
   align-items: baseline;
   gap: 8px;
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--dim);
 }
 
@@ -350,7 +373,7 @@
 .sectionCount {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   letter-spacing: 0;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
@@ -367,9 +390,9 @@
   align-items: baseline;
   gap: 8px;
   cursor: pointer;
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--dim);
   list-style: none;
 }
@@ -391,7 +414,7 @@
   flex-direction: column;
   gap: 1px;
   padding: 3px 4px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
 }
 
 .row:hover {
@@ -420,7 +443,7 @@
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--text-hi);
 }
 
@@ -437,14 +460,14 @@
   white-space: nowrap;
   text-overflow: ellipsis;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
 .elapsed {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
@@ -487,14 +510,14 @@
 }
 
 .taskLink:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .taskId {
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--accent);
 }
 
@@ -537,11 +560,11 @@
   flex: none;
   padding: 1px 5px;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font-family: inherit;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   cursor: pointer;
 }
@@ -552,8 +575,8 @@
 }
 
 .control:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .controlGlyph {
@@ -570,7 +593,7 @@
 .rowNote {
   margin: 0;
   padding-left: 18px;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   color: var(--faint);
   overflow-wrap: anywhere;
@@ -602,14 +625,17 @@
   padding: 4px 6px;
   border: 1px solid var(--border);
   border-left: 2px solid var(--yellow);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: var(--panel-2);
 }
 
 .staleText {
   flex: 1;
   min-width: 0;
-  font-size: var(--fs-ui-10-5);
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   color: var(--text);
   overflow-wrap: anywhere;
@@ -619,12 +645,16 @@
   flex: none;
   padding: 2px 7px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .staleAction:hover {
@@ -632,8 +662,8 @@
 }
 
 .staleAction:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* --- One run of a role, under that role's own line. ---------------------------------- */
@@ -665,7 +695,7 @@
   flex-direction: column;
   gap: 2px;
   padding: 4px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
 }
 
 .roleRow:hover {
@@ -685,7 +715,7 @@
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--text-hi);
 }
 
@@ -705,7 +735,7 @@
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   color: var(--dim);
 }
 
@@ -723,14 +753,14 @@
   margin-left: auto;
   padding-left: 6px;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
 
 .roleDesc {
   margin: 0;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--faint);
   overflow-wrap: anywhere;
@@ -746,7 +776,7 @@
  */
 .roleReason {
   margin: 0;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--dim);
   font-style: italic;

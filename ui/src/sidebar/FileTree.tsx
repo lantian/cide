@@ -98,7 +98,7 @@ import {
   type TreeStatus,
   type TreeStatusMap,
 } from '@/ipc/client'
-import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
+import { Icon, FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
 // The sentence, not a second copy of it. `NO_HOST` is user-visible prose that now appears on
 // four surfaces — the tab strip's *Show history for this file*, this panel's, and the two
@@ -2530,7 +2530,9 @@ function Row({
   // children at all — `has_children` is hard-coded true on it in Rust, because a header with no
   // twisty cannot be opened and opening it is what starts the resolution.
   const hasTwisty = verbs.expandable && row.hasChildren
-  const twisty = hasTwisty ? (row.expanded ? '▾' : '▸') : ''
+  const twisty = hasTwisty ? (
+    <Icon name={row.expanded ? 'chevron-down' : 'chevron-right'} size={1} />
+  ) : null
 
   // Composed rather than a ternary chain: a row can be selected, be the cursor *and* be pending
   // a cut all at once, which is the ordinary case — Ctrl+X acts on the selection.

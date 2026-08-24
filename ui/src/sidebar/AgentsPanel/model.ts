@@ -159,19 +159,31 @@ export const TONES: readonly Tone[] = ['idle', 'busy', 'attention', 'paused', 'd
  * looser `Record<string, string | undefined>` was the alternative and it is a trap: an
  * `undefined` check does not catch `'constructor'`, whose lookup returns a function.
  */
+/*
+ * The eight phases, as icon **names** rather than as `IconName`, and the `string` is not
+ * laziness: this module is import-free on purpose — `check-agents.mjs` compiles it standalone
+ * with no `--rootDir` and imports the output directly — so a single `import type` would pull a
+ * third file into the program, move tsc's inferred common source directory and break that path.
+ * `asIcon` at the render site is what turns a name back into a checked one, and
+ * `check-ui-icons.mjs` is what proves every string here is a mark the app actually ships.
+ *
+ * One silhouette, eight interiors — which is what `○ ◌ ● ◉` was reaching for and could not hold,
+ * because those four came from four different parts of Unicode and rendered at four weights.
+ */
 const PHASE_GLYPH: Record<RunPhase, string> = {
-  queued: '○',
-  starting: '◌',
-  running: '●',
+  queued: 'circle',
+  starting: 'circle-dashed',
+  // An arc, so the mark reads as *turning*: that is the distinction `idle` below turns on.
+  running: 'loader-circle',
   // A ringed dot rather than a hollow or a filled one: the child is *there* (the centre) but is
-  // not turning (the ring). It has to be readable against both `queued`'s hollow ○ and
-  // `running`'s solid ●, because those are the two states a glance at an idle row could
+  // not turning (the ring). It has to be readable against both `queued`'s empty circle and
+  // `running`'s spinner, because those are the two states a glance at an idle row could
   // otherwise mistake it for, and they are the two opposite mistakes.
-  idle: '◉',
-  awaitingPermission: '◆',
-  paused: '⏸',
-  finished: '✓',
-  failed: '✗',
+  idle: 'circle-dot',
+  awaitingPermission: 'circle-alert',
+  paused: 'circle-pause',
+  finished: 'circle-check',
+  failed: 'circle-x',
 }
 
 const PHASE_LABEL: Record<RunPhase, string> = {
@@ -201,7 +213,7 @@ const PHASE_TONE: Record<RunPhase, Tone> = {
  * may be the empty string, and an empty glyph is a row whose dot column silently collapses —
  * which reads as "this run has no state" rather than "cide does not know this state".
  */
-const UNKNOWN_GLYPH = '?'
+const UNKNOWN_GLYPH = 'circle-slash'
 const UNKNOWN_LABEL = 'Unknown'
 const UNKNOWN_TONE: Tone = 'idle'
 

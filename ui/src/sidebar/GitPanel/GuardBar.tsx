@@ -24,6 +24,8 @@
  * The state that raises this bar is one nobody arranges by hand, which is why
  * `?git-story=guard` renders it from a fixture. See `fixture.ts`.
  */
+import { Icon } from '@/icons/Icon'
+
 import styles from './GuardBar.module.css'
 import type { RepoId } from './types'
 
@@ -60,7 +62,7 @@ export function GuardBar({ repos, showRepo, labelFor, onReload, onOverwrite }: G
           role="status"
         >
           <span className={styles.glyph} aria-hidden="true">
-            ⚠
+            <Icon name="triangle-alert" size={1} />
           </span>
           <span className={styles.text}>
             Staging changed outside cide

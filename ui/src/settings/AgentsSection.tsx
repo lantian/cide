@@ -116,6 +116,8 @@ import {
   type Row,
   type Scope,
 } from './agentsDraft'
+import { Icon } from '@/icons/Icon'
+
 import styles from './AgentsSection.module.css'
 
 /** Which file the form is on. `null` is "nothing selected"; a create is `original: null` inside. */
@@ -1456,7 +1458,7 @@ function ToolRows({ tools, onChange }: { tools: readonly string[]; onChange: (ne
             aria-label={`Remove tool ${index + 1}`}
             onClick={() => onChange(tools.filter((_, i) => i !== index))}
           >
-            ×
+            <Icon name="x" size={1} />
           </button>
         </div>
       ))}

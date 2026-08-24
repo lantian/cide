@@ -64,6 +64,8 @@ import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
 import { overflowEntries, tabMenuEntries } from './menuModel'
 import { clippedTabs, overflowHint } from './tabOverflow'
 import { useTabDrag } from './useTabDrag'
+import { Icon } from '@/icons/Icon'
+
 import styles from './TabStrip.module.css'
 
 export interface TabStripProps {
@@ -402,9 +404,9 @@ export function TabStrip({
               if (el !== null) overflow.openFor(el)
             }}
           >
-            {/* The glyph `ProjectMenu` already uses for "this opens a list", which is also the
-                control the report asked for: "a dropdown icon (like > but down)". */}
-            ▾
+            {/* The mark `ProjectMenu` also uses for "this opens a list", which is what the
+                report asked for: "a dropdown icon (like > but down)". */}
+            <Icon name="chevron-down" size={1} />
           </button>
         )}
       </div>
@@ -514,7 +516,15 @@ function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }
             onClose?.(tab.id)
           }}
         >
-          {view.dirty ? '•' : '×'}
+          {/*
+           * A drawn X for clean, a CSS dot for dirty — and the dot is a `<span>` rather than an
+           * icon on purpose. Lucide has no filled primitive: every mark in the set is a stroke,
+           * so a `circle` here would draw a *ring*, which reads as "empty" exactly where the
+           * meaning is "full". A filled dot is a shape, and this app already draws its shapes in
+           * CSS — `AppHeader`'s project dot and `PaneTitleBar`'s `.marker` are both boxes with a
+           * radius.
+           */}
+          {view.dirty ? <span className={styles.dirtyDot} /> : <Icon name="x" size={1} />}
         </button>
       )}
     </div>
@@ -654,7 +664,8 @@ function viewFor(kind: TabKind): TabView {
             <span className={`${styles.badge} ${badge.tone}`} data-audit="fileTabBadge">
               {badge.label}
             </span>
-            <span>{`⚔ ${basename(kind.path)}`}</span>
+            <Icon name="swords" size={1} />
+            <span>{basename(kind.path)}</span>
           </>
         ),
         closable: true,

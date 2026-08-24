@@ -151,6 +151,7 @@ const SERVER_KEYS: &[&str] = &[
 ];
 const PANEL_KEYS: &[&str] = &["id", "label", "icon", "location"];
 const COMMAND_KEYS: &[&str] = &["id", "title", "keywords"];
+const SETTING_KEYS: &[&str] = &["id", "label", "description", "kind"];
 const GRAMMAR_KEYS: &[&str] = &[
     "name",
     "keywords",
@@ -422,7 +423,13 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, ExtProblem> {
         problems.extend(unknown_keys(
             &path,
             contributes,
-            &["languages", "languageServers", "panels", "commands"],
+            &[
+                "languages",
+                "languageServers",
+                "panels",
+                "commands",
+                "settings",
+            ],
             "contributes.",
         ));
         // And one level into each array. Not a general recursive walk: the schema is three deep
@@ -435,6 +442,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, ExtProblem> {
             ("languageServers", SERVER_KEYS),
             ("panels", PANEL_KEYS),
             ("commands", COMMAND_KEYS),
+            ("settings", SETTING_KEYS),
         ] {
             let Some(rows) = contributes.get(key).and_then(serde_json::Value::as_array) else {
                 continue;
@@ -632,6 +640,116 @@ fn validate_contributions(path: &Path, manifest: &mut Manifest) {
                     ),
                 ));
                 false
+            }
+            _ => true,
+        }
+    });
+
+    // A setting's id is stored as a key in `extensions.json` and read back by the worker, so it
+    // has to be a stable, unambiguous string — but it is not a path and not a command, so the rule
+    // is the command one rather than the path one.
+    let mut seen_settings: BTreeSet<String> = BTreeSet::new();
+    let problems = &mut manifest.problems;
+    manifest.contributes.settings.retain(|setting| {
+        if !is_command_segment(&setting.id) {
+            problems.push(error(
+                path,
+                None,
+                format!(
+                    "setting `{}`: an id must be letters, digits, `-` and `.`, starting with a \
+                     letter. It is the key this value is stored under and the name the extension \
+                     reads it by, so it cannot be renamed once shipped.",
+                    setting.id
+                ),
+            ));
+            return false;
+        }
+        if !seen_settings.insert(setting.id.clone()) {
+            problems.push(error(
+                path,
+                None,
+                format!("setting `{}` is declared twice.", setting.id),
+            ));
+            return false;
+        }
+        if setting.label.trim().is_empty() {
+            problems.push(error(
+                path,
+                None,
+                format!(
+                    "setting `{}` has no label, so the Settings page would draw a control with \
+                     nothing beside it.",
+                    setting.id
+                ),
+            ));
+            return false;
+        }
+        match &setting.kind {
+            cide_ipc::ext::SettingKind::Choice { default, choices } => {
+                if choices.is_empty() {
+                    problems.push(error(
+                        path,
+                        None,
+                        format!("setting `{}` is a choice with no choices.", setting.id),
+                    ));
+                    return false;
+                }
+                // A default naming no choice is the one defect here that is *silent*: `coerce`
+                // would fall back to it, the control would show nothing selected, and the value
+                // the worker read would not be in the list it was offered.
+                if !choices.iter().any(|c| &c.value == default) {
+                    problems.push(error(
+                        path,
+                        None,
+                        format!(
+                            "setting `{}`: the default `{default}` is not one of its choices.",
+                            setting.id
+                        ),
+                    ));
+                    return false;
+                }
+                true
+            }
+            cide_ipc::ext::SettingKind::Number { default, min, max } => {
+                if !default.is_finite() {
+                    problems.push(error(
+                        path,
+                        None,
+                        format!("setting `{}`: the default is not a number.", setting.id),
+                    ));
+                    return false;
+                }
+                if let (Some(low), Some(high)) = (min, max)
+                    && low > high
+                {
+                    problems.push(error(
+                        path,
+                        None,
+                        format!(
+                            "setting `{}`: `min` ({low}) is above `max` ({high}), so no value is \
+                             legal.",
+                            setting.id
+                        ),
+                    ));
+                    return false;
+                }
+                // A default outside its own band is a warning rather than a refusal: `coerce`
+                // clamps it, so the setting works — the author has simply written down two
+                // numbers that disagree, and the clamped one is the honest answer.
+                let clamped = min.map_or(*default, |low| default.max(low));
+                let clamped = max.map_or(clamped, |high| clamped.min(high));
+                if (clamped - *default).abs() > f64::EPSILON {
+                    problems.push(warning(
+                        path,
+                        None,
+                        format!(
+                            "setting `{}`: the default {default} is outside its own min/max, so \
+                             it reads as {clamped}.",
+                            setting.id
+                        ),
+                    ));
+                }
+                true
             }
             _ => true,
         }
@@ -1139,6 +1257,122 @@ mod tests {
     /// A path from a manifest never leaves the repository. Checked on the string, before any
     /// filesystem call, because `Path::join` with an absolute right-hand side silently discards
     /// the left one.
+    /// The refusals a setting definition can earn, and the one that only warns.
+    #[test]
+    fn a_setting_definition_is_checked_against_its_own_kind() {
+        let dir = scratch("settings");
+        plant(
+            &dir,
+            r#"{
+              "id": "x", "main": "main.js",
+              "contributes": { "settings": [
+                { "id": "good", "label": "Good", "kind": { "type": "toggle", "default": true } },
+                { "id": "nolabel", "label": "  ", "kind": { "type": "toggle", "default": true } },
+                { "id": "empty-choice", "label": "E", "kind": { "type": "choice", "default": "a", "choices": [] } },
+                { "id": "stray-default", "label": "S", "kind": { "type": "choice", "default": "z",
+                    "choices": [ { "value": "a" } ] } },
+                { "id": "backwards", "label": "B", "kind": { "type": "number", "default": 5, "min": 10, "max": 2 } },
+                { "id": "outside", "label": "O", "kind": { "type": "number", "default": 5, "min": 10, "max": 20 } },
+                { "id": "good", "label": "Twice", "kind": { "type": "toggle", "default": false } }
+              ] }
+            }"#,
+        );
+        let manifest = read_manifest(&dir).expect("loads");
+        let kept: Vec<&str> = manifest
+            .contributes
+            .settings
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["good", "outside"],
+            "a broken definition is dropped and the rest survive; a default outside its own band \
+             only warns, because `coerce` clamps it and the setting works"
+        );
+        let said = |needle: &str| manifest.problems.iter().any(|p| p.message.contains(needle));
+        assert!(said("no label"), "{:?}", manifest.problems);
+        assert!(said("choice with no choices"));
+        assert!(said("is not one of its choices"));
+        assert!(said("no value is legal"));
+        assert!(said("reads as 10"), "the clamped value is named");
+        assert!(said("declared twice"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `coerce` is the one place a value is decided, so every road to one gets the same answer.
+    #[test]
+    fn a_stored_value_is_coerced_against_the_kind_it_was_declared_with() {
+        use cide_ipc::ext::{SettingChoice, SettingDef, SettingKind};
+        use serde_json::json;
+
+        let toggle = SettingDef {
+            id: "t".into(),
+            label: "T".into(),
+            description: None,
+            kind: SettingKind::Toggle { default: true },
+        };
+        assert_eq!(
+            toggle.coerce(None),
+            json!(true),
+            "absent reads as the default"
+        );
+        assert_eq!(toggle.coerce(Some(&json!(false))), json!(false));
+        assert_eq!(
+            toggle.coerce(Some(&json!("no"))),
+            json!(true),
+            "a hand-edited file holding the wrong type falls back rather than reaching a worker"
+        );
+
+        let number = SettingDef {
+            id: "n".into(),
+            label: "N".into(),
+            description: None,
+            kind: SettingKind::Number {
+                default: 50.0,
+                min: Some(1.0),
+                max: Some(100.0),
+            },
+        };
+        assert_eq!(
+            number.coerce(Some(&json!(9000))),
+            json!(100.0),
+            "clamped up"
+        );
+        assert_eq!(number.coerce(Some(&json!(-3))), json!(1.0), "and down");
+        assert_eq!(
+            number.coerce(Some(&json!("50"))),
+            json!(50.0),
+            "a string is not a number"
+        );
+
+        let choice = SettingDef {
+            id: "c".into(),
+            label: "C".into(),
+            description: None,
+            kind: SettingKind::Choice {
+                default: "a".into(),
+                choices: vec![
+                    SettingChoice {
+                        value: "a".into(),
+                        label: None,
+                    },
+                    SettingChoice {
+                        value: "b".into(),
+                        label: Some("Bee".into()),
+                    },
+                ],
+            },
+        };
+        assert_eq!(choice.coerce(Some(&json!("b"))), json!("b"));
+        assert_eq!(
+            choice.coerce(Some(&json!("gone"))),
+            json!("a"),
+            "a value naming a choice that no longer exists — which is what an update that \
+             narrowed the list leaves behind — falls back rather than being handed on"
+        );
+    }
+
     #[test]
     fn a_relative_path_cannot_escape_its_root() {
         let root = Path::new("/srv/clone");
@@ -1230,6 +1464,17 @@ mod tests {
                 label: String::new(),
                 icon: Some(String::new()),
                 location: PanelLocation::Sidebar,
+            })
+            .expect("serialise"),
+        );
+        check(
+            "SETTING_KEYS",
+            SETTING_KEYS,
+            serde_json::to_value(cide_ipc::ext::SettingDef {
+                id: String::new(),
+                label: String::new(),
+                description: Some(String::new()),
+                kind: cide_ipc::ext::SettingKind::Toggle { default: false },
             })
             .expect("serialise"),
         );

@@ -80,6 +80,8 @@ import {
 } from './branchModel'
 import { divergenceOf, strategyAsk } from './pullStrategyModel'
 import { requestPullStrategy } from './pullStrategyStore'
+import { Icon } from '@/icons/Icon'
+
 import styles from './BranchSelector.module.css'
 
 // --- the store --------------------------------------------------------------------------
@@ -290,7 +292,11 @@ export function BranchSelector() {
       // the popup on a `MouseEvent` where `'list' | 'new'` was expected.
       onClick={() => openBranchPopup('list')}
     >
-      ⑂ {label}
+      <Icon name="git-branch" size={1} />
+      {/* The label is its own box because the *button* is now a flex row: `text-overflow`
+          truncates a block container's inline content, so it has to live on the thing holding
+          the text rather than on the thing holding the mark and the text. */}
+      <span className={styles.widgetLabel}>{label}</span>
     </button>
   )
 }
@@ -879,8 +885,25 @@ interface RowProps {
 
 function Row({ entry, heading, id, active, open, busy, ...on }: RowProps) {
   const actions = actionsFor(entry)
-  const ahead = entry.ahead > 0 ? `↑${entry.ahead}` : ''
-  const behind = entry.behind > 0 ? `↓${entry.behind}` : ''
+  /*
+   * `null` rather than `''` when the count is zero, and the distinction is the whole point: an
+   * arrow with no number beside it is a claim about direction with no magnitude, which is not
+   * what "in sync" means. An empty string rendered nothing; so does `null`.
+   */
+  const ahead =
+    entry.ahead > 0 ? (
+      <span className={styles.count}>
+        <Icon name="arrow-up" size={0} />
+        {entry.ahead}
+      </span>
+    ) : null
+  const behind =
+    entry.behind > 0 ? (
+      <span className={styles.count}>
+        <Icon name="arrow-down" size={0} />
+        {entry.behind}
+      </span>
+    ) : null
 
   return (
     <>
@@ -919,7 +942,7 @@ function Row({ entry, heading, id, active, open, busy, ...on }: RowProps) {
           aria-expanded={open}
           onClick={on.onToggleMenu}
         >
-          ⋯
+          <Icon name="ellipsis" size={1} />
         </button>
       </div>
       {open && (

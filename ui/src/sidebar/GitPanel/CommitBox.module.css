@@ -20,7 +20,7 @@
   align-items: center;
   gap: 6px;
   color: var(--text);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   cursor: pointer;
 }
 
@@ -59,8 +59,18 @@
   flex: none;
   resize: none;
   padding: 7px 8px;
-  border: 1px solid var(--accent);
-  border-radius: 5px;
+  /*
+   * Neutral at rest, accent on focus.
+   *
+   * This was `var(--accent)` unconditionally: a 420px-wide, 104px-tall outlined rectangle, the
+   * first thing the eye landed on in the git sidebar, permanently, whether or not anyone was
+   * committing. An accent is for the thing you are doing, not for the thing you might do.
+   */
+  border: 1px solid var(--border);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-mono);
@@ -77,7 +87,8 @@
 
 .message:focus {
   outline: none;
-  border-color: var(--accent-hi);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .actions {
@@ -89,10 +100,14 @@
 .push {
   height: calc(26px * var(--ui-scale));
   padding: 0 12px;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   font-family: inherit;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 /*
@@ -119,6 +134,10 @@
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .push:hover:not(:disabled) {
@@ -136,7 +155,7 @@
 
 .commit:focus-visible,
 .push:focus-visible {
-  outline: 1px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 2px;
 }
 

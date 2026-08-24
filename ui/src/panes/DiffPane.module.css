@@ -58,7 +58,7 @@
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--dim);
   white-space: nowrap;
   overflow: hidden;
@@ -98,10 +98,14 @@
   line-height: 1;
   padding: 4px 7px;
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .mode:hover:not(:disabled) {
@@ -146,11 +150,15 @@
   font-size: var(--fs-ui-12);
   line-height: 1;
   padding: 6px 10px;
-  border-radius: 4px;
+  border-radius: var(--r-2);
   border: 1px solid var(--border);
   background: var(--chrome-hi);
   color: var(--text);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover {
@@ -159,14 +167,18 @@
 }
 
 .button:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .accept {
   border-color: var(--accent-dim);
   background: var(--accent);
   color: var(--bg);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .accept:hover {
@@ -177,6 +189,10 @@
 
 .reject {
   color: var(--red);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .reject:hover {
@@ -253,7 +269,7 @@
 
 .body :global(.cm-editor .cm-scroller) {
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.55;
 }
 
@@ -376,14 +392,18 @@
 
 .chunkButton {
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   line-height: 1;
   padding: 3px 6px;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--chrome);
   color: var(--dim);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .chunkButton:hover {

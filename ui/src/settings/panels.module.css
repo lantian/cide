@@ -5,7 +5,7 @@
   display: inline-block;
   padding: 1px 6px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-1);
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-mono);
@@ -29,7 +29,7 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   font-family: inherit;
@@ -50,9 +50,9 @@
 .table th {
   text-align: left;
   font-weight: 400;
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--faint);
   padding: 0 10px 6px 0;
   border-bottom: 1px solid var(--border);
@@ -84,7 +84,7 @@
 .conflict {
   border: 1px solid var(--border);
   border-left: 2px solid var(--red);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel);
   padding: 9px 12px;
   margin-bottom: 8px;
@@ -132,7 +132,7 @@
    the palette shows. A user reading this screen to write the file by hand needs both. */
 .rowId {
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   color: var(--faint);
   margin-top: 1px;
 }
@@ -154,12 +154,16 @@
   padding: 0 8px;
   margin-left: 4px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-ui);
   font-size: var(--fs-ui-11);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .action:hover:not(:disabled) {
@@ -176,7 +180,7 @@
   padding: 0 10px;
   margin-left: 4px;
   border: 1px solid var(--accent);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--accent);
   color: var(--on-accent);
   font-family: var(--font-ui);
@@ -222,8 +226,8 @@
 
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 9px;
-  box-shadow: var(--shadow);
+  border-radius: var(--r-4);
+  box-shadow: var(--shadow-2);
   overflow: hidden;
 }
 
@@ -234,10 +238,10 @@
   padding: 9px 14px 7px;
   border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   font-weight: 500;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--faint);
 }
 
@@ -253,7 +257,7 @@
   min-height: calc(52px * var(--ui-scale));
   padding: 10px 14px;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-18);
+  font-size: var(--fs-ui-20);
   color: var(--text);
 }
 
@@ -309,7 +313,7 @@
   display: inline-block;
   margin-top: 5px;
   padding: 1px 6px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   background: var(--sel);
   color: var(--text);
   font-size: var(--fs-ui-11);

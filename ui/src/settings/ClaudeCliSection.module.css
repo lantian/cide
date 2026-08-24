@@ -36,7 +36,7 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   /* A program name, a flag and a variable are all machine strings: mono, like every path and
@@ -115,7 +115,7 @@
   flex-basis: 100%;
   margin: 0;
   padding-left: 2px;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   color: var(--dim);
 }
@@ -136,12 +136,16 @@
   height: calc(24px * var(--ui-scale));
   padding: 0 10px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font: inherit;
   font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .add:hover {
@@ -154,12 +158,16 @@
   width: 24px;
   height: calc(26px * var(--ui-scale));
   border: 1px solid transparent;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--faint);
   font-size: var(--fs-ui-14);
   line-height: 1;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .remove:hover {
@@ -172,7 +180,7 @@
 .argv {
   margin: 0;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel);
   padding: 8px 10px;
   font-family: var(--font-mono);
@@ -255,7 +263,7 @@
  */
 .injectionCost {
   margin: 6px 0 0;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
 }

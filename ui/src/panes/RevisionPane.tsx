@@ -83,6 +83,8 @@ import { EditorSurface } from '@/editor/EditorSurface'
 import { file as fileApi, git as gitApi, gitLog, revisionFile } from '@/ipc/client'
 import type { ProjectId, RepoId, RevisionBlob } from '@/ipc/client'
 import { describe, notify } from '@/chrome/notices'
+import { Icon } from '@/icons/Icon'
+
 import styles from './RevisionPane.module.css'
 
 export interface RevisionPaneProps {
@@ -317,7 +319,7 @@ export function RevisionPane({
             <span key={crumb.key} className={styles.crumbSlot}>
               {index > 0 && (
                 <span className={styles.arrow} aria-hidden="true">
-                  ←
+                  <Icon name="chevron-left" size={1} />
                 </span>
               )}
               <button

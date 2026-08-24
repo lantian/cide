@@ -42,7 +42,7 @@
 
 .body {
   margin: 0;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
@@ -88,11 +88,11 @@
   height: calc(28px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text-hi);
   font-family: inherit;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
 }
 
 .input::placeholder {
@@ -100,7 +100,7 @@
 }
 
 .input:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: -1px;
   border-color: var(--accent);
 }
@@ -109,7 +109,7 @@
   flex: none;
   margin: 0;
   padding: 0 18px 10px;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   color: var(--yellow);
 }
 
@@ -136,9 +136,13 @@
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   text-align: left;
   cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .entry:hover:not(:disabled) {
@@ -146,8 +150,8 @@
 }
 
 .entry:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .entry:disabled {
@@ -167,7 +171,7 @@
   white-space: nowrap;
   text-align: right;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   color: var(--faint);
 }
 
@@ -191,14 +195,18 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   line-height: 1;
   padding: 7px 13px;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   border: 1px solid var(--border);
   background: var(--chrome-hi);
   color: var(--text);
   cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .button:hover:not(:disabled) {
@@ -207,7 +215,7 @@
 }
 
 .button:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 1px;
 }
 

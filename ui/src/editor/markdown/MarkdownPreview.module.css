@@ -155,7 +155,7 @@ h6.heading {
 
 .codeSpan {
   padding: 0.12em 0.35em;
-  border-radius: 3px;
+  border-radius: var(--r-1);
   background: var(--chrome-hi);
   font-family: var(--font-mono);
   font-size: calc(var(--fs-code) * 0.94);
@@ -172,7 +172,7 @@ h6.heading {
   margin: 0 0 0.9em;
   padding: 10px 12px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-1);
   background: var(--chrome);
   font-family: var(--font-mono);
   font-size: var(--fs-code);
@@ -234,21 +234,37 @@ h6.heading {
 }
 
 .link:focus-visible {
-  outline: 1px solid var(--accent);
+  outline: var(--focus-ring);
   outline-offset: 2px;
-  border-radius: 2px;
+  border-radius: var(--r-2);
 }
 
-/* An external target is marked, because activating it copies the address instead of opening it. */
+/*
+ * An external target is marked, because activating it copies the address instead of opening it.
+ *
+ * A mask rather than the ` ↗` it used to be: the same reason the lint gutter changed, plus one
+ * of its own — the leading space in that string was the *only* thing separating the mark from
+ * the link text, and a leading space inside `content` is not a margin. `margin-left` is.
+ */
 .link[data-target='external']::after {
-  content: ' ↗';
-  color: var(--faint);
+  content: '';
+  display: inline-block;
+  width: var(--icon-0);
+  height: var(--icon-0);
+  margin-left: var(--sp-1);
+  /* On the text's optical centre, not its baseline — a box has no descender to sit on. */
+  vertical-align: -0.1em;
+  background-color: var(--faint);
+  mask-image: var(--icon-arrow-up-right);
+  mask-size: var(--icon-0) var(--icon-0);
+  mask-position: center;
+  mask-repeat: no-repeat;
 }
 
 .image {
   max-width: 100%;
   height: auto;
-  border-radius: 3px;
+  border-radius: var(--r-1);
   vertical-align: middle;
 }
 
@@ -266,7 +282,7 @@ h6.heading {
 .imageMissing {
   padding: 0.1em 0.35em;
   border: 1px dotted var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-1);
   color: var(--faint);
   font-size: calc(var(--fs-code) * 0.94);
 }

@@ -464,13 +464,25 @@ try {
         { id: 'gopls', label: 'gopls', status: { kind: 'scanning', detail: 'Loading' }, items: 0 },
         { id: 'treeSitter', label: 'tree-sitter', status: { kind: 'ready' }, items: 3 },
         { id: 'claude', label: 'claude', status: { kind: 'ready' }, items: 0 },
+        // M22: a language server an extension contributed, under its own binary name, and an
+        // extension publishing findings from its own worker. The first is a process cide spawned
+        // and can spawn again; the second is not a process at all.
+        { id: 'sqls', label: 'sqls', status: { kind: 'ready' }, items: 2 },
+        {
+          id: 'ext:cide-marketplace.sql',
+          label: 'cide-marketplace.sql',
+          status: { kind: 'ready' },
+          items: 1,
+        },
       ],
     })
     deep(
       rows.map((r) => r.restartable),
-      [true, true, false, false],
-      'only the two that are separate processes offer a restart — a button on the others would ' +
-        'do nothing when pressed',
+      [true, true, false, false, true, false],
+      'every source that is a process cide spawned offers a restart, and nothing else does. It ' +
+        'was a *list* of the two builtins until M22, which was complete right up until an ' +
+        'extension could contribute a server — and then `sqls` reported findings into this panel ' +
+        'with no way to restart it, which is a failure with no symptom in any gate',
     )
     eq(
       rows[0].detail,
@@ -645,8 +657,8 @@ try {
   )
   deep(
     rogue2.glyphs,
-    ['·', '·'],
-    'and a real glyph — including for the prototype key, whose table lookup is a function that ' +
+    ['minus', 'minus'],
+    'and a real mark — including for the prototype key, whose table lookup is a function that ' +
       '`??` passes through, blanking the cell and poisoning the class string',
   )
   ok(

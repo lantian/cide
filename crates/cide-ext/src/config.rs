@@ -83,6 +83,19 @@ pub struct Installed {
     pub commit: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// What the user changed, and **only** what they changed.
+    ///
+    /// The differences from the manifest's defaults, never the whole resolved set. Storing every
+    /// value would freeze an extension's defaults at the moment it was installed: an author who
+    /// improved one in an update would find every existing user pinned to the old number, having
+    /// never chosen it. `SettingDef::coerce` is what turns this back into a complete set.
+    ///
+    /// A key nothing declares any more is kept rather than pruned — an extension that removed a
+    /// setting and puts it back in the next version should find the user's choice still there,
+    /// and the cost of being wrong about that is a few bytes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub settings: std::collections::BTreeMap<String, serde_json::Value>,
+
     /// What the user approved at install, as capability strings.
     ///
     /// Recorded rather than re-read from the manifest, and that is the whole consent mechanism.

@@ -73,13 +73,17 @@
   flex: none;
   padding: 4px 9px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-2);
   background: var(--chrome-hi);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .conflictButton:hover {
@@ -88,8 +92,8 @@
 }
 
 .conflictButton:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .notice {

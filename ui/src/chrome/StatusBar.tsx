@@ -30,6 +30,8 @@ import { sameTrail, subscribeStatusReadout, type ReadoutLine } from '@/editor/st
 import { NO_DIAGNOSTICS_SOURCE } from '@/sidebar/ProblemsPanel/model'
 import { crumbTargets } from '@/sidebar/rowPaths'
 import { BranchSelector } from './BranchSelector'
+import { Icon } from '@/icons/Icon'
+
 import styles from './StatusBar.module.css'
 
 export interface Diagnostics {
@@ -42,6 +44,21 @@ export interface StatusBarProps {
    * No `branch` prop. It was here, defaulted to `'—'`, and nothing ever passed one — so the
    * slot printed a dash forever. `BranchSelector` reads the repository itself; a prop would be
    * a second source of truth for a value it already holds to draw its list.
+   */
+  /**
+   * Lines added and removed in the working tree.
+   *
+   * **Nothing supplies these, and nothing ever has.** They defaulted to `0`, so the slot has
+   * spent every launch claiming a clean tree with total confidence — which is the same failure
+   * the `branch` prop above is a note about, and worse, because a dash is obviously a
+   * placeholder and a zero is a measurement. They are `undefined` by default now and the slot
+   * draws a dash, exactly as the diagnostics pair does when no source has looked.
+   *
+   * Wiring them is a backend change rather than a prop: there is no working-tree line count on
+   * the wire at all. `cide_ipc::git`'s `insertions`/`deletions` belong to a *pull outcome*, and
+   * `cide_git::show::line_counts` is commit-oriented — it takes a rev. A real figure needs a
+   * diff of HEAD against the working tree, summed across every root, behind a command of its
+   * own and a subscription that refreshes it as files change.
    */
   added?: number | undefined
   removed?: number | undefined
@@ -90,6 +107,14 @@ const DIAGNOSTICS_PENDING = NO_DIAGNOSTICS_SOURCE
 
 const CLAUDE_PENDING = 'Session readout arrives from the Claude statusline hook.'
 
+/*
+ * Deliberately says nobody has counted, rather than pretending a clean tree.
+ *
+ * The same distinction the diagnostics pair draws: `— —` means no source looked, `0 0` means a
+ * source looked and found nothing. This slot has only ever been able to say the first.
+ */
+const DIFF_PENDING = 'No working-tree line count is wired yet — this is not a claim of zero.'
+
 /** Shown until a real readout exists, and the value the pending title keys off. */
 const CLAUDE_PLACEHOLDER = 'claude · —'
 
@@ -123,8 +148,8 @@ function isSelecting(): boolean {
 }
 
 export function StatusBar({
-  added = 0,
-  removed = 0,
+  added,
+  removed,
   diagnostics = null,
   claude = CLAUDE_PLACEHOLDER,
   revealRoots,
@@ -185,27 +210,62 @@ export function StatusBar({
         <BranchSelector />
 
         {/*
-         * The mock separates the two counts by two spaces inside one slot rather than by
-         * the 16px gap between slots, so they read as a single diff stat. Both are
-         * non-breaking: under `white-space: nowrap` a run of ordinary spaces still
-         * collapses, and the pair would come out one space wide.
+         * The two counts sit in one slot rather than being separated by the gap between
+         * slots, so they read as a single diff stat.
+         *
+         * It was one template literal with two **non-breaking** spaces in it, because under
+         * `white-space: nowrap` a run of ordinary spaces collapses and the pair came out one
+         * space wide. With drawn marks the string is gone and so is that hazard: `.stat` is a
+         * flex row with its own gaps, and a gap cannot collapse.
+         *
+         * A dash rather than a zero while nothing supplies them — see the props above.
          */}
-        <span title={`${added} lines added, ${removed} removed`}>
-          {`⊕ ${added}  ⊖ ${removed}`}
+        <span
+          className={
+            added === undefined || removed === undefined
+              ? `${styles.diffStat} ${styles.unknownInk}`
+              : styles.diffStat
+          }
+          title={
+            added === undefined || removed === undefined
+              ? DIFF_PENDING
+              : `${added} lines added, ${removed} removed`
+          }
+        >
+          <span className={styles.stat}>
+            <Icon name="circle-plus" size={1} />
+            {added ?? '—'}
+          </span>
+          <span className={styles.stat}>
+            <Icon name="circle-minus" size={1} />
+            {removed ?? '—'}
+          </span>
         </span>
 
         {diagnostics === null ? (
           <span className={styles.unknown} title={DIAGNOSTICS_PENDING}>
-            <span>✗ —</span>
-            <span>⚠ —</span>
+            <span className={styles.stat}>
+              <Icon name="circle-x" size={1} />—
+            </span>
+            <span className={styles.stat}>
+              <Icon name="triangle-alert" size={1} />—
+            </span>
           </span>
         ) : (
           <>
-            <span className={styles.errors} title={`${diagnostics.errors} errors`}>
-              ✗ {diagnostics.errors}
+            <span
+              className={`${styles.errors} ${styles.stat}`}
+              title={`${diagnostics.errors} errors`}
+            >
+              <Icon name="circle-x" size={1} />
+              {diagnostics.errors}
             </span>
-            <span className={styles.warnings} title={`${diagnostics.warnings} warnings`}>
-              ⚠ {diagnostics.warnings}
+            <span
+              className={`${styles.warnings} ${styles.stat}`}
+              title={`${diagnostics.warnings} warnings`}
+            >
+              <Icon name="triangle-alert" size={1} />
+              {diagnostics.warnings}
             </span>
           </>
         )}
@@ -296,10 +356,11 @@ export function StatusBar({
          */}
         <span className={styles.readout} ref={readoutRef} data-audit="editorReadout" />
         <span
-          className={styles.claude}
+          className={`${styles.claude} ${styles.stat}`}
           title={claude === CLAUDE_PLACEHOLDER ? CLAUDE_PENDING : 'Claude session'}
         >
-          ◆ {claude}
+          <Icon name="message-square" size={1} />
+          {claude}
         </span>
         {/* The mock's `rust-analyzer` slot sits here and stays out until one is running. */}
       </div>

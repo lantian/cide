@@ -87,6 +87,8 @@
 import { useEffect, useId, useRef } from 'react'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { basename, dirname } from '@/overlays/format'
+import { Icon, asIcon } from '@/icons/Icon'
+
 import styles from './ConfirmDestructive.module.css'
 
 /**
@@ -162,6 +164,16 @@ export interface ConfirmState {
    * one part of this dialog that states *what kind of thing* is about to happen. Reusing `−`
    * for an open would say "these files are about to go", which is a sentence the dialog would
    * then be contradicting.
+   */
+  /**
+   * The mark drawn beside each row, as an icon **name**.
+   *
+   * `string`, not `IconName`, and that is forced rather than lazy: all three producers —
+   * `chrome/logActions.ts`, `chrome/pullStrategyModel.ts`, `terminal/outsideOpen.ts` — are
+   * **import-free on purpose**, each with a header saying so, because a check script compiles
+   * them standalone. A type-only import would break all three. `asIcon` narrows at the render
+   * site, and `check-ui-icons.mjs` is what proves every string they can produce is a mark this
+   * app ships.
    */
   mark?: string
   /**
@@ -330,12 +342,12 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
             const dir = split ? dirname(path) : ''
             return (
               <li key={path} className={styles.row} title={path}>
-                {/* `−` rather than the tab strip's `●`: what is about to happen to these rows
-                    is removal, and reusing the dirty dot would say "unsaved" instead. The
-                    out-of-project open overrides it with `↗`, because nothing is being
-                    removed there — see `ConfirmState.mark`. */}
+                {/* `minus` rather than the tab strip's dirty dot: what is about to happen to
+                    these rows is removal, and reusing the dot would say "unsaved" instead. The
+                    out-of-project open overrides it with an outward arrow, because nothing is
+                    being removed there — see `ConfirmState.mark`. */}
                 <span className={styles.mark} aria-hidden="true">
-                  {state.mark ?? '−'}
+                  <Icon name={asIcon(state.mark ?? 'minus')} size={1} />
                 </span>
                 <span className={styles.name}>{name}</span>
                 {dir !== '' && <span className={styles.where}>{dir}</span>}

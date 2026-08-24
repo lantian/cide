@@ -108,9 +108,7 @@ export function CloseConfirm({
             return (
               <li key={tab.tab} className={styles.row}>
                 {/* The tab strip's own dirty dot, so the row and the tab match. */}
-                <span className={`${styles.mark} ${styles.markUnsaved}`} aria-hidden="true">
-                  ●
-                </span>
+                <span className={`${styles.mark} ${styles.markUnsaved}`} aria-hidden="true" />
                 <span className={styles.name}>{row.name}</span>
                 <span className={styles.where} title={tab.path}>
                   {row.where}
@@ -126,9 +124,7 @@ export function CloseConfirm({
             const row = sessionRow(session)
             return (
               <li key={session.session} className={styles.row}>
-                <span className={`${styles.mark} ${styles.markSession}`} aria-hidden="true">
-                  ▪
-                </span>
+                <span className={`${styles.mark} ${styles.markSession}`} aria-hidden="true" />
                 <span className={styles.name}>{row.name}</span>
                 <span className={styles.where}>{row.where}</span>
               </li>

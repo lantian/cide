@@ -493,19 +493,44 @@ export const STALE_NOTE = 'Changed since it was checked — positions may be out
  * this whole task is about".
  */
 export interface SourceRow {
-  /** `rustAnalyzer` | `gopls` | `treeSitter` | `claude`. What `restart` is called with. */
+  /**
+   * What `restart` is called with.
+   *
+   * `rustAnalyzer`, `gopls`, `treeSitter`, `claude` — and, since M22, any language server an
+   * extension contributed, under its own binary name, or an `ext:<marketplace>.<extension>` for
+   * findings a worker published itself.
+   */
   id: string
   /** What the user sees: `rust-analyzer`. Carried on the wire; never rebuilt here. */
   label: string
   /** One line under the label: the progress detail, the reason, or a count. */
   detail: string
   status: SourceStatus['kind']
-  /** Only the two that are separate processes. See above. */
+  /** Whether this source is a process cide can start again. See [`NOT_A_PROCESS`]. */
   restartable: boolean
 }
 
-/** The ids that name a language-server process, and therefore the only ones worth restarting. */
-const RESTARTABLE: readonly string[] = ['rustAnalyzer', 'gopls']
+/**
+ * The ids that are **not** processes, and therefore the only ones with nothing to restart.
+ *
+ * A denylist since M22, and the inversion is the whole point. It was `['rustAnalyzer', 'gopls']`,
+ * which was a complete list of the language servers cide could run — right up until an extension
+ * could contribute one, at which point `sqls` reported findings into the panel and the footer
+ * offered no way to restart it. A closed list of servers cannot survive a set that is open, and
+ * there is no signal in the row that would have failed loudly; the button was simply absent.
+ *
+ * `tree-sitter` is cide's own parser and `claude` is a one-shot; everything else that can publish
+ * is a process cide spawned and can spawn again. `DiagnosticSourceId::is_server` is the same rule
+ * in Rust, and `cmd::ext`'s `source_of` is why an *extension's own* findings — which are published
+ * by a worker and not by a process — carry an `ext:` id that is neither of these and is excluded
+ * below.
+ */
+const NOT_A_PROCESS: readonly string[] = ['treeSitter', 'claude']
+
+/** Whether this source is a language server cide started, and can start again. */
+function restartable(id: string): boolean {
+  return !NOT_A_PROCESS.includes(id) && !id.startsWith('ext:')
+}
 
 /**
  * The footer rows, from whichever snapshot arm is in hand.
@@ -521,7 +546,7 @@ export function sourceRows(snapshot: DiagnosticsSnapshot): SourceRow[] {
     label: report.label,
     detail: sourceDetail(report),
     status: report.status.kind,
-    restartable: RESTARTABLE.includes(report.id),
+    restartable: restartable(report.id),
   }))
 }
 

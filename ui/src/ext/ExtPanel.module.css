@@ -51,9 +51,9 @@
   gap: 8px;
   padding: 0 10px;
   border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-10-5);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: var(--fs-ui-12);
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--dim);
   -webkit-user-select: none;
   user-select: none;
@@ -78,12 +78,16 @@
   background: transparent;
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   text-transform: none;
   letter-spacing: 0;
   padding: 2px 6px;
-  border-radius: 3px;
+  border-radius: var(--r-2);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .action:hover:not(:disabled) {
@@ -121,6 +125,10 @@
   text-align: left;
   cursor: default;
   width: 100%;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .clickable {
@@ -135,7 +143,7 @@
   flex: none;
   width: calc(12px * var(--ui-scale));
   color: var(--dim);
-  font-size: var(--fs-ui-9);
+  font-size: var(--fs-ui-11);
   text-align: center;
 }
 
@@ -144,7 +152,7 @@
   width: calc(14px * var(--ui-scale));
   text-align: center;
   color: var(--dim);
-  font-size: var(--fs-ui-10);
+  font-size: var(--fs-ui-11);
 }
 
 .label {
@@ -157,7 +165,7 @@
   margin-left: auto;
   padding-left: 8px;
   color: var(--dim);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   white-space: nowrap;
 }
 
@@ -179,7 +187,7 @@
 
 .notice {
   padding: 12px 10px;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
 }
@@ -190,7 +198,7 @@
 
 .truncated {
   padding: 6px 10px;
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   color: var(--dim);
   font-style: italic;
 }
@@ -198,14 +206,14 @@
 .table {
   width: 100%;
   border-collapse: collapse;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
 }
 
 .table th {
   text-align: left;
   font-weight: 500;
   color: var(--dim);
-  font-size: var(--fs-ui-10-5);
+  font-size: var(--fs-ui-12);
   padding: 4px 10px;
   border-bottom: 1px solid var(--border-soft);
   position: sticky;

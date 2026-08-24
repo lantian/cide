@@ -27,13 +27,13 @@
   padding: 4px 0;
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 9px;
-  box-shadow: var(--shadow);
+  border-radius: var(--r-4);
+  box-shadow: var(--shadow-2);
   /* `placeMenu` computes the budget; the box scrolls inside it rather than off the window. */
   overflow-y: auto;
   overflow-x: hidden;
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-12-5);
+  font-size: var(--fs-ui-13);
   -webkit-user-select: none;
   user-select: none;
   outline: none;
@@ -67,6 +67,10 @@
   color: var(--text);
   font: inherit;
   cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .item:hover:not(.disabled),
@@ -103,13 +107,19 @@
 }
 
 /* The check gutter. Always present on a menu that has any toggle in it, so labels align. */
+/*
+ * The check column. Always present, checked or not — its width is what aligns every label in the
+ * menu, so an unchecked item still occupies it and draws nothing.
+ *
+ * A grid rather than `text-align: center`: it holds one box now, not one character, and
+ * centring a box is what `place-items` is for. The `font-size` went with the character.
+ */
 .check {
   flex: 0 0 auto;
+  display: grid;
+  place-items: center;
   width: 12px;
-  font-size: var(--fs-ui-11);
-  line-height: 1;
   color: var(--accent);
-  text-align: center;
 }
 
 .label {
@@ -130,7 +140,7 @@
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--dim);
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
 }
 
 .reason {

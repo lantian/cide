@@ -71,6 +71,7 @@ import {
 } from './view'
 import type { MarkdownDoc, MdView } from './types'
 import styles from './MarkdownFrame.module.css'
+import { Icon, type IconName } from '@/icons/Icon'
 
 /** How long after the last keystroke the preview re-parses. */
 const PARSE_IDLE_MS = 120
@@ -483,35 +484,24 @@ function ViewSwitch({
  * `icons/FileIcon.tsx` already records why a sprite reference is not the route here. `currentColor`
  * throughout, so the pressed and unpressed states are one colour rule and not two drawings.
  */
+/*
+ * The three-way view switcher's marks.
+ *
+ * This was a hand-drawn 14x14 SVG — a third grid in an app that had two already, with no
+ * `stroke-width` at all (so the SVG default of 1 applied) and a `strokeWidth="1.6"` override on
+ * two lines to fake a heading rule. It drew at a different weight from the activity rail and
+ * from the git log's toggle, which is exactly the drift the vendored set exists to end.
+ *
+ * `file-code` for the source, `columns-2` for the split, `book-open-text` for the preview —
+ * `columns-2` being the same mark the git toolbar's Show diff and the header's Split use, which
+ * is the point: one idea, one picture, wherever it appears.
+ */
+const VIEW_MARK: Readonly<Record<MdView, IconName>> = {
+  text: 'file-code',
+  split: 'columns-2',
+  preview: 'book-open-text',
+}
+
 function ViewGlyph({ view }: { view: MdView }): JSX.Element {
-  return (
-    <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" focusable="false">
-      <rect x="1.5" y="2.5" width="11" height="9" rx="1" fill="none" stroke="currentColor" />
-      {view === 'split' ? <line x1="7" y1="2.5" x2="7" y2="11.5" stroke="currentColor" /> : null}
-      {view === 'text' ? (
-        // Code: three ragged lines across the whole box.
-        <g stroke="currentColor" strokeLinecap="round">
-          <line x1="3.5" y1="5" x2="9" y2="5" />
-          <line x1="3.5" y1="7" x2="10.5" y2="7" />
-          <line x1="3.5" y1="9" x2="7.5" y2="9" />
-        </g>
-      ) : null}
-      {view === 'preview' ? (
-        // Prose: a heading rule and two full measures under it.
-        <g stroke="currentColor" strokeLinecap="round">
-          <line x1="3.5" y1="5" x2="7" y2="5" strokeWidth="1.6" />
-          <line x1="3.5" y1="7.5" x2="10.5" y2="7.5" />
-          <line x1="3.5" y1="9.5" x2="10.5" y2="9.5" />
-        </g>
-      ) : null}
-      {view === 'split' ? (
-        <g stroke="currentColor" strokeLinecap="round">
-          <line x1="3" y1="5" x2="5.5" y2="5" />
-          <line x1="3" y1="7" x2="5.5" y2="7" />
-          <line x1="8.5" y1="5" x2="11" y2="5" strokeWidth="1.6" />
-          <line x1="8.5" y1="7.5" x2="11" y2="7.5" />
-        </g>
-      ) : null}
-    </svg>
-  )
+  return <Icon name={VIEW_MARK[view]} size={1} />
 }

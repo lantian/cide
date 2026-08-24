@@ -105,6 +105,8 @@ import { noteRepoRoots, repoRoot, touchesFile } from '@/sidebar/GitPanel/repoRoo
 import { gitRefsMoved } from '@/gitlog/logModel'
 import { blameFor, blameRefusal, type BlameLookup } from './diffBlame'
 import { diffTabOnScreen } from './diffTabs'
+import { Icon } from '@/icons/Icon'
+
 import styles from './GitDiffPane.module.css'
 
 /*
@@ -610,7 +612,9 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
       <span className={styles.path}>{diff?.path ?? path}</span>
       {diff?.oldPath != null && (
         <>
-          <span className={styles.arrow}>←</span>
+          <span className={styles.arrow}>
+            <Icon name="arrow-left-right" size={0} />
+          </span>
           <span className={styles.path}>{diff.oldPath}</span>
         </>
       )}
@@ -769,7 +773,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
               staging.onMarks(toggleLine(staging.marks, staging.diff, hunkIndex, at))
             }}
           >
-            {on ? '✓' : ''}
+            {on ? <Icon name="check" size={0} /> : null}
           </button>
         )}
         {blame !== null &&
@@ -881,7 +885,11 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
                       staging.onMarks(toggleHunk(staging.marks, staging.diff, hunk.index))
                     }}
                   >
-                    {state === 'all' ? '✓' : state === 'some' ? '–' : ''}
+                    {state === 'all' ? (
+                      <Icon name="check" size={0} />
+                    ) : state === 'some' ? (
+                      <Icon name="minus" size={0} />
+                    ) : null}
                   </button>
                 )}
                 <button
@@ -890,7 +898,9 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
                   aria-expanded={!shut}
                   onClick={() => onCollapse(hunk.index)}
                 >
-                  <span className={styles.caret}>{shut ? '▸' : '▾'}</span>
+                  <span className={styles.caret}>
+                    <Icon name={shut ? 'chevron-right' : 'chevron-down'} size={1} />
+                  </span>
                   {hunk.header}
                 </button>
                 {selectable && op !== 'commit' && (

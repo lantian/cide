@@ -51,7 +51,7 @@
   gap: 10px;
   padding: 7px 9px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--text);
 }
@@ -123,7 +123,7 @@
 .rowBlocked {
   display: block;
   margin-top: 3px;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   line-height: 1.4;
   color: var(--red);
 }
@@ -133,12 +133,12 @@
   flex: none;
   padding: 1px 6px;
   border: 1px solid var(--border);
-  border-radius: 999px;
-  font-size: var(--fs-ui-10-5);
+  border-radius: var(--r-full);
+  font-size: var(--fs-ui-11);
   line-height: 1.5;
   color: var(--dim);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .badgeGlobal {
@@ -170,11 +170,11 @@
   height: calc(22px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font: inherit;
-  font-size: var(--fs-ui-11-5);
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -235,7 +235,7 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   /* A role name is a file stem and a branch segment; a tool name and a model alias are machine
@@ -263,7 +263,7 @@
   min-width: 220px;
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-ui);
@@ -293,7 +293,7 @@
   min-height: calc(320px * var(--ui-scale));
   padding: 9px 10px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-mono);
@@ -345,12 +345,16 @@
   height: calc(24px * var(--ui-scale));
   padding: 0 10px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font: inherit;
   font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .chip:hover {
@@ -388,12 +392,16 @@
   height: calc(24px * var(--ui-scale));
   padding: 0 10px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font: inherit;
   font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .add:hover {
@@ -406,12 +414,16 @@
   width: 24px;
   height: calc(26px * var(--ui-scale));
   border: 1px solid transparent;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--faint);
   font-size: var(--fs-ui-14);
   line-height: 1;
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .remove:hover {
@@ -461,7 +473,7 @@
 
 .dialogTitle {
   margin: 0;
-  font-size: var(--fs-ui-15);
+  font-size: var(--fs-ui-16);
   color: var(--text-hi);
 }
 
@@ -531,7 +543,7 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 14px;
   border: 1px solid var(--accent);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--accent);
   color: var(--on-accent);
   font: inherit;
@@ -550,12 +562,16 @@
   height: calc(26px * var(--ui-scale));
   padding: 0 12px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font: inherit;
   font-size: var(--fs-ui-12);
   cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
 .quiet:hover {

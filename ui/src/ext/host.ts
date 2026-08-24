@@ -48,6 +48,8 @@ interface Live {
   readonly views: Map<string, PanelView>
   /** Panels currently on screen, so a worker is only told about the ones it can affect. */
   readonly shown: Set<string>
+  /** The settings this worker was last told, serialised, so an unchanged set costs no message. */
+  settings: string
 }
 
 /** Keyed by `<marketplace>.<extension>` — the same pair `cide-ext://` uses as a host. */
@@ -125,7 +127,25 @@ export function reconcile(installed: readonly InstalledExtension[]): void {
     }
   }
   for (const [key, row] of wanted) {
-    if (!LIVE.has(key)) start(key, row)
+    const live = LIVE.get(key)
+    if (live === undefined) {
+      start(key, row)
+      continue
+    }
+    /*
+     * A running worker whose settings moved.
+     *
+     * Compared rather than posted unconditionally, because `reconcile` runs on *every* snapshot —
+     * a marketplace refresh, another extension being installed — and a worker woken for a change
+     * that was not its own would redraw its panel for no reason. `JSON.stringify` over a handful
+     * of scalars is the cheap comparison here; the values are already normalised by Rust, and
+     * `BTreeMap` serialises in key order, so two equal sets always produce equal strings.
+     */
+    const next = JSON.stringify(row.settings)
+    if (next !== live.settings) {
+      live.settings = next
+      post(live, { kind: 'settings', settings: row.settings })
+    }
   }
   announce()
 }
@@ -234,6 +254,7 @@ function start(key: string, row: InstalledExtension): void {
     capabilities,
     views: new Map(),
     shown: new Set(),
+    settings: JSON.stringify(row.settings),
   }
   LIVE.set(key, live)
 
@@ -285,6 +306,7 @@ function start(key: string, row: InstalledExtension): void {
     version: row.version,
     capabilities: [...capabilities],
     panels: row.contributes.panels.map((panel) => ({ id: panel.id, label: panel.label })),
+    settings: row.settings,
   })
 
   /*

@@ -315,6 +315,53 @@ try {
       + 'to open a page in',
   )
 
+  // --- Settings ▸ Extensions ----------------------------------------------------------------------
+
+  const settings = stories['settings']
+  ok(settings.includes('Showcase'), 'the section groups rows under the extension that declared them')
+  for (const label of ['Greeting', 'Rows in the list', 'Detail', 'Log every note']) {
+    ok(settings.includes(label), `the \`${label}\` row is drawn`)
+  }
+  ok(
+    settings.includes('type="text"') && settings.includes('placeholder="Say something"'),
+    'a `text` setting draws a text field, with its placeholder — which is not its default, and a '
+      + 'settings screen that conflated the two would store the empty string for a field the user '
+      + 'never touched',
+  )
+  ok(
+    settings.includes('type="number"') && settings.includes('min="1"') && settings.includes('max="20"'),
+    'a `number` setting draws a spinner with the declared band, so the arrows stop where Rust '
+      + 'would clamp',
+  )
+  ok(
+    settings.includes('role="radiogroup"') && settings.includes('>Plain<'),
+    'a `choice` setting draws its options by label rather than by stored value',
+  )
+  ok(
+    settings.includes('role="switch"') || settings.includes('type="checkbox"'),
+    'and a `toggle` draws a switch',
+  )
+  ok(
+    settings.includes('A text setting.'),
+    'a description is drawn under its label — it is the only place a manifest can explain what a '
+      + 'setting is for',
+  )
+  ok(
+    stories['settings-none'].includes('No extensions are installed'),
+    'with nothing installed, the page says so and points at where extensions come from',
+  )
+  ok(
+    stories['settings-nothing-to-configure'].includes('Nothing to configure'),
+    'and with extensions that declare none it says a *different* thing — "you have none" and '
+      + '"yours have none to configure" are two facts, and only one of them suggests installing '
+      + 'something',
+  )
+  ok(
+    stories['settings-nothing-to-configure'].includes('The installed extension declares'),
+    'in the singular for one, because a settings page that says "extensions declare" over a list '
+      + 'of one is a page that was written without looking at it',
+  )
+
   // --- the extension page ------------------------------------------------------------------------
 
   const page = stories['page']
