@@ -35,6 +35,9 @@ import { liveHosts } from '@/layout/paneHosts'
 import { fontVariables, uiScale } from './fontScale'
 import { refont, retheme } from '@/terminal/xterm'
 import { asThemeName, DEFAULT_THEME, otherTheme, themeToAdopt } from './theme'
+import { applyScheme, schemeIsPainted, schemeToApply } from '@/editor/scheme'
+import type { PaintedScheme } from '@/editor/scheme'
+import type { ColorScheme } from '@/ipc/generated'
 
 /** The settings this window currently mirrors, or `null` before bootstrap resolves. */
 export function useSettings(): Settings | null {
@@ -206,6 +209,34 @@ function paintUiScale(size: number): void {
   root.style.setProperty('--ui-scale', value)
 }
 
+
+/**
+ * Write the selected colour scheme's custom properties onto `<html>`. (M24)
+ *
+ * The decision is `editor/scheme.ts` and the DOM write is `applyScheme`; this is the two lines
+ * that join them to the store. Which id to read depends on the theme, because the setting is
+ * per polarity — `EditorSettings` carries the argument.
+ *
+ * **No `?scheme=` parameter, and no `theme-boot.js` line.** The theme needs one because the
+ * chrome's background paints before React exists and a late palette is a visible flash. A
+ * colour scheme cannot flash: `App` gates its entire render on `boot === null`, so no editor
+ * has mounted by the time settings have arrived, and there is nothing on screen for the
+ * properties to be late for. This is the obvious thing a future reader will try to "fix".
+ *
+ * Guarded for `paintFonts`' reason — this listener sees every snapshot and almost none of them
+ * change a scheme — but guarded on the resolved *scheme*, not on the id. See `paintedScheme`.
+ */
+function paintScheme(schemes: readonly ColorScheme[], id: string, theme: Theme): void {
+  const scheme = schemeToApply(schemes, id, theme) as ColorScheme | null
+  const next = { theme, id, scheme }
+  if (schemeIsPainted(painted, next)) return
+  painted = next
+  applyScheme(document.documentElement, scheme)
+}
+
+/** What the last [`paintScheme`] wrote. See `schemeIsPainted` for why it holds the object. */
+let painted: PaintedScheme | null = null
+
 /**
  * Follow the theme in the workspace mirror, and repaint this window whenever it moves.
  *
@@ -262,6 +293,11 @@ export function installThemeSync(): () => void {
     // means it costs one string compare. It is not redundant — the audit entry points and any
     // window opened without the parameter reach here and nowhere else.
     paintUiScale(bootSettings.uiFontSize)
+    paintScheme(
+      schemesOf(useWorkspace.getState()),
+      schemeIdFor(bootSettings.editor, start),
+      start,
+    )
   }
 
   const unsubscribe = useWorkspace.subscribe((state, previous) => {
@@ -281,6 +317,7 @@ export function installThemeSync(): () => void {
     if (settings) {
       paintFonts(settings.editor.fontSize, settings.terminal.fontSize)
       paintUiScale(settings.uiFontSize)
+      paintScheme(schemesOf(state), schemeIdFor(settings.editor, state.theme), state.theme)
     }
   })
 
@@ -289,6 +326,22 @@ export function installThemeSync(): () => void {
     unsubscribe()
   }
   return themeSyncInstalled
+}
+
+/**
+ * The scheme id for the theme on screen. `EditorSettings` stores one per polarity.
+ *
+ * Takes the group rather than the whole `Settings` so the boot path can hand it
+ * `bootSettings.editor` and the subscription can hand it `settings.editor` without either
+ * having to know which.
+ */
+function schemeIdFor(editor: { colorSchemeLight: string; colorSchemeDark: string }, theme: Theme) {
+  return theme === 'dark' ? editor.colorSchemeDark : editor.colorSchemeLight
+}
+
+/** The imported schemes, or none before the bootstrap has landed. */
+function schemesOf(state: { boot: { schemes: ColorScheme[] } | null }): readonly ColorScheme[] {
+  return state.boot?.schemes ?? []
 }
 
 const noop = (): void => {}

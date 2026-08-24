@@ -405,7 +405,19 @@ pub async fn project_pick(
     window: tauri::WebviewWindow,
 ) -> Result<Vec<String>, CoreError> {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
-    show_folder_picker(&app, window, tx)?;
+    show_picker(
+        &app,
+        window,
+        PickerSpec {
+            title: "Open project",
+            accept: "Open",
+            folders: true,
+            // A project may span several roots, and `project_open` already takes a list.
+            multiple: true,
+            filter: None,
+        },
+        tx,
+    )?;
 
     // `spawn_blocking` rather than blocking the command's own task: the answer arrives only
     // when the user has finished browsing, which is unbounded, and the async runtime's worker
@@ -425,6 +437,20 @@ pub async fn project_pick(
         .collect())
 }
 
+/// What a picker asks for. One type across both `cfg` arms, so a second caller cannot pick up
+/// the Linux behaviour and quietly lose the other.
+///
+/// `filter` is `(label, globs)` — glob form, because that is what GTK's `FileFilter` takes and
+/// because the plugin's bare-extension form can be derived from it and not the other way round.
+pub(crate) struct PickerSpec {
+    pub title: &'static str,
+    /// The confirm button's label. GTK only; the plugin has no equivalent.
+    pub accept: &'static str,
+    pub folders: bool,
+    pub multiple: bool,
+    pub filter: Option<(&'static str, &'static [&'static str])>,
+}
+
 /// Build and show the picker on the GTK main thread, answering through `tx`.
 ///
 /// Returns as soon as the dialog is *queued*, not when it is answered: `FileChooserNative::run`
@@ -438,9 +464,10 @@ pub async fn project_pick(
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
-fn show_folder_picker(
+pub(crate) fn show_picker(
     app: &tauri::AppHandle,
     window: tauri::WebviewWindow,
+    spec: PickerSpec,
     tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
 ) -> Result<(), CoreError> {
     app.run_on_main_thread(move || {
@@ -452,23 +479,41 @@ fn show_folder_picker(
         let parent = match window.gtk_window() {
             Ok(parent) => Some(parent),
             Err(error) => {
-                tracing::warn!(%error, "no GTK window to parent the folder picker to");
+                tracing::warn!(%error, "no GTK window to parent the picker to");
                 None
             }
         };
 
         let dialog = gtk::FileChooserNative::new(
-            Some("Open project"),
+            Some(spec.title),
             parent.as_ref(),
-            gtk::FileChooserAction::SelectFolder,
-            Some("Open"),
+            if spec.folders {
+                gtk::FileChooserAction::SelectFolder
+            } else {
+                gtk::FileChooserAction::Open
+            },
+            Some(spec.accept),
             Some("Cancel"),
         );
         // Modal as well as parented. The parent decides *stacking*; modality is what stops the
         // user reaching the window underneath and opening a second picker on top of this one.
         dialog.set_modal(true);
-        // A project may span several roots, and `project_open` already takes a list.
-        dialog.set_select_multiple(true);
+        dialog.set_select_multiple(spec.multiple);
+        if let Some((name, patterns)) = spec.filter {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some(name));
+            for pattern in patterns {
+                filter.add_pattern(pattern);
+            }
+            dialog.add_filter(filter);
+            // A second, unrestricted filter rather than none: a theme saved as `.jsonc`, or
+            // with no extension at all, is a file the importer handles perfectly well, and a
+            // picker that cannot select it is a dead end with no error message.
+            let any = gtk::FileFilter::new();
+            any.set_name(Some("All files"));
+            any.add_pattern("*");
+            dialog.add_filter(any);
+        }
 
         /*
          * One reference, held by the handler and released by it.
@@ -496,7 +541,7 @@ fn show_folder_picker(
         });
         dialog.show();
     })
-    .map_err(|e| CoreError::Io(format!("folder picker: {e}")))
+    .map_err(|e| CoreError::Io(format!("{}: {e}", spec.title)))
 }
 
 /// Windows and macOS, where the plugin parents the dialog itself and `rfd`'s backend honours
@@ -509,26 +554,42 @@ fn show_folder_picker(
     target_os = "netbsd",
     target_os = "openbsd"
 )))]
-fn show_folder_picker(
+pub(crate) fn show_picker(
     _app: &tauri::AppHandle,
     window: tauri::WebviewWindow,
+    spec: PickerSpec,
     tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
 ) -> Result<(), CoreError> {
     use tauri_plugin_dialog::DialogExt;
 
-    window
+    let answer = move |paths: Option<Vec<tauri_plugin_dialog::FilePath>>| {
+        let picked = paths
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| p.into_path().ok())
+            .collect();
+        let _ = tx.send(picked);
+    };
+    let mut builder = window
         .dialog()
         .file()
         .set_parent(&window)
-        .set_title("Open project")
-        .pick_folders(move |paths| {
-            let picked = paths
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|p| p.into_path().ok())
-                .collect();
-            let _ = tx.send(picked);
-        });
+        .set_title(spec.title);
+    if let Some((name, patterns)) = spec.filter {
+        // The plugin wants bare extensions where GTK wants globs, which is why `PickerSpec`
+        // carries the glob form: one of the two has to convert, and stripping `*.` is total
+        // where synthesising a glob from an extension is not.
+        let bare: Vec<&str> = patterns
+            .iter()
+            .map(|p| p.trim_start_matches("*."))
+            .collect();
+        builder = builder.add_filter(name, &bare);
+    }
+    if spec.folders {
+        builder.pick_folders(answer);
+    } else {
+        builder.pick_files(answer);
+    }
     Ok(())
 }
 

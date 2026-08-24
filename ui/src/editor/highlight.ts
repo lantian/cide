@@ -16,58 +16,131 @@ import { tags as t } from '@lezer/highlight'
 import type { Tag } from '@lezer/highlight'
 
 /**
- * A token role, its CSS class, and the design token that colours it.
+ * A token role, its CSS class, and the colour-scheme token that paints it.
  *
- * The first six roles are the mock's own list for Rust: keywords `--purple`, types
- * `--cyan`, functions `--blue`, attributes/strings `--yellow`, comments `--faint`, `?`
- * `--red`. The rest are the roles a real buffer has that a screenshot of forty lines did
- * not happen to show, and they are deliberately quiet — a syntax theme that colours
- * punctuation as loudly as it colours keywords reads as noise.
+ * # The roles are more than the mock's six, and more than they were
+ *
+ * The first six were the mock's own list for Rust: keywords, types, functions,
+ * attributes/strings, comments, `?`. The rest are the roles a real buffer has that a screenshot
+ * of forty lines did not happen to show.
+ *
+ * Twelve of them collapsed further than they had to, and M24 split the ones that were costing
+ * something. The headline is `propertyName`: it painted `--text`, and `.cm-editor` is also
+ * `color: var(--text)`, so a JSON key — the one piece of structure a JSON file has, which
+ * `languages/data.ts` goes to real positional trouble to identify — was pixel-identical to
+ * unhighlighted prose. `atom` is the other: it is a subtag of `keyword`, so `true`/`false`/`null`
+ * inherited the keyword colour and a config file's booleans were the same purple as a Rust `fn`.
+ *
+ * The rest of the new roles (`doc`, `escape`, `regexp`, `namespace`, `macro`, `label`, `bracket`,
+ * `punctuation`, `strong`, `link`, `variable`) mostly hold the value they used to share, and are
+ * split anyway. That is not busywork: a role is the unit an *imported* scheme can speak about, so
+ * a role that does not exist is a colour a VS Code theme has no way to give us. See
+ * `cide_core::scheme::SCOPES`, which is the other half of this table.
+ *
+ * # Bare `variableName` is deliberately not a role
+ *
+ * An ordinary identifier is body text. Colouring every one of them is how a syntax theme turns
+ * into noise, and `check-editor.mjs` pins `classOf('variableName') === null` so it stays that way.
+ *
+ * # Order is precedence
+ *
+ * `HighlightStyle` resolves a tag through its parent chain and takes the first matching entry, so
+ * a role claiming a *child* tag must be listed before the role claiming its parent. Every such
+ * pair in this table is called out in a comment where it appears, because the failure is silent:
+ * the wrong role wins and nothing anywhere fails.
  */
 export interface TokenRole {
   /** Class emitted into the buffer's DOM, and the minimap's lookup key. */
   cls: string
-  /** The `tokens.css` custom property, without the `var()`. */
+  /**
+   * The custom property that colours it, without the `var()`.
+   *
+   * Always a `--tk-*`, never a chrome token. Until M24 these were `--purple`, `--yellow` and so
+   * on — the same six the terminal's ANSI palette reads, so retuning a syntax colour repainted
+   * every terminal in the app. `tokens.css` carries the argument at length.
+   */
   token: string
   /** Lezer tags that resolve to this role, most specific first. */
   tags: readonly Tag[]
 }
 
 export const TOKEN_ROLES: readonly TokenRole[] = [
+  // `docComment` and `docString` are subtags of `comment` and `string`; both roles that claim
+  // those parents are below.
+  { cls: 'cide-tk-doc', token: '--tk-doc', tags: [t.docComment, t.docString] },
+  { cls: 'cide-tk-comment', token: '--tk-comment', tags: [t.comment] },
   // `?` in Rust, and the equivalent control-flow punctuation elsewhere. Listed before the
-  // general operator role because `controlOperator` is a subtag of `operator`, and
-  // `HighlightStyle` resolves to the first matching entry.
-  { cls: 'cide-tk-control', token: '--red', tags: [t.controlOperator, t.invalid] },
-  { cls: 'cide-tk-comment', token: '--faint', tags: [t.comment] },
+  // general operator role because `controlOperator` is a subtag of `operator`.
+  { cls: 'cide-tk-control', token: '--tk-control', tags: [t.controlOperator, t.invalid] },
+  // `true`, `false`, `null`, `self`. Four of these five are subtags of `keyword` and `bool` is a
+  // subtag of `literal`, so this must precede both the keyword role and the number role — which
+  // claims `literal` — or a config file's booleans go back to being keywords.
+  {
+    cls: 'cide-tk-constant',
+    token: '--tk-constant',
+    tags: [t.atom, t.bool, t.self, t.null, t.unit],
+  },
+  // `escape` and `regexp` are subtags of `literal`, so both precede the number role for the
+  // reason above. `escape` before `string` as well, so a `\n` is visible inside the string it
+  // sits in rather than disappearing into it.
+  { cls: 'cide-tk-escape', token: '--tk-escape', tags: [t.escape, t.special(t.string)] },
+  { cls: 'cide-tk-regexp', token: '--tk-regexp', tags: [t.regexp] },
+  // `attributeName` is a subtag of `propertyName`, so this precedes the property role — which is
+  // how a `#[derive]` stays an attribute rather than becoming a key.
   {
     cls: 'cide-tk-attribute',
-    token: '--yellow',
+    token: '--tk-attribute',
     tags: [t.meta, t.attributeName, t.processingInstruction],
   },
-  { cls: 'cide-tk-string', token: '--yellow', tags: [t.string, t.regexp, t.escape, t.url] },
+  // `url` stays here rather than moving to the link role: it is a subtag of `literal`, and the
+  // link role sits below the number role, which claims `literal`. A URL in a string is a string.
+  { cls: 'cide-tk-string', token: '--tk-string', tags: [t.string, t.url] },
+  { cls: 'cide-tk-macro', token: '--tk-macro', tags: [t.macroName] },
+  { cls: 'cide-tk-label', token: '--tk-label', tags: [t.labelName] },
   {
     cls: 'cide-tk-function',
-    token: '--blue',
-    tags: [t.function(t.variableName), t.function(t.propertyName), t.macroName, t.labelName],
+    token: '--tk-function',
+    tags: [t.function(t.variableName), t.function(t.propertyName)],
   },
+  { cls: 'cide-tk-namespace', token: '--tk-namespace', tags: [t.namespace] },
+  // `typeOperator` is a subtag of `operator`; the operator role is below.
+  { cls: 'cide-tk-type', token: '--tk-type', tags: [t.typeName, t.className, t.typeOperator] },
+  // After the constant role, which takes the four `keyword` subtags that wanted their own
+  // colour. `keyword` covers the rest (`modifier`, `controlKeyword`, …) on its own.
+  { cls: 'cide-tk-keyword', token: '--tk-keyword', tags: [t.keyword] },
+  { cls: 'cide-tk-number', token: '--tk-number', tags: [t.number, t.literal] },
+  { cls: 'cide-tk-property', token: '--tk-property', tags: [t.propertyName] },
+  // Split out of the property role. Nothing in cide's own grammars emits it today; an extension
+  // may, and an imported theme's `variable` scope needs somewhere to land.
+  { cls: 'cide-tk-variable', token: '--tk-variable', tags: [t.definition(t.variableName)] },
+  // `bracket` is a subtag of `punctuation`, which is a sibling of `operator`. All three were one
+  // role; they are three so that a scheme can quiet brackets without quieting `+`.
+  { cls: 'cide-tk-bracket', token: '--tk-bracket', tags: [t.bracket] },
   {
-    cls: 'cide-tk-type',
-    token: '--cyan',
-    tags: [t.typeName, t.className, t.namespace, t.typeOperator],
+    cls: 'cide-tk-punctuation',
+    token: '--tk-punctuation',
+    tags: [t.punctuation, t.separator],
   },
-  // After the four `keyword` subtags that want their own colour would go here — there are
-  // none; the mock paints every keyword shade the same purple, and `keyword` covers its
-  // subtags (`self`, `null`, `atom`, `modifier`, `controlKeyword`, …) on its own.
-  { cls: 'cide-tk-keyword', token: '--purple', tags: [t.keyword] },
-  { cls: 'cide-tk-number', token: '--green', tags: [t.number, t.bool, t.literal] },
-  { cls: 'cide-tk-property', token: '--text', tags: [t.propertyName, t.definition(t.variableName)] },
-  { cls: 'cide-tk-operator', token: '--dim', tags: [t.operator, t.punctuation, t.bracket] },
-  { cls: 'cide-tk-heading', token: '--accent', tags: [t.heading, t.strong] },
-  { cls: 'cide-tk-emphasis', token: '--dim', tags: [t.emphasis, t.quote, t.link, t.monospace] },
+  { cls: 'cide-tk-operator', token: '--tk-operator', tags: [t.operator] },
+  { cls: 'cide-tk-heading', token: '--tk-heading', tags: [t.heading] },
+  // Bold shared the heading role until M24. Both are subtags of `content`, which nothing
+  // claims, so the order between them and the three below carries no precedence.
+  { cls: 'cide-tk-strong', token: '--tk-strong', tags: [t.strong] },
+  {
+    cls: 'cide-tk-emphasis',
+    token: '--tk-emphasis',
+    tags: [t.emphasis, t.quote, t.monospace],
+  },
+  { cls: 'cide-tk-link', token: '--tk-link', tags: [t.link] },
 ]
 
-/** The colour a run of text with no role at all is painted, in the buffer and the map. */
-export const PLAIN_TOKEN = '--text'
+/**
+ * The colour a run of text with no role at all is painted, in the buffer and the map.
+ *
+ * `--tk-fg` and not `--text`: this is the editor's ink, so an imported scheme owns it. The two
+ * hold the same value in the cide scheme, and that is a coincidence a reader should not rely on.
+ */
+export const PLAIN_TOKEN = '--tk-fg'
 
 /**
  * The buffer's highlighter.
@@ -75,7 +148,8 @@ export const PLAIN_TOKEN = '--text'
  * `class` rather than `color`: a generated class carrying a literal colour would be baked
  * into a stylesheet at construction time and would still say `#b48ead` after the user
  * switched to the light palette. Naming our own class instead moves the colour into
- * `EditorSurface.module.css`, where it is `var(--purple)` and follows the theme for free.
+ * `editor/highlight.css`, where it is a `var(--tk-*)` and follows both the theme and the
+ * selected colour scheme for free.
  *
  * This object is also a `Highlighter`, which is what lets `minimap.ts` run `highlightTree`
  * over the same rules rather than reimplementing them.

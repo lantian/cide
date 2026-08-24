@@ -21,7 +21,12 @@
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: var(--panel);
+  /*
+   * `--tk-bg`, not `--panel`: an imported colour scheme owns the buffer's ground, and this is
+   * the strip of it CodeMirror does not cover. Left on `--panel` it is a seam down the side of
+   * every scheme whose background is not the chrome's.
+   */
+  background: var(--tk-bg);
 }
 
 /*
@@ -44,10 +49,13 @@
   user-select: text;
 }
 
+/*
+ * The background and the foreground are **not** here any more: `editor/highlight.css` sets them
+ * on the bare `.cm-editor`, so every surface mounting CodeMirror — this one, `DiffPane`,
+ * `MergePane` — takes an imported scheme's ground from one place rather than three.
+ */
 .body :global(.cm-editor) {
   height: 100%;
-  background: var(--panel);
-  color: var(--text);
 }
 
 .body :global(.cm-editor.cm-focused) {
@@ -84,7 +92,7 @@
 }
 
 .body :global(.cm-content) {
-  caret-color: var(--accent);
+  caret-color: var(--tk-caret);
   padding: 4px 0;
 }
 
@@ -94,7 +102,7 @@
 
 .body :global(.cm-cursor),
 .body :global(.cm-dropCursor) {
-  border-left-color: var(--accent);
+  border-left-color: var(--tk-caret);
   border-left-width: 2px;
 }
 
@@ -130,30 +138,40 @@
  */
 .body :global(.cm-selectionBackground),
 .body :global(.cm-editor .cm-selectionBackground) {
-  background: var(--sel);
+  background: var(--tk-sel);
 }
 
 .body :global(.cm-content) ::selection {
-  background: var(--sel);
+  background: var(--tk-sel);
 }
 
 /*
- * The caret's line. `--sel` per the mock, but at 40% and therefore translucent.
+ * The caret's line. The selection colour per the mock, but at 40% and therefore translucent.
  *
  * The alpha is what makes the selection visible again, and the *choice of token* is what
- * keeps it undamaged: 40% of `--sel` composited over `--sel` is `--sel` exactly, so a
- * selection crossing the active line is one uniform colour and the worst-case syntax contrast
- * on it is still the 4.45:1 `tokens.css` picked the token for. A neutral wash was the other
- * candidate and loses on precisely that — any non-`--sel` tint over the selection shifts it,
- * and at an alpha heavy enough to read as an active line it took `--green` on a selected line
- * down to about 4.0:1.
+ * keeps it undamaged: 40% of the selection composited over the selection is the selection
+ * exactly, so a selection crossing the active line is one uniform colour and the worst-case
+ * syntax contrast on it is still the 4.45:1 `tokens.css` picked the token for. A neutral wash
+ * was the other candidate and loses on precisely that — any tint that is not the selection's
+ * own colour shifts it, and at an alpha heavy enough to read as an active line it took
+ * `--green` on a selected line down to about 4.0:1.
  *
- * Off the selection it composites over `--panel` instead and reads as the pale row tint it is
+ * Off the selection it composites over `--tk-bg` instead and reads as the pale row tint it is
  * meant to be. So the two states differ by 60% of the selection's own strength, which is a
  * step, not a hairline.
+ *
+ * # This is why a colour scheme has no `line` role (M24)
+ *
+ * Every argument above is about the relationship between two colours, not about either of
+ * them, so it has to survive an imported scheme — and `editor.lineHighlightBackground` cannot
+ * be honoured without breaking it. VS Code themes write that key with an alpha channel far
+ * more often than not, `ColorScheme` stores six hex digits, and an opaque colour here is the
+ * original bug verbatim: the selection disappears on the caret's row. Deriving it from
+ * `--tk-sel` keeps the invariant true for every scheme rather than for the one shipped with
+ * the app. `cide_core::scheme::SURFACE_KEYS` says the same thing from the other end.
  */
 .body :global(.cm-activeLine) {
-  background: color-mix(in srgb, var(--sel) 40%, transparent);
+  background: color-mix(in srgb, var(--tk-sel) 40%, transparent);
 }
 
 /* --- gutter, 56px and right-aligned ---------------------------------------------------- */
@@ -183,8 +201,8 @@
    * flicker the 70px above exists to prevent.
    */
   min-width: calc(70px + var(--fold-col));
-  background: var(--panel);
-  color: var(--faint);
+  background: var(--tk-bg);
+  color: var(--tk-gutter);
   border-right: none;
   font-family: var(--font-mono);
   /*
@@ -237,7 +255,7 @@
  * in the one column where marking it costs nothing.
  */
 .body :global(.cm-activeLineGutter) {
-  background: var(--sel);
+  background: var(--tk-sel);
   color: var(--dim);
 }
 
@@ -607,6 +625,12 @@
   height: 100%;
   /* The mock puts the map behind a rule; `--border-soft` is the token it names. */
   border-left: 1px solid var(--border-soft);
+  /*
+   * Chrome, and deliberately *not* `--tk-bg`. The map is a column beside the text, not part
+   * of it — the same call `DiffPane`'s gutter makes — and `--panel-2` being a shade off
+   * `--panel` is the mock's own relationship. What the map paints *into* follows the colour
+   * scheme: `minimap.ts` resolves the `--tk-*` properties through `getComputedStyle`.
+   */
   background: var(--panel-2);
   cursor: pointer;
   /* A drag across the map must not select the text underneath it. */

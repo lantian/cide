@@ -105,6 +105,8 @@ Which check covers what you touched:
 | **a splitter's drag path, `layout/resizeGesture.ts`, or any `ResizeObserver`** | `check:resize` — a drag is smooth only because the expensive reactions to a size change (xterm's `fit()`, a `session_resize` that reflows the scrollback on the IPC thread, a minimap repaint) are deferred to the end of the gesture. Undo that and nothing throws, nothing changes on screen, and the app simply locks up while somebody drags a divider |
 | `editor/` | `check:editor` |
 | `editor/markdown/`, the markdown preview | `check:markdown`, `check:editor`, `check:ui-scale` |
+| **a syntax colour, a `--tk-*`, or `TOKEN_ROLES`** | `check:scheme`, then `check:editor` — the role set is spelled in **four** files that cannot import one another (`cide_ipc::theme`, `editor/scheme.ts`, `editor/highlight.css`, `tokens.css`) and every way they disagree is silent: a role declared and read nowhere is a colour nobody sees, and one read and declared nowhere paints *nothing at all*, because an undefined custom property is not a colour. Order in `TOKEN_ROLES` is precedence — `HighlightStyle` resolves a tag through its parent chain — so a role claiming a child tag must precede the role claiming its parent, and the wrong winner looks fine |
+| **the VS Code theme importer — `cide_core::scheme`'s `SCOPES`** | `cargo test -p cide-core scheme` — a scope matcher with precedence rules, differential against theme files shaped like real ones. It is Rust and not TypeScript so that it *can* be tested; the stored scheme is the converted one, so editing `SCOPES` never repaints somebody's existing import. The `.vsix` road builds its archive in the test, so nothing there inflates a byte — check a real package with `CIDE_VSIX=<path> cargo test -p cide-core a_real_package -- --ignored --nocapture`, which prints each theme's converted key/string/number |
 | menus, header, chrome, settings | `check:menus`, `check:menu-model`, `check:tab-overflow`, `check:sidebar`, `check:theme`, `check:fonts`, `check:proxy` |
 | **any `font-size`, or a box drawn around text** | `check:ui-scale` — chrome type is a closed ladder of `--fs-ui-*` rungs over one `--ui-scale`, and a bare `font-size: <n>px` is a label that silently stops following the UI font size. Looks right at the default, which is where you are working |
 | a new sidebar panel, or anything `App.tsx` renders as one | `check:boundary` — an unwrapped panel takes the **whole window** down when it throws, and the rail's choice is restored on launch, so it stays down |
@@ -139,7 +141,8 @@ inside domain logic is the signal that the logic is in the wrong crate.
 crates/
   cide-app/       the Tauri shell: windows, the command surface, process lifecycle. Glue only.
   cide-ipc/       wire DTOs (serde + ts-rs). Simultaneously in-memory domain, disk format, wire format.
-  cide-core/      behaviour over those DTOs, as free functions: workspace tree, keymap, commands, persist.
+  cide-core/      behaviour over those DTOs, as free functions: workspace tree, keymap, commands,
+                  persist, and the VS Code colour-theme importer (`scheme`).
   cide-pty/       PTY sessions: spawn, coalescing, backpressure, vt100 mirror.
   cide-claude/    spawning and supervising `claude`: env, hooks, resume/fork, headless one-shots.
   cide-ide-mcp/   the Claude Code IDE-integration MCP server (openDiff, getDiagnostics, openFile).
@@ -288,6 +291,10 @@ none of it does. Inspect a profile's with `CIDE_PROFILE=<name> ./target/debug/ci
   `./target/debug/cide-headless tree`.
 - `$XDG_CONFIG_HOME/cide/keymap.json` — user binding overrides only (diffs; defaults are
   compiled in).
+- `$XDG_CONFIG_HOME/cide/schemes/<id>.json` — imported editor colour schemes, one file each.
+  The *converted* scheme, not the source VS Code theme: re-converting at launch would let a
+  change to `cide_core::scheme::SCOPES` repaint a buffer somebody was happy with. `cide` is
+  not a file — it is what `tokens.css` declares, so selecting it clears the properties.
 
 ## Conventions
 

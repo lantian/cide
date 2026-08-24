@@ -253,7 +253,7 @@
 
 .body :global(.cm-editor) {
   height: 100%;
-  background: var(--panel);
+  background: var(--tk-bg);
   color: var(--dim);
 }
 
@@ -274,7 +274,7 @@
 }
 
 .body :global(.cm-editor .cm-content) {
-  caret-color: var(--accent);
+  caret-color: var(--tk-caret);
 }
 
 /*
@@ -288,12 +288,18 @@
  * anyway.
  */
 .body :global(.cm-editor) ::selection {
-  background: var(--sel);
+  background: var(--tk-sel);
 }
 
+/*
+ * The gutter keeps `--panel-2` rather than following `--tk-bg`: a diff's gutter is a *chrome*
+ * column — change markers and two revisions' line numbers — and it is deliberately a shade off
+ * the text ground so the two read apart. Only the numbers follow the colour scheme, so they stay
+ * legible against whatever ground an imported one turned out to have.
+ */
 .body :global(.cm-editor .cm-gutters) {
   background: var(--panel-2);
-  color: var(--faint);
+  color: var(--tk-gutter);
   border-right: 1px solid var(--border-soft);
 }
 

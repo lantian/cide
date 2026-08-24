@@ -141,7 +141,17 @@
   overflow: hidden;
 }
 
-/* CodeMirror fills its pane. */
+/*
+ * CodeMirror fills its pane. Its *ground* is not set here: `editor/highlight.css` gives the bare
+ * `.cm-editor` `--tk-bg`, so all three panes take an imported colour scheme's background from the
+ * same place the editor tab does.
+ *
+ * These panes used to be transparent and showed `.host`'s `--bg` through. Following `--tk-bg`
+ * moves them by one shade in the cide scheme (`--bg` → `--panel`) and is the point under any
+ * other one: they already share `cideHighlightStyle` so that a merge does not show the file in
+ * different colours from the tab beside it, and a ground the scheme does not reach would break
+ * exactly that guarantee in the one dimension it did not cover.
+ */
 .paneBody > :global(.cm-editor) {
   height: 100%;
 }

@@ -50,6 +50,7 @@ import { ExtensionSettings } from './ExtensionSettings'
 import { MAX_UI_FONT_SIZE, MIN_UI_FONT_SIZE } from './fontScale'
 import { badge, handshakeNote, sentence } from './cliHandshake'
 import { ClaudeCliSection } from './ClaudeCliSection'
+import { ColorSchemeRow } from './ColorSchemeRow'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
 import { ProxySection } from './ProxySection'
@@ -164,6 +165,12 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir }: SectionPr
             <Segmented label="Theme" value={settings.theme} options={THEMES} onChange={setTheme} />
           }
         />
+        {/*
+          Directly under Theme, because it is *keyed by* Theme: this row sets the scheme for
+          whichever polarity the control above is showing. Two rows apart and the pairing stops
+          being visible at all.
+        */}
+        <ColorSchemeRow theme={settings.theme} editor={settings.editor} patch={patch} />
         <Row
           label="UI font size"
           // Named for what it excludes, because the screen already carries two other font

@@ -5226,6 +5226,186 @@ while mounted, and that no terminal lost its element. A failure names the cycle 
 Current result: `PASS — 103 panes, no terminal re-opened beyond its eviction allowance, no
 host destroyed while mounted`.
 
+## Colour schemes, and importing a VS Code theme (M24)
+
+The report was that highlighting reads flat, JSON worst of all. The diagnosis was not the
+grammars.
+
+`ui/src/editor/highlight.ts` was the only table saying what colour a token is: twelve roles over
+ten colour tokens, and those tokens were the **chrome palette's** — the same six hues that
+`ui/src/settings/theme.ts` maps to the terminal's ANSI slots, which `tokens.css` said outright
+beside `--blue`: *"Read by the editor's highlight table AND by the terminal's ANSI palette."* So
+there was no syntax palette to tune. Retuning a syntax colour repainted every terminal in the
+app, and `check-theme.mjs` holds those six to a 3:1 floor and a grey-ramp ordering that are a
+*terminal's* requirements and have nothing to do with a buffer.
+
+**In a JSON file that resolved to five colours, and the important one was thrown away.** The key
+is `propertyName` — `languages/data.ts` does real positional work to find it, matching a quoted
+string with a colon after it — and the role table painted it `--text`. `.cm-editor` is also
+`color: var(--text)`. A JSON key was pixel-identical to unhighlighted prose, in a file where the
+key is the only structure there is. `true`/`false`/`null` were the second: `atom` is a subtag of
+`keyword`, so a config file's booleans were the same purple as a Rust `fn`.
+
+Three changes, in that order.
+
+**The editor's colours are their own family.** Twenty-nine `--tk-*` custom properties, declared
+in both palette blocks of `tokens.css` and read by `editor/highlight.css`. Nothing else changed
+to make that work: `cideHighlightStyle` is built with `class:` rather than `color:` precisely so
+a class resolves the property at paint time, and the minimap — which paints into a canvas and
+cannot read a class — already resolved the same properties through `getComputedStyle`. Most of
+them still hold the value the chrome token held, restated as literals rather than written
+`var(--purple)`, on `--term-*`'s own argument: the equality is a coincidence of today's design.
+
+**The role table is twenty-four entries instead of twelve.** `constant`, `doc`, `escape`,
+`regexp`, `namespace`, `macro`, `label`, `bracket`, `punctuation`, `strong`, `link` and
+`variable` were split out, and `property` was given a colour of its own. Several of the new ones
+hold the value they used to share, and are split anyway — a role is the unit an *imported* scheme
+can speak about, so a role that does not exist is a colour a theme has no way to give us. Order
+in that table is precedence, because `HighlightStyle` resolves a tag through its parent chain and
+takes the first match: `constant` has to precede `keyword` *and* `number`, `doc` has to precede
+`comment` *and* `string`, `attribute` has to precede `property`, `bracket` has to precede
+`punctuation`. Every such pair carries a comment where it appears, and `check:editor` asserts
+each one, because the failure is silent — the wrong role wins and nothing anywhere fails.
+
+Bare `variableName` is still not a role. That is deliberate and pinned: an ordinary identifier is
+body text, and colouring every one of them is how a syntax theme turns into noise.
+
+**A scheme is a setting, and everything except cide's own is imported.** Settings › Appearance
+grows one row under Theme: a picker of `cide` plus whatever the user has imported, and an
+*Import…* button.
+
+**What that button takes is a `.vsix`.** It did not at first, and the report was the shape of the
+mistake: *"I've downloaded a `.vsix` file — but I cannot import it. What should I try to
+import?"* The answer was `unzip -j theme.vsix "extension/themes/*"`, which is not an answer. A
+`.vsix` is what a marketplace hands you; the theme JSON is a file inside it, and a picker that
+refuses the download with no explanation is the worst version of that.
+
+So `import` dispatches on the file's **first four bytes** rather than its extension — `PK\x03\x04`
+is a ZIP whatever it is called, and a theme is JSON whatever *it* is called, which also covers a
+`.vsix` a browser renamed to `.zip` and a `-color-theme.json` a download manager left with no
+extension at all. For an archive it reads `extension/package.json`, follows
+`contributes.themes[].path`, and converts **every** theme it finds, falling back to scanning
+`extension/themes/*.json` when the manifest declares none — refusing a file that visibly contains
+themes because its manifest is shaped unusually is the same refusal in a new place.
+
+Every theme, not one, because themes ship in light/dark pairs far more often than not and the
+setting is keyed by polarity: importing one of a pair leaves the other theme on the builtin and
+the user back at the file dialog. The row selects whichever variant matches the window and says
+in a sentence what went to the other theme, so a scheme cannot appear months later that nobody
+remembers importing.
+
+Reading an archive the user downloaded brought two bounds with it — 4 MiB per entry and 32 themes
+per package, both two orders of magnitude above anything real. `zip` being correct about the
+format says nothing about the size of what it hands back, and neither line is worth omitting.
+
+The converter is Rust — `cide_core::scheme` — for two reasons, of which the second decided it.
+Only `cide-app` may link tauri, so a converter in the webview would be domain logic in the glue
+crate; and a converter in TypeScript could not be reached by `cargo test`, which matters because
+the interesting part is a scope matcher with precedence rules and it needs a table of cases
+rather than a screenshot. `SCOPES` is that table: for each of cide's roles, the TextMate scopes
+that stand for it, most representative first.
+
+Two departures from TextMate's own rule are worth naming. A theme rule matches when its selector
+is a dot-segment prefix of the scope being asked about — but a great many published themes only
+ever name *language-qualified* scopes (`support.type.property-name.json`,
+`entity.name.function.js`) and never the bare one, and under the strict rule those themes convert
+to almost nothing. So a selector sitting one segment *under* the candidate is accepted as weak
+evidence, scored an order of magnitude below every prefix match so it can never outrank one.
+And resolution is **total**: every unfilled role walks a fallback chain (`macro → function → fg`,
+`bracket → punctuation → operator → fg`) rather than being left empty, because the input is a
+file somebody else wrote and refusing it means the feature does not work for real inputs. The
+same bargain `SettingDef::coerce` already makes.
+
+`zip` is the one new dependency, at `default-features = false, features = ["deflate-flate2"]`:
+the default set drags in aes, bzip2, lzma, ppmd, zstd, xz and a time crate, and a `.vsix` uses
+none of them. `flate2` is named beside it only to *choose* the inflate backend — `deflate-flate2`
+enables the dependency and stops there, and the crate then refuses to compile with "you need to
+choose a zlib backend", because feature unification is per build graph. Its default `rust_backend`
+selects `miniz_oxide`, which the image decoders already build, so the whole road costs `zip`,
+`arbitrary` and nothing else. A hand-written ZIP reader was the alternative and lost: a
+central-directory parser is a hundred lines against a file from the internet, and malformed
+offsets, truncated entries and decompression bombs are exactly what a well-exercised library has
+already got right.
+
+The file is read **once**. What is stored, in `$XDG_CONFIG_HOME/cide/schemes/<id>.json`, is the
+converted scheme — re-converting at every launch would let a change to `SCOPES` silently repaint
+a buffer somebody was happy with, months later. Re-importing is how a user opts into an improved
+table.
+
+**The setting is two fields, one per theme.** `EditorSettings::color_scheme_light` and
+`color_scheme_dark`. A scheme paints the buffer's *background* — the user asked for that
+explicitly — so a single field would let an imported dark scheme paint a dark rectangle inside a
+white window, next to a white sidebar and a white terminal, and every contrast ratio
+`check-theme.mjs` records against `--panel` would stop describing the editor. Keyed by polarity,
+an imported dark scheme is only ever a *different dark*. `Theme` stays `dark | light` and every
+existing consumer of it — the file icons, the native window fill, `theme-boot.js`, `otherTheme`,
+`theme.toggle` — is untouched.
+
+### The two things that were nearly wrong
+
+**The caret's line has no role, and must not get one.** `EditorSurface.module.css` spends thirty
+lines on why `.cm-activeLine` is 40% of the selection rather than an opaque colour: the active
+line paints *above* CodeMirror's selection layer, so anything opaque there hides the selection on
+the caret's row — a reported bug — and only a tint of the selection's own colour composites back
+to the selection exactly. `editor.lineHighlightBackground` is a key every VS Code theme carries,
+almost always with an alpha channel, and `ColorScheme` stores six hex digits. Honouring it would
+have reintroduced that bug for every imported scheme. It is deliberately absent from
+`SURFACE_KEYS`, and both files say so.
+
+**The repaint guard cannot be keyed on the scheme's id.** An import does two things — patches the
+setting that names the id, and broadcasts `cide://schemes-changed` with the scheme itself — and
+they reach a window in whichever order the event loop hands them over. A guard keyed on
+`theme:id` latches on the first: the id resolves to nothing, the builtin is painted, and the list
+arriving a moment later compares equal and is never applied. The import then looks like it did
+nothing at all, in a way no error reports. `schemeIsPainted` compares the resolved scheme by
+**reference**, which also covers a re-import replacing a scheme's colours under the same id.
+
+### What the gates cover
+
+`check:scheme` is new and exists because the role set is spelled in four files that cannot import
+one another — `cide_ipc::theme`, `editor/scheme.ts`, `editor/highlight.css` and `tokens.css` —
+and every way they can disagree is silent on screen. A role declared and read nowhere is a colour
+nobody sees; a role read and declared nowhere paints *nothing at all*, because an undefined
+custom property is not a colour and the span simply inherits. It also asserts that a block
+carrying part of the family carries all of it — the rule `check-theme.mjs` already applies to the
+terminal palette, and the one this file's first draft did not have: a `--tk-doc` missing from the
+dark block resolves to the light value through the cascade and every per-role assertion still
+passes.
+
+Its ink floor is **2.5:1, not the terminal's 3:1**, and the difference is a decision rather than a
+slip. A comment is deliberately quiet; `--tk-comment` in the dark theme is `#5c5c66` at 2.76:1,
+and a higher floor would either fail the palette the app has shipped since M3 or make comments
+shout. What is worth catching is a colour that is not there at all.
+
+`check:editor` grew the role assertions, including a block that walks a JSON buffer tag by tag
+and asserts six distinct roles, and `cargo test -p cide-core scheme` converts a theme shaped like
+a real one and asserts the same six come out as six different colours with the key not equal to
+prose. That pair is the acceptance criterion for the whole change.
+
+**One bug was found on the way and fixed.** `languages.ts::tagIsUnknown` — the check that refuses
+a grammar rule from an extension naming a tag cide cannot colour — used `tagsFor`, which answers
+for any name `@lezer/highlight` exports. Several of those have no role at all (`inserted`,
+`deleted`, `changed`, `list`, `content`, `strikethrough`, and bare `variableName`), so an
+extension writing `"tag": "inserted"` passed validation, parsed, matched, and painted nothing:
+precisely the failure the check's own comment says it exists to prevent, arriving through the
+check itself. It is `tokenClassFor` now, which answers `null` unless a role actually claims the
+tag.
+
+**Not done.** None of it has been confirmed on screen — the same reason as every milestone since
+M14, KDE will not raise a shell-launched window. What is checked is the tables, the converter,
+the applier's decisions and the four copies of the closed set. Two things are deliberately out of
+scope and named here so they are not read as oversights: `fontStyle` from an imported theme is
+ignored, because decoration is a closed set in `highlight.css` and honouring per-scope
+italic/bold means a second custom property per role; and the terminal's ANSI palette stays with
+the chrome theme, because `check-theme.mjs` enforces a contrast floor and a grey-ramp ordering on
+those slots that an arbitrary imported palette would violate. There is no `contributes.themes`
+extension kind either — it is the natural follow-up, and it argues with ADR 0010's *"an extension
+cannot ship CSS"* in a way that needs its own decision.
+
+Semantic highlighting is the next real step up in *accuracy*, as distinct from this change, which
+is about palette: `cide-lsp` requests no `semanticTokens` today, so a stream lexer's guess is
+still what colours a Rust or TypeScript buffer.
+
 ## The look and feel (M23), and what is not verified
 
 The report was "look and feel is bad — font style, font size, icons, across all components", with

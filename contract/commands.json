@@ -169,6 +169,8 @@
   "project_recent",
   "project_reorder",
   "project_reveal",
+  "scheme_import",
+  "scheme_remove",
   "search_cancel",
   "search_query",
   "session_ack",

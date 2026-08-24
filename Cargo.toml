@@ -85,6 +85,33 @@ notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
 ignore = "0.4.33"
 globset = "0.4.20"
+# Reading a `.vsix` — a VS Code extension package, which is a plain ZIP — so that a colour theme
+# can be imported from the file people actually download rather than from a `.json` they had to
+# unzip first. (M24)
+#
+# `default-features = false, features = ["deflate-flate2"]` and that is the whole reason this is
+# affordable: the default set drags in aes, bzip2, lzma, ppmd, zstd, xz and a time crate, none of
+# which a `.vsix` uses — every entry in one is stored or deflated. `deflate-flate2` routes
+# inflation through `flate2`, which is **already in the graph** as a transitive dependency of the
+# image decoders, so naming it here costs one small crate rather than a compression zoo.
+#
+# A hand-written ZIP reader was the alternative and lost on the merits: a central-directory parser
+# is a hundred lines against an untrusted archive, and the failure modes it has to get right
+# (malformed offsets, a truncated entry, a decompression bomb) are exactly what a well-exercised
+# library has already got right. `cide_core::scheme` still caps entry size and theme count on top
+# of it, because a library being correct about the format says nothing about the size of what it
+# hands back.
+zip = { version = "4.6.0", default-features = false, features = ["deflate-flate2"] }
+# The inflate backend `zip`'s `deflate-flate2` asks for but does not choose.
+#
+# `deflate-flate2` enables `dep:flate2` and stops there; the crate then fails to compile with
+# *"You need to choose a zlib backend"*, because feature unification is per build graph and
+# nothing else in `cide-core`'s graph turns one on. `zip` offers two composites and both were
+# rejected: `deflate-flate2-zlib` wants the system libz, and `deflate-flate2-zlib-rs` pulls the
+# `zlib-rs` crate. Naming `flate2` here with its default `rust_backend` instead selects
+# `miniz_oxide`, which the image decoders already build — so the whole `.vsix` road costs `zip`,
+# `arbitrary` and nothing else.
+flate2 = "1.1.9"
 nucleo = "0.5.0"
 # Content search. `nucleo` is a fuzzy matcher over paths and is the wrong tool for a grep:
 # it scores a subsequence, and "every line that loosely resembles the query" is noise when

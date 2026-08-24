@@ -32,6 +32,8 @@ pub mod notes;
 pub mod persist;
 pub mod profile;
 pub mod proxy;
+/// Editor colour schemes: importing a VS Code theme, and the imported ones on disk.
+pub mod scheme;
 pub mod scratch;
 pub mod toolchain;
 pub mod toolwindow;

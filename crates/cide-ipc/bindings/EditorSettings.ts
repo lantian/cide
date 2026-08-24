@@ -32,4 +32,25 @@ autosave: boolean,
 /**
  * How a diff is laid out. See [`DiffView`].
  */
-diffView: DiffView, };
+diffView: DiffView, 
+/**
+ * Which colour scheme paints the buffer, under each [`crate::Theme`]. (M24)
+ *
+ * **Two fields rather than one, and the pair is the design.** A scheme owns the editor's
+ * *background* as well as its token colours, so a single field would let an imported dark
+ * scheme paint a dark rectangle inside a white window, beside a white sidebar and a white
+ * terminal — and every contrast ratio `check-theme.mjs` records against `--panel` would
+ * stop describing the editor. Keyed by polarity, an imported dark scheme is only ever a
+ * *different dark*; the disagreeing state is unreachable rather than merely discouraged.
+ *
+ * It is also the shape `tokens.css` already has: one light block, one dark block. The
+ * Appearance screen shows one row, for whichever theme is showing.
+ *
+ * The value is a [`crate::ColorScheme::id`], or [`crate::BUILTIN_SCHEME`] for the compiled-in
+ * one. A `String` and not an enum because the set is open by construction — the schemes are
+ * whatever the user has imported. An id naming a scheme that has since been removed falls
+ * back to the builtin at paint time rather than being repaired here: a setting is not the
+ * place to discover that a file is missing, and a user who re-imports gets their choice
+ * back.
+ */
+colorSchemeLight: string, colorSchemeDark: string, };

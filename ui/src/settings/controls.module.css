@@ -133,6 +133,55 @@
   box-shadow: var(--focus-inset);
 }
 
+/* --- select --- */
+
+/*
+ * Sized like `.number` and coloured like `.segmented`, because it is a choice rather than a
+ * measurement — so no mono, and the chrome shade the segmented control uses for its ground.
+ *
+ * `appearance: none` and a hand-drawn chevron: the platform arrow is drawn in the *system*
+ * palette, which is a fixed light or dark that has nothing to do with `data-theme`, and it
+ * showed as a black mark on the dark theme. The mark is a `background-image` rather than an
+ * `::after`, because a replaced element has no generated content to hang one on.
+ *
+ * The chevron is inlined rather than taken from `iconPaths.ts`: `check:ui-icons` governs marks
+ * cide *draws*, and this is a control's own furniture at 9px, well under that gate's stroke
+ * band. Its `#888` is the one literal colour in this stylesheet and cannot be a token — a
+ * `data:` URI is parsed as its own document and `var()` does not cross into it. Mid-grey is the
+ * value that clears both grounds: 3.29:1 on the light `--panel-2` and 5.44:1 on the dark one.
+ *
+ * The list itself is the platform's, and an `<option>` inside it is not reachable from CSS on
+ * every engine. `color-scheme` is the one property that is honoured, and `tokens.css` sets it on
+ * both palette blocks — which is what makes the popup dark under the dark theme.
+ */
+.select {
+  min-width: 140px;
+  max-width: 220px;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 26px 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background-color: var(--panel-2);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 9px 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  appearance: none;
+  cursor: pointer;
+}
+
+.select:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+.select:hover {
+  border-color: var(--dim);
+}
+
 /* --- numeric field --- */
 
 .number {

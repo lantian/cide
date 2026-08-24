@@ -88,6 +88,11 @@ pub fn app_get_bootstrap(
         // arrived a round trip after first paint would restore a remembered scroll position
         // against unfolded heights. See `cide_ipc::lang::FoldSpecDto`.
         extensions: resolved,
+        // Read from disk on every bootstrap rather than cached in `WorkspaceState`, and the
+        // cheapness is why: a handful of small files in a directory the user rarely touches,
+        // against a cache that a second window's import would have to invalidate. `load_all`
+        // never fails — an unreadable scheme costs its own row and nothing else.
+        schemes: cide_core::scheme::load_all(),
     }
 }
 

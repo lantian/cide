@@ -33,7 +33,7 @@ import type { FoldSpecDto, GrammarSpecDto, LanguageDef } from '../ipc/generated'
 import { BUILTIN_LANGUAGES } from './builtinLanguages'
 import type { FoldSpec } from './foldRanges'
 import { compileRules } from './grammarRules'
-import { tagsFor } from './highlight'
+import { tokenClassFor } from './highlight'
 import { type Grammar, type GrammarSpec, grammar } from './streamGrammar'
 
 /**
@@ -218,10 +218,10 @@ function rebuild(): string[] {
       problems.push(`${def.label} has no tokenizer, so its files open with no highlighting.`)
     }
     for (const rule of def.grammar.rules ?? []) {
-      // Validated here rather than in Rust, against the same `tagsFor` the buffer and the minimap
-      // resolve names through. A list of legal names copied into `cide-ipc` would be a second
-      // authority that could disagree with the first, and the disagreement shows as a token that
-      // parses, matches, and paints in no colour at all.
+      // Validated here rather than in Rust, against the same role table the buffer and the
+      // minimap resolve names through. A list of legal names copied into `cide-ipc` would be a
+      // second authority that could disagree with the first, and the disagreement shows as a
+      // token that parses, matches, and paints in no colour at all. See `tagIsUnknown`.
       if (tagIsUnknown(rule.tag)) {
         problems.push(`${def.label}: \`${rule.tag}\` is not a token name cide can colour.`)
       }
@@ -475,11 +475,19 @@ export async function loadGrammar(id: LanguageId): Promise<Grammar | null> {
 /**
  * Whether a stream-parser token name resolves to a `Tag` cide has a colour for.
  *
- * `tagsFor` and not a list of legal names copied into `cide-ipc`: it is the same function the
- * buffer and the minimap resolve names through, and a second authority beside it could disagree
- * with it — the disagreement showing as a token that parses, matches, and paints in no colour at
- * all, which is the hardest kind of wrong to look at and diagnose.
+ * Resolved through `highlight.ts` and not against a list of legal names copied into `cide-ipc`:
+ * it is the same path the buffer and the minimap take, and a second authority beside it could
+ * disagree with it — the disagreement showing as a token that parses, matches, and paints in no
+ * colour at all, which is the hardest kind of wrong to look at and diagnose.
+ *
+ * **`tokenClassFor`, not `tagsFor`, and the difference is the whole point of the check.** (M24)
+ * `tagsFor` answers for any name `@lezer/highlight` exports, and several of those have no role
+ * in `TOKEN_ROLES` — `inserted`, `deleted`, `changed`, `list`, `content`, `contentSeparator`,
+ * `strikethrough`, and bare `variableName`, which is unroled deliberately. An extension writing
+ * `"tag": "inserted"` passed this check, parsed, matched and painted nothing: exactly the
+ * failure the paragraph above says it exists to prevent, reached through the check itself.
+ * `tokenClassFor` answers `null` unless a role actually claims the tag.
  */
 function tagIsUnknown(name: string): boolean {
-  return name === '' || tagsFor(name).length === 0
+  return name === '' || tokenClassFor(name) === null
 }

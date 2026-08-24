@@ -64,6 +64,20 @@ pub fn keymap_path() -> PathBuf {
     config_dir().join("keymap.json")
 }
 
+/// Imported editor colour schemes, one JSON file each. (M24)
+///
+/// In **config** rather than state, beside `keymap.json`, and the neighbour is the argument:
+/// both directories hold things the user chose and would want in a dotfiles repository, and
+/// neither is written by the app on its own. A scheme is imported by an explicit gesture and
+/// then never touched again.
+///
+/// One file per scheme rather than one file holding all of them, so that hand-dropping a scheme
+/// in or deleting one is a file operation, and so that a single unparseable scheme costs its own
+/// entry rather than the whole list — see `cide_core::scheme::load_all`.
+pub fn schemes_dir() -> PathBuf {
+    config_dir().join("schemes")
+}
+
 /// Projects the user has opened, most recent first.
 ///
 /// A **separate file** from `workspace.json`, and it has to be: `workspace.json` records what

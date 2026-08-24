@@ -10,7 +10,7 @@
  *
  * One 3px row per line, per the mock: a 2px bar inside a 3px pitch, indented by the line's
  * own indentation and as wide as its trimmed content, coloured by the line's leading
- * syntax token. The caret's line is `--accent`. The visible range is a `--sel` rectangle,
+ * syntax token. The caret's line is `--tk-caret`. The visible range is a `--tk-sel` rectangle,
  * and dragging it scrolls the buffer.
  *
  * # Two decisions worth naming
@@ -97,10 +97,12 @@ function readPalette(el: HTMLElement): Palette {
   return {
     byClass,
     plain: read(PLAIN_TOKEN),
-    caret: read('--accent'),
+    // `--tk-caret`, not `--accent`: an imported colour scheme owns the caret, and a map whose
+    // caret line did not move with it would be pointing at a different row's colour.
+    caret: read('--tk-caret'),
     // The rectangle is a wash over the bars rather than a block on top of them, so the
     // shape of the file stays legible inside the part being looked at.
-    viewportFill: read('--sel'),
+    viewportFill: read('--tk-sel'),
     viewportStroke: read('--border'),
   }
 }
@@ -135,7 +137,7 @@ class Minimap implements PluginValue {
     // Scrolling is not reliably a `ViewUpdate`. CodeMirror renders a margin above and below
     // the visible range, so a scroll inside that margin changes neither the viewport nor the
     // geometry and `update()` below is never called — while both things this canvas draws
-    // from the scroll position, the `--sel` rectangle and (past ~250 lines) which slice of
+    // from the scroll position, the `--tk-sel` rectangle and (past ~250 lines) which slice of
     // the document is shown at all, have just moved. Without this the map jumps a screenful
     // at a time instead of tracking.
     view.scrollDOM.addEventListener('scroll', this.onScroll, { passive: true })

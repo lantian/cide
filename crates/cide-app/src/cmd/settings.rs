@@ -1227,6 +1227,91 @@ fn env_reasons() -> Vec<CliReason> {
         .collect()
 }
 
+// --- colour schemes -----------------------------------------------------------------------
+
+/// Import colour themes from a `.vsix` or a theme `.json`, and return what landed.
+///
+/// **A list, because a `.vsix` usually carries a pair.** Themes ship light-and-dark far more
+/// often than not, and the setting is keyed by polarity — importing one of a pair would leave
+/// the other theme on the builtin and the user back at the file dialog. `cide_core::scheme`
+/// reads every theme the package declares.
+///
+/// An **empty** list means the user cancelled, which is not an error and must not be reported as
+/// one — `project_pick` answers a cancelled folder pick the same way. A file that is not a theme
+/// is an error, because the user picked it on purpose.
+///
+/// The conversion is `cide_core::scheme`, which is where the interesting decisions are and where
+/// they can be tested. This command is the three things that need a running app: a parented file
+/// dialog, a write, and the broadcast that stops a second window from resolving a new id against
+/// a list it has not been given.
+///
+/// It deliberately does **not** select anything. Selecting is a settings patch, and the two are
+/// separate because an imported theme's polarity may not be the one on screen: the frontend knows
+/// which theme this window is showing and can say so, whereas a command that silently wrote
+/// `color_scheme_dark` would leave a user staring at an unchanged light editor with nothing to
+/// explain it.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn scheme_import(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Vec<cide_ipc::ColorScheme>, CoreError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+    crate::cmd::project::show_picker(
+        &app,
+        window,
+        crate::cmd::project::PickerSpec {
+            title: "Import a colour theme",
+            accept: "Import",
+            folders: false,
+            // One *file* at a time — which is not one theme: a `.vsix` normally holds a pair.
+            // A multi-select would have to answer "which of these did you want selected?" across
+            // files as well as within one, and the answer is a dialog nobody asked for.
+            multiple: false,
+            // `.vsix` first, because it is what a marketplace hands you and the reason this
+            // filter grew: a user who downloads one and finds the picker will not open it has no
+            // way to guess that the theme is a `.json` inside the archive.
+            filter: Some(("Colour themes", &["*.vsix", "*.json", "*.jsonc"])),
+        },
+        tx,
+    )?;
+
+    // `spawn_blocking` rather than blocking this task: the answer arrives only when the user
+    // has finished browsing, which is unbounded, and the async runtime's worker pool is shared
+    // with every other command in flight. Exactly `project_pick`'s reasoning.
+    let picked = tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_default())
+        .await
+        .map_err(|e| CoreError::Io(format!("colour theme picker: {e}")))?;
+    let Some(path) = picked.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+
+    // Off the async runtime's worker pool: a `.vsix` is read whole and inflated, which is
+    // milliseconds but is unbounded blocking work on a thread shared with every command in
+    // flight. `project_pick`'s reasoning about `recv`, applied to the step after it.
+    let imported = tauri::async_runtime::spawn_blocking(move || {
+        cide_core::scheme::import(&path).map(cide_core::scheme::save_all)
+    })
+    .await
+    .map_err(|e| CoreError::Io(format!("importing a colour theme: {e}")))??;
+
+    emit::schemes_changed(&app, cide_core::scheme::load_all());
+    Ok(imported)
+}
+
+/// Forget an imported colour scheme.
+///
+/// The *setting* is left alone on purpose. A window still naming this id falls back to the
+/// builtin scheme at paint time — `ui/src/editor/scheme.ts` does that with no round trip — and
+/// repairing the two settings fields here would mean deciding, on the user's behalf, that they
+/// did not mean to re-import it. Removing a scheme is reversible; overwriting a preference is
+/// the kind of quiet correction this project keeps out of the persistence layer.
+#[tauri::command(rename_all = "camelCase")]
+pub fn scheme_remove(app: AppHandle, id: String) -> Result<(), CoreError> {
+    cide_core::scheme::remove(&id)?;
+    emit::schemes_changed(&app, cide_core::scheme::load_all());
+    Ok(())
+}
+
 // --- the log directory --------------------------------------------------------------------
 
 /// Open the directory `tauri-plugin-log` writes to, in the desktop's file manager.

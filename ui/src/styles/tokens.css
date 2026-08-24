@@ -216,6 +216,98 @@
   --term-bright-black: #6c6c77;
   --term-white: #75757f;
   --term-bright-white: #91919d;
+
+  /*
+   * --- the editor's own palette ----------------------------------------------------------
+   *
+   * The **cide colour scheme**: what `ui/src/editor/highlight.css` paints a token, and what
+   * `ui/src/editor/scheme.ts` overwrites on `<html>` when the user selects an imported one.
+   *
+   * # Why these exist at all, rather than the six hues above being read directly
+   *
+   * They were, until M24 — `.cide-tk-keyword` was `var(--purple)` — and the note beside
+   * `--blue` four screens up says what that cost: *"Read by the editor's highlight table AND
+   * by the terminal's ANSI palette."* Retuning a syntax colour repainted every terminal in
+   * the app, and `check-theme.mjs` holds those six to a contrast floor and a grey-ramp
+   * ordering that are a *terminal's* requirements, not a buffer's. There was no syntax
+   * palette to tune; there was one palette doing three jobs.
+   *
+   * So the editor's colours are their own family now. Most of them still hold the value the
+   * chrome token held — restated as literals rather than written `var(--purple)`, on
+   * `--term-*`'s own argument two blocks down: the equality is a coincidence of today's
+   * design, and a `var()` would also defeat a gate that has to resolve these to hex to take
+   * a contrast ratio of them.
+   *
+   * The set is **closed in both directions** and spelled in four places that cannot import
+   * one another — here, `highlight.css`, `editor/scheme.ts` and `cide_ipc::theme` — so
+   * `check:scheme` pins all four against each other.
+   */
+
+  /*
+   * The surface a buffer sits on. An imported scheme owns these too, which is why the editor
+   * reads `--tk-bg` rather than `--panel`: a scheme whose background it could not set would
+   * be a foreground palette pitched for someone else's ground.
+   */
+  --tk-bg: #ffffff;
+  --tk-fg: #1b1b1f;
+  --tk-sel: #ffe7d9;
+  --tk-gutter: #6c6c77;
+  --tk-caret: #c4452a;
+
+  /*
+   * One property per role in `highlight.ts`'s `TOKEN_ROLES`, in that file's order — which is
+   * most-specific-first, because `HighlightStyle` resolves a tag through its parent chain.
+   *
+   * Several hold the same value on purpose. Twenty-four roles are not twenty-four colours and
+   * should not be: the extra roles exist so that an *imported* theme has somewhere to put what
+   * it wants to say, and so the closed set covers the scopes VS Code names. cide's own scheme
+   * says less than it could, deliberately — a syntax theme that colours punctuation as loudly
+   * as it colours keywords reads as noise.
+   */
+  --tk-doc: #6c6c77;
+  --tk-comment: #6c6c77;
+  --tk-control: #c0332b;
+  /*
+   * `true`, `false`, `null` — and the one value in this block that is not a chrome colour
+   * restated. They were `--purple`, because `atom` is a subtag of `keyword` and inherited the
+   * keyword rule, so a JSON file's booleans were the same purple as a Rust `fn`. Orange rather
+   * than another member of the existing six because a JSON buffer only ever shows five or six
+   * roles at once and every one of the six was already spoken for in it.
+   */
+  --tk-constant: #a35a12;
+  --tk-escape: #a35a12;
+  --tk-regexp: #8a5a00;
+  --tk-attribute: #8a5a00;
+  --tk-string: #8a5a00;
+  --tk-macro: #1f5fbf;
+  --tk-label: #1f5fbf;
+  --tk-function: #1f5fbf;
+  --tk-namespace: #0f6c7c;
+  --tk-type: #0f6c7c;
+  --tk-keyword: #7a3fa8;
+  --tk-number: #2f7a3d;
+  /*
+   * **The JSON key**, and the reason this whole family exists.
+   *
+   * It was `--text`, and `.cm-editor` is also `color: var(--text)` — so a key was
+   * pixel-identical to unhighlighted body text, in a file where the key is the only structure
+   * there is. `languages/data.ts` does real positional work to find it (a quoted string with a
+   * colon after it) and the role table threw the answer away.
+   *
+   * Blue, and equal to `--tk-function` on purpose: cide's grammars emit `propertyName` for
+   * config-file keys and almost nothing else, so the two roles are not in the same buffer. A
+   * scheme that wants them apart says so; this one does not have to.
+   */
+  --tk-property: #1f5fbf;
+  --tk-variable: #1b1b1f;
+  --tk-bracket: #56565f;
+  --tk-punctuation: #56565f;
+  --tk-operator: #56565f;
+  --tk-heading: #c4452a;
+  --tk-strong: #c4452a;
+  --tk-emphasis: #56565f;
+  --tk-link: #1f5fbf;
+
 }
 
 /* Transcribed verbatim from the design mock, and unchanged by the move to a light default. */
@@ -316,6 +408,51 @@
   --term-bright-black: #5c5c66;
   --term-white: #d7d7dd;
   --term-bright-white: #f2f2f5;
+
+  /* The cide scheme, dark. See the light block for the argument. */
+
+  /* See the light block for what these are and why the editor does not read `--panel`. */
+  --tk-bg: #151518;
+  --tk-fg: #d7d7dd;
+  --tk-sel: #2b3a55;
+  --tk-gutter: #5c5c66;
+  --tk-caret: #d97757;
+
+  /*
+   * One property per role in `highlight.ts`'s `TOKEN_ROLES`, in that file's order — which is
+   * most-specific-first, because `HighlightStyle` resolves a tag through its parent chain.
+   *
+   * Several hold the same value on purpose. Twenty-four roles are not twenty-four colours and
+   * should not be: the extra roles exist so that an *imported* theme has somewhere to put what
+   * it wants to say, and so the closed set covers the scopes VS Code names. cide's own scheme
+   * says less than it could, deliberately — a syntax theme that colours punctuation as loudly
+   * as it colours keywords reads as noise.
+   */
+  --tk-doc: #5c5c66;
+  --tk-comment: #5c5c66;
+  --tk-control: #e06c75;
+  --tk-constant: #e0954f;
+  --tk-escape: #e0954f;
+  --tk-regexp: #dfae68;
+  --tk-attribute: #dfae68;
+  --tk-string: #dfae68;
+  --tk-macro: #7aa2f7;
+  --tk-label: #7aa2f7;
+  --tk-function: #7aa2f7;
+  --tk-namespace: #6fb3c0;
+  --tk-type: #6fb3c0;
+  --tk-keyword: #b48ead;
+  --tk-number: #8fbf7a;
+  --tk-property: #7aa2f7;
+  --tk-variable: #d7d7dd;
+  --tk-bracket: #84848f;
+  --tk-punctuation: #84848f;
+  --tk-operator: #84848f;
+  --tk-heading: #d97757;
+  --tk-strong: #d97757;
+  --tk-emphasis: #84848f;
+  --tk-link: #7aa2f7;
+
 }
 
 :root {

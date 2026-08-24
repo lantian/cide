@@ -28,6 +28,9 @@ pub mod keymap;
 pub mod positions;
 pub mod settings;
 pub mod settings_ops;
+/// Editor colour schemes — the `--tk-*` palette, as data. A different axis from [`Theme`],
+/// which stays the app's light/dark polarity; the module header argues the split.
+pub mod theme;
 pub mod workspace;
 
 pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
@@ -48,6 +51,7 @@ pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem, KeymapReport,
     SettingsPatch,
 };
+pub use theme::{BUILTIN_SCHEME, ColorScheme, SCHEME_SURFACE, SCHEME_TOKENS, scheme_roles};
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, HistoryTab, LayoutNode,
     MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry, RecentProject,
@@ -155,6 +159,14 @@ pub struct Bootstrap {
     /// The *panel* set, not the panels' contents: no extension worker has started at this point
     /// and none needs to have.
     pub extensions: ext::ResolvedContributions,
+    /// The colour schemes the user has imported. (M24)
+    ///
+    /// Here for `extensions`' reason one floor down: the scheme is written onto `<html>` as
+    /// custom properties before the first editor mounts, and a palette that arrives a round trip
+    /// later is a buffer that paints in the wrong colours and then corrects itself. The compiled
+    /// -in `cide` scheme is deliberately *not* in this list — it is what `tokens.css` already
+    /// declares, so selecting it means clearing the properties rather than writing any.
+    pub schemes: Vec<theme::ColorScheme>,
 }
 
 /// Whether a pane's conversation can be picked up where it left off.

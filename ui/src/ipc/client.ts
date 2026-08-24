@@ -15,6 +15,7 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   Axis,
   Bootstrap,
+  ColorScheme,
   DefinitionAnswer,
   DiagnosticSourceId,
   DiagnosticsSnapshot,
@@ -932,6 +933,27 @@ export const settings = {
    * never on this one.
    */
   graphics: () => invoke<GraphicsStatus>('graphics_status'),
+
+  /**
+   * Pick a `.vsix` or a theme `.json` and import every colour theme in it.
+   *
+   * **A list, because a `.vsix` normally carries a light/dark pair** — and the setting is keyed
+   * by polarity, so importing one of a pair would leave the other theme on the builtin.
+   *
+   * Empty means the user cancelled, which is not an error and must not be reported as one;
+   * `project.pick` answers the same gesture the same way. A file that is not a theme rejects.
+   *
+   * The Rust side opens the dialog, because a picker with no transient parent stacks behind the
+   * window on KDE Wayland; see `cmd::project::show_picker`.
+   *
+   * It does **not** select what it imported. Selecting is a settings patch, and the polarity of
+   * an imported theme may not be the one this window is showing — which is a sentence the screen
+   * can say and a command cannot.
+   */
+  importScheme: () => invoke<ColorScheme[]>('scheme_import'),
+
+  /** Forget an imported colour scheme. Removing one that is already gone is not an error. */
+  removeScheme: (id: string) => invoke<void>('scheme_remove', { id }),
 }
 
 /**
@@ -1119,6 +1141,19 @@ export const events = {
   onKeymapChanged: (handler: (keymap: ResolvedBinding[]) => void) =>
     listen<{ keymap: ResolvedBinding[] }>('cide://keymap-changed', (e) =>
       handler(e.payload.keymap),
+    ),
+
+  /**
+   * The set of imported colour schemes changed, in this window or in another one. (M24)
+   *
+   * `onKeymapChanged`'s reason, one field along: the schemes ride `Bootstrap`, and
+   * `applySnapshot` rebuilds `boot` around a new `workspace` while keeping the old `schemes`
+   * array — so the event that carries the *setting* naming a scheme is exactly the one that
+   * cannot carry the scheme.
+   */
+  onSchemesChanged: (handler: (schemes: ColorScheme[]) => void) =>
+    listen<{ schemes: ColorScheme[] }>('cide://schemes-changed', (e) =>
+      handler(e.payload.schemes),
     ),
 
   /**

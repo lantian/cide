@@ -472,6 +472,8 @@ pub fn run() {
             cmd::settings::claude_explain_selection,
             cmd::settings::claude_cli_support,
             cmd::settings::app_open_log_dir,
+            cmd::settings::scheme_import,
+            cmd::settings::scheme_remove,
             cmd::window::window_detach_pane,
             cmd::window::window_redock_pane,
             cmd::window::window_reveal_pane,

@@ -68,6 +68,7 @@
     "check:terminal-find": "node scripts/check-terminal-find.mjs",
     "check:terminal-keys": "node scripts/check-terminal-keys.mjs",
     "check:theme": "node scripts/check-theme.mjs",
+    "check:scheme": "node scripts/check-scheme.mjs",
     "check:toolwindow": "node scripts/check-toolwindow.mjs",
     "check:toolwindow-render": "node scripts/check-toolwindow-render.mjs",
     "check:tree-drag": "node scripts/check-tree-drag.mjs",

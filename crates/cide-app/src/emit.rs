@@ -247,6 +247,33 @@ pub fn keymap_changed(app: &AppHandle, keymap: &[cide_ipc::ResolvedBinding]) {
     }
 }
 
+/// The set of imported colour schemes changed. (M24)
+///
+/// Exists for `KEYMAP_CHANGED`'s reason, one field along: the schemes ride `Bootstrap`, and
+/// `store/workspace.ts::applySnapshot` rebuilds `{ ...current, workspace }` — so
+/// `cide://workspace-changed`, which is what carries the *setting* naming a scheme, is exactly
+/// the path that cannot carry the scheme itself. Without this event, importing in one window
+/// changes the setting everywhere and the palette in one place: every other window resolves the
+/// new id against a list that does not contain it and falls back to the builtin, which reads as
+/// "the import did not work" in the window the user was not looking at.
+///
+/// Carries the whole list, not a delta. It is a handful of small maps, the round trip is already
+/// paid for, and a window answering by re-reading the directory would be reading a state that
+/// may have moved again.
+pub const SCHEMES_CHANGED: &str = "cide://schemes-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemesChanged {
+    schemes: Vec<cide_ipc::ColorScheme>,
+}
+
+pub fn schemes_changed(app: &AppHandle, schemes: Vec<cide_ipc::ColorScheme>) {
+    if let Err(error) = app.emit(SCHEMES_CHANGED, SchemesChanged { schemes }) {
+        tracing::debug!(%error, "colour scheme broadcast reached no window");
+    }
+}
+
 // --- git events ---------------------------------------------------------------------------
 
 /// The changes tree for one project was recomputed.

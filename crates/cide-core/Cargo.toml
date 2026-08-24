@@ -19,6 +19,10 @@ ts-rs = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }
+# Reading a `.vsix` for `scheme::import`. `flate2` is here to *choose* zip's inflate backend,
+# not to be used directly — the root manifest has the argument.
+zip = { workspace = true }
+flate2 = { workspace = true }
 
 # Unix-only, and gated so the crate still compiles for a target with no `prctl` at all.
 # `child_env` needs it for PR_SET_PDEATHSIG; everything else here is portable.

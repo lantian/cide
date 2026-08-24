@@ -113,6 +113,44 @@ export function Segmented<T extends string>({
   )
 }
 
+export interface SelectProps<T extends string> {
+  value: T
+  options: readonly { value: T; label: string }[]
+  onChange: (next: T) => void
+  label: string
+}
+
+/**
+ * An exclusive choice with too many options to be a `Segmented`. (M24)
+ *
+ * The line between the two is how many rows there are and whether the set is closed. Theme is
+ * two fixed values and stays segmented; a colour scheme is `cide` plus however many the user has
+ * imported, which is unbounded and could be one or twenty.
+ *
+ * A native `<select>` rather than a listbox built out of divs. It gets keyboard behaviour,
+ * typeahead, screen-reader semantics and the platform's own popup for free — and the popup is
+ * the part worth having: a custom one inside a webview cannot escape the window, so a long list
+ * near the bottom of the Settings tab would scroll inside a panel instead of opening over it.
+ * The arrow is drawn with `appearance: none` and a background image so the control matches the
+ * rest of the form; everything else is the browser's.
+ */
+export function Select<T extends string>({ value, options, onChange, label }: SelectProps<T>) {
+  return (
+    <select
+      className={styles.select}
+      aria-label={label}
+      value={value}
+      onChange={(e) => onChange(e.target.value as T)}
+    >
+      {options.map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  )
+}
+
 export interface NumberFieldProps {
   value: number
   min: number

@@ -318,3 +318,20 @@
   color: var(--text);
   font-size: var(--fs-ui-11);
 }
+
+/*
+ * The colour-scheme row's three controls on one line. (M24)
+ *
+ * `Row` gives its control cell no layout of its own — every other row on the screen has a single
+ * control in it — so a row with a picker and two buttons has to bring its own. `flex-wrap`
+ * rather than a fixed three-column grid: `.select` is `max-width: 220px` and the buttons grow
+ * with `--ui-scale`, so at 17px the three of them stop fitting the cell and wrapping is the only
+ * behaviour that does not clip the last one.
+ */
+.schemeControl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}

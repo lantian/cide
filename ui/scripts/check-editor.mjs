@@ -638,27 +638,90 @@ try {
   eq(classOf('comment'), 'cide-tk-comment', 'comments')
   eq(classOf('controlOperator'), 'cide-tk-control', "`?` gets its own role, not the operator's")
 
-  // Subtag fallback is what lets the table have twelve entries instead of forty. `atom` is a
-  // subtag of `keyword` and `bool` of `literal`; if lezer ever reparents them, the mock's
-  // purple `None` and green `true` go plain and nothing else would say so.
-  eq(classOf('atom'), 'cide-tk-keyword', 'an atom falls back to the keyword rule')
-  eq(classOf('bool'), 'cide-tk-number', 'a bool falls back to the literal rule')
-  eq(classOf('macroName'), 'cide-tk-function', 'a macro reads as a call')
-  eq(classOf('labelName'), 'cide-tk-function', 'a YAML anchor reads as a call')
-  eq(classOf('propertyName'), 'cide-tk-property', 'a key')
+  /*
+   * Subtag fallback is what lets the table have twenty-four entries instead of eighty, and
+   * **order is what decides which entry wins**: `HighlightStyle` resolves a tag through its
+   * parent chain and takes the first match, so a role claiming a child tag has to be listed
+   * before the role claiming its parent. Every assertion in this block is a pair whose order
+   * matters, and getting one wrong is silent — the wrong role wins and nothing fails.
+   */
+  eq(classOf('lineComment'), 'cide-tk-comment', 'a line comment falls back to the comment rule')
+  eq(classOf('integer'), 'cide-tk-number', 'an integer falls back to the number rule')
+  eq(classOf('character'), 'cide-tk-string', 'a char literal falls back to the string rule')
+  eq(classOf('arithmeticOperator'), 'cide-tk-operator', 'an operator subtag')
+  eq(classOf('separator'), 'cide-tk-punctuation', 'a separator is punctuation')
+  eq(classOf('paren'), 'cide-tk-bracket', 'a paren is a bracket, not general punctuation')
+  eq(classOf('heading3'), 'cide-tk-heading', 'a numbered heading')
+
+  /*
+   * The M24 splits. Each of these was a *different* class before, and each was costing
+   * something a scheme could not express; the pairs are the ones where order is load-bearing.
+   */
+  // `atom`, `self`, `null` and `unit` are subtags of `keyword`, and `bool` of `literal`. The
+  // constant role therefore has to precede both the keyword role and the number role — which
+  // claims `literal` — or a config file's booleans are keywords again.
+  eq(classOf('atom'), 'cide-tk-constant', "`true`/`null` are constants, not keywords")
+  eq(classOf('bool'), 'cide-tk-constant', 'a bool is a constant, not a number')
+  eq(classOf('self'), 'cide-tk-constant', '`self` is a constant')
+  eq(classOf('modifier'), 'cide-tk-keyword', 'a keyword subtag the constant role does not take')
+  // `docComment` before `comment`, `docString` before `string`.
+  eq(classOf('docComment'), 'cide-tk-doc', 'a doc comment has its own role')
+  eq(classOf('docString'), 'cide-tk-doc', "a docstring is documentation before it is a string")
+  // `escape` and `regexp` are subtags of `literal`, so both precede the number role.
+  eq(classOf('escape'), 'cide-tk-escape', 'an escape inside a string')
+  eq(classOf('regexp'), 'cide-tk-regexp', 'a regex literal')
+  // `url` stays with strings: it is a `literal` subtag and the link role sits below the number
+  // role, which claims `literal`. A URL inside a string is a string.
+  eq(classOf('url'), 'cide-tk-string', 'a URL in a string is a string')
+  // `attributeName` is a subtag of `propertyName`; the attribute role precedes the property one.
+  eq(classOf('attributeName'), 'cide-tk-attribute', 'an attribute name is not a key')
+  eq(classOf('macroName'), 'cide-tk-macro', 'a macro has its own role')
+  eq(classOf('labelName'), 'cide-tk-label', 'a YAML anchor has its own role')
+  eq(classOf('namespace'), 'cide-tk-namespace', 'a namespace has its own role')
+  eq(classOf('className'), 'cide-tk-type', 'a class is a type')
+  eq(classOf('variableName.definition'), 'cide-tk-variable', 'a binding site')
+  eq(classOf('bracket'), 'cide-tk-bracket', 'a bracket has its own role')
+  eq(classOf('punctuation'), 'cide-tk-punctuation', 'punctuation is not the operator role')
+  eq(classOf('strong'), 'cide-tk-strong', 'bold no longer shares the heading role')
+  eq(classOf('link'), 'cide-tk-link', 'a link no longer shares the emphasis role')
+
+  /*
+   * **The JSON file, role by role.** This is the regression this milestone exists to prevent,
+   * and it is the one assertion here that a reader can check against a screenshot: six roles,
+   * every one of them a different class. `propertyName` mapping to anything that also paints
+   * plain text is the bug — see `tokens.css`'s note beside `--tk-property`.
+   */
+  const jsonRoles = ['propertyName', 'string', 'number', 'atom', 'punctuation', 'bracket']
+  const jsonClasses = jsonRoles.map(classOf)
+  ok(
+    jsonClasses.every((c) => typeof c === 'string'),
+    `every tag a JSON buffer emits has a role: ${jsonRoles.join(', ')}`,
+  )
+  eq(classOf('propertyName'), 'cide-tk-property', 'a JSON key is its own role')
+  ok(
+    new Set(jsonClasses).size === jsonRoles.length,
+    'every tag a JSON buffer emits resolves to a role of its own — six of them, where before ' +
+      `M24 the key was body text and brackets, commas and colons were one: ${jsonClasses.join(', ')}`,
+  )
+
   eq(classOf('number'), 'cide-tk-number', 'a number')
   eq(classOf('operator'), 'cide-tk-operator', 'an operator')
-  eq(classOf('bracket'), 'cide-tk-operator', 'a bracket, via punctuation')
-  eq(classOf('punctuation'), 'cide-tk-operator', 'punctuation')
   eq(classOf('heading'), 'cide-tk-heading', 'a markdown heading')
-  eq(classOf('strong'), 'cide-tk-heading', 'bold shares the heading role')
   eq(classOf('emphasis'), 'cide-tk-emphasis', 'italic')
   eq(classOf('quote'), 'cide-tk-emphasis', 'a block quote')
-  eq(classOf('link'), 'cide-tk-emphasis', 'a link')
   eq(classOf('monospace'), 'cide-tk-emphasis', 'inline code')
   // Deliberate: an ordinary identifier is body text, and colouring every one of them is how
   // a syntax theme turns into noise.
   eq(classOf('variableName'), null, 'a plain identifier has no role')
+  /*
+   * And the tags with no role are what `languages.ts::tagIsUnknown` refuses. That check used
+   * `tagsFor`, which answers for any name `@lezer/highlight` exports — so an extension writing
+   * `"tag": "inserted"` validated, parsed, matched and painted nothing. Pinned here because the
+   * fix is *this* function being the authority.
+   */
+  for (const orphan of ['inserted', 'deleted', 'changed', 'list', 'content', 'strikethrough']) {
+    eq(classOf(orphan), null, `\`${orphan}\` has no role, so a rule may not name it`)
+  }
 
   /*
    * The buffer paints from `editor/highlight.css`; the canvas minimap paints from

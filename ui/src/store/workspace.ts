@@ -636,9 +636,24 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
       if (boot === null) return
       set({ boot: { ...boot, keymap } })
     })
+    /*
+     * The imported colour schemes are a third subscription, for the keymap's reason. (M24)
+     *
+     * They ride `Bootstrap` and are not part of the workspace, so `applySnapshot` keeps the
+     * old array. Without this line, importing a theme in one window changes the *setting*
+     * everywhere — that does ride the workspace — while the palette it names exists in one
+     * window only, and every other window falls back to the builtin. The user sees the import
+     * work in the window they did it in and silently not work in the one beside it.
+     */
+    const unlistenSchemes = await events.onSchemesChanged((schemes) => {
+      const boot = get().boot
+      if (boot === null) return
+      set({ boot: { ...boot, schemes } })
+    })
     return () => {
       unlisten()
       unlistenKeymap()
+      unlistenSchemes()
     }
   },
 

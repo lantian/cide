@@ -9,6 +9,7 @@
   "cide://ipc-degraded",
   "cide://keymap-changed",
   "cide://mouse-nav",
+  "cide://schemes-changed",
   "cide://session-awaiting",
   "cide://session-state",
   "cide://session-status",
