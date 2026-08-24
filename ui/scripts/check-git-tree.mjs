@@ -874,7 +874,8 @@ try {
    * workspace (`openDiffTabs.ts`), so the rule below is the whole of what the tree decides.
    */
   const c = await import(`file://${join(out, 'sidebar', 'clickSemantics.js')}`)
-  const click = (gesture, expandable, diffOpen) => c.gitTreeClick({ gesture, expandable, diffOpen })
+  const click = (gesture, expandable, diffOpen) =>
+    c.gitTreeClick({ gesture, expandable, isDir: false, onTwisty: false, diffOpen })
   const act = (select, toggle, open) => ({ select, toggle, open })
 
   eq(
@@ -906,14 +907,46 @@ try {
   eq(
     click('single', true, false),
     act(true, true, false),
-    'a changelist or repo row folds on a single click — it holds no diff, and there is nothing '
-      + 'else a click on one could mean',
+    'a changelist or repo row folds on a single click — it is a header, not a folder, and '
+      + 'there is nothing else a click on one could mean',
   )
   eq(
     click('double', true, true),
     act(false, false, false),
     'and the second half of a double-click on a group does NOTHING: `click` fires twice, so '
       + 'folding on both halves would open the group and shut it again in one gesture',
+  )
+
+  /*
+   * > *"to expand folder we should use double click instead of one click (like in file tree)"*
+   *
+   * A DIRECTORY row is the exception the report carved out of the header rule above: it folds
+   * the way the file tree's folders do. A single click on the row body only selects — a
+   * directory is a drag handle and a context-menu target, so pointing at one must not also
+   * fold it under the pointer — and the fold is a double-click, or one click on the twisty,
+   * which stays single-click for the file tree's reason: it is the one control whose only
+   * meaning is "open this".
+   */
+  const dir = (gesture, onTwisty = false) =>
+    c.gitTreeClick({ gesture, expandable: true, isDir: true, onTwisty, diffOpen: false })
+  eq(
+    dir('single'),
+    act(true, false, false),
+    'one click on a directory row selects it and folds NOTHING — the file-tree rule, ported '
+      + 'on request',
+  )
+  eq(dir('double'), act(true, true, false), 'a double click is what folds a directory')
+  eq(
+    dir('single', true),
+    act(true, true, false),
+    'and one click on its twisty folds too — requiring a double-click on the 9px arrow to do '
+      + 'the one thing it exists for would be a worse tree than the one being fixed',
+  )
+  eq(
+    dir('double', true),
+    act(false, false, false),
+    'the second half of a twisty double-click does nothing, or one gesture would fold twice '
+      + 'and the folder would land where it started',
   )
 
   // --- and WHICH command an opening gesture routes to ------------------------------------
@@ -949,6 +982,41 @@ try {
     /onOpenDiff\(row,\s*diffOpenMode\(gesture\)\)/.test(tree),
     'the mousedown handler routes through `diffOpenMode` — an inline ternary here is exactly '
       + 'the link no test can reach',
+  )
+  /*
+   * The directory rules above are worth nothing if the component answers `gitTreeClick` with
+   * the wrong facts. Both gesture halves must agree — the press decides the selection and the
+   * release decides the fold, and if only one of them said `isDir` the fold and the selection
+   * would follow two different rules for the same click.
+   */
+  eq(
+    (tree.match(/isDir: row\.kind === 'dir',\s*onTwisty: pressOnTwisty\(e, row\),/g) ?? [])
+      .length,
+    2,
+    'BOTH halves of the gesture — the mousedown and the mouseup — hand `gitTreeClick` the '
+      + 'directory and twisty facts',
+  )
+  ok(
+    /function pressOnTwisty\([\s\S]{0,400}?row\.expandable && e\.target instanceof Element/.test(
+      tree,
+    ),
+    '`pressOnTwisty` is guarded on `row.expandable`, like the file tree\'s `hasTwisty`: the '
+      + 'twisty span is drawn empty on every file row, and without the guard a double-click '
+      + 'in that strip resolves to "second half of a twisty gesture" and the diff refuses to '
+      + 'open',
+  )
+  ok(
+    /className=\{styles\.twisty\}[\s\S]{0,700}?onPointerDown=\{\(e\) => e\.stopPropagation\(\)\}/
+      .test(tree),
+    'the twisty is a control and not a drag handle — one click on it now folds a directory, '
+      + 'so a hand that shifts two pixels while clicking must not pick the row up instead',
+  )
+  ok(
+    /row\.kind === 'dir' && \(\s*<FileIcon\s*row=\{\{ name: splitPath\(row\.path \?\? row\.label\)\.name, kind: 'dir', expanded: open \}\}/
+      .test(tree),
+    'a directory row draws the explorer\'s folder icon, keyed by the DEEPEST segment of its '
+      + 'path — a compacted `crates/cide-git/src` row is the directory `src`, and the label '
+      + 'would hand the whole compacted path to the folder-name table',
   )
 
   const hook = readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8')

@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use cide_ipc::{SearchHit, SearchMode, SearchQuery};
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::RegexBuilder;
 
@@ -154,6 +155,204 @@ pub fn compile(query: &SearchQuery) -> Result<Regex, regex::Error> {
         .build()
 }
 
+/// Whether the walk should look at `path`, given the one directory the search is scoped to.
+///
+/// A **file** counts when it is inside `scope`. A **directory** counts when it is inside
+/// `scope` *or when it is on the way down to it* — an ancestor has to be descended into or the
+/// walk never reaches the scope at all, and a scope test that forgot the second half would
+/// answer "no results" for every folder below the root.
+///
+/// Everything else is false, and [`Visitor::visit`] turns a rejected directory into
+/// `WalkState::Skip` — so a sibling subtree is pruned at its top rather than walked and
+/// rejected file by file. That is what makes scoping cheap: the cost of a scoped search over a
+/// large repository is one directory listing per level of the scope's own ancestor chain.
+///
+/// [`Path::starts_with`] is component-wise, which is the whole correctness argument: a
+/// `str::starts_with` would call `/a/bc` a child of `/a/b` and quietly search the wrong tree.
+pub fn within_scope(path: &Path, is_dir: bool, scope: &Path) -> bool {
+    if path.starts_with(scope) {
+        return true;
+    }
+    is_dir && scope.starts_with(path)
+}
+
+/// The directory a [`cide_ipc::SearchQuery::scope`] names, or a sentence saying why it names
+/// none.
+///
+/// The spelling is the one the panel's box shows and the one [`SearchHit::rel`] draws:
+/// absolute, or relative to a root, and optionally the root's own label — alone, or as a
+/// prefix, which is how a multi-root project says *which* root a shared relative path means.
+///
+/// **A scope that names a file resolves to its parent directory.** That is the rule behind
+/// "…or if a file is selected, its parent", and it lives here — where a test can run it —
+/// rather than in the frontend, where it would be a guess made from a tree row that may not be
+/// resident. It also means a path pasted straight out of *Copy Relative Path* does something
+/// sensible instead of finding nothing.
+///
+/// The result must be at or under a root: the walk only ever starts at roots, so a scope
+/// outside every one of them could never produce a hit, and answering "no results" for it
+/// would be a dead end the user cannot diagnose.
+///
+/// # The order the readings are tried in
+///
+/// Three passes over the roots rather than one, and the order is the whole of what makes an
+/// ambiguous string resolve predictably:
+///
+/// 1. **A bare root label.** An exact, whole-string match on a root's name is the strongest
+///    signal there is, and it is what the file tree's own top-level row is called.
+/// 2. **The literal reading**, `<root>/<text>`, for every root in order.
+/// 3. **A label prefix**, `<label>/<rest>`.
+///
+/// The literal reading beating the prefix is the load-bearing one. A repository with a
+/// directory named after itself — `cide/cide/src` — would otherwise have `cide/src` resolve to
+/// `<root>/src`, silently searching a tree the user did not name. With this order the literal
+/// path wins wherever it exists and the prefix is the fallback, which is also why no pass is
+/// gated on the project having several roots: an extra reading that only fires when the
+/// obvious one found nothing cannot take a search away from where it was pointed.
+pub fn resolve_scope(roots: &[SearchRoot], scope: &str) -> Result<PathBuf, String> {
+    let text = scope.trim().trim_end_matches('/');
+    if text.is_empty() {
+        // The caller treats an empty scope as "every root" and does not call this. Answering
+        // rather than asserting, because the one thing this must never do is resolve an empty
+        // string to a root and silently narrow a search nobody asked to narrow.
+        return Err("no folder named".to_string());
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if Path::new(text).is_absolute() {
+        candidates.push(PathBuf::from(text));
+    } else {
+        for root in roots {
+            if text == root.label {
+                candidates.push(root.path.clone());
+            }
+        }
+        for root in roots {
+            candidates.push(root.path.join(text));
+        }
+        for root in roots {
+            if let Some(rest) = text.strip_prefix(&format!("{}/", root.label)) {
+                candidates.push(root.path.join(rest));
+            }
+        }
+    }
+
+    for candidate in candidates {
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        let dir = if meta.is_dir() {
+            candidate
+        } else {
+            // A file names its directory. `parent` is `None` only for a filesystem root, which
+            // cannot be a file, so the fallback is unreachable rather than load-bearing.
+            match candidate.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => continue,
+            }
+        };
+        // Longest match is not needed here — containment is the whole question, because `rel`
+        // is measured from whichever root the *walk* is under and the scope only prunes it.
+        if roots.iter().any(|root| dir.starts_with(&root.path)) {
+            return Ok(dir);
+        }
+        // Only an absolute scope can get here: every relative candidate was built by joining
+        // onto a root, so it is inside one by construction. Reported rather than skipped, so
+        // that naming a real directory outside the project says so instead of finding nothing.
+        return Err(format!("{text} is outside this project"));
+    }
+    Err(format!("no folder named {text} in this project"))
+}
+
+/// A validated glob list — [`cide_ipc::SearchQuery::include`], parsed.
+///
+/// A type rather than a `Vec<String>` so that the validation cannot be skipped: the globs are
+/// checked once by [`compile_globs`], where a malformed one becomes a sentence the panel can
+/// draw, and the per-root [`Override`] built from them afterwards therefore cannot fail. The
+/// alternative — building the matcher inside the walk — puts a parse error somewhere with
+/// nobody to report it to, which is a search that silently ignores what the user typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Globs(Vec<String>);
+
+impl Globs {
+    /// The per-root matcher `ignore` wants. One per root, because a glob with a `/` in it is
+    /// anchored at the directory the builder was given.
+    ///
+    /// Infallible by construction: every glob in here already built once in [`compile_globs`].
+    /// A failure would be a bug in this module rather than in the user's input, so it degrades
+    /// to "no filter" with a log line instead of dropping the search on the floor.
+    fn overrides(&self, root: &Path) -> Override {
+        let mut builder = OverrideBuilder::new(root);
+        for glob in &self.0 {
+            if let Err(err) = builder.add(glob) {
+                tracing::debug!(%err, glob, "a validated glob failed to build for a root");
+            }
+        }
+        builder.build().unwrap_or_else(|err| {
+            tracing::debug!(%err, "a validated glob set failed to build");
+            Override::empty()
+        })
+    }
+}
+
+/// Parse and validate the comma-separated glob list beside the search box.
+///
+/// `Ok(None)` for an empty spec, which is the default and means every file.
+///
+/// The syntax is gitignore's, because that is what the walker already speaks and what
+/// `ripgrep -g` exposes: no `/` matches a basename at any depth, a `/` anchors at the root, a
+/// leading `!` excludes. Commas separate, because that is what every editor's *files to
+/// include* box uses and no real glob contains one.
+///
+/// # Two properties of `ignore`'s overrides this relies on
+///
+/// * `Override::matched` ends with `if mat.is_none() && self.num_whitelists() > 0 && !is_dir`.
+///   That `!is_dir` guard is why a whitelist-only `*.ts` does **not** prune every directory in
+///   the tree: files that match nothing are ignored, directories are left to gitignore. Remove
+///   it and a glob search finds nothing anywhere.
+/// * A whitelist *outranks* gitignore for files, so `*.ts` would on its own resurface a
+///   gitignored `.ts`. It does not, because `cide_fs::Filter` carries its own per-directory
+///   `Gitignore` and [`Search::admits`] is consulted before a file is opened. That is the
+///   "belt and braces" `cmd::search`'s comment claims, and this is the first case where it
+///   actually holds the line rather than merely agreeing.
+pub fn compile_globs(spec: &str) -> Result<Option<Globs>, String> {
+    let globs: Vec<String> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|glob| !glob.is_empty())
+        .map(str::to_string)
+        .collect();
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    // Validated against a fixed directory rather than a real root: `OverrideBuilder::add`
+    // rejects a malformed glob on syntax alone, and the answer cannot depend on which root it
+    // would be anchored to. Doing it once here is what lets `Globs::overrides` be infallible.
+    let mut builder = OverrideBuilder::new("/");
+    for glob in &globs {
+        if let Err(err) = builder.add(glob) {
+            return Err(glob_error(glob, &err));
+        }
+    }
+    if let Err(err) = builder.build() {
+        return Err(glob_error(spec, &err));
+    }
+    Ok(Some(Globs(globs)))
+}
+
+/// A glob failure on one line, for the same reason [`crate::content`]'s caller trims a regex
+/// error to one: `ignore::Error` is a multi-line report and the panel is 252px wide.
+fn glob_error(glob: &str, err: &ignore::Error) -> String {
+    let detail = err
+        .to_string()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("could not be parsed")
+        .to_string();
+    format!("{glob}: {detail}")
+}
+
 /// Whether a query is worth running at all.
 ///
 /// An empty pattern compiles into a regex that matches at every position of every line, so
@@ -184,7 +383,19 @@ pub struct Search<'a> {
     pub limits: Limits,
     /// The shared ignore decision. `None` leaves `ignore`'s own gitignore handling as the
     /// only filter, which is what the crate's own tests use.
+    ///
+    /// Since the search grew a folder scope this is also where that scope is applied — see
+    /// [`within_scope`]. One predicate rather than two, because both answer the same question
+    /// (*should the walk look here at all*) and a directory rejected by either has to prune
+    /// the same way.
     pub admits: Option<Admits<'a>>,
+    /// Which files to look inside. `None` is every file, which is the default.
+    ///
+    /// Applied by `ignore` itself rather than in [`Visitor::scan`], which is the reason it is
+    /// carried here as globs rather than as a second predicate: an override is consulted while
+    /// the walker is already deciding about the entry, so a file that matches nothing is never
+    /// stat'ed, never opened and never counted as scanned.
+    pub include: Option<&'a Globs>,
     /// Set from any thread to stop the walk. Checked once per entry, so a cancelled search
     /// stops within one file rather than at the end of the tree.
     pub cancel: &'a AtomicBool,
@@ -249,6 +460,13 @@ impl Search<'_> {
             .require_git(false)
             .follow_links(false)
             .threads(self.limits.threads);
+
+        // The filename globs, anchored at this root. Whitelist-only globs deliberately do not
+        // prune directories — see [`compile_globs`] for the two `ignore` behaviours this leans
+        // on and why neither is safe to assume without having read them.
+        if let Some(globs) = self.include {
+            builder.overrides(globs.overrides(&root.path));
+        }
 
         let (tx, rx) = mpsc::channel::<Vec<SearchHit>>();
 
@@ -530,6 +748,8 @@ mod tests {
             mode,
             case_sensitive: false,
             whole_word: false,
+            scope: String::new(),
+            include: String::new(),
         }
     }
 
@@ -722,6 +942,80 @@ mod tests {
         let (_, start, end, text) = hits[0].clone();
         assert_eq!(start, 5, "the emoji is four bytes plus a space");
         assert_eq!(&text[start as usize..end as usize], "needle");
+    }
+
+    #[test]
+    fn a_path_inside_the_scope_is_searched_and_a_sibling_is_not() {
+        let scope = Path::new("/p/crates/cide-git");
+        assert!(within_scope(
+            Path::new("/p/crates/cide-git/src/log.rs"),
+            false,
+            scope
+        ));
+        assert!(within_scope(
+            Path::new("/p/crates/cide-git/src"),
+            true,
+            scope
+        ));
+        assert!(!within_scope(Path::new("/p/ui/src/App.tsx"), false, scope));
+        assert!(!within_scope(Path::new("/p/ui"), true, scope));
+    }
+
+    #[test]
+    fn a_directory_above_the_scope_is_admitted_so_the_walk_can_reach_it() {
+        let scope = Path::new("/p/crates/cide-git");
+        // The walk starts at `/p`, so refusing these three is refusing to descend at all —
+        // a scoped search that reported nothing, ever.
+        assert!(within_scope(Path::new("/p"), true, scope));
+        assert!(within_scope(Path::new("/p/crates"), true, scope));
+        assert!(within_scope(scope, true, scope));
+        // A *file* beside the chain is still not searched. Only directories get the pass.
+        assert!(!within_scope(
+            Path::new("/p/crates/Cargo.toml"),
+            false,
+            scope
+        ));
+    }
+
+    #[test]
+    fn scope_containment_is_by_component_and_not_by_prefix() {
+        // `str::starts_with` calls this a child and searches an entirely different crate.
+        let scope = Path::new("/p/crates/cide-git");
+        assert!(!within_scope(
+            Path::new("/p/crates/cide-github/src/x.rs"),
+            false,
+            scope
+        ));
+        assert!(!within_scope(
+            Path::new("/p/crates/cide-github"),
+            true,
+            scope
+        ));
+    }
+
+    #[test]
+    fn a_glob_list_is_split_on_commas_and_an_empty_one_is_no_filter() {
+        assert_eq!(compile_globs("").expect("empty is not an error"), None);
+        assert_eq!(
+            compile_globs("  ,  ").expect("blank entries drop out"),
+            None
+        );
+        let globs = compile_globs(" *.rs , *.toml ").expect("two ordinary globs");
+        assert_eq!(
+            globs,
+            Some(Globs(vec!["*.rs".to_string(), "*.toml".to_string()]))
+        );
+        // A negation is a glob like any other here; `ignore` is what gives it its meaning.
+        assert!(compile_globs("*.ts,!*.d.ts").is_ok());
+    }
+
+    #[test]
+    fn a_malformed_glob_is_a_sentence_naming_it_and_not_a_panic() {
+        let err = compile_globs("*.rs,*.[").expect_err("an unclosed class must not build");
+        // The offending glob is named, because the box may hold several and "invalid glob"
+        // leaves the user to find which one by deleting them in turn.
+        assert!(err.starts_with("*.["), "{err}");
+        assert!(err.len() < 200, "one line, for a 252px panel: {err}");
     }
 
     #[test]

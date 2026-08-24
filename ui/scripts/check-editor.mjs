@@ -2929,6 +2929,30 @@ try {
       'while an editor detached into its own window does have to raise the shell — the case ' +
         'mentionTarget’s fallback makes ordinary',
     )
+
+    // A tab torn out into a window of its own. Unlike a detached pane it STAYS in
+    // `project.tabs`, so the walk above finds it and only the window map says the shell is
+    // not drawing it. `here: true` for the shell here is the silent-nothing again: the raise
+    // would be skipped, `tab_activate` answers success without moving (the domain refuses to
+    // let a shell draw a torn-out tab), and the reveal would claim the user is looking at a
+    // pane no window of theirs shows.
+    const tornTab = {
+      activeTab: 't0',
+      detached: {},
+      tabs: [tabOf('t0', ['console'], 'console'), tabOf('t1', ['editor'], 'editor')],
+    }
+    const tornWindows = { 'shell:1': shell(['p1']), 'tab:1': { kind: 'detachedTab', tab: 't1' } }
+    eq(
+      revealPlan.planReveal(bootOf(shell(['p1']), tornTab, tornWindows), 'p1', 'editor'),
+      { here: false, tab: 't1', activateProject: false, activateTab: false, clearMaximize: false, focusPane: false, blocked: null },
+      'a pane in a torn-out tab is not “here” for the shell, and neither shell mutation runs ' +
+        '— its window shows it whatever the shell has in front, so the raise is the reveal',
+    )
+    eq(
+      revealPlan.planReveal(bootOf({ kind: 'detachedTab', tab: 't1' }, tornTab, tornWindows), 'p1', 'editor').here,
+      true,
+      'and the tab window itself does not ask to raise itself',
+    )
     eq(
       revealPlan.planReveal(bootOf(shell(['other']), twoTabs), 'p1', 'console').here,
       false,

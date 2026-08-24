@@ -399,6 +399,25 @@ export const windows = {
   /** Puts the pane back in its home tab and closes the window it was in. */
   redockPane: (label: string) => invoke<{ rev: number }>('window_redock_pane', { label }),
 
+  /**
+   * Tear a whole tab out into a window of its own — the road a *file* takes, because an
+   * editor's buffer is registered per tab and a lone editor pane cannot leave its tab.
+   * `rect` follows `detachPane`'s reasoning: the tab reopens at the size it already was.
+   */
+  detachTab: (
+    projectId: ProjectId,
+    tabId: TabId,
+    rect?: { width: number; height: number },
+  ) =>
+    invoke<string>('window_detach_tab', {
+      project: projectId,
+      tab: tabId,
+      rect: rect ?? null,
+    }),
+
+  /** Puts the tab back in its shell's strip and closes the window it was in. */
+  redockTab: (label: string) => invoke<{ rev: number }>('window_redock_tab', { label }),
+
   setMode: (mode: WindowMode) => invoke<{ rev: number }>('window_set_mode', { mode }),
 
   /**

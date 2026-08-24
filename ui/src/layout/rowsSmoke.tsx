@@ -155,6 +155,10 @@ function parse(html: string) {
   const splitters: { split: string; orientation: string; chain: number; hidden: boolean }[] = []
   const stack: Element[] = []
   const buttons: string[] = []
+  // Per pane, which `data-edge-*` marks its leaf wrapper carries — the marks that drop a
+  // frame border side where the pane sits flush against the app chrome. Panes with no mark
+  // are absent, so an interior pane appearing here is a failure the assertion can name.
+  const edges: Record<string, string> = {}
   let addRow = 0
 
   const attr = (attrs: string, name: string) =>
@@ -198,6 +202,15 @@ function parse(html: string) {
     if (tag === 'button' && attr(attrs, 'aria-label')?.startsWith('Add a row')) {
       buttons.push(attr(attrs, 'aria-label') ?? '')
     }
+    // The pane div is rendered inside the leaf wrapper, so when its open tag arrives the
+    // wrapper — the element the marks live on — is already on the stack.
+    const paneId = attr(attrs, 'data-pane-id')
+    if (paneId !== undefined) {
+      const marks = ['left', 'top', 'bottom'].filter((e) =>
+        stack.some((n) => n.attrs.includes(`data-edge-${e}`)),
+      )
+      if (marks.length > 0) edges[paneId] = marks.join(',')
+    }
 
     const isVoid = /^(area|base|br|col|embed|hr|img|input|link|meta|source|track|wbr)$/.test(
       tag ?? '',
@@ -205,7 +218,7 @@ function parse(html: string) {
     if (!selfClosing && !isVoid) stack.push(el)
   }
 
-  return { chains, splitters, addRow, buttons }
+  return { chains, splitters, addRow, buttons, edges }
 }
 
 function render(tree: PaneTree, withAddRow: boolean) {
@@ -265,7 +278,13 @@ console.log(
       lone: around(LONE, 1, 'row'),
       noColumn: around(LEANING, 1, 'col'),
     },
-    plain: { chains: plain.chains, splitters: plain.splitters, addRow: plain.addRow, buttons: plain.buttons },
+    plain: {
+      chains: plain.chains,
+      splitters: plain.splitters,
+      addRow: plain.addRow,
+      buttons: plain.buttons,
+      edges: plain.edges,
+    },
     maximized: {
       chains: maximized.chains.length,
       // Per chain, how many of its dividers were explicitly hidden.
@@ -276,6 +295,7 @@ console.log(
         (_, i) => maximized.splitters.filter((s) => s.chain === i).length,
       ),
       addRow: maximized.addRow,
+      edges: maximized.edges,
     },
     noStrip: { addRow: noStrip.addRow, splitters: noStrip.splitters.length },
     leaning: {
@@ -284,6 +304,7 @@ console.log(
       // In document order, which for a grid whose members are placed on explicit tracks is
       // also left-to-right order.
       splitters: leaning.splitters.map((s) => s.split),
+      edges: leaning.edges,
     },
     keys: {
       before: before.members.map(memberKey),

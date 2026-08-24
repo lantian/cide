@@ -113,11 +113,14 @@
  * the computed style; the two buttons reach back over the padding rather than owning it.
  */
 .tab {
-  /* The awaiting badge's reserved box. Named here rather than in `.awaiting` because
-     `.tabOpen` has to reach over it too, and two literals that must agree is one too many.
-     Scaled with the chip's height and glyph — see `TabStrip.module.css` for the failure a
-     fixed reserve would reintroduce. */
+  /* The awaiting badge's box. Named here rather than in `.awaiting` because `.tabOpen` has
+     to reach over it too, and two literals that must agree is one too many. Scaled with the
+     chip's height and glyph — see `TabStrip.module.css` for the failure a fixed size would
+     reintroduce. `--awaiting-slot` is the badge's whole cost in the row — the flex gap in
+     front of it plus the box — so the collapse below can zero both together; zeroing the
+     width alone would leave a 0px flex item still taking a gap on each side. */
   --awaiting-w: calc(18px * var(--ui-scale));
+  --awaiting-slot: calc(var(--sp-4) + var(--awaiting-w));
   display: flex;
   align-items: center;
   gap: var(--sp-4);
@@ -130,6 +133,13 @@
   color: var(--dim);
   cursor: pointer;
   white-space: nowrap;
+}
+
+/* No badge, no box — both numbers together, or a 0px flex item keeps its gap. The full
+   argument, including why this replaced a permanent reserve, is on the `.awaiting` rule. */
+.tab[data-awaiting='false'] {
+  --awaiting-w: 0px;
+  --awaiting-slot: 0px;
 }
 
 .tab:hover {
@@ -152,10 +162,13 @@
  * 14 | dot | 9 | name | 9 | path | 9 | × | 14, with no dead strip at either end.
  *
  * It now reaches over the awaiting badge as well, on the right, for exactly the same reason:
- * the badge is a `span` and not a control, and without this reach the middle 22px of every
- * project tab would light up on hover and do nothing. The badge is `pointer-events: none` and
- * comes after this button in DOM order, so it paints on top of this padding and the click
- * lands on the button underneath.
+ * the badge is a `span` and not a control, and without this reach the middle of every project
+ * tab would light up on hover and do nothing. The reach is the badge's slot plus the flex gap
+ * between the badge and the close button, so it ends exactly at the close button's box in
+ * both states — the slot is zero when nothing is waiting, and the gap term is what used to be
+ * a dead sliver in front of the `×` even while the badge was lit. The badge is
+ * `pointer-events: none` and comes after this button in DOM order, so it paints on top of
+ * this padding and the click lands on the button underneath.
  *
  * `letter-spacing: inherit` is not redundant: the UA sheet forces `letter-spacing: normal`
  * on form controls, which would swallow the active tab's .01em before it reached the text.
@@ -166,8 +179,8 @@
   gap: 9px;
   height: 100%;
   margin-left: -14px;
-  margin-right: calc(-1 * (9px + var(--awaiting-w)));
-  padding: 0 calc(9px + var(--awaiting-w)) 0 14px;
+  margin-right: calc(-1 * (var(--awaiting-slot) + var(--sp-4)));
+  padding: 0 calc(var(--awaiting-slot) + var(--sp-4)) 0 14px;
   background: transparent;
   border: 0;
   color: inherit;
@@ -215,19 +228,17 @@
  * This tab is the only element of a background project that is drawn, so this is the only
  * place the answer can go.
  *
- * # The box is reserved on every tab, filled only when it means something
+ * # The box is rendered on every tab, sized only when it means something
  *
- * The same requirement as the tab strip's badge one level down, and the same reason: a marker
- * that took its space on appearing would widen its tab and slide every tab after it sideways,
- * and `.tabs` reflows *under the pointer* — a tab that moves while being aimed at is a tab
- * that gets clicked wrong. Here the pointer hazard is worse than in the tab strip, because the
- * strip *scrolls*: a tab widening mid-strip does not merely shift its neighbours, it can push
- * the tab the user is reaching for out of the visible box entirely.
- *
- * The price, since nothing measures it: every project tab is `9px + 13px` = 22px wider, so
- * roughly one fewer project tab is visible before the strip starts scrolling. The strip has a
- * wheel handler and scrolls the active tab into view, so that costs reach rather than
- * reachability — which is the trade the tab strip could not make and this one can.
+ * The same contract as the tab strip's badge one level down: the `span` never unmounts — the
+ * live region has to exist before its content arrives to be announced — but an empty badge
+ * costs zero width. The `[data-awaiting='false']` rule below zeroes the box and its slot
+ * together, and the badge's negative `margin-left` hands back the flex gap a 0px item would
+ * still take. The first design reserved the box permanently so a badge appearing could never
+ * move a tab under the pointer; `TabStrip.module.css` records at length why that trade was
+ * reversed — the reserve put a gap-plus-18px of nothing at the tail of every tab in its rest
+ * state, and it read as a layout bug, not as insurance. What survives: the box may never
+ * change size *while lit* — fixed width, `9+` cap, clip.
  *
  * # Not the project dot
  *
@@ -251,6 +262,10 @@
 .awaiting {
   flex: none;
   width: var(--awaiting-w);
+  /* Zero while lit; `-1 * --sp-4` while empty, cancelling the container gap the empty box
+     would otherwise keep. Derived from the slot rather than written as literals so the
+     collapse cannot zero the box and leave its gap. */
+  margin-left: calc(var(--awaiting-slot) - var(--awaiting-w) - var(--sp-4));
   /*
    * 18x16, matching `TabStrip.module.css`'s chip exactly — the same marker on the other tab
    * row, so a user who learns the shape in one strip reads it in the other. Both grew here:

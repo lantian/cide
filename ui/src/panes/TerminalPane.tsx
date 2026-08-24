@@ -10,26 +10,22 @@
  */
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
-import {
-  forgetSession,
-  getHost,
-  noteParsed,
-  openTerminal,
-  peekHost,
-  setHostBusy,
-} from '@/layout/paneHosts'
+import { forgetSession, getHost, openTerminal, peekHost } from '@/layout/paneHosts'
 import { setPathLinkEnv } from '@/terminal/pathLinks'
 import { copyTerminalSelection, pasteIntoTerminal } from '@/terminal/clipboard'
 import type { TerminalPaneKind } from '@/terminal/keys'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
 import { useContextMenu, type MenuEntry } from '@/menus'
+import { isRecoverableSessionError, spawnFailureBytes, spawnFailureText } from './exitMarker'
 import {
-  exitMarkerBytes,
-  isRecoverableSessionError,
-  markFor,
-  spawnFailureBytes,
-  spawnFailureText,
-} from './exitMarker'
+  clearWriteFailure,
+  ensureAttached,
+  measureGeometry,
+  onSinkExit,
+  reportWriteFailure,
+  sinkExit,
+  syncSize,
+} from './sessionSink'
 import { restartOffer, type RestartMode, type RestartOffer } from './restartRule'
 import { TerminalFindBar } from './TerminalFindBar'
 import { openTerminalFind } from '@/terminal/findStore'
@@ -39,8 +35,6 @@ import { acknowledge } from './awaiting'
 import {
   claudeSession,
   diag,
-  events,
-  paneSession,
   session as sessionApi,
   type Geometry,
   type Pane,
@@ -145,30 +139,12 @@ export interface TerminalPaneProps {
 const pending = new Map<string, Promise<string>>()
 
 /**
- * Fallback geometry for a pane that has not been laid out yet.
- *
- * `fitAddon.fit()` on a zero-sized element does not fail — it returns 2x1, and a child
- * spawned at 2x1 draws a ruined first frame and, for a fullscreen TUI, can wedge until
- * something forces a repaint. Observed directly: `TIOCGWINSZ` on a real `claude` child
- * reported `rows=1 cols=2`.
- *
- * So an implausible fit is treated as "no measurement yet": spawn at a conventional
- * terminal size and let the first real `ResizeObserver` callback correct it via SIGWINCH,
- * which every terminal program already handles.
- */
-const FALLBACK: Geometry = { cols: 80, rows: 24, cellWidth: 8, cellHeight: 17 }
-
-/**
  * The login shell to spawn.
  *
  * `$SHELL` is not readable from a webview, so this is the portable default rather than the
  * user's own choice; Settings → Terminal takes it over in M11.
  */
 const DEFAULT_SHELL = '/bin/bash'
-
-function plausible(cols: number, rows: number): boolean {
-  return cols >= 20 && rows >= 5
-}
 
 /**
  * What a pane of each kind runs. A diff pane has no process at all.
@@ -209,146 +185,13 @@ function specFor(
   }
 }
 
-/**
- * Push the pane's current pixel size down to the child as a cell geometry.
- *
- * Called from two places, and it needs both. `ResizeObserver` fires once immediately when
- * you `observe()` an element — which happens in `PaneSlot`'s layout effect, *before*
- * `TerminalPane`'s effect has created the terminal. That first callback is therefore
- * dropped, and if the pane is never resized again it is also the only one: every child
- * would sit at the fallback 80x24 forever, in a window that is plainly much larger.
- * So the spawn path calls this explicitly once the session exists.
- *
- * Returns a promise that settles once the child has actually been told, so a caller that
- * pushes a size of its own afterwards — the alt-screen repaint nudge in `start` — can order
- * itself behind this one. Two un-awaited `session_resize` calls in flight at once is how a
- * pane ends up parked at the nudge's transient `cols - 1`.
+/*
+ * `syncSize`, `measureGeometry`, the write-failure report, the `— exited —` marker and the
+ * whole attach path all live in `sessionSink.ts` now — the sink they serve belongs to the
+ * pane *host* rather than to this mount, which is what keeps a parked pane's buffer filling
+ * across a project switch. This component keeps only what genuinely belongs to a mount:
+ * spawn-or-adopt, restart wiring, menus, listeners on the host element, and the two bars.
  */
-function syncSize(paneId: string): Promise<void> {
-  const host = getHost(paneId)
-  const handle = host.terminal
-  if (!handle) return Promise.resolve()
-  try {
-    handle.fit.fit()
-  } catch {
-    return Promise.resolve()
-  }
-  // Never push a degenerate size at a live child. A pane that is momentarily unlaid-out
-  // fits to 2x1, and forwarding that would reflow the TUI into garbage for no reason.
-  if (!plausible(handle.term.cols, handle.term.rows)) return Promise.resolve()
-  if (!host.sessionId) return Promise.resolve()
-
-  const cell = handle.cellSize()
-  const geo = {
-    cols: handle.term.cols,
-    rows: handle.term.rows,
-    cellWidth: cell.width,
-    cellHeight: cell.height,
-  }
-  // A `ResizeObserver` fires per frame of a drag, and most of those frames are the same cell
-  // geometry — a pixel change under one cell is not a resize. `session_resize` is synchronous
-  // and reflows the whole scrollback under a lock (see `cmd/session.rs`), so re-sending an
-  // unchanged size put one full reflow per frame per pane in front of the user's keystrokes
-  // on the same thread. See `PaneHost.lastGeometry`.
-  const last = host.lastGeometry
-  if (
-    last &&
-    last.cols === geo.cols &&
-    last.rows === geo.rows &&
-    last.cellWidth === geo.cellWidth &&
-    last.cellHeight === geo.cellHeight
-  ) {
-    return Promise.resolve()
-  }
-  host.lastGeometry = geo
-
-  return sessionApi.resize(host.sessionId, geo).catch((e) => {
-    // Cleared so the next callback retries: a dropped resize leaves the child at a size the
-    // pane is not, and silently remembering the size we failed to send would make that
-    // permanent.
-    host.lastGeometry = undefined
-    console.error('[cide] terminal resize failed', e)
-  })
-}
-
-/** Panes that have already reported a failed write, so the log cannot become the outage. */
-const writeFailures = new Set<string>()
-
-/**
- * Say something when a keystroke does not reach the child.
- *
- * Goes to the Rust log as well as the console because the console is not reachable from a
- * shell on Wayland — see `cmd/diag.rs`, which is where that limitation is written down.
- */
-function reportWriteFailure(paneId: string, error: unknown): void {
-  if (writeFailures.has(paneId)) return
-  writeFailures.add(paneId)
-  const line = `pane ${paneId}: session write failed — keystrokes are being dropped: ${String(error)}`
-  console.error(`[cide] ${line}`)
-  void diag.log(line).catch(() => {})
-}
-
-/**
- * Write `— exited —` into the pane whose child has gone.
- *
- * M2's acceptance criterion is "kill the child: EOF arrives and the pane shows `— exited —`",
- * and that string existed only in a comment. `TerminalPane` declared an `onExit` prop and no
- * caller ever passed one, so a dead child produced no visible change anywhere: the cursor
- * sat there and the pane looked idle. The criterion is not decoration — it is the only
- * user-visible proof that `drop(pair.slave)` works, because without that drop the master
- * never sees EOF and this branch is never reached.
- *
- * Written into the terminal rather than rendered as React chrome: see `exitMarker.ts`, which
- * owns the wording and the framing so that a check script can run them without a DOM.
- *
- * `code` is the child's real status — 1 for a failure, 137 for the OOM reaper, 143 for the
- * SIGTERM this app sends on quit — and it is omitted on the one path that cannot know it.
- * Rust reports these honestly now; before this it published a flat -1 for every dead pane,
- * and the pane printed nothing but `— exited —` either way, so a session the machine killed
- * looked exactly like one that finished.
- *
- * Returns whether this call is the one that wrote it. Exit reaches a pane from two
- * directions — the `cide://session-state` event, and the one-shot check for a session that
- * was already dead before this pane attached — and the *marker* must be written once however
- * many arrive. The first one to arrive is the one whose code is shown; that is the event
- * whenever the pane was mounted at the time, which is every case but rehydration.
- *
- * The **offer** over the pane is deliberately not one-shot; see `noteExit`. A pane remounted by
- * a split learns of the exit again through the one-shot check, and it must come back showing
- * the way out even though the marker was written for the previous mount. Tying the control to
- * this return value is how it would have gone missing on exactly the panes that had been
- * around longest.
- */
-function markExited(paneId: string, code?: number): boolean {
-  const host = getHost(paneId)
-  if (host.exitMarked) return false
-  host.exitMarked = true
-  host.terminal?.term.write(exitMarkerBytes(code))
-  return true
-}
-
-/**
- * What the registry can still say about a session this pane was not there to hear die.
- *
- * Returns the argument for `markExited`, or `null` for "do not mark" — see `markFor`, which
- * owns that decision and is the part a check script can run.
- *
- * The `SessionExit` the command returns is handed straight to `markFor`, whose parameter is
- * `exitMarker.ts`'s own `ExitAnswer`. That assignment is the equivalence check between the two:
- * `exitMarker.ts` cannot import the generated bindings, because it is deliberately a pure
- * module that `check-exit-marker.mjs` compiles standalone, so if the Rust enum ever gains a
- * variant or renames a field, this line stops typechecking rather than silently falling through
- * `markFor`'s switch.
- *
- * A rejection is `null`: a question that could not be asked is not evidence the child is gone,
- * and marking a live pane `— exited —` is the worse of the two mistakes.
- */
-async function exitMark(session: string): Promise<{ code?: number } | null> {
-  return sessionApi.exit(session).then(markFor, (e) => {
-    console.error('[cide] could not ask about session exit', e)
-    return null
-  })
-}
 
 /**
  * Whether the registry still holds a *running* child for this session.
@@ -661,7 +504,7 @@ export function TerminalPane({
     // pane must not claim Ctrl+V, or the CLI's own image paste stops working. See
     // `terminal/keys.ts`.
     const handle = openTerminal(paneId, runKind)
-    const { term, fit } = handle
+    const { term } = handle
 
     /*
      * What a file path printed in this pane means, handed to the link provider `openTerminal`
@@ -734,40 +577,16 @@ export function TerminalPane({
     }
 
     /**
-     * The pane's size right now, as a cell geometry.
+     * This pane's child has gone: offer a way back.
      *
-     * A function rather than a value computed once at mount, because a restart happens
-     * whenever the user asks — minutes later, in a pane that has been dragged to a different
-     * size since. Spawning the replacement at the geometry the *first* child was born with
-     * would draw its first frame at the wrong width, which for a fullscreen TUI is a ruined
-     * screen until something forces a repaint.
+     * The *marker* is `sessionSink.ts`'s — it is written into the terminal, which outlives
+     * this mount, and an exit heard while the pane was parked writes it into the parked
+     * buffer so it is already on screen when the user returns. What belongs here is only
+     * the render state: the bar with the way back, which `onSinkExit` replays immediately
+     * when an exit was recorded before this mount, so a pane remounted by a split — or
+     * returning from the project the child died under — comes back offering it.
      */
-    const measure = (): Geometry => {
-      try {
-        fit.fit()
-      } catch {
-        /* the slot may not be laid out yet on the very first frame */
-      }
-      const measured = plausible(term.cols, term.rows)
-      const cell = measured
-        ? handle.cellSize()
-        : { width: FALLBACK.cellWidth, height: FALLBACK.cellHeight }
-      return measured
-        ? { cols: term.cols, rows: term.rows, cellWidth: cell.width, cellHeight: cell.height }
-        : FALLBACK
-    }
-
-    /**
-     * This pane's child has gone: write the marker, and offer a way back.
-     *
-     * Reached from both directions — the `cide://session-state` event, and the one-shot check
-     * for a child that was already dead when this pane attached — because a pane must offer the
-     * control however it learns. `markExited` stays one-shot (the marker is written once per
-     * host); the offer is not, so a pane remounted by a split still shows it.
-     */
-    const noteExit = (code?: number): void => {
-      markExited(paneId, code)
-      setHostBusy(paneId, false)
+    const offExit = onSinkExit(paneId, (code) => {
       if (disposed) return
       setExit(code === undefined ? {} : { code })
 
@@ -784,19 +603,24 @@ export function TerminalPane({
           if (!disposed) setResumable(yes)
         })
         .catch(() => {})
-    }
+    })
 
     /**
      * Attach this pane to a session, spawning one if it does not already hold one.
      *
-     * Everything from "which session" to "the screen is painted" lives here, as a function
-     * rather than as the body of the mount effect, because a restart is exactly this sequence
-     * run again against the same terminal. Doing it by unmounting and remounting the pane was
-     * the alternative and it is forbidden: `layout/paneHosts.ts` rule 2, and it would throw
-     * away the transcript the user is reading the exit code off.
+     * As a function rather than the body of the mount effect, because a restart is exactly
+     * this sequence run again against the same terminal. Doing it by unmounting and
+     * remounting the pane was the alternative and it is forbidden: `layout/paneHosts.ts`
+     * rule 2, and it would throw away the transcript the user is reading the exit code off.
+     *
+     * The attach itself — the sink, the snapshot, the hydration decision, the resize nudge
+     * — is `ensureAttached`'s, and it is idempotent per (pane, session): a pane remounting
+     * after a park finds its sink still attached and its buffer already current, so this
+     * resolves without touching the terminal. Only a pane whose host holds no link — fresh,
+     * released, evicted, restarted — actually attaches.
      */
     const start = async (spawnSpec: TerminalSpec): Promise<void> => {
-      const geo = measure()
+      const geo = measureGeometry(paneId)
       const id = await sessionFor(paneId, spawnSpec, geo)
       if (disposed) return
 
@@ -807,224 +631,27 @@ export function TerminalPane({
         boundCb.current?.(id)
       }
 
-      const host = getHost(paneId)
-
-      // The ack goes in `term.write`'s completion callback, not here. Reaching this line
-      // only means the bytes arrived; the callback fires once xterm has actually parsed
-      // them, which is the rate the session should be pacing itself against. Acking on
-      // arrival would report a speed this renderer cannot sustain and would turn credit
-      // control back into no control at all.
-      const deliver = (bytes: Uint8Array) => {
-        term.write(bytes, () => {
-          paneSession.ack(paneId, id, bytes.byteLength)
-          // The same moment, told to the render watchdog. The bytes are in xterm's buffer
-          // here; whether they ever reach the screen is a separate question, and the one
-          // `terminal/renderStall.ts` exists to ask — a paused `RenderService` keeps parsing
-          // and acking perfectly while painting nothing, so this callback is the only place
-          // the two claims can be told apart.
-          noteParsed(paneId)
-        })
-      }
-
-      // Live frames that arrive before the snapshot has been written.
-      //
-      // They can, and the ordering matters: the sink is registered on the Rust side the
-      // moment `session_attach` runs, so the channel can deliver its first frame while the
-      // command's own reply — the screen those frames continue from — is still in flight.
-      // Writing them in arrival order would paint the continuation and then paint the screen
-      // it continues from on top of it. Queued rather than dropped, because they are already
-      // charged against this sink's credit and only `deliver` pays that back.
-      let painted = false
-      const queued: Uint8Array[] = []
-
-      // Attaching *by pane*, not by window. Two panes mirroring one session in one window
-      // used to be one attachment on the Rust side, so opening a mirror detached the pane
-      // being mirrored — see `paneSession` in the IPC client.
-      //
-      // The screen comes back from `attach` itself, taken at the instant this sink was
-      // registered. It used to be a separate `session.scrollback` beforehand, and the gap
-      // between the two calls is a window in which the Rust mirror runs ahead of the sinks:
-      // bytes landing there were painted from the snapshot and then delivered again as live
-      // output. See `cide_pty::PtySession::attach_with_snapshot`.
-      const screen = await paneSession.attach(paneId, id, geo, (data) => {
-        const bytes = new Uint8Array(data)
-        if (painted) deliver(bytes)
-        else queued.push(bytes)
-      })
+      await ensureAttached(paneId, id)
       if (disposed) return
 
       /*
-       * `session_attach` resized the child before it registered this sink — unconditionally,
-       * to the `geo` measured at the top of this function, which is now several IPC round
-       * trips old. So the cache no longer describes what the child thinks its size is.
+       * The pane is attached and painting, so any offer over it is spent — unless the sink
+       * already knows this child is dead, which is a pane coming back from a park (or a
+       * rehydration) the child did not survive. Clearing there would blank the bar the
+       * `onSinkExit` replay above just drew, with nothing on the way to re-draw it.
        *
-       * Clearing it is not belt and braces. A `ResizeObserver` callback landing in any of
-       * the awaits above runs `syncSize`, which sends the pane's *true* size and records it
-       * here; the attach then quietly puts the child back to the stale one, and the recovery
-       * `syncSize` below measures the true size, finds it equal to what the cache says it
-       * already sent, and returns without sending anything. The child is then left drawing
-       * frames for a geometry the viewport does not have, with no path back until the pane's
-       * pixel size changes — which is exactly why maximising the pane "fixed" it.
-       *
-       * `releaseHost` (see `layout/paneHosts.ts`) already applies this rule for the same
-       * reason; the cache means "what this host last told the child, with no other writer
-       * since", and `session_attach` is another writer. The cost is one extra resize per
-       * attach, and the cache exists to collapse a *drag*, not an attach.
+       * Cleared *here* rather than when the restart button was pressed, and that is the
+       * difference between a control and a trapdoor: a restart whose spawn fails would
+       * otherwise take the only way out of the pane away with it, leaving the same dead end
+       * the button exists to fix — this time with a `— could not start —` line instead of
+       * `— exited —`. React bails out of a re-render when the state is already `null`, so
+       * this costs a live pane nothing.
        */
-      host.lastGeometry = undefined
-
-      /*
-       * Which of the terminal's two buffers the child is painting into.
-       *
-       * Asked *after* the attach, deliberately: the answer must never be older than the
-       * snapshot, or the check below decides against a screen it cannot see. It costs no
-       * extra latency — this is the same three sequential round trips as before, reordered.
-       */
-      const alt = await sessionApi.inAlternateScreen(id)
-      if (disposed) return
-
-      /*
-       * A hydrated terminal can still be on the wrong buffer, and that is its own bug.
-       *
-       * `host.hydrated` means "this terminal already holds the mirror's bytes". It says
-       * nothing about *which* buffer it holds them in, and the two are not the same claim:
-       * this pane's sink is detached in the effect cleanup and re-registered here, so a
-       * `\x1b[?1049h` or `\x1b[?1049l` the child wrote in between reached neither this
-       * terminal nor — because `hydrated` is still true — the snapshot this branch would
-       * otherwise discard. From then on xterm and the child paint different buffers, for
-       * good. Both directions were in one bug report: stuck on the alternate buffer the pane
-       * loses its scrollbar and xterm turns the wheel into cursor keys aimed at the child, so
-       * scrolling edits the agent's prompt; stuck on the normal one the child's
-       * cursor-addressed repaints land in rows that have scrolled away, so a question it drew
-       * is never seen until a resize forces a full repaint.
-       *
-       * Dropping `hydrated` rather than writing a bare `\x1b[?1049h` is what makes this safe:
-       * the switch on its own would show an empty alternate screen, whereas the snapshot
-       * carries the switch *and* the screen that belongs to it (see
-       * `cide_pty::reattach_bytes`). It cannot duplicate anything either — the snapshot opens
-       * with `\x1b[H\x1b[J`, so it replaces the visible screen — and `needsReset` is false on
-       * this path, so the terminal keeps the scrollback the user may have scrolled into.
-       */
-      if (host.hydrated && alt !== (term.buffer.active.type === 'alternate')) {
-        host.hydrated = false
-        // Said out loud, because this repair is otherwise invisible and the bug it repairs
-        // was reported as "rendering is broken". A line here means the two halves had
-        // genuinely drifted; silence over a long session is the honest evidence that the
-        // snapshot is now carrying the buffer it belongs to.
-        void diag
-          .log(
-            `pane ${paneId}: terminal was on the ${alt ? 'primary' : 'alternate'} buffer while session ${id} is on the ${alt ? 'alternate' : 'primary'} one; repainting from the mirror`,
-          )
-          .catch(() => {})
+      if (sinkExit(paneId) === null) {
+        setExit(null)
+        setResumable(false)
       }
 
-      // Exactly once per host. A split or a close remounts the surviving leaf — React swaps
-      // a leaf node for a split node at that position — and this terminal already holds
-      // those bytes; writing them again appends a second copy of the whole transcript. The
-      // host survives the remount, so the flag on it is what makes "once" mean once.
-      if (!host.hydrated) {
-        // A host that was released and is coming back still holds its pre-detach screen.
-        // The mirror replaces that rather than following it.
-        if (host.needsReset) {
-          term.reset()
-          host.needsReset = false
-        }
-        const prior = new Uint8Array(screen)
-        if (prior.byteLength > 0) term.write(prior)
-        host.hydrated = true
-      }
-
-      painted = true
-      for (const bytes of queued) deliver(bytes)
-      queued.length = 0
-
-      // The pane is attached and painting, so any offer over it is spent.
-      //
-      // Cleared *here* rather than when the button was pressed, and that is the difference
-      // between a control and a trapdoor: a restart whose spawn fails would otherwise take the
-      // only way out of the pane away with it, leaving the same dead end the button exists to
-      // fix — this time with a `— could not start —` line instead of `— exited —`. React bails
-      // out of a re-render when the state is already `null`, so this costs a live pane nothing.
-      setExit(null)
-      setResumable(false)
-
-      /*
-       * Now that the session exists, adopt the pane's real size — and only then nudge a
-       * fullscreen TUI into repainting.
-       *
-       * The order is the fix. The nudge used to run *before* `syncSize` and to use `geo` —
-       * the geometry measured before this function's three awaits — so it re-imposed a size
-       * the pane may no longer have, on top of the same stale value `session_attach` had
-       * already written. Nothing then told `syncSize` the child had been resized behind its
-       * back, so it found its cache in agreement with the pane's real size and sent nothing,
-       * and the child spent the rest of its life drawing frames for rows the viewport had
-       * not got. Maximising the pane changed the pixel size, which is the only thing that
-       * broke the agreement — which is why maximising "repaired the rendering".
-       *
-       * Still inside one `requestAnimationFrame`, and still the same three size pushes in the
-       * ordinary case, so this is not another resize bolted on to win a race — it is the same
-       * pushes, ordered so that the last one is the size the pane actually has. (A fourth is
-       * sent only when a resize genuinely raced the nudge; the guard at the end of the block
-       * says why, and it is silent when nothing raced.) Layout has certainly settled by here:
-       * several IPC round trips have happened since mount.
-       */
-      requestAnimationFrame(() => {
-        void (async () => {
-          await syncSize(paneId)
-          // The pane may have been unmounted while the resize was in flight — a re-dock, a
-          // split, a closed tab. Its child is somebody else's now.
-          if (disposed || !alt) return
-          // A fullscreen TUI's own model is authoritative for everything the screen mirror
-          // does not track — OSC 8 hyperlinks, OSC 52 clipboard traffic, DEC 2026 sync
-          // framing. Nudging the size by one column makes it repaint from that model.
-          //
-          // Read after the await, so it is the size `syncSize` has just settled on rather
-          // than the one measured before this function's three round trips. `geo` is the
-          // fallback for the case where `syncSize` had nothing plausible to measure and so
-          // recorded nothing.
-          const before = getHost(paneId).lastGeometry
-          const at = before ?? geo
-          await sessionApi.resize(id, { ...at, cols: Math.max(1, at.cols - 1) })
-          await sessionApi.resize(id, at)
-
-          /*
-           * The nudge is a writer like every other, so it owes the cache the same honesty
-           * `session_attach` does — and the two awaits above are a window a `ResizeObserver`
-           * callback can land in. When one does, `syncSize` sends the pane's *new* size and
-           * records it here, and then the line above quietly puts the child back to `at`. The
-           * cache then agrees with a size the child has not got, which is the exact state this
-           * whole path exists to make unreachable: nothing corrects it until the pane's pixel
-           * size changes again, and for the last frame of a divider drag that may be never.
-           *
-           * Identity and not equality, because `syncSize` stores a fresh object on every write:
-           * a different object means somebody else wrote, whatever the numbers say. Undefined
-           * on both sides means nothing was recorded before *or* after — `syncSize` measured
-           * nothing plausible, or its resize was rejected and it cleared itself — and in that
-           * case there is nothing to correct back to and the next callback retries anyway.
-           *
-           * Costs nothing in the common case (no callback, so no second resize) and one
-           * resize in the case that would otherwise have been permanently wrong.
-           */
-          if (getHost(paneId).lastGeometry !== before) {
-            getHost(paneId).lastGeometry = undefined
-            await syncSize(paneId)
-          }
-        })().catch(() => {
-          // A failed nudge costs a repaint, not correctness: the pane already holds the
-          // snapshot, and the next real resize nudges it again.
-        })
-      })
-
-      // A session that was already dead when this pane attached will never produce an event
-      // — the watcher fired before anyone was listening. One check, not a poll: this is the
-      // rehydration case (a host evicted and re-created after its child had gone), and it is
-      // answered once at attach time rather than every second for the life of the pane.
-      //
-      // The answer carries the code now. It used to be a bool, so this path printed a bare
-      // `— exited —` over a status the registry was still holding — the same pane, the same
-      // dead child, a different sentence depending only on whether it happened to be mounted.
-      const mark = await exitMark(id)
-      if (mark) noteExit(mark.code)
     }
 
     /**
@@ -1051,7 +678,7 @@ export function TerminalPane({
             .log(`pane ${paneId}: the session it was holding is gone; starting one instead`)
             .catch(() => {})
           forgetSession(paneId)
-          writeFailures.delete(paneId)
+          clearWriteFailure(paneId)
           await startOrRecover(spawnSpec, true)
           return
         }
@@ -1104,15 +731,14 @@ export function TerminalPane({
           void diag.log(`pane ${paneId}: kill before restart failed — ${String(error)}`).catch(() => {})
         })
         if (mode === 'resume') await settled(old)
-        // The sink goes with the session it was registered against. Without this the pane's
-        // attachment record would name a session it no longer shows, and the detach in this
-        // effect's cleanup — which reads the host's *current* id — would never take it off.
-        void paneSession.detach(paneId, old)
       }
       if (disposed) return
 
+      // `forgetSession` also closes the sink (`PaneHost.sinkClose`), whose closure captured
+      // `old` at attach — which is what guarantees the detach names the session the sink was
+      // registered against, however the ids have moved since.
       forgetSession(paneId)
-      writeFailures.delete(paneId)
+      clearWriteFailure(paneId)
 
       await startOrRecover(
         { ...spec, resume: mode === 'resume' ? old : undefined, fork: false },
@@ -1157,18 +783,13 @@ export function TerminalPane({
       await startOrRecover(spec, false)
     })()
 
-    const onData = term.onData((data) => {
-      const id = getHost(paneId).sessionId
-      if (!id) return
-      // No `acknowledge` here, and that is a fix rather than an omission — see `onKeyDown`
-      // below, which is where it moved to.
-      //
-      // `void` with no `catch` was swallowing the one failure a user cannot diagnose: a
-      // keystroke that never reached the child looks exactly like a keystroke the child
-      // ignored. Once per pane, because if writes are failing they are failing on every
-      // character and a per-keystroke log is its own outage.
-      sessionApi.write(id, data).catch((e) => reportWriteFailure(paneId, e))
-    })
+    /*
+     * Keystrokes out — `term.onData` → `session.write` — are registered by `ensureAttached`
+     * for the *link's* lifetime, not here for the mount's: a parked pane keeps its keyboard
+     * wiring with its sink, and the two turn over together on a restart. The `keydown`
+     * acknowledge below stays here deliberately — see its comment; `check:awaiting` pins
+     * both halves of that split.
+     */
 
     /*
      * The terminal's own context menu, bound natively.
@@ -1231,43 +852,17 @@ export function TerminalPane({
     }
     hostEl.addEventListener('keydown', onKeyDown)
 
-    // Exit arrives as an event now. It used to be a `session.hasExited` round trip per pane
-    // per second, forever, in every window — twelve panes was twelve IPC calls a second to
-    // learn nothing, and it still took up to a second to notice. `cide://session-state` is
-    // emitted once, by the watcher the session's own spawn started.
-    //
-    // Listening is asynchronous, so a pane disposed before the subscription lands has to
-    // unsubscribe the handle it never got to store.
-    let unlistenExit: (() => void) | null = null
-    void events
-      .onSessionState((session, state) => {
-        // Not `id` from the async block above: this handler outlives it, and a pane that
-        // respawned holds a different session by now.
-        if (session !== getHost(paneId).sessionId) return
-        /*
-         * Mid-turn, which is the one state that must keep this host out of the eviction sweep.
-         *
-         * `setHostBusy` had no caller anywhere: `PaneHost.busy` was documented as being set from
-         * this very event and nobody was setting it, so it was permanently `false` and the pane
-         * with a turn in flight was as evictable as an idle one. Rehydrating from the screen
-         * mirror is lossless for a settled pane and is not for one whose bytes are arriving now.
-         */
-        setHostBusy(paneId, state.state === 'busy')
-        if (state.state !== 'exited') return
-        // `state.code` is the whole reason the Rust side threads the status out of `wait()`.
-        // Dropping it here was the last link in the chain, and it made the change invisible.
-        noteExit(state.code)
-      })
-      .then((fn) => {
-        if (disposed) fn()
-        else unlistenExit = fn
-      })
-      .catch((e) => console.error('[cide] terminal pane cannot hear about exits', e))
+    // Exit, busy and the eviction-protecting `setHostBusy` all arrive through
+    // `sessionSink.ts`'s single module-level `cide://session-state` dispatch now, which is
+    // what keeps them true for a *parked* pane too: the per-mount subscription that used to
+    // live here died with the mount, so a pane parked mid-turn froze at whatever `busy` said
+    // last, and an exit during a project switch was only discovered by the next attach's
+    // one-shot check. The component's share is the `onSinkExit` subscription above — the
+    // render state, which is the only part of an exit that belongs to a mount.
 
     return () => {
       disposed = true
-      onData.dispose()
-      unlistenExit?.()
+      offExit()
       unregisterRestarter()
       restartRef.current = null
       // The provider stays on the host — it belongs to the terminal, not to this mount — so
@@ -1280,11 +875,14 @@ export function TerminalPane({
       // as many menus.
       hostEl.removeEventListener('contextmenu', onMenu)
       hostEl.removeEventListener('keydown', onKeyDown)
-      const id = getHost(paneId).sessionId
-      // Detach the sink, never the session: the child keeps running and this pane can be
-      // re-attached from another window without the process noticing. By pane, so closing
-      // one mirror leaves the other attached.
-      if (id) void paneSession.detach(paneId, id)
+      // Deliberately no `paneSession.detach` here — the sink belongs to the host now
+      // (`sessionSink.ts`), and an unmount is usually a *park*: a project switch, a split,
+      // a re-dock in transit. Detaching with the mount is exactly the frozen-pane bug this
+      // arrangement replaced — output printed while the pane's project was in the
+      // background reached only the Rust mirror, and the recovery snapshot was refused by
+      // the hydration gate on the way back. The moments the sink really must go are all
+      // host-side and all covered: `releaseHost`, `teardown` (close and eviction) and
+      // `forgetSession` each call `PaneHost.sinkClose`.
     }
     // Deliberately keyed on the pane id and its domain session alone. Including the
     // callbacks or the pane object would tear down and re-attach the terminal on every

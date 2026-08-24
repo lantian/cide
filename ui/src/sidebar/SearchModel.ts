@@ -12,7 +12,15 @@
  * The DTO is not imported for the same reason. [`Hit`] is the structural subset this module
  * needs; `SearchStore.ts` holds a compile-time assertion that the generated `SearchHit`
  * satisfies it, so a field renamed in Rust fails `tsc` rather than drawing `undefined`.
+ *
+ * The one import is a **relative** one to a sibling that is itself import-free and compiled in
+ * the same `tsc` invocation — the arrangement `chrome/panelRequests.ts` has with
+ * `./sidebarView`. An `@/…` specifier would not resolve under a bare `tsc` with no `paths`,
+ * which is the whole constraint. `rootOf` is imported rather than reimplemented because the
+ * containment rule it encodes (longest match, segment-aware) is one this project has already
+ * got wrong once; `rowPaths.ts`'s header is the account of that.
  */
+import { rootOf } from './rowPaths'
 
 /** The fields of the generated `SearchHit` this module uses. */
 export interface Hit {
@@ -263,15 +271,61 @@ export function panelState(input: {
   pattern: string
   running: boolean
   total: number
-  error: string | null
+  error: ProblemLike | null
 }): PanelState {
   if (input.pattern === '') return 'empty'
-  // The error outranks `running`: a pattern that did not compile started no walk, and a
-  // panel that said "searching…" over an unparsable regex would wait for something that is
-  // never going to happen.
-  if (input.error !== null && input.error !== '') return 'error'
+  // The error outranks `running`: an input that did not parse started no walk, and a panel
+  // that said "searching…" over an unparsable regex would wait for something that is never
+  // going to happen.
+  if (input.error !== null) return 'error'
   if (input.total > 0) return 'results'
   return input.running ? 'searching' : 'noResults'
+}
+
+/** The structural form of the generated `SearchProblem`; see the note on [`Hit`]. */
+export interface ProblemLike {
+  kind: string
+  detail: string
+}
+
+/** Which of the three boxes a problem is about, or `null` when it is about none of them. */
+export type ProblemField = 'pattern' | 'scope' | 'include' | null
+
+/**
+ * The heading the notice draws above a problem's sentence.
+ *
+ * Here rather than on the wire: the kind is a fact about the search and the words are the
+ * panel's copy, and a DTO carrying a heading would be a Rust crate deciding what a 252px box
+ * says. The `never` is the point of the function — a fourth variant added in Rust becomes a
+ * compile error here instead of a notice with a blank label over a sentence, which is what a
+ * default arm would have produced.
+ */
+export function problemLabel(kind: string): string {
+  switch (kind) {
+    case 'pattern':
+      return 'Bad pattern'
+    case 'scope':
+      return 'No such folder'
+    case 'include':
+      return 'Bad file pattern'
+    default:
+      // Not `never`-checked against a union, because [`ProblemLike`] is structural — the
+      // exhaustiveness that matters is asserted in `SearchStore.ts`, where the generated
+      // `SearchProblem` is narrowed. This is the runtime floor under a frame from a build
+      // that knows a kind this one does not.
+      return 'Search failed'
+  }
+}
+
+/**
+ * Which box to outline for a problem — the one the user can act on.
+ *
+ * Separate from [`problemLabel`] because the notice and the outline answer different
+ * questions: the notice always says something, and an unrecognised kind must not put an
+ * `aria-invalid` on an arbitrary input.
+ */
+export function problemField(kind: string): ProblemField {
+  return kind === 'pattern' || kind === 'scope' || kind === 'include' ? kind : null
 }
 
 /**
@@ -298,16 +352,25 @@ export function summarize(
 /**
  * Whether two queries are the same search.
  *
- * The toggles are part of it. `spawn` with case-sensitivity off and on are two different
- * searches over one pattern, and a frame compared on the pattern alone would be painted
- * under the wrong toggle — which looks exactly like a search that ignored the toggle.
+ * **Every field of `SearchQuery`, not just the pattern.** `spawn` with case-sensitivity off
+ * and on are two different searches over one pattern, and a frame compared on the pattern
+ * alone would be painted under the wrong toggle — which looks exactly like a search that
+ * ignored the toggle. The scope and the glob are the same argument with a sharper edge: a
+ * frame from the unscoped walk painted under a scoped box is one folder's results drawn under
+ * another folder's heading, and there is nothing on screen to tell the user which it is.
+ *
+ * A field added in Rust and forgotten here is silent — the code still compiles, because this
+ * takes a structural subset. `check-search.mjs` drives one field at a time against
+ * `EMPTY_QUERY` to make it loud.
  */
 export function sameQuery(a: QueryLike, b: QueryLike): boolean {
   return (
     a.pattern === b.pattern &&
     a.mode === b.mode &&
     a.caseSensitive === b.caseSensitive &&
-    a.wholeWord === b.wholeWord
+    a.wholeWord === b.wholeWord &&
+    a.scope === b.scope &&
+    a.include === b.include
   )
 }
 
@@ -317,12 +380,73 @@ export interface QueryLike {
   mode: 'literal' | 'regex'
   caseSensitive: boolean
   wholeWord: boolean
+  /** The folder to search, or `''` for the whole project. See [`scopeLabel`]. */
+  scope: string
+  /** Comma-separated file globs, or `''` for every file. */
+  include: string
 }
 
-/** What the panel opens with. */
+/** What the panel opens with. Both narrowing boxes empty, which is today's whole-project search. */
 export const EMPTY_QUERY: QueryLike = {
   pattern: '',
   mode: 'literal',
   caseSensitive: false,
   wholeWord: false,
+  scope: '',
+  include: '',
+}
+
+/** A project root, as much of one as [`scopeLabel`] needs. */
+export interface RootLike {
+  path: string
+  label: string
+}
+
+/**
+ * An absolute directory, as the string the scope box shows and the backend resolves.
+ *
+ * The spelling is deliberately [`Hit.rel`]'s: relative to the root that holds it, prefixed
+ * with that root's label when the project has more than one. So the box reads
+ * `cide-git/src` while the headings under it read `cide-git/src/log.rs`, and the two name one
+ * place the same way. The absolute path would be truthful and unreadable — a 252px box shows
+ * about thirty characters and `/home/…/work/cide/crates/cide-git` is not one of them.
+ *
+ * `cide_search::content::resolve_scope` is the other end of this and the only reader. The two
+ * can drift, and the failure when they do is visible rather than silent: the panel reports
+ * *No such folder* naming the string it sent, which is a bug report rather than a wrong answer.
+ *
+ * A path under no root answers with the **absolute path**, not `''`. Emptying the box would
+ * silently widen the search back to the whole project, and a gesture that appears to do
+ * nothing is worse than one that puts an unwieldy string in a box — the backend will say
+ * *outside this project* about it, which is the true answer.
+ */
+export function scopeLabel(path: string, roots: readonly RootLike[]): string {
+  const root = rootOf(
+    path,
+    roots.map((r) => r.path),
+  )
+  if (root === null) return path
+  const owner = roots.find((r) => r.path === root)
+  const label = owner === undefined ? '' : owner.label
+  // The root itself is named by its label in either case. `''` would be the arithmetically
+  // correct relative path and would read as an empty box — see above.
+  if (root === path) return label
+  const rel = path.slice(root.length + 1)
+  return roots.length > 1 ? `${label}/${rel}` : rel
+}
+
+/**
+ * The directory a tree row stands for: itself when it is one, its parent when it is a file.
+ *
+ * The frontend half of the rule `resolve_scope` also applies, and it is here so that the box
+ * reads right the *instant* the gesture lands rather than after a round trip. Rust stays the
+ * authority — the caller may not know a row's kind, because the tree windows its rows and the
+ * selected one can be scrolled out of the cache — so this narrows when it can and hands the
+ * path over untouched when it cannot.
+ */
+export function scopeDirOf(path: string, isDir: boolean): string {
+  if (isDir) return path
+  const cut = path.lastIndexOf('/')
+  // No separator, or the root itself: there is no parent to name, so the path stands.
+  return cut <= 0 ? path : path.slice(0, cut)
 }

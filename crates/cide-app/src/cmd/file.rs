@@ -33,10 +33,26 @@ use crate::workspace_state::WorkspaceState;
 #[tauri::command(rename_all = "camelCase")]
 pub fn tab_open_file(
     state: State<'_, WorkspaceState>,
+    app: tauri::AppHandle,
     project: ProjectId,
     path: String,
 ) -> Result<TabId> {
-    open_file_tab(&state, project, PathBuf::from(path))
+    let tab = open_file_tab(&state, project, PathBuf::from(path))?;
+    raise_if_detached(&app, &state, tab);
+    Ok(tab)
+}
+
+/// Bring a torn-out tab's window forward, when the tab has one.
+///
+/// The other half of `activate_tab`'s silent success for a detached tab: the shell is
+/// deliberately not drawing it, so opening a file that is already open in a torn-out window
+/// would otherwise be the one open gesture with nothing visible to show for it. The domain
+/// cannot do this — raising is a desktop act — so every command that lands in an existing
+/// tab passes through here after the mutation commits.
+fn raise_if_detached(app: &tauri::AppHandle, state: &WorkspaceState, tab: TabId) {
+    if let Some(label) = workspace::detached_tab_window(&state.snapshot(), tab) {
+        crate::windows::raise(app, &label);
+    }
 }
 
 /// The body of [`tab_open_file`], as a function over the state.
@@ -183,9 +199,13 @@ pub fn tab_reopen_file(
         // opens one when there is not. `reinsert_tab` performs no such dedupe, and a second
         // opener with its own idea of "already open" is how two tabs over one file come back —
         // and with them the save that silently discards the other buffer.
-        ReopenFile::Open => Ok(ReopenedFile::Opened {
-            tab: open_file_tab(&state, project, path)?,
-        }),
+        ReopenFile::Open => {
+            let tab = open_file_tab(&state, project, path)?;
+            // A Back into a file living in a torn-out window has to show that window, for
+            // the reason `tab_open_file` gives: the shell will not draw the tab.
+            raise_if_detached(&app, &state, tab);
+            Ok(ReopenedFile::Opened { tab })
+        }
     }
 }
 
@@ -499,6 +519,7 @@ fn openable(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn terminal_open_path(
     state: State<'_, WorkspaceState>,
+    app: tauri::AppHandle,
     project: ProjectId,
     path: PathBuf,
     approved_target: Option<PathBuf>,
@@ -535,7 +556,12 @@ pub async fn terminal_open_path(
         );
     }
 
-    open_file_tab(&state, project, path).map_err(|e| TerminalOpenError::Failed(e.to_string()))
+    let tab = open_file_tab(&state, project, path)
+        .map_err(|e| TerminalOpenError::Failed(e.to_string()))?;
+    // A ctrl+click on a path whose file lives in a torn-out window has to show that window —
+    // the shell will not draw the tab, so without this the click reads as wired to nothing.
+    raise_if_detached(&app, &state, tab);
+    Ok(tab)
 }
 
 /// The tab a git diff opens as, given its fetch key.

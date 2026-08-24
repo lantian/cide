@@ -42,7 +42,7 @@ use cide_ipc::{
     Pane, PaneId, PaneKind, Project, ProjectId, SessionId, SessionState, TabId, WindowLabel,
     WindowRole, Workspace,
 };
-use cide_pty::{Exit, PtySession};
+use cide_pty::{Exit, JobEvent, PtySession};
 use tauri::{AppHandle, Manager};
 
 use crate::state::SessionRegistry;
@@ -1118,6 +1118,60 @@ fn watch_exit_with(session: &Arc<PtySession>, report: impl FnOnce(Exit) + Send +
     session.on_exit(report);
 }
 
+/// How long a shell pane's foreground job must run before the pane will say anything about it.
+///
+/// The notification policy, and the reason it is a *policy* rather than a constant in
+/// `cide-pty`: the crate below implements "announce jobs at least this long" and has no
+/// opinion about what long means. Ten seconds is the answer to the question this feature
+/// actually asks — *did I walk away from this?* A `git status` never reaches it, a build
+/// always does, and the cost of the threshold being slightly wrong is one notification too
+/// many or too few rather than a pane that behaves oddly.
+///
+/// It gates the announcement of the *start*, not the end. See `cide_pty::jobs`, which carries
+/// the argument: nothing downstream can retract a `Busy`, because `awaitingRule.ts` keeps
+/// `ranATurn` sticky on purpose.
+pub const JOB_NOTIFY_AFTER: Duration = Duration::from_secs(10);
+
+/// Report a shell pane's foreground jobs as session state, so a finished `make` lights the
+/// same surfaces a finished Claude turn does.
+///
+/// Beside [`watch_for_exit`] and for the same reasons: a callback on a thread that is awake
+/// anyway rather than a watcher thread of this crate's own, registered at spawn so nothing
+/// can be missed between the child starting and somebody listening.
+///
+/// Only for panes spawned with `SpawnSpec::watch_jobs`, which today means every pane that is
+/// not Claude — a Claude session's state comes from its hooks, which are exact, know about
+/// permission prompts, and would be contradicted by every tool call the CLI forks.
+pub fn watch_jobs(app: AppHandle, id: SessionId, session: &Arc<PtySession>) {
+    session.on_job(move |event| {
+        // Worth a line at `debug`: this is the only evidence that the foreground watcher is
+        // working on a machine where it silently is not — a shell without job control never
+        // changes its process group, and the correct behaviour there is indistinguishable
+        // from the feature being broken.
+        tracing::debug!(session = %id, ?event, "shell job");
+        crate::emit::session_state(&app, &id.to_string(), job_state(event));
+    });
+}
+
+/// What a job transition means to the frontend's awaiting rule.
+///
+/// A named function for `exit_state`'s reason — this mapping *is* the feature, and a test
+/// that rebuilt it inline would assert nothing about what ships.
+///
+/// `AwaitingInput` rather than `Idle` for a finished job, and the distinction is the whole
+/// point: `Idle` raises the marker only for a session the frontend saw go `Busy`, whereas
+/// `AwaitingInput` says "this pane wants you" outright. Both are true here — the `Busy` was
+/// emitted by this same watcher — but the direct answer does not depend on the frontend
+/// having been listening at the time, which a pane in a background project switched away
+/// from need not have been. It is the same choice `cide_claude::next_state` makes for
+/// `Stop`, and `awaitingRule.ts` already treats the state as unconditional.
+fn job_state(event: JobEvent) -> SessionState {
+    match event {
+        JobEvent::Started => SessionState::Busy,
+        JobEvent::Finished { .. } => SessionState::AwaitingInput,
+    }
+}
+
 /// What the frontend is told about a session that has ended.
 ///
 /// A named function rather than an inline literal at the emit below, because this value *is*
@@ -2133,6 +2187,30 @@ mod tests {
             "an unreadable status was published as something a reader could believe"
         );
         assert_ne!(exit_state(&unknown), SessionState::Exited { code: 0 });
+    }
+
+    #[test]
+    fn a_finished_shell_job_asks_for_the_user_rather_than_merely_going_idle() {
+        // The distinction the whole notification rests on. `Idle` raises the awaiting marker
+        // only for a session the *frontend* saw go `Busy`, so a pane whose project was in the
+        // background — which is the entire situation this feature exists for — could miss the
+        // arming event and then treat the end of a twenty-minute build as nothing at all.
+        // `AwaitingInput` is unconditional in `awaitingRule.ts`, and that is why it is here.
+        assert_eq!(
+            job_state(JobEvent::Finished {
+                ran_for: Duration::from_secs(42)
+            }),
+            SessionState::AwaitingInput,
+        );
+        assert_ne!(
+            job_state(JobEvent::Finished {
+                ran_for: Duration::from_secs(42)
+            }),
+            SessionState::Idle,
+        );
+        // And the arming half: `Busy` is what both starts the turn the rule is looking for
+        // and keeps the pane's host out of the eviction sweep while the job runs.
+        assert_eq!(job_state(JobEvent::Started), SessionState::Busy);
     }
 
     #[test]

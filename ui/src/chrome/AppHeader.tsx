@@ -298,8 +298,12 @@ const LIGHTS = {
  * places rather than two copies: the three buttons and their audit hooks are the same markup
  * either way, and the layout audit's `trafficLight` measurements would otherwise have two
  * sources to drift between.
+ *
+ * Exported for `windows/DetachedTabHeader.tsx`, which is the same argument one window over:
+ * a torn-out tab's header needs the same three lights, and a second copy of this markup is
+ * how one of the two stops matching the `data-window-button` contract.
  */
-function WindowLights() {
+export function WindowLights() {
   return (
     <div className={`${styles.lights} ${CONTROLS.side === 'right' ? styles.lightsRight : ''}`}>
       {CONTROLS.order.map((id) => (
@@ -353,9 +357,9 @@ interface ProjectTabItemProps {
  * how many and decrements as each pane is dealt with, which is the only progress signal
  * available while those panes are not rendered at all.
  *
- * Its box is reserved on every tab whether or not it is filled — see the stylesheet. A marker
- * that took its space on appearing would widen its tab and slide every tab after it sideways,
- * under a pointer that may be on its way to one of them.
+ * Its box is rendered on every tab but sized only when filled — the stylesheet collapses the
+ * empty box via `data-awaiting` on the row, and `TabStrip.module.css` records why the
+ * permanent reserve this replaced was the wrong trade.
  */
 function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItemProps) {
   // `tabs`/`detached` are optional on `ProjectTab` so a four-field measurement fixture still

@@ -172,21 +172,33 @@ export function planReveal(boot: BootLike, project: string, pane: string): Revea
 
   const tab = open.tabs.find((t) => Object.hasOwn(t.tree.panes, pane))
   if (tab !== undefined) {
-    // A tab window is written out even though nothing creates one yet (`window_close` refuses
-    // to re-dock a detached tab, because `cide-core` has no `redock_tab`). Folding it into the
-    // `shell` case would answer `here: false` for the window the pane is actually in, and the
-    // reveal would ask a compositor to raise the window it was already looking at.
+    /*
+     * A tab torn out into a window of its own stays in `project.tabs`, so this branch finds
+     * it — and the shell must then answer `here: false` even though it shows the project:
+     * the shell deliberately does not draw a torn-out tab (`windows/windowTabs.ts`), so
+     * without this the raise is skipped, `tab_activate` is answered with success-and-no-
+     * movement, and the reveal claims the user is looking at a pane nothing on their screen
+     * shows. The tab window itself answers from its role, as before.
+     */
+    const torn = Object.values(boot.workspace.windows).some(
+      (role) => role.kind === 'detachedTab' && role.tab === tab.id,
+    )
     const shows =
-      showsProject(boot.role, project) ||
+      (!torn && showsProject(boot.role, project)) ||
       (boot.role.kind === 'detachedTab' && boot.role.tab === tab.id)
     return {
       here: shows,
       tab: tab.id,
-      activateProject: needsProjectActivated(boot, project),
-      activateTab: open.activeTab !== tab.id,
+      // Neither shell mutation applies to a torn-out tab: its window shows it whatever the
+      // shell has in front, so switching the shell's project or its active tab would move a
+      // window nobody is being sent to — the detached-pane branch below says the same.
+      activateProject: !torn && needsProjectActivated(boot, project),
+      activateTab: !torn && open.activeTab !== tab.id,
       // Cleared rather than moved: maximizing the *target* would be a bigger rearrangement
       // than the gesture asked for, and it would leave the user's own maximize undone with
       // no gesture that restores it. `maximized === pane` is already the answer they want.
+      // These two act on the tab's own tree, so they stand for a torn-out tab too — its
+      // window renders the same tree.
       clearMaximize: tab.tree.maximized !== null && tab.tree.maximized !== pane,
       focusPane: tab.tree.focused !== pane,
       blocked: null,

@@ -70,7 +70,7 @@ pub use fs::{
 pub use search::{PickerFrame, PickerItem, PickerRow};
 // M11: the content search's own wire types. Same module, different job — see the section
 // comment in `search.rs` for why they are not the picker's.
-pub use search::{SearchFrame, SearchHit, SearchMode, SearchQuery};
+pub use search::{SearchFrame, SearchHit, SearchMode, SearchProblem, SearchQuery};
 
 // --- M12: language support ---
 //

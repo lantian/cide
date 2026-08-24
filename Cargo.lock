@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "cide-agents"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-claude",
  "cide-core",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "cide-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-agents",
  "cide-claude",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "cide-claude"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-core",
  "cide-ide-mcp",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "cide-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "cide-ipc",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "cide-deps"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-core",
  "serde",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "cide-ext"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-core",
  "cide-ipc",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "cide-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-ipc",
  "cide-search",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "cide-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "cide-core",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "cide-headless"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-agents",
  "cide-core",
@@ -750,14 +750,14 @@ dependencies = [
 
 [[package]]
 name = "cide-hook"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cide-ide-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-ipc",
  "futures-util",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "cide-ipc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "indexmap 2.14.0",
  "serde",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "cide-lang"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-ipc",
  "ignore",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "cide-lsp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-core",
  "cide-ipc",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "cide-pty"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-ipc",
  "crossbeam-channel",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "cide-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-fs",
  "cide-ipc",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "cide-tasks"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cide-core",
  "cide-ipc",
@@ -6341,7 +6341,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",

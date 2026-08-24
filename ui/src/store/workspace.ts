@@ -555,6 +555,13 @@ interface WorkspaceStore {
    */
   detachPane: (project: ProjectId, tab: TabId, pane: PaneId) => Promise<void>
   redockPane: (label: string) => Promise<void>
+  /**
+   * Tear a whole tab out into its own window — the road a file takes, since a lone editor
+   * pane cannot leave the tab its buffer is registered under. Every host in the tab is
+   * released, for `detachPane`'s reason, one pane at a time.
+   */
+  detachTab: (project: ProjectId, tab: TabId) => Promise<void>
+  redockTab: (label: string) => Promise<void>
   setWindowMode: (mode: WindowMode) => Promise<void>
   /** Replace the mirror. Older revisions are ignored — snapshots can race. */
   applySnapshot: (workspace: Workspace) => void
@@ -918,6 +925,32 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   },
   redockPane: async (label) => {
     await windowApi.redockPane(label)
+    await get().hydrate()
+  },
+  detachTab: async (project, tab) => {
+    // Read before the call: the ids do not change — the tab stays in `project.tabs` — but
+    // reading them now means the release below cannot miss a pane over a mirror that
+    // happens to be mid-refresh.
+    const tree = get().boot?.workspace.projects[project]?.tabs.find((t) => t.id === tab)?.tree
+    const panes = tree ? Object.keys(tree.panes) : []
+    // The size the new window should open at is the size the tab's content already has.
+    // `TabContent` stamps each panel with its tab id, so the panel *is* the measurement —
+    // unlike a pane there is no host to ask, and an editor pane has no host at all.
+    const el = document.querySelector(`[data-tab-id="${tab}"]`)
+    const rect =
+      el instanceof HTMLElement && el.clientWidth > 0 && el.clientHeight > 0
+        ? { width: el.clientWidth, height: el.clientHeight }
+        : undefined
+    await windowApi.detachTab(project, tab, rect)
+    await get().hydrate()
+    await nextFrame()
+    // Released rather than destroyed, per pane, exactly as `detachPane` releases its one:
+    // any terminal split into this tab keeps its child running and the new window attaches
+    // to the same session. Editor panes have no host and `releaseHost` ignores them.
+    for (const pane of panes) releaseHost(pane)
+  },
+  redockTab: async (label) => {
+    await windowApi.redockTab(label)
     await get().hydrate()
   },
   setWindowMode: async (mode) => {

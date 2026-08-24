@@ -94,8 +94,17 @@ export function fileTreeClick({ gesture, isDir, onTwisty }: FileTreeClick): RowA
 
 export interface GitTreeClick {
   readonly gesture: Gesture
-  /** A repository or changelist row. File rows are the leaves. */
+  /** A repository, changelist or directory row. File rows are the leaves. */
   readonly expandable: boolean
+  /**
+   * A *directory* row inside a group — expandable, but not a header.
+   *
+   * The distinction decides the fold gesture: a directory folds the way the file tree's
+   * folders do, a header folds on a single click. See the function comment.
+   */
+  readonly isDir: boolean
+  /** The pointer was on the ▸/▾ twisty rather than on the row's body. */
+  readonly onTwisty: boolean
   /**
    * A git diff tab is open in this project **right now**.
    *
@@ -119,12 +128,35 @@ export interface GitTreeClick {
  * or working in the tree, in which case a click that throws a diff tab in front of you is an
  * interruption.
  *
- * Group rows keep the behaviour they had: a single click folds them, because they hold no
- * diff and there is nothing else for a click on one to mean.
+ * A **directory** folds the way the file tree's folders do, and by the same report:
+ *
+ * > *"to expand folder we should use double click instead of one click (like in file tree)"*
+ *
+ * A single click selects it — since `rowSelection.ts` a directory row is something worth
+ * pointing at: it is a drag handle for everything under it and a context-menu target — and the
+ * fold is a double-click, or a single click on the twisty, which is exempt for the file tree's
+ * reason: requiring a double-click on the one control whose only meaning is "open this" would
+ * be a worse tree than the one being fixed. The twisty acts on the first click only, because a
+ * double-click on it is one gesture and toggling on both halves would fold twice.
+ *
+ * **Group and repo rows** keep the behaviour they had: a single click folds them. They are
+ * headers, not folders — the report says "folder", the file tree's precedent is about
+ * directories, and a changelist header that needed a double-click to fold would cost the one
+ * gesture everyone already has in their hands for it.
  */
-export function gitTreeClick({ gesture, expandable, diffOpen }: GitTreeClick): RowAction {
+export function gitTreeClick({
+  gesture,
+  expandable,
+  isDir,
+  onTwisty,
+  diffOpen,
+}: GitTreeClick): RowAction {
   if (expandable) {
-    // The first click already folded it; folding again on the second half of the same
+    // The twisty, before the dir/header split: for a header it agrees with the row body
+    // anyway, and for a directory it is the single-click fold.
+    if (onTwisty) return gesture === 'single' ? SELECT_TOGGLE : NOTHING
+    if (isDir) return gesture === 'single' ? SELECT : SELECT_TOGGLE
+    // A header's first click already folded it; folding again on the second half of the same
     // gesture would put it straight back.
     return gesture === 'single' ? SELECT_TOGGLE : NOTHING
   }

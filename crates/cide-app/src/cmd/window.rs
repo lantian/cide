@@ -87,6 +87,79 @@ pub fn window_detach_pane(
     Ok(label)
 }
 
+/// Tear a whole tab out of the shell into a window of its own.
+///
+/// This is how a *file* leaves the shell, and the reason it is the tab and not the pane:
+/// an editor's buffer is registered per tab (`ui/src/editor/openBuffers.ts`), so a detached
+/// editor pane would need a second buffer over the same file — which is why the detached-pane
+/// window refuses to render one. The tab keeps its id, so the one buffer moves with it, and
+/// a split made inside the new window is an ordinary split of the same tree.
+///
+/// Unlike a pane detach the tab stays in `project.tabs` — the domain function says why — so
+/// the rollback on a failed window build is symmetric: `redock_tab` merely drops the role.
+///
+/// Asked about a tab already in a window of its own, the domain answers the existing label,
+/// and this raises that window rather than building a second one over the same tab.
+#[tauri::command(rename_all = "camelCase")]
+pub fn window_detach_tab(
+    state: State<'_, WorkspaceState>,
+    app: AppHandle,
+    project: ProjectId,
+    tab: TabId,
+    rect: Option<PaneRect>,
+) -> Result<WindowLabel, CoreError> {
+    let (label, title) = state.update(|ws| {
+        // The same sentence the shell's own title bar would use for this tab — project,
+        // then subject — because the new window has no tab strip to say what it is showing.
+        let title = named(
+            &workspace::project(ws, project)?.name.clone(),
+            Some(subject(workspace::tab(ws, project, tab)?)),
+        );
+        Ok((workspace::detach_tab(ws, project, tab)?, title))
+    })?;
+
+    if app.get_webview_window(label.as_str()).is_some() {
+        // The tab was already out; the honest answer to a second detach is its window.
+        windows::raise(&app, &label);
+        return Ok(label);
+    }
+
+    let size = rect.map_or((windows::DETACHED_WIDTH, windows::DETACHED_HEIGHT), |r| {
+        (r.width, r.height)
+    });
+    if let Err(error) = windows::create(&app, &label, &title, Some(size)) {
+        // A detached tab with no window is worse than a stranded pane: the shell is now
+        // deliberately not drawing it, so nothing anywhere shows the file. Put the role back
+        // rather than leave the workspace describing a window that does not exist.
+        if let Err(rollback) = state.update(|ws| workspace::redock_tab(ws, &label)) {
+            tracing::error!(%label, %rollback, "could not re-dock a tab whose window failed to open");
+        }
+        return Err(CoreError::Io(format!(
+            "could not open window {label}: {error}"
+        )));
+    }
+    // The tab took its sessions' `Awaiting:` badges with it — same arithmetic as a pane
+    // detach, recomputed for every window rather than patched apart.
+    retitle(&app, &state.snapshot());
+    Ok(label)
+}
+
+/// Put a detached tab back in its shell's strip and close the window it was living in.
+#[tauri::command(rename_all = "camelCase")]
+pub fn window_redock_tab(
+    state: State<'_, WorkspaceState>,
+    app: AppHandle,
+    label: WindowLabel,
+) -> Result<Mutated, CoreError> {
+    // Domain first, exactly as `window_redock_pane`: a refusal must leave the window
+    // standing, because it is the only thing on the desktop showing this tab.
+    let closing = state.update(|ws| workspace::redock_tab(ws, &label))?;
+    windows::destroy(&app, &closing);
+    // The tab is back in its shell, which inherits whatever badges its sessions carried.
+    retitle(&app, &state.snapshot());
+    Ok(Mutated { rev: state.rev() })
+}
+
 /// Put a detached pane back in its tab and close the window it was living in.
 #[tauri::command(rename_all = "camelCase")]
 pub fn window_redock_pane(
@@ -194,13 +267,15 @@ pub fn window_close(
             retitle(&app, &state.snapshot());
         }
 
+        // The same rule as a pane, one level up: re-dock, never discard. The tab never left
+        // `project.tabs`, so "re-dock" is only dropping the role — but skipping it would
+        // leave the shell deliberately not drawing a tab that no window shows, which for a
+        // file tab is an open buffer nothing renders. No `force` consulted for the same
+        // reason as a pane: a re-dock discards nothing.
         WindowRole::DetachedTab { .. } => {
-            // Nothing creates one of these yet, and `cide-core` has no `redock_tab` to undo
-            // it with. Refusing is the honest answer: destroying the window would take the
-            // tab's panes off screen with no gesture that brings them back.
-            return Err(CoreError::Invariant(format!(
-                "window {label} shows a detached tab, which cannot yet be re-docked"
-            )));
+            let closing = state.update(|ws| workspace::redock_tab(ws, &label))?;
+            windows::destroy(&app, &closing);
+            retitle(&app, &state.snapshot());
         }
 
         WindowRole::Shell { projects, .. } => match ws.settings.window_mode {
@@ -464,10 +539,10 @@ fn title_for(ws: &Workspace, role: &WindowRole) -> String {
             .and_then(|p| p.detached.get(pane))
             .map(|p| p.title.clone())
             .unwrap_or_else(|| "cide".to_string()),
-        // Nothing creates one of these yet (see `window_close`). It gets the same sentence the
-        // shell does rather than the bare project name it used to get: a `Tab` carries no title
-        // field, but `TabKind::title` is what the strip labels it with, and a torn-out tab has
-        // no strip at all — its own titlebar is the only thing left that can say what it is.
+        // The same sentence the shell gets rather than the bare project name it used to get:
+        // a `Tab` carries no title field, but `TabKind::title` is what the strip labels it
+        // with, and a torn-out tab has no strip at all — its own titlebar is the only thing
+        // left that can say what it is.
         WindowRole::DetachedTab { project, tab } => match workspace::project(ws, *project) {
             Ok(p) => named(
                 &p.name,
@@ -542,15 +617,14 @@ pub fn window_reveal_pane(
 /// a detached *tab* keeps its tab in `project.tabs`, so the shell that owns the project still
 /// answers `holds` for every pane in it. Scanning one pass over `ws.windows` therefore hands
 /// the answer to whichever role `IndexMap` happens to name first, and on a fresh workspace
-/// that is always the shell: the reveal would raise a window that is not drawing the pane, and
-/// the `DetachedTab` arm — written out precisely so a future detach inherits a working reveal
-/// — would never be reached to be noticed.
+/// that is always the shell: the reveal would raise a window that is not drawing the pane at
+/// all.
 fn window_showing(ws: &Workspace, project: ProjectId, pane: PaneId) -> Option<WindowLabel> {
     let torn_out = ws.windows.iter().find_map(|(label, role)| match role {
         WindowRole::DetachedPane { pane: shown, .. } if *shown == pane => Some(label.clone()),
-        // Nothing creates one of these yet (see `window_close`), and it is written out rather
-        // than folded into the wildcard so that whatever does create one inherits a reveal
-        // that works instead of one that raises the shell the tab came from.
+        // Written out rather than folded into the wildcard, because a detached tab keeps its
+        // tab in `project.tabs` — so the shell below would answer `holds` for its panes, and
+        // the reveal would raise a window that is deliberately not drawing them.
         WindowRole::DetachedTab {
             project: owner,
             tab,
@@ -649,9 +723,16 @@ pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
         }
     }
 
-    if !matches!(role, Some(WindowRole::DetachedPane { .. })) {
-        return false;
-    }
+    // A detached *tab* is taken over for the same reason a pane is, with more at stake: the
+    // shell is deliberately not drawing a detached tab, so a native close would leave an
+    // open file (and any session split beside it) shown by nothing, with the stale role
+    // reopening the window on the next launch as the only way back.
+    let redock: fn(&mut cide_ipc::Workspace, &WindowLabel) -> Result<WindowLabel, CoreError> =
+        match role {
+            Some(WindowRole::DetachedPane { .. }) => workspace::redock_pane,
+            Some(WindowRole::DetachedTab { .. }) => workspace::redock_tab,
+            _ => return false,
+        };
 
     let app = app.clone();
     let label = label.clone();
@@ -663,7 +744,7 @@ pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
         let Some(state) = app.try_state::<WorkspaceState>() else {
             return;
         };
-        match state.update(|ws| workspace::redock_pane(ws, &label)) {
+        match state.update(|ws| redock(ws, &label)) {
             Ok(closing) => {
                 windows::destroy(&app, &closing);
                 // Routes 1 and 2 — the close control this window now draws, and Alt+F4 — end
@@ -675,10 +756,10 @@ pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
                 retitle(&app, &state.snapshot());
             }
             Err(error) => {
-                // The pane is no longer re-dockable — its project or its home tab has gone,
-                // and the entry naming this window went with them. Nothing is stranded by
-                // letting the window go.
-                tracing::error!(%label, %error, "could not re-dock a pane whose window was closed");
+                // No longer re-dockable — the project or the home tab has gone, and the
+                // entry naming this window went with them. Nothing is stranded by letting
+                // the window go.
+                tracing::error!(%label, %error, "could not re-dock what a closed window was showing");
                 windows::destroy(&app, &label);
             }
         }

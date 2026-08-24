@@ -28,10 +28,27 @@ import {
   type ProjectId,
   type SearchFrame,
   type SearchHit,
+  type SearchProblem,
   type SearchQuery,
 } from '@/ipc/client'
 import { isNoIndex } from '@/store/fileIndex'
 import { EMPTY_QUERY, sameQuery, spliceHits } from './SearchModel'
+
+/**
+ * Every `SearchProblem` kind, as a value — the exhaustiveness gate for `problemLabel`.
+ *
+ * `SearchModel.ts` is import-free, so its `problemLabel` takes a bare `string` and cannot be
+ * `never`-checked against the generated union where it is written. This is where the union is
+ * in scope: a fourth variant added in Rust is a missing key here and a `tsc --noEmit` failure,
+ * and `check-search.mjs` greps that every key listed here has a `case` in `problemLabel` —
+ * which is the half a type cannot state. Without both, a new kind draws *Search failed* over a
+ * sentence nobody wrote copy for.
+ */
+export const PROBLEM_KINDS: Record<SearchProblem['kind'], true> = {
+  pattern: true,
+  scope: true,
+  include: true,
+}
 
 /**
  * How long the input sits still before a walk starts.
@@ -67,8 +84,11 @@ export interface SearchState {
   scanned: number
   running: boolean
   truncated: boolean
-  /** An unusable pattern, verbatim from the engine. Not a thrown error; see `client.ts`. */
-  error: string | null
+  /**
+   * An unusable pattern, folder or glob, and which of the three it was. Not a thrown error;
+   * see `client.ts`, and `cide_ipc::SearchProblem` for why it rides on the frame.
+   */
+  error: SearchProblem | null
   /** `search_query` is not in this build. Drives the panel's dim notice. */
   degraded: boolean
   /** File groups the user has folded shut, by absolute path. */
@@ -229,7 +249,7 @@ function cleared() {
     scanned: 0,
     running: false,
     truncated: false,
-    error: null as string | null,
+    error: null as SearchProblem | null,
     collapsed: new Set<string>(),
   }
 }
@@ -256,7 +276,21 @@ export const useSearch = create<SearchState>((set, get) => ({
     if (previous !== null && previous !== project) {
       void searchApi.cancel(previous).catch(() => {})
     }
-    set({ project, ...cleared() })
+    /*
+     * The pattern and the toggles survive a project change; the two narrowing boxes do not.
+     *
+     * They hold a *path* and a path means nothing in another project — at best it resolves to
+     * nothing and the panel reports *No such folder* about a folder the user never named here,
+     * at worst it happens to exist in both trees and quietly searches a fraction of the new
+     * project while looking exactly like a search of all of it. The glob goes with it because
+     * the pair is one gesture: a scope cleared and a glob kept is a narrowing nobody set.
+     *
+     * Not on every `attach` — the panel unmounts whenever the rail's selection changes, and
+     * clearing there would throw the boxes away for merely looking at the Git panel.
+     */
+    const narrowed = previous !== null && previous !== project
+    const query = narrowed ? { ...get().query, scope: '', include: '' } : get().query
+    set({ project, query, ...cleared() })
     if (project !== null && get().query.pattern !== '') schedule(generation, 0)
   },
 

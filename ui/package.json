@@ -1,12 +1,13 @@
 {
   "name": "cide-ui",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "check:agents": "node scripts/check-agents.mjs",
     "check:agents-render": "node scripts/check-agents-render.mjs",
+    "check:attach": "node scripts/check-attach.mjs",
     "check:awaiting": "node scripts/check-awaiting.mjs",
     "check:branches": "node scripts/check-branches.mjs",
     "check:blame": "node scripts/check-blame.mjs",

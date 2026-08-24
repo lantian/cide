@@ -477,6 +477,8 @@ pub fn run() {
             cmd::settings::scheme_remove,
             cmd::window::window_detach_pane,
             cmd::window::window_redock_pane,
+            cmd::window::window_detach_tab,
+            cmd::window::window_redock_tab,
             cmd::window::window_reveal_pane,
             cmd::window::window_set_mode,
             cmd::window::window_close,

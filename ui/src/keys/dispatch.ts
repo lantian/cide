@@ -49,6 +49,8 @@
  */
 import { useOverlays } from '@/overlays/store'
 import { useFileTree } from '@/sidebar/treeStore'
+import { treeFocused } from '@/sidebar/treeFocus'
+import { applyScope, scopeFromTree } from '@/sidebar/searchScope'
 import { EXTERNAL_LIBRARIES, PROJECT_NOTES, SCRATCHES, groupPath } from '@/sidebar/groupRows'
 import { useGitStatus } from '@/sidebar/gitStatusStore'
 import { useWorkspace } from '@/store/workspace'
@@ -118,6 +120,7 @@ import {
   isClosableTab,
   windowProjectsOf,
 } from './target'
+import { clusterPlan, detachedTabs } from '@/windows/windowTabs'
 
 export interface DispatchDeps {
   /**
@@ -508,15 +511,35 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // A row, not a column split — see `split` above for why the title decides this.
         return void ws.addRow(on.project, on.tab, on.pane, 'after', null)
 
-      case 'pane.detachToWindow':
-        if (on === null) return unmet(command, 'no focused pane')
-        return void ws.detachPane(on.project, on.tab, on.pane)
+      case 'pane.detachToWindow': {
+        if (target === null || on === null) return unmet(command, 'no focused pane')
+        /*
+         * A tab's only pane detaches as the *tab* — `layout::take_pane` refuses a last pane
+         * (an empty tree is unrepresentable), and this is the same rule that words the
+         * corner cluster's button, from the same function, so the chord and the button
+         * cannot diverge. See `windows/windowTabs.ts` for why an editor can only leave the
+         * shell this way.
+         */
+        const plan = clusterPlan(Object.keys(target.tab.tree.panes).length, !isClosableTab(boot()))
+        if (plan.detach !== 'tab') return void ws.detachPane(on.project, on.tab, on.pane)
+        if (boot()?.role.kind === 'detachedTab') {
+          return unmet(command, 'this tab is already in a window of its own')
+        }
+        return void ws.detachTab(on.project, on.tab)
+      }
 
-      case 'pane.close':
-        // Refusals — the console's primary pane, a tab's last pane, unsaved edits — come
-        // back from Rust and the store turns the unsaved one into the close confirmation.
-        if (on === null) return unmet(command, 'no focused pane')
+      case 'pane.close': {
+        // Refusals — the console's primary pane, unsaved edits — come back from Rust and
+        // the store turns the unsaved one into the close confirmation.
+        if (target === null || on === null) return unmet(command, 'no focused pane')
+        // A tab's only pane closes as the tab, per `clusterPlan` — the rule the cluster's
+        // button follows. `layout::close` would refuse it as the last pane; closing the
+        // last pane IS closing the tab, and `closeTab` still asks about a live session or
+        // an unsaved buffer first.
+        const plan = clusterPlan(Object.keys(target.tab.tree.panes).length, !isClosableTab(boot()))
+        if (plan.close === 'tab') return void ws.closeTab(on.project, on.tab)
         return void ws.closePane(on.project, on.tab, on.pane)
+      }
 
       case 'pane.evenRow':
         // 'row' rather than the tab's rows: the palette row and the pane menu's item are the
@@ -529,6 +552,11 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // maximize with no un-maximize leaves the user with a full-screen pane and no
         // gesture to undo it except finding the pane title bar's button.
         if (target === null || on === null) return unmet(command, 'no focused pane')
+        // A tab's only pane already fills it. The cluster withholds the button for the same
+        // fact (`clusterPlan`); the chord answering `unmet` is what keeps the two honest.
+        if (Object.keys(target.tab.tree.panes).length <= 1) {
+          return unmet(command, 'this pane already fills its tab')
+        }
         const already = target.tab.tree.maximized === on.pane
         return void ws.maximizePane(on.project, on.tab, already ? null : on.pane)
       }
@@ -617,8 +645,16 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       case 'tab.prev': {
         const project = activeProjectOf(boot())
         if (project === null || target === null) return unmet(command, 'no open project')
+        if (boot()?.role.kind === 'detachedTab') {
+          return unmet(command, 'this window shows one tab')
+        }
+        // The strip's walk, over the strip's list: a tab torn out into a window of its own
+        // keeps its slot in `project.tabs` and has to be stepped over here, or the
+        // keystroke lands on a tab this window refuses to draw — `activate_tab` answers
+        // success without moving, and the press visibly does nothing.
+        const torn = detachedTabs(boot()?.workspace.windows ?? {})
         const next = neighbour(
-          project.tabs.map((tab) => tab.id),
+          project.tabs.filter((tab) => !torn.has(tab.id)).map((tab) => tab.id),
           target.tab.id,
           command === 'tab.next' ? 1 : -1,
         )
@@ -1832,6 +1868,27 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * existing mouse path revealed a panel and left the caret in the terminal. Revealing
          * without focusing would have been a new command with the old defect.
          */
+        /*
+         * Pressed with the file tree focused, the chord also points the panel at the selected
+         * folder — a file row meaning its parent. That is the *only* thing focus changes here;
+         * from anywhere else this arm does exactly what it always did.
+         *
+         * The focus test is at runtime rather than in a `when` clause, and `treeFocus.ts`'s
+         * header is the argument: a `Command::when` does not gate the keyboard at all, and
+         * gating is not wanted anyway — the command must keep working everywhere. The tree's
+         * other focus-scoped chords live on its scroller instead, which this one cannot,
+         * because the gate is a window *capture* listener and `ctrl+shift+f` is bound, so the
+         * scroller's `onKeyDown` never runs for it.
+         *
+         * An existing scope is deliberately **left alone** when the press comes from anywhere
+         * else. A chord that silently widened a search back to the whole project would be
+         * worse than one that does not narrow it — the box is on screen with an ✕ beside it,
+         * and the panel opens with the boxes shown whenever either holds something.
+         */
+        if (treeFocused()) {
+          const scope = scopeFromTree()
+          if (scope !== null) applyScope(scope)
+        }
         if (!requestPanel('search')) return unmet(command, 'this window has no sidebar')
         requestFocus('search')
         return

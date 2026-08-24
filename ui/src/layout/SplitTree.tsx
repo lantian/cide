@@ -265,7 +265,38 @@ interface WalkContext {
   next: () => number
 }
 
-function walk(node: LayoutNode, ctx: WalkContext, style: CSSProperties | undefined): ReactNode {
+/**
+ * Which outer edges of the canvas a subtree touches — all three true at the root, narrowed on
+ * the way down: a `row` chain keeps `left` only for its first member, a `col` chain keeps
+ * `top` only for its first and `bottom` only for its last, and each axis passes the other
+ * two flags through untouched.
+ *
+ * These are the edges where the tree meets the app's own chrome, and each of those chrome
+ * pieces already draws the seam: the sidebar splitter's 6px `--panel-2` strip (plus the
+ * sidebar's `border-right`) on the left, the tab strip's `border-bottom` above, and the
+ * add-row strip's / status bar's `border-top` below. The canvas gutter there was a second
+ * gutter and the pane's frame border a second line — the user circled the left one in a
+ * screenshot, then pointed out top and bottom carry the same padding — pushing a pane's
+ * content out of line with the tab strip's tabs. So the canvas pads only the right edge
+ * (`SplitTree.module.css`), which meets the bare window edge and has no chrome line to lean
+ * on, and a leaf on a flush edge drops that side of its frame border via `data-edge-*` →
+ * `--pane-edge-*`, which `PaneTitleBar.module.css` reads as that side's border width.
+ * Content then starts where a tab starts.
+ */
+interface Edges {
+  left: boolean
+  top: boolean
+  bottom: boolean
+}
+
+const ALL_EDGES: Edges = { left: true, top: true, bottom: true }
+
+function walk(
+  node: LayoutNode,
+  ctx: WalkContext,
+  style: CSSProperties | undefined,
+  edges: Edges,
+): ReactNode {
   if (node.kind === 'leaf') {
     // Consumed before the lookup so a pane that is somehow missing does not renumber the
     // ones after it.
@@ -282,11 +313,20 @@ function walk(node: LayoutNode, ctx: WalkContext, style: CSSProperties | undefin
     // typing in — or each pointerdown of a drag-select — must not cost that.
     const raise = ctx.tree.focused === node.pane ? undefined : () => ctx.onFocus?.(node.pane)
 
+    // A maximized leaf spans every chain on its path, so it covers the canvas and every
+    // outer edge is its edge whatever its resting position was — without this an interior
+    // pane grows stray 1px lines against the surrounding chrome for exactly as long as it
+    // is maximized.
+    const flush = ctx.tree.maximized === node.pane ? ALL_EDGES : edges
+
     return (
       <div
         key={node.pane}
         className={styles.leaf}
         style={style}
+        data-edge-left={flush.left ? '' : undefined}
+        data-edge-top={flush.top ? '' : undefined}
+        data-edge-bottom={flush.bottom ? '' : undefined}
         // Capture phase, because the click that focuses a pane usually lands on the
         // terminal's own textarea and is consumed there.
         onFocusCapture={raise}
@@ -308,7 +348,19 @@ function walk(node: LayoutNode, ctx: WalkContext, style: CSSProperties | undefin
     if (holder >= 0) style = i === holder ? FILL : { ...style, ...HIDDEN }
     // Neither this member nor any other holds it: the chain is already inside a hidden
     // subtree, and `visibility` inherits, so there is nothing left to do here.
-    return walk(member, ctx, style)
+    //
+    // A chain narrows the flags along its own axis — first member keeps the leading edge,
+    // last keeps the trailing one — and passes the cross-axis flags through: every member of
+    // a `row` chain shares its chain's top and bottom, every member of a `col` its left.
+    const memberEdges: Edges =
+      chain.axis === 'row'
+        ? { left: edges.left && i === 0, top: edges.top, bottom: edges.bottom }
+        : {
+            left: edges.left,
+            top: edges.top && i === 0,
+            bottom: edges.bottom && i === chain.members.length - 1,
+          }
+    return walk(member, ctx, style, memberEdges)
   })
 
   return (
@@ -355,7 +407,7 @@ export function SplitTree({
 
   return (
     <div className={styles.tree} data-audit="paneTree">
-      <div className={styles.canvas}>{walk(tree.root, ctx, undefined)}</div>
+      <div className={styles.canvas}>{walk(tree.root, ctx, undefined, ALL_EDGES)}</div>
       {/*
         * A flex sibling of the tree, outside every grid, so the divider arithmetic stays
         * pure — an extra track inside the chain would have to be subtracted from `usable` in

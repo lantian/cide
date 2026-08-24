@@ -4,6 +4,10 @@
  * The header is the app header's height and colours without its contents. Matching the
  * height matters beyond looks — the two window kinds sit side by side on the desktop, and a
  * detached pane whose bar is a few pixels off reads as a different application.
+ *
+ * The header classes are shared with `DetachedTabHeader.tsx` — a `tab:<uuid>` window's bar
+ * is the same bar showing a tab's name instead of a pane's — so the two torn-out window
+ * kinds cannot drift apart either.
  */
 .window {
   height: 100%;

@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use cide_fs::testing::{Scratch, scratch};
 use cide_ipc::{SearchHit, SearchMode, SearchQuery};
-use cide_search::content::{Limits, Outcome, Search, SearchRoot, compile};
+use cide_search::content::{
+    Globs, Limits, Outcome, Search, SearchRoot, compile, compile_globs, resolve_scope, within_scope,
+};
 
 /// The string every corpus below is searched for. Chosen so it cannot occur by accident in a
 /// path, a `.gitignore` or the filler text.
@@ -37,6 +39,8 @@ fn literal(pattern: &str) -> SearchQuery {
         mode: SearchMode::Literal,
         case_sensitive: true,
         whole_word: false,
+        scope: String::new(),
+        include: String::new(),
     }
 }
 
@@ -50,6 +54,40 @@ fn run(roots: &[SearchRoot], query: &SearchQuery, limits: Limits) -> (Vec<Search
         regex: &regex,
         limits,
         admits: None,
+        include: None,
+        cancel: &cancel,
+        progress: None,
+    }
+    .run(&mut |batch| hits.extend_from_slice(batch));
+    (hits, outcome)
+}
+
+/// The same, narrowed the way the panel narrows it: one folder, one glob list, or both.
+///
+/// Separate from [`run`] rather than adding two arguments to it, so the twenty call sites that
+/// search everything keep reading as "search everything".
+fn run_narrowed(
+    roots: &[SearchRoot],
+    query: &SearchQuery,
+    scope: Option<&Path>,
+    include: Option<&Globs>,
+) -> (Vec<SearchHit>, Outcome) {
+    let regex = compile(query).expect("the test's own pattern must compile");
+    let cancel = AtomicBool::new(false);
+    let mut hits = Vec::new();
+    // The composition `cmd::search` performs: the shared ignore decision AND the scope. The
+    // test does the same thing rather than passing the scope some other way, because getting
+    // that composition wrong is the failure this is here to catch.
+    let admits = |path: &Path, is_dir: bool| match scope {
+        Some(scope) => within_scope(path, is_dir, scope),
+        None => true,
+    };
+    let outcome = Search {
+        roots,
+        regex: &regex,
+        limits: Limits::default(),
+        admits: Some(&admits),
+        include,
         cancel: &cancel,
         progress: None,
     }
@@ -196,6 +234,7 @@ fn the_shared_filter_is_what_decides_what_is_searched() {
         regex: &regex,
         limits: Limits::default(),
         admits: Some(&admits),
+        include: None,
         cancel: &cancel,
         progress: None,
     }
@@ -216,6 +255,7 @@ fn the_shared_filter_is_what_decides_what_is_searched() {
         regex: &regex,
         limits: Limits::default(),
         admits: Some(&nothing),
+        include: None,
         cancel: &cancel,
         progress: None,
     }
@@ -255,6 +295,7 @@ fn the_filter_is_asked_about_every_file_and_not_only_about_directories() {
         regex: &regex,
         limits: Limits::default(),
         admits: Some(&admits),
+        include: None,
         cancel: &cancel,
         progress: Some(&scanned),
     }
@@ -302,6 +343,7 @@ fn a_refused_directory_is_never_descended_into() {
         regex: &regex,
         limits: Limits::default(),
         admits: Some(&admits),
+        include: None,
         cancel: &cancel,
         progress: None,
     }
@@ -429,6 +471,7 @@ fn a_search_streams_its_first_hits_while_the_walk_is_still_running() {
         regex: &regex,
         limits: Limits::default(),
         admits: None,
+        include: None,
         cancel: &cancel,
         progress: Some(&scanned),
     }
@@ -454,4 +497,229 @@ fn a_search_streams_its_first_hits_while_the_walk_is_still_running() {
         "the walk stopped early: scanned {} of {FILES}",
         outcome.scanned
     );
+}
+
+// --- narrowing the search: one folder, one glob list -------------------------------------
+
+/// A corpus with the needle in three different directories and three different extensions, so
+/// a scope and a glob each have something to exclude that the other would not.
+fn narrowing_corpus(tag: &str) -> Scratch {
+    let dir = scratch(tag);
+    write(dir.join("crates/git/src/log.rs"), format!("// {NEEDLE}\n"));
+    write(dir.join("crates/git/Cargo.toml"), format!("# {NEEDLE}\n"));
+    write(dir.join("crates/fs/src/index.rs"), format!("// {NEEDLE}\n"));
+    write(dir.join("ui/src/App.tsx"), format!("// {NEEDLE}\n"));
+    dir
+}
+
+#[test]
+fn a_scope_searches_one_folder_and_leaves_the_rest_of_the_project_alone() {
+    let dir = narrowing_corpus("search-scope-one-folder");
+    let roots = vec![SearchRoot::new(dir.path())];
+    let scope = dir.join("crates/git");
+
+    let (hits, _) = run_narrowed(&roots, &literal(NEEDLE), Some(&scope), None);
+    let mut rels: Vec<&str> = hits.iter().map(|h| h.rel.as_str()).collect();
+    rels.sort_unstable();
+    assert_eq!(rels, ["crates/git/Cargo.toml", "crates/git/src/log.rs"]);
+}
+
+/// The heading a scoped hit draws is still measured from the **root**, not from the scope.
+///
+/// This is the whole reason scoping is a filter rather than a narrower root list. Re-basing
+/// `rel` on the scope would make one file read `src/log.rs` here and `crates/git/src/log.rs`
+/// in the file picker, which is how two surfaces stop agreeing about what a file is called.
+#[test]
+fn a_scoped_hit_is_still_named_relative_to_its_root() {
+    let dir = narrowing_corpus("search-scope-rel");
+    let roots = vec![SearchRoot::new(dir.path())];
+    let scope = dir.join("crates/git/src");
+
+    let (hits, _) = run_narrowed(&roots, &literal(NEEDLE), Some(&scope), None);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel, "crates/git/src/log.rs");
+}
+
+/// A scope prunes: the subtree it excludes is skipped at its top, not read file by file.
+///
+/// Invisible in the results — both spellings report the same two hits — and it is the whole
+/// difference between narrowing a search and merely filtering its output. `scanned` counts
+/// files actually opened, so it is the instrument.
+#[test]
+fn a_scope_prunes_rather_than_filtering_what_it_has_already_read() {
+    let dir = narrowing_corpus("search-scope-prunes");
+    let roots = vec![SearchRoot::new(dir.path())];
+
+    let (_, whole) = run_narrowed(&roots, &literal(NEEDLE), None, None);
+    let (_, scoped) = run_narrowed(
+        &roots,
+        &literal(NEEDLE),
+        Some(&dir.join("crates/git")),
+        None,
+    );
+    assert_eq!(whole.scanned, 4);
+    assert_eq!(scoped.scanned, 2);
+}
+
+#[test]
+fn a_glob_keeps_only_the_files_it_names_and_still_descends_everywhere() {
+    let dir = narrowing_corpus("search-glob-extension");
+    let roots = vec![SearchRoot::new(dir.path())];
+    let globs = compile_globs("*.rs")
+        .expect("a plain extension glob")
+        .expect("not empty");
+
+    let (hits, _) = run_narrowed(&roots, &literal(NEEDLE), None, Some(&globs));
+    let mut rels: Vec<&str> = hits.iter().map(|h| h.rel.as_str()).collect();
+    rels.sort_unstable();
+    // Both of them, from two different directories — the point being that a whitelist glob
+    // must not prune the directories it does not itself match. `ignore`'s `!is_dir` guard is
+    // what makes that true, and this is the test that notices if it ever stops being.
+    assert_eq!(rels, ["crates/fs/src/index.rs", "crates/git/src/log.rs"]);
+}
+
+#[test]
+fn a_negated_glob_excludes_instead_of_including() {
+    let dir = narrowing_corpus("search-glob-negated");
+    let roots = vec![SearchRoot::new(dir.path())];
+    let globs = compile_globs("!*.toml")
+        .expect("a negation")
+        .expect("not empty");
+
+    let (hits, _) = run_narrowed(&roots, &literal(NEEDLE), None, Some(&globs));
+    assert!(
+        hits.iter().all(|h| !h.rel.ends_with(".toml")),
+        "the .toml was searched anyway: {:?}",
+        hits.iter().map(|h| &h.rel).collect::<Vec<_>>()
+    );
+    assert_eq!(hits.len(), 3);
+}
+
+#[test]
+fn a_scope_and_a_glob_compose() {
+    let dir = narrowing_corpus("search-scope-and-glob");
+    let roots = vec![SearchRoot::new(dir.path())];
+    let globs = compile_globs("*.rs")
+        .expect("an extension glob")
+        .expect("not empty");
+
+    let (hits, _) = run_narrowed(
+        &roots,
+        &literal(NEEDLE),
+        Some(&dir.join("crates/git")),
+        Some(&globs),
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel, "crates/git/src/log.rs");
+}
+
+// --- resolving what the user typed into a directory ----------------------------------------
+
+#[test]
+fn a_scope_resolves_relative_to_a_root_and_absolutely() {
+    let dir = narrowing_corpus("search-resolve-basics");
+    let roots = vec![SearchRoot::new(dir.path())];
+    let want = dir.join("crates/git");
+
+    assert_eq!(resolve_scope(&roots, "crates/git"), Ok(want.clone()));
+    // A trailing separator is what a path copied out of a shell carries.
+    assert_eq!(resolve_scope(&roots, "crates/git/"), Ok(want.clone()));
+    assert_eq!(resolve_scope(&roots, "  crates/git  "), Ok(want.clone()));
+    assert_eq!(
+        resolve_scope(&roots, want.to_str().expect("utf-8 scratch path")),
+        Ok(want)
+    );
+}
+
+/// A scope naming a **file** is that file's directory.
+///
+/// The rule behind "…or if a file is selected, its parent". It lives in Rust so that the
+/// frontend never has to guess from a tree row that may have been scrolled out of the row
+/// cache, and so that a path pasted out of *Copy Relative Path* does something sensible.
+#[test]
+fn a_scope_naming_a_file_resolves_to_its_directory() {
+    let dir = narrowing_corpus("search-resolve-file");
+    let roots = vec![SearchRoot::new(dir.path())];
+    assert_eq!(
+        resolve_scope(&roots, "crates/git/src/log.rs"),
+        Ok(dir.join("crates/git/src"))
+    );
+}
+
+#[test]
+fn a_multi_root_scope_may_name_its_root_by_label() {
+    let one = narrowing_corpus("search-resolve-multi-a");
+    let two = narrowing_corpus("search-resolve-multi-b");
+    let roots = vec![
+        SearchRoot {
+            path: one.path().to_path_buf(),
+            label: "one".to_string(),
+        },
+        SearchRoot {
+            path: two.path().to_path_buf(),
+            label: "two".to_string(),
+        },
+    ];
+
+    // The label alone is the root; the label as a prefix selects which root a shared relative
+    // path means. Without the second, `crates/git` in a two-root project would always resolve
+    // to the first root and silently search the wrong tree.
+    assert_eq!(resolve_scope(&roots, "two"), Ok(two.path().to_path_buf()));
+    assert_eq!(
+        resolve_scope(&roots, "two/crates/git"),
+        Ok(two.join("crates/git"))
+    );
+    assert_eq!(
+        resolve_scope(&roots, "crates/git"),
+        Ok(one.join("crates/git"))
+    );
+}
+
+#[test]
+fn a_scope_that_names_nothing_is_a_sentence_rather_than_an_empty_result() {
+    let dir = narrowing_corpus("search-resolve-missing");
+    let roots = vec![SearchRoot::new(dir.path())];
+
+    let err = resolve_scope(&roots, "crates/nope").expect_err("no such directory");
+    assert!(err.contains("crates/nope"), "{err}");
+
+    // A real directory outside every root is the other half: the walk starts at roots, so a
+    // scope outside them could never produce a hit and answering "no results" would be a dead
+    // end the user cannot diagnose.
+    let outside = scratch("search-resolve-outside");
+    let err = resolve_scope(&roots, outside.path().to_str().expect("utf-8"))
+        .expect_err("outside every root");
+    assert!(err.contains("outside this project"), "{err}");
+}
+
+/// The literal reading of a relative scope beats the label-prefix reading.
+///
+/// A repository with a directory named after itself is the case, and it is not exotic —
+/// `cide/cide/src`, `foo/foo/src`, every Go module laid out that way. Under the other order
+/// `cide/src` resolves to `<root>/src` and searches a tree the user did not name, which is a
+/// wrong answer that looks like a right one.
+#[test]
+fn a_literal_relative_scope_beats_the_root_label_reading() {
+    let dir = scratch("search-resolve-selfnamed");
+    let label = dir
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a utf-8 scratch name")
+        .to_string();
+    write(dir.join("src/a.rs"), "");
+    write(dir.join(format!("{label}/src/b.rs")), "");
+    let roots = vec![SearchRoot::new(dir.path())];
+
+    assert_eq!(
+        resolve_scope(&roots, &format!("{label}/src")),
+        Ok(dir.join(format!("{label}/src"))),
+    );
+    // And with no such literal directory, the prefix reading is still there as the fallback.
+    assert_eq!(
+        resolve_scope(&roots, &format!("{label}/src/a.rs")),
+        Ok(dir.join("src")),
+    );
+    // The bare label is the root itself, which is what the tree's top-level row is called.
+    assert_eq!(resolve_scope(&roots, &label), Ok(dir.path().to_path_buf()));
 }

@@ -272,6 +272,16 @@ export function EditorPane({
    * exactly the window in which the tab is clean and the store wants nothing.
    */
   const readTextRef = useRef<(() => string) | null>(null)
+  /**
+   * The path this pane last rendered, so a *rename* can be told apart from a first mount. (M25)
+   *
+   * The two arrive identically — `path` is a prop — and they want opposite things: a first mount
+   * reads the file, a rename must keep the buffer that is already on screen. See the block below
+   * `lastViewRef`, which is the only writer.
+   */
+  const openedPath = useRef(path)
+  /** Whether the load in flight is a retarget whose buffer must not be replaced. See below. */
+  const carriedRef = useRef(false)
 
   /*
    * The markdown preview's three wires, and none of them is a prop that changes per keystroke.
@@ -293,6 +303,56 @@ export function EditorPane({
    * position store exists to prevent, arriving through the feature that reads it.
    */
   const lastViewRef = useRef<FileView | null>(null)
+
+  /*
+   * The file was renamed under this tab. Keep the buffer and keep the viewport. (M25)
+   *
+   * `path` changing on a mounted `File` tab means exactly one thing: the file moved on disk and
+   * `cide_core::workspace::retarget_paths` moved the tab with it. Two things have to survive that,
+   * and neither survives on its own:
+   *
+   * * **Unsaved edits.** A rename copies nothing, so the bytes on disk are the buffer the user
+   *   has already edited past. Letting the load below bring them back would replace their work at
+   *   a moment when nothing on screen said a buffer was about to be thrown away.
+   * * **Where they were reading.** `EditorSurface` restores from an observation stamped with the
+   *   document's *identity*, which is the path — so after a rename it falls back to the `at` prop,
+   *   which is where the file was when the tab opened. Renaming a file you are four hundred lines
+   *   into and being thrown back to line 1 is the visible half of the same bug.
+   *
+   * # Why this is in the render pass and not in an effect
+   *
+   * React runs a child's effects **before** its parent's. `EditorSurface`'s build effect is keyed
+   * on `[path, reloadKey]`, so on the very commit that carries the new path it tears the
+   * `EditorView` down and rebuilds it from the `doc` prop — before any effect here could have
+   * captured what was in it. By then `readTextRef` reads the *rebuilt* view and answers with the
+   * text the carry exists to replace. Adjusting state during render is React's documented way to
+   * respond to a changed prop, and it is what makes the surface's one rebuild the correct one:
+   * React discards this render, re-runs this component, and the child sees the new path and the
+   * carried buffer together.
+   *
+   * Guarded on the ref rather than on a comparison with `load`, so it runs exactly once per
+   * rename — a `setLoad` during render that could re-trigger itself is an infinite render loop,
+   * which in this application means the whole root unmounting.
+   */
+  if (openedPath.current !== path) {
+    openedPath.current = path
+    // The live buffer, and only when it holds something the disk does not: a clean tab has
+    // nothing to carry and is better served by the ordinary read below.
+    const live = dirtyRef.current ? (readTextRef.current?.() ?? null) : null
+    const seen = lastViewRef.current
+    carriedRef.current = live !== null
+    setLoad((prev) =>
+      prev.kind !== 'ready'
+        ? prev
+        : {
+            ...prev,
+            ...(live === null ? {} : { text: live }),
+            // Stamped with the new path because that is the name the surface will compare
+            // against — `viewTracker` keys its observation on the same value.
+            ...(seen === null ? {} : { at: { ...seen, path } }),
+          },
+    )
+  }
 
   const subscribeText = useCallback((listener: () => void) => {
     docListeners.current.add(listener)
@@ -747,6 +807,15 @@ export function EditorPane({
     (bump: boolean) => {
       let cancelled = false
       /*
+       * Whether the render pass above already put this buffer on screen — a rename. (M25)
+       *
+       * Read once and cleared, because it describes *this* load: the retarget block runs on the
+       * commit that changes `path`, this effect runs on the same one, and every later load — a
+       * reload from disk, a conflict resolved — must go back to trusting the file.
+       */
+      const carried = carriedRef.current
+      carriedRef.current = false
+      /*
        * The remembered position is fetched **beside** the text, in one `Promise.all`, and the
        * surface is not rendered until both have landed.
        *
@@ -762,32 +831,58 @@ export function EditorPane({
       void Promise.all([fileApi.read(path), fileApi.position(path).catch(() => null)])
         .then(([doc, at]) => {
           if (cancelled) return
-          setLoad({
-            kind: 'ready',
-            text: doc.text,
-            writable: doc.writable,
-            at:
-              at === null
-                ? null
-                : {
-                    path: at.path,
-                    line: at.line,
-                    column: at.column,
-                    topLine: at.topLine,
-                    folds: at.folds,
-                  },
-          })
           /*
-           * The remembered layout, applied on the same frame as the remembered scroll. A tick
-           * later would open every previewed file as a buffer and then swap it, which reads as
-           * the setting not having been saved.
+           * A carried buffer takes the refs and nothing else.
+           *
+           * `stamp` above all: it is what the *next* autosave compares against, and the file it
+           * has to describe is the one under the new name. Leaving the old file's token there
+           * would make every autosave after a rename refuse with a conflict the user cannot
+           * explain — a feature that stops working the first time somebody uses another one.
+           *
+           * `setLoad` is deliberately not called: the text on screen is the user's, the viewport
+           * was stamped a moment ago, and replacing either with what is on disk is the whole of
+           * what this branch exists to prevent.
            */
-          setMdView(at?.markdownView ?? 'text')
+          if (!carried) {
+            setLoad({
+              kind: 'ready',
+              text: doc.text,
+              writable: doc.writable,
+              at:
+                at === null
+                  ? null
+                  : {
+                      path: at.path,
+                      line: at.line,
+                      column: at.column,
+                      topLine: at.topLine,
+                      folds: at.folds,
+                    },
+            })
+            /*
+             * The remembered layout, applied on the same frame as the remembered scroll. A tick
+             * later would open every previewed file as a buffer and then swap it, which reads as
+             * the setting not having been saved.
+             */
+            setMdView(at?.markdownView ?? 'text')
+          }
           diskTextRef.current = doc.text
           stampRef.current = doc.stamp
           writableRef.current = doc.writable
           setConflict(false)
-          reportDirty(false)
+          if (!carried) reportDirty(false)
+          else {
+            /*
+             * Still dirty, and the *new* path has to be the one offering the bytes.
+             *
+             * `reportDirty` is the single writer of this pairing and it deduplicates against
+             * `dirtyRef` — the flag has not transitioned, so calling it here would do nothing at
+             * all. The registration is keyed on the path and the unmount above already withdrew
+             * the old one, so without this line a blame over the renamed file would read the disk
+             * and attribute every line after an unsaved insertion to the wrong commit.
+             */
+            registerDirtyBuffer(path, () => readTextRef.current?.() ?? '')
+          }
           if (bump) setReloadKey((n) => n + 1)
         })
         .catch((error: unknown) => {

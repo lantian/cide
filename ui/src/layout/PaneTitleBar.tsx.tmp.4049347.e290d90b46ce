@@ -439,32 +439,31 @@ export function PaneFrame({
         command: 'pane.maximize',
         checked: maximized,
         run: onMaximize,
-        // Greyed rather than hidden when the pane already fills its tab, unlike the button,
-        // which is withheld: the menu is where the `pane.maximize` chip stays discoverable,
-        // and a row with a reason teaches more than a row that vanished.
-        disabledReason: onMaximize ? undefined : 'This pane already fills its tab',
+        // Greyed rather than hidden, unlike the button, which is withheld outright: the
+        // menu has room for the reason and the row keeps the chord discoverable.
+        disabledReason: onMaximize ? undefined : 'This pane already fills the tab',
       },
       { kind: 'separator' },
       {
+        // The tab, when this pane is its tab's whole tree — `layout::take_pane` refuses a
+        // tab's last pane, so the pane-scoped gesture here could only ever fail. See
+        // `tabScoped` on the props.
         id: 'detach',
         label: tabScoped ? 'Detach tab into a window' : 'Detach into a window',
         command: 'pane.detachToWindow',
         run: detachable ? onDetach : undefined,
-        // Three states, two reasons: the console refuses by role, and a tab already in a
-        // window of its own has nowhere further out to go — that is the sole pane of a
-        // torn-out tab, where the caller withholds the handler.
         disabledReason: !detachable
           ? 'The project console pane cannot be detached'
-          : onDetach
+          : onDetach !== undefined
             ? undefined
             : 'This tab is already in a window of its own',
       },
       {
         id: 'close',
         label: tabScoped ? 'Close tab' : 'Close pane',
-        // The chip has to name the chord that really does this: for a tab's only pane the
-        // close is a tab close, and labelling it `pane.close` would print a shortcut whose
-        // handler refuses with `lastPane`.
+        // `tab.close` is Ctrl+W's id, and when the handler closes the tab the chip must
+        // name the chord that really does that — a `pane.close` chip beside "Close tab"
+        // promises a keystroke that answers `LastPane`.
         command: tabScoped ? 'tab.close' : 'pane.close',
         // Red: this close ends what is in it. Not for the console pane, which refuses.
         danger: closable,
@@ -667,55 +666,38 @@ export function PaneFrame({
                     </span>
                   </button>
                 )}
-                {/*
-                 * Withheld, not disabled, for the tab's only pane: a maximize toggle over a
-                 * pane that already fills its tab can never change a pixel, and a live-looking
-                 * button that does nothing is the dead-control state this file keeps citing.
-                 * The menu keeps a greyed row with the reason, so the gesture stays
-                 * discoverable where explaining is possible.
-                 */}
-                {onMaximize && (
-                  <button
-                    type="button"
-                    className={maximized ? `${styles.action} ${styles.actionOn}` : styles.action}
-                    title={maximized ? 'Restore pane' : 'Maximize pane'}
-                    aria-label={maximized ? 'Restore pane' : 'Maximize pane'}
-                    aria-pressed={maximized}
-                    onClick={onMaximize}
-                  >
-                    <Icon name="maximize" size={1} />
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className={maximized ? `${styles.action} ${styles.actionOn}` : styles.action}
+                  title={maximized ? 'Restore pane' : 'Maximize pane'}
+                  aria-label={maximized ? 'Restore pane' : 'Maximize pane'}
+                  aria-pressed={maximized}
+                  onClick={onMaximize}
+                >
+                  <Icon name="maximize" size={1} />
+                </button>
                 {/* `aria-disabled`, not `disabled`, for the reason spelled out on the close
-                    button. Hidden entirely — like maximize, not like the console's refusal —
-                    when the caller withholds the handler with nothing to explain: that is
-                    the sole pane of a tab already in a window of its own. */}
-                {(onDetach !== undefined || !detachable) && (
-                  <button
-                    type="button"
-                    className={
-                      detachable ? styles.action : `${styles.action} ${styles.actionDisabled}`
-                    }
-                    title={
-                      !detachable
-                        ? 'The project console pane cannot be detached'
-                        : tabScoped
-                          ? 'Move this tab into its own window'
-                          : 'Detach into a window'
-                    }
-                    aria-label={
-                      !detachable
-                        ? 'The project console pane cannot be detached'
-                        : tabScoped
-                          ? 'Move this tab into its own window'
-                          : 'Detach pane into a window'
-                    }
-                    aria-disabled={!detachable}
-                    onClick={detachable ? onDetach : undefined}
-                  >
-                    <Icon name="picture-in-picture-2" size={1} />
-                  </button>
-                )}
+                    button. */}
+                <button
+                  type="button"
+                  className={
+                    detachable ? styles.action : `${styles.action} ${styles.actionDisabled}`
+                  }
+                  title={
+                    detachable
+                      ? 'Detach into a window'
+                      : 'The project console pane cannot be detached'
+                  }
+                  aria-label={
+                    detachable
+                      ? 'Detach pane into a window'
+                      : 'The project console pane cannot be detached'
+                  }
+                  aria-disabled={!detachable}
+                  onClick={detachable ? onDetach : undefined}
+                >
+                  <Icon name="picture-in-picture-2" size={1} />
+                </button>
                 {/*
                  * `aria-disabled` rather than `disabled`: a disabled button swallows
                  * pointerdown without bubbling, so clicking the close button of the primary
@@ -724,23 +706,11 @@ export function PaneFrame({
                 <button
                   type="button"
                   className={closable ? styles.action : `${styles.action} ${styles.actionDisabled}`}
-                  title={
-                    !closable
-                      ? 'The project console pane cannot be closed'
-                      : tabScoped
-                        ? 'Close tab'
-                        : 'Close pane'
-                  }
+                  title={closable ? 'Close pane' : 'The project console pane cannot be closed'}
                   // The reason travels in the name, not only in the tooltip: `title` reaches a
                   // mouse pointer, and the one user who cannot see the dimming is the one
                   // reading this button through a screen reader.
-                  aria-label={
-                    !closable
-                      ? 'The project console pane cannot be closed'
-                      : tabScoped
-                        ? 'Close tab'
-                        : 'Close pane'
-                  }
+                  aria-label={closable ? 'Close pane' : 'The project console pane cannot be closed'}
                   aria-disabled={!closable}
                   onClick={closable ? onClose : undefined}
                 >

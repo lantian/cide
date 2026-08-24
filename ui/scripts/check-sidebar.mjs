@@ -387,9 +387,10 @@ try {
         'into a dead React tree',
     )
     ok(
-      /if \(paneWindow\) return\s*\n\s*registerPanelHost\(/.test(app),
-      '…and a detached-pane window registers nothing, so the dispatcher reports rather than ' +
-        'moving a `useState` nothing draws',
+      /if \(paneWindow \|\| tabWindow\) return\s*\n\s*registerPanelHost\(/.test(app),
+      '…and a detached window of either kind registers nothing — the pane window has no ' +
+        'sidebar at all and the tab window renders no rail or panels — so the dispatcher ' +
+        'reports rather than moving a `useState` nothing draws',
     )
     const hook = readFileSync('src/sidebar/GitPanel/useGitPanel.ts', 'utf8')
     ok(

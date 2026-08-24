@@ -18,8 +18,8 @@ builds and runs, real `claude` processes render in xterm panes, the domain core 
 workspace tree, the shell chrome matches the dimensions `chrome/layoutAudit.ts` records in
 both themes,
 and the pinned Claude tab tiles into a recursive split tree whose panes hold live sessions.
-Panes detach into their own windows, quitting saves the workspace, and relaunching resumes
-each project's primary conversation. Four automated gates guard the seams: the IPC transport
+Panes — and whole tabs, which is how a file travels — detach into their own windows, quitting
+saves the workspace, and relaunching resumes each project's primary conversation. Four automated gates guard the seams: the IPC transport
 benchmark (`BENCH.md`), the chrome layout audit, the pane lifecycle audit, and the window
 audit.
 
@@ -2580,10 +2580,11 @@ so:
 **Not done.** None of it has been confirmed on screen — the gesture needs a held modifier, KDE will
 not raise a shell-launched window and the Wayland compositor exposes no capture protocol; the
 coverage is `check:switcher`, `check:keys`, `check:sidebar` and `check:commands`. `tab.next` /
-`tab.prev` still have the latent issue the new commands avoid: they carry no `shellWindow` clause,
-so from a detached-tab window they would move the *shell* window's active tab. The palette's key
-chip prints `f4` lowercase, because `chipLabel` upper-cases single characters only and has no f-key
-glyph — `ctrl+f12` has always rendered `⌃f12`.
+`tab.prev` still carry no `shellWindow` clause, but the latent issue that used to imply — from a
+detached-tab window they would move the *shell* window's active tab — was closed when detached-tab
+windows became creatable: their dispatch arm answers `unmet` in one ("this window shows one tab").
+The palette's key chip prints `f4` lowercase, because `chipLabel` upper-cases single characters only
+and has no f-key glyph — `ctrl+f12` has always rendered `⌃f12`.
 
 ## Editing the keymap from Settings (M14), and what is not done
 
@@ -2827,10 +2828,42 @@ pointer over *External Libraries* from launching `cargo metadata`.
 reasons in `useTreeDrag.ts`'s header — so there is **no drag into cide from Dolphin or Nautilus and
 none out**, the same missing desktop-clipboard flavours the tree's Copy already documents. Dropping
 on empty space is refused rather than meaning "the project root", because a pointer released over
-the editor resolves to no row either. Nothing retargets an **open editor tab** when its file moves —
-`fs_rename` and Cut+Paste have always had that gap and this does not widen it. And none of it has
+the editor resolves to no row either. And none of it has
 been confirmed on screen: the gesture needs a pointer, KDE will not raise a shell-launched window,
 and the Wayland compositor exposes no capture protocol.
+
+## An open editor tab follows its file (M25)
+
+Until M25 nothing retargeted an **open editor tab** when its file moved, and the second half of that
+was worse than the first. A `TabKind::File` tab is an absolute path, and `cide_core::document::write`
+canonicalizes before it writes — so a rename left the tab showing the old name over a buffer that
+**could not be saved at all**: `ENOENT` in the log, a dirty dot with no gesture that could clear it,
+and an autosave notice on a timer. The tree was right and the editor was silently stranded.
+
+`cide_core::workspace::retarget_paths` is the rule, called by `fs_rename` and by the **cut** half of
+`fs_paste` once the disk agrees, never before. It matches a tab's path exactly *or* as a directory
+prefix — renaming `src/` moves every tab beneath it — and it rewrites the editor panes' headers with
+it, in the tab's own tree and in `project.detached`, exactly as `retarget_diff` does for a diff torn
+into its own window. It reaches **every project**, not the one the gesture came from: the path is
+absolute, `TabKind::File`'s own documentation makes the point that nothing there claims the file is
+even in the project, and the file moved for whoever has it open. `rev` moves only when a tab did, so
+the common rename — of a file nobody has open — tells no window anything. `PositionsState::rename`
+moves the remembered scroll with the same rule, so renaming a file you are reading at line 400 does
+not throw you to the top of it.
+
+**Unsaved edits survive it.** A rename copies nothing, so the bytes on disk are the buffer the user
+had already edited past; re-reading them would replace their work at a moment when nothing on screen
+said a buffer was about to be thrown away. `EditorPane` carries the live text across instead and the
+tab stays dirty, so the next Ctrl+S writes it to the new name. The **undo history does not survive**:
+`EditorSurface`'s build effect is keyed on `[path, reloadKey]` and has to be, because the language is
+resolved from the extension — `notes.txt` renamed to `notes.md` is a different grammar.
+
+**What is deliberately not retargeted**: a `Diff` tab (a `ClaudeMcp` one is holding an agent's turn
+open on a fetch key, and a `Git` one spells its paths repo-relative), and `Revision` and `Merge` tabs,
+which are repo-relative and name blobs a working-tree rename does not touch. **Not confirmed on
+screen** — the gesture needs a pointer, for the reason above. The rule is covered by
+`cargo test -p cide-core workspace`, including the folder-prefix case and the near miss beside it
+(`src/network.md` is not inside `src/net`).
 
 ## Project Notes (M17), and what is not done
 
@@ -5718,6 +5751,154 @@ file, so the render is pixel-identical); the left column is never blamed (a seco
 other revision is a real feature, not an omission of this one); and the unified whole-file view
 drops the sticky `@@` headers rather than making them float — the line numbers are on screen,
 and the staging affordances moved to a slim non-sticky bar per hunk.
+
+## Narrowing a search to a folder and a file pattern (M25), and what is not verified
+
+The ⌕ panel searched every file under every project root, always. `SearchQuery` carried a
+pattern and three toggles and nothing about *where*, and `cmd::search` mapped `project_fs.roots`
+1:1 into `Vec<SearchRoot>` unconditionally. Two boxes and one gesture close that.
+
+**The wire.** `SearchQuery` gains `scope` (one folder, `""` for every root) and `include`
+(comma-separated file globs, `""` for every file). Fields on the query rather than arguments
+beside it, because `SearchRegistry::job_for` keys the running job on `job.query == *query` and
+every frame echoes the query back — so being a field buys job identity and the
+stale-frame check for free, and anything outside the struct would have to rebuild both. The
+failure that guards against is not hypothetical: it is one folder's results drawn under another
+folder's heading, with nothing on screen to say which. `SearchModel.ts::sameQuery` is the
+frontend half and `check:search` drives one field at a time — and then every key of
+`EMPTY_QUERY` — so a field added in Rust and forgotten there fails the build rather than
+painting a wrong answer.
+
+`SearchFrame::error` is now a `SearchProblem` — `Pattern`, `Scope` or `Include`, each carrying
+its sentence — rather than a bare string. One nullable field and a *kind*, not three fields and
+not a heading: two fields that can disagree is what `PickerRow::source` argues against, and a
+heading on the wire would be a Rust crate deciding what a 252px box says. The panel maps the
+kind to the words and outlines the box the user can act on. It stays an answer *on the frame*
+and never a rejected `invoke`, for the reason that was already written down for regexes and is
+just as true of the other two: half of every folder path is unusable while it is being typed.
+
+**Scoping is a filter, not a narrower root list.** `cide_search::content::within_scope` composes
+into the `admits` closure `cmd::search` already builds, and `Visitor::visit` turns a rejected
+directory into `WalkState::Skip` — so a search scoped to `crates/cide-git` skips `ui/` at its
+top rather than walking it to reject every file one at a time, and the cost of the whole
+narrowing is one directory listing per level of the scope's own ancestor chain
+(`a_scope_prunes_rather_than_filtering_what_it_has_already_read` measures it through `scanned`).
+A directory *above* the scope is deliberately admitted, or the walk never reaches the scope at
+all. Containment is `Path::starts_with`, which is component-wise: a `str::starts_with` would
+call `/p/crates/cide-github` a child of `/p/crates/cide-git` and search the wrong crate.
+
+Replacing `roots` with the scope directory would have been a marginally cheaper walk and would
+have re-based every `SearchHit::rel`, so one file would read `src/log.rs` in the panel and
+`cide-git/src/log.rs` in the file picker. `a_scoped_hit_is_still_named_relative_to_its_root`
+is what holds that.
+
+**The globs are `ignore`'s own overrides**, one `Override` per root, which is what
+`rg -g '*.ts'` uses and means the syntax is gitignore's: no `/` matches a basename at any depth,
+a `/` anchors at the root, a leading `!` excludes. Two properties of `ignore` 0.4.33 are load
+bearing and both look like bugs if you assume otherwise, so `compile_globs` names them:
+`Override::matched` ends `if mat.is_none() && self.num_whitelists() > 0 && !is_dir`, and that
+`!is_dir` is why a whitelist-only `*.ts` does not prune every directory in the tree; and a
+whitelist *outranks* gitignore for files, so `*.ts` would on its own resurface a gitignored
+`.ts` — it does not, because `cide_fs::Filter` carries its own per-directory `Gitignore` and is
+consulted before a file is opened. That is the "belt and braces" `Job::walk`'s comment has
+always claimed, and this is the first case where it holds the line rather than merely agreeing.
+
+**What the box holds** is the spelling `SearchHit::rel` draws: relative to the root, prefixed
+with the root's label when the project has more than one. So the box reads `cide-git/src` while
+the headings under it read `cide-git/src/log.rs`. `resolve_scope` is the only reader and tries
+three readings in a fixed order — a bare root label, then the literal `<root>/<text>` for every
+root, then a `<label>/<rest>` prefix. The literal beating the prefix is the load-bearing one: a
+repository with a directory named after itself would otherwise have `cide/src` resolve to
+`<root>/src` and search a tree the user did not name. A scope naming a **file** resolves to its
+parent directory, which is the rule behind "or if a file is selected, its parent" — stated once,
+in Rust, where a test can run it and where the frontend does not have to guess from a tree row
+that may have been scrolled out of the row cache.
+
+**Ctrl+Shift+F from the file tree** seeds the folder box from the selected row. The focus test
+is at runtime in `keys/dispatch.ts`'s `sidebar.search` arm and **not** a `when` clause, and
+`ui/src/sidebar/treeFocus.ts` is the argument at length. The short version is that the tree's
+other focus-scoped chords — Ctrl+C/X/V, Delete, the speed-search letters — live on its scroller
+*because nothing in the default keymap binds them*; `ctrl+shift+f` is bound, the gate is
+`window.addEventListener('keydown', gate, true)`, so it resolves and swallows the chord and the
+scroller's `onKeyDown` is never called. A `CONTEXT_FLAGS` entry is the other reflex and is wrong
+twice: a `Command::when` does not gate the keyboard at all, and gating is not what is wanted —
+the command must keep working everywhere and merely do slightly more in one place. `sidebarFiles`,
+the flag that exists, means the panel is *visible*, which it is while the user types in a
+terminal beside it.
+
+Pressed anywhere else the chord does exactly what it always did, and an existing scope is left
+alone: a chord that silently widened a search back to the whole project would be worse than one
+that does not narrow it. The tree's context menu carries the same act as *Search in Folder*
+(*Search in Containing Folder* on a file row), disabled with a sentence for a row under no
+project root — the search only ever walks roots, so scoping to a dependency source could not
+produce a hit and an enabled item that reported it afterwards is the dead control this panel has
+already shipped twice.
+
+`applyScope` attaches the store to the project *before* writing the scope, and that ordering is
+the whole of a bug that would only have bitten a user who had switched project since they last
+opened the panel: `attach` clears both boxes when the project changes — right, because a path
+means nothing in another tree — and the panel is usually not mounted when the gesture is made,
+so its own `attach` runs a commit later and would have thrown the scope away.
+
+**The two boxes are folded away** behind a ⋯ disclosure, because two more inputs are ~56px of a
+252px panel spent on something most searches do not use. They are shown unconditionally whenever
+either holds something, so the panel can never be quietly searching one folder while looking
+exactly like it is searching all of them, and the disclosure is refused with its reason in that
+state rather than becoming a button that changes nothing.
+
+**Not verified on screen.** The model, the resolution, the pruning, the glob semantics and the
+kind-to-heading mapping are pinned by `check:search` and by `cargo test -p cide-search`
+(differential over real directory trees) and `-p cide-app`. What no check holds is the feel: the
+140ms debounce over a half-typed folder path, whether the yellow outline on the offending box
+reads as guidance rather than an error, and whether the disclosure is discoverable at all. Same
+reason as every milestone since M14. Deliberately out of scope, named so they are not read as
+oversights: there is no *exclude* box beside the include one (a leading `!` in the same box is
+`rg -g`'s answer and costs no chrome); the scope is one folder rather than a set, because the
+box and the wire both say one place and a search narrowed to five folders has no honest
+spelling; and neither box completes paths or globs as you type.
+
+## A file in its own window: detached tabs, and what a sole pane's buttons mean (M25), and what is not verified
+
+The report: the corner cluster of a file pane draws a maximize button (over a pane that already
+fills its tab), and its detach and close buttons "print `lastPane`" — both ran into
+`layout::close`/`take_pane`'s refusal to empty a tree — where detach should move the file into a
+window of its own and close should close the tab.
+
+**Close and detach on a tab's only pane act on the tab, and maximize is withheld.** The rule is
+one function, `windows/windowTabs.ts::clusterPlan`, consulted by the cluster's buttons
+(`App.tsx`), the context-menu rows and the `pane.close` / `pane.detachToWindow` /
+`pane.maximize` chords (`keys/dispatch.ts`) — the chord doing something different from the
+button it shares a name with being the drift `check:detached` now pins against. Close routes
+through `closeTab`, so the unsaved-buffer and live-session dialogs are the same ones the strip's
+× raises. The pinned console is exempt: its sole pane keeps the pane-scoped buttons and the
+role-based refusals that word them.
+
+**Detaching a file means detaching the tab**, because a detached *pane* window refuses editors
+by design — the buffer registry is per `TabId` (`editor/openBuffers.ts`), and a pane taken out
+of its tab would need a second buffer over the same file. `WindowRole::DetachedTab` existed as
+"a domain variant nothing can produce"; it is now produced by `window_detach_tab` and undone by
+`window_redock_tab`, `window_close` and `intercept_close` (Alt+F4), each ending in
+`workspace::redock_tab`. Unlike a pane, **the tab never leaves `project.tabs`** — quit guards,
+restore plans and the awaiting arithmetic all walk that list — so the whole arrangement rests on
+one invariant: *no shell draws a torn-out tab*. The domain holds it from its side (`detach_tab`
+moves `active_tab` off and drops the tab from the focus order; `activate_tab` answers success
+without moving; `close_tab` picks successors around it) and the webview from its
+(`windowTabs.ts::shownTabs` filters both the strip and — load-bearingly — `TabContent`, which
+mounts every tab it is handed). The window renders through the shell's own path — same
+`TabContent`, same `PaneFrame`/`PaneBody`, so splits inside it are ordinary splits — under a
+small header (`windows/DetachedTabHeader.tsx`) carrying the title, the drag region, Redock and
+the `WindowLights` the shell's header draws. Opening a file whose tab is torn out raises that
+window instead of appearing to do nothing, and `planReveal` learned the same fact from the other
+end: the shell answers `here: false` for a pane whose tab is out, so a reveal raises the tab's
+window rather than claiming success over a pane nothing shows.
+
+**Not verified on screen.** The rules are pinned by `check:detached`, `check:editor`'s reveal
+fixtures and `cargo test -p cide-core workspace`; restore of a `tab:` window across a relaunch
+rides the same `restore_windows` path as `pane:` windows and has not been watched happening.
+Ctrl+Tab's switcher can still reach a torn-out tab from the shell — deliberate: MRU switching is
+"go to where I was", and choosing one raises its window — while `tab.next`/`tab.prev` step over
+it, because a positional walk should match the strip on screen. Sizing: the new window opens at
+the tab panel's measured size, or `DETACHED_WIDTH×HEIGHT` when nothing measured.
 
 ## The look and feel (M23), and what is not verified
 

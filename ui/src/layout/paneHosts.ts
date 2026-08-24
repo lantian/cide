@@ -85,6 +85,22 @@ export interface PaneHost {
    * which is what shipped.
    */
   mirrored?: boolean | undefined
+  /**
+   * Close this pane's session sink: stop delivering output and take the attachment off the
+   * Rust side.
+   *
+   * Installed by `panes/sessionSink.ts`, which owns the sink for exactly as long as the
+   * host holds its claim on the session — **not** for as long as a React mount, which is
+   * the distinction this field exists for. A project switch unmounts the pane but only
+   * *parks* the host, and a parked pane keeps its sink so the buffer keeps filling; the
+   * sink ends at the three moments this module knows about first, which are the three
+   * callers: `releaseHost` (another window shows the pane now), `teardown` (the terminal
+   * itself is going away), and `forgetSession` (a restart — the closure captured the old
+   * session id, so the detach names the session the sink was registered against by
+   * construction). A closure rather than an import, so this module never depends on the
+   * controller that already depends on it.
+   */
+  sinkClose?: (() => void) | undefined
   cleanup: Array<() => void>
   /** True while the element sits in a live slot. A mounted host is never evicted. */
   mounted: boolean
@@ -359,14 +375,14 @@ export function mountHost(paneId: string, slot: HTMLElement): void {
    * `parking` is never appended to `document.body` (see its declaration), so a parked host is
    * *detached* — and this module's own header states what that means to xterm: a
    * non-intersecting element pauses `RenderService`. The buffer keeps taking writes while
-   * paused, so the terminal's state is correct throughout; what stops is the painting. Coming
-   * back therefore shows whatever was on the canvas at the moment of parking.
-   *
-   * That is the "the pane still looks like it is working, and going full-screen fixes it"
-   * report. Parking is reached by a split, a **project switch** and a re-dock — not by a tab
-   * switch, which only flips `visibility` — so the reproduction is: switch project, let a turn
-   * finish, switch back. Maximising repaired it because it resizes, and a resize redraws from
-   * the buffer; nothing else on the mount path ever asked for a frame.
+   * paused — xterm's write pipeline is macrotask-driven and does not pause with the renderer
+   * — and since the sink moved onto the host (`PaneHost.sinkClose`, `panes/sessionSink.ts`)
+   * a parked pane keeps *receiving* too: parking is reached by a split, a **project switch**
+   * and a re-dock — not by a tab switch, which only flips `visibility` — and a project
+   * switch used to detach the sink with the mount, so the buffer this refresh repainted was
+   * itself stale by the whole away period and the snapshot that could have repaired it was
+   * refused by the hydration gate. The terminal's state is correct throughout now; what
+   * stops while parked is only the painting, and this is where it resumes.
    *
    * In a `requestAnimationFrame` so the element has been laid out and the observer has had a
    * chance to report it intersecting again. Safe in either order: `refreshRows` while still
@@ -380,6 +396,15 @@ export function mountHost(paneId: string, slot: HTMLElement): void {
       const term = hosts.get(paneId)?.terminal?.term
       if (term !== undefined) term.refresh(0, term.rows - 1)
     })
+    /*
+     * And put the watchdog on it. `armStallCheck` is only otherwise reachable from
+     * `noteParsed`, so a pane that comes back owing a frame — bytes were parsed into it
+     * while it was parked — with no further output on the way is never examined: the
+     * refresh above only *arms* xterm's own repaint, and if the intersection callback does
+     * not fire on re-attachment nothing ever spends it. One armed check costs nothing when
+     * the frame gets paid, and is the only examiner when it does not.
+     */
+    if (host.opened && owesFrame(host)) armStallCheck(host)
   }
 
   // `releaseHost` handed this pane's WebGL context back while it was out of the tree, and
@@ -463,13 +488,48 @@ function stallInput(host: PaneHost, atBottom: boolean): RenderStallInput {
   }
 }
 
+/** Bytes were parsed into this terminal and no frame has answered them yet. */
+function owesFrame(host: PaneHost): boolean {
+  return (
+    host.lastParsedAt !== undefined &&
+    (host.lastRenderedAt === undefined || host.lastRenderedAt < host.lastParsedAt)
+  )
+}
+
 function checkStall(host: PaneHost): void {
   const term = host.terminal?.term
   if (!term || !host.opened) return
   const buffer = term.buffer.active
   const input = stallInput(host, buffer.viewportY === buffer.baseY)
-  if (!isRenderStalled(input)) return
-  if (!shouldRepairRender(input)) return
+  if (!isRenderStalled(input)) {
+    /*
+     * Not stalled — but "not stalled" and "healthy" are different claims, and returning
+     * without re-arming used to conflate them. Bytes that arrived after this timer was
+     * armed pushed the stall window past it: armed at t=0 for t=STALL_MS, more bytes at
+     * t=STALL_MS-100 make this check compute a recency under the threshold and return —
+     * and if that burst was the last, no `noteParsed` ever arms another timer, so a stall
+     * that began there was never noticed for the rest of the session. Re-armed only when
+     * recency is the plausible blocker, so a parked, off-screen or scrolled-back pane does
+     * not buy a per-STALL_MS heartbeat (and `stallInput`'s forced layout) for as long as
+     * it sits in that state.
+     */
+    if (host.mounted && owesFrame(host) && input.now - (host.lastParsedAt ?? 0) < STALL_MS) {
+      armStallCheck(host)
+    }
+    return
+  }
+  if (!shouldRepairRender(input)) {
+    // Stalled but inside the repair cooldown. Re-armed only while no repair has answered
+    // these bytes, so a genuinely dead renderer gets its one deferred repair per burst and
+    // then goes quiet, instead of nudging and logging every cooldown for ever.
+    if (
+      host.mounted &&
+      (host.lastRepairAt === undefined || host.lastRepairAt < (host.lastParsedAt ?? 0))
+    ) {
+      armStallCheck(host)
+    }
+    return
+  }
   host.lastRepairAt = input.now
   repaintHost(host)
   // Said out loud, because the repair is otherwise invisible and the bug it repairs was
@@ -573,7 +633,18 @@ function quiesce(host: PaneHost): void {
   }
 }
 
-/** Return a host to parking. Never destroys it. */
+/**
+ * Return a host to parking. Never destroys it.
+ *
+ * Deliberately does **not** touch `hydrated`, `needsReset` or `sinkClose`: a parked pane
+ * keeps its sink (`panes/sessionSink.ts`), so its buffer stays current for the whole away
+ * period and the next mount has nothing to re-read. The previous arrangement — the sink
+ * detached with the React mount while `hydrated` stayed true — is exactly the frozen-pane
+ * bug: output printed during a project switch reached only the Rust mirror, and the
+ * snapshot that could have repaired the buffer on the way back was refused by the
+ * hydration gate. If parking ever detaches the sink again, it must take the two lines
+ * `releaseHost` has, for the reasons written there.
+ */
 export function parkHost(paneId: string): void {
   const host = hosts.get(paneId)
   if (!host) return
@@ -612,10 +683,13 @@ export function releaseHost(paneId: string): void {
   host.mounted = false
   host.lastUsed = now()
   // The pane has left this window: another one is showing it now, and its child keeps
-  // printing where this terminal cannot see. Clearing the flag is what makes a re-docked
-  // pane read the screen mirror again — without it the terminal comes back holding only
-  // what it saw before the detach, and every byte from the detached period is gone with no
-  // sign that anything is missing.
+  // printing where this terminal cannot see. The sink goes first — it used to go in
+  // `TerminalPane`'s effect cleanup, but the sink belongs to the host now and survives an
+  // ordinary unmount on purpose, so the one unmount that really is a goodbye has to say so
+  // here. Clearing the flag is what makes a re-docked pane read the screen mirror again —
+  // without it the terminal comes back holding only what it saw before the detach, and
+  // every byte from the detached period is gone with no sign that anything is missing.
+  host.sinkClose?.()
   host.hydrated = false
   // The mirror is the whole screen, not a delta, so re-hydrating has to *replace* what the
   // terminal holds rather than append to it. Without the reset the pane comes back showing
@@ -657,6 +731,12 @@ export function destroyHost(paneId: string): void {
 }
 
 function teardown(host: PaneHost): void {
+  // The sink first, before anything touches the terminal it writes into: a frame delivered
+  // between `terminal.dispose()` and the Rust-side detach would be written into a disposed
+  // terminal. This is also what detaches an *evicted* pane — eviction reaches here through
+  // `evictBeyondCap` — so the fresh host its next mount builds attaches a fresh sink and
+  // rehydrates from the mirror, exactly as before the sink moved onto the host.
+  host.sinkClose?.()
   if (host.mounted) {
     // The one thing this module exists to prevent: the element is on screen, so removing
     // it destroys a visible terminal mid-frame. Whoever called this should have released
@@ -784,6 +864,12 @@ export function setHostBusy(paneId: string, busy: boolean): void {
 export function forgetSession(paneId: string): void {
   const host = hosts.get(paneId)
   if (host) {
+    // The sink goes with the session it was registered against. The closure captured that
+    // id at attach, so the detach names the right session *by construction* — the explicit
+    // `paneSession.detach(paneId, old)` this replaces had to be ordered before the id was
+    // cleared, and a detach that read the host's current id after this line would name
+    // nothing and leave the old sink registered for ever.
+    host.sinkClose?.()
     host.sessionId = undefined
     // A restarted pane owns its new child: whatever it adopted is gone, and the id it is
     // about to hold is one this pane spawned. Leaving the flag set would make `closePane`

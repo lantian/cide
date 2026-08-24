@@ -100,11 +100,22 @@ pub enum SearchMode {
     Regex,
 }
 
-/// What the user typed, and the toggles beside the input.
+/// What the user typed, and the toggles and boxes beside the input.
 ///
 /// Echoed back on every [`SearchFrame`] whole, rather than only the pattern string: toggling
 /// case-sensitivity without touching the text changes the answer, and a frontend that
 /// compared pattern strings alone would paint the old results under the new toggle.
+///
+/// # Why the scope and the glob are fields here and not arguments beside the query
+///
+/// `SearchRegistry::job_for` keys the running job on `job.query == *query`, and every frame
+/// echoes the query so one answering a question nobody is asking any more can be dropped
+/// rather than painted. Both of those come free for anything inside this struct and have to
+/// be built by hand for anything outside it — and getting it wrong means one folder's results
+/// drawn under another folder's heading, which is exactly the failure the paragraph above
+/// describes for the case toggle. `ui/src/sidebar/SearchModel.ts::sameQuery` is the frontend
+/// half and must name every field here; `check-search.mjs` drives a field at a time to prove
+/// it does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
@@ -115,6 +126,50 @@ pub struct SearchQuery {
     /// Wrap the pattern in `\b…\b`. On a literal made only of punctuation this can never
     /// match, which is what `grep -w` does with the same input.
     pub whole_word: bool,
+    /// The one folder to search, or `""` for every root — which is the default, so a panel
+    /// nobody has narrowed behaves exactly as it did before this field existed.
+    ///
+    /// Absolute, or relative to a project root and prefixed with that root's label when the
+    /// project has more than one — **the same spelling [`SearchHit::rel`] uses**, so the box
+    /// and the file headings name a place the same way and a path copied from one reads in the
+    /// other. `cide_search::content::resolve_scope` is the only thing that reads it and the
+    /// only place that rule is written down.
+    pub scope: String,
+    /// Which files to look inside, as comma-separated globs, or `""` for all of them.
+    ///
+    /// `*.ts`, `*.rs,*.toml`, `!*.min.js`. Gitignore syntax, because that is what the walker
+    /// already speaks: a glob with no `/` matches a basename at any depth (which is what makes
+    /// a bare `*.ts` mean what everybody expects), one with a `/` is anchored at the root, and
+    /// a leading `!` excludes instead of including.
+    pub include: String,
+}
+
+/// Why a search could not run.
+///
+/// One nullable field on the frame rather than three, and a *kind* rather than a heading. Two
+/// fields that can disagree is what [`PickerRow::source`] argues against at length, and a
+/// heading travelling over the wire would put the panel's copy in a DTO — the frontend maps
+/// the kind to the words, which is where the words belong and where a `never` guard can force
+/// a fourth variant to be spelled out rather than drawn as a blank label.
+///
+/// Carried on the frame instead of rejecting the command, for the reason [`SearchFrame::error`]
+/// gives: half of every regex is unparsable while it is being typed, and so is half of every
+/// folder path and half of every glob. A rejected promise per keystroke would turn ordinary
+/// typing into a stream of errors in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum SearchProblem {
+    /// The pattern did not compile — an unbalanced `(` in regex mode, almost always.
+    Pattern { detail: String },
+    /// [`SearchQuery::scope`] names no directory this project can search.
+    Scope { detail: String },
+    /// [`SearchQuery::include`] holds a glob that did not parse.
+    Include { detail: String },
 }
 
 /// One matching line.
@@ -173,10 +228,7 @@ pub struct SearchFrame {
     pub running: bool,
     /// The hit cap stopped the search early, so the counts are floors rather than totals.
     pub truncated: bool,
-    /// An unusable pattern — an unbalanced `(` in regex mode, almost always.
-    ///
-    /// Carried on the frame instead of rejecting the command: half of every regex is
-    /// unparsable while it is being typed, and a rejected promise per keystroke would turn
-    /// ordinary typing into a stream of errors in the log.
-    pub error: Option<String>,
+    /// An unusable input — the pattern, the scope or the glob. See [`SearchProblem`], which
+    /// carries which one it was.
+    pub error: Option<SearchProblem>,
 }

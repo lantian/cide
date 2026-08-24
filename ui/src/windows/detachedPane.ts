@@ -19,9 +19,10 @@
  * holds a *pane*, not a tab — `Project.detached` is a map of panes, and the pane it holds has
  * been taken out of its tab's tree. Inventing a tab id here would give the file two buffers and
  * whichever saved second would silently discard the other's edits, which is the exact failure
- * `cmd::file::open_file_tab` reuses tabs to prevent. Floating an editor into its own window is a
- * real feature and it starts with making `detached` carry the tab, so this says so instead of
- * half-building it.
+ * `cmd::file::open_file_tab` reuses tabs to prevent. Floating an editor into its own window is
+ * therefore the *tab's* move, not the pane's: `window_detach_tab` tears the whole tab out with
+ * its id, so the one buffer travels with it — see `windows/windowTabs.ts` — and the refusal
+ * below now names that road instead of a bare "yet".
  *
  * Import-free on purpose: `ui/scripts/check-detached.mjs` compiles this file on its own and runs
  * the table below. [`PaneLike`] is a structural subset of the generated `Pane`, declared rather
@@ -71,8 +72,8 @@ export function detachedContent(pane: PaneLike): DetachedContent {
       kind: 'unsupported',
       message:
         pane.kind === 'editor'
-          ? 'A file cannot be shown in a window of its own yet. Redock this pane to get it back.'
-          : 'A diff cannot be shown in a window of its own yet. Redock this pane to get it back.',
+          ? 'A lone file pane cannot live in a window of its own — Redock it, then detach the whole tab instead.'
+          : 'A diff cannot be shown in a window of its own. Redock this pane to get it back.',
     }
   }
   if (pane.session === null) {

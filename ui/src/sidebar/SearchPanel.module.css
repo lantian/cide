@@ -105,6 +105,64 @@
   color: var(--faint);
 }
 
+/*
+ * One narrowing box and its ✕.
+ *
+ * The input flexes and the button does not, so the ✕ sits hard against the right edge at every
+ * UI scale and the box grows into whatever is left. It is a sibling rather than an overlay
+ * inside the input: an absolutely positioned button would need padding-right on the input to
+ * keep the caret out from under it, and that padding would be wrong the moment the icon's
+ * rendered size followed `--ui-scale`.
+ */
+.field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.field .input {
+  flex: 1;
+  min-width: 0;
+}
+
+/*
+ * The offending box, when the frame says which one it is.
+ *
+ * `[aria-invalid='true']` and not a class, so the thing the screen reader is told and the thing
+ * the eye is told cannot come apart — there is one source for both.
+ *
+ * `--yellow` for the reason `.noticeLabel` below is yellow, and it has to be the same colour as
+ * that label or the panel makes two different claims about one fact: an unparsable regex, an
+ * unfinished folder path and a half-typed glob are all states you pass *through* while typing,
+ * not failures. Red here would flash an error at somebody two characters into `crates/`.
+ */
+.input[aria-invalid='true'],
+.input[aria-invalid='true']:focus {
+  border-color: var(--yellow);
+}
+
+/*
+ * Empties its box. Sized like a `.toggle` because it sits in the same column of chrome and a
+ * second button metric here would be visible as a half-pixel of drift against the row above.
+ */
+.clear {
+  flex: none;
+  width: 24px;
+  height: calc(20px * var(--ui-scale));
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  line-height: 1;
+  cursor: default;
+}
+
+.clear:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
 .input:focus {
   outline: none;
   border-color: var(--accent);
@@ -137,6 +195,27 @@
 .toggle:hover {
   background: var(--chrome-hi);
   color: var(--text);
+}
+
+/*
+ * A switch that is on and cannot be turned off — only the ⋯ disclosure, and only while one of
+ * the boxes it reveals holds something.
+ *
+ * `:hover` is neutralised as well as the cursor: a hover wash is a promise that clicking will
+ * do something, and this is the one button here where it will not. It keeps the `.toggleOn`
+ * colour rather than fading, because it is genuinely on — what is refused is turning it off,
+ * and a greyed-out switch would say the opposite. The `title` carries the reason.
+ */
+.toggle:disabled {
+  cursor: default;
+}
+
+.toggle:disabled:hover {
+  background: transparent;
+}
+
+.toggleOn:disabled:hover {
+  background: var(--sel);
 }
 
 .toggleOn,

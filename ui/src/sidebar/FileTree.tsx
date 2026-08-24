@@ -34,6 +34,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { blurLeftTheTree } from '@/sidebar/speedSearch'
+import { claimTreeFocus, releaseTreeFocus } from './treeFocus'
+import { scopeFor, searchInFolder } from './searchScope'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useShallow } from 'zustand/react/shallow'
 import { useFileTree } from './treeStore'
@@ -791,6 +793,17 @@ export function FileTree({
     scrollRef.current?.focus()
     clearFocusRequest('fileTree')
   }, [wantsFocus])
+
+  /*
+   * Give the focus claim up on unmount.
+   *
+   * This panel unmounts every time the rail's selection changes, and a `blur` is not guaranteed
+   * on the way out — React removes the node, and a removed element's focus does not travel
+   * through `focusout` in every path. A claim that survived would mean ⌃⇧F pressed in a
+   * terminal, with the Git panel showing, still scoped the search to whatever row the tree had
+   * selected the last time anybody looked at it.
+   */
+  useEffect(() => () => releaseTreeFocus(), [])
 
   /**
    * Show a refused selection gesture, or say nothing.
@@ -1594,6 +1607,16 @@ export function FileTree({
        */
       const rowRefusal = row === null ? null : mutationRefusal([row.path], writable)
       /*
+       * The string *Search in Folder* would put in the panel's box, or `null` when this row
+       * names no folder the search can reach.
+       *
+       * Computed here beside the other two refusals rather than inside the item, so the label
+       * and the enabled-ness are decided from one answer. `roots` and not `writable`: the
+       * search walks the project's roots, and the *Scratches* drawer is writable and outside
+       * every one of them.
+       */
+      const searchScope = row === null ? null : scopeFor(row.path, row.isDir)
+      /*
        * And the narrower one: a row cide may *rename* but whose directory nobody fills.
        *
        * A scratch is the only such row. `mutationRefusal` passes it — Rename, Cut and *Move to
@@ -1799,6 +1822,44 @@ export function FileTree({
         },
         {
           /*
+           * *Search in Folder*.
+           *
+           * The clicked row and not the selection, for the reason *Reveal in File Manager*
+           * above gives: a scope is one place, and there is no way to express "these five
+           * folders" on the wire or in the box. A **file** row means its containing folder,
+           * which is what `scopeFor` resolves and what the label has to say out loud — an item
+           * reading *Search in Folder* on a `.rs` file would be ambiguous about whether it
+           * searched the file.
+           *
+           * Carries the command id so the row draws whatever chord the live keymap has for
+           * `sidebar.search` — ⌃⇧F, which is exactly the key that does this when the tree has
+           * focus. That is the point of the chip here: it teaches the shortcut for the gesture
+           * the user has just performed with the mouse.
+           *
+           * Disabled with a sentence for a row under no project root — a dependency source, a
+           * scratch, a group heading. The search only ever walks roots, so scoping to one of
+           * those could not produce a hit, and an enabled item that reports *outside this
+           * project* after the fact is the dead control this panel has already shipped twice.
+           */
+          id: 'searchIn',
+          label: row.isDir ? 'Search in Folder' : 'Search in Containing Folder',
+          command: 'sidebar.search',
+          ...(searchScope === null
+            ? {
+                disabledReason: row.isDir
+                  ? 'cide searches only inside the project\u2019s own folders'
+                  : 'This file is outside the project, so there is no folder here to search',
+              }
+            : {
+                run: () => {
+                  if (!searchInFolder(searchScope)) {
+                    setProblem('This window has no sidebar to show the search panel in.')
+                  }
+                },
+              }),
+        },
+        {
+          /*
            * *Show File History*. (M18)
            *
            * Carries the command id, so the row draws whatever chord the live keymap has for it
@@ -1976,6 +2037,14 @@ export function FileTree({
         {...(drag.state === null ? {} : { 'data-dragging': '' })}
         onKeyDown={onKeyDown}
         /*
+         * The tree has the caret. `onFocus` is the bubbling `focusin`, so this also fires for
+         * the rename box and the speed-search field inside the tree — which is right: those
+         * are the tree, and ⌃⇧F pressed in one of them still means the selected row. See
+         * `treeFocus.ts` for why the fact has to be published at all rather than answered by a
+         * handler on this element.
+         */
+        onFocus={claimTreeFocus}
+        /*
          * Every other way out of a speed search, and each one is necessary.
          *
          * A **press** anywhere in the tree is the user choosing a row with the pointer, which is
@@ -1994,7 +2063,9 @@ export function FileTree({
         onBlur={(e) => {
           // Only when focus really left the tree — `onBlur` is the bubbling
           // `focusout`, so landing on a match fires it too. See `blurLeftTheTree`.
-          if (blurLeftTheTree(e.currentTarget, e.relatedTarget)) speedSearch.exit()
+          if (!blurLeftTheTree(e.currentTarget, e.relatedTarget)) return
+          speedSearch.exit()
+          releaseTreeFocus()
         }}
         onContextMenu={onContextMenu}
       >

@@ -438,12 +438,17 @@ try {
   eq(awaitingBadge(0), '', 'nothing waiting draws an empty box, never a zero')
   eq(awaitingBadge(1), '1', 'a count, not a dot: how many decides whether the user goes now')
   eq(awaitingBadge(9), '9', 'nine still fits the reserved box')
-  // The reserve and the chip are one number, and that is what stops the marker moving a tab.
+  // The box, its slot and every reach-over are one set of numbers, and the empty marker
+  // collapses them together.
   //
-  // `.awaiting` sets `width: var(--awaiting-w)`; `.labelPinned` reaches over the same variable
-  // in a negative margin and a matching padding. Written as two literals they would drift, and
-  // the drift is invisible until a marker appears and shoves every tab after it sideways under
-  // the pointer. Asserted on the stylesheet because there is no DOM here.
+  // `.awaiting` sets `width: var(--awaiting-w)` and cancels its flex gap from
+  // `--awaiting-slot`; `.labelPinned` reaches over the slot in a negative margin and a
+  // matching padding; `[data-awaiting='false']` zeroes width and slot as a pair. Written as
+  // literals they would drift, and every direction of drift is invisible in the rest state:
+  // a width zeroed without its slot is 8px of nothing between a title and its close button, a
+  // slot zeroed without the reach following is a pinned label poking past its own tab's edge,
+  // and no collapse at all is the permanent 26px reserve this design replaced. Asserted on
+  // the stylesheet because there is no DOM here.
   {
     const css = readFileSync(new URL('../src/chrome/TabStrip.module.css', import.meta.url), 'utf8')
     eq(
@@ -454,7 +459,22 @@ try {
     eq(
       (css.match(/var\(--awaiting-w\)/g) ?? []).length,
       3,
-      'and so do both halves of `.labelPinned`\'s reach-over — three readers, one number',
+      'exactly three readers of the width — the slot definition, the chip, and its ' +
+        'gap-cancel — one number',
+    )
+    eq(
+      (css.match(/var\(--awaiting-slot\)/g) ?? []).length,
+      3,
+      "and three of the slot — both halves of `.labelPinned`'s reach-over and the chip's " +
+        'gap-cancel — or the label reach drifts from the geometry it reaches over',
+    )
+    eq(
+      /\.tab\[data-awaiting='false'\]\s*\{\s*--awaiting-w:\s*0px;\s*--awaiting-slot:\s*0px;\s*\}/.test(
+        css,
+      ),
+      true,
+      'an empty marker collapses BOTH numbers together — the width alone leaves the flex ' +
+        'gap, the slot alone leaves the label reach; either half is invisible until hovered',
     )
 
     /*
@@ -619,16 +639,36 @@ try {
   //    terminal answers Device Attributes, cursor position and focus reports on it by itself —
   //    so acknowledging there let the CLI's own end-of-turn probe clear the marker with nobody
   //    at the keyboard, in exactly the situation the feature exists for.
-  const terminal = src('src/panes/TerminalPane.tsx')
-  const onData = terminal.slice(terminal.indexOf('term.onData('))
-  if (onData.slice(0, onData.indexOf('})')).includes('acknowledge(')) {
+  //
+  //    The handler lives in `sessionSink.ts` now — keystrokes ride the sink, whose lifetime
+  //    is the host's claim on the session rather than a mount — so the slice is taken there,
+  //    and its presence is asserted first: the original form indexed into TerminalPane.tsx
+  //    and passed vacuously with the handler deleted.
+  const sink = src('src/panes/sessionSink.ts')
+  const onDataAt = sink.indexOf('term.onData(')
+  if (onDataAt === -1) {
     console.error(
-      'FAIL the awaiting marker is not cleared by terminal output\n' +
-        '  TerminalPane.tsx acknowledges inside term.onData, which fires for the terminal s ' +
-        'own automatic replies — the CLI probing the terminal after a turn would clear it',
+      'FAIL sessionSink.ts registers no term.onData handler\n' +
+        '  the keystroke path lives with the sink; without it nothing reaches the child',
     )
     failed++
+  } else {
+    const onData = sink.slice(onDataAt)
+    if (onData.slice(0, onData.indexOf('})')).includes('acknowledge(')) {
+      console.error(
+        'FAIL the awaiting marker is not cleared by terminal output\n' +
+          '  sessionSink.ts acknowledges inside term.onData, which fires for the terminal s ' +
+          'own automatic replies — the CLI probing the terminal after a turn would clear it',
+      )
+      failed++
+    }
   }
+  lacks(
+    'src/panes/TerminalPane.tsx',
+    'term.onData(',
+    'the keystroke handler is the sink s alone — a second one per mount would send every ' +
+      'keystroke twice',
+  )
   has(
     'src/panes/TerminalPane.tsx',
     "addEventListener('keydown', onKeyDown)",
@@ -649,6 +689,34 @@ try {
     )
     failed++
   }
+  // 4b. A shell pane raises the same signal. Every surface above keys off a *session id* and
+  //     never on the pane's kind, so the only reason a bash pane stayed dark was that a shell
+  //     emitted exactly one `SessionState` in its life — `Exited`, at death. Both halves of
+  //     what changed that are pinned here, because both fail silently: a shell that stops
+  //     being watched simply never notifies again, and a Claude pane that starts being
+  //     watched gets a second, contradictory opinion about its own state on every tool call.
+  const spawn = rust('crates/cide-app/src/cmd/session.rs')
+  if (!/if !is_claude \{\s*\n\s*spec = spec\.watch_jobs\(/.test(spawn)) {
+    console.error(
+      'FAIL a shell pane watches its foreground process group, and a Claude pane does not\n' +
+        '  cmd/session.rs no longer gates `watch_jobs` on `!is_claude` — either a finished ' +
+        '`make` notifies nobody, or the pgid watcher is fighting the hooks for one SessionState',
+    )
+    failed++
+  }
+  const lifecycle = rust('crates/cide-app/src/lifecycle.rs')
+  const mapping = lifecycle.slice(lifecycle.indexOf('fn job_state('))
+  const arms = mapping.slice(0, mapping.indexOf('\n}\n'))
+  if (!/JobEvent::Finished \{ \.\. \} => SessionState::AwaitingInput/.test(arms)) {
+    console.error(
+      'FAIL a finished shell job asks for the user rather than merely going idle\n' +
+        '  lifecycle.rs maps it to something else — `Idle` raises the marker only for a ' +
+        'session the frontend watched go Busy, and a pane in a background project need not ' +
+        'have been listening at the time',
+    )
+    failed++
+  }
+
   // 5. …and the hint is a LEVEL, not an edge. This is the fix for "i saw it once only, and
   //    after i've focused - nothing more calling me in title, or panel". An urgency hint on
   //    the *active* window is dropped rather than deferred (KWin's `demandAttention` opens

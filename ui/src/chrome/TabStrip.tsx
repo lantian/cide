@@ -69,7 +69,9 @@ import { Icon } from '@/icons/Icon'
 import styles from './TabStrip.module.css'
 
 export interface TabStripProps {
-  tabs: Tab[]
+  // `readonly`: the shell hands in a filtered view (`windows/windowTabs.ts`), and the strip
+  // has no business mutating the list either way.
+  tabs: readonly Tab[]
   activeTab: TabId
   onActivate?: ((id: TabId) => void) | undefined
   onClose?: ((id: TabId) => void) | undefined
@@ -480,12 +482,11 @@ function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }
         {view.body}
       </button>
       {/*
-       * Always rendered, filled only when it means something — the same contract, and for the
-       * same reason, as the marker in the pane title bar. A box that appeared and cleared
-       * would change this tab's width, shove every tab after it sideways and reflow the strip
-       * *under the pointer*; the strip is 30px with 12-13px paddings, so a tab that moves
-       * while being aimed at is a tab that gets missed. Reserving 13px permanently is the
-       * price, and the CSS states what that price actually costs.
+       * Always rendered, filled only when it means something. Rendered always because the
+       * live region below has to exist before its content arrives to be announced; *sized*
+       * only when lit, because the stylesheet collapses the empty box via `data-awaiting` on
+       * the row — the permanent reserve it replaced put 26px of nothing at the tail of every
+       * tab, and the CSS records why that trade was reversed.
        */}
       <span
         className={badge ? `${styles.awaiting} ${styles.awaitingOn}` : styles.awaiting}

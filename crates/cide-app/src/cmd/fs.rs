@@ -1035,23 +1035,59 @@ pub async fn fs_reveal_roots(
     .await
 }
 
+/// Rename a file or folder, and take everything that pointed at it along. (M25)
+///
+/// The second half is not a courtesy. A `TabKind::File` tab is an absolute path, and
+/// `cide_core::document::write` canonicalizes before it writes — so a tab left behind by a rename
+/// is a buffer the user can still type into and **cannot save at all**, with `ENOENT` in the log
+/// and a dirty dot that nothing can clear. See [`cide_core::workspace::retarget_paths`], which is
+/// where the rule lives and where the reasoning is written down.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_rename(
     app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
+    state: State<'_, WorkspaceState>,
+    positions: State<'_, Arc<crate::positions_state::PositionsState>>,
     project: ProjectId,
     from: PathBuf,
     to: PathBuf,
 ) -> Result<(), FsError> {
     let fs = project_fs(&registry, project)?;
     let events: Arc<dyn FsEvents> = Arc::new(app);
+    let moved = (from.clone(), to.clone());
     blocking("fs_rename", move || {
         if rename_entry(&fs, &from, &to)? {
             events.status(project, &fs.status());
         }
         Ok(())
     })
-    .await?
+    .await??;
+    // Only after the disk agrees. A refusal — a root, an occupied name, a cross-device move —
+    // leaves every tab naming a file that is still there, which is the correct answer.
+    follow_moves(&state, &positions, &[moved]);
+    Ok(())
+}
+
+/// Tell everything that remembers where a file *was* that it moved. (M25)
+///
+/// Two records, one gesture: the open tabs and the per-file view memory. Both are keyed on an
+/// absolute path and both are wrong the instant one changes, and they are moved together here
+/// rather than at each call site so that a third mover — a future *Move to…* — has one function
+/// to call instead of two facts to remember.
+///
+/// A `Result` would have nowhere to go: the file has already moved, and refusing to update the
+/// mirror of a move that has happened is not a recovery. The tab retarget can only fail by
+/// breaking a workspace invariant, which `WorkspaceState::update` rolls back and logs.
+fn follow_moves(
+    state: &WorkspaceState,
+    positions: &crate::positions_state::PositionsState,
+    moves: &[(PathBuf, PathBuf)],
+) {
+    positions.rename(moves);
+    let _ = state.update(|ws| {
+        cide_core::workspace::retarget_paths(ws, moves);
+        Ok(())
+    });
 }
 
 /// [`fs_rename`] with its Tauri-injected arguments already resolved. Answers whether the scratch
@@ -1217,9 +1253,19 @@ pub async fn fs_paste_plan(
 /// directory of every path it is given, so naming a cut's source is what makes the row it left
 /// behind disappear in the same repaint that draws the row it arrived at — otherwise a move
 /// shows the file in two places until the watcher catches up.
+///
+/// A **cut** is a move, so it takes the open tabs with it exactly as [`fs_rename`] does — same
+/// defect, same fix, and the paste half is the one that would have been left behind. A copy moves
+/// nothing and is asked nothing.
 #[tauri::command(rename_all = "camelCase")]
+// Three of the eight are Tauri's injected state, which the caller never spells: the wire
+// signature is the five below them, and splitting a command's arguments into a struct to satisfy
+// this lint would change what the frontend sends for a reason no frontend has.
+#[allow(clippy::too_many_arguments)]
 pub async fn fs_paste(
     registry: State<'_, FsRegistry>,
+    state: State<'_, WorkspaceState>,
+    positions: State<'_, Arc<crate::positions_state::PositionsState>>,
     project: ProjectId,
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
@@ -1227,10 +1273,22 @@ pub async fn fs_paste(
     decisions: Vec<cide_ipc::PasteDecision>,
 ) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
     let fs = project_fs(&registry, project)?;
-    blocking("fs_paste", move || {
+    let pasted = blocking("fs_paste", move || {
         paste_into(&fs, &sources, &dest_dir, mode, &decisions)
     })
-    .await?
+    .await??;
+    if mode == cide_ipc::PasteMode::Cut {
+        // `entry.dest` and not the destination directory joined to the source's name: a
+        // collision is renamed rather than refused, so the file the user cut may well have
+        // landed as `main copy.rs` — and a tab retargeted onto the name it *wanted* would be a
+        // tab pointing at somebody else's file.
+        let moves: Vec<(PathBuf, PathBuf)> = pasted
+            .iter()
+            .map(|entry| (entry.source.clone(), entry.dest.clone()))
+            .collect();
+        follow_moves(&state, &positions, &moves);
+    }
+    Ok(pasted)
 }
 
 /// [`fs_paste`] with its Tauri-injected argument already resolved to a value.

@@ -1,5 +1,9 @@
 /**
- * Checks `src/windows/detachedPane.ts` — what a `pane:<uuid>` window may show.
+ * Checks `src/windows/detachedPane.ts` — what a `pane:<uuid>` window may show — and
+ * `src/windows/windowTabs.ts` — which tabs each window draws, and what a tab's only pane's
+ * close/detach/maximize buttons act on. The two are one feature seen from both windows: an
+ * editor can only leave the shell as a whole tab, and a torn-out tab must be drawn by
+ * exactly one window.
  *
  * Worth a check because the failure it replaces was invisible to `tsc` and nearly invisible to
  * a reader. `DetachedPaneWindow` asked `needsSession(pane)`, got `false` for an `editor` pane —
@@ -45,6 +49,7 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/windows/detachedPane.ts',
+      'src/windows/windowTabs.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -134,11 +139,102 @@ try {
       'a negated orphan check, a truthiness test — is how a shell gets spawned for an editor',
   )
 
+  // --- the detached-TAB rules: src/windows/windowTabs.ts --------------------------------------
+
+  const { clusterPlan, detachedTabs, shownTabs } = await import(
+    `file://${join(out, 'windowTabs.js')}`
+  )
+
+  const TABS = [{ id: 'console' }, { id: 'a' }, { id: 'b' }]
+  const WINDOWS = {
+    'shell:1': { kind: 'shell' },
+    'tab:1': { kind: 'detachedTab', tab: 'b' },
+    'pane:1': { kind: 'detachedPane', tab: 'a' },
+  }
+
+  eq(
+    [...detachedTabs(WINDOWS)],
+    ['b'],
+    'a detachedTab role marks its tab as torn out; a detachedPane role marks NOTHING — its ' +
+      '`tab` is the home the pane re-docks into, still drawn by the shell',
+  )
+  eq(
+    shownTabs({ kind: 'shell' }, TABS, WINDOWS).map((t) => t.id),
+    ['console', 'a'],
+    'THE LOAD-BEARING FILTER: the shell must not draw a torn-out tab. The tab stays in ' +
+      '`project.tabs` (quit guards and restore plans walk that list), so this filter is the ' +
+      'only thing between one file tab and two live buffers over one file',
+  )
+  eq(
+    shownTabs({ kind: 'detachedTab', tab: 'b' }, TABS, WINDOWS).map((t) => t.id),
+    ['b'],
+    'a tab window draws exactly its own tab',
+  )
+  eq(
+    shownTabs({ kind: 'detachedPane', tab: 'a' }, TABS, WINDOWS).map((t) => t.id),
+    [],
+    'a pane window draws no tab at all — its pane lives outside every tree',
+  )
+  eq(
+    shownTabs({ kind: 'shell' }, TABS, { 'shell:1': { kind: 'shell' } }),
+    TABS,
+    'with nothing torn out the shell draws every tab',
+  )
+
+  eq(
+    clusterPlan(1, false),
+    { maximize: false, close: 'tab', detach: 'tab' },
+    "a tab's only pane: maximize is withheld (it already fills the tab), and close/detach " +
+      "act on the TAB — `layout::close`/`take_pane` refuse a last pane, and these buttons " +
+      "used to run into that refusal and print `lastPane`",
+  )
+  eq(
+    clusterPlan(2, false),
+    { maximize: true, close: 'pane', detach: 'pane' },
+    'a pane with a sibling keeps all three pane-scoped actions',
+  )
+  eq(
+    clusterPlan(1, true),
+    { maximize: false, close: 'pane', detach: 'pane' },
+    "the pinned console's sole pane stays pane-scoped: the console cannot close or detach " +
+      'as a tab, and the pane-scoped arms keep the role-based refusals that word the buttons',
+  )
+
+  // --- the source pins for the tab rules ------------------------------------------------------
+
+  const app = readFileSync(join(UI, 'src/App.tsx'), 'utf8')
+  ok(
+    /<TabContent[\s\S]{0,600}tabs=\{visibleTabs\}/.test(app),
+    'TabContent is fed the FILTERED list. It mounts every tab it is handed, hidden or not, ' +
+      'so `tabs={activeProject.tabs}` here would put a second live editor behind the shell ' +
+      'for every torn-out file',
+  )
+  ok(
+    app.includes('shownTabs(boot.role, activeProject.tabs, boot.workspace.windows)'),
+    'and the filtered list comes from this module rather than being re-derived in place',
+  )
+  ok(
+    app.includes('clusterPlan('),
+    "the pane cluster's handlers are routed by clusterPlan, not by a re-derived pane count",
+  )
+
+  const dispatch = readFileSync(join(UI, 'src/keys/dispatch.ts'), 'utf8')
+  ok(
+    /case 'pane\.close': \{[\s\S]{0,900}clusterPlan\(/.test(dispatch),
+    "the pane.close chord follows the same clusterPlan the button does — the chord closing " +
+      'the pane while the button closes the tab is the drift this module exists to prevent',
+  )
+  ok(
+    /case 'pane\.detachToWindow': \{[\s\S]{0,900}clusterPlan\(/.test(dispatch),
+    'and so does pane.detachToWindow',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)
   }
   console.log('detached pane window: ok')
+  console.log('detached tab rules: ok')
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

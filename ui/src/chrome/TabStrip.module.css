@@ -32,12 +32,19 @@
  * computed style; the buttons reach back over the padding rather than owning it.
  */
 .tab {
-  /* The awaiting marker's reserved box. Named here rather than in `.awaiting` because
-     `.labelPinned` has to reach over it too, and two literals that must agree is one too
-     many. Scaled, because the chip's *height and glyph* are and this is the only one of the
-     three that is a width — left fixed, the reserve would stop holding `9+` the moment the
-     chrome font size went up, and the `overflow: hidden` below would eat the `+`. */
+  /* The awaiting marker's box. Named here rather than in `.awaiting` because `.labelPinned`
+     has to reach over it too, and two literals that must agree is one too many. Scaled,
+     because the chip's *height and glyph* are and this is the only one of the three that is
+     a width — left fixed, the box would stop holding `9+` the moment the chrome font size
+     went up, and the `overflow: hidden` below would eat the `+`.
+
+     `--awaiting-slot` is the marker's whole cost in the row — the flex gap in front of it
+     plus the box — and it exists so the two can be zeroed *together* when nothing is
+     waiting (see the `[data-awaiting='false']` rule below). Zeroing the width alone leaves
+     the gap: a 0px flex item still takes a gap on each side, which is 8px of nothing
+     between a file tab's title and its close button. */
   --awaiting-w: calc(18px * var(--ui-scale));
+  --awaiting-slot: calc(var(--tab-gap) + var(--awaiting-w));
   display: flex;
   align-items: center;
   gap: var(--tab-gap);
@@ -130,7 +137,14 @@
 .shapeClaude {
   --tab-gap: var(--sp-4);
   --tab-pad: var(--sp-5);
-  padding-right: 0px;
+  /* No `padding-right: 0` here, and it is load-bearing that there is none. The right padding
+     was once zeroed to trim the pinned tab's blank right side, back when the awaiting box was
+     a permanent reserve and its empty 26px doubled as padding — but the tab's right padding
+     is ALSO the lit chip's only margin from the tab edge, so the chip sat flush against the
+     edge, and `.labelPinned`'s reach-over — which trusts `--tab-pad` to exist on the right —
+     overflowed the tab by exactly the padding it reached over. The reserve is gone (the box
+     collapses when empty, below), so the trim has nothing left to trim; the audit expects
+     12px (`consoleTab.paddingRight`), and both failures come back if this returns. */
   font-weight: 500;
   font-size: var(--fs-ui-13);
 }
@@ -172,40 +186,49 @@
 
 /*
  * The pinned console has no close button, so its label reaches over both sides — and past
- * the awaiting marker too, which is a `span` and not a control. Without the `--awaiting-w`
- * and `--tab-gap` terms the right-hand 22px of the console tab would light up on hover and
- * do nothing, which is the same dead strip the left padding was before `.label` reached over
- * it. The marker is `pointer-events: none`, so the click lands on the label underneath.
+ * the awaiting marker too, which is a `span` and not a control. The slot term is the gap
+ * plus the chip when the marker is lit and exactly zero when it is not, so in both states
+ * the reach ends at the tab's edge: without it the right-hand end of the console tab would
+ * light up on hover and do nothing, which is the same dead strip the left padding was
+ * before `.label` reached over it; past it, the label would poke out of its own tab. The
+ * marker is `pointer-events: none`, so the click lands on the label underneath.
  */
 .labelPinned {
-  margin-right: calc(-1 * (var(--tab-pad) + var(--tab-gap) + var(--awaiting-w)));
-  padding-right: calc(var(--tab-pad) + var(--tab-gap) + var(--awaiting-w));
+  margin-right: calc(-1 * (var(--tab-pad) + var(--awaiting-slot)));
+  padding-right: calc(var(--tab-pad) + var(--awaiting-slot));
+}
+
+/*
+ * No badge, no box.
+ *
+ * The marker stays *rendered* on every tab — `role="status"` has to exist before its content
+ * arrives to be reliably announced, so the TSX never unmounts it — but an empty marker now
+ * costs zero width: this rule zeroes the box and its slot together, and the chip's own
+ * negative `margin-left` (below) hands back the flex gap a 0px item would still take.
+ *
+ * This reverses the first design, which reserved the box permanently so that a marker
+ * appearing could never move a tab under the pointer. That invariant was real but priced
+ * wrong: it put `--tab-gap` + 18px of nothing at the tail of EVERY tab in its rest state —
+ * between a file tab's title and its close button, trailing the console tab's title — and it
+ * read as a layout bug ("a lot of empty space in tab"), not as insurance. The hazard it
+ * bought out is narrow: a badge *appears* when a session finishes a turn, which is occasional,
+ * and it *clears* on a keystroke into the waiting pane — a moment when the pointer is in the
+ * pane, not in the strip. The owner took the occasional 26px shift over permanent dead space.
+ * What survives of the old rule: the box may never change size *while lit* — fixed width,
+ * `9+` cap, clip — so a count going 2 → 9+ still moves nothing.
+ */
+.tab[data-awaiting='false'] {
+  --awaiting-w: 0px;
+  --awaiting-slot: 0px;
 }
 
 /*
  * "Sessions behind this tab are waiting for you."
  *
- * The box is reserved on every tab, always, and that is the requirement rather than tidiness:
- * a marker that took its space on appearing would widen its tab and slide every tab after it
- * sideways. The strip is 30px tall with 12-13px paddings and it reflows *under the pointer* —
- * a tab that moves as it is being aimed at is a tab that gets clicked wrong. The pane title
- * bar reserves its 7px for the same reason and pays the same price.
- *
- * The price is not free and is worth stating, because nothing measures it: every tab is now
- * `--tab-gap + 13px` = 21-22px wider, `.tabs` has `overflow: hidden` and the tabs do not
- * shrink or scroll, so roughly two fewer tabs fit before the last one is cut off. The
- * alternative that lost was `position: absolute` inside a `position: relative` tab, which
- * meets the no-reflow requirement at zero width. It lost because there is nowhere free to
- * put it: the tab is swatch/badge, title, close, and an absolute chip lands on top of one of
- * them — over the close button it eats the click target, over the title it hides the text a
- * clipped tab most needs. A reserved box is 22px of strip; an overlay is a control the user
- * cannot hit.
- *
  * Fixed `width` with `flex: none`, and the mono family and `tabular-nums` regardless of which
  * shape class the tab wears: a digit's advance otherwise depends on the tab kind, the user's
- * font and the theme, and the one thing this box may not do is be a different size in a
- * different tab. 13px holds `9+` at 9.5px mono with room to spare; `awaitingBadge` caps the
- * count there so nothing can ever overflow it.
+ * font and the theme, and a lit box may not be a different size in a different tab.
+ * `awaitingBadge` caps the count at `9+` so nothing can ever overflow it.
  *
  * `pointer-events: none` keeps the tab one box the pointer can hit anywhere — the tooltip
  * lives on the tab's own button, which is also where the uncapped count is spelled out.
@@ -213,6 +236,11 @@
 .awaiting {
   flex: none;
   width: var(--awaiting-w);
+  /* Zero while lit; `-1 * --tab-gap` while empty. The subtraction is not clever for its own
+     sake: written as literals, the collapse above would zero the box and leave its gap, and
+     8px of residual nothing is exactly the class of drift the slot variable exists to make
+     impossible. */
+  margin-left: calc(var(--awaiting-slot) - var(--awaiting-w) - var(--tab-gap));
   /*
    * 18x16, not 13x13, and a pill rather than a rounded square.
    *
@@ -226,10 +254,10 @@
    * 2.8px — back under the 3px floor, by two tenths of a pixel. `check:awaiting` caught it,
    * which is the whole reason that gate derives the number instead of pinning it.
    *
-   * `--awaiting-w` is what makes that safe. It is read here AND by `.labelPinned`'s
-   * margin/padding pair, so the space the label reaches over grows with the chip and the tab
-   * does not shift when the marker appears — which is the one thing this marker may not do.
-   * The height is not shared and is set beside it; they are a visual pair, not a layout one.
+   * `--awaiting-w` is what makes that safe. It is read here, by the gap-cancel above, and by
+   * `--awaiting-slot` — which `.labelPinned`'s margin/padding pair reaches over — so the
+   * label's reach grows with the chip and ends at the tab's edge in both states. The height
+   * is not shared and is set beside it; they are a visual pair, not a layout one.
    *
    * Still comfortably inside the strip, and **wider** than the two mono digits `9+` needs
    * — JetBrains Mono advances 0.6em, so 13.2px at this size against an 18px box — which is what
@@ -239,8 +267,8 @@
    */
   height: calc(16px * var(--ui-scale));
   /* Clip rather than `min-width`. If a fallback font ever makes `9+` wider than the box, a
-     clipped `+` is a cosmetic loss; `min-width` would let the box grow, which moves the tab
-     and every tab after it — the one thing this marker may not do. */
+     clipped `+` is a cosmetic loss; `min-width` would let the box grow, which moves a LIT
+     tab under the pointer — the part of the old no-reflow rule that still holds. */
   overflow: hidden;
   /* A pill, so the shape says "badge" rather than "small filled square", which is what 3px on
      a 13px box read as. `--r-full` rather than half the height: on a box wider than it is tall

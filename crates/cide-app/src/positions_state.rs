@@ -114,6 +114,44 @@ impl PositionsState {
         persist::position_for(&self.inner.lock(), path).cloned()
     }
 
+    /// Follow files that moved on disk — `(from, to)` pairs, matched exactly or as a directory
+    /// prefix. (M25)
+    ///
+    /// The record is keyed on an absolute path, so a rename orphans it: the tab that
+    /// `workspace::retarget_paths` just moved asks for the *new* name, is told nothing is
+    /// remembered, and the editor rebuilds at line 1. Renaming a file you are reading at line 400
+    /// and being thrown to the top of it is the visible half of that; the invisible half is the
+    /// orphan, which survives in `positions.json` until the LRU evicts it.
+    ///
+    /// Same rule as the tabs, via [`cide_core::workspace::moved_path`], because a second spelling
+    /// of "is this path inside that folder" would be a second answer.
+    ///
+    /// No event, for the reason the module header gives about every write here: a position is
+    /// read when a pane mounts and never pushed, and the pane that is about to ask has not been
+    /// told the path moved yet either.
+    pub fn rename(&self, moves: &[(PathBuf, PathBuf)]) {
+        let mut changed = false;
+        {
+            let mut list = self.inner.lock();
+            for at in list.iter_mut() {
+                if let Some(next) = moves
+                    .iter()
+                    .find_map(|(from, to)| cide_core::workspace::moved_path(&at.path, from, to))
+                {
+                    at.path = next;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            // Noted so the move reaches the disk on the ordinary debounce. Without it a rename
+            // followed by a quit with no further scrolling would write the old paths back out.
+            // Guarded, because most renames are of files nobody has ever scrolled: an
+            // unconditional note would put a disk write behind every one of them.
+            self.debounce.note_change();
+        }
+    }
+
     /// Write if the debounce has elapsed.
     pub fn flush_if_due(&self) {
         if self.debounce.take() {

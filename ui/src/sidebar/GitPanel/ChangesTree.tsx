@@ -536,11 +536,14 @@ export function ChangesTree({
               const action = gitTreeClick({
                 gesture,
                 expandable: row.expandable,
+                isDir: row.kind === 'dir',
+                onTwisty: pressOnTwisty(e, row),
                 diffOpen,
               })
               deferred.current = null
-              // `action.select` is false only on the second half of a double-click, whose
-              // first half has already moved the cursor and set the selection.
+              // `action.select` is false only on the second half of a double-click on a
+              // header or a twisty, whose first half has already moved the cursor and set
+              // the selection.
               if (action.select && onPress(row.id, mods)) deferred.current = row.id
               /*
                * The gesture, not a second rule. `gitTreeClick` returns `open` for two
@@ -577,10 +580,12 @@ export function ChangesTree({
              * pointer, taking the rows being dragged off the screen. So the toggle waits for
              * the mouseup and is skipped when the gesture turned out to be a drag.
              *
-             * The rule itself is untouched: `gitTreeClick` is asked again, with the same
-             * `detail`-derived gesture (a mouseup carries the click count too), so the second
-             * half of a double-click still does nothing and a file row still toggles nothing.
-             * Diff-opening stays on the press, where it feels immediate.
+             * The rule itself lives in `gitTreeClick`, asked again with the same
+             * `detail`-derived gesture (a mouseup carries the click count too): a header folds
+             * on the first release and refuses the second, a directory folds on the second
+             * release or on a twisty's first — the file tree's gesture, ported on request —
+             * and a file row toggles nothing. Diff-opening stays on the press, where it feels
+             * immediate.
              *
              * The *selection's* collapse is here for the same reason the fold is, and it is
              * the detail that makes dragging a multi-row selection possible at all. A plain
@@ -605,13 +610,24 @@ export function ChangesTree({
               const action = gitTreeClick({
                 gesture: gestureOf(e.detail),
                 expandable: row.expandable,
+                isDir: row.kind === 'dir',
+                onTwisty: pressOnTwisty(e, row),
                 diffOpen,
               })
               if (action.toggle) onToggleExpand(row)
             }}
             onKeyDown={(e) => onKeyDown(e, row, index)}
           >
-            <span className={styles.twisty} aria-hidden="true">
+            <span
+              className={styles.twisty}
+              /* The twisty is a control, not a handle — on a directory row one click on it is
+                 the fold, so a hand that shifts three pixels while clicking it must not pick
+                 the row up instead. The *click* still reaches the row (only the pointer press
+                 is stopped), so `gitTreeClick`'s `onTwisty` rule is untouched. Same rule, same
+                 comment as the explorer's twisty and this tree's own checkbox. */
+              onPointerDown={(e) => e.stopPropagation()}
+              aria-hidden="true"
+            >
               {row.expandable ? (
                 <Icon name={open ? 'chevron-down' : 'chevron-right'} size={1} />
               ) : null}
@@ -649,7 +665,12 @@ export function ChangesTree({
             {row.kind === 'file' ? (
               <FileLabel row={row} iconTheme={iconTheme} match={speedSearch.spanFor(index)} />
             ) : (
-              <GroupLabel row={row} match={speedSearch.spanFor(index)} />
+              <GroupLabel
+                row={row}
+                open={open}
+                iconTheme={iconTheme}
+                match={speedSearch.spanFor(index)}
+              />
             )}
           </div>
         )
@@ -691,6 +712,21 @@ function DragGhost({ state }: { state: ChangesDragState }) {
 }
 
 /**
+ * Whether a press landed on the row's twisty — `gitTreeClick`'s `onTwisty`.
+ *
+ * `row.expandable` guards it the way `hasTwisty` guards the file tree's, and the guard is
+ * load-bearing rather than tidy: the `.twisty` span is drawn on *every* row — it is part of
+ * the layout, so a file row has one too, empty and 9px wide — and without the guard those 9px
+ * would be a strip down the left of each file where a double-click resolved to "second half
+ * of a twisty gesture", which is `NOTHING`: the file would simply refuse to open its diff.
+ */
+function pressOnTwisty(e: { target: EventTarget }, row: Row): boolean {
+  return (
+    row.expandable && e.target instanceof Element && e.target.closest(`.${styles.twisty}`) !== null
+  )
+}
+
+/**
  * Four orthogonal facts about a row, so the ternary chain does not have to nest.
  *
  * `groupRow` is the `--panel-2` header ground, and a *directory* deliberately does not get it:
@@ -711,22 +747,42 @@ function rowClass(row: Row, isCurrent: boolean, isSelected: boolean): string {
 }
 
 /**
- * A changelist or a repository: name, then its file count.
+ * A changelist, a repository or a directory: name, then its file count.
  *
  * The active changelist is the one a commit defaults to, so it is the one name in this
  * tree that is drawn in `--text` rather than `--dim`. A repository row carries its absolute
  * work tree as a tooltip — the row itself shows only the last path component, and in a
  * workspace with two roots called `core` that is the only way to tell them apart.
+ *
+ * A **directory** row draws the explorer's folder icon, open or closed with the row, because
+ * without one it was the only folder in the app drawn as bare text — the same argument that
+ * put the file icons on the leaves below it. The icon is looked up by the *deepest* segment
+ * of `row.path`, not by the label: a compacted row reads `crates/cide-git/src` on one line,
+ * and the directory that row actually is — the one its id and its files hang off — is `src`,
+ * which is also what the explorer shows an icon for at that level. Headers draw none: a
+ * changelist is not a folder, and a folder icon on it would say it is one.
  */
 function GroupLabel({
   row,
+  open,
+  iconTheme,
   match,
 }: {
   row: Row
+  /** Expanded, per the tree's `expanded` set — drives the open/closed folder mark. */
+  open: boolean
+  iconTheme: IconTheme
   match: { start: number; end: number } | undefined
 }) {
   return (
     <>
+      {row.kind === 'dir' && (
+        <FileIcon
+          row={{ name: splitPath(row.path ?? row.label).name, kind: 'dir', expanded: open }}
+          theme={iconTheme}
+          className={styles.icon}
+        />
+      )}
       <span
         className={row.kind === 'dir' ? styles.dirName : styles.groupName}
         data-kind={row.kind}

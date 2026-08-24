@@ -908,6 +908,26 @@ pub async fn session_spawn(
     // a program can do with it.
     let replay_for = (!is_claude).then_some(resume).flatten();
 
+    // Watch the foreground process group, for a shell and only for a shell.
+    //
+    // This is what makes a finished `make` in a bash pane raise the same signal a finished
+    // Claude turn raises — the pane dot, the tab and project badges, `Awaiting: n` in the
+    // window title and the task-bar urgency hint. None of those surfaces were ever
+    // Claude-specific: they key off a session id, and the reason a shell pane stayed dark is
+    // that a shell emitted exactly one `SessionState` in its life, `Exited`, at death.
+    //
+    // Never for Claude, and that is not a performance decision: a Claude session's state
+    // comes from its hooks, which know the difference between a turn ending and a permission
+    // prompt, and every tool call the CLI forks takes a process group of its own. Watching
+    // both would have two writers disagreeing about one `SessionState`, with whichever polled
+    // last winning.
+    //
+    // See `cide_pty::jobs` for what is observed, and `lifecycle::JOB_NOTIFY_AFTER` for why a
+    // job has to run for a while before anything is said about it.
+    if !is_claude {
+        spec = spec.watch_jobs(crate::lifecycle::JOB_NOTIFY_AFTER);
+    }
+
     let session = blocking(move || {
         // Inside the blocking closure, not outside it: the first call reads `screens.json`
         // off disk, and every Tauri command that touches a filesystem in this app does it
@@ -929,6 +949,7 @@ pub async fn session_spawn(
     // fires immediately instead of never — but registering it first keeps the ordering
     // obvious rather than relying on that.
     crate::lifecycle::watch_for_exit(app.clone(), id, &session);
+    crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
     registry.insert(id, session);
     Ok(id)

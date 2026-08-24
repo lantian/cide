@@ -115,11 +115,15 @@ import {
   agentEvents,
   taskEvents,
   toolWindow as toolWindowApi,
+  windowLabel,
+  windowRole,
   type PaneRestore,
   type ProjectId,
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
+import { DetachedTabHeader } from '@/windows/DetachedTabHeader'
+import { clusterPlan, shownTabs } from '@/windows/windowTabs'
 import { runBench, formatReport, probeIpcOnce } from '@/bench/ipcBench'
 import { retheme } from '@/terminal/xterm'
 import { useWorkspace } from '@/store/workspace'
@@ -234,6 +238,19 @@ export function App() {
   const newClaudeTab = useWorkspace((st) => st.newClaudeTab)
   const detachPane = useWorkspace((st) => st.detachPane)
   const redockPane = useWorkspace((st) => st.redockPane)
+  const detachTab = useWorkspace((st) => st.detachTab)
+  const redockTab = useWorkspace((st) => st.redockTab)
+
+  /*
+   * Whether this webview is a `tab:<uuid>` window — one torn-out tab and nothing else.
+   *
+   * From the URL rather than from `boot.role`, for the reason `PaneTitleBar` reads its
+   * window kind there: it is true for the whole life of the window and known before the
+   * first bootstrap round trip resolves. The sidebar's initial state depends on it *at
+   * mount* — a `useState` initialiser runs once, and deciding from a `boot` that is still
+   * `null` would flash the Files panel into a window that has no rail to ever close it.
+   */
+  const tabWindow = windowRole() === 'tab'
 
   /**
    * Which sidebar view the rail has lit, whether a panel is showing, and which one comes back.
@@ -244,7 +261,12 @@ export function App() {
    * see `chrome/sidebarView.ts`, which owns every rule about this value so that a check script
    * can compile them. Nothing here is persisted; that module says why.
    */
-  const [sidebar, setSidebar] = useState<SidebarState>(SIDEBAR_INITIAL)
+  // Closed from the first render in a torn-out tab window, which draws no rail: the
+  // initialiser runs once, and `SIDEBAR_INITIAL` there would mount a Files panel with no
+  // button anywhere that could ever dismiss it.
+  const [sidebar, setSidebar] = useState<SidebarState>(
+    tabWindow ? { view: null, last: SIDEBAR_INITIAL.last } : SIDEBAR_INITIAL,
+  )
   /*
    * This window's answer to "reveal a panel", for every caller that is not inside React.
    *
@@ -254,10 +276,11 @@ export function App() {
    * box, shipped listed and disabled. `chrome/panelRequests.ts` holds the slot; this is the one
    * registration that fills it, and every reveal in the app now ends here.
    *
-   * **Not registered in a detached-pane window.** That window returns long before the sidebar is
-   * rendered, so a registration there would accept requests, move a `useState` nothing draws, and
-   * report success — a silent no-op in place of the `unmet` line the dispatcher writes when the
-   * slot is empty. The refusal is the whole value of the slot being fillable.
+   * **Not registered in a detached window of either kind.** The pane window returns long before
+   * the sidebar is rendered, and the tab window renders the shell path with no rail and no
+   * panels — so a registration in either would accept requests, move a `useState` nothing
+   * draws, and report success — a silent no-op in place of the `unmet` line the dispatcher
+   * writes when the slot is empty. The refusal is the whole value of the slot being fillable.
    *
    * `setSidebar` is a `useState` setter and therefore stable, so this runs once per window. The
    * cleanup is not optional: a root that goes away while registered leaves `requestPanel` calling
@@ -265,10 +288,10 @@ export function App() {
    */
   const paneWindow = boot?.role.kind === 'detachedPane'
   useEffect(() => {
-    if (paneWindow) return
+    if (paneWindow || tabWindow) return
     registerPanelHost((view) => setSidebar((s) => showPanel(s, view)))
     return () => registerPanelHost(null)
-  }, [paneWindow])
+  }, [paneWindow, tabWindow])
   /**
    * Which overlay is up, if any. `null` is the ordinary state.
    *
@@ -521,6 +544,26 @@ export function App() {
         ? boot.role.active
         : boot.role.project
   const activeProject = activeProjectId ? (boot?.workspace.projects[activeProjectId] ?? null) : null
+
+  /*
+   * The tabs THIS window draws — `windows/windowTabs.ts` holds the rule and says why it is
+   * load-bearing: a torn-out tab stays in `project.tabs` (so quit guards, restore plans and
+   * awaiting counts keep seeing it), and this filter is the only thing standing between one
+   * file tab and two live buffers over one file. A shell subtracts the torn-out tabs; a
+   * `tab:` window keeps exactly its own.
+   */
+  const visibleTabs =
+    boot !== null && activeProject !== null
+      ? shownTabs(boot.role, activeProject.tabs, boot.workspace.windows)
+      : []
+  const tabRole = boot !== null && boot.role.kind === 'detachedTab' ? boot.role : null
+  // The tab a `tab:` window shows — the role's, never the project's `activeTab`, which the
+  // domain deliberately keeps pointed at a tab the *shell* draws. `null` while the mirror
+  // has not caught up, or after the tab or its project closed under the window.
+  const windowTab =
+    tabRole !== null && activeProject !== null
+      ? (activeProject.tabs.find((t) => t.id === tabRole.tab) ?? null)
+      : null
 
   /*
    * The activity rail's changed-file count.
@@ -1049,6 +1092,18 @@ export function App() {
   return (
     <WindowFrame>
       <div className={styles.app}>
+        {/*
+          * A `tab:<uuid>` window renders THIS same shell path — same `TabContent`, same
+          * `PaneFrame`/`PaneBody`, same status bar and dialogs — because a torn-out tab is
+          * not a different kind of tab; `DetachedPaneWindow`'s header states what a second
+          * rendering costs. What it does not get is the chrome that belongs to the shell:
+          * the project strip (this header), the activity rail, the sidebar and the tab
+          * strip, each gated on `tabWindow` below. Its own header carries the window's
+          * lights, the drag region and the way back.
+          */}
+        {tabWindow ? (
+          <DetachedTabHeader tab={windowTab} onRedock={() => void redockTab(windowLabel())} />
+        ) : (
         <AppHeader
           projects={projects}
           activeProject={activeProjectId}
@@ -1077,6 +1132,7 @@ export function App() {
               }
             : {})}
         />
+        )}
 
         <div className={styles.body}>
           {/*
@@ -1087,6 +1143,9 @@ export function App() {
             * appeared in any repository state. The count is now real and the fixture is the
             * override, which is the way round every other audit-driven surface here works.
             */}
+          {/* No rail in a torn-out tab window: every button on it opens a panel this window
+              does not render, and the sidebar state was initialised closed to match. */}
+          {!tabWindow && (
           <ActivityRail
             active={sidebar.view}
             changed={auditMode() ? AUDIT_GIT_CHANGES : gitChanged}
@@ -1154,6 +1213,7 @@ export function App() {
                 .catch(() => {})
             }}
           />
+          )}
           {/*
            * Everything but the rail, stacked.
            *
@@ -1416,12 +1476,18 @@ export function App() {
               {/* A real project opens with only its console tab, so a live app never renders
                   a file tab or a language badge. The fixture covers every shape the strip has
                   to get right; see chrome/auditFixture.ts. */}
-              {auditMode() ? (
+              {/* No strip in a torn-out tab window: it shows exactly one tab, whose name is
+                  already in its header, and every strip gesture — activate, reorder, close
+                  others — is about tabs this window does not hold. */}
+              {tabWindow ? null : auditMode() ? (
                 <TabStrip tabs={AUDIT_TABS} activeTab={AUDIT_ACTIVE_TAB} />
               ) : (
                 activeProject && (
                   <TabStrip
-                    tabs={activeProject.tabs}
+                    // The window's own view of the strip, not `activeProject.tabs`: a tab
+                    // torn out into its own window keeps its slot in the domain's list, and
+                    // drawing it here would be two windows claiming one tab.
+                    tabs={visibleTabs}
                     activeTab={activeProject.activeTab}
                     onActivate={(id) => void activateTab(activeProject.id, id)}
                     onClose={(id) => void closeTab(activeProject.id, id)}
@@ -1454,8 +1520,14 @@ export function App() {
                   See the note on the state itself. */}
               {!benchMode() && !auditMode() && activeProject && restorePlan !== null && (
                 <TabContent
-                  tabs={activeProject.tabs}
-                  activeTab={activeProject.activeTab}
+                  // The same filtered list the strip draws — `windows/windowTabs.ts` — and
+                  // here it is the load-bearing copy: `TabContent` MOUNTS every tab it is
+                  // handed, hidden or not, so an unfiltered list would put a second live
+                  // editor (and a second buffer) behind the shell for every torn-out file.
+                  tabs={visibleTabs}
+                  // A `tab:` window's one tab comes from its role; the project's
+                  // `activeTab` deliberately points at a tab the *shell* draws.
+                  activeTab={tabRole !== null ? tabRole.tab : activeProject.activeTab}
                   renderTree={(tab, active) =>
                     // A settings tab has a pane tree — every tab does, which is the invariant
                     // that makes "promote pane to tab" one code path — but nothing to render
@@ -1479,12 +1551,29 @@ export function App() {
                       onRatioCommit={(split, ratio) =>
                         void setRatio(activeProject.id, tab.id, split, ratio)
                       }
-                      renderPane={(paneNode, index) => (
+                      renderPane={(paneNode, index) => {
+                        /*
+                         * What this pane's corner cluster acts on — `windows/windowTabs.ts`
+                         * holds the rule. A tab's only pane closes and detaches as the
+                         * *tab*: `layout::close` and `layout::take_pane` both refuse a
+                         * tab's last pane, and these two buttons used to run straight into
+                         * that refusal and print `lastPane` at the user. Its maximize is
+                         * withheld outright — one pane already fills its tab. The pinned
+                         * console is exempt so its primary pane keeps the role-based
+                         * refusals `PaneFrame` already words.
+                         */
+                        const plan = clusterPlan(
+                          Object.keys(tab.tree.panes).length,
+                          activeProject.tabs[0]?.id === tab.id,
+                        )
+                        const tabScoped = plan.close === 'tab'
+                        return (
                         <PaneFrame
                           pane={paneNode}
                           index={index}
                           focused={tab.tree.focused === paneNode.id}
                           maximized={tab.tree.maximized === paneNode.id}
+                          tabScoped={tabScoped}
                           onFocus={() => void focusPane(activeProject.id, tab.id, paneNode.id)}
                           // `row` is a tile beside this one, in this pane's own row — the axis
                           // the command layer routes to `add_tile`. The row gesture is on the
@@ -1502,15 +1591,34 @@ export function App() {
                           onAddRow={() =>
                             void splitPane(activeProject.id, tab.id, tab.tree.focused, 'col', 'after')
                           }
-                          onMaximize={() =>
-                            void maximizePane(
-                              activeProject.id,
-                              tab.id,
-                              tab.tree.maximized === paneNode.id ? null : paneNode.id,
-                            )
+                          onMaximize={
+                            plan.maximize
+                              ? () =>
+                                  void maximizePane(
+                                    activeProject.id,
+                                    tab.id,
+                                    tab.tree.maximized === paneNode.id ? null : paneNode.id,
+                                  )
+                              : undefined
                           }
-                          onDetach={() => void detachPane(activeProject.id, tab.id, paneNode.id)}
-                          onClose={() => void closePane(activeProject.id, tab.id, paneNode.id)}
+                          onDetach={
+                            plan.detach === 'tab'
+                              ? // A tab already in a window of its own has nowhere further
+                                // out to go; withholding the handler hides the button and
+                                // greys the menu row with that sentence.
+                                tabWindow
+                                ? undefined
+                                : () => void detachTab(activeProject.id, tab.id)
+                              : () => void detachPane(activeProject.id, tab.id, paneNode.id)
+                          }
+                          onClose={
+                            plan.close === 'tab'
+                              ? // Through `closeTab`, which asks about a live session or an
+                                // unsaved buffer before it discards either — the same dialog
+                                // the strip's × raises for this tab.
+                                () => void closeTab(activeProject.id, tab.id)
+                              : () => void closePane(activeProject.id, tab.id, paneNode.id)
+                          }
                         >
                           {/*
                             * A git diff replaces the pane rather than living in one, the way a
@@ -1571,7 +1679,8 @@ export function App() {
                           />
                           )}
                         </PaneFrame>
-                      )}
+                        )
+                      }}
                     />
                     )
                   }

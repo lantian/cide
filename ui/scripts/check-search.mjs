@@ -11,18 +11,29 @@
  *
  * Same shape as `check-picker.mjs` — there is no JS test runner in this project, and
  * `SearchModel.ts` is import-free precisely so the TypeScript in `node_modules` can compile
- * it on its own.
+ * it on its own. `rowPaths.ts` and `treeFocus.ts` are compiled beside it for the same reason:
+ * the first is the containment rule `scopeLabel` reuses rather than reimplements, and the
+ * second is the "does the file tree hold the caret" claim that decides whether ⌃⇧F narrows
+ * the search to a folder.
  *
  * Run: `pnpm --dir ui run check:search`
  */
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const out = mkdtempSync(join(tmpdir(), 'cide-search-'))
 let failed = 0
+
+const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
+
+const ok = (cond, what) => {
+  if (cond) return
+  failed += 1
+  console.error(`FAIL ${what}`)
+}
 
 const eq = (actual, expected, what) => {
   const a = JSON.stringify(actual)
@@ -42,6 +53,12 @@ try {
       // The click rules, pinned at the foot of this file. They live in a module of their own
       // so a check script can hold them; see `clickSemantics.ts`.
       'src/sidebar/clickSemantics.ts',
+      // `scopeLabel` imports `rootOf` from here — the longest-match, segment-aware containment
+      // rule this repository has already got wrong once. Compiled in the same invocation so a
+      // relative sibling import resolves under a bare `tsc` with no `paths`.
+      'src/sidebar/rowPaths.ts',
+      // The focus claim ⌃⇧F consults. Import-free so it can be driven here.
+      'src/sidebar/treeFocus.ts',
       '--outDir', out,
       '--rootDir', 'src',
       '--module', 'commonjs',
@@ -64,14 +81,21 @@ try {
     groupHits,
     hitPosition,
     panelState,
+    problemField,
+    problemLabel,
     rowKey,
     sameQuery,
+    scopeDirOf,
+    scopeLabel,
     spliceHits,
     splitHighlight,
     summarize,
     trimIndent,
   } = require(join(out, 'sidebar/SearchModel.js'))
   const { searchClick, gestureOf } = require(join(out, 'sidebar/clickSemantics.js'))
+  const { claimTreeFocus, releaseTreeFocus, treeFocused, __resetTreeFocus } = require(
+    join(out, 'sidebar/treeFocus.js'),
+  )
 
   /* ------------------------------------------------------------------------- grouping */
 
@@ -241,10 +265,16 @@ try {
   eq(state({}), 'noResults', 'a finished walk with nothing in it')
   eq(state({ total: 3 }), 'results', 'hits')
   eq(state({ running: true, total: 3 }), 'results', 'hits, still walking')
-  // The error outranks `running`: a pattern that did not compile started no walk.
-  eq(state({ running: true, error: 'unclosed group' }), 'error', 'a bad pattern is not progress')
-  eq(state({ pattern: '', error: 'stale' }), 'empty', 'an emptied box beats a stale error')
-  eq(state({ error: '' }), 'noResults', 'an empty error string is not an error')
+  // The error outranks `running`: an input that did not parse started no walk.
+  const problem = (kind, detail = 'nope') => ({ kind, detail })
+  eq(
+    state({ running: true, error: problem('pattern', 'unclosed group') }),
+    'error',
+    'a bad pattern is not progress',
+  )
+  eq(state({ pattern: '', error: problem('scope') }), 'empty', 'an emptied box beats a stale error')
+  eq(state({ error: problem('scope') }), 'error', 'a folder that names nothing is an answer')
+  eq(state({ error: problem('include') }), 'error', 'and so is a glob that did not parse')
 
   /* -------------------------------------------------------------------------- readout */
 
@@ -268,11 +298,21 @@ try {
     false,
     'a different pattern',
   )
-  // Every toggle is part of the identity, or a frame would be painted under the wrong one.
+  /*
+   * Every field of `SearchQuery` is part of the identity, or a frame is painted under the
+   * wrong one. The toggles are the mild version of that; the scope is the sharp one — an
+   * unscoped frame drawn under a scoped box is one folder's results under another folder's
+   * heading, with nothing on screen to say which.
+   *
+   * Driven a field at a time rather than asserted as a list, because the failure is a
+   * *forgotten* field and a list would have to be remembered too.
+   */
   for (const [key, value] of [
     ['caseSensitive', true],
     ['wholeWord', true],
     ['mode', 'regex'],
+    ['scope', 'crates/cide-git'],
+    ['include', '*.ts'],
   ]) {
     eq(
       sameQuery({ ...EMPTY_QUERY }, { ...EMPTY_QUERY, [key]: value }),
@@ -280,8 +320,98 @@ try {
       `${key} is part of the query identity`,
     )
   }
+  // And the other direction: every key of `EMPTY_QUERY` is one `sameQuery` actually reads. A
+  // field added to the DTO and to `EMPTY_QUERY` but not to the comparison is exactly the bug
+  // the loop above cannot see, because nothing there names the field either.
+  for (const key of Object.keys(EMPTY_QUERY)) {
+    const other = key === 'mode' ? 'regex' : typeof EMPTY_QUERY[key] === 'boolean' ? true : 'x'
+    eq(
+      sameQuery({ ...EMPTY_QUERY }, { ...EMPTY_QUERY, [key]: other }),
+      false,
+      `sameQuery reads every field of EMPTY_QUERY, including ${key}`,
+    )
+  }
   eq(EMPTY_QUERY.pattern, '', 'the panel opens with an empty box')
   eq(EMPTY_QUERY.mode, 'literal', 'and in literal mode, not regex')
+  eq(EMPTY_QUERY.scope, '', 'and unscoped — the whole project, as it always was')
+  eq(EMPTY_QUERY.include, '', 'and over every file')
+
+  /* ------------------------------------------------------- naming a folder to search in */
+
+  const ROOT = { path: '/home/u/cide', label: 'cide' }
+  const OTHER = { path: '/home/u/ui', label: 'ui' }
+
+  eq(
+    scopeLabel('/home/u/cide/crates/cide-git', [ROOT]),
+    'crates/cide-git',
+    'a single-root project names a folder relative to its root — the spelling `rel` uses',
+  )
+  eq(
+    scopeLabel('/home/u/cide/crates/cide-git', [ROOT, OTHER]),
+    'cide/crates/cide-git',
+    'and a multi-root one prefixes the label, so the box and the hit headings agree',
+  )
+  eq(scopeLabel('/home/u/cide', [ROOT]), 'cide', 'the root itself is named by its label')
+  eq(
+    scopeLabel('/home/u/cide', [ROOT, OTHER]),
+    'cide',
+    'in either case — an empty box would read as no scope at all',
+  )
+  // Longest match, which is `rootOf`'s rule and the reason this imports it rather than
+  // slicing at the first root that matches.
+  eq(
+    scopeLabel('/home/u/cide/ui/src', [ROOT, { path: '/home/u/cide/ui', label: 'ui' }]),
+    'ui/src',
+    'the innermost root wins when two of them nest',
+  )
+  eq(
+    scopeLabel('/tmp/elsewhere/src', [ROOT]),
+    '/tmp/elsewhere/src',
+    'a path under no root keeps its absolute spelling: emptying the box would silently widen '
+      + 'the search back to the whole project, and the backend can say what is wrong with it',
+  )
+  // `/home/u/cide-old` is not inside `/home/u/cide`; a bare `startsWith` says it is and would
+  // slice the string at the wrong offset. `rowPaths.ts`'s header is the account of that.
+  eq(
+    scopeLabel('/home/u/cide-old/src', [ROOT]),
+    '/home/u/cide-old/src',
+    'containment is segment-aware',
+  )
+
+  eq(scopeDirOf('/a/b/c', true), '/a/b/c', 'a directory is its own scope')
+  eq(scopeDirOf('/a/b/c.rs', false), '/a/b', 'and a file means the folder that holds it')
+  eq(scopeDirOf('/c.rs', false), '/c.rs', 'a file at the filesystem root has no parent to name')
+
+  /* --------------------------------------------------- which box a problem is about */
+
+  eq(problemLabel('pattern'), 'Bad pattern', 'the heading the notice draws')
+  eq(problemLabel('scope'), 'No such folder', 'a mistyped folder is not a mistyped regex')
+  eq(problemLabel('include'), 'Bad file pattern', 'nor is a mistyped glob')
+  eq(problemLabel('whatever'), 'Search failed', 'and an unknown kind still says something')
+  eq(problemField('scope'), 'scope', 'the box to outline')
+  eq(
+    problemField('whatever'),
+    null,
+    'an unknown kind outlines nothing: an aria-invalid on an arbitrary input would be a lie',
+  )
+
+  /* ------------------------------------------------ does the file tree hold the caret */
+
+  /*
+   * The fact ⌃⇧F consults to decide whether it narrows the search to the selected folder.
+   * A claim that is never released is the failure worth pinning: it would mean the chord kept
+   * scoping to whatever the tree had selected long after the caret went to a terminal.
+   */
+  __resetTreeFocus()
+  eq(treeFocused(), false, 'nothing holds the caret before anything has focused')
+  claimTreeFocus()
+  eq(treeFocused(), true, 'the tree took it')
+  claimTreeFocus()
+  eq(treeFocused(), true, 'and a second focus inside the tree is not a second claim')
+  releaseTreeFocus()
+  eq(treeFocused(), false, 'a blur that really left the tree gives it up')
+  releaseTreeFocus()
+  eq(treeFocused(), false, 'releasing twice is safe — unmount runs after a blur')
 
   /* ------------------------------------------------------ where a hit actually is */
 
@@ -353,6 +483,58 @@ try {
   eq(click('single', 'file'), act(true, true, false), 'a heading folds its group')
   eq(click('double', 'file'), act(false, false, false), 'and does not fold it straight back')
   eq(gestureOf(2), 'double', 'told apart by `detail`, with no timer to make a click feel late')
+
+  /* ------------------------------------------------- the parts a type cannot state */
+
+  /*
+   * `problemLabel` takes a bare `string`, because `SearchModel.ts` is import-free and cannot
+   * see the generated `SearchProblem` union. `SearchStore.ts` holds the union in a `Record`
+   * so a new Rust variant is a `tsc --noEmit` failure there — but nothing in the type system
+   * connects that list to the `case` arms here, and a kind with no arm draws *Search failed*
+   * over a sentence nobody wrote copy for. This is that connection.
+   */
+  const store = read('../src/sidebar/SearchStore.ts')
+  const model = read('../src/sidebar/SearchModel.ts')
+  const kinds = (store.match(/PROBLEM_KINDS[^{]*\{([^}]*)\}/s)?.[1] ?? '')
+    .split(',')
+    .map((line) => line.trim().split(':')[0].trim())
+    .filter((name) => /^[a-z][a-zA-Z]*$/.test(name))
+  ok(kinds.length >= 3, `PROBLEM_KINDS parsed out of SearchStore.ts (got ${kinds.join()})`)
+  for (const kind of kinds) {
+    ok(
+      model.includes(`case '${kind}':`),
+      `problemLabel has a case for the ${kind} problem kind`,
+    )
+    ok(
+      problemLabel(kind) !== 'Search failed',
+      `and the ${kind} kind draws its own heading rather than the fallback`,
+    )
+  }
+
+  /*
+   * The panel's own wiring, greped rather than rendered.
+   *
+   * Each of these is a way for the feature to compile, type-check and do nothing visible:
+   * a hardcoded heading that survives the typed error, a clear button drawn as the character
+   * `✕` (which `check:ui-icons` bans and which would slip through as ordinary JSX text), and
+   * two boxes that exist in the model with no input bound to them.
+   */
+  const panel = read('../src/sidebar/SearchPanel.tsx')
+  ok(panel.includes('problemLabel(error.kind)'), 'the notice heading comes from the problem kind')
+  ok(!/>\s*Bad pattern\s*</.test(panel), 'and is not a hardcoded string beside it')
+  ok(panel.includes('audit="searchScope"'), 'the folder box exists')
+  ok(panel.includes('audit="searchInclude"'), 'the file-pattern box exists')
+  ok(panel.includes('data-audit={audit}'), 'and both reach the DOM as audit hooks')
+  // The mark, not the character — `check:ui-icons` is what bans the character everywhere, and
+  // this is the positive half: the button must actually draw something.
+  ok(/<Icon name="x"/.test(panel), 'the clear button is an icon mark')
+  // The disclosure must not be able to hide a filter that is in force — a panel searching one
+  // folder while looking exactly like it is searching all of them is the whole hazard here.
+  ok(
+    /narrowInUse\s*=\s*query\.scope[^\n]*query\.include/.test(panel)
+      && /showNarrow\s*=\s*moreOpen\s*\|\|\s*narrowInUse/.test(panel),
+    'the narrowing boxes are shown whenever either of them holds something',
+  )
 
   if (failed > 0) {
     console.error(`\ncheck-search: ${failed} failure(s)`)

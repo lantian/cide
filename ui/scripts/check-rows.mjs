@@ -846,31 +846,78 @@ try {
   eq(a.lone, null, 'a lone pane is in no row at all — the case the item greys itself out for')
   eq(a.noColumn, null, 'and so is every pane of a tab that has only ever been split sideways')
 
-  // --- every pane edge gets the same gutter, including the ones with no neighbour -------
+  // --- interior edges get the gutter; chrome-facing edges are flush ---------------------
   //
-  // A splitter track is 6px, which is two 3px half-gutters back to back. At the edges of the
-  // tree there is no neighbour and so there was no half-gutter: the outermost pane's frame sat
-  // flush against the tab strip, the sidebar and the status bar, and two 1px `--border` lines
-  // touching read as one 2px line belonging to neither box.
-  //
-  // This used to be justified by the editor's accent focus ring, which the block above has
-  // just removed. The padding survives it: the gutter is about the frame's *ordinary* border,
-  // which every pane of every kind carries in both focus states. The worst case is still the
-  // same one — a **file tab** always opens as a single pane in a tab of its own, so every edge
-  // is an outer edge and there is no interior gutter anywhere to set the scale by.
+  // A splitter track is 6px, which is two 3px half-gutters back to back. The canvas used to
+  // pad every outer edge by the missing half-gutter, on the premise that an outer edge has no
+  // neighbour — but on three of the four edges the app's own chrome IS the neighbour and
+  // already draws the seam: the sidebar splitter's 6px `--panel-2` strip on the left, the tab
+  // strip's `border-bottom` above, the add-row strip's / status bar's `border-top` below. On
+  // those edges the 3px plus the frame's 1px border put a lone `--border` line a few pixels in
+  // from the chrome's seam and pushed a pane's content out of line with the tab strip's tabs —
+  // the user circled the left one in a screenshot, then pointed out top and bottom carry the
+  // same padding. So the canvas pads only the RIGHT edge, which meets the bare window edge and
+  // has no chrome line to lean on, and the leaves on a flush edge drop that side of the frame
+  // border through `--pane-edge-*` — both ends of that seam are pinned below.
   //
   // Tied to `--w-splitter` rather than asserted as a literal, because the two numbers are one
-  // decision: a splitter that stops being 6px leaves the edges out of step with the middle.
+  // decision: a splitter that stops being 6px leaves the edge out of step with the middle.
   const splitCss = css('src/layout/SplitTree.module.css')
-  const canvasPad = Number(/\.canvas \{[^}]*padding:\s*(\d+)px/.exec(splitCss)?.[1] ?? NaN)
+  const canvasPad = /\.canvas \{[^}]*padding:\s*([^;]+);/.exec(splitCss)?.[1]?.trim()
   const splitter = Number(
     /--w-splitter:\s*(\d+)px/.exec(readFileSync('src/styles/tokens.css', 'utf8'))?.[1] ?? NaN,
   )
   eq(
     canvasPad,
-    splitter / 2,
-    'the tree canvas pads by half a splitter, so a pane against the window chrome shows the ' +
-      'same gutter as a pane against its neighbour rather than merging into it',
+    `0 ${splitter / 2}px 0 0`,
+    'the tree canvas pads by half a splitter on the right edge only — the other three sit ' +
+      'flush against chrome that already draws the seam, lining panes up with the tab strip',
+  )
+
+  // The seam itself: each edge mark sets its property, and the frame reads each as that
+  // side's border width — with a 1px fallback, which is what keeps a detached pane window's
+  // frame whole.
+  for (const edge of ['left', 'top', 'bottom']) {
+    ok(
+      new RegExp(`\\.leaf\\[data-edge-${edge}\\] \\{[^}]*--pane-edge-${edge}:\\s*0px`).test(
+        splitCss,
+      ),
+      `a ${edge}-edge leaf declares --pane-edge-${edge}: 0px`,
+    )
+    ok(
+      new RegExp(`border-${edge}-width:\\s*var\\(--pane-edge-${edge},\\s*1px\\)`).test(paneCss),
+      `the frame's border-${edge}-width is var(--pane-edge-${edge}, 1px)`,
+    )
+  }
+
+  // Which leaves get which marks, proved on the markup. In FIXTURE — Col(Row(1..4), Row(5, 6))
+  // — every tile of the top row touches the canvas's top, every tile of the bottom row its
+  // bottom, and only each row's first tile its left; nothing interior is marked. In LEANING —
+  // Row(Row(1, 2), 3) — the flattened chain is one row, so every tile spans top to bottom. A
+  // maximized pane spans every chain on its path and so covers the canvas: it wears all three
+  // marks wherever it rests, or an interior pane would grow stray border lines against the
+  // chrome for as long as it is maximized.
+  eq(
+    d.plain.edges,
+    {
+      'pane-1': 'left,top',
+      'pane-2': 'top',
+      'pane-3': 'top',
+      'pane-4': 'top',
+      'pane-5': 'left,bottom',
+      'pane-6': 'bottom',
+    },
+    'each tile is marked with exactly the outer edges it touches',
+  )
+  eq(
+    d.leaning.edges,
+    { 'pane-1': 'left,top,bottom', 'pane-2': 'top,bottom', 'pane-3': 'top,bottom' },
+    'a single row spans the canvas top to bottom, and only its first tile is flush left',
+  )
+  eq(
+    d.maximized.edges['pane-3'],
+    'left,top,bottom',
+    'a maximized interior pane is flush on every chrome-facing edge — it covers the canvas',
   )
 
   if (failed === 0) console.log('rows layout: ok')

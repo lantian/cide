@@ -88,6 +88,20 @@
   min-height: 0;
   background: var(--panel);
   border: 1px solid var(--border);
+  /*
+   * Zero on the sides where this pane sits against the app's own chrome, whose seam already
+   * draws the line — the sidebar splitter on the left, the tab strip above, the add-row
+   * strip / status bar below. `SplitTree.module.css` sets `--pane-edge-*` on the leaf and the
+   * reason lives there. The width, not the colour: the focus/awaiting rules below recolour
+   * whatever width is here, and on a flush edge that is nothing, which is the point — the
+   * pane's content starts exactly in line with the tab strip's tabs. This does not
+   * reintroduce the resize-on-focus problem the note above forbids: the widths change only
+   * when the pane's *position* in the tree changes, which resizes it anyway. Detached pane
+   * windows have no `.leaf` above the frame, so the fallbacks keep their border whole.
+   */
+  border-left-width: var(--pane-edge-left, 1px);
+  border-top-width: var(--pane-edge-top, 1px);
+  border-bottom-width: var(--pane-edge-bottom, 1px);
   /* What `.cluster` and the focus ring resolve `top/right/inset` against. */
   position: relative;
   /*

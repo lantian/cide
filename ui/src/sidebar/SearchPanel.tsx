@@ -35,12 +35,14 @@ import {
   groupHits,
   hitPosition,
   panelState,
+  problemField,
+  problemLabel,
   rowKey,
   splitHighlight,
   summarize,
   trimIndent,
 } from './SearchModel'
-import type { SearchRow } from './SearchModel'
+import type { ProblemField, ProblemLike, SearchRow } from './SearchModel'
 import { gestureOf, moveIndex, searchClick } from './clickSemantics'
 import { copyText } from './copyText'
 import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
@@ -119,6 +121,16 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
    * gate calls `preventDefault` on every stroke it handles before dispatching.
    */
   const input = useRef<HTMLInputElement>(null)
+  /*
+   * Whether the user has asked for the two narrowing boxes.
+   *
+   * Local and transient, like every other "which bit of chrome is open" fact in this project:
+   * it is a preference about this panel in this window right now, not something `workspace.json`
+   * should be asked to remember. It survives a re-render and not an unmount, and what it does
+   * *not* have to survive is a scope being set from somewhere else — `showNarrow` reads the
+   * query as well, so the boxes appear whether or not this is on.
+   */
+  const [moreOpen, setMoreOpen] = useState(false)
   const focusWanted = useFocusRequested('search')
   useEffect(() => {
     if (!focusWanted) return
@@ -140,6 +152,15 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
 
   const rows = groupHits(hits, collapsed)
   const state = panelState({ pattern: query.pattern, running, total, error })
+  // Which box the frame is complaining about, so it can be outlined where the user typed it.
+  // `null` for a kind this build does not know — the notice still says something; see
+  // `problemField`.
+  const bad: ProblemField = error === null ? null : problemField(error.kind)
+  // Shown when asked for *or* when either box holds something. The second half is not a
+  // convenience: a filter that is in force and off screen is the panel lying about what it
+  // searched, and the tree's ⌃⇧F sets one without going through the disclosure.
+  const narrowInUse = query.scope !== '' || query.include !== ''
+  const showNarrow = moreOpen || narrowInUse
 
   return (
     <div className={styles.panel} data-audit="searchPanel">
@@ -163,6 +184,7 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
           autoComplete="off"
           placeholder="Search in files"
           aria-label="Search in files"
+          aria-invalid={bad === 'pattern'}
           onChange={(e) => useSearch.getState().setQuery({ pattern: e.target.value })}
         />
         <div className={styles.toggles} role="group" aria-label="Search options">
@@ -186,7 +208,53 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
               useSearch.getState().setQuery({ mode: query.mode === 'regex' ? 'literal' : 'regex' })
             }
           />
+          {/*
+            * The disclosure for the two narrowing boxes, at the end of the toggle row.
+            *
+            * Hidden by default because two more inputs are ~56px of a 252px panel, spent on
+            * something most searches do not use — which is why VS Code and IDEA both fold
+            * theirs away too. `narrowInUse` below is what keeps that from hiding state: a scope
+            * set by ⌃⇧F from the tree opens the boxes whether or not the user has ever
+            * pressed this, so the panel can never be quietly searching one folder while
+            * looking exactly like it is searching all of them.
+            */}
+          <Toggle
+            label={showNarrow ? 'Hide folder and file filters' : 'Filter by folder and file name'}
+            icon="ellipsis"
+            on={showNarrow}
+            /*
+             * Refused, with the reason, while a filter is actually in force. The boxes stay up
+             * in that state whatever this button says — see `showNarrow` — so a button that
+             * still clicked would be a control that changes nothing, which is the shape this
+             * project has shipped often enough to have a name for. The ✕ in each box is the
+             * way out, and the sentence points at it.
+             */
+            {...(narrowInUse
+              ? { disabledReason: 'Clear the folder and file boxes to hide them' }
+              : {})}
+            onClick={() => setMoreOpen(!moreOpen)}
+          />
         </div>
+        {showNarrow && (
+          <>
+            <Field
+              value={query.scope}
+              audit="searchScope"
+              label="Folder to search"
+              placeholder="Folder to search (all)"
+              invalid={bad === 'scope'}
+              onChange={(scope) => useSearch.getState().setQuery({ scope })}
+            />
+            <Field
+              value={query.include}
+              audit="searchInclude"
+              label="File name pattern"
+              placeholder="File name pattern, e.g. *.ts"
+              invalid={bad === 'include'}
+              onChange={(include) => useSearch.getState().setQuery({ include })}
+            />
+          </>
+        )}
       </div>
 
       {degraded ? (
@@ -211,7 +279,7 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
 interface BodyProps {
   state: ReturnType<typeof panelState>
   rows: SearchRow[]
-  error: string | null
+  error: ProblemLike | null
   scanned: number
   iconTheme: IconTheme
   onOpenHit: OpenHit | undefined
@@ -230,11 +298,15 @@ function Body({ state, rows, error, scanned, iconTheme, onOpenHit }: BodyProps) 
   if (state === 'empty') {
     return <div className={styles.hint}>Type to search this project&rsquo;s files.</div>
   }
-  if (state === 'error') {
+  if (state === 'error' && error !== null) {
     return (
       <div className={styles.notice} data-audit="searchError">
-        <span className={styles.noticeLabel}>Bad pattern</span>
-        <span className={styles.noticeCode}>{error}</span>
+        {/* The heading names which of the three boxes is wrong. It used to be the literal
+            string `Bad pattern`, which was true while the pattern was the only thing that
+            could be — a mistyped folder reported under it would send the user to rewrite a
+            regex that was fine. See `problemLabel`. */}
+        <span className={styles.noticeLabel}>{problemLabel(error.kind)}</span>
+        <span className={styles.noticeCode}>{error.detail}</span>
       </div>
     )
   }
@@ -536,6 +608,59 @@ function basename(rel: string): string {
   return cut < 0 ? rel : rel.slice(cut + 1)
 }
 
+/**
+ * One of the two narrowing boxes: a text input and the ✕ that empties it.
+ *
+ * The ✕ is a real icon mark rather than the character — `check:ui-icons` bans a Unicode symbol
+ * drawn as an icon outright, and the set carries `x` because this is the gesture it is for. It
+ * is `hidden` rather than absent when the box is empty, so the input's width does not change as
+ * the first character is typed.
+ */
+function Field({
+  value,
+  audit,
+  label,
+  placeholder,
+  invalid,
+  onChange,
+}: {
+  value: string
+  audit: string
+  label: string
+  placeholder: string
+  invalid: boolean
+  onChange: (next: string) => void
+}) {
+  return (
+    <div className={styles.field}>
+      <input
+        className={styles.input}
+        data-audit={audit}
+        type="text"
+        value={value}
+        spellCheck={false}
+        autoComplete="off"
+        placeholder={placeholder}
+        aria-label={label}
+        aria-invalid={invalid}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <button
+        type="button"
+        className={styles.clear}
+        aria-label={`Clear ${label.toLowerCase()}`}
+        title={`Clear ${label.toLowerCase()}`}
+        // `hidden` and not `disabled`: a disabled button is still a target the pointer stops
+        // on, and there is nothing to explain about a ✕ beside an empty box.
+        hidden={value === ''}
+        onClick={() => onChange('')}
+      >
+        <Icon name="x" size={1} />
+      </button>
+    </div>
+  )
+}
+
 /*
  * One of the three find options.
  *
@@ -550,11 +675,20 @@ function Toggle({
   icon,
   on,
   onClick,
+  disabledReason,
 }: {
   label: string
   icon: IconName
   on: boolean
   onClick: () => void
+  /**
+   * Why this switch cannot be flipped right now, in the words the tooltip says.
+   *
+   * A reason and not a bare `disabled`, for the rule the tree's context menu already follows:
+   * a control that is off has to be able to say why, or the user is left to guess whether it
+   * is broken. Only the disclosure uses it; the three find options are never refused.
+   */
+  disabledReason?: string | undefined
 }) {
   return (
     <button
@@ -565,7 +699,8 @@ function Toggle({
          toolbar, and the mark is the only visible label. */
       aria-pressed={on}
       aria-label={label}
-      title={label}
+      title={disabledReason ?? label}
+      disabled={disabledReason !== undefined}
       onClick={onClick}
     >
       <Icon name={icon} size={1} />

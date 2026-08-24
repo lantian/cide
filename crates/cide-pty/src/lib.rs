@@ -42,6 +42,9 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+pub mod jobs;
+pub use jobs::{JobEvent, JobWatch};
+
 /// Flush as soon as this many bytes have accumulated.
 ///
 /// Chosen to sit comfortably above Tauri's 1024-byte raw threshold so frames always take
@@ -268,6 +271,18 @@ pub struct SpawnSpec {
     /// too. `screen_state()` is the buffer-agnostic picture, which is the right shape for a
     /// replay.
     pub preload: Vec<u8>,
+    /// Announce foreground jobs in this pane that run at least this long.
+    ///
+    /// `None` — the default, and what every Claude pane uses — watches nothing and costs
+    /// nothing. A Claude session learns its state from hooks (`cide_claude::next_state`),
+    /// which are exact and know about permission prompts; watching its process group as well
+    /// would report every tool call the CLI forks as a job of its own and fight the hooks for
+    /// the same `SessionState`.
+    ///
+    /// A shell has no hooks, so this is the only thing that can tell a pane the `make` it was
+    /// running has finished. See [`crate::jobs`] for what is watched and why there is a
+    /// threshold at all.
+    pub watch_jobs: Option<Duration>,
 }
 
 impl SpawnSpec {
@@ -281,6 +296,7 @@ impl SpawnSpec {
             geometry: Geometry::default(),
             credit: CreditPolicy::default(),
             preload: Vec::new(),
+            watch_jobs: None,
         }
     }
 
@@ -340,6 +356,12 @@ impl SpawnSpec {
     /// Seed the screen mirror with bytes from a previous run. See [`SpawnSpec::preload`].
     pub fn preload(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.preload = bytes.into();
+        self
+    }
+
+    /// Watch this pane's foreground process group. See [`SpawnSpec::watch_jobs`].
+    pub fn watch_jobs(mut self, announce_after: Duration) -> Self {
+        self.watch_jobs = Some(announce_after);
         self
     }
 }
@@ -430,7 +452,11 @@ enum Frame {
 /// Owned by the session registry in the app crate, never by a window, tab or pane —
 /// closing any of those detaches a sink, it does not kill the child.
 pub struct PtySession {
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    /// Shared with the coalescer, which asks it `tcgetpgrp` on a slow tick — see
+    /// [`JobProbe`]. An `Arc` rather than this struct's own `Mutex` only for that: the
+    /// coalescer thread is started inside [`PtySession::spawn`], before this struct exists,
+    /// so there is nothing else it could borrow from.
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer_tx: Sender<Vec<u8>>,
     /// Attach requests, serviced on the coalescer thread. A channel of its own rather than a
     /// variant on the reader→coalescer channel: that one reaching `Disconnected` is how EOF is
@@ -452,7 +478,18 @@ pub struct PtySession {
     exit: Arc<Mutex<ExitSlot>>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     credit: CreditPolicy,
+    /// Who to tell when this pane's foreground goes to a job and comes back.
+    ///
+    /// Shared with the coalescer, which is what does the observing. Empty unless the spec
+    /// asked for [`SpawnSpec::watch_jobs`], and empty for every Claude pane.
+    job_listeners: JobListeners,
 }
+
+/// Registered [`PtySession::on_job`] callbacks.
+///
+/// A list rather than a slot for the same reason `sinks` is one, though today exactly one
+/// consumer registers: `cide_app::lifecycle::watch_jobs`, once, at spawn.
+type JobListeners = Arc<Mutex<Vec<Box<dyn Fn(JobEvent) + Send>>>>;
 
 impl PtySession {
     /// Open a PTY, spawn the child, and start the reader, writer and coalescer threads.
@@ -515,6 +552,22 @@ impl PtySession {
         let (writer_tx, writer_rx) = unbounded::<Vec<u8>>();
         let (control_tx, control_rx) = unbounded::<Control>();
 
+        let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
+        let job_listeners: JobListeners = Arc::new(Mutex::new(Vec::new()));
+
+        // Only when asked, and only when the child actually started: `tcgetpgrp` compares
+        // against the shell's own pid, so a spawn that produced no pid has nothing to
+        // compare with and watches nothing rather than guessing.
+        let probe = match (spec.watch_jobs, child_pid) {
+            (Some(after), Some(pid)) => Some(JobProbe {
+                master: Arc::clone(&master),
+                watch: JobWatch::new(pid as i32, after),
+                listeners: Arc::clone(&job_listeners),
+                last_poll: None,
+            }),
+            _ => None,
+        };
+
         spawn_reader(reader, raw_tx);
         spawn_coalescer(
             raw_rx,
@@ -523,6 +576,7 @@ impl PtySession {
             Arc::clone(&sinks),
             Arc::clone(&exited),
             spec.credit,
+            probe,
         );
         spawn_writer(writer, writer_rx);
 
@@ -531,7 +585,7 @@ impl PtySession {
         spawn_reaper(child, Arc::clone(&exited), Arc::clone(&exit));
 
         Ok(Arc::new(Self {
-            master: Mutex::new(pair.master),
+            master,
             writer_tx,
             control_tx,
             vt,
@@ -543,6 +597,7 @@ impl PtySession {
             exit,
             killer: Mutex::new(killer),
             credit: spec.credit,
+            job_listeners,
         }))
     }
 
@@ -604,6 +659,20 @@ impl PtySession {
         // session something.
         drop(slot);
         f(exit);
+    }
+
+    /// Call `f` whenever this pane's foreground goes to a job and comes back.
+    ///
+    /// Silent unless the session was spawned with [`SpawnSpec::watch_jobs`], which is what
+    /// decides whether anything is observed at all; registering here on a session that was
+    /// not asked to watch is harmless and simply never fires.
+    ///
+    /// Runs on the coalescer thread, which is the thread every byte this pane prints passes
+    /// through — so `f` must not block, and must not call back into this session's
+    /// [`Self::on_job`] (the listener list is held while it runs, and the lock is not
+    /// reentrant). Emitting a Tauri event, which is the one caller, does neither.
+    pub fn on_job(&self, f: impl Fn(JobEvent) + Send + 'static) {
+        self.job_listeners.lock().push(Box::new(f));
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -979,6 +1048,74 @@ fn serve_control(
     }
 }
 
+/// How often the foreground process group is asked about.
+///
+/// One `tcgetpgrp` per quarter second per watched pane, and only for shells. Slow enough to
+/// be free, fast enough that the gap between a job ending and the pane saying so is shorter
+/// than the time it takes to look at the screen. It is deliberately the same order as the
+/// coalescer's own idle timeout, so a quiet pane's poll rides a wakeup that already happens.
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The observing half of [`crate::jobs`]: the syscall, the clock and the fan-out.
+///
+/// Lives on the coalescer thread rather than a thread of its own, on `watch_for_exit`'s
+/// argument — a wakeup per session per interval, for every pane, is what the exit watcher was
+/// rewritten to stop doing. The coalescer is already awake for output and already ticks while
+/// idle, so this costs one syscall on a tick that was happening anyway.
+struct JobProbe {
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    watch: JobWatch,
+    listeners: JobListeners,
+    last_poll: Option<Instant>,
+}
+
+impl JobProbe {
+    /// Ask, at most once per [`JOB_POLL_INTERVAL`], and report what the rule makes of it.
+    ///
+    /// Rate-limited here rather than by only polling on the idle tick, and that is not a
+    /// refinement: under continuous output — a build printing steadily — the idle arm may
+    /// never be selected at all, so a job that both started *and* finished inside one noisy
+    /// stretch would be missed entirely. Polling from the output arm too is what makes the
+    /// observation independent of how talkative the job is.
+    fn poll(&mut self, vt: &Arc<Mutex<vt100::Parser>>, now: Instant) {
+        if let Some(last) = self.last_poll
+            && now.saturating_duration_since(last) < JOB_POLL_INTERVAL
+        {
+            return;
+        }
+        self.last_poll = Some(now);
+
+        // Both locks are taken and released one at a time, never nested: the coalescer holds
+        // `vt` on every chunk of output and the resize path holds `master`, so a routine that
+        // wanted both at once would be the only place in this file able to order them wrongly.
+        let foreground = foreground_pgid(&self.master);
+        let alternate_screen = vt.lock().screen().alternate_screen();
+
+        let Some(event) = self.watch.observe(foreground, alternate_screen, now) else {
+            return;
+        };
+        for listener in self.listeners.lock().iter() {
+            listener(event);
+        }
+    }
+}
+
+/// Which process group currently owns the terminal, or `None` if it cannot be known.
+///
+/// `None` on a platform without the call is the same answer as `None` from a pty that has
+/// gone away, and [`JobWatch::observe`] treats it as no information rather than as a prompt —
+/// so a build for a target this is not implemented on simply never notices a job, which is
+/// exactly the pre-existing behaviour.
+#[cfg(unix)]
+fn foreground_pgid(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) -> Option<i32> {
+    master.lock().process_group_leader()
+}
+
+#[cfg(not(unix))]
+fn foreground_pgid(_master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) -> Option<i32> {
+    None
+}
+
 fn spawn_coalescer(
     rx: Receiver<Vec<u8>>,
     control_rx: Receiver<Control>,
@@ -986,6 +1123,7 @@ fn spawn_coalescer(
     sinks: Arc<Mutex<Vec<Registered>>>,
     exited: Arc<AtomicBool>,
     policy: CreditPolicy,
+    mut probe: Option<JobProbe>,
 ) {
     thread::Builder::new()
         .name("cide-pty-coalesce".into())
@@ -1059,6 +1197,11 @@ fn spawn_coalescer(
                             );
                             first_byte_at = None;
                         }
+                        // After the mirror has the chunk, so the alternate-screen bit the
+                        // rule reads is this instant's rather than the previous poll's.
+                        if let Some(probe) = probe.as_mut() {
+                            probe.poll(&vt, Instant::now());
+                        }
                     }
                     Event::Idle => {
                         if !pending.is_empty() {
@@ -1073,6 +1216,12 @@ fn spawn_coalescer(
                         // Service credit even with nothing to send, so a sink that choked
                         // during a burst still recovers once the burst ends.
                         broadcast(&sinks, &vt, &policy, Frame::Tick);
+                        // The arm that carries a *finished* job: work ends, the shell prints
+                        // a prompt, the pane goes quiet, and this fires a quarter second
+                        // later. The output arm above covers the noisy half.
+                        if let Some(probe) = probe.as_mut() {
+                            probe.poll(&vt, Instant::now());
+                        }
                     }
                     Event::Eof => {
                         if !pending.is_empty() {
@@ -1331,6 +1480,91 @@ mod tests {
     /// running, which made `reports_exit_after_the_child_finishes` fail once and pass on the
     /// next three runs — a flaky test being strictly worse than no test.
     const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// A real `bash`, a real job, and the two events a pane needs to notify.
+    ///
+    /// The unit tests in [`crate::jobs`] drive the rule; this drives the half they cannot —
+    /// that `tcgetpgrp` on this pty actually changes when a shell runs something, which is
+    /// the entire premise of the feature and is a claim about the platform rather than about
+    /// any code here.
+    ///
+    /// `--norc -i`: interactive, because job control is what puts a job in a process group of
+    /// its own and bash only turns it on for an interactive shell — a `bash -c` never leaves
+    /// its own group and this would (correctly) observe nothing. `--norc` so the test does not
+    /// source whatever is in the developer's rc files.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_shell_reports_a_job_starting_and_finishing() {
+        let spec = SpawnSpec::new("/bin/bash", std::env::temp_dir())
+            .arg("--norc")
+            .arg("-i")
+            // Far below the ten seconds the app ships, for the ordinary reason: a test that
+            // waits out a production threshold is a test nobody runs.
+            .watch_jobs(Duration::from_millis(100));
+        let session = PtySession::spawn(spec).expect("spawn bash");
+
+        let (tx, rx) = mpsc::channel::<JobEvent>();
+        session.on_job(move |event| {
+            let _ = tx.send(event);
+        });
+
+        // A sink, so the pane is being read exactly as a real one is. Without it the
+        // coalescer still runs, but keeping the shape honest costs one line.
+        let (sink, _out) = collect_sink();
+        session.attach(sink);
+
+        // Let bash reach its first prompt before asking it to do anything: the rule
+        // deliberately says nothing until it has seen the shell own its own terminal, which
+        // is the guard against a slow `.bash_profile` being reported as the pane's first job.
+        thread::sleep(Duration::from_millis(400));
+        session.write(b"sleep 1\n".to_vec());
+
+        let started = rx
+            .recv_timeout(DEADLINE)
+            .expect("a job that outran the threshold is announced");
+        assert_eq!(started, JobEvent::Started);
+
+        let finished = rx
+            .recv_timeout(DEADLINE)
+            .expect("and the prompt coming back ends it");
+        match finished {
+            JobEvent::Finished { ran_for } => {
+                assert!(
+                    ran_for >= Duration::from_millis(500),
+                    "the duration is the job's, not the poll interval's: {ran_for:?}",
+                );
+            }
+            other => panic!("expected a finished job, got {other:?}"),
+        }
+    }
+
+    /// The pane every user already has: no watching asked for, nothing observed, no events.
+    ///
+    /// Pinned because the cost of getting this wrong is not a crash — it is every Claude pane
+    /// in the app publishing a second, contradictory opinion about its own `SessionState`
+    /// every time the CLI forks a tool.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_that_did_not_ask_to_be_watched_reports_nothing() {
+        let spec = SpawnSpec::new("/bin/bash", std::env::temp_dir())
+            .arg("--norc")
+            .arg("-i");
+        let session = PtySession::spawn(spec).expect("spawn bash");
+
+        let (tx, rx) = mpsc::channel::<JobEvent>();
+        session.on_job(move |event| {
+            let _ = tx.send(event);
+        });
+        let (sink, _out) = collect_sink();
+        session.attach(sink);
+
+        thread::sleep(Duration::from_millis(400));
+        session.write(b"sleep 1\n".to_vec());
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).is_err(),
+            "an unwatched session announced a job",
+        );
+    }
 
     fn collect_sink() -> (Arc<dyn Sink>, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();

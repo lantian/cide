@@ -419,6 +419,15 @@ try {
    * treats as local. That is the shape `check:rows` now enforces — a consumer reading the bare
    * width reserves 125px where an editor pane needs 221, which is how the conflict bar came to
    * be drawn, hovered, and answering the close button's click.
+   *
+   * The `--pane-edge-*` trio are the other such measurements, flowing the other way:
+   * `SplitTree`'s leaf publishes each (`0px` on a leaf that touches the tree's left, top or
+   * bottom edge, where the app chrome — sidebar splitter, tab strip, add-row strip / status
+   * bar — already draws the seam) and `PaneTitleBar`'s frame reads each as that side's border
+   * width, with a 1px fallback that keeps a detached pane window's frame whole. Same
+   * reasoning as above: they are one box's geometry, the frame's class is hashed out of
+   * `SplitTree.module.css`'s reach, and a theme has no opinion on them. `check:rows` pins
+   * both ends and which leaves get which marks.
    */
   const publishers = new Map()
   for (const file of cssModules('src')) {
@@ -448,9 +457,14 @@ try {
     wanted
       .filter((t) => (darkAll[t] ?? '') === '' && contract(t))
       .map((t) => `${t} <- ${publishers.get(t)[0]}`),
-    ['--pane-corner-clear <- src/layout/PaneTitleBar.module.css'],
-    'the only custom property one CSS module publishes to another is the pane corner reserve, ' +
-      'and exactly one file publishes it',
+    [
+      '--pane-corner-clear <- src/layout/PaneTitleBar.module.css',
+      '--pane-edge-bottom <- src/layout/SplitTree.module.css',
+      '--pane-edge-left <- src/layout/SplitTree.module.css',
+      '--pane-edge-top <- src/layout/SplitTree.module.css',
+    ],
+    'the custom properties one CSS module publishes to another are the pane corner reserve ' +
+      'and the three flush-edge marks, each from exactly one file',
   )
 
   // --- the three notice edges are three colours a person can tell apart --------------------

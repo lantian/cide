@@ -765,9 +765,11 @@ try {
       'and `close_tab` consults it — which is the whole reason it is in Rust and not here',
     )
     ok(
-      closeTab !== undefined && /tabs\.get\(index - 1\)/.test(closeTab),
+      closeTab !== undefined && /tabs\[\.\.index\]\s*\.iter\(\)\s*\.rev\(\)/.test(closeTab),
       'while keeping the left-neighbour rule as the fallback, for the migrated workspace whose ' +
-        'order holds nothing but the tab being closed',
+        'order holds nothing but the tab being closed — as a leftward walk now, because the ' +
+        'nearest neighbour can be a tab torn out into its own window and activating one of ' +
+        'those would draw it in two windows at once',
     )
   }
 

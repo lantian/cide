@@ -48,15 +48,32 @@
  * there to prevent. The canvas's own background resolves to `.tree`'s `--panel-2`, so the new
  * 3px is the same ground the gutters already show.
  *
- * It costs one terminal refit at load — the panes are 6px narrower and shorter — and none
- * afterwards: nothing about this changes when a pane is focused, split or maximized.
+ * It costs one terminal refit at load and none afterwards: nothing about this changes when a
+ * pane is focused, split or maximized.
+ *
+ * # Only the RIGHT edge now — the chrome-facing edges pad by zero
+ *
+ * The paragraph above earned the gutter on the premise "no neighbour, no half-gutter", and
+ * that premise turned out to be false on three of the four edges, where the app's own chrome
+ * is the neighbour and already draws the seam: the sidebar splitter's 6px `--panel-2` strip
+ * (plus the sidebar's `border-right`) on the left, the tab strip's `border-bottom` above, and
+ * the add-row strip's / status bar's `border-top` below. On those edges the 3px here plus the
+ * frame's 1px border put a lone `--border` line a few pixels in from the chrome's own seam,
+ * floating against nothing, and pushed a pane's content out of line with the tab strip's tabs
+ * — the user circled the left one in a screenshot, then pointed out that top and bottom carry
+ * the same padding. Zero padding on those edges — with that side of the frame border dropped
+ * via `data-edge-*` below — puts an edge pane's content exactly in line with the tabs, and
+ * the chrome seam stays the only line.
+ *
+ * The right edge keeps the half-gutter: it meets the bare window edge, which draws nothing,
+ * so it is the one edge where the original argument still holds.
  */
 .canvas {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   display: grid;
-  padding: 3px;
+  padding: 0 3px 0 0;
 }
 
 /*
@@ -121,6 +138,35 @@
   display: grid;
   min-width: 0;
   min-height: 0;
+}
+
+/*
+ * A leaf that touches one of the canvas's chrome-facing edges — marked by `SplitTree.tsx`'s
+ * walk, which is the only place that knows the tree's shape. With the canvas's padding at
+ * zero on those edges (see `.canvas`), a frame border there would sit directly against the
+ * chrome's own seam — the sidebar splitter on the left, the tab strip's `border-bottom`
+ * above, the add-row strip's / status bar's `border-top` below — and be a doubled line
+ * belonging to neither box. The properties are custom properties rather than classes on the
+ * frame because the frame lives in `PaneTitleBar.module.css`, whose class names are hashed
+ * out of this file's reach — same seam as `--pane-corner-clear`, in the other direction.
+ * `check:rows` pins both ends and which leaves get which marks.
+ *
+ * The cost, stated because it is real: an edge pane's focus and awaiting border colours lose
+ * the flush segments — on a single-pane tab, where every edge but the right is flush, the
+ * amber awaiting border survives only on the right. A focused terminal keeps its full ring
+ * (`.frameFocused::after` draws all four edges inside the frame regardless of border width),
+ * and an awaiting pane still has the tab strip's chip.
+ */
+.leaf[data-edge-left] {
+  --pane-edge-left: 0px;
+}
+
+.leaf[data-edge-top] {
+  --pane-edge-top: 0px;
+}
+
+.leaf[data-edge-bottom] {
+  --pane-edge-bottom: 0px;
 }
 
 .splitter {

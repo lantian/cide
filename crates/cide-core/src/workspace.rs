@@ -518,6 +518,19 @@ pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId, force: bool
         });
     }
 
+    // Which tabs are torn out into windows of their own, read before the mutable borrow:
+    // the successor below must not hand the shell a tab it is deliberately not drawing.
+    // The mru arm is screened by construction — `activate_tab` refuses to admit a detached
+    // tab to the order — but the positional fallback walks the strip itself.
+    let torn: Vec<TabId> = ws
+        .windows
+        .values()
+        .filter_map(|role| match role {
+            WindowRole::DetachedTab { tab, .. } => Some(*tab),
+            _ => None,
+        })
+        .collect();
+
     let p = project_mut(ws, project)?;
     p.tabs.remove(index);
     // Out of the focus order whether or not it was the active tab, and *before* the successor
@@ -547,12 +560,22 @@ pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId, force: bool
         // nothing here, and both then get the left neighbour — which always exists, because
         // `index` is at least 1 and `tabs[0]` is the console, which cannot be closed. So the
         // successor is never absent and is never the tab just removed.
+        // Both arms skip tabs that are torn out into their own windows: activating one from
+        // here would draw it in two windows at once. The positional arm walks left from the
+        // closed tab's slot rather than taking `index - 1` blindly — `tabs[0]` is the
+        // console, which can never detach, so the walk always lands somewhere.
         let successor = p
             .tab_mru
             .iter()
             .copied()
-            .find(|id| p.tabs.iter().any(|t| t.id == *id))
-            .or_else(|| p.tabs.get(index - 1).map(|t| t.id));
+            .find(|id| !torn.contains(id) && p.tabs.iter().any(|t| t.id == *id))
+            .or_else(|| {
+                p.tabs[..index]
+                    .iter()
+                    .rev()
+                    .find(|t| !torn.contains(&t.id))
+                    .map(|t| t.id)
+            });
         if let Some(next) = successor {
             set_active(p, next);
         }
@@ -581,6 +604,20 @@ pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId, force: bool
 /// `persist::load` repairs on the way in as well; this is the belt to that pair of braces, and
 /// it settles after one activation because `set_active` puts the tab at the head.
 pub fn activate_tab(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Result<()> {
+    // A tab torn out into a window of its own is already on screen — there, not here.
+    // Making it the shell's active tab would draw the same tab in two windows at once,
+    // which for a file tab is two live editors over one buffer, the exact failure the
+    // per-tab buffer registry exists to prevent (see `ui/src/editor/openBuffers.ts`).
+    //
+    // Answered with success rather than refused, deliberately: the callers that reach this
+    // are reveal flows — a mention landing in a pane, `tab_open_file` finding the path
+    // already open — and each goes on to raise the tab's own window, which is the honest
+    // rendering of "activate". A refusal here would surface an error toast in the middle of
+    // a gesture that is about to succeed.
+    if detached_tab_window(ws, tab).is_some() {
+        index_of_tab(self::project(ws, project)?, tab)?;
+        return Ok(());
+    }
     let p = project_mut(ws, project)?;
     index_of_tab(p, tab)?;
 
@@ -830,6 +867,128 @@ pub fn promote_diff(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Resul
     Ok(())
 }
 
+/// Follow files that moved on disk: rewrite every [`TabKind::File`] tab that named one. (M25)
+///
+/// `moves` is `(from, to)` pairs, and a pair matches a tab either **exactly** — the file itself
+/// was renamed — or as a **directory prefix**, which is the case that is easy to forget: renaming
+/// `src/` moves every open file under it, and a tab left pointing at `src/old/main.rs` is as
+/// broken as one pointing at the old name of the file itself.
+///
+/// # Why this exists at all
+///
+/// A `File` tab is an absolute path and nothing else, and `cide_core::document::write` resolves
+/// that path with `canonicalize`, which **requires the file to exist**. So a rename in the file
+/// tree used to leave the editor holding a path with nothing behind it: the tab went on showing
+/// the old name, and every save — Ctrl+S and autosave alike — failed with `ENOENT` on a buffer
+/// the user could still type into. The tab stayed dirty with no gesture that could clean it.
+/// That is the bug this closes, and it is why the retarget belongs beside the rename in Rust
+/// rather than in a webview: `workspace.json` is the record, one gesture moved the file, and two
+/// windows deciding separately what their mirror should say is the thing ADR 0002 exists to stop.
+///
+/// # Every project, not the one the gesture came from
+///
+/// The path is absolute and says nothing about which project opened it — `TabKind::File`'s own
+/// documentation makes the point that nothing there claims the file is even *in* the project. Two
+/// projects with overlapping roots, or a file reached by go-to-definition, can both hold a tab on
+/// one file, and the file moved for both of them. Scoping this to the calling project would leave
+/// the second one holding exactly the broken tab described above.
+///
+/// # What is deliberately left alone
+///
+/// * **[`TabKind::Diff`]**. A `ClaudeMcp` diff is the one tab that holds an agent's turn open, and
+///   its spec is the *key the pane fetches by* (`claude_diff_content`) rather than a label —
+///   re-pointing it would leave a `claude` blocked on a request nobody can answer, which is the
+///   failure `cmd::ide`'s "every early return must cancel first" rule exists to prevent. A `Git`
+///   diff's paths are repo-relative, so this function does not hold enough to rewrite one.
+/// * **[`TabKind::Revision`] and [`TabKind::Merge`]**, for the second of those reasons: both spell
+///   their path repo-relative, and a revision tab names a blob in a commit that a rename in the
+///   working tree does not touch.
+/// * **The `dirty` flag.** The buffer did not change because the file was renamed; the edits are
+///   still in the editor and still unsaved. `ui/src/panes/EditorPane.tsx` carries them across the
+///   path change for the same reason.
+///
+/// Bumps `rev` **only if a tab moved**, which is the ordinary rule here and matters because the
+/// common rename is of a file nobody has open: a mirror that was already right must not be told
+/// it is stale. Silent on a workspace with nothing to move, exactly as [`promote_diff`] is on a
+/// tab that was never a preview — that is not an error, it is the usual case.
+pub fn retarget_paths(ws: &mut Workspace, moves: &[(PathBuf, PathBuf)]) {
+    // Read first, mutate second. The pane titles have to be rewritten in two places — the tab's
+    // own tree and `project.detached`, which `detach_pane` moved panes *out* of the tree into —
+    // and the second is reached through `detached_panes_of`, which takes `&Workspace`. Collecting
+    // the plan is what lets both happen without a second index keyed by tab.
+    let plan: Vec<(ProjectId, TabId, PathBuf)> = ws
+        .projects
+        .iter()
+        .flat_map(|(id, p)| {
+            p.tabs.iter().filter_map(move |t| {
+                let TabKind::File { path, .. } = &t.kind else {
+                    return None;
+                };
+                let next = moves
+                    .iter()
+                    .find_map(|(from, to)| moved_path(path, from, to))?;
+                Some((*id, t.id, next))
+            })
+        })
+        .collect();
+    if plan.is_empty() {
+        return;
+    }
+
+    for (project, tab, next) in plan {
+        // A basename, which is what `cmd::file::tab_open_file` minted the pane with: the pane
+        // header draws this string, and leaving it would put `old.rs` above a buffer over
+        // `new.rs` — the same staleness `retarget_diff` renames its panes to avoid.
+        let title = basename(&next);
+        let torn_out = detached_panes_of(ws, project, tab);
+        let Ok(t) = tab_mut(ws, project, tab) else {
+            continue;
+        };
+        if let TabKind::File { path, .. } = &mut t.kind {
+            *path = next;
+        }
+        for pane in t.tree.panes.values_mut() {
+            if pane.kind == PaneKind::Editor {
+                pane.title = title.clone();
+            }
+        }
+        let Ok(p) = project_mut(ws, project) else {
+            continue;
+        };
+        for id in torn_out {
+            if let Some(pane) = p.detached.get_mut(&id)
+                && pane.kind == PaneKind::Editor
+            {
+                pane.title = title.clone();
+            }
+        }
+    }
+
+    bump(ws);
+}
+
+/// Where `path` ends up when `from` becomes `to`, or `None` if this move does not touch it.
+///
+/// `pub` because a moved file has more than one record pointing at it: [`retarget_paths`] moves
+/// the tabs, and `cide-app`'s position store moves the remembered scroll with the same rule. Two
+/// spellings of "is this path inside that folder" is two answers the day one of them is fixed.
+///
+/// The exact case is answered before `strip_prefix` rather than through it, and that is not
+/// tidiness: `strip_prefix` on an equal path yields `""`, and `to.join("")` is `to` **with a
+/// trailing separator**. `Path` compares by component so Rust would never notice, but the value is
+/// serialised into `workspace.json` and compared as a *string* by every consumer in the webview —
+/// `EditorPane`'s path prop, `paneHosts`' map, the tab-already-open check in `tab_open_file`. One
+/// stray slash there is a second tab for a file that is already open.
+pub fn moved_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    if path == from {
+        return Some(to.to_path_buf());
+    }
+    // Only ever a *directory* prefix: `strip_prefix` matches whole components, so renaming
+    // `src/main.rs` does not claim `src/main.rs.bak`.
+    let rest = path.strip_prefix(from).ok()?;
+    Some(to.join(rest))
+}
+
 /// Normalise the walk that led to a revision tab — [`TabKind::Revision::from`]. (M18)
 ///
 /// Pure, and here rather than in `cmd::file` for the reason every other rule in this module is:
@@ -1038,6 +1197,128 @@ pub fn redock_pane(ws: &mut Workspace, label: &WindowLabel) -> Result<WindowLabe
     }
 
     ws.windows.shift_remove(label);
+    bump(ws);
+    Ok(label.clone())
+}
+
+/// The window one tab is torn out into, if any.
+///
+/// `pub` because three sides of the feature ask it: [`detach_tab`] for idempotence,
+/// [`activate_tab`] for the guard below, and `cide-app`'s file-open path, which raises this
+/// window instead of activating a tab the shell is deliberately not drawing.
+pub fn detached_tab_window(ws: &Workspace, tab: TabId) -> Option<WindowLabel> {
+    ws.windows.iter().find_map(|(label, role)| match role {
+        WindowRole::DetachedTab { tab: t, .. } if *t == tab => Some(label.clone()),
+        _ => None,
+    })
+}
+
+/// Give a whole tab a window of its own.
+///
+/// The counterpart of [`detach_pane`] one level up, and deliberately *not* the same
+/// mechanism: a pane moves into `project.detached` because an empty slot in a tree is
+/// unrepresentable, but a tab needs no holding map — **it stays in `project.tabs`**, and the
+/// window role is an overlay saying "this tab is drawn elsewhere". That is what keeps every
+/// walk over `p.tabs` honest while the tab is out: `unsaved_tabs` still refuses a quit that
+/// would discard its buffer, `plan_restore` still plans its panes, and `sessions_of` still
+/// counts its sessions — for the tab's own window rather than the shell's.
+///
+/// This is also the only road a torn-out *editor* can take. A detached-pane window refuses
+/// `PaneKind::Editor` outright (see `ui/src/windows/detachedPane.ts`): buffers are registered
+/// per **tab**, and a pane taken out of its tab would need a second buffer over the same
+/// file — whichever saved second would silently discard the other's edits. Detaching the tab
+/// keeps the `TabId`, so the one buffer moves with it.
+///
+/// What the shell must then uphold — and this function starts — is that **no shell draws a
+/// detached tab**: two windows rendering one tab is two live editors over one buffer, the
+/// exact failure the per-tab registry exists to prevent. So the tab leaves `tab_mru` (the
+/// switcher's order and `close_tab`'s successor pool) and, when it was active, the shell is
+/// moved to the same successor a close would pick. [`activate_tab`] holds the line from the
+/// other side.
+///
+/// Refused for the pinned console ([`CoreError::TabPinned`]): the console is the project's
+/// anchor, and the tab strip with a hole at index 0 is a state nothing else handles. Asked
+/// twice for a tab already out, it answers the existing window's label without bumping —
+/// the caller then has a window to raise rather than an error to word.
+pub fn detach_tab(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Result<WindowLabel> {
+    let index = index_of_tab(self::project(ws, project)?, tab)?;
+    if index == 0 {
+        return Err(CoreError::TabPinned);
+    }
+    if let Some(label) = detached_tab_window(ws, tab) {
+        return Ok(label);
+    }
+
+    // Which other tabs are already torn out, read before the mutable borrow: the successor
+    // below must not hand the shell a tab some other window is drawing.
+    let torn: Vec<TabId> = ws
+        .windows
+        .values()
+        .filter_map(|role| match role {
+            WindowRole::DetachedTab { tab, .. } => Some(*tab),
+            _ => None,
+        })
+        .collect();
+
+    let p = project_mut(ws, project)?;
+    // Out of the focus order exactly as `close_tab` takes a closing tab out: the order is
+    // what the Ctrl+Tab switcher walks and what picks a successor, and both must stop
+    // offering a tab this window no longer shows. `redock_tab`'s `set_active` puts it back.
+    p.tab_mru.retain(|id| *id != tab);
+    if p.active_tab == tab {
+        // The same successor rule as `close_tab`, because to the shell this *is* a close:
+        // the most recently used survivor, else the nearest live neighbour to the left. The
+        // `torn` filter is belt over the mru braces — `activate_tab` never lets a detached
+        // tab into the order — and load-bearing on the positional arm, where nothing else
+        // screens it. `tabs[0]` is the console, which cannot detach, so the arm always finds
+        // something.
+        let successor = p
+            .tab_mru
+            .iter()
+            .copied()
+            .find(|id| !torn.contains(id) && p.tabs.iter().any(|t| t.id == *id))
+            .or_else(|| {
+                p.tabs[..index]
+                    .iter()
+                    .rev()
+                    .find(|t| !torn.contains(&t.id))
+                    .map(|t| t.id)
+            });
+        if let Some(next) = successor {
+            set_active(p, next);
+        }
+    }
+
+    let label = WindowLabel::detached_tab();
+    ws.windows
+        .insert(label.clone(), WindowRole::DetachedTab { project, tab });
+    bump(ws);
+    Ok(label)
+}
+
+/// Put a detached tab back in its shell's strip and name the window that should now close.
+///
+/// Far smaller than [`redock_pane`] because the detach was smaller: the tab never left
+/// `project.tabs`, so there is nothing to re-insert and no anchor to restore — dropping the
+/// window role *is* the re-dock. `set_active` rather than a bare reappearance, because the
+/// gesture is "put it back where I can see it": a tab that silently rejoined a strip the
+/// user is not looking at would read as the window closing and the file going with it.
+pub fn redock_tab(ws: &mut Workspace, label: &WindowLabel) -> Result<WindowLabel> {
+    let Some(WindowRole::DetachedTab { project, tab }) = ws.windows.get(label).cloned() else {
+        return Err(CoreError::Invariant(format!(
+            "window {label} is not a detached tab"
+        )));
+    };
+
+    ws.windows.shift_remove(label);
+    // The project can have closed while the window was up only if something skipped
+    // `close_project`'s pruning; the tab likewise. Neither is worth failing the re-dock
+    // over — the window is going away either way, and the role is already gone.
+    if let Ok(p) = project_mut(ws, project)
+        && p.tabs.iter().any(|t| t.id == tab)
+    {
+        set_active(p, tab);
+    }
     bump(ws);
     Ok(label.clone())
 }
@@ -3029,6 +3310,138 @@ mod tests {
         validate(&ws).expect("valid");
     }
 
+    #[test]
+    fn detaching_a_tab_keeps_it_in_the_project_and_moves_the_shell_off_it() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let file = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", false);
+        assert_eq!(project(&ws, id).expect("exists").active_tab, file);
+
+        let label = detach_tab(&mut ws, id, file).expect("detaches");
+
+        // Unlike a pane, the tab stays where it was: `unsaved_tabs`, `plan_restore` and the
+        // awaiting arithmetic all walk `p.tabs`, and the window role alone says it is drawn
+        // elsewhere.
+        let p = project(&ws, id).expect("exists");
+        assert!(p.tabs.iter().any(|t| t.id == file));
+        assert!(matches!(
+            ws.windows.get(&label),
+            Some(WindowRole::DetachedTab { tab, .. }) if *tab == file
+        ));
+        // The shell stops drawing it: the active tab moves to a survivor and the focus order
+        // stops offering it, exactly as if the tab had closed.
+        assert_eq!(p.active_tab, console);
+        assert!(!p.tab_mru.contains(&file));
+        validate(&ws).expect("valid");
+    }
+
+    #[test]
+    fn detaching_the_pinned_console_tab_is_refused() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        assert_eq!(detach_tab(&mut ws, id, console), Err(CoreError::TabPinned));
+    }
+
+    /// A second detach of the same tab answers the first window rather than minting a rival:
+    /// two windows over one tab would be two live editors over one buffer.
+    #[test]
+    fn detaching_a_tab_twice_answers_the_same_window_and_moves_nothing() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let file = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", false);
+
+        let first = detach_tab(&mut ws, id, file).expect("detaches");
+        let rev = ws.rev;
+        assert_eq!(detach_tab(&mut ws, id, file), Ok(first));
+        assert_eq!(ws.rev, rev, "an idempotent answer is not a mutation");
+    }
+
+    /// The guard the whole arrangement leans on: while a tab is out, no activation may make
+    /// the shell draw it — success with no movement, because the callers that reach this are
+    /// reveal flows that go on to raise the tab's own window.
+    #[test]
+    fn a_detached_tab_cannot_become_the_shells_active_tab() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let file = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", false);
+        detach_tab(&mut ws, id, file).expect("detaches");
+        let rev = ws.rev;
+
+        activate_tab(&mut ws, id, file).expect("answered with success, not a refusal");
+
+        let p = project(&ws, id).expect("exists");
+        assert_eq!(p.active_tab, console);
+        assert!(!p.tab_mru.contains(&file));
+        assert_eq!(ws.rev, rev);
+    }
+
+    #[test]
+    fn redocking_a_tab_drops_its_window_and_brings_the_tab_back_in_front() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let file = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", false);
+        let label = detach_tab(&mut ws, id, file).expect("detaches");
+
+        redock_tab(&mut ws, &label).expect("redocks");
+
+        assert!(!ws.windows.contains_key(&label));
+        let p = project(&ws, id).expect("exists");
+        // Active again, not merely present: "put it back" means back where the user can see
+        // it, or the window closing reads as the file going with it.
+        assert_eq!(p.active_tab, file);
+        assert_eq!(p.tab_mru.first(), Some(&file));
+        validate(&ws).expect("valid");
+    }
+
+    /// The positional fallback is the arm nothing else screens: with an empty focus order —
+    /// a workspace written before `tab_mru` existed — closing a tab walks the strip leftward,
+    /// and the walk must step over a tab some other window is drawing.
+    #[test]
+    fn closing_a_tab_never_hands_the_shell_a_detached_successor() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let a = open_file(&mut ws, id, "/home/dev/work/cide/src/a.rs", false);
+        let b = open_file(&mut ws, id, "/home/dev/work/cide/src/b.rs", false);
+        detach_tab(&mut ws, id, a).expect("detaches");
+        activate_tab(&mut ws, id, b).expect("activates");
+        project_mut(&mut ws, id).expect("exists").tab_mru.clear();
+
+        close_tab(&mut ws, id, b, false).expect("closes");
+
+        let p = project(&ws, id).expect("exists");
+        assert_eq!(
+            p.active_tab, console,
+            "the left neighbour was torn out, so the walk continues to the console"
+        );
+        validate(&ws).expect("valid");
+    }
+
+    /// Ctrl+W inside the torn-out window itself: the close prunes the window's role, which
+    /// is what lets the app destroy the now-empty window instead of stranding it.
+    #[test]
+    fn closing_a_detached_tab_drops_its_window_role() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let file = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", false);
+        let label = detach_tab(&mut ws, id, file).expect("detaches");
+
+        close_tab(&mut ws, id, file, false).expect("closes");
+
+        assert!(!ws.windows.contains_key(&label));
+        assert!(
+            !project(&ws, id)
+                .expect("exists")
+                .tabs
+                .iter()
+                .any(|t| t.id == file)
+        );
+        validate(&ws).expect("valid");
+    }
+
     /// The criterion: "re-dock restores its tree position". Detach, change nothing, re-dock —
     /// and the tab is the tree it was, ratio included.
     ///
@@ -4037,6 +4450,14 @@ mod tests {
         tab(ws, project, id).expect("exists").kind.clone()
     }
 
+    /// A file tab's path as a string, which is how every consumer in the webview reads it.
+    fn path_of(ws: &Workspace, project: ProjectId, id: TabId) -> String {
+        let TabKind::File { path, .. } = kind_of(ws, project, id) else {
+            panic!("not a file tab");
+        };
+        path.to_string_lossy().into_owned()
+    }
+
     /// The operation the user asked for, at the level that owns it: the tab changes, the
     /// strip does not grow.
     #[test]
@@ -4370,5 +4791,151 @@ mod tests {
             revision_spec("src/e.rs", "beef123"),
         )
         .expect("same family, so it retargets");
+    }
+
+    /*
+     * Renaming a file the user has open. (M25)
+     *
+     * The tab is the thing that has to move: `cide_core::document::write` canonicalizes before it
+     * writes, so a tab left on the old name is a buffer that cannot be saved at all — which is
+     * the report this came from, and it is invisible from inside `fs_rename`, whose own answer
+     * (the file moved) was correct.
+     */
+    #[test]
+    fn renaming_an_open_file_moves_its_tab_and_its_pane_header() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let id = open_file(&mut ws, project, "/repo/src/old.rs", true);
+        let before = ws.rev;
+
+        retarget_paths(
+            &mut ws,
+            &[(
+                PathBuf::from("/repo/src/old.rs"),
+                PathBuf::from("/repo/src/new.rs"),
+            )],
+        );
+
+        assert_eq!(
+            kind_of(&ws, project, id),
+            TabKind::File {
+                path: PathBuf::from("/repo/src/new.rs"),
+                // Still dirty. The rename moved the file, not the buffer: the edits are in the
+                // editor and are still unsaved, and clearing this would offer to close the tab
+                // without a word about them.
+                dirty: true,
+            },
+        );
+        assert!(
+            tab(&ws, project, id)
+                .expect("exists")
+                .tree
+                .panes
+                .values()
+                .all(|p| p.title == "new.rs"),
+            "the pane header names the file the buffer is now over",
+        );
+        assert!(ws.rev > before, "every window has to be told");
+    }
+
+    /// Renaming a *folder* takes every tab under it. The prefix case is the one that gets
+    /// forgotten, and it fails in exactly the same way as the file case.
+    #[test]
+    fn renaming_a_folder_moves_the_tabs_beneath_it() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let deep = open_file(&mut ws, project, "/repo/src/net/http.rs", false);
+        let sibling = open_file(&mut ws, project, "/repo/src/main.rs", false);
+        // The near miss: a sibling whose path *starts with the same characters* and is not
+        // inside the folder. `strip_prefix` matches whole components, which is what keeps it out.
+        let decoy = open_file(&mut ws, project, "/repo/src/network.md", false);
+
+        retarget_paths(
+            &mut ws,
+            &[(
+                PathBuf::from("/repo/src/net"),
+                PathBuf::from("/repo/src/io"),
+            )],
+        );
+
+        assert_eq!(path_of(&ws, project, deep), "/repo/src/io/http.rs");
+        assert_eq!(path_of(&ws, project, sibling), "/repo/src/main.rs");
+        assert_eq!(path_of(&ws, project, decoy), "/repo/src/network.md");
+    }
+
+    /// The same file open in two projects moves in both. The path is absolute and the file moved
+    /// on disk; the project that happened to issue the rename has nothing to do with it.
+    #[test]
+    fn a_rename_reaches_every_project_holding_the_file() {
+        let mut ws = Workspace::default();
+        let one = open(&mut ws, "/repo");
+        let two = open(&mut ws, "/other");
+        let here = open_file(&mut ws, one, "/repo/src/old.rs", false);
+        let there = open_file(&mut ws, two, "/repo/src/old.rs", false);
+
+        retarget_paths(
+            &mut ws,
+            &[(
+                PathBuf::from("/repo/src/old.rs"),
+                PathBuf::from("/repo/src/new.rs"),
+            )],
+        );
+
+        assert_eq!(path_of(&ws, one, here), "/repo/src/new.rs");
+        assert_eq!(path_of(&ws, two, there), "/repo/src/new.rs");
+    }
+
+    /// The common rename is of a file nobody has open, and it must not cost a broadcast: the
+    /// caller only emits when this says something moved.
+    #[test]
+    fn renaming_a_file_no_tab_names_is_not_news() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        open_file(&mut ws, project, "/repo/src/main.rs", false);
+        let before = ws.rev;
+
+        retarget_paths(
+            &mut ws,
+            &[(
+                PathBuf::from("/repo/README.md"),
+                PathBuf::from("/repo/READ.md"),
+            )],
+        );
+        assert_eq!(ws.rev, before, "no tab moved, so no mirror is stale");
+    }
+
+    /// A retargeted path is compared as a *string* by everything in the webview that reads it,
+    /// so the exact case must not come back with `to.join("")`'s trailing separator.
+    #[test]
+    fn a_moved_path_is_spelled_the_way_the_frontend_will_compare_it() {
+        assert_eq!(
+            moved_path(
+                Path::new("/repo/src/old.rs"),
+                Path::new("/repo/src/old.rs"),
+                Path::new("/repo/src/new.rs"),
+            )
+            .expect("the file itself moved")
+            .to_string_lossy(),
+            "/repo/src/new.rs",
+        );
+        assert_eq!(
+            moved_path(
+                Path::new("/repo/src/net/http.rs"),
+                Path::new("/repo/src/net"),
+                Path::new("/repo/src/io"),
+            )
+            .expect("a folder above it moved")
+            .to_string_lossy(),
+            "/repo/src/io/http.rs",
+        );
+        assert_eq!(
+            moved_path(
+                Path::new("/repo/src/network.md"),
+                Path::new("/repo/src/net"),
+                Path::new("/repo/src/io"),
+            ),
+            None,
+            "a name that merely starts the same is not inside the folder",
+        );
     }
 }

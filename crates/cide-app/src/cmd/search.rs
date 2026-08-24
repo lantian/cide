@@ -19,13 +19,13 @@
 //! and the alternative — a job per window — would let a background window keep a walk of a
 //! 100k-file repository running for a panel nobody is looking at.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use cide_fs::{Filter, FsError};
-use cide_ipc::{ProjectId, SearchFrame, SearchHit, SearchQuery};
-use cide_search::content::{Limits, PatternError, Regex, Search, SearchRoot};
+use cide_ipc::{ProjectId, SearchFrame, SearchHit, SearchProblem, SearchQuery};
+use cide_search::content::{Globs, Limits, PatternError, Regex, Search, SearchRoot, within_scope};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tauri::State;
@@ -114,9 +114,9 @@ struct Found {
     hits: Vec<SearchHit>,
     files: u32,
     truncated: bool,
-    /// An unusable pattern. Set before the walk is even attempted; see
+    /// An unusable pattern, folder or glob. Set before the walk is even attempted; see
     /// [`cide_ipc::SearchFrame::error`] for why it is not a rejection.
-    error: Option<String>,
+    error: Option<SearchProblem>,
 }
 
 impl Job {
@@ -158,7 +158,18 @@ impl Job {
     /// The blocking half: walk the roots under the project's own ignore rules.
     ///
     /// **Blocking**, for as long as the tree takes. `spawn_blocking` is the only caller.
-    fn walk(&self, roots: Vec<SearchRoot>, filter: Arc<Filter>, regex: Regex) {
+    ///
+    /// `scope` and `include` are the panel's two narrowing boxes, already resolved and
+    /// validated by the handler — an unusable one is a frame with a [`SearchProblem`] on it and
+    /// never reaches here, which is why neither is fallible at this point.
+    fn walk(
+        &self,
+        roots: Vec<SearchRoot>,
+        filter: Arc<Filter>,
+        regex: Regex,
+        scope: Option<PathBuf>,
+        include: Option<Globs>,
+    ) {
         // The very object the file tree and the watcher consult — `ProjectFs::filter` — and
         // not a second one built from the same `dir_paths()`. Rebuilding it here cost a `stat`
         // per directory in the project, a few thousand on a large one, at the start of every
@@ -172,13 +183,26 @@ impl Job {
         // is that the search follows the *tree* rather than a copy of the tree's rules: the
         // day `Filter` grows a rule the walker has no setting for, the search inherits it
         // instead of quietly disagreeing about which files exist.
-        let admits = |path: &Path, is_dir: bool| filter.admits(path, is_dir);
+        //
+        // The folder scope rides in the same predicate rather than beside it. Both answer
+        // "should the walk look here at all", and a directory rejected by either has to prune
+        // identically — `content::Visitor::visit` turns one `false` into a `WalkState::Skip`,
+        // so a search scoped to `crates/cide-git` skips `ui/` at its top rather than walking it
+        // to reject every file one at a time. See `content::within_scope` for why a directory
+        // *above* the scope still has to be admitted.
+        let admits = |path: &Path, is_dir: bool| {
+            filter.admits(path, is_dir)
+                && scope
+                    .as_ref()
+                    .is_none_or(|scope| within_scope(path, is_dir, scope))
+        };
 
         let outcome = Search {
             roots: &roots,
             regex: &regex,
             limits: Limits::default(),
             admits: Some(&admits),
+            include: include.as_ref(),
             cancel: &self.stop,
             progress: Some(&self.scanned),
         }
@@ -254,16 +278,16 @@ pub async fn search_query(
             // Nothing to search for. Not an error and not a walk — the panel's empty state.
             job.running.store(false, Ordering::Release);
         } else {
-            match cide_search::content::compile(&job.query) {
-                Ok(regex) => {
-                    let roots: Vec<SearchRoot> = project_fs
-                        .roots
-                        .iter()
-                        .map(|r| SearchRoot {
-                            path: r.path.clone(),
-                            label: r.label.clone(),
-                        })
-                        .collect();
+            let roots: Vec<SearchRoot> = project_fs
+                .roots
+                .iter()
+                .map(|r| SearchRoot {
+                    path: r.path.clone(),
+                    label: r.label.clone(),
+                })
+                .collect();
+            match plan(&job.query, &roots) {
+                Ok(plan) => {
                     // Taken here rather than inside the worker: it is one `RwLock` read and an
                     // `Arc` bump, and the worker outlives this call — it must not hold a
                     // reference to a project that can be closed while the walk runs. The
@@ -274,12 +298,15 @@ pub async fn search_query(
                     let job = Arc::clone(&job);
                     // Not awaited. The frame below is the empty first one, and the panel
                     // polls for the rest.
-                    tauri::async_runtime::spawn_blocking(move || job.walk(roots, filter, regex));
+                    tauri::async_runtime::spawn_blocking(move || {
+                        job.walk(roots, filter, plan.regex, plan.scope, plan.include)
+                    });
                 }
-                Err(error) => {
-                    // Half of every regex is unparsable while it is being typed. The frame
-                    // carries it and the panel shows it in place of the results.
-                    job.found.lock().error = Some(pattern_error(&error));
+                Err(problem) => {
+                    // Half of every regex is unparsable while it is being typed, and so is half
+                    // of every folder path and half of every glob. The frame carries which one
+                    // it was and the panel shows it in place of the results.
+                    job.found.lock().error = Some(problem);
                     job.running.store(false, Ordering::Release);
                 }
             }
@@ -287,6 +314,47 @@ pub async fn search_query(
     }
 
     Ok(job.frame(offset, limit))
+}
+
+/// Everything a walk needs that can fail before it starts.
+struct Plan {
+    regex: Regex,
+    /// The one folder to search, or every root.
+    scope: Option<PathBuf>,
+    /// Which files to look inside, or all of them.
+    include: Option<Globs>,
+}
+
+/// Turn a query into a plan, or into the sentence the panel shows instead of results.
+///
+/// All three inputs are validated here, in the handler, and none of them inside the worker.
+/// That is the whole point: a walk is dispatched and not awaited, so anything the worker
+/// discovers has nowhere to be reported — a bad glob would become a search that silently
+/// ignored what the user typed. Compiling, resolving and parsing are microseconds, and doing
+/// them on this side is what lets a mistyped folder be an answer.
+///
+/// The order is the order the user reads the boxes in, and it matters only in that a query
+/// wrong in two ways reports the first one. Reporting both would need a list on the frame and
+/// a panel that could draw one, for a case that resolves itself as soon as either is fixed.
+fn plan(query: &SearchQuery, roots: &[SearchRoot]) -> Result<Plan, SearchProblem> {
+    let regex = cide_search::content::compile(query).map_err(|error| SearchProblem::Pattern {
+        detail: pattern_error(&error),
+    })?;
+    let scope = if query.scope.trim().is_empty() {
+        None
+    } else {
+        Some(
+            cide_search::content::resolve_scope(roots, &query.scope)
+                .map_err(|detail| SearchProblem::Scope { detail })?,
+        )
+    };
+    let include = cide_search::content::compile_globs(&query.include)
+        .map_err(|detail| SearchProblem::Include { detail })?;
+    Ok(Plan {
+        regex,
+        scope,
+        include,
+    })
 }
 
 /// Stop the search a project is running and forget its results.
@@ -327,6 +395,8 @@ mod tests {
             mode: SearchMode::Literal,
             case_sensitive: false,
             whole_word: false,
+            scope: String::new(),
+            include: String::new(),
         }
     }
 
@@ -550,6 +620,43 @@ mod tests {
         }
     }
 
+    /// Each unusable input reports itself as *its own* kind.
+    ///
+    /// The kind is what the panel turns into the heading above the sentence, so a scope error
+    /// labelled `Bad pattern` sends the user to rewrite a regex that was fine. Cheap to get
+    /// wrong — the three arms of `plan` are three `map_err`s in a row — and invisible in every
+    /// other test, because all three produce the same "no results, a notice instead".
+    #[test]
+    fn each_unusable_input_is_reported_as_its_own_kind() {
+        let dir = cide_fs::testing::scratch("search-plan-kinds");
+        let roots = vec![SearchRoot::new(dir.path())];
+
+        let mut bad_pattern = query("fn (");
+        bad_pattern.mode = SearchMode::Regex;
+        assert!(matches!(
+            plan(&bad_pattern, &roots),
+            Err(SearchProblem::Pattern { .. })
+        ));
+
+        let mut bad_scope = query("zqneedle");
+        bad_scope.scope = "nowhere/at/all".to_string();
+        assert!(matches!(
+            plan(&bad_scope, &roots),
+            Err(SearchProblem::Scope { .. })
+        ));
+
+        let mut bad_glob = query("zqneedle");
+        bad_glob.include = "*.[".to_string();
+        assert!(matches!(
+            plan(&bad_glob, &roots),
+            Err(SearchProblem::Include { .. })
+        ));
+
+        // And the ordinary query, with both boxes empty, plans nothing at all.
+        let ok = plan(&query("zqneedle"), &roots).expect("an ordinary query");
+        assert!(ok.scope.is_none() && ok.include.is_none());
+    }
+
     /// The glue this module exists for, end to end minus Tauri's argument extraction: a real
     /// tree, the real ignore rules, and the pages the panel would read.
     ///
@@ -583,6 +690,8 @@ mod tests {
             roots,
             Arc::clone(&filter),
             cide_search::content::compile(&job.query).unwrap(),
+            None,
+            None,
         );
 
         let first = job.frame(0, 3);
