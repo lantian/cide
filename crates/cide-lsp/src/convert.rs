@@ -365,6 +365,216 @@ pub fn locations(value: &serde_json::Value) -> Option<Vec<Loc>> {
     Some(array.iter().filter_map(one_location).collect())
 }
 
+/// Apply a `TextEdit[] | null` reply to the text it was computed against. (M26)
+///
+/// `Some(new_text)` on success, including `Some(text.to_owned())` for `null` or `[]` — a
+/// formatter with nothing to change is the *common* case and is not a failure. `None` only when
+/// the reply is not a shape this understands, which the caller must report rather than treat as
+/// "no change": silently returning the original would make a protocol disagreement look exactly
+/// like an already-formatted file, for ever.
+///
+/// # Why the edits are applied here and not in the webview
+///
+/// Because this is where the (line, UTF-16 column) → offset conversion already lives, and doing
+/// it in TypeScript would be a second implementation of it in the half of the codebase with no
+/// test runner. See the module header for why the column stays UTF-16.
+///
+/// # Back to front, and why that is not merely convenient
+///
+/// The spec says edits are computed against the *same* document state and must be applied as
+/// though simultaneously — so an edit's offsets do not account for any other edit. Applying
+/// from the last to the first is what makes that true with a single mutable buffer: every edit
+/// yet to be applied lies before the one just made, so no offset it holds has moved. Applying
+/// front to back instead needs every later edit shifted by the net length change of every
+/// earlier one, which is the same arithmetic with somewhere to go wrong.
+///
+/// The sort is **stable and by start position**, and the reverse iteration therefore applies
+/// same-position edits in reverse document order. That matters for the one legal case of two
+/// edits at one offset — a pure insertion beside another — where the spec's order-of-appearance
+/// is the tie-break.
+pub fn apply_text_edits(text: &str, value: &serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        return Some(text.to_owned());
+    }
+    let array = value.as_array()?;
+    if array.is_empty() {
+        return Some(text.to_owned());
+    }
+
+    // Line starts as byte offsets, computed once. `text.lines()` is wrong here — it drops the
+    // information about whether a trailing newline exists, and a formatter that appends a final
+    // newline is the single most common edit there is.
+    let mut line_starts = vec![0usize];
+    for (at, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(at + 1);
+        }
+    }
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::with_capacity(array.len());
+    for edit in array {
+        let range = edit.get("range")?;
+        let start = offset_of(text, &line_starts, range.get("start")?)?;
+        let end = offset_of(text, &line_starts, range.get("end")?)?;
+        // A server that hands back an inverted range is not one to guess for: applying it would
+        // splice text at a negative length and the panic would be in `String::replace_range`.
+        if end < start {
+            return None;
+        }
+        edits.push((start, end, edit.get("newText")?.as_str()?.to_owned()));
+    }
+
+    edits.sort_by_key(|(start, _, _)| *start);
+    let mut out = text.to_owned();
+    for (start, end, new_text) in edits.into_iter().rev() {
+        // Unreachable for a well-behaved server, and a refusal rather than a panic if one is
+        // not: `replace_range` panics on a non-char-boundary index, and a language server is not
+        // something this process should be crashed by.
+        if !out.is_char_boundary(start) || !out.is_char_boundary(end) || end > out.len() {
+            return None;
+        }
+        out.replace_range(start..end, &new_text);
+    }
+    Some(out)
+}
+
+/// One LSP `Position` as a byte offset into `text`.
+///
+/// Clamps rather than refusing, in both directions, and each clamp answers a real server
+/// behaviour: a whole-document edit is routinely spelled as ending at
+/// `{ line: <huge>, character: 0 }` because the server does not want to count the lines, and a
+/// `character` past the end of a line is what an end-exclusive range on the last line looks
+/// like. Neither is an error, and refusing them would reject rust-analyzer's ordinary reply.
+fn offset_of(text: &str, line_starts: &[usize], position: &serde_json::Value) -> Option<usize> {
+    let line = usize::try_from(position.get("line")?.as_u64()?).ok()?;
+    let character = usize::try_from(position.get("character")?.as_u64()?).ok()?;
+
+    let Some(&line_start) = line_starts.get(line) else {
+        // Past the last line: the end of the document. This is the whole-document edit above.
+        return Some(text.len());
+    };
+    // The line's own bytes, without its newline — a `character` may not walk into the next line.
+    let line_end = line_starts
+        .get(line + 1)
+        .map_or(text.len(), |&next| next.saturating_sub(1));
+    let slice = text.get(line_start..line_end)?;
+
+    // Walk UTF-16 code units, which is what `character` counts. `char::len_utf16` is 2 for a
+    // non-BMP scalar, so an emoji advances the count by two and the byte offset by four — the
+    // one case where counting chars instead would silently misplace every edit after it on
+    // that line.
+    let mut units = 0usize;
+    for (at, ch) in slice.char_indices() {
+        if units >= character {
+            return Some(line_start + at);
+        }
+        units += ch.len_utf16();
+    }
+    Some(line_end)
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn edit(sl: u32, sc: u32, el: u32, ec: u32, new_text: &str) -> serde_json::Value {
+        json!({
+            "range": {
+                "start": { "line": sl, "character": sc },
+                "end": { "line": el, "character": ec },
+            },
+            "newText": new_text,
+        })
+    }
+
+    #[test]
+    fn a_null_reply_is_no_change_and_not_a_failure() {
+        // The common case: a formatter run on an already-formatted file. Reading this as an
+        // error would make Ctrl+Alt+F report a problem every second time it was pressed.
+        assert_eq!(
+            apply_text_edits("fn main() {}\n", &serde_json::Value::Null).as_deref(),
+            Some("fn main() {}\n")
+        );
+        assert_eq!(
+            apply_text_edits("fn main() {}\n", &json!([])).as_deref(),
+            Some("fn main() {}\n")
+        );
+    }
+
+    #[test]
+    fn a_whole_document_replacement_is_what_rust_analyzer_sends() {
+        // rustfmt reformats the file and rust-analyzer returns one edit covering all of it,
+        // ending past the last line — which is why `offset_of` clamps rather than refusing.
+        let text = "fn  main( ) {\n}\n";
+        let out = apply_text_edits(text, &json!([edit(0, 0, 9999, 0, "fn main() {}\n")]));
+        assert_eq!(out.as_deref(), Some("fn main() {}\n"));
+    }
+
+    #[test]
+    fn several_edits_do_not_shift_each_other() {
+        // THE ONE THAT MATTERS, and the reason the application runs back to front. gofmt-style
+        // replies are many small edits, every one of them addressed against the *original*
+        // text. Applying these front to back without re-basing puts the second edit four bytes
+        // early and the result is quietly corrupt rather than obviously wrong.
+        let text = "a = 1\nb = 2\nc = 3\n";
+        let out = apply_text_edits(
+            text,
+            &json!([
+                edit(0, 0, 0, 1, "alpha"),
+                edit(1, 0, 1, 1, "beta"),
+                edit(2, 0, 2, 1, "gamma"),
+            ]),
+        );
+        assert_eq!(out.as_deref(), Some("alpha = 1\nbeta = 2\ngamma = 3\n"));
+    }
+
+    #[test]
+    fn edits_arriving_out_of_order_are_still_applied_correctly() {
+        // The spec does not promise an order, and gopls does not always send one.
+        let text = "a = 1\nb = 2\n";
+        let out = apply_text_edits(
+            text,
+            &json!([edit(1, 0, 1, 1, "beta"), edit(0, 0, 0, 1, "alpha")]),
+        );
+        assert_eq!(out.as_deref(), Some("alpha = 1\nbeta = 2\n"));
+    }
+
+    #[test]
+    fn a_column_is_utf16_code_units_and_not_characters() {
+        // An emoji is one `char` and *two* UTF-16 code units, and the column that reaches this
+        // function counts the latter. Counting chars would place every edit after an emoji on
+        // that line one unit early — the exact bug the module header says the UTF-16 decision
+        // exists to prevent, in the one place that has the text to get it wrong.
+        let text = "let s = \"🦀\"; let  x = 1;\n";
+        // The double-spaced `let  x` run starts after the emoji and is six UTF-16 units long.
+        // Its start is counted the way a server counts it — `len_utf16`, so the crab is 2.
+        let units: u32 = "let s = \"🦀\"; "
+            .chars()
+            .map(|ch| u32::try_from(ch.len_utf16()).expect("1 or 2"))
+            .sum();
+        let out = apply_text_edits(text, &json!([edit(0, units, 0, units + 6, "let x")]));
+        assert_eq!(out.as_deref(), Some("let s = \"🦀\"; let x = 1;\n"));
+    }
+
+    #[test]
+    fn appending_a_final_newline_is_expressible() {
+        // The single most common formatter edit, and the reason line starts are counted from
+        // the bytes rather than from `str::lines`, which cannot tell these two texts apart.
+        let out = apply_text_edits("x = 1", &json!([edit(0, 5, 0, 5, "\n")]));
+        assert_eq!(out.as_deref(), Some("x = 1\n"));
+    }
+
+    #[test]
+    fn a_reply_that_is_not_edits_is_refused_rather_than_read_as_no_change() {
+        // Returning the original here would make a protocol disagreement indistinguishable from
+        // an already-formatted file — a feature that silently never works.
+        assert!(apply_text_edits("x", &json!({"changes": {}})).is_none());
+        assert!(apply_text_edits("x", &json!([{ "newText": "y" }])).is_none());
+        assert!(apply_text_edits("x", &json!([edit(0, 1, 0, 0, "y")])).is_none());
+    }
+}
+
 #[cfg(test)]
 mod location_tests {
     use super::*;

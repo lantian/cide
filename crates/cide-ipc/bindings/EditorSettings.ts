@@ -81,4 +81,33 @@ completionOnTyping: boolean,
  * place to discover that a file is missing, and a user who re-imports gets their choice
  * back.
  */
-colorSchemeLight: string, colorSchemeDark: string, };
+colorSchemeLight: string, colorSchemeDark: string, 
+/**
+ * How to reformat a buffer, keyed by [`crate::lang::LanguageDef::id`]. (M26)
+ *
+ * **A language absent from this map is formatted by its language server**, and one present
+ * here is formatted by this instead — the configured entry wins. The precedence is that way
+ * round because this map is the only lever a user has over a formatter cide chose for them:
+ * both servers are bundled now, so "I do not want the shipped rust-analyzer's rustfmt"
+ * would otherwise mean switching the whole server to [`ServerBinaryChoice::System`], which
+ * is a far larger hammer than the complaint.
+ *
+ * **A `Vec<String>` and not a command line**, for the reason [`ClaudeCli::args`] gives at
+ * length and which applies here word for word: a single string needs a quoting parser cide
+ * would have to invent, and would get wrong at the first `--stdin-filepath "my file.ts"`.
+ * One token per row in the UI, and the argv reaches `execvp`, never a shell — so `$HOME`,
+ * `*`, `|` and `&&` are literal argument text and not syntax. The two placeholders cide
+ * does substitute are `${file}` and `${dir}`; see `cide_core::format::argv`.
+ *
+ * The program is run as a **filter**: the buffer on stdin, the formatted text on stdout.
+ * That is what `prettier --stdin-filepath`, `black -`, `gofmt` and `rustfmt --emit stdout`
+ * all do, and it is the only shape that can format an *unsaved* buffer. A formatter that
+ * only rewrites files in place — `cargo fmt` itself — does not belong here, and would be
+ * exactly the on-disk write under a dirty buffer that `cide_core::document`'s
+ * `a_stale_precondition_refuses_and_leaves_the_file_alone` calls the one that matters.
+ *
+ * Empty by default rather than seeded, for the reason
+ * [`InspectionSettings::server_binaries`] states: a seeded row would make today's default a
+ * stored fact that survives a future change of default.
+ */
+formatters: { [key in string]: Array<string> }, };

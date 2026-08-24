@@ -100,8 +100,9 @@ import {
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
-import { focusedCaret, focusedFolds, focusedWord } from '@/editor/caretTrack'
+import { focusedCaret, focusedFolds, focusedFormat, focusedWord } from '@/editor/caretTrack'
 import { focusedChangeNav } from '@/panes/changeNav'
+import { formatDocument } from '@/editor/formatDocument'
 import { goToDefinition } from '@/editor/goToDefinition'
 import { findUsages, goToImplementation } from '@/editor/codeIntel'
 import { refreshDiagnostics } from '@/sidebar/ProblemsPanel/actions'
@@ -918,6 +919,33 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // which is what puts the close confirmation in front of the user. Swallowed here so
         // an unhandled rejection does not reach the window.
         if (saving !== null) void saving.catch(() => {})
+        return
+      }
+
+      case 'editor.format': {
+        /*
+         * Ctrl+Alt+F. (M26)
+         *
+         * **The precondition is re-checked here even though the command carries
+         * `.when("editorFocused")`.** That clause filters the palette and never gates the
+         * keyboard — the key gate resolves through `Binding::when`, a different field — so the
+         * chord arriving from a terminal pane reaches this line and must be answered. It is the
+         * rule the fold family states below and the one written out at the head of
+         * `cide_core::commands`.
+         *
+         * `focusedFormat()` and not `focusedCaret()`: a split showing one file twice has two
+         * selections, and the actions come from the half the user is in. It is also null for a
+         * claim made without them — a fixture, a check script — which this refusal covers too.
+         *
+         * Fire-and-forget: every outcome, including "no formatter for this language" and a
+         * formatter's own error text, reports itself through `Failures`. See
+         * `editor/formatDocument.ts`.
+         */
+        const actions = focusedFormat()
+        if (actions === null) return unmet(command, 'no editor focused')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        void formatDocument(project.id, actions)
         return
       }
 

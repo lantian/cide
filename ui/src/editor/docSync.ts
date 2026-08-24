@@ -157,6 +157,31 @@ export function syncNow(path: string, text: string): Promise<void> {
   return send(path, text)
 }
 
+/**
+ * Send this document's pending edit **and wait for it to land**. (M26)
+ *
+ * **The await is the load-bearing part**, and it is the same argument [`savedDoc`] makes for
+ * `didSave` one step further: [`scheduleDoc`] is a 300 ms trailing throttle, so at any moment
+ * the server may be holding text up to that old. Reformat code asks the server to rewrite the
+ * buffer and then applies the answer to it — so formatting against stale text does not produce a
+ * stale *result*, it produces a **corrupt** one: edits computed against text that is not what
+ * they land on.
+ *
+ * Awaited rather than fired because ordering on the wire follows from ordering of the calls:
+ * once this resolves the notification is on the outbox, and the format request joins the same
+ * ordered channel behind it. Firing it instead would let the request overtake the notification
+ * and reintroduce exactly the staleness this closes.
+ *
+ * It narrows the window; it does not close it. A keystroke landing *after* the flush is caught
+ * on the other side, by `formatModel.isStillCurrent`, which is why both exist.
+ */
+export function flushDoc(path: string): Promise<void> {
+  // `send(path, null)` and not a second implementation: `send` is completion's (M25), and it
+  // already returns the promise this needs. One road to the server, one place the version is
+  // bumped, and no way for the two to disagree about which notification is in flight.
+  return send(path, null)
+}
+
 /** A pane opened this file. Only the first one tells the server. */
 export function openDoc(project: ProjectId, path: string, text: string): void {
   const existing = docs.get(path)
@@ -178,7 +203,7 @@ export function scheduleDoc(path: string, read: () => string): void {
   // reader, so the send lands `SYNC_MS` after the burst *started* rather than being pushed back by
   // every keystroke. See `SYNC_MS`.
   if (doc.timer !== null) return
-  doc.timer = setTimeout(() => flush(path), SYNC_MS)
+  doc.timer = setTimeout(() => void flush(path), SYNC_MS)
 }
 
 /**
@@ -201,7 +226,7 @@ export function resetDoc(path: string, text: string): void {
 export function savedDoc(path: string): void {
   const doc = docs.get(path)
   if (doc === undefined) return
-  flush(path)
+  void flush(path)
   fire(diagnosticsApi.didSave(doc.project, path))
 }
 

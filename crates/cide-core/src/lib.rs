@@ -23,6 +23,7 @@ pub mod commands;
 pub mod diagnostics;
 pub mod document;
 pub mod error;
+pub mod format;
 pub mod handshake;
 /// Images: what a file is, from its own bytes. The sibling of [`document`], never its pixels.
 pub mod image;

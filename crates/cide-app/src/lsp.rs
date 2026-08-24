@@ -1397,6 +1397,117 @@ impl ProjectDiagnostics {
         }
     }
 
+    /// Reformat `text` with this file's language server. (M26)
+    ///
+    /// **Blocks for up to `timeout`.** Blocking pool only, and the `handles` lock is taken to
+    /// clone a `Requester` and then dropped — the rule [`Self::definition`] states.
+    ///
+    /// `text` is the buffer as the caller has it, and the caller has already flushed its
+    /// `didChange`, so the server is formatting the same bytes. Passing it in is what lets the
+    /// reply's edits be applied *here*, where the (line, UTF-16 column) → offset conversion
+    /// already lives, rather than a second time in TypeScript. See
+    /// `cide_lsp::convert::apply_text_edits`.
+    ///
+    /// `range` narrows the request to a selection **only if the server said it could** — the
+    /// probe is `Some(true)` and nothing weaker. `None` there means the handshake has not
+    /// finished, and the honest move is the whole document: range formatting is an optimisation
+    /// over a fallback that always works, so gambling a round trip on a method the server may
+    /// answer with `MethodNotFound` buys nothing. This is the one capability read that way
+    /// round, and `LspHandle::supports_range_formatting` says so at its definition.
+    pub fn format(
+        &self,
+        path: &std::path::Path,
+        text: &str,
+        range: Option<cide_ipc::FormatRange>,
+        options: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> cide_ipc::FormatAnswer {
+        use cide_ipc::FormatAnswer;
+
+        let (server, requester) = match self.requester_for(path) {
+            Ok(pair) => pair,
+            Err(missing) => {
+                return FormatAnswer::Unavailable {
+                    reason: missing.sentence("Reformat code"),
+                };
+            }
+        };
+
+        // `Some(false)` is a real refusal and worth making immediately: an extension may
+        // contribute a server that does not format at all, and a twenty-second wait ending in
+        // "probably still indexing" would be a lie about it. `None` is *not* a refusal — see
+        // `LspHandle::supports_formatting`.
+        let (formats, ranges) = {
+            let handles = self.handles.lock();
+            let handle = handles.iter().find(|handle| handle.server() == server);
+            (
+                handle.and_then(cide_lsp::LspHandle::supports_formatting),
+                handle.and_then(cide_lsp::LspHandle::supports_range_formatting),
+            )
+        };
+        if formats == Some(false) {
+            return FormatAnswer::Unavailable {
+                reason: format!(
+                    "{} does not offer formatting. It answered the handshake without \
+                     `documentFormattingProvider`.",
+                    server.binary()
+                ),
+            };
+        }
+
+        let uri = cide_lsp::convert::path_to_uri(path);
+        let (method, params) = match range.filter(|_| ranges == Some(true)) {
+            Some(range) => (
+                "textDocument/rangeFormatting",
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "range": range_params(range),
+                    "options": options,
+                }),
+            ),
+            None => (
+                "textDocument/formatting",
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "options": options,
+                }),
+            ),
+        };
+
+        match requester.request(method, params, timeout) {
+            Ok(value) => match cide_lsp::convert::apply_text_edits(text, &value) {
+                Some(formatted) if formatted == text => FormatAnswer::Unchanged {
+                    by: server.binary(),
+                },
+                Some(text) => FormatAnswer::Formatted {
+                    text,
+                    by: server.binary(),
+                },
+                // A reply this does not understand. Reported rather than folded into
+                // "no change", which would make a protocol disagreement look exactly like an
+                // already-formatted file and hide the feature being broken for ever.
+                None => FormatAnswer::Unavailable {
+                    reason: format!(
+                        "{} answered with something other than a list of edits.",
+                        server.binary()
+                    ),
+                },
+            },
+            // Its own sentence, for the reason `definition` gives: while the server is indexing
+            // this is the *expected* answer for the first minute of a session, and a generic
+            // failure would teach the user the formatter does not work.
+            Err(cide_lsp::RequestError::Timeout) => FormatAnswer::Unavailable {
+                reason: format!(
+                    "{} did not answer in time — it is probably still indexing. Try again in a moment.",
+                    server.binary()
+                ),
+            },
+            Err(error) => FormatAnswer::Unavailable {
+                reason: format!("{}: {error}", server.binary()),
+            },
+        }
+    }
+
     /// Restart one source after it gave up.
     /// Start any newly contributed server, and drop any that is no longer contributed. (M22)
     ///
@@ -1652,6 +1763,24 @@ fn position_params(path: &std::path::Path, line: u32, column: u32) -> serde_json
         "position": {
             "line": line.saturating_sub(1),
             "character": column.saturating_sub(1),
+        },
+    })
+}
+
+/// A [`cide_ipc::FormatRange`] in LSP's units. (M26)
+///
+/// 0-based on the wire, and the column stays UTF-16 — the same conversion [`position_params`]
+/// makes, `saturating_sub` included, because a selection starting at column 1 must not underflow
+/// to `u32::MAX` and ask the server to format from four billion characters in.
+fn range_params(range: cide_ipc::FormatRange) -> serde_json::Value {
+    serde_json::json!({
+        "start": {
+            "line": range.start_line.saturating_sub(1),
+            "character": range.start_column.saturating_sub(1),
+        },
+        "end": {
+            "line": range.end_line.saturating_sub(1),
+            "character": range.end_column.saturating_sub(1),
         },
     })
 }

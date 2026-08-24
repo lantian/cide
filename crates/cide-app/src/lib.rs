@@ -533,6 +533,8 @@ pub fn run() {
             cmd::diagnostics::diagnostics_implementations,
             cmd::diagnostics::diagnostics_refresh,
             cmd::diagnostics::diagnostics_restart,
+            // --- M26: Reformat code ---
+            cmd::format::format_document,
             cmd::diagnostics::diagnostics_invalidate_caches,
             // --- M18: the git tool window ---
             cmd::toolwindow::tool_window_set_layout,

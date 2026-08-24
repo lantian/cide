@@ -427,6 +427,38 @@ pub fn defaults() -> Vec<Binding> {
             // would be the only entry in that list not justified by the OS eating the chord.
             ("ctrl+g", "navigate.line", "editorFocused"),
             /*
+             * Reformat code. (M26)
+             *
+             * # What it costs, checked in every layer rather than assumed
+             *
+             * * **In `defaults()`**: the Ctrl+Alt entries are the two splits
+             *   (`ctrl+alt+right`/`down`), the four pane moves (`ctrl+alt+h/j/k/l`),
+             *   `ctrl+alt+shift+n`, `ctrl+alt+b` and the recursive folds
+             *   (`ctrl+alt+minus`/`equal`/`plus`). Nothing uses `ctrl+alt+f`. Free.
+             * * **In CodeMirror**: `searchKeymap` binds `Mod-f`, `F3`, `Mod-g`, `Mod-Shift-l`,
+             *   `Mod-Alt-g` and `Mod-d`; `defaultKeymap` binds `Alt-u`, `Alt-l`, `Alt-A`,
+             *   `Mod-Alt-\` and the `Alt`-arrow family; `editorKeys.ts` adds `Mod-d`,
+             *   `Mod-Alt-d` and `Alt-j`. **No installed keymap binds `Mod-Alt-f`.** Free.
+             * * **On KDE, the development platform**: `ctrl+alt+f` is not a stock global. Note
+             *   what this chord is *not*: IDEA's own Reformat Code is Ctrl+Alt+L, which is KDE's
+             *   Lock Screen and never reaches the app at all — the same reason `alt+l` above
+             *   rejected it. So this diverges from IDEA knowingly, and Ctrl+Alt+F is what VS
+             *   Code puts Format Document on, which is the next-best precedent a user carries.
+             * * **In xterm**: `terminal/keys.ts` encodes a control byte only for ctrl *without*
+             *   alt, so Ctrl+Alt+F reaches a shell as `ESC ^F` — readline's `forward-word` on a
+             *   terminal that maps Alt to an Escape prefix. That is a real byte a shell user
+             *   wants, which is precisely why the clause below is not optional.
+             *
+             * `editorFocused`, for the reason `ctrl+b` above states at length: the gate is a
+             * window **capture** listener, so an unscoped chord is swallowed in every terminal
+             * pane in every window, for a command that needs a buffer to mean anything.
+             *
+             * macOS: `platform_layer` rewrites Ctrl to Meta and leaves Alt alone, so this
+             * becomes ⌥⌘F. Not in `MACOS_MENU_CHORDS`, so no exception is needed — and it is
+             * what VS Code binds Format Document to on macOS as well.
+             */
+            ("ctrl+alt+f", "editor.format", "editorFocused"),
+            /*
              * ⌥L — widen Ctrl+P to *External Libraries*, while Ctrl+P has the keyboard. (M16)
              *
              * # What it costs, checked in every layer rather than assumed

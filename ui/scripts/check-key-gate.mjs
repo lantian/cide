@@ -269,6 +269,13 @@ try {
     // `KeyG` is in the sweep below, so both entry points are held to agreeing about it — and to
     // *passing it through* in a terminal-focused context, which is the half that matters.
     { key: 'ctrl+g', command: 'navigate.line', when: 'editorFocused' },
+    // M26. Reformat code, on VS Code's chord for it — IDEA's Ctrl+Alt+L is KDE's Lock Screen and
+    // never reaches the app, which `keymap.rs` records at `alt+l` and again here. Scoped for the
+    // same reason ⌃B is: `terminal/keys.ts` encodes a control byte only for ctrl *without* alt,
+    // so Ctrl+Alt+F reaches a shell as `ESC ^F` — readline's `forward-word`. `KeyF` is in the
+    // sweep below, so both entry points are held to agreeing about it, including that a
+    // terminal-focused window passes it through.
+    { key: 'ctrl+alt+f', command: 'editor.format', when: 'editorFocused' },
     // M16. The file picker's library scope. `filePickerOpen` and not `overlayOpen`, and the
     // difference is the whole reason that flag was added: ⌥L is `ESC l` to a shell — readline's
     // `downcase-word` — so a binding scoped to *any* overlay would have the window capture

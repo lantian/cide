@@ -418,6 +418,14 @@ struct Caps {
     /// drops the guard, the same discipline `Requester` follows about `handles`, so the lock is
     /// never held while anything else happens.
     triggers: parking_lot::Mutex<Arc<[char]>>,
+    /// `textDocument/formatting` — see [`LspHandle::supports_formatting`].
+    formatting: std::sync::atomic::AtomicU8,
+    /// `textDocument/rangeFormatting` — see [`LspHandle::supports_range_formatting`].
+    ///
+    /// Its own slot rather than being inferred from `formatting`, for the reason
+    /// `Session::supports_range_formatting` spells out: the two diverge per *binary*, not per
+    /// server, so which build resolved decides the answer and only the handshake knows.
+    range_formatting: std::sync::atomic::AtomicU8,
 }
 
 impl Caps {
@@ -434,6 +442,10 @@ impl Caps {
         // "ask anyway while it starts" branch would build a `TriggerCharacter` context out of a
         // list the running server never declared.
         *self.triggers.lock() = Arc::from(Vec::new());
+        self.formatting
+            .store(Capability::Unknown as u8, Ordering::Release);
+        self.range_formatting
+            .store(Capability::Unknown as u8, Ordering::Release);
     }
 
     /// Record what this life's `initialize` result said.
@@ -458,6 +470,14 @@ impl Caps {
         };
         self.completion
             .store(Capability::of(completion.is_some()), Ordering::Release);
+        self.formatting.store(
+            Capability::of(session.supports_formatting()),
+            Ordering::Release,
+        );
+        self.range_formatting.store(
+            Capability::of(session.supports_range_formatting()),
+            Ordering::Release,
+        );
     }
 
     fn read(slot: &std::sync::atomic::AtomicU8) -> Option<bool> {
@@ -629,6 +649,31 @@ impl LspHandle {
     /// "probably still indexing" wait comes from.
     pub fn supports_implementation(&self) -> Option<bool> {
         Caps::read(&self.caps.implementation)
+    }
+
+    /// Does this server answer `textDocument/formatting`? `None` while it is still starting.
+    ///
+    /// The same three states as [`Self::supports_references`], and the `None` is load-bearing in
+    /// the same direction: Ctrl+Alt+F pressed a moment after launch must be *asked*, not refused
+    /// with "this server cannot format", which is the one sentence that is certainly wrong about
+    /// a server that has not spoken yet.
+    ///
+    /// Unlike its neighbours, `Some(false)` here is reachable today rather than hypothetical:
+    /// a language server contributed by an extension is under no obligation to format, and
+    /// telling its user so immediately beats a timeout.
+    pub fn supports_formatting(&self) -> Option<bool> {
+        Caps::read(&self.caps.formatting)
+    }
+
+    /// Does this server answer `textDocument/rangeFormatting`? `None` while it is still starting.
+    ///
+    /// **Here the `None` is read the other way round from every capability above**, and that is
+    /// deliberate: range formatting is an *optimisation* over a fallback that always works, so a
+    /// caller that does not know yet should format the whole document rather than gamble a round
+    /// trip on a method the server may answer with `MethodNotFound`. Only `Some(true)` narrows
+    /// the request to a range. See `ProjectDiagnostics::format`.
+    pub fn supports_range_formatting(&self) -> Option<bool> {
+        Caps::read(&self.caps.range_formatting)
     }
 
     /// A cloneable sender for request/response traffic.

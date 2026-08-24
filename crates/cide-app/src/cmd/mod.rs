@@ -32,6 +32,13 @@ pub mod search;
 pub mod diagnostics;
 pub mod symbols;
 
+// --- M26: Reformat code ---
+// Its own module and not a row in `diagnostics`, because only one of its two roads is a language
+// server: the other spawns a user-configured filter and never speaks LSP at all. Filing it under
+// the module whose header is about document sync would put a process spawn somewhere nobody
+// looking for one would think to check.
+pub mod format;
+
 // --- M18: the git tool window ---
 // The bottom panel's own state — open, height, which tabs. Separate from `git` because nothing
 // here touches a repository: `git` answers about commits and working trees, this answers about a

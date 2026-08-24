@@ -71,6 +71,8 @@ import { copyUnavailable, pasteUnavailable, readClipboard, writeClipboard } from
 import { toggleBlame } from './blameStore'
 import { levelFor, setLevel } from './highlightLevel'
 import { goToDefinition } from './goToDefinition'
+import { focusedFormat } from './caretTrack'
+import { formatDocument } from './formatDocument'
 import { findUsages } from './codeIntel'
 import { wordTargetAt } from './ctrlLink'
 import {
@@ -351,6 +353,51 @@ export function useCodeMenu({
           run: () => {
             openSearchPanel(live)
           },
+        },
+        /*
+         * Reformat code. (M26)
+         *
+         * A flat row rather than a submenu, and above *Folding ▸* because it acts on the file
+         * where everything below it acts on the view.
+         *
+         * **No `disabledReason`.** Whether anything can format this buffer is a question only
+         * Rust can answer — it depends on which language servers are running, what each of them
+         * advertised at its handshake, and what the user configured — and asking it to paint a
+         * menu would mean an IPC round trip every time the menu opened. So the row is always
+         * live and the refusal is a sentence after the fact, which is the same trade
+         * *Go to definition* below makes for the same reason. Note `menus/model.ts` resolves
+         * `run: enabled ? (entry.run ?? null) : null`, so a `disabledReason` set *beside* a
+         * `run` yields a row that looks wired and is dead — never both.
+         *
+         * `command` names the id so the chip on the right comes from the live keymap rather than
+         * a literal a `keymap.json` could silently falsify.
+         */
+        {
+          id: 'format',
+          label: 'Reformat code',
+          command: 'editor.format',
+          disabledReason:
+            project === undefined
+              ? 'This editor is not part of a project, so there is no formatter to run'
+              : undefined,
+          run:
+            project === undefined
+              ? undefined
+              : () => {
+                  /*
+                   * `focusedFormat()` and not a `FormatActions` assembled here, deliberately.
+                   * The one in `EditorSurface` is where the `EditorView` lives, and a second
+                   * implementation would be a second copy of the staleness re-check and the
+                   * minimal-change trim — the copy that is wrong when one of them changes.
+                   *
+                   * `live.focus()` first, because that is what makes the slot answer *this*
+                   * editor: opening a context menu moved focus off the buffer, and in a split
+                   * showing one file twice the wrong half would otherwise be formatted.
+                   */
+                  live.focus()
+                  const actions = focusedFormat()
+                  if (actions !== null) void formatDocument(project, actions)
+                },
         },
         /*
          * Folding, as a submenu. (M19)

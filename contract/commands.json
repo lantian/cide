@@ -63,6 +63,7 @@
   "file_position",
   "file_read",
   "file_write",
+  "format_document",
   "fs_close",
   "fs_collapse",
   "fs_create",
