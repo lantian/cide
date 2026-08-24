@@ -65,6 +65,7 @@ interface Claim {
   lines: number
   word: WordReader | null
   folds: FoldActions | null
+  format: FormatActions | null
 }
 
 /**
@@ -107,6 +108,51 @@ export interface FoldActions {
   unfoldAll(): boolean
   foldRecursively(): boolean
   unfoldRecursively(): boolean
+}
+
+/**
+ * Reading and rewriting the text of the editor that holds the slot. (M26)
+ *
+ * Rides here for the reason [`FoldActions`] gives at length — the question *which editor is the
+ * user in* has one answer and this module is it — and the argument is sharper for formatting
+ * than for folding. `openBuffers.ts` is the other shape available and it is keyed by **tab**,
+ * which is right for Ctrl+S (a save means a tab, focused or not) and wrong here: a split showing
+ * one file twice has two selections, and Ctrl+Alt+F is about the one the user is looking at.
+ *
+ * # Why this hands out functions rather than the text
+ *
+ * The same narrowing `EditorSurface`'s `onSaveHandle` documents. `keys/dispatch.ts` has no
+ * `EditorView` and cannot get one — pane DOM lives in a module-level map outside React precisely
+ * so nothing above it holds a reference — so it must be given capabilities, not a document. What
+ * it gets is exactly enough to format: read the text, read the selection, refuse if read-only,
+ * put text back.
+ */
+export interface FormatActions {
+  /** The buffer's path, so the caller can flush the right document's pending `didChange`. */
+  path(): string
+  /**
+   * The text, in the units the language server has it — LF, whatever the file's real endings
+   * are. `docSync` sends exactly this, so an edit computed against it lands correctly here; the
+   * file's own endings are restored on save and never round-tripped through a formatter.
+   */
+  text(): string
+  /**
+   * The selection as 1-based lines and 1-based UTF-16 columns, or `null` when it is empty.
+   *
+   * `null` for an empty selection and not a zero-width range, because the two mean different
+   * things to the caller: a caret is "format the document", a range is "format this much".
+   */
+  selection(): { startLine: number; startColumn: number; endLine: number; endColumn: number } | null
+  /** Whether this buffer refuses edits — a diff pane, a file with no write permission. */
+  readOnly(): boolean
+  /**
+   * Replace the text, preserving as much as the change allows.
+   *
+   * Returns `false` when the buffer has moved since `text()` was read, which the caller must
+   * treat as "abandon" rather than "retry": the answer describes a document that no longer
+   * exists, and applying it would discard whatever was typed in the meantime.
+   */
+  apply(from: string, to: string): boolean
 }
 
 /**
@@ -154,20 +200,45 @@ export function focusedFolds(): FoldActions | null {
 }
 
 /**
+ * The text actions of the editor the user is in, or `null`.
+ *
+ * `null` means "no editor holds the slot" — a detached terminal window, a Claude tab — exactly as
+ * for [`focusedFolds`], and every caller has to render it. It is *also* null for a claim made
+ * without actions, which is what a fixture or a check script produces.
+ */
+export function focusedFormat(): FormatActions | null {
+  const top = claims.at(-1)
+  return top === undefined ? null : top.format
+}
+
+/**
  * Claim the slot for an editor showing `path`.
  *
  * Mounting claims it, because a freshly opened file is the one being looked at — the same rule
  * `claimStatusReadout` follows, and the two are claimed and released together.
  *
- * `word` and `folds` are optional so a caller that has no cheap way to supply them — a fixture, a
- * check script — still gets a working claim; [`focusedWord`] and [`focusedFolds`] then answer
- * `null`, which every caller already has to handle.
+ * `word`, `folds` and `format` are optional so a caller that has no cheap way to supply them — a
+ * fixture, a check script — still gets a working claim; [`focusedWord`], [`focusedFolds`] and
+ * [`focusedFormat`] then answer `null`, which every caller already has to handle.
  */
-export function claimCaret(path: string, word?: WordReader, folds?: FoldActions): CaretSlot {
+export function claimCaret(
+  path: string,
+  word?: WordReader,
+  folds?: FoldActions,
+  format?: FormatActions,
+): CaretSlot {
   // `lines: 1` rather than 0, because "an empty document is one empty line" is CodeMirror's own
   // arithmetic and this value is read before the first `set` arrives. A 0 here would let Go to
   // line report a file with no lines in it for one frame after a split opens.
-  const claim: Claim = { path, line: 1, column: 1, lines: 1, word: word ?? null, folds: folds ?? null }
+  const claim: Claim = {
+    path,
+    line: 1,
+    column: 1,
+    lines: 1,
+    word: word ?? null,
+    folds: folds ?? null,
+    format: format ?? null,
+  }
   claims.push(claim)
 
   let released = false

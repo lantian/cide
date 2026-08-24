@@ -715,6 +715,37 @@ fn build() -> Vec<Command> {
         Command::new("file.save", "Save file", FILE).when("editorFocused"),
         Command::new("file.saveAll", "Save all files", FILE).when("editorOpen"),
         /*
+         * Reformat code — Ctrl+Alt+F. (M26)
+         *
+         * [`FILE`] and deliberately not [`VIEW`]. The fold family's comment above `editor.fold`
+         * defines this group boundary as *changes what is on screen and changes nothing about
+         * the file*, and reformatting is the other side of that line: it edits the buffer, it
+         * dirties the tab, and Ctrl+Z undoes it. Its neighbours here are the two commands that
+         * also write the user's text.
+         *
+         * **It does not save.** The formatted text is dispatched into the buffer and the tab
+         * goes dirty like any other edit. Formatting the file *on disk* instead would be the
+         * write-under-a-dirty-buffer that `cide_core::document`'s
+         * `a_stale_precondition_refuses_and_leaves_the_file_alone` calls the one that matters —
+         * and its worked example is literally `cargo fmt`.
+         *
+         * Two roads behind one id, resolved in `cide_app::lsp`: a formatter configured in
+         * Settings → Editor → Formatters wins, otherwise the language server's
+         * `textDocument/formatting`. One id because the user's question is "reformat this", not
+         * "reformat this using a particular mechanism" — and because a second id would be a
+         * second thing to bind, list and explain for a distinction they cannot act on.
+         *
+         * `editorFocused` and nothing weaker, like every other command that needs a caret. The
+         * keyword list is long on purpose: none of the five title/id scoring tiers reaches
+         * "Reformat code" from `fmt`, `prettier` or `gofmt`, which is what a person types.
+         */
+        Command::new("editor.format", "Reformat code", FILE)
+            .when("editorFocused")
+            .keywords(&[
+                "format", "fmt", "rustfmt", "gofmt", "prettier", "indent", "tidy", "beautify",
+                "reindent",
+            ]),
+        /*
          * *Select Opened File* — IDEA's name for it, and the name a user types into the palette.
          *
          * The id is unchanged and must stay unchanged: ids are API, a `keymap.json` names them,

@@ -22,6 +22,8 @@ import type {
   DiffAnswer,
   Direction,
   FileOutline,
+  FormatAnswer,
+  FormatRange,
   FsChange,
   FsStatus,
   GraphicsStatus,
@@ -908,6 +910,36 @@ export const diagnostics = {
    * server, and a survivor in another project would re-save what was just deleted.
    */
   invalidateCaches: () => invoke<void>('diagnostics_invalidate_caches', {}),
+
+  /**
+   * Reformat a buffer — Ctrl+Alt+F. (M26)
+   *
+   * On this object because one of its two roads is `textDocument/formatting` against the same
+   * language server everything else here asks; the other spawns a filter the user configured,
+   * and Rust decides which, so the webview never learns the difference.
+   *
+   * `text` is sent rather than read from disk, and the caller must have **awaited**
+   * `flushDoc(path)` first, or the server is holding text up to 300 ms old. `range` is the
+   * selection when there is one; it is honoured only by a server advertising
+   * `documentRangeFormattingProvider` and ignored on the filter road.
+   *
+   * Never rejects for a user-facing outcome: every answer is a `FormatAnswer` arm carrying a
+   * sentence, including "no formatter for this language".
+   */
+  format: (
+    projectId: ProjectId,
+    path: string,
+    languageId: string,
+    text: string,
+    range: FormatRange | null,
+  ) =>
+    invoke<FormatAnswer>('format_document', {
+      project: projectId,
+      path,
+      languageId,
+      text,
+      range,
+    }),
 }
 
 /**

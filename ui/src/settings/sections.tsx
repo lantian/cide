@@ -42,6 +42,7 @@ import {
 } from './controls'
 import { AgentsSection } from './AgentsSection'
 import { ExtensionSettings } from './ExtensionSettings'
+import { FormattersSection } from './FormattersSection'
 // The band, from the module the arithmetic lives in, rather than two literals typed here.
 // `check-ui-scale.mjs` pins that module against Rust's `MIN_UI_FONT_SIZE`/`MAX_UI_FONT_SIZE`,
 // so importing it is what makes this input's clamp the same clamp `settings_set` applies —
@@ -450,6 +451,27 @@ function Editor({ settings, patch }: SectionProps) {
           checked={editor.autosave}
           onChange={(v) => set({ autosave: v })}
         />
+      </Group>
+      <Group title="Formatters">
+        <Note title="Ctrl+Alt+F asks the language server first">
+          Rust and Go format out of the box — cide ships rust-analyzer and gopls, so{' '}
+          <code>rustfmt</code> and <code>gofmt</code> need no row here. Add one for a language
+          with no server, or to override the one a server would use.
+        </Note>
+        <FormattersSection editor={editor} patch={set} />
+        <Note title="One box per argument, and no shell">
+          cide runs the program directly, so <code>$HOME</code>, <code>*</code>, <code>|</code>{' '}
+          and <code>&amp;&amp;</code> are ordinary argument text rather than syntax — which is why
+          each argument gets its own box instead of one command line. Only{' '}
+          <code>{'${file}'}</code> and <code>{'${dir}'}</code> are substituted.
+          <br />
+          The program must be a <em>filter</em>: it reads the buffer on standard input and writes
+          the result to standard output — <code>prettier --stdin-filepath {'${file}'}</code>,{' '}
+          <code>black -</code>, <code>gofmt</code>. A tool that rewrites files in place and prints
+          nothing, <code>cargo fmt</code> among them, cannot be used here and is refused rather
+          than allowed to empty the buffer. Formatting never writes the file; the tab goes dirty
+          like any other edit.
+        </Note>
       </Group>
     </>
   )

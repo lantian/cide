@@ -74,6 +74,7 @@ import {
   type ReadoutSlot,
 } from './statusReadout'
 import { claimCaret, type CaretSlot } from './caretTrack'
+import { isStillCurrent, minimalChange } from './formatModel'
 import { ctrlLink, wordTargetAt } from './ctrlLink'
 import { trailNames, type OutlineNode } from './memberNav'
 import { lintRanges, type LintSource } from './lintMap'
@@ -1417,6 +1418,72 @@ export function EditorSurface({
         unfoldAll: () => onLiveView(unfoldAllRanges),
         foldRecursively: () => onLiveView(foldRecursive),
         unfoldRecursively: () => onLiveView(unfoldRecursive),
+      },
+      /*
+       * Reformat code, on the same claim and for the same reason as the folds above. (M26)
+       *
+       * `viewRef.current` throughout, per the note over `onLiveView`: a format round trip is a
+       * language server or a child process, so the window in which the tab can close underneath
+       * it is not theoretical here the way it nearly is for a fold.
+       */
+      {
+        path: () => identity,
+        /*
+         * The document as CodeMirror holds it — LF — which is exactly what `docSync` sent the
+         * server, so an edit computed against it applies here without a conversion.
+         *
+         * Deliberately **not** `restoreLineEndings(...)`: that is the save path's job, and
+         * running a CRLF file's text through a formatter and back would either strip the `\r`s
+         * or double them, depending on the tool. The endings are restored once, on write, from
+         * `endingRef` — a formatter never sees them and never needs to.
+         */
+        text: () => viewRef.current?.state.doc.toString() ?? '',
+        selection: () => {
+          const live = viewRef.current
+          if (live === null) return null
+          const { from, to } = live.state.selection.main
+          // A caret is "format the document"; only a real range is "format this much".
+          if (from === to) return null
+          const start = live.state.doc.lineAt(from)
+          const end = live.state.doc.lineAt(to)
+          // 1-based lines, 1-based UTF-16 columns — `cide_ipc::FormatRange`'s units, which are
+          // the units every other position on this wire uses. CodeMirror offsets are UTF-16
+          // already, so the column is arithmetic and not a conversion.
+          return {
+            startLine: start.number,
+            startColumn: from - start.from + 1,
+            endLine: end.number,
+            endColumn: to - end.from + 1,
+          }
+        },
+        readOnly: () => readOnly,
+        apply: (from, to) => {
+          const live = viewRef.current
+          if (live === null) return false
+          const held = live.state.doc.toString()
+          // The other half of the staleness defence — `flushDoc` narrows the window before the
+          // request, this closes what is left of it after. A keystroke that landed during the
+          // round trip makes `to` an answer about a document that no longer exists, and applying
+          // it would discard that keystroke without a word.
+          if (!isStillCurrent(from, held)) return false
+          const change = minimalChange(held, to)
+          // Already formatted. No transaction at all: a zero-width dispatch still marks the tab
+          // dirty and still pushes an undo step, so a reflexive Ctrl+Alt+F on a clean file would
+          // leave it modified.
+          if (change === null) return true
+          live.dispatch({
+            changes: change,
+            /*
+             * No `selection` and no `scrollIntoView`, both on purpose. Omitting the selection
+             * lets CodeMirror map the existing one through the change, which — because the
+             * change is trimmed to what actually differs — leaves the caret where it was for
+             * every edit that did not cross it. Naming a selection here would move it on every
+             * format instead.
+             */
+            userEvent: 'input.format',
+          })
+          return true
+        },
       },
     )
     /*

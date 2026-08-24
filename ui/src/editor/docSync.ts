@@ -101,19 +101,53 @@ function fire(call: Promise<void>): void {
   void call.catch(() => {})
 }
 
-/** Send whatever is pending for `path` now, and cancel the timer. */
-function flush(path: string): void {
+/**
+ * Send whatever is pending for `path` now, and cancel the timer.
+ *
+ * Returns the in-flight `didChange`, so a caller that needs the server to have *received* it can
+ * await — see [`flushDoc`]. Callers that only need it sent keep ignoring the result, which is
+ * what `savedDoc` and `resetDoc` do.
+ */
+function flush(path: string): Promise<void> {
   const doc = docs.get(path)
-  if (doc === undefined) return
+  if (doc === undefined) return Promise.resolve()
   if (doc.timer !== null) {
     clearTimeout(doc.timer)
     doc.timer = null
   }
   const read = doc.pending
   doc.pending = null
-  if (read === null) return
+  if (read === null) return Promise.resolve()
   doc.version += 1
-  fire(diagnosticsApi.didChange(doc.project, path, doc.version, read()))
+  const sending = diagnosticsApi.didChange(doc.project, path, doc.version, read())
+  fire(sending)
+  // Swallowed here as well as in `fire`, so an awaiting caller gets "the flush is over" rather
+  // than a rejection it would have to handle separately from its own failures. A `didChange`
+  // that did not land is not a reason to refuse to format — the server simply has older text,
+  // which is the state this whole function exists to narrow rather than to guarantee away.
+  return sending.catch(() => {})
+}
+
+/**
+ * Send this document's pending edit **and wait for it to land**. (M26)
+ *
+ * **The await is the load-bearing part**, and it is the same argument [`savedDoc`] makes for
+ * `didSave` one step further: [`scheduleDoc`] is a 300 ms trailing throttle, so at any moment
+ * the server may be holding text up to that old. Reformat code asks the server to rewrite the
+ * buffer and then applies the answer to it — so formatting against stale text does not produce a
+ * stale *result*, it produces a **corrupt** one: edits computed against text that is not what
+ * they land on.
+ *
+ * Awaited rather than fired because ordering on the wire follows from ordering of the calls:
+ * once this resolves the notification is on the outbox, and the format request joins the same
+ * ordered channel behind it. Firing it instead would let the request overtake the notification
+ * and reintroduce exactly the staleness this closes.
+ *
+ * It narrows the window; it does not close it. A keystroke landing *after* the flush is caught
+ * on the other side, by `formatModel.isStillCurrent`, which is why both exist.
+ */
+export function flushDoc(path: string): Promise<void> {
+  return flush(path)
 }
 
 /** A pane opened this file. Only the first one tells the server. */
@@ -137,7 +171,7 @@ export function scheduleDoc(path: string, read: () => string): void {
   // reader, so the send lands `SYNC_MS` after the burst *started* rather than being pushed back by
   // every keystroke. See `SYNC_MS`.
   if (doc.timer !== null) return
-  doc.timer = setTimeout(() => flush(path), SYNC_MS)
+  doc.timer = setTimeout(() => void flush(path), SYNC_MS)
 }
 
 /**
@@ -149,7 +183,7 @@ export function resetDoc(path: string, text: string): void {
   const doc = docs.get(path)
   if (doc === undefined) return
   doc.pending = () => text
-  flush(path)
+  void flush(path)
 }
 
 /**
@@ -163,7 +197,7 @@ export function resetDoc(path: string, text: string): void {
 export function savedDoc(path: string): void {
   const doc = docs.get(path)
   if (doc === undefined) return
-  flush(path)
+  void flush(path)
   fire(diagnosticsApi.didSave(doc.project, path))
 }
 

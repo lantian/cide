@@ -1,0 +1,162 @@
+/*
+ * Settings → Editor → Formatters. (M26)
+ *
+ * Sized off `--ui-scale` and coloured from the palette tokens throughout, like every other
+ * settings surface — `check-ui-scale.mjs` bans a bare `font-size: <n>px` because a box drawn
+ * around text stops following the UI font size the moment one appears, and it looks right at
+ * the default, which is where you are working.
+ *
+ * The shapes here deliberately mirror `ClaudeCliSection.module.css`'s repeatable rows: two
+ * screens that let a user assemble an argv should not be two different-looking editors.
+ */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 9px 0;
+}
+
+/* One language: its id, then its argv, then the remove control. */
+.entry {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+}
+
+.entryHead {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Fixed, so a column of language ids lines up however long the argv beside it grows. */
+.language {
+  flex: none;
+  width: 38%;
+}
+
+/*
+ * The argv, one input per token.
+ *
+ * `wrap`, because an argv is genuinely open-ended — `prettier --stdin-filepath ${file}` is three
+ * and a fussy `eslint` invocation is eight — and a row that scrolls sideways hides the tokens at
+ * the end, which are the ones being edited.
+ */
+.tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.token {
+  flex: 0 1 auto;
+  width: calc(120px * var(--ui-scale));
+  min-width: 0;
+}
+
+.input {
+  height: calc(26px * var(--ui-scale));
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  /* `--panel-2`, the same ground every other settings input sits on. A `var()` with a fallback
+     would be worse than a wrong colour: `check-theme.mjs` resolves every token a stylesheet
+     names against both palette blocks precisely because an undefined one takes its fallback in
+     silence, and the screen then looks subtly unlike every other. */
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.add {
+  align-self: flex-start;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.add:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.remove {
+  flex: none;
+  width: 24px;
+  height: calc(26px * var(--ui-scale));
+  border: 1px solid transparent;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--faint);
+  font-size: var(--fs-ui-14);
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.remove:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/*
+ * The resolved command line, read-only, under each entry.
+ *
+ * Its whole job is to make the no-shell rule visible: the tokens are joined with a separator
+ * that is *not* a space, so a user cannot read the readout as something a shell would parse and
+ * conclude that `&&` or `|` would work.
+ */
+.argv {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0;
+  padding-left: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.4;
+  color: var(--dim);
+}
+
+/*
+ * One argument, boxed.
+ *
+ * The border is the separator, which is the whole point: a joined string reads as a command line
+ * and invites `|` and `&&`, and a glyph between tokens would be a Unicode symbol drawn as a mark
+ * — what `check-ui-icons.mjs` exists to refuse. Boxes say "these are N separate arguments"
+ * without a character doing the saying.
+ */
+.argvToken {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  white-space: pre;
+}

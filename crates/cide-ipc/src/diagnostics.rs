@@ -625,3 +625,70 @@ pub enum UsagesAnswer {
     /// Nobody could be asked, or the wait ran out. `reason` is shown verbatim.
     Unavailable { reason: String },
 }
+
+/// The selection Reformat code was pressed over, when there was one. (M26)
+///
+/// 1-based lines and 1-based UTF-16 columns, end exclusive — the same units [`Usage`] and
+/// `SymbolSpan` use, so a position means one thing everywhere on this wire. The conversion to
+/// LSP's 0-based pair happens in one place, `cide_app::lsp::range_params`.
+///
+/// Whether it is *used* is decided by the server, not by this type's presence: only a server
+/// advertising `documentRangeFormattingProvider` is asked to format a range, and every other
+/// formatter — including every configured filter, which reads a whole buffer on stdin — formats
+/// the whole document and ignores it. See `LspHandle::supports_range_formatting`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FormatRange {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+/// What reformatting the buffer produced — or why nothing could. (M26)
+///
+/// # Why this carries whole text and not a `Vec<TextEdit>`
+///
+/// The protocol answers formatting with edits, and cide deliberately does not put them on this
+/// wire. There is no `TextEdit` DTO anywhere in the workspace and adding one buys nothing here:
+/// LSP ranges are (line, UTF-16 column) pairs, so the webview would need an offset mapper to
+/// apply them to a CodeMirror document — a second implementation of a conversion
+/// `cide_lsp::convert` already owns, in the language with no test runner. Applying them in Rust
+/// against the text the request was built from is the same arithmetic done once, where it is
+/// unit-tested, and it makes both roads — a language server and a user-configured filter —
+/// answer in one shape.
+///
+/// The *minimal* change is still computed, but on the frontend and against the live buffer, by
+/// `ui/src/editor/formatModel.ts`. That is the only place it can be done correctly: what has to
+/// be preserved is a caret and a scroll position this layer cannot see.
+///
+/// # Why `Unchanged` is its own arm
+///
+/// Formatting an already-formatted file is the common case — it is what a reflexive Ctrl+Alt+F
+/// does — and it must not dirty the tab, push an undo step, or report a failure. A `Formatted`
+/// carrying identical text would be indistinguishable from real work at every layer above, so
+/// the distinction is drawn here, once, rather than re-derived by each caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum FormatAnswer {
+    /// The whole buffer as it should now read, and who said so.
+    Formatted {
+        text: String,
+        /// What the readout names — `rust-analyzer`, `prettier`. The server's *binary name*,
+        /// never the resolved path: a user's Rust is formatted by "rust-analyzer" whether the
+        /// file on disk was `cide-rust-analyzer` or their own build, and which one ran is
+        /// already in `server::supervise`'s `resolved` log line where a bug report finds it.
+        by: String,
+    },
+    /// The formatter ran and had nothing to change. See the type's docs.
+    Unchanged { by: String },
+    /// Nobody could be asked, the wait ran out, or the formatter refused. `reason` is shown
+    /// verbatim, so it is a sentence and not a code.
+    Unavailable { reason: String },
+}

@@ -853,3 +853,181 @@ fn gopls_re_diagnoses_a_file_it_was_told_changed_on_disk() {
          Go file the user has not opened depends on this notification. Seen after it: {after:#?}"
     );
 }
+
+/// Reformat code, against whichever rust-analyzer resolves here. (M26)
+///
+/// **The only thing that can answer what the servers actually advertise.** Everything else about
+/// formatting is unit-tested against fixtures; which of `documentFormattingProvider` and
+/// `documentRangeFormattingProvider` a given *build* offers is a fact about the binary on this
+/// machine, and it is the fact the whole capability-probing design exists for.
+///
+/// It matters per **provenance**, not per server: `cide_lsp::config` sends
+/// `initializationOptions` only to a build cide shipped, rust-analyzer gates range formatting
+/// behind one, so the bundled fork and a stock `PATH` build may answer differently. Run it both
+/// ways — plain, and with `CIDE_RA_PATH` pointing at another build — and read the printed line.
+///
+/// The assertion is deliberately one-sided: whole-document formatting **must** be offered
+/// (without it the feature does nothing for Rust), and range formatting is only *reported*,
+/// because a build that lacks it is correct and `ProjectDiagnostics::format` falls back.
+#[test]
+#[ignore = "spawns the real rust-analyzer"]
+fn rust_analyzer_formats_a_misformatted_file() {
+    let dir = std::env::temp_dir().join(format!("cide-lsp-fmt-rs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write");
+    // Misformatted on purpose, in ways rustfmt certainly changes: spacing and indentation.
+    let source = "pub fn  add( a:i32,b:i32 )->i32{\n        a+b\n}\n";
+    std::fs::write(dir.join("src/lib.rs"), source).expect("write");
+
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
+    let (_, seen) = wait_for(&handle, Duration::from_secs(180), ready);
+    let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RUST_ANALYZER);
+    if let cide_lsp::Effect::Send(message) =
+        session.did_open(uri.clone(), "rust", 1, source.to_string())
+    {
+        handle.send(message);
+    }
+
+    // What this test exists to record. Printed rather than only asserted, because the *pair* is
+    // the answer a reader wants and only one half of it is a requirement.
+    println!(
+        "rust-analyzer: documentFormattingProvider={:?} documentRangeFormattingProvider={:?}",
+        handle.supports_formatting(),
+        handle.supports_range_formatting()
+    );
+    assert_eq!(
+        handle.supports_formatting(),
+        Some(true),
+        "rust-analyzer must advertise documentFormattingProvider; a None means the capability \
+         was never read off the handshake, i.e. `Caps::store_from` stopped being called.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => String::new(),
+        }
+    );
+
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "options": { "tabSize": 4, "insertSpaces": true },
+    });
+    let requester = handle.requester();
+    let mut formatted: Option<String> = None;
+    for _ in 0..20 {
+        match requester.request(
+            "textDocument/formatting",
+            params.clone(),
+            Duration::from_secs(10),
+        ) {
+            Ok(value) => {
+                // Through the same function the app uses, so this covers the applier too — a
+                // reply shape it cannot read fails here rather than in front of a user.
+                if let Some(text) = cide_lsp::convert::apply_text_edits(source, &value)
+                    && text != source
+                {
+                    formatted = Some(text);
+                    break;
+                }
+            }
+            Err(error) => panic!("the request failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let text = formatted.expect(
+        "rust-analyzer never reformatted the file — if it answered `null` every time, rustfmt is \
+         probably not installed for the active toolchain, which is the one failure this feature \
+         cannot distinguish from 'already formatted'",
+    );
+    assert_eq!(
+        text, "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        "rustfmt's own output, byte for byte — anything else means the edits were applied \
+         wrongly rather than that rustfmt disagrees"
+    );
+}
+
+/// The same, for gopls. (M26)
+///
+/// gopls' `textDocument/formatting` is `gofmt`, and unlike rustfmt it is built into the server
+/// rather than a separate binary — so a `null` here means something is wrong with the server
+/// rather than with the toolchain, which is why this failure message differs from its sibling's.
+#[test]
+#[ignore = "spawns the real gopls"]
+fn gopls_formats_a_misformatted_file() {
+    let dir = std::env::temp_dir().join(format!("cide-lsp-fmt-go-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("go.mod"), "module probe\n\ngo 1.21\n").expect("write");
+    // gofmt indents with tabs and puts one space after a comma and around a binary operator.
+    let source = "package probe\n\nfunc Add(a int,b int) int {\n            return a+b\n}\n";
+    std::fs::write(dir.join("lib.go"), source).expect("write");
+
+    let handle = LspHandle::start(Server::GOPLS, vec![dir.clone()]).expect("start");
+    let (_, seen) = wait_for(&handle, Duration::from_secs(180), ready);
+    let uri = cide_lsp::convert::path_to_uri(&dir.join("lib.go"));
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::GOPLS);
+    if let cide_lsp::Effect::Send(message) =
+        session.did_open(uri.clone(), "go", 1, source.to_string())
+    {
+        handle.send(message);
+    }
+
+    println!(
+        "gopls: documentFormattingProvider={:?} documentRangeFormattingProvider={:?}",
+        handle.supports_formatting(),
+        handle.supports_range_formatting()
+    );
+    assert_eq!(
+        handle.supports_formatting(),
+        Some(true),
+        "gopls must advertise documentFormattingProvider.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => String::new(),
+        }
+    );
+
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "options": { "tabSize": 4, "insertSpaces": false },
+    });
+    let requester = handle.requester();
+    let mut formatted: Option<String> = None;
+    for _ in 0..20 {
+        match requester.request(
+            "textDocument/formatting",
+            params.clone(),
+            Duration::from_secs(10),
+        ) {
+            Ok(value) => {
+                if let Some(text) = cide_lsp::convert::apply_text_edits(source, &value)
+                    && text != source
+                {
+                    formatted = Some(text);
+                    break;
+                }
+            }
+            Err(error) => panic!("the request failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let text = formatted.expect("gopls never reformatted the file");
+    assert_eq!(
+        text, "package probe\n\nfunc Add(a int, b int) int {\n\treturn a + b\n}\n",
+        "gofmt's own output, byte for byte — gopls answers with several small edits rather than \
+         one whole-document replacement, so this is also the strongest check there is that \
+         `apply_text_edits` does not shift them against each other"
+    );
+}

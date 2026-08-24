@@ -377,6 +377,51 @@ impl Session {
         }
     }
 
+    /// Does this server answer `textDocument/formatting`? (M26)
+    ///
+    /// The same `boolean | Options` reading as [`Self::supports_references`] —
+    /// `documentFormattingProvider` is `boolean | DocumentFormattingOptions` in the spec.
+    ///
+    /// `false` before the handshake completes is "nothing has said yet", not a refusal. See
+    /// `LspHandle::supports_formatting`, which is where that distinction is kept.
+    pub fn supports_formatting(&self) -> bool {
+        match self.capabilities.get("documentFormattingProvider") {
+            Some(Value::Bool(yes)) => *yes,
+            Some(Value::Object(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Does this server answer `textDocument/rangeFormatting`? (M26)
+    ///
+    /// **Asked separately and never inferred from [`Self::supports_formatting`]**, because the
+    /// two genuinely diverge — and as of M26 they diverge on *every* server cide ships.
+    ///
+    /// Measured, not assumed. `rust_analyzer_formats_a_misformatted_file` and
+    /// `gopls_formats_a_misformatted_file` print the pair, and against the stock `PATH` builds
+    /// on the development machine both answer:
+    ///
+    /// ```text
+    /// rust-analyzer: documentFormattingProvider=Some(true) documentRangeFormattingProvider=Some(false)
+    /// gopls:         documentFormattingProvider=Some(true) documentRangeFormattingProvider=Some(false)
+    /// ```
+    ///
+    /// So **the whole-document fallback is what actually runs today, always**, and Ctrl+Alt+F
+    /// with a selection formats the file. That is worth knowing before anyone "simplifies" the
+    /// range branch away as dead code: rust-analyzer gates range formatting behind an
+    /// `initializationOptions` key that also wants a nightly rustfmt, and `crate::config` sends
+    /// options only to a build cide shipped — so *the same server answers differently depending
+    /// on which binary resolved*, and an extension may contribute one that answers `true`
+    /// outright. The probe is what lets any of those light the branch up without a code change;
+    /// hardcoding today's measurement would be the thing that has to be found and undone.
+    pub fn supports_range_formatting(&self) -> bool {
+        match self.capabilities.get("documentRangeFormattingProvider") {
+            Some(Value::Bool(yes)) => *yes,
+            Some(Value::Object(_)) => true,
+            _ => false,
+        }
+    }
+
     fn status(&self) -> SourceStatus {
         // Ready needs *both*: the handshake done, and nothing in flight. See the module docs for
         // why "a diagnostic has arrived" is not part of it.
@@ -669,6 +714,26 @@ fn initialize_params(
                  * `references` block gives.
                  */
                 "implementation": { "dynamicRegistration": false, "linkSupport": false },
+                /*
+                 * Reformat code. (M26)
+                 *
+                 * Both are stated rather than omitted, for the reason `references` gives above:
+                 * an absent capability and one declared `false` are the same thing to a server
+                 * and very different things to the next person reading this list.
+                 *
+                 * `rangeFormatting` is declared even though the fallback never needs it, and
+                 * that is the point — a client that does not declare it cannot complain when a
+                 * server does not offer it. What cide must *not* do is infer the server's answer
+                 * from this declaration: the reply's `documentRangeFormattingProvider` is the
+                 * only thing that decides, because rust-analyzer's depends on options only a
+                 * bundled build receives. See `Session::supports_range_formatting`.
+                 *
+                 * No `formatting.dynamicRegistration` beyond `false`: cide never handles
+                 * `client/registerCapability`, so a server that tried to register formatting at
+                 * runtime would be talking to nobody. Saying `false` is the honest half.
+                 */
+                "formatting": { "dynamicRegistration": false },
+                "rangeFormatting": { "dynamicRegistration": false },
             },
         },
     });
@@ -843,6 +908,17 @@ mod tests {
             caps["textDocument"]["implementation"]["linkSupport"],
             json!(false)
         );
+        // Reformat code. Both are declared, because a server may gate the method behind client
+        // support — and `rangeFormatting` is declared even though cide falls back without it,
+        // so that the *server's* answer is the only thing deciding, never this line.
+        assert_eq!(
+            caps["textDocument"]["formatting"]["dynamicRegistration"],
+            json!(false)
+        );
+        assert_eq!(
+            caps["textDocument"]["rangeFormatting"]["dynamicRegistration"],
+            json!(false)
+        );
         // We answer `workspace/configuration`, so we must say we can.
         assert_eq!(caps["workspace"]["configuration"], json!(true));
         assert_eq!(
@@ -907,6 +983,50 @@ mod tests {
         }));
         assert!(!none.supports_implementation());
         assert!(!started().supports_implementation());
+    }
+
+    #[test]
+    fn the_two_formatting_capabilities_are_read_apart() {
+        // The load-bearing assertion of the pair: a server that formats whole documents and
+        // *not* ranges is the normal case, not a broken one — rust-analyzer gates
+        // `documentRangeFormattingProvider` behind options only a bundled build receives. Reading
+        // one from the other would send `textDocument/rangeFormatting` to a server that never
+        // offered it, and the reply is a `MethodNotFound` the user sees as a formatter that
+        // silently does nothing whenever they happen to have a selection.
+        let mut whole_only = started();
+        whole_only.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "documentFormattingProvider": true } },
+        }));
+        assert!(whole_only.supports_formatting());
+        assert!(!whole_only.supports_range_formatting());
+
+        // `boolean | DocumentFormattingOptions`, the same three-state reading every other
+        // capability here gets: the object form is what a server sends when it wants work-done
+        // progress, and reading only the boolean would report "cannot format" about a server
+        // that can.
+        let mut options = started();
+        options.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": {
+                "documentFormattingProvider": { "workDoneProgress": true },
+                "documentRangeFormattingProvider": { "workDoneProgress": true },
+            }},
+        }));
+        assert!(options.supports_formatting());
+        assert!(options.supports_range_formatting());
+
+        // An explicit `false` is a refusal, not a shrug.
+        let mut refused = started();
+        refused.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "documentFormattingProvider": false } },
+        }));
+        assert!(!refused.supports_formatting());
+
+        // And nothing has said yet before the handshake lands.
+        assert!(!started().supports_formatting());
+        assert!(!started().supports_range_formatting());
     }
 
     #[test]

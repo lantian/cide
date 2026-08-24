@@ -52,6 +52,7 @@
     "check:picker": "node scripts/check-picker.mjs",
     "check:problems": "node scripts/check-problems.mjs",
     "check:proxy": "node scripts/check-proxy.mjs",
+    "check:reformat": "node scripts/check-reformat.mjs",
     "check:render": "node scripts/check-git-render.mjs",
     "check:render-stall": "node scripts/check-render-stall.mjs",
     "check:resize": "node scripts/check-resize.mjs",

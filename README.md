@@ -6094,6 +6094,87 @@ Problems populating, the per-profile cache filling) has not been watched on scre
 packaged bundle carrying both sidecars has been built with `--run`. The flatpak golang SDK
 extension is stated in the manifest but a flatpak build has not been attempted.
 
+## Reformat code — Ctrl+Alt+F (M26), and what is not verified
+
+cide had no formatting at all. The only appearances of `cargo fmt` in the tree were as *the
+antagonist*: it is the worked example in `cide_core::document`'s
+`a_stale_precondition_refuses_and_leaves_the_file_alone` and in `EditorPane.tsx` for "a write
+nobody typed landing under a dirty buffer". So the user's only route was to leave the editor,
+run the formatter in a shell pane and click back — which is exactly the sequence those guards
+exist to survive.
+
+**Two roads behind one command id**, resolved in `cmd::format::run`:
+
+- **The language server.** `textDocument/formatting`, which *is* rustfmt against rust-analyzer
+  and *is* gofmt against gopls. Both are bundled since M25/M26, so **Rust and Go format out of
+  the box with nothing installed**. It also comes free for any server an extension contributes.
+- **A user-configured filter**, for the nine builtin languages with no server — TypeScript,
+  JSON, YAML, TOML, Markdown, Python, shell, SQL, clike. Settings → Editor → Formatters, keyed
+  by language id, and a row **wins** over the server: it is the only lever over a formatter cide
+  chose, short of switching the whole server to System, which is a far larger hammer.
+
+A formatter is a **`Vec<String>`, one box per argument, never a command line** — the rule
+`ClaudeCli::args` already states and for its reason: a single string needs a quoting parser cide
+would have to invent and would get wrong at the first path with a space in it. The argv reaches
+`execvp` directly, so `$HOME`, `*`, `|` and `&&` are argument bytes rather than syntax; only
+`${file}` and `${dir}` are substituted. It is run as a **filter** — buffer on stdin, result on
+stdout — which is the only shape that can format an *unsaved* buffer, and a tool that rewrites
+in place and prints nothing (`cargo fmt` itself, the first thing anyone tries) is refused by
+name rather than allowed to empty the buffer.
+
+**Nothing is ever written to disk.** Both roads return text, the buffer takes a transaction, the
+tab goes dirty like any other edit, and Ctrl+S is unchanged.
+
+**The four rules that make it not corrupt anything**, each silent if dropped:
+
+1. **`flushDoc` is awaited** before the request. `didChange` is a 300 ms trailing throttle, so
+   without it the server formats text up to 300 ms old — and the answer is applied to the buffer,
+   so stale input produces a *corrupt* result rather than a stale one. Same argument `savedDoc`
+   already makes for `didSave`, one step further.
+2. **The buffer is re-checked on reply** (`formatModel.isStillCurrent`). The flush narrows the
+   window; a keystroke landing inside what remains would otherwise be discarded silently.
+3. **A buffer past 1 MiB is refused**, because that is `cmd::diagnostics::MAX_SYNC_BYTES` — above
+   it `didChange` stops being sent and the server holds *the file as last saved*, so formatting
+   would throw away every unsaved edit in a large file.
+4. **The change is trimmed to what differs** (`formatModel.minimalChange`). A
+   `{from: 0, to: doc.length}` replacement is one line and remaps every position in the document:
+   the caret jumps, the scroll jumps, every fold and diagnostic is rebuilt, and the undo step
+   becomes the whole file.
+
+**The chord.** `ctrl+alt+f`, `editorFocused`. IDEA's Ctrl+Alt+L is KDE's Lock Screen and never
+reaches the app — `keymap.rs` already avoided it once for `alt+l` — so this follows VS Code's
+chord instead, which is also what ⌥⌘F becomes on macOS. The clause is not optional:
+`terminal/keys.ts` encodes a control byte only for ctrl *without* alt, so Ctrl+Alt+F reaches a
+shell as `ESC ^F`, readline's `forward-word`, and the gate is a window capture listener.
+
+**What the servers actually answer, measured rather than assumed.**
+`rust_analyzer_formats_a_misformatted_file` and `gopls_formats_a_misformatted_file` print the
+capability pair and assert the formatted bytes. Against the stock `PATH` builds:
+
+```text
+rust-analyzer: documentFormattingProvider=Some(true) documentRangeFormattingProvider=Some(false)
+gopls:         documentFormattingProvider=Some(true) documentRangeFormattingProvider=Some(false)
+```
+
+So **neither shipped server offers range formatting, and the whole-document fallback is what runs
+today, always** — Ctrl+Alt+F with a selection formats the file. The range branch is still there
+and is still probed, because rust-analyzer gates its own behind an `initializationOptions` key
+that only a bundled build receives, and a contributed server may answer `true` outright; the
+probe is what lets either light it up with no code change. gopls' reply is also the strongest
+check `convert::apply_text_edits` has: it sends several small edits rather than one replacement,
+so the test reproducing gofmt's output byte for byte is what proves they are not shifted against
+each other.
+
+**What is not verified.** None of it has been watched on screen — `./run.sh` was not driven, so
+the caret-and-scroll preservation, the settings editor, the context-menu row and the notice text
+are all read rather than seen. Only the **stock** provenance was exercised: no bundled sidecar
+was built, so whether the forks answer the same capability pair is untested, and the
+`CIDE_RA_PATH`/`CIDE_GOPLS_PATH` road was not run. No configured filter has been driven through
+the real UI — `prettier` end to end is only covered by unit tests standing in for it (`tr`,
+`cat`, `true`, `sh`). CRLF is reasoned about (the formatter never sees `\r`; `restoreLineEndings`
+runs only on save) and not tested. `check:css-prefix` fails on `EditorSurface.module.css:954` at
+this commit and did so before this work — it is not from this feature.
+
 ## The look and feel (M23), and what is not verified
 
 The report was "look and feel is bad — font style, font size, icons, across all components", with

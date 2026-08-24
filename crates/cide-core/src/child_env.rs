@@ -482,6 +482,148 @@ pub fn prepare_command(command: &mut Command) {
     }
 }
 
+/// What running a child as a filter produced. See [`run_filter`].
+#[derive(Debug)]
+pub struct Filtered {
+    /// Did the child exit successfully? `false` and a populated [`Self::stderr`] is the shape
+    /// of every refusal a formatter or a `git` subcommand makes.
+    pub ok: bool,
+    /// Everything the child wrote to stdout, bytes as written. Never decoded here — a
+    /// formatter's output is the user's file and this layer must not normalise it.
+    pub stdout: Vec<u8>,
+    /// Everything it wrote to stderr, lossily decoded, because it is only ever shown.
+    pub stderr: String,
+}
+
+/// Why a filter produced nothing. **Tagged and not prose**, so each caller phrases its own
+/// sentence: `git blame` and a code formatter fail in the same four ways and have nothing
+/// useful to say to a user in the same words.
+#[derive(Debug)]
+pub enum FilterError {
+    /// The program could not be started — almost always "not found on `PATH`".
+    Spawn(std::io::Error),
+    /// It was still running at the deadline, and has been killed.
+    Timeout,
+    /// It ran, but its stdout could not be read.
+    Unreadable,
+    /// It ran and could not be reaped.
+    Wait(std::io::Error),
+}
+
+/// Run `command` as a filter — bytes in on stdin, bytes out on stdout — and give up after
+/// `deadline`.
+///
+/// # Why this is here rather than beside either caller
+///
+/// Because there are two, and the second one arrived. It began life inside `cide-git`'s
+/// `blame::run_with_deadline`, feeding a dirty buffer to `git blame --contents -`; M26's
+/// Reformat code needs exactly the same thing to feed a dirty buffer to `prettier`. The three
+/// paragraphs below are the entire reason the function is hard to write, and a second copy of
+/// them is a second thing to get subtly wrong — the deadlock they describe does not throw, it
+/// hangs.
+///
+/// # Three threads, each load-bearing
+///
+/// **stdout is read concurrently**, because the output is routinely larger than a pipe buffer
+/// and a child blocked writing it while this thread blocks waiting for the child is a deadlock.
+/// **stderr gets its own thread** for the same reason applied to the other pipe: reading two
+/// pipes in sequence from one thread deadlocks whenever the child fills the one not being read.
+/// **stdin is written on a third**, because a multi-megabyte buffer does not fit in a pipe
+/// either, so a single-threaded write-then-read deadlocks on the first large file.
+///
+/// # Both spawn rules, applied here so no caller can forget
+///
+/// [`prepare_command`] and [`arm`], in that order — the pair CLAUDE.md requires of every
+/// `Command::new` in the workspace. Applying them inside is not tidiness: `blame`'s own call
+/// site had `prepare_command` and *not* `arm` for two milestones, which is exactly the miss a
+/// chokepoint makes unrepresentable.
+///
+/// [`arm`]'s contract is that the forking thread outlives the child, and this function
+/// satisfies it by construction — every path below either waits for the child or kills it
+/// before returning. That is also why this must not be moved onto [`on_spawn_thread`], which
+/// exists for the opposite case: children nobody waits for.
+pub fn run_filter(
+    mut command: Command,
+    stdin: Option<&[u8]>,
+    deadline: std::time::Duration,
+) -> Result<Filtered, FilterError> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    prepare_command(&mut command);
+    arm(&mut command);
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(FilterError::Spawn)?;
+
+    let writer = stdin.map(|bytes| {
+        let bytes = bytes.to_vec();
+        let mut handle = child.stdin.take();
+        std::thread::spawn(move || {
+            if let Some(handle) = handle.as_mut() {
+                // A failed write is not reported: it means the child exited early, and the exit
+                // status and stderr say why in terms the user can read.
+                let _ = handle.write_all(&bytes);
+            }
+            // Explicit, because the pipe has to be *closed* for the child to see end of input.
+            // A formatter reading stdin to EOF hangs for ever without this.
+            drop(handle);
+        })
+    });
+
+    let mut out = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let ok = out.read_to_end(&mut buffer).is_ok();
+        let _ = tx.send((ok, buffer));
+    });
+    let mut errors = child.stderr.take().expect("stderr was piped");
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = errors.read_to_string(&mut text);
+        text
+    });
+
+    let received = rx.recv_timeout(deadline);
+    if received.is_err() {
+        // Kill first, then join: both reader threads end when their pipes close, and the writer
+        // ends with `EPIPE`. Rust's runtime ignores `SIGPIPE`, so that write returns an error
+        // rather than killing this process.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        let _ = stderr.join();
+        if let Some(writer) = writer {
+            let _ = writer.join();
+        }
+        return Err(FilterError::Timeout);
+    }
+
+    let (read_ok, stdout) = received.expect("checked above");
+    let status = child.wait().map_err(FilterError::Wait)?;
+    let _ = reader.join();
+    let stderr = stderr.join().unwrap_or_default();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    if !read_ok {
+        return Err(FilterError::Unreadable);
+    }
+    Ok(Filtered {
+        ok: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
 /// The whole environment a **PTY** child is given, as one ordered [`EnvChange`] list.
 ///
 /// The composition half of what `cmd::session::base_env` used to do inline. It lives here and

@@ -55,11 +55,11 @@
 //! the same commit's name and address ride the wire once.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
+use cide_core::child_env::{FilterError, Filtered};
 use cide_ipc::git::GitError;
 use cide_ipc::history::{
     BlameCommit, BlameFile, BlameFollow, BlameParent, BlameRequest, BlameRun, BlameSource,
@@ -467,14 +467,17 @@ fn via_binary(
     lines: u32,
 ) -> std::result::Result<(Vec<BlameRun>, Vec<BlameCommit>), String> {
     let mut command = Command::new("git");
-    // **Mandatory, and the first line of every spawn in this workspace.** An AppImage's `AppRun`
-    // leaves `LD_LIBRARY_PATH` and `PYTHONHOME` pointing inside the mounted image, and `git`
-    // dlopens the host's libcurl and OpenSSL — so a `git` that inherits cide's bundled
-    // environment picks up eleven bundled libraries ahead of the host's and fails in ways that
-    // are reported from three processes below anything cide logs. `prepare_command` also appends
-    // `cide_core::toolchain::extra_dirs` to `PATH`, which is what lets a GUI-launched cide find
-    // a `git` that is not in the desktop session's `PATH` at all. See ADR 0007.
-    cide_core::child_env::prepare_command(&mut command);
+    // The two mandatory spawn passes are applied by `run_filter` below, at the chokepoint, and
+    // deliberately not here. They used to be one line at this spot — `prepare_command` without
+    // its `arm` partner, which is the half that had been missing since this route was written.
+    //
+    // Why they matter for `git` specifically: an AppImage's `AppRun` leaves `LD_LIBRARY_PATH`
+    // and `PYTHONHOME` pointing inside the mounted image, and `git` dlopens the host's libcurl
+    // and OpenSSL — so a `git` that inherits cide's bundled environment picks up eleven bundled
+    // libraries ahead of the host's and fails in ways reported from three processes below
+    // anything cide logs. `prepare_command` also appends `cide_core::toolchain::extra_dirs` to
+    // `PATH`, which is what lets a GUI-launched cide find a `git` that is not in the desktop
+    // session's `PATH` at all. See ADR 0007 and ADR 0008.
     command.current_dir(root);
     command.arg("blame").arg("--porcelain");
     // Plain `--porcelain` and **not** `--line-porcelain`: the latter repeats the whole commit
@@ -517,7 +520,26 @@ fn via_binary(
     command.arg("--").arg(path);
 
     let started = Instant::now();
-    let (ok, stdout, stderr) = run_with_deadline(command, bytes, BINARY_DEADLINE)?;
+    // The three-thread runner lives in `cide_core::child_env` since M26, because Reformat code
+    // needs the identical thing to feed a dirty buffer to a formatter. The error is tagged
+    // rather than prose precisely so this call site keeps saying "the gutter follows whole-file
+    // renames only", which means nothing to a formatter.
+    let Filtered { ok, stdout, stderr } = cide_core::child_env::run_filter(
+        command,
+        bytes,
+        BINARY_DEADLINE,
+    )
+    .map_err(|error| match error {
+        FilterError::Spawn(error) => format!("`git` could not be started ({error})"),
+        FilterError::Timeout => format!(
+            "`git blame` did not finish within {}s, so the gutter follows whole-file renames only",
+            BINARY_DEADLINE.as_secs()
+        ),
+        FilterError::Unreadable => "`git blame`'s output could not be read".to_string(),
+        FilterError::Wait(error) => {
+            format!("`git blame` could not be waited for ({error})")
+        }
+    })?;
     if !ok {
         let message = stderr.trim();
         return Err(format!(
@@ -555,93 +577,6 @@ fn via_binary(
         "blamed via the git binary"
     );
     Ok((runs, commits))
-}
-
-/// Run `command`, feeding it `stdin`, and give up after `deadline`.
-///
-/// Three threads, and each of the three is load-bearing. stdout is read concurrently because a
-/// blame's porcelain output is far larger than a pipe buffer and a child blocked writing it
-/// while we block waiting for the child is a deadlock. stderr is read on its own thread for the
-/// same reason applied to the other pipe — reading two pipes in sequence from one thread
-/// deadlocks whenever the child fills the one that is not being read. stdin is written on a
-/// third because a two-megabyte buffer does not fit in a pipe either.
-fn run_with_deadline(
-    mut command: Command,
-    stdin: Option<&[u8]>,
-    deadline: Duration,
-) -> std::result::Result<(bool, Vec<u8>, String), String> {
-    command
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("`git` could not be started ({error})"))?;
-
-    let writer = stdin.map(|bytes| {
-        let bytes = bytes.to_vec();
-        let mut handle = child.stdin.take();
-        std::thread::spawn(move || {
-            if let Some(handle) = handle.as_mut() {
-                // A failed write is not reported: it means the child exited early, and the exit
-                // status and stderr say why in terms the user can read.
-                let _ = handle.write_all(&bytes);
-            }
-            // Explicit, because the pipe has to be *closed* for git to see end of input.
-            drop(handle);
-        })
-    });
-
-    let mut out = child.stdout.take().expect("stdout was piped");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let ok = out.read_to_end(&mut buffer).is_ok();
-        let _ = tx.send((ok, buffer));
-    });
-    let mut errors = child.stderr.take().expect("stderr was piped");
-    let stderr = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = errors.read_to_string(&mut text);
-        text
-    });
-
-    let received = rx.recv_timeout(deadline);
-    if received.is_err() {
-        // Kill first, then join: both reader threads end when their pipes close, and the writer
-        // ends with `EPIPE`. Rust's runtime ignores `SIGPIPE`, so that write returns an error
-        // rather than killing this process.
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = reader.join();
-        let _ = stderr.join();
-        if let Some(writer) = writer {
-            let _ = writer.join();
-        }
-        return Err(format!(
-            "`git blame` did not finish within {}s, so the gutter follows whole-file renames only",
-            deadline.as_secs()
-        ));
-    }
-
-    let (read_ok, stdout) = received.expect("checked above");
-    let status = child
-        .wait()
-        .map_err(|error| format!("`git blame` could not be waited for ({error})"))?;
-    let _ = reader.join();
-    let stderr = stderr.join().unwrap_or_default();
-    if let Some(writer) = writer {
-        let _ = writer.join();
-    }
-    if !read_ok {
-        return Err("`git blame`'s output could not be read".to_string());
-    }
-    Ok((status.success(), stdout, stderr))
 }
 
 /// Everything the porcelain format says about one commit, accumulated until its content line.
