@@ -23,6 +23,7 @@
 import { useState } from 'react'
 
 import { settings as settingsApi } from '@/ipc/client'
+import { errorText } from '@/ipc/errorText'
 import { useWorkspace, type Theme } from '@/store/workspace'
 import { BUILTIN_SCHEME, schemeChoices } from '@/editor/scheme'
 import type { ColorScheme, EditorSettings, SettingsPatch } from '@/ipc/generated'
@@ -111,7 +112,7 @@ export function ColorSchemeRow({ theme, editor, patch }: ColorSchemeRowProps) {
         if (usable[0]) select(usable[0].id)
         setImported(schemes)
       })
-      .catch((e: unknown) => setFailed(String(e)))
+      .catch((e: unknown) => setFailed(errorText(e)))
   }
 
   const remove = () => {
@@ -122,7 +123,7 @@ export function ColorSchemeRow({ theme, editor, patch }: ColorSchemeRowProps) {
     // setting names a file that is gone. `scheme_remove` deliberately leaves the setting alone
     // — see its own note — which makes this the caller's job.
     select(BUILTIN_SCHEME)
-    void settingsApi.removeScheme(value).catch((e: unknown) => setFailed(String(e)))
+    void settingsApi.removeScheme(value).catch((e: unknown) => setFailed(errorText(e)))
   }
 
   return (

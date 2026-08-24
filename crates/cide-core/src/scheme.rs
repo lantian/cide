@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use cide_ipc::Theme;
 use cide_ipc::theme::{
-    BUILTIN_SCHEME, ColorScheme, SCHEME_SURFACE, luminance, normalise_hex, scheme_roles,
+    BUILTIN_SCHEME, ColorScheme, SCHEME_SURFACE, composite, luminance, normalise_hex, scheme_roles,
 };
 use serde::Deserialize;
 
@@ -161,6 +161,40 @@ const SCOPES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Roles where a narrower rule than the one being asked about must **not** be taken as evidence.
+///
+/// The weak-evidence rule (see [`score`]) exists because most themes only ever name
+/// language-qualified scopes: a theme that says `entity.name.function.js` and nothing else is
+/// telling us what it thinks a function name looks like, and refusing to hear it converts such a
+/// theme to almost nothing.
+///
+/// That reading is wrong for punctuation. A rule on `punctuation.separator.key-value` is a
+/// deliberate special case — the `:` between a key and its value — not a statement about every
+/// comma and semicolon in the file, and taking it as one is how Min Dark converted with its
+/// punctuation, brackets and operators all painted the theme's **keyword red**. VS Code paints
+/// unstated punctuation with `editor.foreground`, and so does cide now: no weak evidence here,
+/// no match, and the fallback chain ends at `fg`.
+///
+/// The distinction is *language qualification versus special case*, and it is not something a
+/// scope string carries — hence a list rather than a rule.
+const NO_WEAK_EVIDENCE: &[&str] = &["punctuation", "bracket", "operator"];
+
+/// What VS Code itself paints when a theme states neither of the editor's two grounds.
+///
+/// `(dark, light)`. These are the built-in default themes' values rather than cide's own, and the
+/// distinction matters: an imported scheme is a rendering of somebody else's theme, so where the
+/// theme is silent the right answer is what its author saw, not what cide would have chosen. Min
+/// Dark ships no `editor.foreground` and its own showcase image renders code at `#BBBBBB`.
+const VS_DEFAULT_BG: (&str, &str) = ("#1e1e1e", "#ffffff");
+const VS_DEFAULT_FG: (&str, &str) = ("#bbbbbb", "#000000");
+
+fn vs_default(pair: (&'static str, &'static str), polarity: Theme) -> &'static str {
+    match polarity {
+        Theme::Dark => pair.0,
+        Theme::Light => pair.1,
+    }
+}
+
 /// Which key in the theme's `colors` map fills each surface role.
 ///
 /// `editor.lineHighlightBackground` is **deliberately absent**, and it is the one thing a reader
@@ -175,7 +209,17 @@ const SCOPES: &[(&str, &[&str])] = &[
 /// primary one is absent.
 const SURFACE_KEYS: &[(&str, &[&str])] = &[
     ("bg", &["editor.background"]),
-    ("fg", &["editor.foreground", "foreground"]),
+    // **`editor.foreground` and nothing else.** The obvious second choice is the workbench
+    // `foreground`, and it is wrong: that key colours the sidebar, the status bar and the
+    // activity rail, and themes routinely make it far dimmer than the text in the buffer. Min
+    // Dark sets `foreground: #7D7D7D` and no `editor.foreground` at all, so reading it dropped
+    // every unroled identifier in a Rust file to a mid grey — the theme's own showcase renders
+    // that same file at `#BBBBBB`. It was reported as *"I don't see all colours"*, and washed out
+    // is exactly what it looked like.
+    //
+    // VS Code does not read `foreground` for the editor either; it falls back to the built-in
+    // default theme, which is what [`VS_DEFAULT_FG`] restates.
+    ("fg", &["editor.foreground"]),
     (
         "sel",
         &[
@@ -311,7 +355,7 @@ where
 ///
 /// A selector with a descendant part (`meta.function entity.name`) is judged on its **last**
 /// component, which is the element such a selector actually matches.
-fn score(selector: &str, candidate: &str) -> Option<u32> {
+fn score(selector: &str, candidate: &str, weak_allowed: bool) -> Option<u32> {
     let leaf = selector.split_whitespace().next_back()?;
     // `-` introduces an exclusion (`source -string`), which cannot be honoured out of context.
     // A rule whose selector is only an exclusion says nothing about any candidate.
@@ -319,16 +363,33 @@ fn score(selector: &str, candidate: &str) -> Option<u32> {
     if leaf.is_empty() || leaf.starts_with('-') {
         return None;
     }
-    let segments = |s: &str| s.split('.').count() as u32;
+    // **How many dot-segments the two share is the primary score**, and that ordering is a fix
+    // rather than a refinement. It used to rank a *prefix* match above a longer one in the other
+    // direction by an order of magnitude, which meant a theme saying both `support` and
+    // `support.type.property-name.json` answered the property question with `support` — the
+    // broad rule beating the one VS Code would actually apply to a JSON key. Min Dark says
+    // exactly that pair, and cide painted its keys blue where the theme says white.
+    let shared = leaf
+        .split('.')
+        .zip(candidate.split('.'))
+        .take_while(|(a, b)| a == b)
+        .count() as u32;
+    if shared == 0 {
+        return None;
+    }
+    // Direction breaks a tie at equal depth: an exact match, then a true TextMate prefix match,
+    // then a narrower sibling. See `NO_WEAK_EVIDENCE` for where that last one is refused.
     if candidate == leaf {
-        return Some(1000 + segments(leaf) * 10);
+        return Some(shared * 10 + 3);
     }
     if candidate.starts_with(leaf) && candidate.as_bytes().get(leaf.len()) == Some(&b'.') {
-        return Some(100 + segments(leaf) * 10);
+        return Some(shared * 10 + 2);
     }
-    if leaf.starts_with(candidate) && leaf.as_bytes().get(candidate.len()) == Some(&b'.') {
-        // Weak evidence, and deliberately scored below every prefix match — see above.
-        return Some(10);
+    if weak_allowed
+        && leaf.starts_with(candidate)
+        && leaf.as_bytes().get(candidate.len()) == Some(&b'.')
+    {
+        return Some(shared * 10 + 1);
     }
     None
 }
@@ -337,7 +398,7 @@ fn score(selector: &str, candidate: &str) -> Option<u32> {
 ///
 /// Ties go to the **later** rule, which is VS Code's own precedence: a theme that restates a
 /// scope further down the file is correcting itself. `>=` rather than `>` is that rule.
-fn colour_for(theme: &VsTheme, candidate: &str) -> Option<String> {
+fn colour_for(theme: &VsTheme, candidate: &str, weak_allowed: bool) -> Option<String> {
     let mut best: Option<(u32, String)> = None;
     for rule in &theme.token_colors {
         let Some(fg) = rule.settings.foreground.as_deref() else {
@@ -347,7 +408,7 @@ fn colour_for(theme: &VsTheme, candidate: &str) -> Option<String> {
             continue;
         };
         for selector in rule.scope.selectors() {
-            let Some(points) = score(selector, candidate) else {
+            let Some(points) = score(selector, candidate, weak_allowed) else {
                 continue;
             };
             if best.as_ref().is_none_or(|(seen, _)| points >= *seen) {
@@ -360,8 +421,9 @@ fn colour_for(theme: &VsTheme, candidate: &str) -> Option<String> {
 
 /// One role's colour, from `tokenColors` first and `semanticTokenColors` as a last resort.
 fn resolve_role(theme: &VsTheme, role: &str, candidates: &[&str]) -> Option<String> {
+    let weak_allowed = !NO_WEAK_EVIDENCE.contains(&role);
     for candidate in candidates {
-        if let Some(hex) = colour_for(theme, candidate) {
+        if let Some(hex) = colour_for(theme, candidate, weak_allowed) {
             return Some(hex);
         }
     }
@@ -437,10 +499,22 @@ pub fn convert(raw: &str, name_hint: &str, source: Option<String>) -> Result<Col
         .map_err(|e| CoreError::Serde(format!("not a VS Code colour theme: {e}")))?;
 
     let mut colors = BTreeMap::new();
+
+    // The background first and on its own, because every other surface colour may need to be
+    // composited onto it. A theme that gives none gets the polarity default that
+    // `ColorScheme::normalise` would supply anyway, resolved here so there is a ground to
+    // composite against.
+    let polarity = polarity_of(&theme);
+    let ground = theme
+        .colors
+        .get("editor.background")
+        .and_then(|v| normalise_hex(v))
+        .unwrap_or_else(|| vs_default(VS_DEFAULT_BG, polarity).to_string());
+
     for (role, keys) in SURFACE_KEYS {
         if let Some(hex) = keys
             .iter()
-            .find_map(|key| theme.colors.get(*key).and_then(|v| normalise_hex(v)))
+            .find_map(|key| theme.colors.get(*key).and_then(|v| composite(v, &ground)))
         {
             colors.insert((*role).to_string(), hex);
         }
@@ -450,6 +524,12 @@ pub fn convert(raw: &str, name_hint: &str, source: Option<String>) -> Result<Col
             colors.insert((*role).to_string(), hex);
         }
     }
+    // Both grounds always stated, so the last-resort defaults inside `ColorScheme::normalise` —
+    // which are *cide's* colours, not VS Code's — are unreachable from the import road.
+    colors.entry("bg".into()).or_insert_with(|| ground.clone());
+    colors
+        .entry("fg".into())
+        .or_insert_with(|| vs_default(VS_DEFAULT_FG, polarity).to_string());
 
     let name = theme
         .name
@@ -459,7 +539,7 @@ pub fn convert(raw: &str, name_hint: &str, source: Option<String>) -> Result<Col
     let mut scheme = ColorScheme {
         id: slug(&name),
         name,
-        polarity: polarity_of(&theme),
+        polarity,
         colors,
         source,
     };
@@ -565,6 +645,10 @@ fn strip_jsonc(raw: &str) -> String {
 const MAX_ENTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_THEMES: usize = 32;
 
+/// The most a bare theme `.json` may be. Same reasoning as [`MAX_ENTRY_BYTES`], one layer out:
+/// the picker accepts any file, and a file that is not an archive is read as text.
+const MAX_THEME_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Read a colour theme from disk. A `.vsix` may carry several; a `.json` is always one.
 ///
 /// **Dispatched on the file's first four bytes, not on its extension.** `PK\x03\x04` is a ZIP,
@@ -573,12 +657,42 @@ const MAX_THEMES: usize = 32;
 /// `-color-theme.json` with no extension left after a download manager finished with it. The
 /// extension is a hint the user did not necessarily control; the magic number is the fact.
 pub fn import(path: &Path) -> Result<Vec<ColorScheme>> {
-    let bytes =
-        fs::read(path).map_err(|e| CoreError::Io(format!("reading {}: {e}", path.display())))?;
-    if bytes.starts_with(b"PK\x03\x04") {
-        return import_vsix(path, bytes);
+    use std::io::{Read as _, Seek as _};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| CoreError::Io(format!("reading {}: {e}", path.display())))?;
+
+    // Four bytes, not the file. A `.vsix` from a marketplace is routinely tens or hundreds of
+    // megabytes — the C/C++ extension is 137 MB — and reading one whole into a `Vec` to look at
+    // its header, and then again to reject it, is a large allocation for a question answered by
+    // the first word. The archive road below takes the `File` itself, so `zip` seeks to the
+    // central directory and inflates only the handful of entries a theme lives in.
+    let mut magic = [0u8; 4];
+    let read = file
+        .read(&mut magic)
+        .map_err(|e| CoreError::Io(format!("reading {}: {e}", path.display())))?;
+    file.rewind()
+        .map_err(|e| CoreError::Io(format!("reading {}: {e}", path.display())))?;
+    if read == 4 && magic == *b"PK\x03\x04" {
+        return import_vsix(path, file);
     }
-    let raw = String::from_utf8(bytes)
+
+    // A theme file is a few kilobytes of JSON. The cap is here so that pointing the picker at
+    // something enormous that is *not* an archive fails with a sentence rather than by
+    // exhausting memory — the same reasoning as `MAX_ENTRY_BYTES`, one layer out.
+    let size = file.metadata().map(|m| m.len()).unwrap_or_default();
+    if size > MAX_THEME_BYTES {
+        return Err(CoreError::Serde(format!(
+            "{} is {:.1} MB, which is far too large to be a colour theme — a theme file is a few \
+             kilobytes of JSON, and a `.vsix` would start with a ZIP header",
+            path.display(),
+            size as f64 / (1024.0 * 1024.0),
+        )));
+    }
+
+    let mut raw = String::new();
+    file.take(MAX_THEME_BYTES)
+        .read_to_string(&mut raw)
         .map_err(|_| CoreError::Serde(format!("{} is not text", path.display())))?;
     let hint = path
         .file_stem()
@@ -630,9 +744,12 @@ struct VsixContributes {
 /// files. That is not a guess at what the user meant: it is the convention every published theme
 /// follows, and the alternative — refusing a file that visibly contains themes because its
 /// manifest is shaped unusually — is the sort of refusal that reads as a broken importer.
-fn import_vsix(path: &Path, bytes: Vec<u8>) -> Result<Vec<ColorScheme>> {
+fn import_vsix(path: &Path, file: std::fs::File) -> Result<Vec<ColorScheme>> {
     let source = path.to_string_lossy().into_owned();
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| {
+    // `BufReader<File>` rather than the bytes: `ZipArchive` needs `Read + Seek`, and given both it
+    // reads the central directory and then only the entries asked for. A 137 MB extension costs a
+    // few seeks and one small inflate instead of 137 MB of allocation.
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| {
         CoreError::Serde(format!("{} is not a readable .vsix: {e}", path.display()))
     })?;
 
@@ -696,13 +813,40 @@ fn import_vsix(path: &Path, bytes: Vec<u8>) -> Result<Vec<ColorScheme>> {
     }
 
     if schemes.is_empty() {
+        // Names what was looked for *and* what the file turned out to be. The overwhelmingly
+        // common way to reach this is pointing the picker at a perfectly good extension that
+        // simply is not a theme — a language server, a debugger — and "contains no colour themes"
+        // on its own reads as cide failing rather than as the file being the wrong one.
+        let what = display_name(&mut archive)
+            .map(|name| format!(" — {name} is an extension, but not a theme"))
+            .unwrap_or_default();
         return Err(CoreError::Serde(format!(
-            "{} contains no colour themes — looked for contributes.themes in \
+            "{} contains no colour themes{what}. Looked for contributes.themes in \
              extension/package.json, then for extension/themes/*.json",
             path.display()
         )));
     }
     Ok(schemes)
+}
+
+/// The extension's own display name, for an error message that can say what the file *is*.
+fn display_name<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Named {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    }
+    let raw = read_entry(archive, "extension/package.json")?;
+    let named: Named = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
+    named
+        .display_name
+        .or(named.name)
+        .filter(|n| !n.trim().is_empty())
 }
 
 /// The name to use, when the packaging says something the theme file does not.
@@ -892,8 +1036,10 @@ mod tests {
         let s = converted();
         assert_eq!(s.colors["bg"], "#1e1e1e");
         assert_eq!(s.colors["fg"], "#d4d4d4");
-        // The alpha is dropped rather than composited.
-        assert_eq!(s.colors["sel"], "#264f78");
+        // `#264f7899` is 60% of `#264f78` over the theme's own `#1e1e1e`, which is what VS Code
+        // actually paints — not `#264f78`, which is what dropping the alpha used to give. The
+        // difference is the whole of `cide_ipc::theme::composite`.
+        assert_eq!(s.colors["sel"], "#233b54");
         assert_eq!(s.colors["gutter"], "#858585");
     }
 
@@ -936,6 +1082,42 @@ mod tests {
         assert_eq!(convert(inline, "x", None).expect("convert").name, "A // B");
     }
 
+    /// **The workbench `foreground` is not the editor's.**
+    ///
+    /// Min Dark states `foreground: #7D7D7D` — the colour of its sidebar and status bar — and no
+    /// `editor.foreground` at all. Reading the first as the second dropped every unroled
+    /// identifier in the buffer to a mid grey, against the `#BBBBBB` the theme's own showcase
+    /// renders. VS Code falls back to its built-in default theme here, and so does cide.
+    #[test]
+    fn the_workbench_foreground_is_not_the_editors() {
+        let theme = r##"{ "name": "T", "type": "dark",
+            "colors": { "editor.background": "#1f1f1f", "foreground": "#7d7d7d" } }"##;
+        let s = convert(theme, "x", None).expect("convert");
+        assert_eq!(
+            s.colors["fg"], "#bbbbbb",
+            "the workbench grey leaked into the buffer"
+        );
+        assert_eq!(s.colors["bg"], "#1f1f1f");
+
+        // A theme that *does* state one is taken at its word.
+        let stated = r##"{ "name": "T", "type": "dark",
+            "colors": { "editor.background": "#1f1f1f", "editor.foreground": "#d4d4d4",
+                        "foreground": "#7d7d7d" } }"##;
+        assert_eq!(convert(stated, "x", None).unwrap().colors["fg"], "#d4d4d4");
+    }
+
+    /// A theme stating neither ground gets VS Code's defaults, not cide's palette — an imported
+    /// scheme is a rendering of somebody else's theme.
+    #[test]
+    fn a_theme_stating_neither_ground_gets_vs_codes_defaults() {
+        let dark = convert(r##"{ "name": "D", "type": "dark" }"##, "x", None).unwrap();
+        assert_eq!(dark.colors["bg"], "#1e1e1e");
+        assert_eq!(dark.colors["fg"], "#bbbbbb");
+        let light = convert(r##"{ "name": "L", "type": "light" }"##, "x", None).unwrap();
+        assert_eq!(light.colors["bg"], "#ffffff");
+        assert_eq!(light.colors["fg"], "#000000");
+    }
+
     #[test]
     fn polarity_falls_back_to_the_background() {
         let dark = r##"{ "name": "D", "colors": { "editor.background": "#101014" } }"##;
@@ -956,27 +1138,77 @@ mod tests {
         );
     }
 
-    /// A prefix match must beat the weak under-the-candidate rule regardless of file order,
-    /// or a theme that names both would answer with the language-specific one.
+    /// **A deeper match wins, whichever direction it lies in**, and this test used to assert the
+    /// opposite.
+    ///
+    /// It was written when a prefix match scored a flat 100 and anything narrower a flat 10, and
+    /// it pinned that: `entity.name` beat `entity.name.function.js` for the function question.
+    /// That ordering is what made Min Dark's JSON keys blue — the theme says `support` and
+    /// `support.type.property-name.json`, and the broad rule won. Depth is the better signal in
+    /// both cases: a theme that qualifies a scope by language is still telling us what it thinks
+    /// that family looks like, and it is telling us more precisely than a one-segment rule three
+    /// levels above it.
     #[test]
-    fn a_prefix_match_beats_weak_evidence() {
+    fn the_deeper_of_two_matching_rules_wins() {
         let theme = r##"{ "name": "T", "tokenColors": [
             { "scope": "entity.name.function.js", "settings": { "foreground": "#111111" } },
             { "scope": "entity.name", "settings": { "foreground": "#222222" } }
         ] }"##;
         assert_eq!(
             convert(theme, "x", None).unwrap().colors["function"],
-            "#222222"
+            "#111111"
         );
     }
 
     #[test]
     fn an_exclusion_selector_answers_nothing() {
-        assert_eq!(score("-comment", "comment"), None);
+        assert_eq!(score("-comment", "comment", true), None);
+        // A descendant selector is judged on its last component, which is the element it matches.
+        // `entity.name` is a two-segment prefix of the candidate: 2 shared, +2 for a prefix.
         assert_eq!(
-            score("meta.function entity.name", "entity.name.function"),
-            Some(120)
+            score("meta.function entity.name", "entity.name.function", true),
+            Some(22)
         );
+    }
+
+    /// **Depth beats direction.** A theme naming both a broad scope and a qualified one under it
+    /// must answer with the qualified one, which is what VS Code applies to the token.
+    ///
+    /// Min Dark says `support` → `#79b8ff` and `support.type.property-name.json` → `#f8f8f8`, and
+    /// the old scoring — a flat 100 for any prefix against a flat 10 for anything narrower —
+    /// picked `support`. JSON keys came out blue where the theme paints them white.
+    #[test]
+    fn a_deeper_match_beats_a_shallower_one_in_either_direction() {
+        let broad = score("support", "support.type.property-name", true).expect("prefix");
+        let deep = score(
+            "support.type.property-name.json",
+            "support.type.property-name",
+            true,
+        )
+        .expect("weak");
+        assert!(deep > broad, "{deep} should beat {broad}");
+
+        // At equal depth, direction still decides: exact, then prefix, then narrower.
+        let exact = score("entity.name.function", "entity.name.function", true).expect("exact");
+        let narrower =
+            score("entity.name.function.macro", "entity.name.function", true).expect("weak");
+        assert!(exact > narrower);
+    }
+
+    /// Punctuation refuses the narrower-sibling rule, and that is what keeps a theme's commas
+    /// from being painted its keyword colour. See `NO_WEAK_EVIDENCE`.
+    #[test]
+    fn a_narrow_punctuation_rule_is_not_evidence_about_all_punctuation() {
+        assert_eq!(
+            score(
+                "punctuation.separator.key-value",
+                "punctuation.separator",
+                false
+            ),
+            None
+        );
+        // The same shape under a name family *is* evidence, which is why the flag is per role.
+        assert!(score("entity.name.function.js", "entity.name.function", true).is_some());
     }
 
     /// Build a `.vsix` in memory: a ZIP with `extension/` at its root.
@@ -1116,6 +1348,44 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// **The common way to reach that error is a perfectly good extension that is not a theme.**
+    ///
+    /// `cpptools-linux-x64.vsix` — Microsoft's C/C++ extension, 137 MB, contributing languages,
+    /// debuggers and semantic tokens and no themes at all — is the file that prompted this. The
+    /// message has to say what the file *is*, or refusing it reads as cide failing rather than as
+    /// the wrong file being chosen.
+    #[test]
+    fn a_non_theme_extension_is_named_in_its_refusal() {
+        let dir = tempdir();
+        let path = dir.join("cpptools-linux-x64.vsix");
+        std::fs::write(
+            &path,
+            vsix(&[(
+                "extension/package.json",
+                r##"{ "name": "cpptools", "displayName": "C/C++",
+                      "contributes": { "languages": [], "debuggers": [] } }"##,
+            )]),
+        )
+        .expect("write");
+
+        let said = import(&path).expect_err("no themes").to_string();
+        assert!(said.contains("C/C++"), "{said}");
+        assert!(said.contains("not a theme"), "{said}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A huge file that is not an archive fails with a sentence rather than by being read whole.
+    #[test]
+    fn something_far_too_large_to_be_a_theme_is_refused_by_size() {
+        let dir = tempdir();
+        let path = dir.join("enormous.json");
+        std::fs::write(&path, vec![b' '; (MAX_THEME_BYTES + 1) as usize]).expect("write");
+
+        let said = import(&path).expect_err("too large").to_string();
+        assert!(said.contains("too large to be a colour theme"), "{said}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// **Against a package the reader supplies**, because everything above builds its own archive
     /// with stored entries and therefore never inflates a byte.
     ///
@@ -1129,6 +1399,14 @@ mod tests {
     #[test]
     #[ignore = "needs a .vsix on disk; set CIDE_VSIX"]
     fn a_real_package_imports() {
+        if std::env::var_os("CIDE_VSIX_EXPECT_REFUSAL").is_some() {
+            let path = std::env::var_os("CIDE_VSIX").expect("set CIDE_VSIX");
+            let said = import(std::path::Path::new(&path))
+                .expect_err("expected a refusal")
+                .to_string();
+            println!("refused: {said}");
+            return;
+        }
         let Some(path) = std::env::var_os("CIDE_VSIX") else {
             panic!("set CIDE_VSIX to a .vsix file");
         };
@@ -1145,9 +1423,40 @@ mod tests {
                 scheme.colors["string"],
                 scheme.colors["number"],
             );
+            println!(
+                "  {:<22} sel={} ({:.0} from the background)",
+                "",
+                scheme.colors["sel"],
+                cide_ipc::theme::distance(&scheme.colors["sel"], &scheme.colors["bg"])
+                    .unwrap_or_default()
+            );
             for role in roles() {
                 assert!(scheme.colors.contains_key(role), "{role} missing");
             }
+            // The whole table, because "some colours are missing" is a report about the *set* of
+            // distinct values and cannot be judged from a handful of them.
+            let mut by_colour: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+            for role in roles() {
+                by_colour
+                    .entry(scheme.colors[role].as_str())
+                    .or_default()
+                    .push(role);
+            }
+            println!(
+                "  {} distinct colours over {} roles",
+                by_colour.len(),
+                roles().len()
+            );
+            for (colour, group) in &by_colour {
+                println!("    {colour}  {}", group.join(", "));
+            }
+            let apart = cide_ipc::theme::distance(&scheme.colors["sel"], &scheme.colors["bg"])
+                .expect("hex");
+            assert!(
+                apart >= cide_ipc::theme::MIN_SELECTION_DISTANCE,
+                "{}: the selection is only {apart:.0} from the background",
+                scheme.name
+            );
         }
     }
 

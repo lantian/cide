@@ -352,6 +352,20 @@ pub struct FileDiff {
     /// symlink or a deletion. The UI hides the per-hunk affordances rather than offering a
     /// control that will be refused.
     pub partial_ok: bool,
+    /// The old side's full text, lossily UTF-8 decoded, for whole-file rendering. `None`
+    /// when the side does not exist (an addition), when the file is binary, a submodule or
+    /// a typechange, or when a side exceeded the byte cap (`texts_omitted` tells those
+    /// apart). Display-only: staging and selections never read it — `hunks` and `rev` stay
+    /// the authoritative patch, at git's default three context lines, because that is the
+    /// exact byte stream `rev` hashes and staging re-derives.
+    pub old_text: Option<String>,
+    /// The new side's full text. Same rules. The UI rebuilds the whole file from this plus
+    /// `hunks`; hunk content stays the authoritative source for changed rows.
+    pub new_text: Option<String>,
+    /// True when an existing side exceeded the byte cap and both texts were therefore
+    /// withheld. The texts are never truncated instead: a truncated text cannot number the
+    /// lines below the cut, and a wrong line number under a tick box is a mis-staged line.
+    pub texts_omitted: bool,
 }
 
 // --- selections -------------------------------------------------------------------------
@@ -890,6 +904,50 @@ impl FetchOutcome {
             conflicts: Vec::new(),
         }
     }
+}
+
+/// What `git merge <name>` did — the branch picker's *Merge into current branch*.
+///
+/// Its own type rather than a reuse of [`FetchOutcome`], and the difference is honesty, not
+/// taste: that struct's transport half (`remote`, `shelled_out`, `output`) and strategy ladder
+/// (`strategy`, `rewritten`, `skipped`) are all lies for a merge that never touches the
+/// network — reusing it would smuggle a branch name through a field documented as a remote.
+/// `FetchOutcome::strategy`'s comment defends fetch and pull sharing one shape because one
+/// frontend function turns both into sentences; a merge's sentences name the *source branch*,
+/// which is a different set, so the honest shape is a different type with `branchModel`'s
+/// `mergeNote` as its one sentence function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MergeOutcome {
+    /// The ref merged in, exactly as the user picked it: `feature` or `origin/feature`.
+    pub source: String,
+    /// The branch merged into — the one that was checked out.
+    pub branch: String,
+    /// The branch simply moved forward; no merge commit exists.
+    pub fast_forward: bool,
+    /// Where the branch was before, short. Equal to `new_oid` when the branch already
+    /// contained the source — and when conflicts landed, because a conflicted merge has not
+    /// moved `HEAD` yet.
+    pub old_oid: String,
+    pub new_oid: String,
+    /// Commits the merge takes: reachable from the source, hidden behind the pre-merge tip.
+    /// Non-zero even when conflicts landed — the merge still brings them in once concluded.
+    pub advanced: u32,
+    /// `git diff --shortstat` between the two tips. Zeros while conflicts are pending, which
+    /// is the honest answer: nothing is different about the tree *yet*.
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+    /// The commits taken, newest first, **capped in Rust** — same cap, same wire argument,
+    /// as [`FetchOutcome::commits`].
+    pub commits: Vec<PulledCommit>,
+    /// How many more there were beyond `commits`. Zero when the list is complete.
+    pub more_commits: u32,
+    /// Paths left conflicted. **Non-empty is not a failure** — the same contract as
+    /// [`FetchOutcome::conflicts`]: real `MERGE_HEAD` state is on disk and the resolver
+    /// takes over.
+    pub conflicts: Vec<String>,
 }
 
 // --- shelf and stash --------------------------------------------------------------------

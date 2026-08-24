@@ -258,6 +258,89 @@ fn a_binary_file_is_flagged_and_has_no_hunks() {
     assert!(diff.binary);
     assert!(diff.hunks.is_empty(), "there is nothing to render as lines");
     assert_eq!(diff.status, FileState::Modified);
+    assert_eq!(diff.old_text, None, "binary content is not a text to carry");
+    assert_eq!(diff.new_text, None);
+    assert!(
+        !diff.texts_omitted,
+        "skipped is not the same claim as capped"
+    );
+}
+
+// --- the whole-file texts the diff carries ----------------------------------------------------
+
+/// Which blob each side's text comes from, against `git show`'s answer for the same names.
+#[test]
+fn whole_file_texts_match_git_show_on_both_sides() {
+    let repo = history("texts");
+    let diff = revision::revision_diff(
+        &repo.root,
+        "src.txt",
+        &commit(&repo, "HEAD"),
+        &RevSide::FirstParent,
+    )
+    .expect("revision diff");
+
+    assert_eq!(
+        diff.old_text.as_deref(),
+        Some(repo.git(&["show", "HEAD~1:src.txt"]).as_str())
+    );
+    assert_eq!(
+        diff.new_text.as_deref(),
+        Some(repo.git(&["show", "HEAD:src.txt"]).as_str())
+    );
+    assert!(!diff.texts_omitted);
+}
+
+#[test]
+fn a_working_tree_new_side_reads_the_disk() {
+    let repo = history("texts-workdir");
+    let on_disk = b"one\nTWO\nthree\nfour\nfive\nSIX\nseven\nUNSAVED\n";
+    repo.write("src.txt", on_disk);
+    let diff = revision::revision_diff(
+        &repo.root,
+        "src.txt",
+        &RevSide::WorkingTree,
+        &commit(&repo, "HEAD"),
+    )
+    .expect("revision diff");
+
+    assert_eq!(
+        diff.new_text.as_deref().map(str::as_bytes),
+        Some(on_disk.as_slice()),
+        "the working tree side is the file as it is, unsaved edit included"
+    );
+    assert_eq!(
+        diff.old_text.as_deref(),
+        Some(repo.git(&["show", "HEAD:src.txt"]).as_str())
+    );
+}
+
+/// A rename's old text lives under the old name, and reading it under the new one would come
+/// back `Missing` — so this is the test that the old side honours `old_path`.
+#[test]
+fn a_renames_old_text_is_read_at_the_old_path() {
+    let repo = TempRepo::new("texts-rename");
+    repo.write("old.txt", b"alpha\nbravo\ncharlie\ndelta\necho\n");
+    repo.commit_all("first");
+    repo.git(&["mv", "old.txt", "new.txt"]);
+    repo.write("new.txt", b"alpha\nBRAVO\ncharlie\ndelta\necho\n");
+    repo.commit_all("rename and edit");
+
+    let diff = revision::revision_diff(
+        &repo.root,
+        "new.txt",
+        &commit(&repo, "HEAD"),
+        &RevSide::FirstParent,
+    )
+    .expect("revision diff");
+    assert_eq!(
+        diff.old_text.as_deref(),
+        Some(repo.git(&["show", "HEAD~1:old.txt"]).as_str())
+    );
+    assert_eq!(
+        diff.new_text.as_deref(),
+        Some(repo.git(&["show", "HEAD:new.txt"]).as_str())
+    );
 }
 
 #[test]

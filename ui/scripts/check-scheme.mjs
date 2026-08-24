@@ -54,17 +54,71 @@ const eq = (actual, expected, what) => {
 const ok = (actual, what) => eq(actual === true, true, what)
 
 /**
- * The floor a role's colour must clear against its own scheme's background.
+ * The floor a token role must clear — against the buffer's background **and** against its
+ * selection.
  *
- * **2.5 and not 3.** `check-theme.mjs` holds the terminal's ink to 3:1 and is right to — a
- * program printing in colour 4 has no say in the matter. A syntax role is a different question:
- * a comment is *deliberately* quiet, `--tk-comment` is the dark theme's `#5c5c66` at 2.76:1, and
- * raising the floor above that would either fail the palette the app has shipped since M3 or
- * force a comment to shout. The number that is worth enforcing is the one that catches a colour
- * which is not there at all — a scheme naming its background as a foreground, which a sparse
- * imported theme plus a bad fallback chain could produce.
+ * # The selection is the half this file did not check, and it was hiding a real bug
+ *
+ * The first version measured ink against `--tk-bg` only, and the report that followed was *"when
+ * I select the code in dark theme I don't see the text"*. It was true and it was worse than it
+ * sounds: the dark selection sat 1.60:1 above the background, so it raised the floor under every
+ * ink at once, and comments landed at **1.73:1** — invisible — with punctuation at 3.09:1.
+ *
+ * A selection is a *ground*. Checking ink against one ground and then painting it on another is
+ * not a weaker check, it is a check of the wrong thing, and the palette had shipped that way
+ * since M3 with a comment in `EditorSurface.module.css` asserting a 4.45:1 worst case that had
+ * been measured against `--panel` and was never true of the pair.
+ *
+ * # 3.0, and the carve-out that used to be here is gone
+ *
+ * This was 2.5, argued as "a comment is deliberately quiet and `#5c5c66` is 2.76:1". That was
+ * true and it was the wrong conclusion: 2.76:1 was already marginal, and it was the reason the
+ * selection could not be fixed by darkening the selection alone. Both moved, the palette now
+ * clears 3.0 on both grounds in both themes, and the exemption stopped being a decision.
+ *
+ * 3.0 is `check-theme.mjs`'s `TERMINAL_MIN_CONTRAST`, deliberately: it is the same question about
+ * the same kind of thing, and two floors would be two numbers to argue about.
  */
-const INK_FLOOR = 2.5
+const INK_FLOOR = 3
+
+/**
+ * The share of its unselected contrast an ink must keep when it is selected.
+ *
+ * **This is the assertion that actually prevents the bug, and the absolute floor above is the
+ * backstop.** A floor asks "is this pair legible"; this asks "does selecting cost anything", and
+ * only the second one scales — the palette can be retuned freely as long as the selection stays
+ * out of the way, and no future colour can be quietly ruined by the ground it lands on.
+ *
+ * It exists because an absolute floor was tried first and was not enough. The dark selection was
+ * darkened from the chrome's `#2b3a55` to `#132a4d`, ink cleared 3:1, this gate went green — and
+ * the report came back, because 3:1 is the WCAG floor for *large* text and the buffer is 12.5px.
+ * Chasing a higher absolute floor is unbounded: contrast against a selection is
+ * `(ink + 0.05) / (selection + 0.05)`, so the selection's luminance taxes every ink at once, and
+ * a palette whose quietest ink is 3.84:1 unselected cannot reach 4.5:1 on *any* selection —
+ * against a pure black one it tops out at 4.42:1.
+ *
+ * The way out is a selection that carries no luminance, only chroma, which is what
+ * `--tk-sel: #0a1450` is. Then the question stops being "how much does the selection cost" and
+ * becomes "nothing", and this ratio is how that is stated.
+ *
+ * 0.80 rather than the 0.94 the dark palette achieves: the light theme's warm `#ffe7d9` sits at
+ * 0.84 and is fine at it — every light ink clears 4.18:1 on it — because losing a sixth of a
+ * large ratio is not the same as losing a sixth of a small one. The threshold is set where it
+ * fails every state known to be bad (the shipped bug scored 0.63, the insufficient fix 0.79) and
+ * passes both palettes as they stand.
+ */
+const SELECTION_KEEP = 0.8
+
+/**
+ * The floor for the gutter's line numbers, which are ink but are not a token role.
+ *
+ * Lower on purpose, and measured against the background only. A line number is furniture: it is
+ * never drawn on a selection — `.cm-activeLineGutter` grounds the caret's row on `--tk-sel` but
+ * colours the number `--dim`, not `--tk-gutter` — and brighter numbers compete with the code they
+ * are numbering. Its own floor rather than an exemption inside the loop, because an exemption is
+ * a hole and a named number is a decision.
+ */
+const GUTTER_FLOOR = 2.5
 
 try {
   execFileSync(
@@ -128,10 +182,22 @@ try {
   for (const prop of tokenProps) {
     ok(highlightReads.has(prop), `highlight.css paints ${prop}`)
   }
+  /*
+   * The three surface roles `highlight.css` owns, and the third one is there for a reason worth
+   * pinning. `--tk-sel` cannot live in a CSS module: `@codemirror/view`'s base theme claims the
+   * selection at specificity (0,6,0) and a module's hashed `.body` prefix cannot reach that, so
+   * the rule that used to sit in `EditorSurface.module.css` was silently inert and the editor
+   * painted CodeMirror's light-mode lavender. Moving it back would restore that bug with nothing
+   * failing, which is exactly what this list is for.
+   */
   eq(
     [...highlightReads].filter((p) => !tokenProps.has(p)).sort(),
-    ['--tk-bg', '--tk-fg'],
-    'highlight.css reads exactly the token roles plus the buffer’s own ground and ink',
+    ['--tk-bg', '--tk-fg', '--tk-sel'],
+    'highlight.css reads exactly the token roles plus the ground, the ink and the selection',
+  )
+  ok(
+    /html:root[^{]*\.cm-selectionBackground/.test(highlightCss),
+    'the selection rule out-specifies `@codemirror/view`’s own (0,6,0) base-theme rule',
   )
   eq(
     [...highlightCss.matchAll(/\.(cide-tk-[a-z]+)\s*\{/g)].map((m) => m[1]).length,
@@ -235,14 +301,67 @@ try {
   // --- 3. the compiled-in scheme is legible against its own ground --------------------------
 
   for (const theme of ['light', 'dark']) {
-    const ground = palettes[theme]['--tk-bg']
-    const dim = []
+    /*
+     * **Both grounds.** A token is painted on the background most of the time and on the
+     * selection whenever the user drags across it, and the second is the one that was never
+     * checked — see `INK_FLOOR`. The active line needs no third pass: it is a fraction of the
+     * selection composited over one of these two, so it lies between them.
+     */
+    for (const [ground, what] of [
+      [palettes[theme]['--tk-bg'], 'its own background'],
+      [palettes[theme]['--tk-sel'], 'a selection'],
+    ]) {
+      const dim = []
+      for (const role of SCHEME_TOKENS) {
+        const value = palettes[theme][propertyFor(role)]
+        const ratio = contrast(value, ground)
+        if (ratio !== null && ratio < INK_FLOOR) dim.push(`${role}=${value} ${ratio.toFixed(2)}:1`)
+      }
+      eq(dim, [], `every ${theme} role clears ${INK_FLOOR}:1 on ${what} (${ground})`)
+    }
+
+    /*
+     * And selecting must not *cost* an ink its legibility — see `SELECTION_KEEP`. This is the
+     * claim that survives a retune of the palette; the two floors above are the backstop.
+     */
+    const bg = palettes[theme]['--tk-bg']
+    const sel = palettes[theme]['--tk-sel']
+    const lost = []
     for (const role of SCHEME_TOKENS) {
       const value = palettes[theme][propertyFor(role)]
-      const ratio = contrast(value, ground)
-      if (ratio !== null && ratio < INK_FLOOR) dim.push(`${role}=${value} ${ratio.toFixed(2)}:1`)
+      const onBg = contrast(value, bg)
+      const onSel = contrast(value, sel)
+      if (onBg === null || onSel === null) continue
+      const kept = onSel / onBg
+      if (kept < SELECTION_KEEP) {
+        lost.push(`${role}=${value} keeps ${(kept * 100).toFixed(0)}%`)
+      }
     }
-    eq(dim, [], `every ${theme} role clears ${INK_FLOOR}:1 on its own background`)
+    eq(
+      lost,
+      [],
+      `${theme}: selecting costs no role more than ${((1 - SELECTION_KEEP) * 100).toFixed(0)}% ` +
+        `of its contrast (selection ${sel} is ${contrast(sel, bg)?.toFixed(2)}:1 off the background)`,
+    )
+
+    /*
+     * And the selection is a ground rather than a repaint: too close to the background and
+     * dragging across a region does nothing visible. Measured with `apart` and not `contrast`,
+     * because the fix for the bug above was to make the selection *darker* — it is legible as a
+     * selection through chroma, and a luminance ratio would have rated the fix as a regression.
+     */
+    const separation = apart(palettes[theme]['--tk-sel'], palettes[theme]['--tk-bg'])
+    ok(
+      separation !== null && separation > 60,
+      `${theme}: the selection is distinguishable from the background (${separation?.toFixed(0)})`,
+    )
+
+    const gutter = palettes[theme]['--tk-gutter']
+    const gutterRatio = contrast(gutter, palettes[theme]['--tk-bg'])
+    ok(
+      gutterRatio !== null && gutterRatio >= GUTTER_FLOOR,
+      `${theme}: line numbers clear ${GUTTER_FLOOR}:1 (${gutterRatio?.toFixed(2)})`,
+    )
   }
   /*
    * And the ground is not the ink. Measured separately from the loop because it is a different
@@ -354,7 +473,53 @@ try {
   eq(rows.length, 2, 'only schemes of the theme on screen are offered')
   eq(rows[1]?.value, 'night', 'and it is the matching one')
 
-  // --- 7. something actually calls it ------------------------------------------------------
+  // --- 7. the error path, which is the one nobody looks at ---------------------------------
+
+  /*
+   * `CoreError` is a tagged enum, so a rejected `invoke` arrives as `{ kind, detail }` and
+   * `String()` of it is `"[object Object]"` — which is what the import failure showed. The
+   * sentence Rust composed, naming the file and what was looked for inside it, reached nobody.
+   *
+   * Pinned here because a failure path is only ever seen by the person it is failing, so nothing
+   * about the happy path can catch it going wrong again.
+   */
+  execFileSync(
+    'node',
+    [
+      'node_modules/typescript/bin/tsc',
+      'src/ipc/errorText.ts',
+      '--outDir', out,
+      '--module', 'esnext',
+      '--target', 'es2022',
+      '--moduleResolution', 'bundler',
+      '--strict',
+      '--noUncheckedIndexedAccess',
+    ],
+    { stdio: 'inherit' },
+  )
+  const { errorText } = await import(`file://${join(out, 'errorText.js')}`)
+
+  eq(
+    errorText({ kind: 'serde', detail: 'x.vsix contains no colour themes — C/C++ is …' }),
+    'x.vsix contains no colour themes — C/C++ is …',
+    'a tagged CoreError shows the sentence Rust wrote, not [object Object]',
+  )
+  eq(errorText({ kind: 'tabPinned' }), 'tabPinned', 'a payload-free tag shows its name')
+  eq(errorText('plain'), 'plain', 'a string passes through')
+  eq(errorText(new Error('boom')), 'boom', 'an Error shows its message')
+  eq(errorText(null), 'null', 'and anything else is still something')
+  ok(
+    !/\[object Object\]/.test(errorText({ kind: 'io', detail: 'nope' })),
+    'no rejected command can reach a user as [object Object]',
+  )
+
+  for (const surface of ['src/settings/ColorSchemeRow.tsx', 'src/settings/KeymapSection.tsx']) {
+    const text = readFileSync(surface, 'utf8')
+    ok(!/String\(e\)/.test(text), `${surface} does not stringify a rejection with String()`)
+    ok(/errorText\(/.test(text), `${surface} renders a rejection through errorText`)
+  }
+
+  // --- 8. something actually calls it ------------------------------------------------------
 
   /*
    * The failure this catches is the whole feature being inert: every assertion above can pass
@@ -373,6 +538,25 @@ try {
     /schemeIsPainted\(/.test(useSettings),
     'and the repaint guard is the checked one, not an inline `theme:id` comparison',
   )
+
+  /*
+   * **Every surface that mounts CodeMirror must tell it which polarity it is drawing in.**
+   *
+   * Nothing did, so every editor in the app was a light-mode CodeMirror — and its base theme is
+   * written in terms of generated `&light`/`&dark` classes across view, autocomplete, lint,
+   * search and merge. Most of it was masked by our own stylesheets; the selection was not, and it
+   * shipped as a lavender block with the text invisible on it. A fourth surface added without
+   * this line would reintroduce the whole family, and nothing else here would notice.
+   */
+  for (const surface of [
+    'src/editor/EditorSurface.tsx',
+    'src/panes/DiffPane.tsx',
+    'src/panes/MergePane.tsx',
+  ]) {
+    const text = readFileSync(surface, 'utf8')
+    ok(/polarityExtension\(/.test(text), `${surface} tells CodeMirror its polarity`)
+    ok(/watchPolarity\(/.test(text), `${surface} keeps that polarity in step with the theme`)
+  }
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s) out of ${checks} checks`)
@@ -452,6 +636,39 @@ function resolve(rules, theme, props) {
   for (const rule of rules) if (base(rule.selector)) apply(rule)
   for (const rule of rules) if (named(rule.selector).includes(theme)) apply(rule)
   return values
+}
+
+/**
+ * How far apart two colours *look*, or `null` when either is not a hex colour.
+ *
+ * Thiadmer Riemersma's redmean weighted RGB distance, the same one `check-theme.mjs` uses for the
+ * notice edges and copied here for that file's stated reason — these scripts are standalone and a
+ * shared module between them is one more thing that has to be right for either to run.
+ *
+ * **Not `contrast`, and the distinction is what makes the selection assertion correct.** WCAG
+ * contrast is a ratio of luminance, which asks whether ink can be read on a ground. Whether a
+ * *fill* is visible is a different question, and the answer to the selection bug was to lower the
+ * selection's luminance and let its chroma carry it — which a contrast ratio would have scored as
+ * the selection getting worse.
+ */
+function apart(a, b) {
+  const x = rgb(a)
+  const y = rgb(b)
+  if (x === null || y === null) return null
+  const mean = (x[0] + y[0]) / 2
+  const [dr, dg, db] = [x[0] - y[0], x[1] - y[1], x[2] - y[2]]
+  return Math.sqrt((2 + mean / 256) * dr * dr + 4 * dg * dg + (2 + (255 - mean) / 256) * db * db)
+}
+
+/** The three channels of a hex colour as 0…255, or `null` for anything that is not one. */
+function rgb(colour) {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec((colour ?? '').trim())
+  if (!hex) return null
+  const digits =
+    hex[1].length === 3
+      ? [...hex[1]].map((c) => c + c)
+      : [hex[1].slice(0, 2), hex[1].slice(2, 4), hex[1].slice(4, 6)]
+  return digits.map((d) => parseInt(d, 16))
 }
 
 /** WCAG contrast between two hex colours, or `null` when either is not one. */

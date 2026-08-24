@@ -42,6 +42,7 @@ import {
   rectangularSelection,
 } from '@codemirror/view'
 import { cideHighlightStyle } from './highlight'
+import { polarityExtension, polaritySlot, watchPolarity } from './cmPolarity'
 import { useCodeMenu } from './codeMenu'
 import { lineEditKeymap } from './editorKeys'
 import { findExtensions } from './find'
@@ -691,6 +692,16 @@ export function EditorSurface({
      * come back with the column still on.
      */
     const blameSlot = new Compartment()
+    /*
+     * Which polarity CodeMirror thinks it is drawing in. (M24)
+     *
+     * Not cosmetic and not optional: without it every editor is a *light-mode* CodeMirror, and
+     * its base theme's `&light` rules — forty of them across view, autocomplete, lint, search and
+     * merge — win over ours wherever they are more specific. `cmPolarity.ts` has the whole story,
+     * including the one that shipped: a light-lavender selection under the dark theme, at 1.02:1
+     * against `--tk-fg`.
+     */
+    const polarity = polaritySlot()
     let baseline: EditorState['doc'] | null = null
     /*
      * The status bar's line, claimed once the view exists further down — the update
@@ -875,6 +886,14 @@ export function EditorSurface({
        * regression a reader cannot see in a diff; `check:blame` pins it.
        */
       blameSlot.of(blameOnRef.current === true ? blameExt : []),
+      /*
+       * Which polarity CodeMirror thinks it is drawing in — see the `polarity` declaration above
+       * and `cmPolarity.ts`. Deliberately *after* the blame slot: this contributes no gutter, but
+       * `check:blame` pins that `blameSlot` is the first entry of this array because gutters are
+       * laid out in extension order, and putting anything above it moves the annotation column to
+       * the wrong side of the line numbers.
+       */
+      polarityExtension(polarity),
       lineNumbers(),
       highlightActiveLineGutter(),
       highlightActiveLine(),
@@ -1216,6 +1235,7 @@ export function EditorSurface({
     }
     baseline = view.state.doc
     viewRef.current = view
+    const stopPolarity = watchPolarity(view, polarity)
     lintSlotRef.current = lintSlot
     blameSlotRef.current = blameSlot
     /*
@@ -1584,6 +1604,7 @@ export function EditorSurface({
       if (slotRef.current === readout) slotRef.current = null
       // Before `destroy`, so a request racing the unmount cannot dispatch into a dead view.
       stopReveal()
+      stopPolarity()
       view.destroy()
     }
     // Rebuilt only on a different file or an explicit reload. `doc` is intentionally absent:

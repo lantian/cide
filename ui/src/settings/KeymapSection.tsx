@@ -47,6 +47,7 @@ import {
   stopRecording,
   useRecorder,
 } from '@/keys/recorderStore'
+import { errorText } from '@/ipc/errorText'
 import { useWorkspace } from '@/store/workspace'
 import {
   bareKeyWarning,
@@ -110,7 +111,7 @@ export function KeymapSection() {
         if (!cancelled) setReport(next)
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(String(e))
+        if (!cancelled) setError(errorText(e))
       })
     return () => {
       cancelled = true
@@ -137,7 +138,7 @@ export function KeymapSection() {
     } catch (e: unknown) {
       // Shown rather than logged: the one refusal this command makes is "your keymap.json does
       // not parse, so it will not be rewritten", which is a sentence the user has to read.
-      setError(String(e))
+      setError(errorText(e))
     }
   }, [])
 

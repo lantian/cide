@@ -323,18 +323,64 @@
 }
 
 /*
- * Side by side. One grid row, two halves, one scroller — see `splitHunk` in the `.tsx` for
- * why that is the design rather than two editors kept in step by a scroll listener.
+ * Side by side: two independently scrolling columns.
  *
  * `minmax(0, 1fr)` twice, not `1fr 1fr`: a grid track's default minimum is `auto`, which is
  * the content's min-content width, so one long unbreakable line — a minified bundle, a base64
  * blob — would push its column past half the pane and shove the other side off screen. With a
- * zero minimum the halves stay even and the line wraps inside its own cell.
+ * zero minimum the columns stay even and the line wraps inside its own cell.
  */
-.splitRow {
+.splitBody {
+  flex: 1;
+  min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  align-items: stretch;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  /* The app root sets `user-select: none`; a diff is text people copy out of. */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/*
+ * One column, one scroller. `position: relative` is load-bearing, not cosmetic: the sync
+ * effect reads each row's `offsetTop`, and a positioned scroller makes that number
+ * scroller-relative — remove it and every measured anchor is off by the column's own offset
+ * in the pane. `overflow-x: hidden` because rows wrap (`.text` is `pre-wrap`); there is no
+ * horizontal scroll to synchronize, and that is a sentence the sync effect relies on.
+ */
+.column {
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+}
+
+/*
+ * One visible scrollbar, IDEA-style. The columns are different heights now, and two
+ * scrollbars sitting at two different fractions read as two documents rather than one diff.
+ * The left column still scrolls — wheel and keyboard work; the sync keeps the pair honest —
+ * it just does not draw the widget. Both spellings, same rule as `user-select`.
+ */
+.column[data-side='old'] {
+  scrollbar-width: none;
+  /* The seam. On the left column only, so it does not double up at the pane's right edge. */
+  border-right: 1px solid var(--border-soft);
+}
+
+.column[data-side='old']::-webkit-scrollbar {
+  display: none;
+}
+
+/*
+ * The rows' direct parent, and the node the sync effect's ResizeObserver watches: the
+ * column's own box never changes when content grows — a blame lands, a fold opens — so
+ * observing the column would miss exactly the changes that move every anchor.
+ */
+.columnContent {
+  display: flex;
+  flex-direction: column;
 }
 
 .half {
@@ -346,43 +392,104 @@
 }
 
 /*
- * The same four lists for a split half. Both halves get the blame track even though only the
- * right one is annotated — the left draws `.blameGap` into it — because the two are separate
- * grids and a track present in one and absent in the other slides the old side's code out of
- * line with the new side's for every row of the diff.
+ * The same conditional column lists for a split row, scoped to the column now. Four rules
+ * are written and the left column only ever uses the first two: it is never blamed
+ * (`data-blamed` is hard-coded `'false'` on it — annotating the old side needs a second
+ * blame at the other revision, see `cell()`), and with the columns independently laid out
+ * there is nothing a missing track could push out of alignment any more.
  */
-.lines[data-boxed='false'] .half {
+.column[data-boxed='false'] .half {
   grid-template-columns: 5ch 2ch minmax(0, 1fr);
 }
 
-.lines[data-blamed='true'] .half {
+.column[data-blamed='true'] .half {
   grid-template-columns: 16px var(--blame-col) 5ch 2ch minmax(0, 1fr);
 }
 
-.lines[data-boxed='false'][data-blamed='true'] .half {
+.column[data-boxed='false'][data-blamed='true'] .half {
   grid-template-columns: var(--blame-col) 5ch 2ch minmax(0, 1fr);
 }
 
-/* The seam. On the left cell only, so it does not double up at the pane's right edge. */
-.splitRow > .half:first-child {
-  border-right: 1px solid var(--border-soft);
+/*
+ * Where the other column has a block and this one has nothing: a thin line between two
+ * rows, IDEA's gesture, in place of the hatched filler cells this layout used to draw.
+ *
+ * A dedicated zero-height in-flow element rather than a border on the following row, for
+ * three reasons that all bit during design: a border adds 2px of layout height and shifts
+ * every measured scroll anchor below it; "the following row" does not exist for an
+ * insertion at end of file; and a countable element is what the render check reads. The
+ * `::before` overdraws 1px into each neighbour instead of taking layout space.
+ */
+.insertMark {
+  position: relative;
+  height: 0;
+  overflow: visible;
+  z-index: 1;
+}
+
+.insertMark::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -1px;
+  height: 2px;
+  pointer-events: none;
+}
+
+.insertMark[data-tone='add']::before {
+  background: var(--green);
+}
+
+.insertMark[data-tone='del']::before {
+  background: var(--red);
 }
 
 /*
- * A row where only one side has a line: the other half is blank.
- *
- * Faintly hatched rather than left empty, because an empty cell next to an addition reads as
- * "the old file had a blank line here", which is a different fact from "the old file had
- * nothing here". The stripes are `--border-soft` on the panel, so they are visible without
- * competing with the add/remove tint opposite them.
+ * The slim per-hunk strip of the non-sticky layouts — the whole-file unified view and the
+ * split columns. Not `position: sticky`: the split's scroll anchors are measured off row
+ * tops, and a stuck bar's painted position lying about its layout position is exactly the
+ * kind of quiet disagreement the one-scroller design was originally keeping out.
  */
-.filler {
-  background: repeating-linear-gradient(
-    135deg,
-    transparent 0 6px,
-    var(--border-soft) 6px 7px
-  );
-  opacity: 0.6;
+.hunkBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--chrome);
+  color: var(--dim);
+}
+
+.hunkFill {
+  flex: 1;
+}
+
+/* A folded gap: full width, quiet, obviously clickable. */
+.fold {
+  display: block;
+  width: 100%;
+  padding: 3px 8px;
+  border: 0;
+  border-top: 1px dashed var(--border-soft);
+  border-bottom: 1px dashed var(--border-soft);
+  background: var(--panel-2);
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  text-align: center;
+  cursor: pointer;
+}
+
+.fold:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--chrome-hi);
+}
+
+.fold:disabled {
+  cursor: default;
 }
 
 .context {
@@ -429,7 +536,8 @@
  * cannot rely on (`drawSelection` puts its rectangles in a z-index -1 layer instead — see
  * `editor/EditorSurface.module.css`), and it is why nothing here needs an alpha.
  */
-.body ::selection {
+.body ::selection,
+.splitBody ::selection {
   background: var(--sel);
 }
 
@@ -499,15 +607,6 @@
    */
   -webkit-user-select: none;
   user-select: none;
-}
-
-/*
- * The old side's spacer, in the split layout. Same track, same hairline, no content — see
- * `cell()`'s `which === 'old'` branch for why the left column is never annotated.
- */
-.blameGap {
-  align-self: stretch;
-  border-right: 1px solid var(--border-soft);
 }
 
 /*

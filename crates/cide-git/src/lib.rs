@@ -61,6 +61,7 @@ pub mod conflict;
 pub mod diff;
 pub mod lanes;
 pub mod log;
+pub mod merge;
 pub mod patch;
 pub mod pull;
 pub mod push;

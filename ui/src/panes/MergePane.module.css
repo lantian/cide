@@ -296,6 +296,45 @@
 }
 
 /*
+ * A block this pane has no lines for: the boundary drawn as a thin line, IDEA's gesture and
+ * the same one the split diff's `.insertMark` makes. (M25)
+ *
+ * A `::before` on the class the line decoration adds, overdrawing 1px into each neighbour —
+ * NO layout height, which is what makes this safe to add to a CodeMirror line: the height
+ * cache and with it the block-anchored scroll sync see nothing. The tones are the pane's
+ * existing two, not a third colour language: red is a conflict nobody has decided, blue a
+ * one-sided change not yet answered, and a settled block draws no marker at all.
+ * `cm-mergeInsertEnd` is an insertion below the last line, which has no following line to
+ * carry a top edge, so the closing line's bottom edge carries it.
+ */
+:global(.cm-mergeInsert) {
+  position: relative;
+}
+
+:global(.cm-mergeInsert)::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -1px;
+  height: 2px;
+  pointer-events: none;
+}
+
+:global(.cm-mergeInsertConflict)::before {
+  background: var(--red);
+}
+
+:global(.cm-mergeInsertPending)::before {
+  background: var(--blue);
+}
+
+:global(.cm-mergeInsertEnd)::before {
+  top: auto;
+  bottom: -1px;
+}
+
+/*
  * The per-conflict chevrons, in the side panes' gutters. (M20)
  *
  * `:global` for the reason the tones above are: CodeMirror writes these onto its own gutter DOM.

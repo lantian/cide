@@ -136,29 +136,41 @@
  * contrast the token below is chosen for. CodeMirror's own base theme reaches the same
  * conclusion with `#cceeff44` (L6934).
  */
-.body :global(.cm-selectionBackground),
-.body :global(.cm-editor .cm-selectionBackground) {
-  background: var(--tk-sel);
-}
-
-.body :global(.cm-content) ::selection {
-  background: var(--tk-sel);
-}
+/*
+ * **The selection's colour is not here any more — it is in `editor/highlight.css`.** (M24)
+ *
+ * These two rules were (0,3,0) and lost to `@codemirror/view`'s own (0,6,0)
+ * `&light.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground`, so a focused
+ * editor painted CodeMirror's light-mode lavender `#d7d4f0` under the dark theme — 1.02:1
+ * against the text. That file carries the whole story and the selectors that win. Do not put a
+ * selection colour back here; a module-hashed `.body` prefix cannot reach the specificity needed,
+ * and it would be silently inert exactly as this was.
+ */
 
 /*
- * The caret's line. The selection colour per the mock, but at 40% and therefore translucent.
+ * The caret's line. The selection colour, translucent.
  *
  * The alpha is what makes the selection visible again, and the *choice of token* is what
- * keeps it undamaged: 40% of the selection composited over the selection is the selection
- * exactly, so a selection crossing the active line is one uniform colour and the worst-case
- * syntax contrast on it is still the 4.45:1 `tokens.css` picked the token for. A neutral wash
- * was the other candidate and loses on precisely that — any tint that is not the selection's
- * own colour shifts it, and at an alpha heavy enough to read as an active line it took
- * `--green` on a selected line down to about 4.0:1.
+ * keeps it undamaged: a fraction of the selection composited over the selection is the
+ * selection **exactly**, at any fraction, so a selection crossing the active line is one
+ * uniform colour and the worst-case syntax contrast on it is the one `tokens.css` chose
+ * `--tk-sel` for. A neutral wash was the other candidate and loses on precisely that — any tint
+ * that is not the selection's own colour shifts it, and at an alpha heavy enough to read as an
+ * active line it took `--green` on a selected line down to about 4.0:1.
  *
  * Off the selection it composites over `--tk-bg` instead and reads as the pale row tint it is
- * meant to be. So the two states differ by 60% of the selection's own strength, which is a
- * step, not a hairline.
+ * meant to be.
+ *
+ * **55%, not the 40% this shipped with (M24).** The fraction is not a design number; it is
+ * whatever makes the composite land where the tint is meant to be, and the dark `--tk-sel` moved
+ * a long way — it is now 1.12:1 against the background where it was 1.60:1 above it, because at
+ * the old value a selection made comments invisible and `tokens.css` argues out the arithmetic.
+ * At 40% of the new token the active line came out 50 redmean units off the background, against
+ * the 52 it used to be, which is a row tint fading out. 55% puts it at 69, and still leaves the
+ * caret's line and a real selection 55 apart, which is what stops the two reading as one state.
+ *
+ * That the invariant above holds at *any* fraction is what made this safe to move: the note used
+ * to say "40%" three times as though the number were load-bearing, and it is not.
  *
  * # This is why a colour scheme has no `line` role (M24)
  *
@@ -171,7 +183,7 @@
  * the app. `cide_core::scheme::SURFACE_KEYS` says the same thing from the other end.
  */
 .body :global(.cm-activeLine) {
-  background: color-mix(in srgb, var(--tk-sel) 40%, transparent);
+  background: color-mix(in srgb, var(--tk-sel) 55%, transparent);
 }
 
 /* --- gutter, 56px and right-aligned ---------------------------------------------------- */

@@ -24,4 +24,24 @@ rev: string,
  * symlink or a deletion. The UI hides the per-hunk affordances rather than offering a
  * control that will be refused.
  */
-partialOk: boolean, };
+partialOk: boolean, 
+/**
+ * The old side's full text, lossily UTF-8 decoded, for whole-file rendering. `None`
+ * when the side does not exist (an addition), when the file is binary, a submodule or
+ * a typechange, or when a side exceeded the byte cap (`texts_omitted` tells those
+ * apart). Display-only: staging and selections never read it — `hunks` and `rev` stay
+ * the authoritative patch, at git's default three context lines, because that is the
+ * exact byte stream `rev` hashes and staging re-derives.
+ */
+oldText: string | null, 
+/**
+ * The new side's full text. Same rules. The UI rebuilds the whole file from this plus
+ * `hunks`; hunk content stays the authoritative source for changed rows.
+ */
+newText: string | null, 
+/**
+ * True when an existing side exceeded the byte cap and both texts were therefore
+ * withheld. The texts are never truncated instead: a truncated text cannot number the
+ * lines below the cut, and a wrong line number under a tick box is a mis-staged line.
+ */
+textsOmitted: boolean, };

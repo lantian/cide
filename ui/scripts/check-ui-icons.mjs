@@ -46,7 +46,9 @@
  *
  * Run: `pnpm --dir ui run check:ui-icons`
  */
-import { readFileSync, readdirSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import ts from 'typescript'
 
@@ -167,7 +169,14 @@ const ALLOWED = [
   { file: 'overlays/SymbolPicker.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
   { file: 'overlays/StructurePicker.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
   { file: 'overlays/UsagesPopup.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
-  { file: 'panes/GitDiffPane.tsx', chars: '⏎', why: 'A key hint beside a staging control.' },
+  {
+    file: 'panes/GitDiffPane.tsx',
+    chars: '⏎⋯',
+    why: 'The ⏎ is a key hint beside a staging control. The ⋯ opens the fold row\'s label — '
+      + '"⋯ 5,998 unchanged lines" — the same glyph every editor puts on a folded region, '
+      + 'inside a sentence that line-breaks and selects as text; an icon would divorce the '
+      + 'mark from the count it qualifies.',
+  },
   {
     file: 'chrome/branchModel.ts',
     chars: '↑↓',
@@ -305,24 +314,115 @@ eq(
 
 /* -- 4: the stroke stays in band ------------------------------------------------------------ */
 
-const iconCss = readFileSync(join(SRC, 'icons/Icon.module.css'), 'utf8')
-const tokens = readFileSync(join(SRC, 'styles/tokens.css'), 'utf8')
-for (const m of iconCss.matchAll(/\[data-size='(\d)'\][^{]*\{([^}]*)\}/g)) {
-  const rung = m[1]
-  const stroke = Number(/stroke-width:\s*([\d.]+)/.exec(m[2])?.[1])
-  const box = Number(new RegExp(`--icon-${rung}:\\s*(\\d+)px`).exec(tokens)?.[1])
-  ok(Number.isFinite(stroke) && Number.isFinite(box), `--icon-${rung} has a box and a stroke`)
-  if (!Number.isFinite(stroke) || !Number.isFinite(box)) continue
-  // Rounded before comparing: 2.8 × 12 / 24 is 1.3999999999999997 in binary floating
-  // point, and a band this gate states to one decimal place must not be decided by the
-  // seventeenth.
-  const drawn = Math.round(((stroke * box) / 24) * 1000) / 1000
+/*
+ * The box and the stroke reach the mark at all.
+ *
+ * This gate used to check only the arithmetic in the stylesheet, and the arithmetic was right
+ * while the rules reached nothing: they lived in `Icon.module.css` under a hashed class that
+ * `<Icon>` applied and `iconElement` — which builds the merge gutter's buttons, the find bar's
+ * and the fold gutter's, inside CodeMirror where no hashed name exists — did not. `data-size`
+ * on its own selects nothing, an `<svg>` with no width fills its container, and
+ * `.cm-mergeChevron` is `width: 100%`. The marks came out the size of the gutter and shoved the
+ * ignore button out of the row.
+ *
+ * So: one literal class, written by both builders, defined in a plain stylesheet. A module
+ * import here would reintroduce exactly the split that caused it.
+ */
+const iconCss = readFileSync(join(SRC, 'icons/icon.css'), 'utf8')
+const iconElementTs = readFileSync(join(SRC, 'icons/iconElement.ts'), 'utf8')
+const iconTsx = readFileSync(join(SRC, 'icons/Icon.tsx'), 'utf8')
+
+const literal = /export const ICON_CLASS = '([\w-]+)'/.exec(iconElementTs)?.[1]
+ok(literal !== undefined, '`ICON_CLASS` is a literal string in `icons/iconElement.ts`')
+if (literal !== undefined) {
   ok(
-    drawn >= 1.4 && drawn <= 1.8,
-    `--icon-${rung} draws its stroke at ${drawn.toFixed(3)}px, inside 1.4–1.8. A 24-unit grid `
-      + 'at one stroke-width renders 2px at 24px and 1.08px at 13px, which is the spread this '
-      + 'app shipped with; below ~1.4px WebKit antialiases a line into a grey smear',
+    iconCss.includes(`.${literal} {`),
+    `\`icons/icon.css\` defines \`.${literal}\` — the class both builders write`,
   )
+  ok(
+    new RegExp(`\\.${literal}\\[data-size=`).test(iconCss),
+    'and sizes it per `data-size`, which is the attribute both builders set',
+  )
+}
+ok(
+  /svg\.setAttribute\('class'/.test(iconElementTs)
+    && !/className === undefined \? '' :/.test(iconElementTs),
+  '`iconElement` applies the sizing class unconditionally rather than leaving it to a caller — '
+    + 'an optional class is an optional size, and a mark with no size fills its container',
+)
+ok(
+  iconTsx.includes('ICON_CLASS'),
+  '`<Icon>` writes the same literal, so the component and the imperative builder cannot drift',
+)
+const importsModule = (src) => /^\s*import .*\.module\.css'/m.test(src)
+ok(
+  !importsModule(iconTsx) && !importsModule(iconElementTs),
+  'neither builder imports a CSS module for the box — a hashed name is unreachable from the '
+    + 'CodeMirror surfaces, which is how the two paths came apart',
+)
+
+/*
+ * And the imperative builder really does apply it — **run**, not grepped.
+ *
+ * The first version of this assertion was a regex for `setAttribute('class'`, and it passed
+ * against the exact bug it was written for: the call was still there, wrapped in
+ * `if (className !== undefined)`. A pattern that matches the broken code as happily as the
+ * fixed one is worse than no pattern, because it reads like cover. `iconElement.ts` imports
+ * nothing but `iconPaths.ts`, so it compiles standalone and can simply be called.
+ */
+{
+  const out = mkdtempSync(join(tmpdir(), 'cide-ui-icons-'))
+  try {
+    execFileSync(
+      'node',
+      [
+        'node_modules/typescript/bin/tsc',
+        'src/icons/iconElement.ts',
+        '--outDir', out,
+        '--rootDir', 'src',
+        '--module', 'commonjs',
+        '--moduleResolution', 'node10',
+        '--target', 'es2022',
+        '--strict',
+        '--noUncheckedIndexedAccess',
+        '--exactOptionalPropertyTypes',
+      ],
+      { stdio: 'inherit' },
+    )
+    // The smallest DOM `iconElement` touches: two namespaced elements and `append`.
+    const made = []
+    globalThis.document = {
+      createElementNS(_ns, tag) {
+        const el = { tag, attrs: {}, children: [],
+          setAttribute(k, v) { this.attrs[k] = v },
+          append(...c) { this.children.push(...c) } }
+        made.push(el)
+        return el
+      },
+    }
+    const { iconElement, ICON_CLASS } = await import(
+      `file://${join(out, 'icons/iconElement.js')}`
+    )
+    for (const size of [0, 1, 2, 3]) {
+      const el = iconElement('x', size)
+      eq(
+        el.attrs.class,
+        ICON_CLASS,
+        `iconElement('x', ${size}) carries the sizing class. Without it \`data-size\` selects `
+          + 'nothing, the `<svg>` has no width, and it fills whatever contains it',
+      )
+      eq(String(el.attrs['data-size']), String(size), 'and the rung it was asked for')
+    }
+    const withExtra = iconElement('x', 1, 'cm-mergeChevron')
+    ok(
+      withExtra.attrs.class.split(/\s+/).includes(ICON_CLASS),
+      'a caller-supplied class is added to the sizing class rather than replacing it — '
+        + 'replacing it is the bug, in the exact shape it shipped',
+    )
+  } finally {
+    rmSync(out, { recursive: true, force: true })
+    delete globalThis.document
+  }
 }
 
 /* -- 5: nothing is still drawing a character ------------------------------------------------ */

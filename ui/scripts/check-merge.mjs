@@ -508,6 +508,50 @@ try {
     /if \(tone === null\) return \[\]/.test(pane),
     'and every pane skips a settled block rather than painting it a second colour',
   )
+  /*
+   * The insertion markers. (M25) A block a pane has no lines for — the other side inserted
+   * where it has nothing, or it deleted the block — draws the boundary as a thin line
+   * rather than lying a full tone band onto the neighbouring line, and rather than (the
+   * worse, older state) drawing nothing at all in the pane that lacked the lines.
+   */
+  const decoSrc = read('../src/panes/mergeDecorations.ts')
+  ok(
+    /span\.from === span\.to/.test(decoSrc) && /cm-mergeInsert /.test(decoSrc),
+    'a zero-width span paints as a cm-mergeInsert marker line, not as a band on the line beside it',
+  )
+  ok(
+    /cm-mergeInsertEnd/.test(decoSrc),
+    'with the end-of-document variant, because an insertion below the last line has no ' +
+      'following line to carry a top edge',
+  )
+  ok(
+    /const inserts = spans\.filter/.test(pane) && /span\.from !== span\.to/.test(pane),
+    'the side panes append their zero-width spans — `lit` cannot carry a block this side did ' +
+      'not change, which is exactly the theirs-only insertion that used to be invisible here',
+  )
+  ok(
+    /\[\.\.\.lit, \.\.\.inserts\]/.test(pane),
+    'through the same paint call and the same regionTone gate, so a settled block draws nothing',
+  )
+  {
+    const mergeCss = read('../src/panes/MergePane.module.css')
+    ok(
+      /\.cm-mergeInsert\)\s*\{[^}]*position:\s*relative/.test(mergeCss) &&
+        /\.cm-mergeInsert\)::before\s*\{[^}]*height:\s*2px/.test(mergeCss),
+      'the marker is a 2px ::before with no layout height — CodeMirror’s height cache and the ' +
+        'block-anchored scroll sync must see nothing',
+    )
+    ok(
+      /\.cm-mergeInsertConflict\)::before\s*\{[^}]*var\(--red\)/.test(mergeCss) &&
+        /\.cm-mergeInsertPending\)::before\s*\{[^}]*var\(--blue\)/.test(mergeCss),
+      'in the pane’s existing two tones — red for an undecided conflict, blue for an ' +
+        'unanswered one-sided change — not a third colour language',
+    )
+    ok(
+      /\.cm-mergeInsertEnd\)::before\s*\{[^}]*bottom:\s*-1px/.test(mergeCss),
+      'and the end variant moves the line to the bottom edge',
+    )
+  }
   ok(
     /scrollDOM\.addEventListener\('scroll'/.test(pane) && /echoes\.current\.add\(to\)/.test(pane),
     'the panes scroll together, with a re-entry guard so the sync cannot feed itself',

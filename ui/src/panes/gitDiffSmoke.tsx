@@ -21,7 +21,14 @@ function line(origin: LineOrigin, content: string, oldLineno: number | null, new
   return { origin, content, oldLineno, newLineno, noNewline: false }
 }
 
-/** The same three-hunk shape `check-diff-selection.mjs` uses, so the two agree by eye. */
+/**
+ * The same three-hunk shape `check-diff-selection.mjs` uses, so the two agree by eye.
+ *
+ * `newText: null`, deliberately: every digest that predates the whole-file view renders
+ * against this fixture, and a `null` text is exactly the wire an old backend — or a
+ * too-large file — sends, so all of those digests keep pinning the hunks-only fallback.
+ * The whole-file arm has fixtures of its own below.
+ */
 export const FIXTURE: FileDiff = {
   path: 'src/main.rs',
   oldPath: null,
@@ -32,6 +39,9 @@ export const FIXTURE: FileDiff = {
   newMode: 33188,
   rev: 'cafef00dcafef00d',
   partialOk: true,
+  oldText: null,
+  newText: null,
+  textsOmitted: false,
   hunks: [
     {
       index: 0,
@@ -80,11 +90,11 @@ export const FIXTURE: FileDiff = {
 /**
  * An addition immediately *followed* by a deletion, which the three-hunk fixture never has.
  *
- * `splitHunk` treats `+` then `-` as two separate edits and refuses to zip across the boundary,
- * because git emits `-` before `+` within one edit — so a `+` already closed the edit it
- * belonged to. Nothing in `FIXTURE` can tell that rule from its absence: it only ever has `-`
- * before `+`, where flushing and not flushing produce identical rows. This one fixture is the
- * difference between the rule being checked and merely being written down.
+ * `diffRows.columnRows` treats `+` then `-` as two separate edits and refuses to group across
+ * the boundary, because git emits `-` before `+` within one edit — so a `+` already closed the
+ * edit it belonged to. Nothing in `FIXTURE` can tell that rule from its absence: it only ever
+ * has `-` before `+`, where flushing and not flushing produce identical runs. This one fixture
+ * is the difference between the rule being checked and merely being written down.
  */
 export const PAIR_FIXTURE: FileDiff = {
   ...FIXTURE,
@@ -102,6 +112,140 @@ export const PAIR_FIXTURE: FileDiff = {
         line('addition', 'added first', null, 2),
         line('deletion', 'removed after', 2, null),
         line('context', 'tail', 3, 3),
+      ],
+    },
+  ],
+}
+
+/* --- the whole-file fixtures (M25) -------------------------------------------------------- */
+
+/**
+ * `FIXTURE`'s hunks with the texts they came from: a 24-line new side whose gaps — new
+ * 4–10 and 14–20 — are what the whole-file view has to fill in. The arithmetic matters more
+ * than the words: `wholeFileSegments` validates every context and addition line against
+ * this text and refuses the file on any disagreement, so a fixture whose numbers were off
+ * by one would silently pin the *fallback* and prove nothing about the feature.
+ */
+const WHOLE_TEXT =
+  [
+    'fn main() {',
+    '    let x = 1;',
+    '}',
+    'g4',
+    'g5',
+    'g6',
+    'g7',
+    'g8',
+    'g9',
+    'g10',
+    'let a = 0;',
+    'let b = 2;',
+    'let c = 3;',
+    'g14',
+    'g15',
+    'g16',
+    'g17',
+    'g18',
+    'g19',
+    'g20',
+    'one',
+    'two',
+    'three',
+    'end',
+  ].join('\n') + '\n'
+
+/** The old side, 20 lines. Not consumed by the row model; carried because a real wire has it. */
+const WHOLE_OLD =
+  [
+    'fn main() {',
+    '}',
+    'g4',
+    'g5',
+    'g6',
+    'g7',
+    'g8',
+    'g9',
+    'g10',
+    'let a = 0;',
+    'let b = 1;',
+    'let c = 3;',
+    'g14',
+    'g15',
+    'g16',
+    'g17',
+    'g18',
+    'g19',
+    'g20',
+    'end',
+  ].join('\n') + '\n'
+
+export const WHOLE: FileDiff = {
+  ...FIXTURE,
+  path: 'src/whole.rs',
+  oldText: WHOLE_OLD,
+  newText: WHOLE_TEXT,
+}
+
+/**
+ * The same hunks with a context line the text contradicts — `let a = 0;` is `DIFFERENT` in
+ * the text. The whole-file view must refuse this and render exactly what `FIXTURE` renders:
+ * the check compares the two digests field for field.
+ */
+export const WHOLE_MISMATCH: FileDiff = {
+  ...WHOLE,
+  path: 'src/mismatch.rs',
+  newText: WHOLE_TEXT.replace('let a = 0;', 'DIFFERENT'),
+}
+
+/**
+ * A 6,000-line file — over `WHOLE_FILE_COLLAPSE_ABOVE` — with one change at the top, so the
+ * single 5,998-line gap must fold behind an expander row. The `Open` variant renders the
+ * same fixture with gap 0 expanded, which is the state one click produces.
+ */
+const BIG_LINES = Array.from({ length: 6_000 }, (_, i) => `l${i + 1}`)
+export const WHOLE_BIG: FileDiff = {
+  ...FIXTURE,
+  path: 'src/big.rs',
+  oldText: BIG_LINES.slice(1).join('\n') + '\n',
+  newText: BIG_LINES.join('\n') + '\n',
+  hunks: [
+    {
+      index: 0,
+      header: '@@ -1,1 +1,2 @@',
+      oldStart: 1,
+      oldLines: 1,
+      newStart: 1,
+      newLines: 2,
+      lines: [line('addition', 'l1', null, 1), line('context', 'l2', 1, 2)],
+    },
+  ],
+}
+
+/**
+ * A block added at line 1, a deletion in the middle, a block added at end of file — the
+ * three marker positions the split view has to get right: before the first row, between
+ * rows, and *after the last row*, which is the boundary a marker keyed on "the following
+ * row" would not have.
+ */
+export const EDGE: FileDiff = {
+  ...FIXTURE,
+  path: 'src/edge.rs',
+  oldText: 'mid1\ngone\nmid2\n',
+  newText: 'first\nmid1\nmid2\nlast\n',
+  hunks: [
+    {
+      index: 0,
+      header: '@@ -1,3 +1,4 @@',
+      oldStart: 1,
+      oldLines: 3,
+      newStart: 1,
+      newLines: 4,
+      lines: [
+        line('addition', 'first', null, 1),
+        line('context', 'mid1', 1, 2),
+        line('deletion', 'gone', 2, null),
+        line('context', 'mid2', 3, 3),
+        line('addition', 'last', null, 4),
       ],
     },
   ],
@@ -224,6 +368,24 @@ export interface DiffDigest {
    * in the DOM twice and "the rows drawn as selected" has stopped being a set of positions.
    */
   positions: string[]
+  /**
+   * The positions split per column — the left (old) column's in its file order, then the
+   * right's. Both empty in the unified layout. Document order across the whole markup stopped
+   * meaning file order when the columns became sequential in the DOM, so the order claims
+   * live here now.
+   */
+  leftPositions: string[]
+  rightPositions: string[]
+
+  /* --- the whole-file view (M25) --- */
+
+  /** `data-count` of every unchanged-gap wrapper, in document order. */
+  gaps: string[]
+  /** `data-count` of every fold (expander) row, in document order. */
+  folds: string[]
+  /** `data-tone` of every insertion marker, per column. Empty outside the split layout. */
+  insertLeft: string[]
+  insertRight: string[]
 
   /* --- the blame column (M18) --- */
 
@@ -238,8 +400,6 @@ export interface DiffDigest {
   blameCells: string[]
   /** `data-age` of every blame cell, in the same order. `'-1'` is uncommitted, `''` is absent. */
   blameAges: string[]
-  /** Old-side spacers — the split layout's left column, which is never annotated. */
-  blameGaps: number
   /** Whether the row grid reserved a track for the column. */
   blameTrack: boolean
   blamePressed: boolean
@@ -247,15 +407,49 @@ export interface DiffDigest {
   blameTitle: string
 }
 
-/** Every blame cell's `data-blame` and `data-age`, in document order, and the spacers. */
-function blameOf(html: string): { cells: string[]; ages: string[]; gaps: number } {
+/** Every blame cell's `data-blame` and `data-age`, in document order. */
+function blameOf(html: string): { cells: string[]; ages: string[] } {
   const found = [
     ...html.matchAll(/data-audit="gitDiffBlame" data-blame="([^"]*)" data-age="([^"]*)"/g),
   ]
   return {
     cells: found.map((m) => m[1] ?? ''),
     ages: found.map((m) => m[2] ?? ''),
-    gaps: [...html.matchAll(/data-audit="gitDiffBlameGap"/g)].length,
+  }
+}
+
+/** The positional row regex, over one slice of the markup. */
+function rowsOf(html: string): Array<RegExpMatchArray> {
+  return [...html.matchAll(/data-audit="gitDiffRow" data-at="([\d:]+)" data-selected="(\w+)"/g)]
+}
+
+/**
+ * The whole-file and split facts, from one render. The column boundary is the right
+ * column's `data-side="new"` — everything before it is the header plus the left column,
+ * and no row or marker exists outside a column in the split layout.
+ */
+function layoutOf(html: string): {
+  leftPositions: string[]
+  rightPositions: string[]
+  gaps: string[]
+  folds: string[]
+  insertLeft: string[]
+  insertRight: string[]
+} {
+  const boundary = html.indexOf('data-side="new"')
+  const left = boundary === -1 ? '' : html.slice(0, boundary)
+  const right = boundary === -1 ? '' : html.slice(boundary)
+  const tones = (part: string): string[] =>
+    [...part.matchAll(/data-audit="gitDiffInsertMark" data-tone="(\w+)"/g)].map((m) => m[1] ?? '')
+  return {
+    leftPositions: rowsOf(left).map((m) => m[1] ?? ''),
+    rightPositions: rowsOf(right).map((m) => m[1] ?? ''),
+    gaps: [...html.matchAll(/data-audit="gitDiffGap" data-count="(\d+)"/g)].map((m) => m[1] ?? ''),
+    folds: [...html.matchAll(/data-audit="gitDiffExpand" data-count="(\d+)"/g)].map(
+      (m) => m[1] ?? '',
+    ),
+    insertLeft: tones(left),
+    insertRight: tones(right),
   }
 }
 
@@ -291,6 +485,16 @@ const REVISION_FIXTURE: RevisionDiff = {
   oldMode: FIXTURE.oldMode,
   newMode: FIXTURE.newMode,
   hunks: FIXTURE.hunks,
+  oldText: null,
+  newText: null,
+  textsOmitted: false,
+}
+
+/** The read-only arm with the texts, so the whole-file view is proved on frozen history too. */
+const REVISION_WHOLE: RevisionDiff = {
+  ...REVISION_FIXTURE,
+  oldText: WHOLE_OLD,
+  newText: WHOLE_TEXT,
 }
 
 function digest(
@@ -312,6 +516,8 @@ function digest(
      * able to reproduce.
      */
     blame?: BlameLookup | null
+    /** Gaps opened in a folded whole-file view. */
+    expanded?: ReadonlySet<number>
   },
 ): DiffDigest {
   const html = renderToStaticMarkup(
@@ -332,6 +538,8 @@ function digest(
       // again on its own. A fixture that always passed a handler would prove only the second
       // half.
       {...(blameRefusal(over.side) === null ? { onBlame: () => {} } : {})}
+      {...(over.expanded === undefined ? {} : { expandedGaps: over.expanded })}
+      onExpandGap={() => {}}
       onSide={() => {}}
       onMarks={() => {}}
       onCollapse={() => {}}
@@ -341,9 +549,7 @@ function digest(
   )
   const blame = blameOf(html)
   const toggle = blameToggleOf(html)
-  const rows = [
-    ...html.matchAll(/data-audit="gitDiffRow" data-at="([\d:]+)" data-selected="(\w+)"/g),
-  ]
+  const rows = rowsOf(html)
   const apply = /data-audit="gitDiffApply"([^>]*)>([^<]*)</.exec(html)
   return {
     name,
@@ -365,9 +571,9 @@ function digest(
     sideControl: html.includes('data-audit="gitDiffSide"'),
     lineBox: html.includes('data-audit="gitDiffLineBox"'),
     positions: rows.map((m) => m[1] ?? ''),
+    ...layoutOf(html),
     blameCells: blame.cells,
     blameAges: blame.ages,
-    blameGaps: blame.gaps,
     blameTrack: html.includes('data-blamed="true"'),
     blamePressed: toggle.pressed,
     blameDisabled: toggle.disabled,
@@ -412,13 +618,12 @@ function readOnlyDigest(
       // at all.
       onBlame={() => {}}
       onCollapse={() => {}}
+      onExpandGap={() => {}}
     />,
   )
   const blame = blameOf(html)
   const toggle = blameToggleOf(html)
-  const rows = [
-    ...html.matchAll(/data-audit="gitDiffRow" data-at="([\d:]+)" data-selected="(\w+)"/g),
-  ]
+  const rows = rowsOf(html)
   const apply = /data-audit="gitDiffApply"([^>]*)>([^<]*)</.exec(html)
   return {
     name,
@@ -440,9 +645,9 @@ function readOnlyDigest(
     sideControl: html.includes('data-audit="gitDiffSide"'),
     lineBox: html.includes('data-audit="gitDiffLineBox"'),
     positions: rows.map((m) => m[1] ?? ''),
+    ...layoutOf(html),
     blameCells: blame.cells,
     blameAges: blame.ages,
-    blameGaps: blame.gaps,
     blameTrack: html.includes('data-blamed="true"'),
     blamePressed: toggle.pressed,
     blameDisabled: toggle.disabled,
@@ -471,7 +676,7 @@ const digests: DiffDigest[] = [
    * The same claims again in the side-by-side layout.
    *
    * Without these the split view is drawn by code no check can fail: every case above renders
-   * with `view` unset, which is `'unified'`, so `splitHunk` and the `cell()` calls that pair
+   * with `view` unset, which is `'unified'`, so `columnRows` and the `cell()` calls that place
    * its rows were reachable from the app and from nothing that runs in CI. The pane exists to
    * keep one promise — what is highlighted is what is staged — and that promise has to be
    * proved in both layouts or the layout switch is the place it silently stops holding.
@@ -546,6 +751,34 @@ const digests: DiffDigest[] = [
    */
   digest('blameStaged', new Set(), { diff: FIXTURE, side: 'staged' }),
   readOnlyDigest('revisionBlame', REVISION_FIXTURE, undefined, { blame: BLAME }),
+
+  /*
+   * The whole-file view. (M25)
+   *
+   * The selection claims are the same claims as ever — `wholeUnified` must carry exactly the
+   * positions `empty` does, because gap rows have none — plus the new facts: the gaps drawn,
+   * the folds above the size threshold, the insertion markers per column, and the mismatch
+   * fixture falling back to a render indistinguishable from the hunks-only one.
+   */
+  digest('wholeUnified', new Set(['1:2']), { diff: WHOLE, side: 'unstaged' }),
+  digest('wholeSplit', new Set(['1:2']), { diff: WHOLE, side: 'unstaged', view: 'split' }),
+  readOnlyDigest('wholeRevision', REVISION_WHOLE),
+  readOnlyDigest('wholeRevisionSplit', REVISION_WHOLE, 'split'),
+  digest('wholeBig', new Set(), { diff: WHOLE_BIG, side: 'unstaged' }),
+  digest('wholeBigOpen', new Set(), {
+    diff: WHOLE_BIG,
+    side: 'unstaged',
+    expanded: new Set([0]),
+  }),
+  digest('wholeMismatch', new Set(), { diff: WHOLE_MISMATCH, side: 'unstaged' }),
+  digest('edgeSplit', new Set(), { diff: EDGE, side: 'unstaged', view: 'split' }),
+  digest('wholeBlame', new Set(), { diff: WHOLE, side: 'unstaged', blame: BLAME }),
+  digest('wholeBlameSplit', new Set(), {
+    diff: WHOLE,
+    side: 'unstaged',
+    view: 'split',
+    blame: BLAME,
+  }),
 ]
 
 console.log(JSON.stringify(digests))

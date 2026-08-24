@@ -14,6 +14,11 @@ import './styles/tokens.css'
  */
 import './styles/iconMasks.css'
 /*
+ * The icon box, as a plain stylesheet rather than a module: `icons/iconElement.ts` builds marks
+ * inside CodeMirror, where there is no hashed class name to reach for. See its header.
+ */
+import './icons/icon.css'
+/*
  * The colours for `editor/highlight.ts`'s token classes. (M20)
  *
  * Here, and not beside the code that emits them, for a reason worth writing down: `highlight.ts`

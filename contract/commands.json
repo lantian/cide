@@ -116,6 +116,7 @@
   "git_locate",
   "git_log",
   "git_log_cancel",
+  "git_merge",
   "git_merge_abort",
   "git_merge_continue",
   "git_pull",

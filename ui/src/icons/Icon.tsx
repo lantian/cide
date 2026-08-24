@@ -32,11 +32,11 @@
  */
 import type { ReactElement } from 'react'
 
+import { ICON_CLASS } from './iconElement'
 import { ICON_PATHS, type IconName } from './iconPaths'
 
 /* Re-exported so a component that draws a mark needs one import rather than two. */
 export type { IconName }
-import styles from './Icon.module.css'
 
 /* Declared in `iconElement.ts` so that module stays free of `.tsx`; see the note there. */
 export type { IconSize } from './iconElement'
@@ -59,7 +59,7 @@ export function Icon({ size = 2, className, label, ...source }: IconProps): Reac
   const d = source.name === undefined ? source.d : ICON_PATHS[source.name]
   return (
     <svg
-      className={className === undefined ? styles.icon : `${styles.icon} ${className}`}
+      className={className === undefined ? ICON_CLASS : `${ICON_CLASS} ${className}`}
       data-size={size}
       /*
        * The mark's name, in the markup, for the same reason `data-audit` exists: this app has no

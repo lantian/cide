@@ -32,4 +32,19 @@ newOid: string | null, oldOid: string | null, status: FileState, binary: boolean
  * Unix mode bits, e.g. 33188 (0o100644). Zero when the side does not exist — the same
  * convention [`crate::git::FileDiff`] uses, so a reader who knows one knows both.
  */
-oldMode: number, newMode: number, hunks: Array<DiffHunkView>, };
+oldMode: number, newMode: number, hunks: Array<DiffHunkView>, 
+/**
+ * The old side's full text, for whole-file rendering. Same rules as
+ * [`crate::git::FileDiff::old_text`]: `None` for an absent side, a binary file, a
+ * submodule, a typechange, or when a side exceeded the byte cap.
+ */
+oldText: string | null, 
+/**
+ * The new side's full text. See [`crate::git::FileDiff::new_text`].
+ */
+newText: string | null, 
+/**
+ * True when an existing side exceeded the byte cap and both texts were withheld.
+ * See [`crate::git::FileDiff::texts_omitted`].
+ */
+textsOmitted: boolean, };

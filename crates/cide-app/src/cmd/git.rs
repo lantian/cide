@@ -30,8 +30,8 @@ use cide_git::{
 use cide_ipc::git::{
     BranchInfo, BranchList, ChangesTree, CheckoutMode, CheckoutOutcome, CommitOutcome,
     CommitRequest, ConflictFile, ConflictSide, ContinueOutcome, DiffSide, FetchOutcome, FileDiff,
-    GitError, MergeState, PathSelection, PullRequest, PushOutcome, RepoInfo, ShelfEntry,
-    StashEntry, TreeStatusMap,
+    GitError, MergeOutcome, MergeState, PathSelection, PullRequest, PushOutcome, RepoInfo,
+    ShelfEntry, StashEntry, TreeStatusMap,
 };
 use cide_ipc::{ProjectId, RepoId, ToolTabId};
 use tauri::State;
@@ -535,7 +535,7 @@ pub async fn git_diff_file(
         let request = diff::DiffRequest::new(side).renames(true);
         let file = diff::file_diff(&handle, &path, request)?
             .ok_or(GitError::NoSuchChange { path: path.clone() })?;
-        Ok(diff::view(&file, side))
+        Ok(diff::view(&handle, &file, side))
     })
     .await
 }
@@ -904,6 +904,33 @@ pub async fn git_pull(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = cide_git::pull::pull_with(&root, &request, fallback, &proxy);
+        let _ = refreshed(&app, &roots, project);
+        outcome
+    })
+    .await
+}
+
+/// Merge a branch — local or remote-tracking — into the checked-out one. See `cide_git::merge`.
+///
+/// No proxy and no settings read: unlike `git_pull` there is no network half and no strategy
+/// ladder — the source is already in the repository, and fast-forward-when-possible is the one
+/// behaviour, so nothing configurable travels into `blocking`.
+///
+/// Refreshes before the `?` for `git_pull`'s second reason: a landed conflict returns `Ok` and
+/// the panel has a merge to draw, and even a refusal must not leave the popup beside a status
+/// bar showing a pre-gesture tree.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_merge(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    name: String,
+) -> Result<MergeOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = cide_git::merge::merge_into_head(&root, &name);
         let _ = refreshed(&app, &roots, project);
         outcome
     })

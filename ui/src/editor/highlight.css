@@ -51,6 +51,48 @@
   color: var(--tk-fg);
 }
 
+/*
+ * The selection, and the reason it is here rather than in a CSS module. (M24)
+ *
+ * # It was reported twice as "I select the code and I can't see the text"
+ *
+ * `@codemirror/view`'s base theme carries this rule:
+ *
+ *     "&light.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground":
+ *       { background: "#d7d4f0" }
+ *
+ * `&` and `&light` are **generated classes** (`baseThemeID`, `baseLightID` — see `buildTheme`
+ * and `lightDarkIDs` in that package), so the selector is six classes: specificity **(0,6,0)**.
+ * `EditorSurface.module.css` said `.body :global(.cm-editor .cm-selectionBackground)`, which is
+ * (0,3,0). It never applied. Every focused editor in this application painted its selection
+ * CodeMirror's light-mode lavender `#d7d4f0`, and `--tk-fg` in the dark theme is `#d7d7dd` — a
+ * contrast ratio of **1.02:1**. The text was not dim; it was gone.
+ *
+ * `cmPolarity.ts` is the other half and fixes the cause: nothing ever set `EditorView.darkTheme`,
+ * so `&light` matched under the dark theme. That alone is not enough — the `&dark` twin of the
+ * rule above is the same (0,6,0) selector with `#233` in it, so cide's colour still has to win.
+ *
+ * # Why the selectors are shaped like this
+ *
+ * They mirror CodeMirror's own structure and add one element to the specificity: `html:root`
+ * contributes a class *and* an element, which makes (0,6,1) against its (0,6,0). It is a
+ * deliberate escalation and it is written out rather than reached with `!important`, because an
+ * `!important` here could not be overridden by anything later — including a contributed theme,
+ * which is where this palette is heading.
+ *
+ * Two selectors, not one: the focused rule has to out-specify a six-class rule, and the
+ * unfocused one only a three-class rule (`&light .cm-selectionBackground`, `#d9d9d9`), but both
+ * have to be *stated* or the unfocused editor keeps CodeMirror's grey.
+ *
+ * The native `::selection` needs no rule at all. `drawSelection` hides it with `!important`
+ * while it paints its own layer (`hideNativeSelection`, `Prec.highest`), so the rule that used to
+ * sit in the module files was inert whenever it mattered.
+ */
+html:root .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground,
+html:root .cm-editor > .cm-scroller > .cm-selectionLayer .cm-selectionBackground {
+  background: var(--tk-sel);
+}
+
 .cide-tk-doc {
   color: var(--tk-doc);
   font-style: italic;

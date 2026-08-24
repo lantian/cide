@@ -414,7 +414,49 @@
   /* See the light block for what these are and why the editor does not read `--panel`. */
   --tk-bg: #151518;
   --tk-fg: #d7d7dd;
-  --tk-sel: #2b3a55;
+  /*
+   * **Iso-luminant with `--tk-bg`, and that is the whole design rather than a tuned value.** (M24)
+   *
+   * A selection is a *ground*. Every dark ink in this block was chosen against `--tk-bg`, which
+   * is nearly black, so a selection lighter than the background raises the floor under all of
+   * them at once — and the arithmetic is unforgiving. The chrome's `--sel` (#2b3a55) sits 1.60:1
+   * above the background, which took comments from 2.76:1 to **1.73:1**, gone, and punctuation
+   * to 3.09:1. The report was "when I select the code in dark theme I don't see the text", and it
+   * was true of the whole quiet half of the palette.
+   *
+   * It predates the `--tk-*` family: `--sel` and `--faint` have held those values since M3, and
+   * `EditorSurface.module.css` carried a comment asserting the worst case was 4.45:1, which was
+   * measured against `--panel` and was never true of this pair.
+   *
+   * **Darkening it partway does not work, and the ceiling is why.** Contrast against a selection
+   * is `(ink + 0.05) / (selection + 0.05)`, so a selection's luminance is a tax on every ink at
+   * once. `#72727e` has a luminance of 0.171 — against a *pure black* selection that is 4.42:1,
+   * so no selection of any colour can carry this palette's comment to the 4.5:1 body-text bar.
+   * An intermediate `#132a4d` was tried and reached 3.02:1, which is the WCAG floor for *large*
+   * text and not enough for 12.5px code; the report came back.
+   *
+   * So the selection carries almost no luminance. This is 1.12:1 against the background and is
+   * visible through **chroma**, at a redmean distance of 124 — more separation than the old
+   * `#2b3a55` managed at 131, for a third of the luminance. The consequence is the point: every
+   * ink keeps **89%** of the contrast it has unselected, so selecting a region stops being a
+   * legibility question. `check:scheme` asserts that ratio directly, which is a stronger and more
+   * durable claim than any absolute floor.
+   *
+   * Blue because blue's luminance coefficient is 0.0722 against green's 0.7152 — it is the only
+   * channel that can carry this much chroma at this little brightness, which is also why every
+   * dark theme's selection is blue.
+   *
+   * **This token did not reach the screen until M24's third attempt**, and two rounds of tuning
+   * it went past before anyone read the pixels. `@codemirror/view`'s base theme claims the
+   * selection at specificity (0,6,0) and the rule setting it was (0,3,0), so a focused editor
+   * painted CodeMirror's light-mode lavender whatever this said. `editor/highlight.css` owns the
+   * rule now, at a specificity that wins; do not move it back into a CSS module.
+   *
+   * Deliberately **not** the chrome's `--sel`, which is unchanged: that token grounds a selected
+   * file-tree row against `--panel` and answers a different question. The two being separable is
+   * what this family is for.
+   */
+  --tk-sel: #0d1560;
   --tk-gutter: #5c5c66;
   --tk-caret: #d97757;
 
@@ -428,8 +470,21 @@
    * says less than it could, deliberately — a syntax theme that colours punctuation as loudly
    * as it colours keywords reads as noise.
    */
-  --tk-doc: #5c5c66;
-  --tk-comment: #5c5c66;
+  /*
+   * Lifted from `#5c5c66` (2.76:1) to 3.84:1 on `--tk-bg`. (M24)
+   *
+   * Forced by the selection above and correct on its own: darkening the selection alone could
+   * not carry a comment to a readable ratio — at every selection dark enough to do it, the
+   * selection had stopped being visible. So the quietest ink had to come up, and 2.76:1 was
+   * marginal for body text to begin with. It is still the quietest thing in the buffer, which is
+   * what a comment should be.
+   *
+   * `--tk-gutter` deliberately did *not* follow it and holds the old `#5c5c66`: line numbers are
+   * never drawn on a selection — `.cm-activeLineGutter` grounds them on `--tk-sel` but colours
+   * them `--dim` — so nothing forces them up, and brighter numbers compete with the code.
+   */
+  --tk-doc: #72727e;
+  --tk-comment: #72727e;
   --tk-control: #e06c75;
   --tk-constant: #e0954f;
   --tk-escape: #e0954f;

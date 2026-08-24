@@ -145,6 +145,25 @@ try {
         'conflicts',
       ],
     ],
+    // The merge's own report (M24). Same join, same reason: `branchModel::MergeReport` declares
+    // this shape structurally, so only this line notices a rename in `cide-ipc`.
+    [
+      'MergeOutcome',
+      [
+        'source',
+        'branch',
+        'fastForward',
+        'oldOid',
+        'newOid',
+        'advanced',
+        'filesChanged',
+        'insertions',
+        'deletions',
+        'commits',
+        'moreCommits',
+        'conflicts',
+      ],
+    ],
     [
       'PushOutcome',
       ['remote', 'refspec', 'shelledOut', 'output', 'branch', 'pushed', 'oldOid', 'newOid'],
@@ -300,21 +319,42 @@ try {
   // --- what a row may do ---------------------------------------------------------------------
 
   eq(
-    m.actionsFor(ref('feature/login')),
-    ['checkout', 'newFrom', 'rename', 'delete'],
-    'an ordinary local branch offers all four',
+    m.actionsFor(ref('feature/login'), head()),
+    ['checkout', 'newFrom', 'merge', 'rename', 'delete'],
+    'an ordinary local branch offers all five',
   )
   eq(
-    m.actionsFor(ref('main', { current: true })),
+    m.actionsFor(ref('main', { current: true }), head()),
     ['newFrom', 'rename'],
-    'the branch you are on cannot be checked out again or deleted — git refuses the second ' +
-      'and the first would do nothing',
+    'the branch you are on cannot be checked out again, merged into itself, or deleted — git ' +
+      'refuses the last and the first two would do nothing',
   )
   eq(
-    m.actionsFor(ref('origin/main', { remote: true })),
-    ['checkout', 'newFrom'],
-    'a remote-tracking ref cannot be renamed or deleted: it is a cache of the remote’s names ' +
-      'and the next fetch would put it back',
+    m.actionsFor(ref('origin/main', { remote: true }), head()),
+    ['checkout', 'newFrom', 'merge'],
+    'a remote-tracking ref cannot be renamed or deleted (it is a cache of the remote’s names ' +
+      'and the next fetch would put it back) — but it CAN be merged, which is `git merge ' +
+      'origin/x`: taking a fetched branch without creating a local copy first',
+  )
+  /*
+   * Merge needs somewhere to merge *into*. A detached or unborn HEAD has no current branch, so
+   * the item vanishes rather than opening a panel whose only outcome is a refusal — the same
+   * gate `canPull` applies, minus the upstream half a merge does not need.
+   */
+  eq(
+    m.actionsFor(ref('feature/login'), head({ detached: true })),
+    ['checkout', 'newFrom', 'rename', 'delete'],
+    'a detached HEAD offers no merge — there is no current branch to merge into',
+  )
+  eq(
+    m.actionsFor(ref('feature/login'), head({ unborn: true })),
+    ['checkout', 'newFrom', 'rename', 'delete'],
+    'an unborn branch offers no merge — there is no commit to merge onto',
+  )
+  eq(
+    m.actionsFor(ref('feature/login'), null),
+    ['checkout', 'newFrom', 'rename', 'delete'],
+    'and no head at all offers no merge rather than throwing',
   )
 
   eq(m.canPull(head()), true, 'pull is offered with an upstream')
@@ -425,8 +465,13 @@ try {
     'a pull says what a pull does, not what a checkout does',
   )
   ok(
-    said(refusal, 'pull').includes('src/a.rs'),
-    'and either way the files that block are still named — that is the whole variant',
+    said(refusal, 'merge').startsWith('Merging feature'),
+    'a merge names the merge — and the branch in the sentence is the SOURCE, because Rust puts ' +
+      'the ref being merged in `branch` for this op',
+  )
+  ok(
+    said(refusal, 'pull').includes('src/a.rs') && said(refusal, 'merge').includes('src/a.rs'),
+    'and whichever gesture it was, the files that block are still named — that is the whole variant',
   )
   eq(
     said(refusal),
@@ -734,6 +779,66 @@ try {
       + 'calling it anyway cannot produce an empty toast with a bullet in it',
   )
 
+  // --- what a *merge* asks, and what it says afterwards (M24) ----------------------------------
+
+  {
+    const ask = m.mergeConfirm('feature/login', 'main')
+    eq(ask.title, 'Merge feature/login into main?', 'the question names both branches')
+    ok(
+      ask.body.includes('merge commit') && ask.body.includes('Nothing is pushed'),
+      'the body says what will happen and what will NOT — "merge" one button from Push must ' +
+        'not read as publishing anything',
+    )
+  }
+
+  const merged = (over = {}) => ({
+    source: 'feature/login',
+    branch: 'main',
+    fastForward: false,
+    oldOid: 'a1b2c3d4',
+    newOid: 'e5f6a7b8',
+    advanced: 0,
+    filesChanged: 0,
+    insertions: 0,
+    deletions: 0,
+    commits: [],
+    moreCommits: 0,
+    conflicts: [],
+    ...over,
+  })
+
+  eq(
+    m.mergeNote(merged({ advanced: 3, filesChanged: 5, insertions: 40, deletions: 2 })),
+    'Merged 3 commits from feature/login into main · 5 files +40 −2',
+    'a merge commit reports what it took — the counts answer "is my build stale", '
+      + '`fetchNote`\'s argument',
+  )
+  eq(
+    m.mergeNote(merged({ fastForward: true, advanced: 1, filesChanged: 1, insertions: 3 })),
+    'Fast-forwarded main 1 commit to feature/login · 1 file +3',
+    'a fast-forward says so — the verb is the shape of the history about to be pushed, '
+      + 'singular throughout, and a side with nothing on it is left out',
+  )
+  eq(
+    m.mergeNote(merged()),
+    'main already contains feature/login',
+    'nothing to take names both branches — with several repositories it is the only thing '
+      + 'that says which one answered',
+  )
+  eq(
+    m.mergeNote(
+      merged({ advanced: 4, oldOid: 'a1b2c3d4', newOid: 'a1b2c3d4', conflicts: ['src/a.rs', 'src/b.rs'] }),
+    ),
+    'Merging feature/login into main — 2 files to resolve: src/a.rs and src/b.rs',
+    'conflicts lead, whatever else is true — the counts would bury the one fact that '
+      + 'needs acting on',
+  )
+  eq(
+    m.mergeNote(merged({ advanced: 1, conflicts: ['src/a.rs'] })),
+    'Merging feature/login into main — 1 file to resolve: src/a.rs',
+    'and the conflict count is singular when it should be',
+  )
+
   // --- the keyboard, which is the half a browserless harness can still own -------------------
 
   /*
@@ -994,6 +1099,24 @@ try {
     'and a success that had something to say — a stash taken, a tracking branch created, a ' +
       'restore that conflicted — hands it to the notice stack, which outlives the popup',
   )
+
+  /*
+   * The merge gesture is wired end to end (M24). A conflicted merge must reach
+   * `showConflicts` — the one surface that can finish it, the same route `keys/dispatch.ts`
+   * takes after a conflicted pull — and never the note bar alone, which would say "2 files to
+   * resolve" and offer nothing that resolves them. Every other failure goes through `explain`
+   * with the merge wording, so the sentence names the merge that was asked for rather than a
+   * switch that was not.
+   */
+  for (const call of [
+    'branchApi.merge(',
+    'showConflicts(',
+    "explain(error, 'merge')",
+    'mergeConfirm(',
+    'mergeNote(',
+  ]) {
+    ok(popup.includes(call), `BranchSelector.tsx actually calls ${call} — the merge action is wired up`)
+  }
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

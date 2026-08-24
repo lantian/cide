@@ -103,6 +103,25 @@ pub fn revision_diff(
         });
     };
 
+    // The whole file on both sides, for the pane that draws more than the hunks. The same
+    // helpers the staging surface uses, so the skip rules and the byte cap cannot drift
+    // between the two diff panes.
+    let texts = if diff::text_skip(&raw) {
+        diff::DiffTexts::NONE
+    } else {
+        let old_path = raw.old_path.as_deref().unwrap_or(&raw.path);
+        let old_read = match &old_side {
+            Side::Tree { tree, .. } => diff::tree_blob_read(&repo, tree.as_ref(), old_path),
+            // Refused as the old side before anything was resolved.
+            Side::Workdir => diff::TextRead::Missing,
+        };
+        let new_read = match &new_side {
+            Side::Tree { tree, .. } => diff::tree_blob_read(&repo, tree.as_ref(), &raw.path),
+            Side::Workdir => diff::workdir_read(&repo, &raw.path),
+        };
+        diff::DiffTexts::combine(old_read, new_read)
+    };
+
     Ok(RevisionDiff {
         path: raw.path.clone(),
         old_path: raw.old_path.clone(),
@@ -119,6 +138,9 @@ pub fn revision_diff(
         // read-only surface — the one nobody stages from, so the one where a wrong line number
         // produces no visible failure until somebody trusts it.
         hunks: diff::hunk_views(&raw),
+        old_text: texts.old_text,
+        new_text: texts.new_text,
+        texts_omitted: texts.omitted,
     })
 }
 

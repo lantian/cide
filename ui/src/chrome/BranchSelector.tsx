@@ -44,6 +44,7 @@ import {
   events,
   git as gitApi,
   pendingCommand,
+  type BranchInfo,
   type BranchList,
   type BranchRef,
   type CheckoutMode,
@@ -66,6 +67,8 @@ import {
   headTitle,
   kindOf,
   listFor,
+  mergeConfirm,
+  mergeNote,
   primaryRepo,
   refusalOf,
   visibleBranches,
@@ -78,6 +81,7 @@ import {
   type GitOp,
   type Refusal,
 } from './branchModel'
+import { showConflicts } from './conflictsStore'
 import { divergenceOf, strategyAsk } from './pullStrategyModel'
 import { requestPullStrategy } from './pullStrategyStore'
 import { Icon } from '@/icons/Icon'
@@ -309,6 +313,8 @@ type Mode =
   | { kind: 'new'; from: string | null }
   | { kind: 'rename'; from: string }
   | { kind: 'delete'; name: string; force: boolean }
+  /** The merge confirmation. `name` is the source — the row the "…" was opened on. */
+  | { kind: 'merge'; name: string }
   /** A checkout Rust refused, with the files it named. The reason this feature exists. */
   | { kind: 'refusal'; refusal: Refusal }
 
@@ -368,7 +374,8 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
    */
   useEffect(() => {
     if (mode.kind === 'list') search.current?.focus()
-    else if (mode.kind === 'delete' || mode.kind === 'refusal') popupEl.current?.focus()
+    else if (mode.kind === 'delete' || mode.kind === 'merge' || mode.kind === 'refusal')
+      popupEl.current?.focus()
   }, [mode.kind])
 
   /*
@@ -523,6 +530,52 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
       } finally {
         useBranches.setState({ busy: false })
         await useBranches.getState().load(project, true)
+      }
+    })()
+  }
+
+  /*
+   * Merge, whose one non-sentence outcome goes to a different surface entirely.
+   *
+   * A conflicted merge is a success with work attached — real `MERGE_HEAD` state is on disk —
+   * and the one component that can finish it is the resolver, so this dismisses the popup and
+   * opens the conflicts list the way `keys/dispatch.ts` does after a conflicted pull, and for
+   * its reason: the toast-or-note route says "2 files to resolve" and offers nothing that
+   * resolves them. The popup closes first because the user's next act is resolving, not branch
+   * picking. (The popup's own Pull leaves conflicts as a note instead — it already has the
+   * divergence dialog stacked over it; unifying the two routes is a known follow-up.)
+   *
+   * A `checkoutWouldOverwrite` here goes through `explain`, never the refusal panel: that
+   * panel's stash buttons are *checkout* gestures, and after a blocked merge they would stash
+   * the user's work and then merge with it off screen.
+   */
+  const tryMerge = (name: string) => {
+    if (project === null || repo === null || busy) return
+    const p = project
+    const r = repo
+    const repoName = lists.length > 1 ? (list?.repo.name ?? '') : ''
+    setMode({ kind: 'list' })
+    // The row menu the panel was opened from, or the list comes back with it still open.
+    setOpenRow(null)
+    search.current?.focus()
+    // Same load-bearing `busy` as `tryCheckout`: a double-click on Merge must not start a
+    // second merge over the `MERGE_HEAD` the first one may be about to write.
+    useBranches.setState({ busy: true, note: null })
+    void (async () => {
+      try {
+        const outcome = await branchApi.merge(p, r, name)
+        if (outcome.conflicts.length > 0) {
+          onDismiss()
+          const state = await branchApi.conflicts(p, r)
+          if (state !== null) showConflicts({ project: p, repo: r, repoName, state })
+          return
+        }
+        useBranches.getState().say(mergeNote(outcome))
+      } catch (error) {
+        useBranches.getState().say(explain(error, 'merge'))
+      } finally {
+        useBranches.setState({ busy: false })
+        await useBranches.getState().load(p, true)
       }
     })()
   }
@@ -685,6 +738,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                 <Row
                   key={`${entry.remote ? 'r' : 'l'}:${entry.name}`}
                   entry={entry}
+                  head={list?.head ?? null}
                   // The section headings are drawn from the transition rather than by
                   // splitting the array: one flat list is one keyboard sequence, and the
                   // heading is a property of the boundary.
@@ -696,6 +750,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   onToggleMenu={() => setOpenRow(openRow === entry.name ? null : entry.name)}
                   onCheckout={() => tryCheckout(entry.name)}
                   onNewFrom={() => setMode({ kind: 'new', from: entry.name })}
+                  onMerge={() => setMode({ kind: 'merge', name: entry.name })}
                   onRename={() => setMode({ kind: 'rename', from: entry.name })}
                   onDelete={() => setMode({ kind: 'delete', name: entry.name, force: false })}
                 />
@@ -788,6 +843,15 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
           </div>
         )}
 
+        {mode.kind === 'merge' && (
+          <MergePanel
+            ask={mergeConfirm(mode.name, list?.head.head ?? 'the current branch')}
+            busy={busy}
+            onCancel={back}
+            onMerge={() => tryMerge(mode.name)}
+          />
+        )}
+
         {mode.kind === 'refusal' && (
           <div className={styles.panel}>
             <p className={styles.panelTitle}>
@@ -869,6 +933,8 @@ function sectionOf(entry: BranchRef, previous: BranchRef | undefined): string | 
 
 interface RowProps {
   entry: BranchRef
+  /** The repository's HEAD — what a merge would merge *into*. `actionsFor` gates on it. */
+  head: BranchInfo | null
   heading: string | null
   /** Stable per index, so the field's `aria-activedescendant` can name it. */
   id: string
@@ -879,12 +945,13 @@ interface RowProps {
   onToggleMenu: () => void
   onCheckout: () => void
   onNewFrom: () => void
+  onMerge: () => void
   onRename: () => void
   onDelete: () => void
 }
 
-function Row({ entry, heading, id, active, open, busy, ...on }: RowProps) {
-  const actions = actionsFor(entry)
+function Row({ entry, head, heading, id, active, open, busy, ...on }: RowProps) {
+  const actions = actionsFor(entry, head)
   /*
    * `null` rather than `''` when the count is zero, and the distinction is the whole point: an
    * arrow with no number beside it is a claim about direction with no magnitude, which is not
@@ -957,6 +1024,11 @@ function Row({ entry, heading, id, active, open, busy, ...on }: RowProps) {
               New branch from here
             </button>
           )}
+          {actions.includes('merge') && (
+            <button type="button" className={styles.menuItem} onClick={on.onMerge}>
+              Merge into current branch
+            </button>
+          )}
           {actions.includes('rename') && (
             <button type="button" className={styles.menuItem} onClick={on.onRename}>
               Rename
@@ -970,6 +1042,37 @@ function Row({ entry, heading, id, active, open, busy, ...on }: RowProps) {
         </div>
       )}
     </>
+  )
+}
+
+interface MergePanelProps {
+  /** `branchModel::mergeConfirm`'s question, built by the caller so the check can pin it. */
+  ask: { title: string; body: string }
+  busy: boolean
+  onCancel: () => void
+  onMerge: () => void
+}
+
+/**
+ * The merge confirmation — the delete panel's shape, without delete's escalation: there is no
+ * harder question a merge can come back with, because the refusals (`operationInProgress`,
+ * `checkoutWouldOverwrite`, …) are sentences for the note bar, and a conflict is not a refusal
+ * at all — it dismisses the popup and opens the resolver.
+ */
+function MergePanel({ ask, busy, onCancel, onMerge }: MergePanelProps) {
+  return (
+    <div className={styles.panel}>
+      <p className={styles.panelTitle}>{ask.title}</p>
+      <p className={styles.panelBody}>{ask.body}</p>
+      <div className={styles.panelButtons}>
+        <button type="button" className={styles.action} onClick={onCancel}>
+          Cancel
+        </button>
+        <button type="button" className={styles.primary} disabled={busy} onClick={onMerge}>
+          Merge
+        </button>
+      </div>
+    </div>
   )
 }
 

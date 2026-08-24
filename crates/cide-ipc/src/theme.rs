@@ -98,6 +98,10 @@ pub fn fallback(role: &str) -> Option<&'static str> {
     Some(match role {
         // Surface. `bg` and `fg` have no fallback and are required of every scheme.
         //
+        // `sel` is filled by [`ColorScheme::normalise`] before this table can be consulted — see
+        // there — so this entry is the floor and not the path. It stays because the chain has to
+        // be total for every role, and a role with no entry is a hang waiting to be written.
+        //
         // There is deliberately no `line` role. The caret's line is *derived* from `sel` in CSS,
         // at 40%, and `EditorSurface.module.css` carries the thirty-line argument for why: it is
         // painted **above** the selection layer, so anything opaque there hides the selection on
@@ -132,10 +136,13 @@ pub fn fallback(role: &str) -> Option<&'static str> {
         "number" => "fg",
         "property" => "fg",
         "variable" => "fg",
-        // Punctuation is the one chain that is three deep, and it runs towards the quietest of
-        // the three rather than away from it.
+        // Punctuation falls to the **foreground**, not to the operator role, and that is what VS
+        // Code does with punctuation a theme says nothing about. It used to run
+        // `bracket → punctuation → operator`, on the reasoning that the three are neighbours —
+        // but `operator` is a *keyword* in TextMate and is usually coloured like one, so a theme
+        // silent about punctuation had its commas and brackets painted keyword red.
         "bracket" => "punctuation",
-        "punctuation" => "operator",
+        "punctuation" => "fg",
         "operator" => "fg",
         "strong" => "heading",
         "heading" => "fg",
@@ -144,6 +151,31 @@ pub fn fallback(role: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// How far a selection must sit from the background before it reads as a selection at all.
+///
+/// Redmean units — see [`distance`]. 72 is the light theme's own `--tk-sel` measured against its
+/// background; the dark one is at 124. Below about 50 a selection is a shade the eye does not
+/// register as a state change, which is exactly what was reported of an imported theme that
+/// carried no `editor.selectionBackground`: *"no selection visible at all, like I'm just moving
+/// the cursor."*
+pub const MIN_SELECTION_DISTANCE: f64 = 72.0;
+
+/// What a derived selection is tinted towards, per polarity.
+///
+/// **Chroma, not lightness, and that is the whole trick.** Contrast against a selection is
+/// `(ink + 0.05) / (selection + 0.05)`, so any selection brighter than the background taxes every
+/// ink at once — the failure `tokens.css` argues out at length for cide's own dark scheme. A deep
+/// saturated blue sits at roughly the luminance of a dark editor's background while being
+/// obviously a different colour, so a tint towards it buys visibility for almost no contrast.
+/// Measured across real themes, a dark scheme keeps 93–99% of its ink contrast this way where
+/// blending towards the foreground kept far less and was still invisible.
+///
+/// A light background cannot play that trick — there is nothing above white — so the light tint
+/// is a mid blue and the cost is real but bounded, the same 0.84-ish the built-in light scheme
+/// already pays.
+const SELECTION_TINT_DARK: &str = "#0d20a0";
+const SELECTION_TINT_LIGHT: &str = "#4a90ff";
 
 /// One imported colour scheme, resolved and total.
 ///
@@ -229,6 +261,57 @@ impl ColorScheme {
             let value = value.unwrap_or_else(|| self.colors["fg"].clone());
             self.colors.insert(role.into(), value);
         }
+
+        // The selection last, because deriving one needs to know every ink it will be painted
+        // under — and it is *validated*, not merely filled.
+        //
+        // Filling was the first attempt and was not enough. A theme is free to carry no
+        // `editor.selectionBackground` at all (Min Dark does), in which case the chain above has
+        // just answered `bg` and the selection is invisible; but a theme can also carry one that
+        // is useless in practice — an alpha-only tint whose opaque form is its own background, or
+        // a value that simply sits too close to it. Both produce the same report, so both get the
+        // same answer: if it does not read as a selection, replace it.
+        //
+        // Overriding a value the theme did state is a real intrusion and worth naming. It is
+        // taken because the alternative is a feature that silently does not work — a user
+        // dragging across code and seeing the caret move and nothing else — and because
+        // `ColorScheme` is a *rendering* of a theme rather than a copy of one.
+        let bg = self.colors["bg"].clone();
+        let current = self
+            .colors
+            .get("sel")
+            .cloned()
+            .unwrap_or_else(|| bg.clone());
+        if distance(&current, &bg).is_none_or(|d| d < MIN_SELECTION_DISTANCE) {
+            let derived = self.derive_selection(&bg);
+            self.colors.insert("sel".into(), derived);
+        }
+    }
+
+    /// The gentlest tint towards [`SELECTION_TINT_DARK`]/`_LIGHT` that still reads as a selection.
+    ///
+    /// *Gentlest* is the whole criterion: every step away from the background costs some ink some
+    /// contrast, so the answer is the first candidate that clears [`MIN_SELECTION_DISTANCE`]
+    /// rather than the most visible one available. Stepping in 2% increments is finer than any
+    /// eye can resolve and bounds the loop at 33 iterations.
+    ///
+    /// If no tint reaches the bar — a background already so blue that a blue tint cannot move it
+    /// — the strongest candidate is returned. Visibility is the reported failure; a selection
+    /// that is hard to read beats one that is not there.
+    fn derive_selection(&self, bg: &str) -> String {
+        let tint = match self.polarity {
+            Theme::Dark => SELECTION_TINT_DARK,
+            Theme::Light => SELECTION_TINT_LIGHT,
+        };
+        let mut strongest = blend(bg, tint, 0.02);
+        for step in 1..=33 {
+            let candidate = blend(bg, tint, f64::from(step) * 0.02);
+            if distance(&candidate, bg).is_some_and(|d| d >= MIN_SELECTION_DISTANCE) {
+                return candidate;
+            }
+            strongest = candidate;
+        }
+        strongest
     }
 }
 
@@ -256,6 +339,75 @@ pub fn normalise_hex(raw: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("#{}", six.to_ascii_lowercase()))
+}
+
+/// `fraction` of the way from `from` towards `towards`, in sRGB. Both must be hex; `from` is
+/// returned unchanged if either is not.
+///
+/// sRGB rather than a perceptual space on purpose: this is the same arithmetic CSS's
+/// `color-mix(in srgb, …)` does, and `EditorSurface.module.css` composites the caret's line with
+/// exactly that function. Two blends of the same pair that disagreed would be a selection and an
+/// active line that do not line up.
+pub fn blend(from: &str, towards: &str, fraction: f64) -> String {
+    let (Some(a), Some(b)) = (channels(from), channels(towards)) else {
+        return from.to_string();
+    };
+    let f = fraction.clamp(0.0, 1.0);
+    let mix = |i: usize| (a[i] as f64 + (b[i] as f64 - a[i] as f64) * f).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", mix(0), mix(1), mix(2))
+}
+
+/// The three channels of a normalised hex colour.
+fn channels(hex: &str) -> Option<[u8; 3]> {
+    let body = normalise_hex(hex)?;
+    let bytes = body.as_bytes();
+    let at = |i: usize| u8::from_str_radix(std::str::from_utf8(&bytes[i..i + 2]).ok()?, 16).ok();
+    Some([at(1)?, at(3)?, at(5)?])
+}
+
+/// How far apart two colours *look*, or `None` if either is not a hex colour.
+///
+/// Thiadmer Riemersma's redmean weighted RGB distance, the same metric `check-theme.mjs` and
+/// `check-scheme.mjs` use, restated here because those are JavaScript and this is not. Range is
+/// roughly 0…765.
+///
+/// **Not a contrast ratio, and the difference decides the answer.** Contrast is a ratio of
+/// luminance and asks whether ink can be read on a ground. Whether a *fill* is visible is a
+/// different question: the built-in dark selection is 1.12:1 against its background — no contrast
+/// to speak of — and perfectly obvious, because it is a different colour. A contrast ratio would
+/// rate it as invisible and rate the value it replaced as fine.
+pub fn distance(a: &str, b: &str) -> Option<f64> {
+    let (x, y) = (channels(a)?, channels(b)?);
+    let mean = (f64::from(x[0]) + f64::from(y[0])) / 2.0;
+    let d = |i: usize| f64::from(x[i]) - f64::from(y[i]);
+    Some(
+        ((2.0 + mean / 256.0) * d(0) * d(0)
+            + 4.0 * d(1) * d(1)
+            + (2.0 + (255.0 - mean) / 256.0) * d(2) * d(2))
+        .sqrt(),
+    )
+}
+
+/// Flatten `#rrggbbaa` (or `#rgba`) onto `ground`, giving the opaque colour that would be drawn.
+///
+/// **Compositing rather than dropping the alpha, which is what this used to do.** VS Code themes
+/// write `editor.selectionBackground` with an alpha channel far more often than not, and the two
+/// answers are nothing alike: `#ffffff20` composited over a dark editor is a barely-lifted grey,
+/// which is what the theme meant, while `#ffffff` with the alpha discarded is a white block over
+/// the text. The stored value is still six hex digits — `ColorScheme` has no notion of
+/// translucency and `check-scheme.mjs` takes contrast ratios of every role — so what is being
+/// kept is the *rendering* the theme asked for rather than its notation.
+///
+/// An opaque or malformed input passes through [`normalise_hex`] unchanged.
+pub fn composite(raw: &str, ground: &str) -> Option<String> {
+    let body = raw.trim().strip_prefix('#')?;
+    let alpha = match body.len() {
+        4 => u8::from_str_radix(&body[3..4].repeat(2), 16).ok()?,
+        8 => u8::from_str_radix(&body[6..8], 16).ok()?,
+        _ => return normalise_hex(raw),
+    };
+    let over = normalise_hex(raw)?;
+    Some(blend(ground, &over, f64::from(alpha) / 255.0))
 }
 
 /// Relative luminance, per WCAG. Used to guess a polarity when a theme does not declare one, and
@@ -317,9 +469,14 @@ mod tests {
             assert!(scheme.colors.contains_key(*role), "{role} is missing");
         }
         assert!(!scheme.colors.contains_key("editor.background"));
-        // `doc` → `comment` is one hop; `bracket` → `punctuation` → `operator` is two.
+        // `doc` → `comment` is one hop.
         assert_eq!(scheme.colors["doc"], "#888888");
-        assert_eq!(scheme.colors["bracket"], "#777777");
+        // `bracket` → `punctuation` → `fg`, and **not** through `operator`, even though this
+        // scheme states one. VS Code paints punctuation a theme is silent about with the
+        // foreground; routing it through the operator role painted Min Dark's commas and
+        // brackets in that theme's keyword red. See `fallback`.
+        assert_eq!(scheme.colors["bracket"], "#ffffff");
+        assert_eq!(scheme.colors["operator"], "#777777");
         // A value that is not a colour is dropped and then refilled from the chain, rather than
         // surviving as itself and reaching the DOM.
         assert_eq!(scheme.colors["keyword"], "#ffffff");
@@ -346,6 +503,128 @@ mod tests {
                 "the chain from {role} ends at {at} rather than at fg or bg"
             );
         }
+    }
+
+    /// A theme with no `editor.selectionBackground` — Min Dark is a real one — must not get an
+    /// invisible selection. Reported as *"no selection visible at all, like I'm just moving the
+    /// cursor"*.
+    #[test]
+    fn a_scheme_with_no_selection_gets_a_visible_one() {
+        let mut scheme = dark_scheme(&[("bg", "#1f1f1f"), ("fg", "#7d7d7d")]);
+        scheme.normalise();
+        let sel = &scheme.colors["sel"];
+        let apart = distance(sel, "#1f1f1f").expect("hex");
+        assert!(
+            apart >= MIN_SELECTION_DISTANCE,
+            "derived {sel} is only {apart:.0} from the background"
+        );
+    }
+
+    /// A selection the theme *did* state, but which is useless in practice, is replaced on the
+    /// same terms. An alpha-only tint whose opaque form is its own background is the common way
+    /// to reach this; a theme that simply picked a near-background value is the other.
+    #[test]
+    fn a_selection_too_close_to_the_background_is_replaced() {
+        let mut scheme = dark_scheme(&[("bg", "#1f1f1f"), ("fg", "#d0d0d0"), ("sel", "#212121")]);
+        scheme.normalise();
+        assert_ne!(scheme.colors["sel"], "#212121");
+        assert!(distance(&scheme.colors["sel"], "#1f1f1f").expect("hex") >= MIN_SELECTION_DISTANCE);
+    }
+
+    /// A usable selection is left exactly as the theme wrote it. The override above is an
+    /// intrusion and must not happen to a theme that got it right.
+    #[test]
+    fn a_usable_selection_is_left_alone() {
+        let mut scheme = dark_scheme(&[("bg", "#1f1f1f"), ("fg", "#d0d0d0"), ("sel", "#264f78")]);
+        scheme.normalise();
+        assert_eq!(scheme.colors["sel"], "#264f78");
+    }
+
+    /// The derived selection must be visible **without** costing the inks their contrast — the
+    /// failure that took three rounds to get right for the built-in dark scheme. A tint towards a
+    /// deep blue is what buys both at once.
+    #[test]
+    fn a_derived_selection_preserves_ink_contrast() {
+        for (bg, fg) in [
+            ("#1f1f1f", "#7d7d7d"),
+            ("#282c34", "#abb2bf"),
+            ("#000000", "#dddddd"),
+        ] {
+            let mut scheme = dark_scheme(&[("bg", bg), ("fg", fg)]);
+            scheme.normalise();
+            let sel = &scheme.colors["sel"];
+            let ratio = |a: &str, b: &str| {
+                let (x, y) = (luminance(a).unwrap(), luminance(b).unwrap());
+                (x.max(y) + 0.05) / (x.min(y) + 0.05)
+            };
+            let kept = ratio(fg, sel) / ratio(fg, bg);
+            assert!(
+                kept >= 0.85,
+                "{bg}: the derived {sel} costs {:.0}% of the ink's contrast",
+                (1.0 - kept) * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_is_composited_onto_the_ground_rather_than_dropped() {
+        // 60% of #264f78 over #1e1e1e — what VS Code paints, not #264f78.
+        assert_eq!(
+            composite("#264f7899", "#1e1e1e").as_deref(),
+            Some("#233b54")
+        );
+        // A translucent white is a lifted grey, not a white block over the text.
+        assert_eq!(
+            composite("#ffffff20", "#000000").as_deref(),
+            Some("#202020")
+        );
+        // Fully opaque and fully transparent are the two ends.
+        assert_eq!(
+            composite("#264f78ff", "#1e1e1e").as_deref(),
+            Some("#264f78")
+        );
+        assert_eq!(
+            composite("#264f7800", "#1e1e1e").as_deref(),
+            Some("#1e1e1e")
+        );
+        // No alpha channel: unchanged.
+        assert_eq!(composite("#264f78", "#1e1e1e").as_deref(), Some("#264f78"));
+        assert_eq!(composite("not a colour", "#1e1e1e"), None);
+    }
+
+    #[test]
+    fn distance_sees_a_colour_change_that_contrast_cannot() {
+        // The built-in dark selection against its background: no contrast to speak of, and
+        // obviously a different colour. A ratio would call it invisible.
+        let (a, b) = (luminance("#0d1560").unwrap(), luminance("#151518").unwrap());
+        let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        assert!(ratio < 1.2, "{ratio}");
+        assert!(distance("#0d1560", "#151518").unwrap() > MIN_SELECTION_DISTANCE);
+    }
+
+    /// A dark scheme carrying only the roles named, for the tests above.
+    fn dark_scheme(pairs: &[(&str, &str)]) -> ColorScheme {
+        ColorScheme {
+            id: "t".into(),
+            name: "T".into(),
+            polarity: Theme::Dark,
+            colors: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn blending_matches_css_color_mix_in_srgb() {
+        assert_eq!(blend("#000000", "#ffffff", 0.5), "#808080");
+        assert_eq!(blend("#000000", "#ffffff", 0.0), "#000000");
+        assert_eq!(blend("#000000", "#ffffff", 1.0), "#ffffff");
+        // Out of range is clamped rather than extrapolated into a colour that is not one.
+        assert_eq!(blend("#000000", "#ffffff", 4.0), "#ffffff");
+        // A non-colour in either position leaves the first unchanged rather than inventing one.
+        assert_eq!(blend("#123456", "not a colour", 0.5), "#123456");
     }
 
     #[test]

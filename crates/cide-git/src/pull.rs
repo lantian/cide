@@ -465,7 +465,11 @@ impl Integrated {
 ///
 /// Always old-local-tree → final-tree, and never merge-base → upstream. For a merge those are
 /// different sets, and the first one is the answer to the question that was asked.
-fn diff_totals(repo: &Repository, from: &Tree<'_>, to: &Tree<'_>) -> Result<(u32, u32, u32)> {
+pub(crate) fn diff_totals(
+    repo: &Repository,
+    from: &Tree<'_>,
+    to: &Tree<'_>,
+) -> Result<(u32, u32, u32)> {
     let stats = repo
         .diff_tree_to_tree(Some(from), Some(to), None)
         .wrap()?
@@ -487,7 +491,7 @@ fn diff_totals(repo: &Repository, from: &Tree<'_>, to: &Tree<'_>) -> Result<(u32
 /// Used for both halves of a divergence — what came down, and what a rebase would replay — so
 /// the dialog and the outcome describe their sets with the same cap and cannot disagree about
 /// how many there were.
-fn taken_commits(
+pub(crate) fn taken_commits(
     repo: &Repository,
     tip: Oid,
     hidden: Oid,
@@ -516,7 +520,7 @@ fn taken_commits(
 }
 
 /// Eight hex digits, the width every other short oid in this crate uses.
-fn short_oid(oid: Oid) -> String {
+pub(crate) fn short_oid(oid: Oid) -> String {
     oid.to_string().chars().take(8).collect()
 }
 
@@ -895,7 +899,7 @@ fn merges_among(repo: &Repository, oids: &[Oid]) -> Result<Vec<PulledCommit>> {
 /// Best-effort: a repository where this fails is one where the pull is about to fail anyway,
 /// and refusing to pull because a convenience ref could not be written would be the wrong
 /// trade.
-fn write_orig_head(repo: &Repository, was: Oid) {
+pub(crate) fn write_orig_head(repo: &Repository, was: Oid) {
     let _ = repo.reference("ORIG_HEAD", was, true, "cide: pull");
 }
 
@@ -912,7 +916,7 @@ fn write_orig_head(repo: &Repository, was: Oid) {
 /// pull followed by a commit could ask the user to reconcile an index nobody but cide had
 /// touched. Same `let _` as `replay::replay`: a sidecar that cannot be written is a warning,
 /// not a reason to report a pull that happened as failed.
-fn settle(root: &Path, repo: &Repository) {
+pub(crate) fn settle(root: &Path, repo: &Repository) {
     let _ = changelist::record_index(root, repo);
     // The pulled paths either arrived as commits, and so have no pending change, or landed as
     // conflicts, which live outside changelists entirely. Either way no changelist needs

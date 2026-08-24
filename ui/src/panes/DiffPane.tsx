@@ -17,6 +17,7 @@ import { MergeView, unifiedMergeView } from '@codemirror/merge'
 import { history, historyKeymap } from '@codemirror/commands'
 import { EditorState } from '@codemirror/state'
 import { EditorView, keymap, lineNumbers } from '@codemirror/view'
+import { polarityExtension, polaritySlot, watchPolarity } from '@/editor/cmPolarity'
 import {
   getDiffView,
   getServerDiffView,
@@ -280,7 +281,11 @@ export function DiffPane({
      * guards on `state.readOnly` and returns `false`, so the read-only `a` side refuses it
      * without a second array. See `editor/editorKeys.ts` for the binding and the chord trade.
      */
+    // Which polarity CodeMirror thinks it is drawing in. Without it this pane is a light-mode
+    // CodeMirror under the dark theme; `editor/cmPolarity.ts` has the argument and the bug.
+    const polarity = polaritySlot()
     const shared = [
+      polarityExtension(polarity),
       lineNumbers(),
       EditorView.lineWrapping,
       history(),
@@ -346,7 +351,11 @@ export function DiffPane({
           ],
         })
         bufferRef.current = view
-        destroyRef.current = () => view.destroy()
+        const stopPolarity = watchPolarity(view, polarity)
+        destroyRef.current = () => {
+          stopPolarity()
+          view.destroy()
+        }
       } else {
         const view = new MergeView({
           // A: the file as it stands. Read-only in both senses — `readOnly` stops commands and
@@ -368,7 +377,15 @@ export function DiffPane({
           collapseUnchanged,
         })
         bufferRef.current = view.b
-        destroyRef.current = () => view.destroy()
+        // A `MergeView` is not an `EditorView`; it owns two, and each carries its own copy of
+        // the shared extensions, so each needs its own subscription to the same compartment.
+        const stopA = watchPolarity(view.a, polarity)
+        const stopB = watchPolarity(view.b, polarity)
+        destroyRef.current = () => {
+          stopA()
+          stopB()
+          view.destroy()
+        }
       }
     } catch (e) {
       // A third-party constructor run over arbitrary file contents, in an app with no error

@@ -41,6 +41,7 @@
  * selection rather than carrying it across.
  */
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -104,6 +105,16 @@ import { noteRepoRoots, repoRoot, touchesFile } from '@/sidebar/GitPanel/repoRoo
 // about whether an index-only burst counts. See the `onFsChanged` subscription below.
 import { gitRefsMoved } from '@/gitlog/logModel'
 import { blameFor, blameRefusal, type BlameLookup } from './diffBlame'
+import {
+  columnRows,
+  hunkSegments,
+  presentSegments,
+  splitLines,
+  wholeFileSegments,
+  type ColumnRow,
+  type DisplaySegment,
+} from './diffRows'
+import { insertMarkers, mapScroll, rowSpans, type SyncGeometry } from './diffSync'
 import { diffTabOnScreen } from './diffTabs'
 import { Icon } from '@/icons/Icon'
 
@@ -179,71 +190,19 @@ function rowClass(origin: LineOrigin): string {
 export const DIFF_SPLIT_MIN_PX = 860
 
 /**
- * One row of a side-by-side hunk: what is on the left, what is on the right, either may be
- * absent.
+ * What one drawn line carries beside its text: the wire position, or none.
  *
  * `at` is the index into `hunk.lines` — the second half of a `hunk:line` mark — and it is
- * `null` on the mirrored half of a context row. A context line is one entry in the unified
- * diff and is drawn twice here, so exactly one of the two cells carries the position; without
- * that rule the same mark would appear twice in the DOM and "the rows drawn as selected" would
- * no longer be a set of positions.
+ * `null` on a row that must not carry one: the right column's copy of a context line, or a
+ * gap line the whole-file reconstruction synthesized. A context line is one entry in the
+ * unified diff and is drawn twice in the split layout, so exactly one of the two carries the
+ * position; without that rule the same mark would appear twice in the DOM and "the rows
+ * drawn as selected" would no longer be a set of positions. The grouping itself — which
+ * lines share a run, which column they land in — is `diffRows.columnRows` now.
  */
 export interface SplitCell {
   line: DiffLineView
   at: number | null
-}
-
-export interface SplitRow {
-  left: SplitCell | null
-  right: SplitCell | null
-}
-
-/**
- * Pair a hunk's unified rows into two columns.
- *
- * A run of deletions immediately followed by a run of additions is one edit, so the two runs
- * are zipped: the first deletion faces the first addition, and whichever run is shorter leaves
- * blanks at the bottom. That is what makes a side-by-side diff readable — the changed line and
- * what it became are on the same row — and it is the whole content of "side by side"; anything
- * finer (matching by similarity rather than by position) is a diff algorithm, and the diff has
- * already been computed by libgit2.
- *
- * A deletion *after* an addition starts a new pair group rather than joining the one before
- * it. `git` emits `-` before `+` within an edit, so `+` then `-` means two separate edits that
- * happen to be adjacent, and zipping across the boundary would face a line against a line from
- * a different change.
- *
- * Pure and exported so it can be reasoned about on its own; it is also what
- * `ui/scripts/check-diff-render.mjs` would assert against if the split view ever grows
- * fixtures of its own.
- */
-export function splitHunk(hunk: DiffHunkView): SplitRow[] {
-  const out: SplitRow[] = []
-  let dels: SplitCell[] = []
-  let adds: SplitCell[] = []
-
-  const flush = (): void => {
-    for (let i = 0; i < Math.max(dels.length, adds.length); i++) {
-      out.push({ left: dels[i] ?? null, right: adds[i] ?? null })
-    }
-    dels = []
-    adds = []
-  }
-
-  hunk.lines.forEach((line, at) => {
-    if (line.origin === 'deletion') {
-      if (adds.length > 0) flush()
-      dels.push({ line, at })
-    } else if (line.origin === 'addition') {
-      adds.push({ line, at })
-    } else {
-      flush()
-      // The position rides on the left cell; the right one is the same text, unnumbered.
-      out.push({ left: { line, at }, right: { line, at: null } })
-    }
-  })
-  flush()
-  return out
 }
 
 /**
@@ -310,6 +269,15 @@ export interface DrawnDiff {
   readonly status: FileState
   readonly binary: boolean
   readonly hunks: readonly DiffHunkView[]
+  /**
+   * Both sides whole, for the IDEA-style whole-file rendering, or `null` where the backend
+   * withheld them — see `FileDiff::old_text` in `cide-ipc`. The view treats `null` as "draw
+   * the hunks alone", which is every diff this pane ever drew before M25.
+   */
+  readonly oldText: string | null
+  readonly newText: string | null
+  /** An existing side was over the byte cap; the one case worth a sentence in the pane. */
+  readonly textsOmitted: boolean
 }
 
 /** What both arms carry. Everything here is about *painting* the diff. */
@@ -366,6 +334,15 @@ interface GitDiffViewCommon {
    */
   onBlame?: ((on: boolean) => void) | undefined
   onCollapse: (hunk: number) => void
+  /**
+   * Gaps the user has opened in a folded whole-file view. Optional, like `view`, so every
+   * fixture and call site that predates the whole-file rendering keeps compiling — and an
+   * absent set is an empty one, which for a file under `WHOLE_FILE_COLLAPSE_ABOVE` lines is
+   * also the only one there is.
+   */
+  expandedGaps?: ReadonlySet<number> | undefined
+  /** Absent ⇒ fold rows draw disabled. The wiring owns the set; this is one gap opening. */
+  onExpandGap?: ((gap: number) => void) | undefined
 }
 
 /**
@@ -424,6 +401,9 @@ export type GitDiffViewProps = GitDiffStagingProps | GitDiffReadOnlyProps
 /** Shared by every read-only render, so the empty case allocates nothing per frame. */
 const NO_MARKS: Marks = new Set<string>()
 
+/** The default for {@link GitDiffViewCommon.expandedGaps} — one instance, for the same reason. */
+const NO_GAPS: ReadonlySet<number> = new Set<number>()
+
 /**
  * The diff, its gutters, and — on the working-tree arm — the three buttons. Pure.
  *
@@ -452,6 +432,8 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     onView,
     onBlame,
     onCollapse,
+    expandedGaps = NO_GAPS,
+    onExpandGap,
   } = props
   /**
    * The staging half of the union, or `null` on a revision diff.
@@ -524,6 +506,169 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
   const layout: DiffView = view === 'split' && wide ? 'split' : 'unified'
   const cramped = view === 'split' && !wide
 
+  /*
+   * Whether the tick boxes are drawn at all.
+   *
+   * `staging === null` withholds them from the whole revision arm: there is no index to
+   * stage two commits into, so a box there would be a control whose only possible outcome is
+   * a refusal from Rust. Computed up here, before the no-diff return, because the split
+   * model below is a hook and hooks cannot sit past a conditional return.
+   */
+  const selectable =
+    staging !== null &&
+    staging.diff !== null &&
+    staging.diff.partialOk &&
+    (diff?.hunks.length ?? 0) > 0
+
+  /*
+   * The whole file, reconstructed — or `null`, which means every rendering below falls back
+   * to the hunks alone, exactly as this pane drew before M25. `diffRows.wholeFileSegments`
+   * validates the text against the hunks and refuses any disagreement, so a `null` here is
+   * "cannot be trusted whole", never an error.
+   */
+  const whole = useMemo(
+    () =>
+      diff === null || diff.hunks.length === 0
+        ? null
+        : wholeFileSegments(diff.hunks, diff.newText),
+    [diff],
+  )
+  const totalLines = useMemo(
+    () => (diff?.newText == null ? 0 : splitLines(diff.newText).length),
+    [diff],
+  )
+  const segments: DisplaySegment[] | null = useMemo(
+    () => (whole === null ? null : presentSegments(whole, totalLines, expandedGaps)),
+    [whole, totalLines, expandedGaps],
+  )
+
+  /*
+   * The split view's two columns and the run table that aligns them.
+   *
+   * The fallback arm (no whole-file model) feeds the same renderer from the hunks alone:
+   * bars carry the `@@` header — the only landmark between discontinuous line numbers — and
+   * honour the collapsed set, as the unified fallback does. The whole-file arm draws bars
+   * only where there is a staging affordance to hold; a read-only whole file has its line
+   * numbers for landmarks and a bar would say nothing they do not.
+   */
+  const split = useMemo(() => {
+    if (layout !== 'split' || diff === null || diff.hunks.length === 0) return null
+    return segments === null
+      ? columnRows(hunkSegments(diff.hunks), { bars: true, collapsed })
+      : columnRows(segments, { bars: selectable })
+  }, [layout, diff, segments, collapsed, selectable])
+
+  /*
+   * Keeping the two columns in step.
+   *
+   * # Why two scrollers now, when this pane spent a comment arguing for one
+   *
+   * The split view used to be one grid scroller with hatched filler cells wherever a side
+   * had no line — alignment by construction, no sync to write. The fillers are what lost:
+   * a column of empty cells beside an added block reads as blank lines that are not there,
+   * and IDEA's answer — the left column simply flows on, with a thin marker at the insertion
+   * point — needs the columns to be different heights, which one scroller cannot draw.
+   *
+   * `@codemirror/merge`'s `MergeView` still loses too, even though the whole documents it
+   * needs exist since M25: it aligns by inserting spacer blocks, which is the same empty
+   * space with different plumbing, and this pane's tick boxes, wire positions and blame are
+   * plain DOM keyed by `hunk:line` — rebuilding those as CodeMirror extensions buys nothing
+   * but the rebuild.
+   *
+   * The scroll-echo loop that one-scroller design feared is real and answered: writing the
+   * other column's `scrollTop` fires that column's own scroll event, *asynchronously*, so a
+   * time-released flag is down before the echo lands — `MergePane.tsx` documents the failure
+   * at length and its Set-of-marks guard is reused here verbatim in spirit. The mapping is
+   * `diffSync.mapScroll` over anchors measured once per render and after a *settled* resize
+   * (`check:resize`'s rule), never per scroll frame.
+   */
+  const [leftCol, setLeftCol] = useState<HTMLElement | null>(null)
+  const [rightCol, setRightCol] = useState<HTMLElement | null>(null)
+  const echoes = useRef<Set<'left' | 'right'>>(new Set())
+  const syncKey = useRef({})
+  useEffect(() => {
+    if (leftCol === null || rightCol === null || split === null) return
+    const spans = rowSpans(split.runs)
+    const key = syncKey.current
+    const echoSet = echoes.current
+    let geometry: SyncGeometry | null = null
+
+    /** Pixel top of every row (markers skipped — they are height 0), plus an end sentinel. */
+    const rowTops = (column: HTMLElement): number[] | null => {
+      const content = column.firstElementChild
+      if (!(content instanceof HTMLElement)) return null
+      const tops: number[] = []
+      for (const child of Array.from(content.children)) {
+        if (!(child instanceof HTMLElement)) continue
+        if (child.dataset['audit'] === 'gitDiffInsertMark') continue
+        tops.push(child.offsetTop)
+      }
+      tops.push(column.scrollHeight)
+      return tops
+    }
+    const measure = (): void => {
+      const left = rowTops(leftCol)
+      const right = rowTops(rightCol)
+      if (left === null || right === null) {
+        geometry = null
+        return
+      }
+      const anchors: Array<{ a: number; b: number }> = [{ a: 0, b: 0 }]
+      for (const span of spans) {
+        const a1 = left[span.leftFrom]
+        const b1 = right[span.rightFrom]
+        const a2 = left[span.leftTo]
+        const b2 = right[span.rightTo]
+        if (a1 === undefined || b1 === undefined || a2 === undefined || b2 === undefined) continue
+        anchors.push({ a: a1, b: b1 }, { a: a2, b: b2 })
+      }
+      anchors.push({ a: leftCol.scrollHeight, b: rightCol.scrollHeight })
+      geometry = {
+        anchors,
+        aMax: Math.max(0, leftCol.scrollHeight - leftCol.clientHeight),
+        bMax: Math.max(0, rightCol.scrollHeight - rightCol.clientHeight),
+      }
+    }
+    measure()
+
+    // Content height moves without the column resizing — a blame landing changes wrapping,
+    // a fold opens — so the observer watches the inner content, and the re-measure is
+    // deferred to a settled size like every other expensive resize reaction.
+    const observer =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(() => whenResizeSettles(key, measure))
+    const leftContent = leftCol.firstElementChild
+    const rightContent = rightCol.firstElementChild
+    if (observer !== null && leftContent !== null) observer.observe(leftContent)
+    if (observer !== null && rightContent !== null) observer.observe(rightContent)
+
+    const follow = (fromName: 'left' | 'right'): void => {
+      // Our own doing: consume the mark and stop. This is the whole loop guard.
+      if (echoSet.delete(fromName)) return
+      if (geometry === null) return
+      const from = fromName === 'left' ? leftCol : rightCol
+      const to = fromName === 'left' ? rightCol : leftCol
+      const want = mapScroll(geometry, fromName === 'left' ? 'a' : 'b', from.scrollTop)
+      // Clamped before compared: a write clamped to the value already there fires no event,
+      // and a mark laid for it would linger and swallow the next real scroll.
+      if (Math.abs(want - to.scrollTop) < 1) return
+      echoSet.add(fromName === 'left' ? 'right' : 'left')
+      to.scrollTop = want
+    }
+    const onLeft = (): void => follow('left')
+    const onRight = (): void => follow('right')
+    leftCol.addEventListener('scroll', onLeft, { passive: true })
+    rightCol.addEventListener('scroll', onRight, { passive: true })
+    return () => {
+      leftCol.removeEventListener('scroll', onLeft)
+      rightCol.removeEventListener('scroll', onRight)
+      observer?.disconnect()
+      cancelResizeSettle(key)
+      echoSet.clear()
+    }
+  }, [leftCol, rightCol, split, blame])
+
   const layoutSwitcher = (
     <div className={styles.sides} role="group" aria-label="Diff layout">
       {(['unified', 'split'] as const).map((mode) => (
@@ -536,7 +681,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
               : cramped
                 ? `This pane is under ${DIFF_SPLIT_MIN_PX}px wide, so it is drawn unified.` +
                   ' Widen it, or detach the tab, to get the two sides.'
-                : 'The two sides beside each other, in one scroller.'
+                : 'The two sides beside each other, scrolled in step.'
           }
           aria-pressed={view === mode}
           data-audit="gitDiffLayout"
@@ -682,15 +827,6 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     )
   }
 
-  /*
-   * Whether the tick boxes are drawn at all.
-   *
-   * `staging === null` is the new clause and it withholds them from the whole revision arm:
-   * there is no index to stage two commits into, so a box there would be a control whose only
-   * possible outcome is a refusal from Rust.
-   */
-  const selectable =
-    staging !== null && staging.diff !== null && staging.diff.partialOk && diff.hunks.length > 0
   const selection =
     staging === null || staging.diff === null ? null : toSelection(staging.marks, staging.diff)
   const totalChanges = diff.hunks.reduce(
@@ -719,16 +855,10 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
   const cell = (
     key: string,
     hunkIndex: number,
-    entry: SplitCell | null,
+    entry: SplitCell,
     which: 'old' | 'new' | 'both',
     className: string,
   ): ReactNode => {
-    if (entry === null) {
-      // The other side has a line here and this one does not. Kept in the flow rather than
-      // omitted so the two columns stay in step row for row — an absent cell would slide
-      // everything below it up by one and face the wrong lines against each other.
-      return <div key={key} className={`${className} ${styles.filler ?? ''}`} aria-hidden="true" />
-    }
     const { line, at } = entry
     const change = line.origin !== 'context'
     const on = at !== null && painted.has(mark(hunkIndex, at))
@@ -736,12 +866,12 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     /*
      * Which commit wrote this line — on the new side only.
      *
-     * `which === 'old'` is the split layout's left half, and it gets a spacer instead of a cell.
-     * The reason is the same one `blameFor` gives for refusing `oldLineno`: the left column is a
-     * *different document*, and annotating it needs a second blame at the other revision. The
-     * spacer is not decoration — it is the `entry === null` argument one level down. Both halves
-     * are grids with the same template, so a column present in one and absent in the other would
-     * slide the left side's code out of line with the right's for every row of the diff.
+     * `which === 'old'` is the split layout's left column, and it has no blame cell and no
+     * blame track at all. The reason is the same one `blameFor` gives for refusing
+     * `oldLineno`: the left column is a *different document*, and annotating it needs a
+     * second blame at the other revision. The columns are independent grids now, so the
+     * missing track costs nothing to alignment — the scroll sync's anchors are measured off
+     * the rendered rows, whatever their widths.
      */
     const annotated = blame !== null && which !== 'old' ? blameFor(blame, line) : null
     return (
@@ -776,10 +906,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
             {on ? <Icon name="check" size={0} /> : null}
           </button>
         )}
-        {blame !== null &&
-          (which === 'old' ? (
-            <span className={styles.blameGap} data-audit="gitDiffBlameGap" aria-hidden="true" />
-          ) : (
+        {blame !== null && which !== 'old' && (
             <span
               className={styles.blame}
               data-audit="gitDiffBlame"
@@ -816,7 +943,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
                   ? '—'
                   : `${annotated.oid} ${annotated.author}`}
             </span>
-          ))}
+        )}
         {which === 'both' ? (
           <>
             <span className={styles.lineno}>{line.oldLineno ?? ''}</span>
@@ -836,6 +963,153 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     )
   }
 
+  /** The tri-state hunk box, one markup for the sticky header and the slim bar. */
+  const hunkBox = (hunkIndex: number): ReactNode => {
+    const state =
+      staging === null || staging.diff === null
+        ? 'none'
+        : hunkState(staging.marks, staging.diff, hunkIndex)
+    return (
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={state === 'all' ? true : state === 'some' ? 'mixed' : false}
+        aria-label={`Select hunk ${hunkIndex + 1}`}
+        className={styles.box}
+        data-audit="gitDiffHunkBox"
+        data-state={state}
+        onClick={() => {
+          if (staging === null || staging.diff === null) return
+          staging.onMarks(toggleHunk(staging.marks, staging.diff, hunkIndex))
+        }}
+      >
+        {state === 'all' ? (
+          <Icon name="check" size={0} />
+        ) : state === 'some' ? (
+          <Icon name="minus" size={0} />
+        ) : null}
+      </button>
+    )
+  }
+
+  const hunkActionButton = (hunkIndex: number): ReactNode => (
+    <button
+      type="button"
+      className={styles.hunkAction}
+      disabled={busy}
+      // The whole hunk, whatever is ticked — the gesture people expect from a hunk header,
+      // and the shortest path to `Selection::Hunks`. The same `hunkMarks` the checkbox
+      // uses, so the two cannot disagree about what "this hunk" means.
+      onClick={() => {
+        if (staging === null || staging.diff === null) return
+        staging.onApply(new Set(hunkMarks(staging.diff, hunkIndex)))
+      }}
+    >
+      {op === 'stage' ? 'Stage hunk' : 'Unstage hunk'}
+    </button>
+  )
+
+  /**
+   * The slim per-hunk strip the non-sticky layouts draw: the whole-file unified view (the
+   * staging affordances have nowhere else to live once the `@@` headers are gone) and both
+   * arms of the split view. In the split, `which` keeps the controls in the left column
+   * only — a box per column would be two checkboxes for one hunk — while the bar itself
+   * renders in both so the columns keep equal heights across it. The fallback split (no
+   * whole-file model) is the one place the `@@` text survives: there the line numbers jump
+   * between hunks and the header is the only landmark saying by how much.
+   */
+  const hunkBar = (hunkIndex: number, which: 'old' | 'new' | 'both', key: string): ReactNode => {
+    const withHeader = segments === null
+    const controls = selectable && which !== 'new'
+    const shut = collapsed.has(hunkIndex)
+    return (
+      <div key={key} className={styles.hunkBar} data-audit="gitDiffHunkBar">
+        {controls && hunkBox(hunkIndex)}
+        {withHeader ? (
+          <button
+            type="button"
+            className={styles.hunkTitle}
+            aria-expanded={!shut}
+            onClick={() => onCollapse(hunkIndex)}
+          >
+            <span className={styles.caret}>
+              <Icon name={shut ? 'chevron-right' : 'chevron-down'} size={1} />
+            </span>
+            {diff.hunks[hunkIndex]?.header ?? ''}
+          </button>
+        ) : (
+          <span className={styles.hunkFill} />
+        )}
+        {controls && op !== 'commit' && hunkActionButton(hunkIndex)}
+      </div>
+    )
+  }
+
+  /** A folded gap: one full-width row saying what is hidden, click to open. */
+  const foldRow = (gap: number, count: number, key: string): ReactNode => (
+    <button
+      key={key}
+      type="button"
+      className={styles.fold}
+      data-audit="gitDiffExpand"
+      data-count={`${count}`}
+      aria-label={`Expand ${count} unchanged lines`}
+      disabled={onExpandGap === undefined}
+      onClick={() => onExpandGap?.(gap)}
+    >
+      ⋯ {count} unchanged lines
+    </button>
+  )
+
+  /**
+   * One column of the split view. The insertion markers are interleaved between rows at the
+   * boundaries `diffSync.insertMarkers` names — zero-height, so they cost the measured
+   * anchors nothing — and `beforeRow` may equal the row count for an insertion at end of
+   * file, which is why the last marker is looked up separately.
+   */
+  const column = (side: 'old' | 'new', rows: readonly ColumnRow[]): ReactNode => {
+    if (split === null) return null
+    const colName = side === 'old' ? 'left' : 'right'
+    const tones = new Map<number, 'add' | 'del'>()
+    for (const marker of insertMarkers(split.runs)) {
+      if (marker.column === colName) tones.set(marker.beforeRow, marker.tone)
+    }
+    const markEl = (tone: 'add' | 'del', key: string): ReactNode => (
+      <div
+        key={key}
+        className={styles.insertMark}
+        data-audit="gitDiffInsertMark"
+        data-tone={tone}
+        aria-hidden="true"
+      />
+    )
+    const children: ReactNode[] = []
+    rows.forEach((row, index) => {
+      const tone = tones.get(index)
+      if (tone !== undefined) children.push(markEl(tone, `m${index}`))
+      if (row.kind === 'line') {
+        children.push(cell(`r${index}`, row.hunk, { line: row.line, at: row.at }, side, styles.half ?? ''))
+      } else if (row.kind === 'bar') {
+        children.push(hunkBar(row.hunk, side, `r${index}`))
+      } else {
+        children.push(foldRow(row.gap, row.count, `r${index}`))
+      }
+    })
+    const end = tones.get(rows.length)
+    if (end !== undefined) children.push(markEl(end, `m${rows.length}`))
+    return (
+      <div
+        className={styles.column}
+        data-side={side}
+        data-boxed={selectable ? 'true' : 'false'}
+        data-blamed={side === 'new' && blame !== null ? 'true' : 'false'}
+        ref={side === 'old' ? setLeftCol : setRightCol}
+      >
+        <div className={styles.columnContent}>{children}</div>
+      </div>
+    )
+  }
+
   return (
     <div className={styles.pane} data-audit="gitDiffPane" ref={setRoot}>
       {header}
@@ -851,6 +1125,11 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
           or a rename. Tick it in the panel instead.
         </p>
       )}
+      {diff.textsOmitted && (
+        <p className={styles.note} data-audit="gitDiffTruncated">
+          This file is too large to show whole — showing the changes alone.
+        </p>
+      )}
       {staging !== null && held !== null && (
         <p className={styles.note} data-audit="gitDiffHeld">
           {held} line{held === 1 ? '' : 's'} of this file are held for the next commit.{' '}
@@ -860,126 +1139,116 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
         </p>
       )}
 
-      <div className={styles.body}>
-        {diff.hunks.length === 0 && <p className={styles.notice}>No text changes on this side.</p>}
-        {diff.hunks.map((hunk) => {
-          const state =
-            staging === null || staging.diff === null
-              ? 'none'
-              : hunkState(staging.marks, staging.diff, hunk.index)
-          const shut = collapsed.has(hunk.index)
-          return (
-            <section key={hunk.index} className={styles.hunk}>
-              <div className={styles.hunkHeader}>
-                {selectable && (
-                  <button
-                    type="button"
-                    role="checkbox"
-                    aria-checked={state === 'all' ? true : state === 'some' ? 'mixed' : false}
-                    aria-label={`Select hunk ${hunk.index + 1}`}
-                    className={styles.box}
-                    data-audit="gitDiffHunkBox"
-                    data-state={state}
-                    onClick={() => {
-                      if (staging === null || staging.diff === null) return
-                      staging.onMarks(toggleHunk(staging.marks, staging.diff, hunk.index))
-                    }}
-                  >
-                    {state === 'all' ? (
-                      <Icon name="check" size={0} />
-                    ) : state === 'some' ? (
-                      <Icon name="minus" size={0} />
-                    ) : null}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className={styles.hunkTitle}
-                  aria-expanded={!shut}
-                  onClick={() => onCollapse(hunk.index)}
-                >
-                  <span className={styles.caret}>
-                    <Icon name={shut ? 'chevron-right' : 'chevron-down'} size={1} />
-                  </span>
-                  {hunk.header}
-                </button>
-                {selectable && op !== 'commit' && (
-                  <button
-                    type="button"
-                    className={styles.hunkAction}
-                    disabled={busy}
-                    // The whole hunk, whatever is ticked — the gesture people expect from a
-                    // hunk header, and the shortest path to `Selection::Hunks`. The same
-                    // `hunkMarks` the checkbox uses, so the two cannot disagree about what
-                    // "this hunk" means.
-                    onClick={() => {
-                      if (staging === null || staging.diff === null) return
-                      staging.onApply(new Set(hunkMarks(staging.diff, hunk.index)))
-                    }}
-                  >
-                    {op === 'stage' ? 'Stage hunk' : 'Unstage hunk'}
-                  </button>
-                )}
-              </div>
-
-              {/*
-                * `data-boxed` and `data-blamed` are the row grid's column list, stated once per
-                * hunk instead of once per row.
-                *
-                * A row's cells are placed by *order*, so a template with a track for a cell that
-                * was not rendered puts every later cell one column to the left. That is not
-                * hypothetical: the read-only arm draws no tick box, and until the blame column
-                * needed a fifth track nothing had noticed that its line numbers were sitting in
-                * the box's 16px and its text in the sign's 2ch. The stylesheet spells out all
-                * four combinations; the flags are what pick one.
-                */}
-              {!shut && layout === 'unified' && (
-                <div
-                  className={styles.lines}
-                  data-boxed={selectable ? 'true' : 'false'}
-                  data-blamed={blame !== null ? 'true' : 'false'}
-                >
-                  {hunk.lines.map((line, index) =>
-                    cell(`${index}`, hunk.index, { line, at: index }, 'both', styles.row ?? ''),
-                  )}
-                </div>
-              )}
-
-              {/*
-                * Side by side. **One scroller, two columns** — the two sides are cells of the
-                * same grid row, so they are aligned by layout and scroll together because
-                * there is only one thing scrolling. That is the whole reason this is not two
-                * synchronized editors and not `@codemirror/merge`'s `MergeView`: a scroll
-                * listener writing the other pane's `scrollTop` writes a scroll event back, and
-                * the guard flag that stops the loop is the bug people spend an afternoon on.
-                * Here there is no loop to guard.
-                *
-                * `MergeView` lost for a second, harder reason. It diffs two whole *documents*,
-                * and `git_diff_file` hands this pane a patch: hunks with a few lines of context
-                * and nothing between them. The documents it would need do not exist here, and
-                * its chunks are its own — mapping a `MergeView` chunk back onto a `hunk:line`
-                * position is exactly the index arithmetic that stages the line next to the one
-                * the user ticked. `DiffPane` uses `MergeView` and is right to: it has both
-                * documents in full.
-                */}
-              {!shut && layout === 'split' && (
-                <div
-                  className={styles.lines}
-                  data-boxed={selectable ? 'true' : 'false'}
-                  data-blamed={blame !== null ? 'true' : 'false'}
-                >
-                  {splitHunk(hunk).map((row, index) => (
-                    <div key={index} className={styles.splitRow}>
-                      {cell('l', hunk.index, row.left, 'old', styles.half ?? '')}
-                      {cell('r', hunk.index, row.right, 'new', styles.half ?? '')}
+      {layout === 'split' && split !== null ? (
+        /*
+         * Side by side: two independently scrolling columns, each drawing only its own
+         * side's rows — no filler cells where the other side has a block, only a thin
+         * `.insertMark` at the insertion point. The columns are kept in step by the sync
+         * effect above; see its comment for why this replaced the one-grid layout, and
+         * `diffRows.columnRows` for the row/run model both columns and the sync read.
+         */
+        <div className={styles.splitBody} data-audit="gitDiffSplit">
+          {column('old', split.left)}
+          {column('new', split.right)}
+        </div>
+      ) : (
+        <div className={styles.body}>
+          {diff.hunks.length === 0 && (
+            <p className={styles.notice}>No text changes on this side.</p>
+          )}
+          {segments !== null ? (
+            /*
+             * The whole file, unified. Hunk rows go through the same `cell()` at the same
+             * `hunk:line` positions as ever; gap rows carry no position (`at: null`), so
+             * nothing about the selection contract moved. No `@@` headers — the line
+             * numbers are on screen — but the staging arm keeps a slim bar per hunk,
+             * because the tri-state box and "Stage hunk" have nowhere else to live.
+             *
+             * `data-boxed`/`data-blamed` are the row grid's column list, stated once for
+             * the file — same rule as the fallback below, which see.
+             */
+            <div
+              className={styles.lines}
+              data-audit="gitDiffWholeFile"
+              data-boxed={selectable ? 'true' : 'false'}
+              data-blamed={blame !== null ? 'true' : 'false'}
+            >
+              {segments.map((segment) => {
+                if (segment.kind === 'gap') {
+                  return (
+                    <div
+                      key={`g${segment.index}`}
+                      data-audit="gitDiffGap"
+                      data-count={`${segment.lines.length}`}
+                    >
+                      {segment.lines.map((line, index) =>
+                        cell(`${index}`, -1, { line, at: null }, 'both', styles.row ?? ''),
+                      )}
                     </div>
-                  ))}
-                </div>
-              )}
-            </section>
-          )
-        })}
-      </div>
+                  )
+                }
+                if (segment.kind === 'fold') {
+                  return foldRow(segment.gap, segment.count, `f${segment.gap}`)
+                }
+                return (
+                  <Fragment key={`h${segment.hunk.index}`}>
+                    {selectable && hunkBar(segment.hunk.index, 'both', `hb${segment.hunk.index}`)}
+                    {segment.hunk.lines.map((line, index) =>
+                      cell(`${index}`, segment.hunk.index, { line, at: index }, 'both', styles.row ?? ''),
+                    )}
+                  </Fragment>
+                )
+              })}
+            </div>
+          ) : (
+            diff.hunks.map((hunk) => {
+              const shut = collapsed.has(hunk.index)
+              return (
+                <section key={hunk.index} className={styles.hunk}>
+                  <div className={styles.hunkHeader}>
+                    {selectable && hunkBox(hunk.index)}
+                    <button
+                      type="button"
+                      className={styles.hunkTitle}
+                      aria-expanded={!shut}
+                      onClick={() => onCollapse(hunk.index)}
+                    >
+                      <span className={styles.caret}>
+                        <Icon name={shut ? 'chevron-right' : 'chevron-down'} size={1} />
+                      </span>
+                      {hunk.header}
+                    </button>
+                    {selectable && op !== 'commit' && hunkActionButton(hunk.index)}
+                  </div>
+
+                  {/*
+                    * `data-boxed` and `data-blamed` are the row grid's column list, stated once
+                    * per hunk instead of once per row.
+                    *
+                    * A row's cells are placed by *order*, so a template with a track for a cell
+                    * that was not rendered puts every later cell one column to the left. That is
+                    * not hypothetical: the read-only arm draws no tick box, and until the blame
+                    * column needed a fifth track nothing had noticed that its line numbers were
+                    * sitting in the box's 16px and its text in the sign's 2ch. The stylesheet
+                    * spells out all four combinations; the flags are what pick one.
+                    */}
+                  {!shut && (
+                    <div
+                      className={styles.lines}
+                      data-boxed={selectable ? 'true' : 'false'}
+                      data-blamed={blame !== null ? 'true' : 'false'}
+                    >
+                      {hunk.lines.map((line, index) =>
+                        cell(`${index}`, hunk.index, { line, at: index }, 'both', styles.row ?? ''),
+                      )}
+                    </div>
+                  )}
+                </section>
+              )
+            })
+          )}
+        </div>
+      )}
 
       {/*
         * The footer is the staging half and is withheld entirely on the revision arm.
@@ -1123,6 +1392,8 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
   const [reason, setReason] = useState<string | null>(null)
   const [marks, setMarks] = useState<Marks>(() => new Set<string>())
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => new Set<number>())
+  /** Gaps opened in a folded whole-file view. Cleared with the marks: same staleness rule. */
+  const [expandedGaps, setExpandedGaps] = useState<ReadonlySet<number>>(() => new Set<number>())
   const [note, setNote] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   /** Bumped to re-run the fetch; a git mutation anywhere invalidates this view. */
@@ -1266,10 +1537,17 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
             setNote('The file changed while it was open, so the selection was cleared.')
           }
           setMarks(new Set<string>())
+          // The gap indices are positions in the previous reconstruction; a moved file has
+          // different gaps, and index 3 of the new set is not what the user opened.
+          setExpandedGaps(new Set<number>())
         }
         revRef.current = fresh.rev
-        const rows = fresh.hunks.reduce((n, hunk) => n + hunk.lines.length, 0)
-        if (rows > COLLAPSE_ABOVE) setCollapsed(new Set(fresh.hunks.map((h) => h.index)))
+        // The collapse-by-default guard is the *fallback's*; the whole-file view bounds its
+        // rows by folding gaps instead, and pre-collapsed hunks there would fight it.
+        if (wholeFileSegments(fresh.hunks, fresh.newText) === null) {
+          const rows = fresh.hunks.reduce((n, hunk) => n + hunk.lines.length, 0)
+          if (rows > COLLAPSE_ABOVE) setCollapsed(new Set(fresh.hunks.map((h) => h.index)))
+        }
       })
       .catch((e: unknown) => {
         if (disposed) return
@@ -1520,6 +1798,8 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
           return next
         })
       }
+      expandedGaps={expandedGaps}
+      onExpandGap={(gap) => setExpandedGaps((prev) => new Set(prev).add(gap))}
       onApply={apply}
       onDropHeld={() => clearPartial(repo, path)}
     />
@@ -1598,6 +1878,8 @@ export function RevisionDiffPane({
   const [diff, setDiff] = useState<RevisionDiff | null>(null)
   const [reason, setReason] = useState<string | null>(null)
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => new Set<number>())
+  /** Gaps opened in a folded whole-file view. Reset by each fetch — the indices are its. */
+  const [expandedGaps, setExpandedGaps] = useState<ReadonlySet<number>>(() => new Set<number>())
   /** Bumped to re-run the fetch. Only a moving side can bump it — see the module note above. */
   const [nonce, setNonce] = useState(0)
   /** One line under the header. On this arm it only ever carries a blame refusal. */
@@ -1620,8 +1902,12 @@ export function RevisionDiffPane({
         if (disposed) return
         setDiff(fresh)
         setReason(null)
-        const rows = fresh.hunks.reduce((n, hunk) => n + hunk.lines.length, 0)
-        if (rows > COLLAPSE_ABOVE) setCollapsed(new Set(fresh.hunks.map((h) => h.index)))
+        setExpandedGaps(new Set<number>())
+        // Fallback only, as in `GitDiff`: the whole-file view folds gaps instead.
+        if (wholeFileSegments(fresh.hunks, fresh.newText) === null) {
+          const rows = fresh.hunks.reduce((n, hunk) => n + hunk.lines.length, 0)
+          if (rows > COLLAPSE_ABOVE) setCollapsed(new Set(fresh.hunks.map((h) => h.index)))
+        }
       })
       .catch((e: unknown) => {
         if (disposed) return
@@ -1801,6 +2087,8 @@ export function RevisionDiffPane({
           return nextSet
         })
       }
+      expandedGaps={expandedGaps}
+      onExpandGap={(gap) => setExpandedGaps((prev_) => new Set(prev_).add(gap))}
     />
   )
 }

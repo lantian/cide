@@ -287,9 +287,12 @@
  * with no precedence question to answer. The row tints are `--diff-*-bg`, which are translucent
  * anyway.
  */
-.body :global(.cm-editor) ::selection {
-  background: var(--tk-sel);
-}
+/*
+ * The selection's colour lives in `editor/highlight.css`, which is the only place that can reach
+ * the specificity `@codemirror/view`'s base theme demands — see the note there. This rule was the
+ * native `::selection`, which `drawSelection` hides with `!important` whenever it is painting its
+ * own layer, so it never did anything.
+ */
 
 /*
  * The gutter keeps `--panel-2` rather than following `--tk-bg`: a diff's gutter is a *chrome*

@@ -13,17 +13,17 @@
  * # What the selector deliberately does not offer
  *
  * IDEA's branch popup has *compare with current*, *merge into current*, *rebase current onto*
- * and *delete on remote*. None of them are here, and their absence is a decision rather than a
- * backlog:
+ * and *delete on remote*. Their absence was a decision rather than a backlog, and the list is
+ * kept current as items graduate off it:
  *
- * * **Merge into current and rebase current onto** are still absent, but the reason has
- *   changed and is worth recording rather than quietly deleting. It used to be that they *end
- *   in conflicts often enough that they are only usable with a conflict-resolution surface* —
- *   which cide did not have, and which is why `git pull` was fast-forward-only. M20 built one
- *   (`panes/MergePane.tsx`, and the *Merge Conflicts* group in the commit panel), and pull now
- *   merges and rebases. What is left is narrower: these two menu items would each need a
- *   branch chooser and a confirmation of their own, and neither has been designed. The
- *   *capability* is there; the gesture is not.
+ * * **Merge into current** landed in M24 and is no longer on this list. The original reason
+ *   for its absence — that it *ends in conflicts often enough that it is only usable with a
+ *   conflict-resolution surface* — was answered by M20 (`panes/MergePane.tsx`, and the *Merge
+ *   Conflicts* group in the commit panel); what was still missing, a chooser and a
+ *   confirmation of its own, is now the row's "…" menu and the popup's `merge` panel, with
+ *   `cide_git::merge` behind them. **Rebase current onto** is still absent for the remainder
+ *   of that reason: it needs the same chooser-and-confirmation pair and it has not been
+ *   designed. The *capability* is there — pull rebases — the gesture is not.
  * * **Compare** needs a branch-to-branch diff view. The diff tabs compare a file against HEAD.
  * * **Delete on remote** is a push of an empty refspec. It is not undoable by the person who
  *   ran it and it must not share a menu item with deleting a local ref.
@@ -288,25 +288,34 @@ export function alreadyOn(name: string): string {
 // --- what a row may do ---------------------------------------------------------------------
 
 /** The per-branch actions, in the order the row menu lists them. */
-export type BranchAction = 'checkout' | 'newFrom' | 'rename' | 'delete'
+export type BranchAction = 'checkout' | 'newFrom' | 'merge' | 'rename' | 'delete'
 
 /**
  * Which actions `entry` offers.
  *
- * Deriving the list rather than rendering four buttons and disabling three is the same rule
+ * Deriving the list rather than rendering five buttons and disabling three is the same rule
  * the rest of this app follows for menus: an item that is present and dead is a claim that
- * something is possible here. The two exclusions are load-bearing:
+ * something is possible here. The exclusions are load-bearing:
  *
- * * the **current** branch cannot be checked out again (nothing would happen) or deleted
- *   (git refuses, and so does `cide_git::branch::delete`);
+ * * the **current** branch cannot be checked out again (nothing would happen), merged into
+ *   itself (nothing to take), or deleted (git refuses, and so does `cide_git::branch::delete`);
  * * a **remote-tracking** ref cannot be renamed or deleted, because it is a cache of the
  *   remote's names — the next fetch would put it straight back. *Checkout* on one is offered
  *   and means "create a local branch that tracks it", which is what git and IDEA both do.
+ *   *Merge* on one is offered too and means the ref itself — `git merge origin/x` — which is
+ *   how you take a fetched branch without creating a local copy of it first.
+ * * **merge** also needs somewhere to merge *into*: a detached or unborn HEAD has no current
+ *   branch, so the item vanishes rather than opening a panel whose only outcome is a refusal.
+ *   `head` is required rather than optional so the compiler finds every call site that has to
+ *   supply it. An operation in progress is deliberately *not* checked here — the popup's list
+ *   can be minutes stale, and Rust's `OperationInProgress` sentence is the truthful answer,
+ *   the same division of labour Pull uses.
  */
-export function actionsFor(entry: BranchRef): BranchAction[] {
+export function actionsFor(entry: BranchRef, head: BranchInfo | null): BranchAction[] {
   const actions: BranchAction[] = []
   if (!entry.current) actions.push('checkout')
   actions.push('newFrom')
+  if (!entry.current && head !== null && !head.detached && !head.unborn) actions.push('merge')
   if (!entry.remote) {
     actions.push('rename')
     if (!entry.current) actions.push('delete')
@@ -394,9 +403,12 @@ export function refusalOf(error: unknown): Refusal | null {
  *
  * A parameter rather than a second error variant in Rust: the refusal is genuinely the same
  * refusal, computed by the same `blockers()`, and splitting it in the crate would make
- * `cide-git` carry a fact about which button was pressed.
+ * `cide-git` carry a fact about which button was pressed. `merge` joined in M24 for the same
+ * refusal again — a merge moves the working tree too, and `cide_git::merge` puts the *source*
+ * ref in `branch`, so the sentence names the branch being merged rather than the one you are
+ * standing on.
  */
-export type GitOp = 'checkout' | 'pull'
+export type GitOp = 'checkout' | 'pull' | 'merge'
 
 /**
  * A list of paths in a sentence: `src/main.rs and src/lib.rs`, `a, b and 4 more`.
@@ -477,6 +489,9 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
       // Only files that genuinely differ between the two trees are in `paths` — a dirty file
       // the pull does not touch comes along untouched — so the sentence may not say "the tree
       // is dirty". It says what would be lost, which is the thing the user decides about.
+      if (op === 'merge') {
+        return `Merging ${name('branch')} would overwrite local changes${paths}`
+      }
       return op === 'pull'
         ? `Fast-forwarding ${name('branch')} would overwrite local changes${paths}`
         : `Switching to ${name('branch')} would overwrite local changes${paths}`
@@ -866,6 +881,72 @@ export function pullReport(results: readonly RepoFetch[]): { text: string; detai
     text: `Updated ${where} · ${commits(total((o) => o.advanced))}${stat}`,
     detail,
   }
+}
+
+// --- merge into current --------------------------------------------------------------------
+
+/**
+ * A `MergeOutcome`, structurally. Declared rather than imported for `FetchReport`'s reason:
+ * the check pins these field names against `ui/src/ipc/generated.ts` instead.
+ */
+export interface MergeReport {
+  source: string
+  branch: string
+  fastForward: boolean
+  oldOid: string
+  newOid: string
+  advanced: number
+  filesChanged: number
+  insertions: number
+  deletions: number
+  commits: readonly { shortOid: string; summary: string; author: string }[]
+  moreCommits: number
+  /** Paths left conflicted. Non-empty is a success with work attached, not a failure. */
+  conflicts: readonly string[]
+}
+
+/**
+ * The merge panel's question and its one-sentence answer to "what will this do".
+ *
+ * The body states the three outcomes because a merge is the one branch action whose result is
+ * not a rename of something on screen: it can move the tree without a commit, write a commit,
+ * or stop half-way — and a person deciding whether to press the button is deciding about all
+ * three. It also says what the merge does *not* do (push), because "merge" in a popup that
+ * also offers Push is one click away from meaning more than it does.
+ */
+export function mergeConfirm(source: string, into: string): { title: string; body: string } {
+  return {
+    title: `Merge ${source} into ${into}?`,
+    body:
+      `Fast-forwards ${into} when it can, otherwise writes a merge commit. ` +
+      'A conflict opens the resolver with real git state — abortable at any point. ' +
+      'Nothing is pushed.',
+  }
+}
+
+/**
+ * What a completed merge has to say. Never empty: the user confirmed a panel to get here.
+ *
+ * The same contract as `fetchNote`, with the source branch where the remote was: conflicts
+ * lead because they are the only outcome with work attached, the counts answer "what did I
+ * just take", and *already contains* names both branches because the popup may be acting on a
+ * different repository from the one on screen.
+ */
+export function mergeNote(outcome: MergeReport): string {
+  if (outcome.conflicts.length > 0) {
+    const n = outcome.conflicts.length
+    return `Merging ${outcome.source} into ${outcome.branch} — ${n} file${n === 1 ? '' : 's'} to resolve: ${anded(outcome.conflicts)}`
+  }
+  const stat = shortstat(outcome.filesChanged, outcome.insertions, outcome.deletions)
+  if (outcome.advanced === 0) {
+    return `${outcome.branch} already contains ${outcome.source}`
+  }
+  if (outcome.fastForward) {
+    // Named as what it was: a fast-forward made no commit, and a person about to push wants
+    // to know their history is a straight line — `fetchNote`'s argument for verb honesty.
+    return `Fast-forwarded ${outcome.branch} ${commits(outcome.advanced)} to ${outcome.source}${stat}`
+  }
+  return `Merged ${commits(outcome.advanced)} from ${outcome.source} into ${outcome.branch}${stat}`
 }
 
 /**

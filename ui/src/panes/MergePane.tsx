@@ -44,6 +44,7 @@ import { history as textHistory, historyKeymap } from '@codemirror/commands'
 import { syntaxHighlighting } from '@codemirror/language'
 import { lineEditKeymap } from '@/editor/editorKeys'
 import { cideHighlightStyle } from '@/editor/highlight'
+import { polarityExtension, polaritySlot, watchPolarity } from '@/editor/cmPolarity'
 import { loadLanguage } from '@/editor/languages'
 import { notify } from '@/chrome/notices'
 import { explain } from '@/chrome/branchModel'
@@ -546,14 +547,22 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
       ['result', result, true],
       ['theirs', file.theirs ?? null, false],
     ]
+    // One compartment per side, because a compartment belongs to one view's configuration, and
+    // one unsubscribe per side to match.
+    const stopPolarity: (() => void)[] = []
     for (const [side, value, editable] of sides) {
       const host = hosts.current[side]
       if (host === undefined || host === null || views.current[side]) continue
+      const polarity = polaritySlot()
       const view = new EditorView({
         parent: host,
         state: EditorState.create({
           doc: value ?? '',
           extensions: [
+            // Which polarity CodeMirror thinks it is drawing in — `editor/cmPolarity.ts` has
+            // the argument. All three panes, for the reason they share `cideHighlightStyle`:
+            // a merge must not show the file in different colours from the tab beside it.
+            polarityExtension(polarity),
             EditorView.lineWrapping,
             // Line numbers in all three. They do not line up across the panes — the three
             // documents are different lengths — and that mismatch is itself information.
@@ -629,8 +638,10 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
         if (extension === null || slot === undefined || views.current[side] !== view) return
         view.dispatch({ effects: slot.reconfigure(extension) })
       })
+      stopPolarity.push(watchPolarity(view, polarity))
     }
     return () => {
+      for (const stop of stopPolarity) stop()
       for (const key of Object.keys(views.current)) {
         views.current[key]?.destroy()
         views.current[key] = null
@@ -700,6 +711,27 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
         const region = doc.regions.find((r) => r.id === span.id)
         return region !== undefined && pending(region, decisionOf(decisions, span.id), side)
       })
+      /*
+       * The blocks this pane has NO lines for — the other side inserted where this one has
+       * nothing, or this side deleted the block. (M25)
+       *
+       * `lit` cannot carry the first kind: a side that did not change a block has no work
+       * pending in it, so `pending` filters it out — which before M25 made a theirs-only
+       * insertion completely invisible in the ours pane, with nothing at the spot to say
+       * lines exist across the way. The zero-width spans are appended for `paint`, whose
+       * `from === to` branch draws them as thin insertion markers rather than bands, gated
+       * on `regionTone` so a settled block draws nothing here just as it draws nothing
+       * anywhere. Minus the ones already in `lit` (a deletion by this side, still pending),
+       * which reach the same branch through the ordinary path.
+       */
+      const inserts = spans.filter((span) => {
+        if (span.from !== span.to) return false
+        if (lit.some((open) => open.id === span.id)) return false
+        const region = doc.regions.find((r) => r.id === span.id)
+        return (
+          region !== undefined && regionTone(region, decisionOf(decisions, span.id)) !== null
+        )
+      })
       const marks = lit.flatMap((span) => {
         const region = doc.regions.find((r) => r.id === span.id)
         if (region === undefined) return []
@@ -708,7 +740,7 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
       })
       paint(
         view,
-        lit.flatMap((span) => {
+        [...lit, ...inserts].flatMap((span) => {
           const region = doc.regions.find((r) => r.id === span.id)
           if (region === undefined) return []
           const tone = regionTone(region, decisionOf(decisions, span.id))

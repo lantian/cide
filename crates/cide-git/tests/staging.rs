@@ -1358,7 +1358,7 @@ fn a_line_ref_taken_from_the_rendered_view_stages_the_row_the_user_ticked() {
     )
     .expect("diff")
     .expect("f.txt is modified");
-    let view = diff::view(&raw_file, DiffSide::Unstaged);
+    let view = diff::view(&git_repo, &raw_file, DiffSide::Unstaged);
 
     // The view is the raw file, row for row. Stated as an assertion and not as a comment
     // because it is the whole reason a `LineRef` means the same thing at both ends.
@@ -1412,6 +1412,113 @@ fn a_line_ref_taken_from_the_rendered_view_stages_the_row_the_user_ticked() {
         repo.git(&["show", ":f.txt"]).into_bytes(),
         FIRST_HUNK_UNSTAGED.to_vec(),
         "the row the user ticked is the row that was staged"
+    );
+}
+
+// --- the whole-file texts the view carries ---------------------------------------------------
+
+/// Each `DiffSide` pairs a different old and new source, and every one of the six is checked
+/// against the `git` binary's own answer for that source. A swap — index text where HEAD text
+/// belongs — renders a plausible whole file whose unchanged region silently disagrees with
+/// the hunks, which is exactly the failure the frontend's validation then hides by falling
+/// back, so it has to be caught here where the sources are named.
+#[test]
+fn whole_file_texts_come_from_the_side_the_pair_names() {
+    let repo = TempRepo::new("view-texts");
+    repo.write("f.txt", BASE_15);
+    repo.commit_all("base");
+    repo.write("f.txt", EDITED_15);
+    repo.git(&["add", "f.txt"]);
+    // A third state on disk, so all three pairs have a nonempty diff at once.
+    let on_disk = b"A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\nO\np\n";
+    repo.write("f.txt", on_disk);
+
+    let git_repo = git2::Repository::open(&repo.root).expect("open");
+    let head = repo.git(&["show", "HEAD:f.txt"]);
+    let index = repo.git(&["show", ":f.txt"]);
+
+    let view = |side| diff::view(&git_repo, &raw(&repo, "f.txt", side), side);
+
+    let staged = view(DiffSide::Staged);
+    assert_eq!(staged.old_text.as_deref(), Some(head.as_str()));
+    assert_eq!(staged.new_text.as_deref(), Some(index.as_str()));
+    assert!(!staged.texts_omitted);
+
+    let unstaged = view(DiffSide::Unstaged);
+    assert_eq!(unstaged.old_text.as_deref(), Some(index.as_str()));
+    assert_eq!(
+        unstaged.new_text.as_deref().map(str::as_bytes),
+        Some(on_disk.as_slice())
+    );
+
+    let combined = view(DiffSide::Combined);
+    assert_eq!(combined.old_text.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        combined.new_text.as_deref().map(str::as_bytes),
+        Some(on_disk.as_slice())
+    );
+}
+
+#[test]
+fn an_absent_side_has_no_text_rather_than_an_empty_one() {
+    let repo = TempRepo::new("view-texts-absent");
+    repo.write("keep.txt", b"anchor\n");
+    repo.write("gone.txt", b"doomed\n");
+    repo.commit_all("base");
+    repo.write("new.txt", b"fresh\n");
+    std::fs::remove_file(repo.root.join("gone.txt")).expect("delete");
+
+    let git_repo = git2::Repository::open(&repo.root).expect("open");
+
+    let added = diff::view(
+        &git_repo,
+        &raw(&repo, "new.txt", DiffSide::Combined),
+        DiffSide::Combined,
+    );
+    assert_eq!(added.old_text, None, "an untracked file has no old side");
+    assert_eq!(added.new_text.as_deref(), Some("fresh\n"));
+    assert!(!added.texts_omitted);
+
+    let deleted = diff::view(
+        &git_repo,
+        &raw(&repo, "gone.txt", DiffSide::Combined),
+        DiffSide::Combined,
+    );
+    assert_eq!(deleted.old_text.as_deref(), Some("doomed\n"));
+    assert_eq!(deleted.new_text, None, "a deleted file has no new side");
+    assert!(!deleted.texts_omitted);
+}
+
+/// The texts are display enrichment and the cap must cost exactly the enrichment: the hunks,
+/// the `rev`, and therefore every selection made against the view stay what they were.
+#[test]
+fn a_side_over_the_cap_withholds_both_texts_and_moves_nothing_else() {
+    let repo = TempRepo::new("view-texts-cap");
+    // 3 MiB of numbered lines — over `revision::MAX_BLOB_BYTES` on both sides.
+    let mut big = String::new();
+    let mut n = 0u32;
+    while big.len() <= 3 * 1024 * 1024 {
+        big.push_str(&format!("line {n}\n"));
+        n += 1;
+    }
+    repo.write("big.txt", big.as_bytes());
+    repo.commit_all("base");
+    let mut edited = big;
+    edited.push_str("appended\n");
+    repo.write("big.txt", edited.as_bytes());
+
+    let git_repo = git2::Repository::open(&repo.root).expect("open");
+    let raw_file = raw(&repo, "big.txt", DiffSide::Unstaged);
+    let view = diff::view(&git_repo, &raw_file, DiffSide::Unstaged);
+
+    assert_eq!(view.old_text, None);
+    assert_eq!(view.new_text, None);
+    assert!(view.texts_omitted, "the cap must say it acted");
+    assert_eq!(view.hunks.len(), 1, "the hunks are not the cap's business");
+    assert_eq!(
+        view.rev,
+        raw_file.rev(),
+        "the rev hashes the patch bytes and the texts are not among them"
     );
 }
 

@@ -96,13 +96,30 @@ export function paint(
   }
 
   for (const span of painted) {
+    /*
+     * A region that occupies no lines in this document — a side that deleted the block, or a
+     * block the other side inserted where this one has nothing. It used to paint the line
+     * that closed over the gap with the full tone band, which was a slight lie: that line is
+     * not part of the block, it is merely next to where the block would be. Since M25 the
+     * boundary itself is drawn instead — a thin `cm-mergeInsert` line at the join, IDEA's
+     * gesture, the same one the split diff's `.insertMark` makes. The tone still says which
+     * kind of work is undone, and `cm-mergeCurrent`'s accent rail still lands on the closing
+     * line so stepping onto a deleted block stays visible.
+     *
+     * `cm-mergeInsertEnd` is the one edge case a top-edge line cannot draw: an insertion
+     * *below the last line* has no following line to carry a top border, so the closing
+     * line's bottom edge carries it instead.
+     */
+    if (span.from === span.to) {
+      const atEnd = span.from + 1 > doc.lines
+      const cls =
+        `cm-mergeInsert ${TONE[span.tone] === 'cm-mergeConflict' ? 'cm-mergeInsertConflict' : 'cm-mergeInsertPending'}` +
+        `${atEnd ? ' cm-mergeInsertEnd' : ''}${span.current ? ' cm-mergeCurrent' : ''}`
+      ranges.push({ at: doc.line(clamp(span.from)).from, value: Decoration.line({ class: cls }) })
+      continue
+    }
     const cls = `${TONE[span.tone]}${span.current ? ' cm-mergeCurrent' : ''}`
     const value = Decoration.line({ class: cls })
-    /*
-     * A region that occupies no lines still gets one marked. `from === to` is *take neither* —
-     * the region was deleted — and painting nothing would make that decision invisible, so the
-     * line that closed over the gap carries the mark instead.
-     */
     const first = clamp(span.from)
     const last = Math.max(clamp(span.to - 1), first)
     for (let line = first; line <= last; line += 1) {

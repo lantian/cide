@@ -360,6 +360,7 @@ pub fn run() {
             cmd::git::git_branch_delete,
             cmd::git::git_fetch,
             cmd::git::git_pull,
+            cmd::git::git_merge,
             cmd::file::tab_open_merge,
             cmd::git::git_conflicts,
             cmd::git::git_conflict_read,

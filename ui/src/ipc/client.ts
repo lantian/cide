@@ -2167,6 +2167,7 @@ import type {
   ConflictSide,
   ContinueOutcome,
   FetchOutcome,
+  MergeOutcome,
   MergeState,
   PullRequest,
   RepoId as BranchRepoId,
@@ -2612,6 +2613,17 @@ export const branch = {
   /** `git merge --abort` / `git rebase --abort`. Puts the tree back where it was. */
   mergeAbort: (project: ProjectId, repo: BranchRepoId) =>
     invoke<void>('git_merge_abort', { project, repo }),
+
+  /**
+   * Merge a branch — local or remote-tracking, exactly as named — into the checked-out one.
+   *
+   * Fast-forwards when it can, writes a real merge commit otherwise. Resolves with a
+   * `MergeOutcome` whose **`conflicts` may be non-empty**: real `MERGE_HEAD` state is on disk
+   * and the resolver takes over — a success with work attached, `git.pull`'s contract. See
+   * `cide_git::merge` for the refusal ladder.
+   */
+  merge: (project: ProjectId, repo: BranchRepoId, name: string) =>
+    invoke<MergeOutcome>('git_merge', { project, repo, name }),
 }
 
 /**

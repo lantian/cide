@@ -451,7 +451,13 @@ pub fn hunk_views(file: &RawFile) -> Vec<DiffHunkView> {
 }
 
 /// The frontend's view of a file diff.
-pub fn view(file: &RawFile, side: DiffSide) -> FileDiff {
+///
+/// Takes the repository because the view now carries the whole file alongside the hunks —
+/// see [`side_texts`]. The texts are attached strictly downstream of [`RawFile::rev`]: the
+/// hunks and the rev are still derived from the same context-3 patch bytes staging
+/// re-derives, so nothing here can make a selection stale.
+pub fn view(repo: &Repository, file: &RawFile, side: DiffSide) -> FileDiff {
+    let texts = side_texts(repo, file, side);
     FileDiff {
         path: file.path.clone(),
         old_path: file.old_path.clone(),
@@ -463,6 +469,9 @@ pub fn view(file: &RawFile, side: DiffSide) -> FileDiff {
         hunks: hunk_views(file),
         rev: file.rev(),
         partial_ok: file.partial_refusal().is_none(),
+        old_text: texts.old_text,
+        new_text: texts.new_text,
+        texts_omitted: texts.omitted,
     }
 }
 
@@ -493,6 +502,169 @@ pub fn index_blob(repo: &Repository, path: &str) -> Result<Option<Oid>> {
         .get_path(Path::new(path), 0)
         .map(|entry| entry.id)
         .filter(|oid| !oid.is_zero()))
+}
+
+// --- whole-file texts -------------------------------------------------------------------
+
+/// One side's full content, or the reason there is none.
+///
+/// `Missing` covers both "the side does not exist" (an added file's old side) and every
+/// read failure: text enrichment is display-only and must never turn a working diff into an
+/// error, so an unreadable side degrades to the hunks-only rendering instead.
+pub(crate) enum TextRead {
+    Text(String),
+    TooLarge,
+    Missing,
+}
+
+/// The whole file on both sides of a diff, for the pane that draws more than the hunks.
+pub(crate) struct DiffTexts {
+    pub old_text: Option<String>,
+    pub new_text: Option<String>,
+    /// An existing side was over the cap and both texts were withheld because of it.
+    pub omitted: bool,
+}
+
+impl DiffTexts {
+    pub(crate) const NONE: DiffTexts = DiffTexts {
+        old_text: None,
+        new_text: None,
+        omitted: false,
+    };
+
+    /// All-or-nothing: one whole side without the other cannot be aligned against the
+    /// hunks, so a single over-cap side withholds both and says so.
+    pub(crate) fn combine(old: TextRead, new: TextRead) -> DiffTexts {
+        if matches!(old, TextRead::TooLarge) || matches!(new, TextRead::TooLarge) {
+            return DiffTexts {
+                old_text: None,
+                new_text: None,
+                omitted: true,
+            };
+        }
+        let text = |read: TextRead| match read {
+            TextRead::Text(text) => Some(text),
+            _ => None,
+        };
+        DiffTexts {
+            old_text: text(old),
+            new_text: text(new),
+            omitted: false,
+        }
+    }
+}
+
+/// Whether a file's content is the kind the whole-file view can draw at all.
+///
+/// The same family [`RawFile::partial_refusal`] names, minus deletions and renames — those
+/// are ordinary text and display fine whole. A submodule's "content" is a commit id, a
+/// symlink's is its target path, and a typechange has two files that are not two versions
+/// of one thing; none of them is a document to reconstruct.
+pub(crate) fn text_skip(file: &RawFile) -> bool {
+    let commit = u32::from(git2::FileMode::Commit);
+    let link = u32::from(git2::FileMode::Link);
+    file.binary
+        || file.old_mode == commit
+        || file.new_mode == commit
+        || file.old_mode == link
+        || file.new_mode == link
+        || file.status == Delta::Typechange
+}
+
+/// One blob's content, capped. The cap is [`crate::revision::MAX_BLOB_BYTES`] — the same
+/// two megabytes the revision pane refuses to render past, shared on purpose so "too large
+/// to show whole" means one thing everywhere. Never truncated instead: a truncated text
+/// cannot number the lines below the cut.
+pub(crate) fn blob_read(repo: &Repository, oid: Oid) -> TextRead {
+    let Ok(blob) = repo.find_blob(oid) else {
+        return TextRead::Missing;
+    };
+    if blob.size() > crate::revision::MAX_BLOB_BYTES {
+        return TextRead::TooLarge;
+    }
+    TextRead::Text(String::from_utf8_lossy(blob.content()).into_owned())
+}
+
+/// The content of `path` in `tree`, when both exist.
+pub(crate) fn tree_blob_read(
+    repo: &Repository,
+    tree: Option<&git2::Tree<'_>>,
+    path: &str,
+) -> TextRead {
+    let Some(tree) = tree else {
+        return TextRead::Missing;
+    };
+    let Ok(entry) = tree.get_path(Path::new(path)) else {
+        return TextRead::Missing;
+    };
+    if entry.kind() != Some(git2::ObjectType::Blob) {
+        return TextRead::Missing;
+    }
+    blob_read(repo, entry.id())
+}
+
+/// The content of `path` on disk, raw.
+///
+/// Raw where the hunks went through libgit2's builtin check-in filters (crlf, ident).
+/// Those never change line *counts*, and the frontend strips one trailing `\r` per line —
+/// the [`strip_newline`] rule — and validates every hunk line against this text before
+/// trusting it, falling back to hunks-only on a mismatch. So a filter that rewrites
+/// content (ident) costs the whole-file view, never correctness.
+pub(crate) fn workdir_read(repo: &Repository, path: &str) -> TextRead {
+    let Some(workdir) = repo.workdir() else {
+        return TextRead::Missing;
+    };
+    let full = workdir.join(path);
+    let Ok(meta) = std::fs::metadata(&full) else {
+        return TextRead::Missing;
+    };
+    if !meta.is_file() {
+        return TextRead::Missing;
+    }
+    if meta.len() > crate::revision::MAX_BLOB_BYTES as u64 {
+        return TextRead::TooLarge;
+    }
+    match std::fs::read(&full) {
+        Ok(bytes) => TextRead::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => TextRead::Missing,
+    }
+}
+
+/// Both sides of a [`DiffSide`] pair, whole.
+///
+/// | pair | old side | new side |
+/// | --- | --- | --- |
+/// | `Staged` (HEAD→index) | HEAD tree blob | index blob |
+/// | `Unstaged` (index→worktree) | index blob | workdir file |
+/// | `Combined` (HEAD→worktree) | HEAD tree blob | workdir file |
+///
+/// The old side reads at the pre-rename path when the delta carries one. Absent sides (an
+/// added file's old, a deleted file's new) come back `Missing` from the reads themselves —
+/// the tree has no entry, the index has no stage-0 entry, the disk has no file.
+fn side_texts(repo: &Repository, file: &RawFile, side: DiffSide) -> DiffTexts {
+    if text_skip(file) {
+        return DiffTexts::NONE;
+    }
+    let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+
+    let head = || head_tree(repo).unwrap_or_default();
+    let index = |path: &str| match index_blob(repo, path) {
+        Ok(Some(oid)) => blob_read(repo, oid),
+        _ => TextRead::Missing,
+    };
+
+    let (old, new) = match side {
+        DiffSide::Staged => (
+            tree_blob_read(repo, head().as_ref(), old_path),
+            index(&file.path),
+        ),
+        DiffSide::Unstaged => (index(old_path), workdir_read(repo, &file.path)),
+        DiffSide::Combined => (
+            tree_blob_read(repo, head().as_ref(), old_path),
+            workdir_read(repo, &file.path),
+        ),
+    };
+    DiffTexts::combine(old, new)
 }
 
 pub(crate) fn strip_newline(bytes: &[u8]) -> &[u8] {

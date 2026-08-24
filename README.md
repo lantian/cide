@@ -5372,10 +5372,265 @@ terminal palette, and the one this file's first draft did not have: a `--tk-doc`
 dark block resolves to the light value through the cascade and every per-role assertion still
 passes.
 
-Its ink floor is **2.5:1, not the terminal's 3:1**, and the difference is a decision rather than a
-slip. A comment is deliberately quiet; `--tk-comment` in the dark theme is `#5c5c66` at 2.76:1,
-and a higher floor would either fail the palette the app has shipped since M3 or make comments
-shout. What is worth catching is a colour that is not there at all.
+### Selecting code in the dark theme made it disappear — and the first two fixes were the wrong bug
+
+**Read this section as a worked example of diagnosing from a model instead of from the artefact.**
+Two rounds of palette arithmetic went into this report before anyone opened the screenshot in an
+image library and sampled a pixel, and the value being tuned was not reaching the screen at all.
+
+`@codemirror/view`'s base theme carries:
+
+```
+"&light.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground":
+  { background: "#d7d4f0" }
+```
+
+`&` and `&light` are **generated classes** — `baseThemeID` and `baseLightID`, see `buildTheme`
+and `lightDarkIDs` in that package — so that selector is six classes, specificity **(0,6,0)**.
+`EditorSurface.module.css` said `.body :global(.cm-editor .cm-selectionBackground)`, which is
+(0,3,0). It never applied, in any theme, since the file was written. Every focused editor painted
+CodeMirror's light-mode lavender `#d7d4f0`; `--tk-fg` in the dark theme is `#d7d7dd`. That is
+**1.02:1**. The text was not dim, it was gone — which is exactly what the report said, twice, and
+exactly what a pixel sample showed in ten seconds: selected rows at `#d7d4f0`, the identifier
+`serde` on them at `#d7d7dd`, and the active line at `#0e1436`, which *was* the new token and
+proved the palette was live while the selection was not.
+
+It also explains the detail that should have redirected the investigation a round earlier:
+imported themes looked fine. Min Dark's foreground is a mid grey `#7d7d7d`, which is legible on
+lavender. cide's near-white is not. The bug was never in the palette.
+
+The root cause is one line that was never written: **nothing in this application ever set
+`EditorView.darkTheme`**, so every editor in cide has been a *light-mode* CodeMirror, including
+under the dark theme. That facet decides which of the two generated classes lands on the editor
+element, and the base themes of view, autocomplete, lint, search and merge are written in terms
+of them — around forty rules. Most were masked by our own stylesheets overriding the same
+properties. The selection was the one with specificity to spare.
+
+`editor/cmPolarity.ts` sets the facet, in a compartment so a theme switch reconfigures rather than
+rebuilds — a rebuild would take scrollback, selection and undo history with it, the same argument
+the language, lint and blame compartments each make. All three CodeMirror surfaces carry it, and
+`check:scheme` asserts each one does, because a fourth surface added without it would reintroduce
+the whole family silently.
+
+That alone does not settle the colour: the `&dark` twin of the rule above is the same (0,6,0)
+selector with `#233` in it. So the selection rule moved to `editor/highlight.css` — the one
+stylesheet that is global rather than module-hashed — written as `html:root .cm-editor.cm-focused
+> .cm-scroller > .cm-selectionLayer .cm-selectionBackground`, which is (0,6,1) and wins on the
+element. Spelled out rather than reached with `!important`, because an `!important` here could
+not be overridden by anything later, and a contributed theme is where this palette is heading.
+The module files keep a comment where the rules were, saying not to put them back.
+
+**What the two earlier rounds were actually worth.** The contrast analysis was correct about a
+real defect and is now load-bearing rather than theoretical, because `--tk-sel` finally reaches
+the screen. The rest of this section is that work, and it stands.
+
+
+The gate above shipped measuring ink against **one** ground — `--tk-bg` — and the next report was
+*"when I select the code in dark theme I don't see the text."* It was true, and it was worse than
+it sounds.
+
+A selection is a *ground*. Every dark ink in `tokens.css` was chosen against `--tk-bg`, which is
+nearly black; `--sel` sat 1.60:1 above it, so selecting a region raised the floor under all of
+them at once. Comments went from a marginal 2.76:1 to **1.73:1** — gone — and punctuation,
+brackets, operators and emphasis to 3.09:1. Checking ink against one ground and then painting it
+on another is not a weaker check; it is a check of the wrong thing.
+
+**None of it was new.** `--faint: #5c5c66` and `--sel: #2b3a55` have held those values since M3,
+and the pairing was never measured: `EditorSurface.module.css` carried a comment asserting the
+worst case on a selection was "still the 4.45:1 `tokens.css` picked the token for", and that
+number was the token's ratio against `--panel`. The colour-scheme work neither caused this nor
+fixed it — it moved the values into `--tk-*` verbatim and carried the wrong comment along.
+
+**The first fix was not enough, and the second attempt is the one worth reading.** `--tk-comment`
+came up to `#72727e` (3.84:1, which it wanted anyway) and `--tk-sel` was darkened to `#132a4d`,
+1.27:1 above the background. Ink cleared 3:1, the gate went green, and the report came back:
+*"still have elements that is close to selection color."* Correct — 3:1 is the WCAG floor for
+**large** text, and a 12.5px buffer is not large text.
+
+Chasing a higher absolute floor is unbounded, and the arithmetic says so out loud. Contrast
+against a selection is `(ink + 0.05) / (selection + 0.05)`, so the selection's luminance is a tax
+on every ink at once. `#72727e` has luminance 0.171; against a **pure black** selection that is
+4.42:1. No selection of any colour can carry this palette's comment to the 4.5:1 body-text bar.
+Either the quiet half of the palette stops being quiet, or the selection stops charging the tax.
+
+So the selection carries almost no luminance. `--tk-sel` is `#0d1560`: 1.12:1 against the
+background, visible through *chroma* at a redmean distance of 124 — more separation than the old
+`#2b3a55` managed at 131, for a third of the luminance. Blue because blue's luminance coefficient
+is 0.0722 against green's 0.7152, so it is the only channel that can carry that much chroma at
+that little brightness, which is also why every dark theme's selection is blue.
+
+The consequence is the point, and it is a different kind of claim from a floor: every ink keeps
+**89%** of the contrast it has unselected. Selecting a region stopped being a legibility question
+rather than becoming a better-tuned one.
+
+The chrome's `--sel` is untouched. It grounds a selected file-tree row against `--panel` and
+answers a different question; the two being separable is what the `--tk-*` family is for.
+
+The caret's line went from 40% of the selection to **55%**, and that number turning out not to be
+load-bearing is the useful part. Its own comment argues at length that the *token* matters —
+a fraction of the selection over the selection is the selection exactly — and that holds at any
+fraction, but the note repeated "40%" as though it were a design value. With a darker selection
+40% put the active line 39 redmean units off the background where it used to be 52; 55% puts it
+at 55, and improves the light theme's from 29 to 40 on the way past.
+
+### Refusing a file that is not a theme, and doing it legibly
+
+*"I'm not able to import cpptools-linux-x64.vsix."* That is Microsoft's C/C++ extension: it
+contributes languages, debuggers, semantic tokens and eighteen other things, and **no themes at
+all**. Refusing it is correct. Two things about *how* it was refused were not.
+
+**The message reached nobody.** `CoreError` is a tagged enum, so a rejected `invoke` arrives in
+the webview as `{ kind: 'serde', detail: '…' }`, and the Settings screen rendered it with
+`String(e)` — `"[object Object]"`. The sentence Rust had composed, naming the file and what was
+looked for inside it, was thrown away at the last step, and the user saw a failure with no
+explanation. `ipc/errorText.ts` is the fix and `check:scheme` pins it, because a failure path is
+only ever seen by the person it is failing and nothing about the happy path can catch it
+regressing. `KeymapSection` had the same bug on the same screen and is fixed with it.
+
+**The file was read whole to be rejected.** `import` did `fs::read` before looking at the header —
+137 MB into a `Vec` to inspect four bytes. It now reads the four, and hands the archive road the
+`File` itself, so `zip` seeks to the central directory and inflates only the entries a theme lives
+in. A bare `.json` is capped at 8 MB, so pointing the picker at something enormous that is *not*
+an archive fails with a sentence rather than by exhausting memory.
+
+And the refusal now says what the file turned out to be, read from the manifest's own
+`displayName`:
+
+> `cpptools-linux-x64.vsix` contains no colour themes — **C/C++ is an extension, but not a theme**.
+> Looked for contributes.themes in extension/package.json, then for extension/themes/\*.json
+
+"contains no colour themes" on its own reads as cide failing. Naming the extension makes it read
+as the wrong file, which is what it is.
+
+### The whole buffer washed out, and the value that settled it
+
+*"Still something is wrong — check how the theme is rendered in cide and how it is represented in
+the theme's own screenshots."* Two artefacts, and between them the answer took one measurement:
+classify the ink in cide's render, classify the fills in the theme's showcase SVG, compare the two
+palettes.
+
+The showcase's code block uses six colours — `#b392f0`, `#f97583`, `#f8f8f8`, `#ffab70`, `#6b737c`
+and, for everything else, **`#bbbbbb`**. cide's render had the first five and, in place of the
+last, `#7d7d7d`: a full stop darker, across every identifier in the file, which is most of it.
+
+Min Dark states no `editor.foreground` at all. It states the *workbench* `foreground: #7D7D7D` —
+the colour of a sidebar, a status bar and an activity rail — and `SURFACE_KEYS` listed that as the
+second choice for the editor's ink. VS Code does not read it for the editor; it falls back to its
+built-in default theme, which is the `#BBBBBB` the showcase renders. So the key is gone from that
+row, and a theme stating neither ground now gets **VS Code's** defaults rather than cide's, on the
+principle the whole importer rests on: an imported scheme is a rendering of somebody else's theme,
+so where the theme is silent the right answer is what its author saw.
+
+It is also the third bug in this feature found by measuring an artefact rather than reasoning
+about the model, after the lavender selection and the scope matcher — and the second where the
+evidence was sitting in a file the whole time.
+
+**Re-import is required for this one.** What is stored is the converted scheme, so a fix to the
+conversion reaches a scheme only when it is imported again. The selection repairs itself on load;
+the colours do not.
+
+### An imported theme showing the wrong colours, and how the scope matcher was reading themes
+
+*"Custom colour scheme is not fully working — I don't see all colours like before."* Under-specified
+as a report, and this time the theme file was the ground truth: Min Dark's `tokenColors` say what
+it wants, so what cide computed could be checked against it line by line rather than guessed at.
+Two of the answers were provably wrong.
+
+**A broad rule was beating a qualified one.** The scoring gave any prefix match a flat 100 and any
+narrower sibling a flat 10, so a theme stating both `support` and
+`support.type.property-name.json` answered the property question with `support`. Min Dark states
+exactly that pair, and cide painted JSON keys `#79b8ff` where the theme says `#f8f8f8` — the rule
+VS Code actually applies to a JSON key. The primary score is now **how many dot-segments the two
+share**, with direction only breaking a tie at equal depth: exact, then a true TextMate prefix,
+then a narrower sibling. Depth is the better signal in both directions, because a theme that
+qualifies a scope by language is still describing that family and describing it more precisely
+than a one-segment rule three levels above it. One test asserted the old ordering and is reversed,
+with the reason written into it.
+
+**Punctuation was inheriting a keyword colour.** Two things caused it and both had to go. The
+narrower-sibling rule fired on `punctuation.separator.key-value` — a deliberate special case, the
+`:` between a key and its value — and read it as a statement about every comma in the file; and
+the fallback chain ran `bracket → punctuation → operator`, where `operator` is a *keyword* in
+TextMate and is usually coloured like one. Min Dark's buffer came out with its punctuation,
+brackets and operators all in the theme's keyword red. `NO_WEAK_EVIDENCE` now refuses the
+narrower-sibling rule for those three roles, and the chain ends at `fg`, which is what VS Code
+paints punctuation a theme is silent about.
+
+The distinction the list encodes is *language qualification versus special case*, and it is not
+something a scope string carries — hence a list rather than a rule.
+
+Min Dark now converts to the colours its own file asks for: keys `#f8f8f8`, punctuation and
+brackets at the foreground, operators the theme's keyword red (faithful — `keyword` is a prefix of
+`keyword.operator`, so VS Code paints them that way too), strings `#ffab70`, comments `#6a737d`.
+
+### An imported theme that names no selection at all
+
+The next report was the mirror image, on an imported theme: *"no selection visible at all, like
+I'm just moving the cursor."* Min Dark declares `editor.background` and **no
+`editor.selectionBackground`** — a legal and not-rare thing for a theme to do, since VS Code falls
+back to its own default.
+
+The fallback that had been written for that case blended the background 18% towards the
+foreground. On Min Dark's `#1f1f1f` and `#7d7d7d` that is `#303030`: 51 redmean units, below
+anything the eye registers as a state change. It was also the wrong *direction* — blending towards
+the ink is pure luminance, which is the tax the section above spends its length avoiding.
+
+Three changes, and the first is the one that was simply a mistake:
+
+**Alpha is composited now, not dropped.** `editor.selectionBackground` carries an alpha channel in
+most themes, and the two readings are nothing alike: `#ffffff20` over a dark editor is a
+barely-lifted grey, which is what the theme meant, while `#ffffff` with the alpha discarded is a
+white block over the text. `composite` flattens onto the theme's own background, so what is stored
+is still six hex digits — `ColorScheme` has no notion of translucency — but it is the *rendering*
+the theme asked for rather than its notation.
+
+**The selection is validated, not merely filled.** A theme can state a selection that is useless
+in practice as easily as it can omit one, and both produce the same report, so both get the same
+answer. If it does not read as a selection — under 72 redmean units, which is what the built-in
+light scheme measures — it is replaced. Overriding a value a theme did state is a real intrusion
+and is taken deliberately: the alternative is a feature that silently does not work, and a
+`ColorScheme` is a rendering of a theme rather than a copy of one. A theme that got it right is
+left alone, and there is a test that says so.
+
+**The derivation tints towards chroma, not lightness.** A deep saturated blue sits at roughly the
+luminance of a dark editor's background while being obviously a different colour, so the gentlest
+tint towards it that clears 72 units buys visibility for almost nothing: measured across real
+themes a dark scheme keeps **93–99%** of its ink contrast. *Gentlest* is the whole criterion —
+every step away from the background costs some ink something, so the answer is the first candidate
+that clears the bar rather than the most visible one available. A light background cannot play
+that trick, since there is nothing above white, so its tint is a mid blue and the cost is the same
+0.84-ish the built-in light scheme already pays.
+
+Min Dark now imports with `#191f4b`, 75 units off its background; Min Light with `#dbe9ff`, 76.
+Schemes already on disk repair themselves, because `load_all` normalises what it reads — no
+re-import needed.
+
+`check:scheme` gained the assertion that states exactly that: **selecting may not cost any role
+more than 20% of its contrast.** That is the check that survives a retune of the palette, where an
+absolute floor does not — and it is the one that would have caught the insufficient fix, which
+passed every floor. The threshold is set where it fails every state known to be bad: the shipped
+bug scores 0.63, the intermediate `#132a4d` 0.79, and VS Code Dark+'s own `#264f78` fails against
+this palette too. The dark palette now scores 0.89 and the light theme's warm `#ffe7d9` 0.84 —
+fine at it, because losing a sixth of a large ratio is not losing a sixth of a small one.
+
+Beside it, the two absolute floors as a backstop, and the assertion that the selection is
+distinguishable from the background at all — measured with `apart`, not `contrast`, because the
+whole direction of the fix was to remove the selection's luminance and a ratio would have scored
+that as a regression.
+
+Its ink floor went **up** to 3:1 in the same change, which is `check-theme.mjs`'s
+`TERMINAL_MIN_CONTRAST`. It was 2.5, argued as "a comment is deliberately quiet and `#5c5c66` is
+2.76:1" — true, and the wrong conclusion: 2.76:1 was already marginal, and it was the reason the
+selection could not be repaired by moving the selection. Both moved, the palette clears 3.0 on
+both grounds in both themes, and the carve-out stopped being a decision. The gutter keeps a lower
+floor of its own, named rather than exempted: a line number is never drawn on a selection, and
+brighter numbers compete with the code they number.
+
+One more thing fell out of it. `ColorScheme::normalise`'s fallback chain answered `bg` for a
+missing `sel`, so a theme with no `editor.selectionBackground` — legal, and rare rather than
+impossible — imported with an *invisible selection*: the same bug, arriving by a different road.
+It is now derived, 18% of the way from the background towards the ink, by the same sRGB blend CSS
+uses so the selection and the active line cannot disagree.
 
 `check:editor` grew the role assertions, including a block that walks a JSON buffer tag by tag
 and asserts six distinct roles, and `cargo test -p cide-core scheme` converts a theme shaped like
@@ -5405,6 +5660,64 @@ cannot ship CSS"* in a way that needs its own decision.
 Semantic highlighting is the next real step up in *accuracy*, as distinct from this change, which
 is about palette: `cide-lsp` requests no `semanticTokens` today, so a stream lexer's guess is
 still what colours a Rust or TypeScript buffer.
+
+## The whole file in a diff, and IDEA's split view (M25), and what is not verified
+
+The git diff tab used to show the patch — hunks at git's default three context lines, nothing
+between them — and its side-by-side view kept the two sides row-for-row aligned by drawing
+hatched filler cells wherever one side had no line. Both were the complaint: the reader wants
+the *document* with the changes in it, and IDEA's answer to an added block is not a column of
+empty cells but a thin green line on the side that lacks it.
+
+**The wire.** `FileDiff` and `RevisionDiff` carry `oldText`/`newText` now — both sides whole,
+read in the same round trip (`crates/cide-git/src/diff.rs::side_texts` names which blob each
+`DiffSide` pair reads; the index blob was the one not exposed before). The hunks stay at context
+3 **byte for byte**, because `FileDiff::rev` hashes those exact patch bytes and staging
+re-derives them: widening context would have turned every partial stage into `StaleSelection`.
+`texts_omitted` marks a side over the 2 MiB cap (`revision::MAX_BLOB_BYTES`, shared on purpose);
+binary, submodule and typechange skip the texts entirely. Texts are display enrichment — a read
+failure degrades to `None`, never to an error.
+
+**The reconstruction** is `ui/src/panes/diffRows.ts`, import-free so `check:diff-render`
+compiles it standalone. Hunk rows are the wire rows, untouched — every `hunk:line` position,
+tick box and selection survives by construction, and gap rows carry no position at all. Every
+context and addition line is validated against the text; any disagreement (the ident filter, a
+drift this module did not foresee) falls back to the hunks-only rendering, which is never wrong,
+only shorter. Files over 5,000 lines fold long unchanged runs behind "⋯ N unchanged lines"
+expander rows; under that, the file is simply all there.
+
+**The split view** is two independently scrolling columns now — left old, right new, no fillers,
+no `blameGap` spacers — with a thin 2px marker (`--green`/`--red`, both palettes) at each point
+where the other column has a block this one lacks, end-of-file included. The columns are kept in
+step by `ui/src/panes/diffSync.ts`: anchors measured at changed-run boundaries once per render
+and after a *settled* resize, proportional interpolation between them, and MergePane's
+Set-of-marks echo guard — its comment explains why a time-released flag cannot guard a loop
+whose echo arrives asynchronously. Scrolling the right column through an inserted block holds
+the left still at its marker, which is IDEA's behaviour. The left column hides its scrollbar
+(two scrollbars at two fractions read as two documents); the fallback split (no texts) renders
+through the same two columns from the hunks alone, with the `@@` header on the per-hunk bar as
+the landmark between discontinuous line numbers.
+
+**The merge pane** got the same gesture: a block a pane has no lines for — the other side
+inserted where it has nothing, or it deleted the block — draws a `cm-mergeInsert` marker line
+at the boundary instead of either lying a full tone band onto the neighbouring line (the result
+pane's old behaviour) or drawing nothing at all (the side panes', which made a theirs-only
+insertion invisible in the ours pane). The marker is a `::before` with no layout height, so
+CodeMirror's height cache and the block-anchored scroll sync are undisturbed, and it follows the
+pane's colour rule: a settled block draws nothing, anywhere.
+
+**Not verified on screen.** The model, the markup, the run table, the mapping arithmetic and the
+marker positions are all pinned by `check:diff-render` (including `diffRows`/`diffSync` compiled
+standalone) and `check:merge`; the Rust side is differential against the real `git` in
+`staging.rs` and `revision.rs`. What no check can hold is the *feel* of the scroll sync — wheel,
+find-in-page landing in one column, the snap past a pure insertion when driving from the side
+that lacks it — and that has not been confirmed on a display, same reason as every milestone
+since M14. Deliberately out of scope, named so they are not read as oversights: deletions still
+fall back to hunks-only (`newText` is `None`, and a deleted file's one hunk *is* the whole old
+file, so the render is pixel-identical); the left column is never blamed (a second blame at the
+other revision is a real feature, not an omission of this one); and the unified whole-file view
+drops the sticky `@@` headers rather than making them float — the line numbers are on screen,
+and the staging affordances moved to a slim non-sticky bar per hunk.
 
 ## The look and feel (M23), and what is not verified
 

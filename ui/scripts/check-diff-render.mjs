@@ -155,10 +155,11 @@ try {
   eq(splitNames.length, 5, 'the split layout is exercised at all')
 
   /*
-   * The pairing boundary, in document order. `PAIR_FIXTURE` is `context, +, -, context`: the
-   * `+` closes its edit, so the `-` after it opens a new one and the two must NOT be zipped
-   * onto one row. Zipped, the addition and the deletion swap places in the document, which the
-   * sorted comparisons below are blind to by construction.
+   * The pairing boundary. `PAIR_FIXTURE` is `context, +, -, context`: the `+` closes its
+   * edit, so the `-` after it opens a new one and the two are two one-sided runs, never one
+   * zipped row. The columns are sequential in the DOM now, so document order across the
+   * whole markup stopped meaning file order — the order claims are per column instead, and
+   * `positions` must be exactly their concatenation, left first.
    */
   eq(
     byName.pairUnified.positions,
@@ -166,20 +167,49 @@ try {
     'unified draws a hunk in file order',
   )
   eq(
-    byName.pairSplit.positions,
-    ['0:0', '0:1', '0:2', '0:3'],
-    "split keeps file order too: a '+' followed by a '-' is two edits, so the deletion goes on "
-      + 'its own row below rather than being faced against the addition above it',
+    byName.pairSplit.leftPositions,
+    ['0:0', '0:2', '0:3'],
+    "the left column keeps the old side's file order: context, the deletion, context",
   )
+  eq(
+    byName.pairSplit.rightPositions,
+    ['0:1'],
+    "the right column carries the addition alone — a '+' then a '-' is two edits, so the "
+      + 'deletion has no line to be faced against',
+  )
+  eq(
+    byName.pairSplit.insertLeft,
+    ['add'],
+    "and the left column marks where the addition belongs — the un-zipped pair reads as two "
+      + 'one-sided runs, each with its thin line on the side that lacks it',
+  )
+  eq(byName.pairSplit.insertRight, ['del'], 'the deletion marks the right column the same way')
 
-  for (const name of splitNames) {
-    const d = byName[name]
+  for (const d of Object.values(byName)) {
     eq(
       [...new Set(d.positions)].length,
       d.positions.length,
-      `${name}: no position is written twice — a context line is drawn in both columns and `
+      `${d.name}: no position is written twice — a context line is drawn in both columns and `
         + 'numbered in only one',
     )
+    eq(
+      d.positions,
+      [...d.leftPositions, ...d.rightPositions].length === 0
+        ? d.positions
+        : [...d.leftPositions, ...d.rightPositions],
+      `${d.name}: positions are the two columns' in DOM order, left first`,
+    )
+    for (const side of ['leftPositions', 'rightPositions']) {
+      eq(
+        d[side],
+        [...d[side]].sort((a, b) => {
+          const [ah, al] = a.split(':').map(Number)
+          const [bh, bl] = b.split(':').map(Number)
+          return ah - bh || al - bl
+        }),
+        `${d.name}: ${side} is in its side's file order`,
+      )
+    }
   }
 
   // Every position the unified layout names, the split layout names too, and no other. Paired
@@ -262,7 +292,6 @@ try {
     'with no `blame` prop the column is not in the markup at all — absent, not zero-width; a ' +
       'diff nobody asked to annotate must not pay 22 characters of margin',
   )
-  eq(byName.empty.blameGaps, 0, 'and no spacer either')
   eq(byName.empty.blameTrack, false, 'and the row grid reserves no track for it')
   eq(byName.empty.blamePressed, false, 'and the toggle reads off, which is the default')
   eq(byName.empty.blameDisabled, false, 'while still being usable on a side that can answer')
@@ -297,7 +326,6 @@ try {
       'a quarter, `5` is the oldest, `-1` is uncommitted and `` is a row with no attribution',
   )
   eq(byName.blame.blameTrack, true, 'and the row grid reserves the track it needs')
-  eq(byName.blame.blameGaps, 0, 'unified draws no spacers — there is only one column of code')
   eq(byName.blame.blamePressed, true, 'the toggle reads on')
   eq(
     byName.blame.selected,
@@ -306,8 +334,9 @@ try {
   )
   eq(byName.blame.positions, byName.empty.positions, 'nor about which positions are written')
 
-  // The split layout. The right half is the new side, so the cells are all on it; the left half
-  // is the old side and gets a spacer, which is what keeps the two halves' grids in step.
+  // The split layout. The right column is the new side, so the cells are all on it; the left
+  // column simply has no blame track — the columns are independent grids since M25, so there
+  // is no alignment for a missing track to break and no spacers to count.
   eq(
     byName.blameSplit.blameCells,
     ['aaa1111', 'aaa1111', 'aaa1111', 'bbb2222', '', 'bbb2222', 'ccc3333', 'ccc3333', 'ccc3333', 'ccc3333'],
@@ -323,12 +352,6 @@ try {
     byName.blameSplit.blameCells.filter((c) => c !== '').sort(),
     byName.blame.blameCells.filter((c) => c !== '').sort(),
     'no attribution is gained or lost by switching layout — the layout is a layout, not a filter',
-  )
-  eq(
-    byName.blameSplit.blameGaps,
-    6,
-    'one spacer per drawn old-side cell, so the two halves keep the same column list. A missing ' +
-      'one slides the old code out of line with the new for every row below it',
   )
   eq(
     [...new Set(byName.blameSplit.positions)].length,
@@ -390,6 +413,119 @@ try {
     'and it is off by default there as well, rather than on because the pane is read-only',
   )
 
+  // --- the whole-file view (M25) ------------------------------------------------------------
+  //
+  // The texts arrived on the wire and the pane now draws the document, not just the patch. The
+  // claim that must not move is the old one: whole-file mode adds NO wire positions and loses
+  // none — a gap row is unselectable by construction, not by a disabled flag.
+
+  eq(
+    byName.wholeUnified.positions,
+    byName.empty.positions,
+    'the whole file names exactly the positions the hunks-only render names: gap rows carry none',
+  )
+  eq(byName.wholeUnified.gaps, ['7', '7'], 'both unchanged runs are drawn, 7 lines each')
+  eq(byName.wholeUnified.folds, [], 'and nothing folds under the size threshold')
+  eq(byName.wholeUnified.selected, ['1:2'], 'ticking works exactly as before')
+  eq(
+    byName.wholeUnified.hunkBoxes,
+    ['none', 'some', 'none'],
+    'the staging arm keeps a tri-state box per hunk — on the slim bar now, the sticky @@ header '
+      + 'is gone',
+  )
+  eq(
+    byName.wholeUnified.count,
+    '1 of 6 lines selected · lines',
+    'and the footer still counts only the change lines, however many context rows are on screen',
+  )
+
+  eq(
+    [...byName.wholeSplit.positions].sort(),
+    [...byName.empty.positions].sort(),
+    'the split whole file names the same set',
+  )
+  eq(
+    byName.wholeSplit.leftPositions,
+    ['0:0', '0:2', '1:0', '1:1', '1:3', '2:3'],
+    'left column: contexts and the deletion, in old-side file order',
+  )
+  eq(
+    byName.wholeSplit.rightPositions,
+    ['0:1', '1:2', '2:0', '2:1', '2:2'],
+    'right column: the additions, in new-side file order',
+  )
+  eq(
+    byName.wholeSplit.insertLeft,
+    ['add', 'add'],
+    "two pure insertions (hunk 0's one line, hunk 2's three) mark the left column; the "
+      + 'deletion-then-addition in hunk 1 is a pair — both sides have content, no marker',
+  )
+  eq(byName.wholeSplit.insertRight, [], 'and nothing marks the right column here')
+  eq(byName.wholeSplit.hunkBoxes, ['none', 'some', 'none'], 'one box per hunk, left column only')
+
+  eq(
+    byName.wholeRevision.positions,
+    byName.empty.positions,
+    'the read-only arm draws the same whole file',
+  )
+  eq(byName.wholeRevision.gaps, ['7', '7'], 'gaps included')
+  eq(
+    byName.wholeRevision.hunkBoxes,
+    [],
+    'with no hunk bars at all — nothing to stage, and the line numbers are the landmarks',
+  )
+  eq(
+    [...byName.wholeRevisionSplit.positions].sort(),
+    [...byName.wholeRevision.positions].sort(),
+    'and its split names the same set',
+  )
+  eq(byName.wholeRevisionSplit.insertLeft, ['add', 'add'], 'with the same insertion markers')
+  eq(byName.wholeRevisionSplit.hunkBoxes, [], 'and still no box anywhere')
+
+  eq(
+    byName.wholeBig.folds,
+    ['5998'],
+    'over the size threshold the one long gap folds behind an expander row saying how much it hides',
+  )
+  eq(byName.wholeBig.gaps, [], 'and is not also drawn open')
+  eq(byName.wholeBig.rows, 2, 'so the DOM is the changes plus a fold, not 6,000 rows')
+  eq(byName.wholeBigOpen.folds, [], 'one click later the fold is gone')
+  eq(byName.wholeBigOpen.gaps, ['5998'], 'and the gap is open in its place')
+
+  eq(
+    byName.wholeMismatch.positions,
+    byName.empty.positions,
+    'a text that contradicts a hunk line falls back to the hunks-only render, indistinguishable '
+      + 'from a wire with no texts — wrong unchanged lines between correct changed ones would be '
+      + 'silent, so the whole file is refused instead',
+  )
+  eq(byName.wholeMismatch.gaps, [], 'no gap of it is drawn')
+  eq(byName.wholeMismatch.folds, [], 'and nothing folds')
+  eq(byName.wholeMismatch.count, byName.empty.count, 'and the footer agrees with the fallback')
+
+  eq(
+    byName.edgeSplit.insertLeft,
+    ['add', 'add'],
+    'an insertion at line 1 marks above the first row and one at end of file marks below the '
+      + 'last — the boundary a marker keyed on "the following row" would not have',
+  )
+  eq(byName.edgeSplit.insertRight, ['del'], 'and the deletion marks the right column')
+  eq(byName.edgeSplit.leftPositions, ['0:1', '0:2', '0:3'], 'old side: context, deletion, context')
+  eq(byName.edgeSplit.rightPositions, ['0:0', '0:4'], 'new side: the two additions')
+
+  eq(
+    byName.wholeBlame.blameCells.length,
+    byName.wholeBlame.rows + 14,
+    'blame annotates gap rows too — one cell per drawn line, hunk rows and the 14 gap lines alike',
+  )
+  eq(byName.wholeBlame.blameTrack, true, 'and the grid reserves the track')
+  eq(
+    byName.wholeBlameSplit.blameCells.length,
+    24,
+    'in the split, every right-column line row has a cell — 24 of them — and the left column '
+      + 'has none, it is a different document',
+  )
+
   // --- the blame column, as a model ---------------------------------------------------------
   //
   // `diffBlame.ts` compiled on its own. What the render section above cannot reach: the
@@ -401,6 +537,8 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/panes/diffBlame.ts',
+      'src/panes/diffRows.ts',
+      'src/panes/diffSync.ts',
       'src/editor/blameModel.ts',
       '--rootDir', 'src',
       '--outDir', out,
@@ -505,6 +643,276 @@ try {
     'the staged side is not: its new text is the index, which `cide_git::blame` cannot produce',
   )
 
+  // --- the whole-file row model, on its own (M25) --------------------------------------------
+  //
+  // `diffRows.ts` compiled standalone, like `diffBlame.ts` above. What the render section
+  // cannot reach: the offset arithmetic at every hunk boundary, the zero-length coverage
+  // convention, and each validation edge — every one of which fails silently in markup, as a
+  // plausible file with the wrong unchanged lines in it.
+
+  const rowsMod = await import(`file://${resolve(out, 'panes/diffRows.js')}`)
+  const {
+    splitLines,
+    wholeFileSegments,
+    presentSegments,
+    hunkSegments,
+    columnRows,
+    GAP_COLLAPSE_MIN,
+    WHOLE_FILE_COLLAPSE_ABOVE,
+  } = rowsMod
+
+  eq(splitLines('a\nb\n'), ['a', 'b'], 'a trailing newline is a terminator, not a phantom line')
+  eq(splitLines('a\nb'), ['a', 'b'], 'and its absence is not a lost line')
+  eq(splitLines('a\r\nb\r\n'), ['a', 'b'], 'CRLF strips one \\r per line — the strip_newline rule')
+  eq(splitLines(''), [], 'an empty text has no lines')
+
+  const mkLine = (origin, content, oldLineno, newLineno) => ({
+    origin,
+    content,
+    oldLineno,
+    newLineno,
+    noNewline: false,
+  })
+  /** The smoke's WHOLE fixture, restated: 24 new lines, three hunks, two 7-line gaps. */
+  const wholeHunks = [
+    {
+      index: 0, header: '@@ -1,2 +1,3 @@', oldStart: 1, oldLines: 2, newStart: 1, newLines: 3,
+      lines: [
+        mkLine('context', 'fn main() {', 1, 1),
+        mkLine('addition', '    let x = 1;', null, 2),
+        mkLine('context', '}', 2, 3),
+      ],
+    },
+    {
+      index: 1, header: '@@ -10,3 +11,3 @@', oldStart: 10, oldLines: 3, newStart: 11, newLines: 3,
+      lines: [
+        mkLine('context', 'let a = 0;', 10, 11),
+        mkLine('deletion', 'let b = 1;', 11, null),
+        mkLine('addition', 'let b = 2;', null, 12),
+        mkLine('context', 'let c = 3;', 12, 13),
+      ],
+    },
+    {
+      index: 2, header: '@@ -20,1 +21,4 @@', oldStart: 20, oldLines: 1, newStart: 21, newLines: 4,
+      lines: [
+        mkLine('addition', 'one', null, 21),
+        mkLine('addition', 'two', null, 22),
+        mkLine('addition', 'three', null, 23),
+        mkLine('context', 'end', 20, 24),
+      ],
+    },
+  ]
+  const wholeText =
+    ['fn main() {', '    let x = 1;', '}', 'g4', 'g5', 'g6', 'g7', 'g8', 'g9', 'g10',
+     'let a = 0;', 'let b = 2;', 'let c = 3;', 'g14', 'g15', 'g16', 'g17', 'g18', 'g19', 'g20',
+     'one', 'two', 'three', 'end'].join('\n') + '\n'
+
+  const segments = wholeFileSegments(wholeHunks, wholeText)
+  eq(
+    segments?.map((s) => s.kind),
+    ['hunk', 'gap', 'hunk', 'gap', 'hunk'],
+    'the file is hunks with the gaps between their coverages filled in',
+  )
+  eq(
+    [segments?.[1]?.lines[0]?.oldLineno, segments?.[1]?.lines[0]?.newLineno],
+    [3, 4],
+    "the first gap starts numbered on BOTH sides — the old number is the new one plus hunk 0's "
+      + 'declared offset, no second text needed',
+  )
+  eq(
+    [segments?.[3]?.lines.at(-1)?.oldLineno, segments?.[3]?.lines.at(-1)?.newLineno],
+    [19, 20],
+    'and the second gap ends one line short of hunk 2 on both sides',
+  )
+  eq(
+    segments?.[1]?.lines.length,
+    7,
+    'seven lines in the first gap — new 4 through 10',
+  )
+
+  eq(
+    wholeFileSegments(wholeHunks, null),
+    null,
+    'no text, no whole file: the fallback is the hunks-only render, never a guess',
+  )
+  eq(
+    wholeFileSegments(wholeHunks, wholeText.replace('let a = 0;', 'DIFFERENT')),
+    null,
+    'a context line the text contradicts refuses the whole file',
+  )
+  eq(
+    wholeFileSegments(wholeHunks, wholeText.replace('    let x = 1;', 'WRONG')),
+    null,
+    'and so does an addition — every line that exists on the new side is checked',
+  )
+  eq(
+    wholeFileSegments([wholeHunks[1], wholeHunks[0], wholeHunks[2]], wholeText),
+    null,
+    'hunks out of order are refused, not sorted — an out-of-order wire is a wire this module '
+      + 'does not understand',
+  )
+  eq(
+    wholeFileSegments(wholeHunks, 'fn main() {\n'),
+    null,
+    'a coverage past the end of the text is refused',
+  )
+  eq(
+    wholeFileSegments(
+      [{ ...wholeHunks[0], lines: wholeHunks[0].lines.map((l) =>
+        l.content === '}' ? { ...l, content: '}\r' } : l) }],
+      'fn main() {\r\n    let x = 1;\r\n}\r\n',
+    ),
+    null,
+    'but hunk content never carries the \\r the text had — Rust already stripped it — so a hunk '
+      + 'that does is a mismatch like any other',
+  )
+  eq(
+    wholeFileSegments(
+      wholeHunks.slice(0, 1),
+      'fn main() {\r\n    let x = 1;\r\n}\r\n',
+    )?.map((s) => s.kind),
+    ['hunk'],
+    'while a CRLF text against LF hunk content compares equal, one stripped \\r per line',
+  )
+  eq(
+    wholeFileSegments(
+      [{ index: 0, header: '@@ -1,2 +0,0 @@', oldStart: 1, oldLines: 2, newStart: 0, newLines: 0,
+         lines: [mkLine('deletion', 'a', 1, null), mkLine('deletion', 'b', 2, null)] }],
+      '',
+    )?.map((s) => s.kind),
+    ['hunk'],
+    'a whole-file deletion — the zero-length coverage convention, git numbering the line BEFORE '
+      + 'the position — reconstructs to just the hunk and no phantom gap',
+  )
+
+  // The folding policy.
+  ok(WHOLE_FILE_COLLAPSE_ABOVE === 5_000, 'the threshold is the documented 5,000 lines')
+  const gapOf = (n) => ({
+    kind: 'gap',
+    index: 0,
+    lines: Array.from({ length: n }, (_, i) =>
+      mkLine('context', `l${i + 1}`, i + 1, i + 1)),
+  })
+  eq(
+    presentSegments([gapOf(500)], 4_000, new Set()).map((s) => s.kind),
+    ['gap'],
+    'under the threshold nothing folds, whatever the gap length — the whole file is the feature',
+  )
+  eq(
+    presentSegments([gapOf(GAP_COLLAPSE_MIN)], 6_000, new Set()).map((s) => s.kind),
+    ['gap'],
+    'a gap at the minimum stays open even over the threshold: a fold that hides ten lines buys '
+      + 'nothing',
+  )
+  const folded = presentSegments([gapOf(GAP_COLLAPSE_MIN + 1)], 6_000, new Set())
+  eq(folded.map((s) => s.kind), ['fold'], 'one past the minimum folds')
+  eq(folded[0]?.count, GAP_COLLAPSE_MIN + 1, 'and says how much it hides')
+  eq(
+    presentSegments([gapOf(GAP_COLLAPSE_MIN + 1)], 6_000, new Set([0])).map((s) => s.kind),
+    ['gap'],
+    'and an expanded index opens it again',
+  )
+
+  // The split columns and their run table.
+  const cols = columnRows(segments, { bars: false })
+  eq(
+    cols.runs.map((r) => r.kind),
+    ['shared', 'add', 'shared', 'shared', 'shared', 'pair', 'shared', 'shared', 'add', 'shared'],
+    'the run table: context and gaps are shared, a lone insertion is `add`, a deletion followed '
+      + 'by its addition is one `pair`',
+  )
+  for (const run of cols.runs) {
+    if (run.kind !== 'shared') continue
+    eq(
+      run.leftTo - run.leftFrom,
+      run.rightTo - run.rightFrom,
+      'a shared run occupies both columns with equal row counts — the equality the scroll sync '
+        + 'leans on',
+    )
+  }
+  eq(
+    cols.runs.filter((r) => r.kind === 'add').every((r) => r.leftFrom === r.leftTo),
+    true,
+    'an add run is empty on the left',
+  )
+  eq(
+    cols.left.length + cols.right.length,
+    cols.runs.reduce((n, r) => n + (r.leftTo - r.leftFrom) + (r.rightTo - r.rightFrom), 0),
+    'every row is in exactly one run',
+  )
+  const barred = columnRows(hunkSegments(wholeHunks), { bars: true, collapsed: new Set([1]) })
+  eq(
+    barred.left.filter((r) => r.kind === 'bar').length,
+    3,
+    'the fallback draws a bar per hunk in each column',
+  )
+  eq(
+    barred.left.some((r) => r.kind === 'line' && r.hunk === 1),
+    false,
+    'and a collapsed hunk keeps its bar and folds its lines away',
+  )
+
+  // --- the scroll mapping, on its own (M25) --------------------------------------------------
+
+  const syncMod = await import(`file://${resolve(out, 'panes/diffSync.js')}`)
+  const { rowSpans, mapScroll, insertMarkers } = syncMod
+
+  eq(
+    rowSpans(cols.runs).length,
+    cols.runs.filter((r) => r.kind !== 'shared').length,
+    'only disagreeing runs become spans — shared runs carry the offset and need no anchor',
+  )
+  eq(
+    insertMarkers(cols.runs).map((m) => `${m.column}:${m.tone}`),
+    ['left:add', 'left:add'],
+    'markers land in the column that LACKS the run: both pure insertions mark the left, the '
+      + 'pair marks nothing',
+  )
+  const delRuns = [{ kind: 'del', leftFrom: 0, leftTo: 2, rightFrom: 0, rightTo: 0 }]
+  eq(
+    insertMarkers(delRuns),
+    [{ column: 'right', beforeRow: 0, tone: 'del' }],
+    'and a lone deletion marks the right',
+  )
+
+  // A geometry with a pure insertion on the right: left pixels 0..300, right 0..500, the
+  // insertion occupying right 100..300 while the left holds at 100.
+  const geometry = {
+    anchors: [
+      { a: 0, b: 0 },
+      { a: 100, b: 100 },
+      { a: 100, b: 300 },
+      { a: 300, b: 500 },
+    ],
+    aMax: 200,
+    bMax: 400,
+  }
+  eq(mapScroll(geometry, 'a', 0), 0, 'exact at the start anchor')
+  eq(mapScroll(geometry, 'b', 100), 100, 'exact at a boundary anchor')
+  eq(
+    mapScroll(geometry, 'b', 200),
+    100,
+    'inside the insertion the left column holds still at the marker — the IDEA behaviour',
+  )
+  eq(mapScroll(geometry, 'b', 300), 100, 'right up to its end')
+  eq(mapScroll(geometry, 'b', 400), 200, 'and interpolates again past it')
+  eq(mapScroll(geometry, 'a', 200), 400, 'the same segment from the left maps into the stretch')
+  eq(mapScroll(geometry, 'a', 9_999), 400, 'over-scroll clamps to what the target can reach')
+  eq(mapScroll(geometry, 'b', -5), 0, 'and under-scroll clamps to zero')
+  {
+    let last = -1
+    for (let top = 0; top <= 500; top += 7) {
+      const mapped = mapScroll(geometry, 'b', top)
+      ok(mapped >= last, `monotonic at b=${top}: a mapping that goes backwards judders`)
+      last = mapped
+    }
+  }
+  eq(
+    mapScroll({ anchors: [], aMax: 90, bMax: 90 }, 'a', 40),
+    40,
+    'no anchors — no changed runs — is the identity mapping, clamped',
+  )
+
   // --- the joins ----------------------------------------------------------------------------
   //
   // The structural restatement is not a second source of truth only for as long as these hold.
@@ -523,6 +931,11 @@ try {
     ['BlameRun', ['start', 'lines', 'commit']],
     ['BlameCommit', ['shortOid', 'author']],
     ['DiffLineView', ['origin', 'oldLineno', 'newLineno']],
+    // The whole-file texts, on both diff wires — `diffRows`' restatements mean nothing if
+    // these leave.
+    ['FileDiff', ['oldText', 'newText', 'textsOmitted', 'hunks', 'rev', 'partialOk']],
+    ['RevisionDiff', ['oldText', 'newText', 'textsOmitted']],
+    ['DiffHunkView', ['oldStart', 'oldLines', 'newStart', 'newLines']],
   ]) {
     const body = shape(type)
     ok(body !== '', `${type} exists in generated.ts`)
@@ -565,9 +978,9 @@ try {
     ".lines[data-boxed='false'] .row",
     ".lines[data-blamed='true'] .row",
     ".lines[data-boxed='false'][data-blamed='true'] .row",
-    ".lines[data-boxed='false'] .half",
-    ".lines[data-blamed='true'] .half",
-    ".lines[data-boxed='false'][data-blamed='true'] .half",
+    ".column[data-boxed='false'] .half",
+    ".column[data-blamed='true'] .half",
+    ".column[data-boxed='false'][data-blamed='true'] .half",
   ]) {
     ok(
       css.includes(rule),
@@ -575,6 +988,37 @@ try {
         'track for a cell that was not rendered puts every later cell one column left',
     )
   }
+
+  // The split layout's own pieces: the insertion marker, and the corpses that must stay buried.
+  ok(
+    /\.insertMark\s*\{[^}]*height:\s*0/.test(css),
+    'the insertion marker takes NO layout height — a 2px-tall element would shift every row '
+      + 'below it and with them every measured scroll anchor',
+  )
+  ok(
+    /\.insertMark::before\s*\{[^}]*height:\s*2px/.test(css),
+    'while its ::before paints the visible 2px line by overdraw',
+  )
+  ok(
+    css.includes(".insertMark[data-tone='add']::before") && css.includes('var(--green)'),
+    'the add tone is the theme green — a token declared in both palette blocks, not a literal',
+  )
+  ok(
+    css.includes(".insertMark[data-tone='del']::before") && css.includes('var(--red)'),
+    'and the del tone the theme red',
+  )
+  for (const corpse of ['.filler', '.blameGap', '.splitRow']) {
+    ok(
+      !css.includes(corpse),
+      `\`${corpse}\` is gone: the split view aligns by scroll mapping now, and a resurrected ` +
+        'filler cell is the empty-space layout the markers replaced',
+    )
+  }
+  ok(
+    /\.column\s*\{[^}]*position:\s*relative/.test(css),
+    "the column is positioned, so each row's offsetTop is scroller-relative — remove this and " +
+      'every measured anchor is off by the column’s own offset in the pane',
+  )
 
   // --- both diff panes offer the layout toggle (M21) --------------------------------------------
   //
@@ -599,6 +1043,38 @@ try {
     2,
     '…from the same store, so the mode is one editor setting rather than one remembered per '
       + 'pane kind',
+  )
+
+  // --- the split view's scroll sync, pinned in the pane (M25) -------------------------------
+  //
+  // The pure mapping is driven above; what only the pane holds is the wiring discipline, and
+  // each of these is a bug with no error and no changed pixel in any snapshot if it goes.
+
+  ok(
+    /const echoes = useRef<Set<'left' \| 'right'>>/.test(paneSrc),
+    'the echo guard is a Set of marks — MergePane.tsx documents at length why a time-released '
+      + 'flag cannot guard a loop whose echo event arrives asynchronously',
+  )
+  ok(
+    paneSrc.includes('echoSet.delete(fromName)'),
+    'and the echoed scroll consumes its mark and stops — that consumption IS the loop guard',
+  )
+  ok(
+    [...paneSrc.matchAll(/addEventListener\('scroll'/g)].length >= 2,
+    'both columns are listened to, so wheel, keyboard and find-in-page all ride one path',
+  )
+  ok(
+    /whenResizeSettles\(key, measure\)/.test(paneSrc),
+    'anchors re-measure only when a size SETTLES — a per-event measure is the drag-stutter '
+      + 'class check:resize exists for',
+  )
+  ok(
+    !paneSrc.includes('gitDiffBlameGap'),
+    'the blame spacer is gone with the filler cells; the left column simply has no blame track',
+  )
+  ok(
+    /import[^;]*from '\.\/diffRows'/s.test(paneSrc) && /import[^;]*from '\.\/diffSync'/s.test(paneSrc),
+    'the pane consumes the two pure modules this script drives, not private copies of them',
   )
 
   if (failed === 0) console.log('git diff view render: ok')

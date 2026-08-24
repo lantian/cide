@@ -896,6 +896,15 @@ pub struct RevisionDiff {
     pub old_mode: u32,
     pub new_mode: u32,
     pub hunks: Vec<DiffHunkView>,
+    /// The old side's full text, for whole-file rendering. Same rules as
+    /// [`crate::git::FileDiff::old_text`]: `None` for an absent side, a binary file, a
+    /// submodule, a typechange, or when a side exceeded the byte cap.
+    pub old_text: Option<String>,
+    /// The new side's full text. See [`crate::git::FileDiff::new_text`].
+    pub new_text: Option<String>,
+    /// True when an existing side exceeded the byte cap and both texts were withheld.
+    /// See [`crate::git::FileDiff::texts_omitted`].
+    pub texts_omitted: bool,
 }
 
 /// One path's summary inside a [`RevisionRange`].
