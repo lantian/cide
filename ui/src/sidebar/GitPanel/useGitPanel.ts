@@ -385,7 +385,7 @@ export interface GitPanelActions {
   stageFile: (repo: RepoId, path: string) => void
   unstageFile: (repo: RepoId, path: string) => void
   /** Opens the confirmation. Nothing is destroyed until it is answered. */
-  rollbackFile: (repo: RepoId, path: string) => void
+  rollbackFile: (repo: RepoId, path: string, deletes?: boolean) => void
 
   // --- changelists -------------------------------------------------------------------------
 
@@ -432,12 +432,14 @@ export interface GitPanelActions {
   /**
    * Same, for an explicit list of paths.
    *
-   * `untracked` is not a flavour of wording, it is what the command *does*: `stage::rollback`
-   * finds nothing in HEAD for an untracked path and deletes it from disk instead. Pass it for
-   * any set drawn from the unversioned list, or the dialog promises a restore before running a
-   * delete — see `revertGroup`, which has split on the same fact since the group menu shipped.
+   * `deletes` is not a flavour of wording, it is what the command *does*: `stage::rollback`
+   * finds nothing in HEAD for a path HEAD never had and removes it — from disk and from the
+   * index — instead of restoring it. Pass it for any set drawn from the unversioned list, and
+   * for a staged addition, which is drawn in `Changes` and has no pre-image either. Without it
+   * the dialog promises a restore before running a delete — see `revertGroup`, which has split
+   * on the same fact since the group menu shipped.
    */
-  revertFiles: (repo: RepoId, paths: string[], untracked?: boolean) => void
+  revertFiles: (repo: RepoId, paths: string[], deletes?: boolean) => void
   /** Shelve a whole group under its own name — the group menu's `Shelve Changelist`. */
   shelveGroup: (repo: RepoId, group: string) => void
   dismissDialog: () => void
@@ -469,6 +471,13 @@ export interface GitPanelActions {
    * keyboard, a host wiring the tree itself) says nothing and gets that.
    */
   openDiff: (row: Row, mode?: DiffOpenMode) => void
+  /**
+   * A file row's **working-tree file**, in an editor tab: the tree's Ctrl+double-click.
+   *
+   * Not a diff and not a mode of one — see `openFile` for what it refuses and why the refusals
+   * are the panel's to make rather than `tab_open_file`'s.
+   */
+  openFile: (row: Row) => void
   /**
    * The toolbar's ◫ — the diff of the first ticked file.
    *
@@ -1809,25 +1818,29 @@ export function useGitPanel(
   // --- reverting, which is the one thing here with no undo ------------------------------------
 
   const revertFiles = useCallback(
-    (repo: RepoId, paths: string[], untracked = false) => {
+    (repo: RepoId, paths: string[], deletes = false) => {
       if (paths.length === 0) return
       setConfirm({
-        // The same split `revertGroup` makes, and for the same reason: git has nothing to
-        // restore an untracked path from, so `stage::rollback` removes the file. A dialog
-        // saying "goes back to its last committed state" over a delete is the one wording in
-        // this panel that could cost work the user cannot get back.
-        title: untracked
+        // The same split `revertGroup` makes, and for the same reason: git has no pre-image for
+        // a path that was never committed, so `stage::rollback` removes the file rather than
+        // restoring it. A dialog saying "goes back to its last committed state" over a delete
+        // is the one wording in this panel that could cost work the user cannot get back.
+        title: deletes
           ? `Delete ${files(paths.length)}?`
           : paths.length === 1
             ? 'Revert this file?'
             : `Revert ${files(paths.length)}?`,
-        body: untracked
-          ? 'Git is not tracking these files, so there is nothing to restore them from. '
+        // Worded from "never committed" rather than "not tracked", because it now also covers
+        // a *staged* addition — git is tracking that one, in the index, and the index entry is
+        // dropped along with the file. Saying "git is not tracking these files" over it would
+        // be a sentence the user can see is false about the row they just right-clicked.
+        body: deletes
+          ? 'These files were never committed, so there is nothing to restore them from. '
             + 'They are deleted from disk.'
           : 'These files go back to their last committed state. Uncommitted work in them is '
             + 'thrown away, and git has no undo for it.',
         files: paths,
-        confirmLabel: untracked
+        confirmLabel: deletes
           ? `Delete ${files(paths.length)}`
           : `Revert ${files(paths.length)}`,
         run: () => doRollback(repo, paths),
@@ -1836,9 +1849,15 @@ export function useGitPanel(
     [doRollback],
   )
 
-  /** **Opens the confirmation.** The menu marks it `danger` and the dialog names the file. */
+  /**
+   * **Opens the confirmation.** The menu marks it `danger` and the dialog names the file.
+   *
+   * `deletes` comes from the row rather than from a default, because the file menu is the one
+   * surface that knows: a staged addition is drawn in `Changes` and rolls back to nothing —
+   * see `GitPanelHost`'s `deletes`.
+   */
   const rollbackFile = useCallback(
-    (repo: RepoId, path: string) => revertFiles(repo, [path]),
+    (repo: RepoId, path: string, deletes = false) => revertFiles(repo, [path], deletes),
     [revertFiles],
   )
 
@@ -1861,7 +1880,7 @@ export function useGitPanel(
           ? `Delete ${files(paths.length)} in “${found.name}”?`
           : `Revert “${found.name}”?`,
         body: untracked
-          ? 'Git is not tracking these files, so there is nothing to restore them from. '
+          ? 'These files were never committed, so there is nothing to restore them from. '
             + 'They are deleted from disk.'
           : `Every change in this changelist goes back to its last committed state. `
             + 'Uncommitted work in these files is thrown away, and git has no undo for it.',
@@ -2186,6 +2205,52 @@ export function useGitPanel(
     [showDiff],
   )
 
+  /**
+   * Ctrl+double-click on a file row: open the file itself, not its change.
+   *
+   * > *"git tree: CTRL+mouse double click - should open current file (not diff)"*
+   *
+   * Two things have to happen here that `tab_open_file` cannot do for us, and both are
+   * refusals rather than conveniences:
+   *
+   * * **The path is repo-relative.** Every row in this panel carries a `RepoId` and a path
+   *   spelled the way git spells one, because that is what `cide_ipc::git` takes; every tab
+   *   command takes an absolute path. The root comes from the view the tree is already drawn
+   *   from, so this costs no round trip — the same join *Show File History* makes one file
+   *   over, for the same reason.
+   * * **A deletion has no file to open.** `tab_open_file` does not stat: it mints a tab for
+   *   whatever path it is handed, and a tab over a path that is gone is a permanent one reading
+   *   *"This file could not be opened"* — the failure `file.reopen` exists to avoid on the
+   *   history road. A staged `git rm` is `index: deleted, worktree: unmodified` and an
+   *   unstaged one is `worktree: deleted`, so both spellings are checked; a path deleted in the
+   *   index and re-created on disk (`worktree: untracked`) is *not* gone and opens.
+   *
+   * Both land in the panel's one-line note rather than a toast, which is where every other
+   * refusal in this hook goes.
+   */
+  const openFile = useCallback(
+    (row: Row) => {
+      if (project === null) return
+      if (row.kind !== 'file' || row.entry === undefined) return
+      const entry = row.entry
+      const gone =
+        entry.worktree === 'deleted' || (entry.index === 'deleted' && entry.worktree === 'unmodified')
+      if (gone) {
+        note('open file', `${entry.path} is not in the working tree — this change is a deletion`)
+        return
+      }
+      const root = repoOf(view, row.repo)?.root
+      if (root === undefined) {
+        note('open file', "this repository's root has not been read yet — refresh the panel")
+        return
+      }
+      void guarded('open file', () =>
+        fileApi.open(project, `${root.replace(/\/+$/, '')}/${entry.path}`),
+      )
+    },
+    [project, view, note, guarded],
+  )
+
   /** The toolbar's ◫: the first ticked file, whether or not its group is rendered. */
   const showSelectedDiff = useCallback(() => {
     const first = flatFiles(view).find((f) => selected.has(f.id))
@@ -2349,6 +2414,7 @@ export function useGitPanel(
     overwriteIndex,
     clearPartials: clearAllPartials,
     openDiff,
+    openFile,
     showSelectedDiff,
   }
 }

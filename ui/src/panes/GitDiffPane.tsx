@@ -629,7 +629,21 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     if (diff === null || diff.hunks.length === 0) return null
     return segments === null
       ? columnRows(hunkSegments(diff.hunks), { bars: true, collapsed })
-      : columnRows(segments, { bars: selectable })
+      /*
+       * **No hunk bars in the split whole-file view.** (M25)
+       *
+       * They were `bars: selectable`, and what that drew was a row per hunk in *both* columns
+       * carrying a tri-state box on the left and nothing at all on the right — a checkbox facing
+       * a blank line, twice per hunk, in a view whose whole job is to put the two documents side
+       * by side. Reported in those words and it is the right call: the bar's landmark value is
+       * the `@@` header, and a whole-file rendering has none to show (the line numbers are
+       * continuous and on screen), so all that was left of it was the affordance.
+       *
+       * The fallback above keeps its bars, and must: with only the hunks drawn the headers are
+       * the only landmark between discontinuous line numbers. Its controls moved to the new side
+       * with the per-line boxes — see `hunkBar`.
+       */
+      : columnRows(segments, { bars: false })
   }, [diff, segments, collapsed, selectable])
   /** The same table, when it is what the split layout is drawing from. Rendering is unchanged. */
   const split = layout === 'split' ? model : null
@@ -1227,6 +1241,23 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
      * A miss here costs this row its colour and nothing else.
      */
     const coloured = lineTokens(tokens, line)
+    /*
+     * Whether *this column* draws a tick box. (M25)
+     *
+     * The left column does not, and that is a deliberate narrowing rather than an oversight.
+     * Two boxes facing each other across the gutter read as two independent selections of one
+     * file, which is the opposite of what the model does — a mark is a `hunk:line` position and
+     * the sides are two views of one set. One column of boxes says that; two invite the
+     * question of what ticking both would mean.
+     *
+     * **The cost is real and is stated rather than discovered: a deletion cannot be ticked in
+     * the split layout.** A deletion exists only on the old side, so its position rides the left
+     * column and there is now no box on it — the row still *paints* as selected when it is, so
+     * the split view shows the selection faithfully, it just cannot originate one there.
+     * Unified is the layout that stages, which is also where the hunk boxes live; split is the
+     * one that reads. Requested in exactly those terms.
+     */
+    const boxSide = selectable && which !== 'old'
     return (
       <div
         key={key}
@@ -1243,7 +1274,20 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
               'data-current': currentKeys.has(mark(hunkIndex, at)) ? 'true' : 'false',
             })}
       >
-        {selectable && (
+        {/*
+          * The line number, before the tick box on the new side. (M25)
+          *
+          * Three orders, one per column, because the two split columns are read from opposite
+          * directions: the left column's number sits at its right edge and the right column's at
+          * its left, so the two meet either side of the connector. The unified row is unchanged
+          * — it has both numbers, side by side, and no gutter to meet across.
+          *
+          * Ordering matters and is not cosmetic: a grid places its children **by order**, so
+          * these fragments and the per-side track lists in the stylesheet are one decision
+          * written in two files, and `check:diff-render` reads the order back off the markup.
+          */}
+        {which === 'new' && <span className={styles.lineno}>{numbered ?? ''}</span>}
+        {boxSide && (
           <button
             type="button"
             role="checkbox"
@@ -1301,14 +1345,12 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
                   : `${annotated.oid} ${annotated.author}`}
             </span>
         )}
-        {which === 'both' ? (
+        {which === 'both' && (
           <>
             <span className={styles.lineno}>{line.oldLineno ?? ''}</span>
             <span className={styles.lineno}>{line.newLineno ?? ''}</span>
           </>
-        ) : which === 'new' ? (
-          <span className={styles.lineno}>{numbered ?? ''}</span>
-        ) : null}
+        )}
         <span className={styles.sign}>
           {line.origin === 'addition' ? '+' : line.origin === 'deletion' ? '-' : ' '}
         </span>
@@ -1412,7 +1454,9 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    */
   const hunkBar = (hunkIndex: number, which: 'old' | 'new' | 'both', key: string): ReactNode => {
     const withHeader = segments === null
-    const controls = selectable && which !== 'new'
+    // The new side, following the per-line boxes across in M25. `which === 'both'` is the
+    // unified row, which is one column and keeps them.
+    const controls = selectable && which !== 'old'
     const shut = collapsed.has(hunkIndex)
     return (
       <div key={key} className={styles.hunkBar} data-audit="gitDiffHunkBar">
@@ -1496,7 +1540,10 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
         // What the changes iterator writes `scrollTop` on. Marked rather than found by class,
         // because the unified body is a different element with the same job.
         data-audit="gitDiffScroller"
-        data-boxed={selectable ? 'true' : 'false'}
+        // The new side only, matching `boxSide` in `cell()`. A grid places by order, so a track
+        // reserved for a cell this column does not render would move every later cell across —
+        // the failure the four track lists in the stylesheet were written for.
+        data-boxed={selectable && side === 'new' ? 'true' : 'false'}
         data-blamed={side === 'new' && blame !== null ? 'true' : 'false'}
         ref={side === 'old' ? setLeftCol : setRightCol}
       >

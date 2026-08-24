@@ -235,6 +235,7 @@ export function GitPanelView({
             onToggleCheckSelected={git.toggleCheckSelected}
             onToggleExpand={git.toggleExpand}
             onOpenDiff={git.openDiff}
+            onOpenFile={git.openFile}
             /* Drag and drop's only connection to git. The rules live in `dragDrop.ts` and the
                gesture in `useChangesDrag.ts`; by the time this is called the target has been
                named and the same-list paths dropped.

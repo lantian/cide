@@ -971,6 +971,9 @@ button.chip:focus-visible {
  * here as a margin rather than to the row's padding, so the row's own box stays uniform and the
  * hover and selection backgrounds still run the full width.
  *
+ * Since M27 a *directory* row carries the same margin, because the list is a real tree and a
+ * heading is a row inside it rather than a bucket label pinned to the left edge.
+ *
  * A fixed width so the folder icon does not shift sideways when the mark changes: ▸ and ▾ have
  * different advance widths in most UI fonts, and a heading whose icon jumps on every fold reads
  * as the list twitching.

@@ -67,7 +67,7 @@ import type { RowSelection, SelectMods } from './rowSelection'
 import { useChangesDrag, type ChangesDragState } from './useChangesDrag'
 import { TriCheckbox } from './TriCheckbox'
 import type { DiffOpenMode, RepoId, StatusView } from './types'
-import { gestureOf, gitTreeClick } from '../clickSemantics'
+import { gestureOf, gitTreeClick, gitTreePress } from '../clickSemantics'
 import { useSpeedSearch } from '../useSpeedSearch'
 import { SpeedName, SpeedSearchBar } from '../SpeedSearchBar'
 import { fs as fsApi } from '@/ipc/client'
@@ -136,6 +136,15 @@ export interface ChangesTreeProps {
    */
   onOpenDiff: (row: Row, mode: DiffOpenMode) => void
   /**
+   * Open a file row's **working-tree file** rather than its diff — the Ctrl+double-click.
+   *
+   * A second callback rather than a mode on `onOpenDiff`, because it is not a diff at all: it
+   * goes to `tab_open_file` and lands in an editor tab, and the panel has to resolve the row's
+   * repo-relative path against its repository root first. See `gitTreePress` for when it is
+   * called and `useGitPanel::openFile` for what it refuses.
+   */
+  onOpenFile: (row: Row) => void
+  /**
    * File paths dropped on a changelist row.
    *
    * Absent makes the tree inert rather than decorative: with nothing to run the move, no press
@@ -191,6 +200,7 @@ export function ChangesTree({
   onToggleCheckSelected,
   onToggleExpand,
   onOpenDiff,
+  onOpenFile,
   onMovePaths,
   onTrackPaths,
   onContextMenu,
@@ -540,11 +550,26 @@ export function ChangesTree({
                 onTwisty: pressOnTwisty(e, row),
                 diffOpen,
               })
+              /*
+               * What the modifiers make of that. `gitTreeClick` above reads the row and the
+               * gesture; `gitTreePress` reads what is held down, and the two are separate
+               * functions because they answer separate questions — the first is shared with the
+               * file tree and the search results, and neither of those has a multi-row
+               * selection to build or a second thing to open.
+               *
+               * A ctrl-click means "add this row" and a shift-click means "extend to here", so
+               * neither may throw a diff on screen: doing so would open a tab per row while the
+               * user assembles a selection, which is the thirty-tabs bug arriving through a
+               * different door. A ctrl **double**-click is the one modified gesture that opens,
+               * and it opens the file rather than the diff.
+               */
+              const press = gitTreePress({ action, gesture, ctrl: mods.ctrl, shift: mods.shift })
               deferred.current = null
-              // `action.select` is false only on the second half of a double-click on a
-              // header or a twisty, whose first half has already moved the cursor and set
-              // the selection.
-              if (action.select && onPress(row.id, mods)) deferred.current = row.id
+              // `press.select` is false on the second half of a double-click on a header or a
+              // twisty, whose first half has already moved the cursor and set the selection —
+              // and on the second half of a ctrl double-click, whose first half added this row
+              // to the selection and must not now take it back out.
+              if (press.select && onPress(row.id, mods)) deferred.current = row.id
               /*
                * The gesture, not a second rule. `gitTreeClick` returns `open` for two
                * different reasons — a double-click, or a single click while a diff is
@@ -561,15 +586,12 @@ export function ChangesTree({
                * executed by anything in the repo — it needs a DOM — and an inline ternary here
                * was the one link in the chain from the click rule to `tab_retarget_diff` that
                * no test could reach. `check-git-tree.mjs` runs that function under node.
-               *
-               * Gated on an *unmodified* press, which is new and belongs here rather than in
-               * `gitTreeClick`: that rule is shared with the file tree and the search results,
-               * and neither of those has a multi-row selection to build. A ctrl-click means
-               * "add this row" and a shift-click means "extend to here" — either one also
-               * throwing a diff on screen would open a tab per row while the user assembles a
-               * selection, which is the thirty-tabs bug arriving through a different door.
                */
-              if (action.open && !mods.ctrl && !mods.shift) onOpenDiff(row, diffOpenMode(gesture))
+              if (press.open === 'diff') onOpenDiff(row, diffOpenMode(gesture))
+              // Ctrl+double-click: the file itself, in an editor tab. The row is a change and
+              // the file is what the change is in; this is the gesture that asks for the
+              // second one, and until it existed a ctrl double-click did nothing at all.
+              else if (press.open === 'file') onOpenFile(row)
             }}
             /*
              * Folding happens on *release*, and that is a change with a reason.

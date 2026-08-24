@@ -610,6 +610,92 @@ pub fn window_reveal_pane(
     Some(label)
 }
 
+/// Bring an open project to the front of whichever window is responsible for it.
+///
+/// The two halves are different work in the two window modes and this does both, because a
+/// caller outside the webview — the macOS dock menu is the first, see [`crate::dock`] — has no
+/// way to know which mode is in force and should not have to:
+///
+/// * **`Stacked`** is mostly a header-tab switch: `activate_project` moves the one shell's
+///   `active` and the broadcast repaints it. There is only ever one shell to raise, and the
+///   raise still does real work whenever the gesture came from outside the app — a dock menu is
+///   picked while cide is in the *background*, and on macOS `set_focus` is what activates it.
+/// * **`PerProject`** is a window raise. The project is *already* its window's `active` — the
+///   domain minted the role that way and nothing can change it — so `activate_project` moves
+///   nothing at all and the raise is the entire gesture.
+///
+/// Both are run either way rather than branching on the mode, because a branch here is a
+/// second copy of the mapping `rebuild_windows` owns, and the two would drift the first time a
+/// third mode existed. Running both is idempotent in each: an activation that changes nothing
+/// still bumps `rev`, which is what `project_activate` beside it already relies on to make a
+/// second window follow along.
+///
+/// `Err` for an id no project answers to, rather than a silent no-op. Every caller reads the id
+/// out of a snapshot of this same tree, so a miss means the caller's copy has diverged — and a
+/// dock menu that quietly does nothing on a click is indistinguishable from one nobody wired up,
+/// which is this project's signature defect.
+///
+/// The label is the answer, `None` when the workspace names no shell for the project. That is
+/// not an error either: it is what a workspace mid-`reconcile` looks like, and there is nothing
+/// for a caller to do about it beyond what [`reconcile`] is already doing.
+///
+/// # Why it is `allow(dead_code)` off macOS rather than `cfg`-ed to it
+///
+/// Its only caller today is [`crate::dock`]'s AppKit half, which exists on one platform. `cfg`-ing
+/// this to match would mean the whole of it — the domain call, the reconcile, the raise — is
+/// never compiled on the platform cide is developed on, and `README.md`'s Platforms section is
+/// the record of what that costs: both errors the first Mac build reported were in code no Linux
+/// build had ever type-checked. Compiled everywhere and called on one platform is the trade, and
+/// the `allow` is the price of saying so rather than inventing a caller for it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn focus_project(
+    app: &AppHandle,
+    state: &WorkspaceState,
+    project: ProjectId,
+) -> Result<Option<WindowLabel>, CoreError> {
+    let label = state.update(|ws| {
+        // Resolved first so an unknown id is reported rather than activating nothing — the
+        // same order, and the same reason, as `project_activate`.
+        workspace::project(ws, project)?;
+        workspace::activate_project(ws, project);
+        Ok(shell_showing(ws, project))
+    })?;
+    let Some(label) = label else {
+        // `rebuild_windows` puts every project in some shell's `projects`, so this is a
+        // workspace that disagrees with itself rather than a state to handle. Reported the way
+        // `window_showing`'s `None` is: there is nothing for a caller to do about it.
+        tracing::warn!(%project, "no shell window is responsible for this project");
+        return Ok(None);
+    };
+
+    // **The role can name a window the desktop does not have**, and then a raise is a warning
+    // in the log and nothing on screen. `reconcile` is the repair — it builds every shell the
+    // workspace names and has none of — and it is run *before* the raise rather than instead of
+    // it, because a window that has just been created is behind whatever the user was looking
+    // at. Skipped when the window is there, which is every ordinary call: `reconcile`
+    // enumerates the desktop and retitles every window, and that is not a per-click cost.
+    if app.get_webview_window(label.as_str()).is_none() {
+        reconcile(app, state)?;
+    }
+    windows::raise(app, &label);
+    Ok(Some(label))
+}
+
+/// The shell window responsible for a project: every one of them in `Stacked`, exactly one in
+/// `PerProject`.
+///
+/// Detached roles are not consulted and must not be. A `pane:`/`tab:` window shows a *part* of
+/// a project and carries none of its chrome, so raising one in answer to "show me this project"
+/// would put a single torn-out terminal in front of the user and leave the project itself
+/// wherever it was.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn shell_showing(ws: &Workspace, project: ProjectId) -> Option<WindowLabel> {
+    ws.windows.iter().find_map(|(label, role)| match role {
+        WindowRole::Shell { projects, .. } if projects.contains(&project) => Some(label.clone()),
+        _ => None,
+    })
+}
+
 /// The window a pane is on screen in, or `None` when nothing shows it.
 ///
 /// **Torn-out windows are asked first, and that is not a style choice.** A pane detached into

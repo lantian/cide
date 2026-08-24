@@ -461,7 +461,15 @@ try {
       + 'deletion-then-addition in hunk 1 is a pair — both sides have content, no marker',
   )
   eq(byName.wholeSplit.insertRight, [], 'and nothing marks the right column here')
-  eq(byName.wholeSplit.hunkBoxes, ['none', 'some', 'none'], 'one box per hunk, left column only')
+  eq(
+    byName.wholeSplit.hunkBoxes,
+    [],
+    'and the split whole-file view draws NO hunk bar at all. It used to draw one per hunk in '
+      + 'both columns — a tri-state box on the left facing a blank line on the right — and the '
+      + 'bar’s landmark value is its `@@` header, which a whole-file rendering has none of, so '
+      + 'all that was left of it was the affordance. The fallback below keeps its bars, where '
+      + 'the headers are the only landmark between discontinuous line numbers',
+  )
 
   eq(
     byName.wholeRevision.positions,
@@ -936,6 +944,41 @@ try {
       + 'contract rests on',
   )
 
+  // --- which column selects, and where its box sits (M25) ------------------------------------
+
+  eq(
+    byName.wholeSplit.leftBoxes,
+    [],
+    'the LEFT column draws no tick box on any row. Two boxes facing each other across the '
+      + 'gutter read as two independent selections of one file, which is the opposite of what '
+      + 'the model does: a mark is one `hunk:line` position and the sides are two views of one '
+      + 'set',
+  )
+  ok(
+    byName.wholeSplit.lineBox,
+    '…while the split view still has boxes — they are all on the right',
+  )
+  ok(
+    byName.wholeSplit.rightBoxAfterNumber,
+    'and the right column writes its box AFTER its line number, so the box sits beside the '
+      + 'change it selects rather than at the column’s outer margin',
+  )
+  eq(
+    byName.wholeSplit.selected,
+    byName.wholeSplit.sent,
+    'moving the boxes moves no selection: what is painted is still exactly what the wire '
+      + 'Selection resolves to, on both sides',
+  )
+  ok(
+    byName.wholeSplit.leftPositions.length > 0,
+    'the left column still carries positions — a deletion is still SHOWN as selected there, it '
+      + 'just cannot be selected FROM there any more; unified is the layout that stages',
+  )
+  ok(
+    !byName.wholeUnified.leftBoxes.length && byName.wholeUnified.lineBox,
+    'the unified row is untouched: one column, and it keeps its box',
+  )
+
   // --- the connector's ribbons (M25) ---------------------------------------------------------
   //
   // None of this is visible in markup: a wrong path is a shape in the wrong place, not a missing
@@ -1312,9 +1355,14 @@ try {
     ".lines[data-boxed='false'] .row",
     ".lines[data-blamed='true'] .row",
     ".lines[data-boxed='false'][data-blamed='true'] .row",
-    ".column[data-boxed='false'] .half",
-    ".column[data-blamed='true'] .half",
-    ".column[data-boxed='false'][data-blamed='true'] .half",
+    // M25: the split row's lists are per column now, because the two columns no longer draw
+    // the same cells — the left has no tick box and puts its number last, the right leads with
+    // its number and follows it with the box.
+    ".column[data-side='old'] .half",
+    ".column[data-side='new'] .half",
+    ".column[data-side='new'][data-boxed='true'] .half",
+    ".column[data-side='new'][data-blamed='true'] .half",
+    ".column[data-side='new'][data-boxed='true'][data-blamed='true'] .half",
   ]) {
     ok(
       css.includes(rule),

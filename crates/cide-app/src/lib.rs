@@ -13,6 +13,11 @@ pub mod agent_rpc;
 pub mod agents;
 pub mod closed_tabs;
 pub mod cmd;
+/// The macOS dock icon's own menu: every open project, one click from the front.
+///
+/// Platform-neutral model, `cfg`-gated AppKit glue, and a no-op on Linux — its header says why
+/// the dock is the *only* surface that can name projects the desktop cannot see.
+pub mod dock;
 pub mod edit_wait;
 pub mod emit;
 /// The `cide-ext://` scheme: an installed extension's own files, path-jailed and read-only.
@@ -797,6 +802,12 @@ pub fn run() {
             }
 
             restore_windows(app.handle())?;
+
+            // After the windows, because the dock menu is a *view* of the projects those
+            // windows show and installing it first would put a menu on screen before there was
+            // anything for a pick to raise. A no-op off macOS; `dock`'s header says why there
+            // is no Linux counterpart to write.
+            dock::install(app.handle());
             Ok(())
         })
         .build(context)

@@ -124,7 +124,7 @@ import {
   type TabId,
 } from '@/ipc/client'
 import { DetachedTabHeader } from '@/windows/DetachedTabHeader'
-import { clusterPlan, shownTabs } from '@/windows/windowTabs'
+import { clusterPlan, shownProjects, shownTabs } from '@/windows/windowTabs'
 import { runBench, formatReport, probeIpcOnce } from '@/bench/ipcBench'
 import { retheme } from '@/terminal/xterm'
 import { useWorkspace } from '@/store/workspace'
@@ -547,7 +547,13 @@ export function App() {
     }
   }, [])
 
-  const projects = boot ? Object.values(boot.workspace.projects) : []
+  /*
+   * The projects THIS window's header draws — `windows/windowTabs.ts` holds the rule and says
+   * why every project in the process is the wrong answer: in `PerProject` mode each window's
+   * role names exactly one, and rendering the other two put tabs in the strip that activate a
+   * project this window does not show.
+   */
+  const projects = boot ? shownProjects(boot.role, Object.values(boot.workspace.projects)) : []
   // A detached pane or tab window shows one project too, and naming it here keeps the
   // header honest in those windows rather than rendering no active tab at all.
   const activeProjectId =

@@ -129,6 +129,21 @@ export function GitPanel({ project, onOpenDiff, onShowHistory, onUpdate }: GitPa
        * all-untracked or none-untracked and this one flag answers for the whole set.
        */
       const untracked = row.groupKind === 'unversioned'
+      /*
+       * Whether rolling *this* row back is a delete rather than a restore.
+       *
+       * `untracked` is the group's answer and covers the unversioned list. `entry.index ===
+       * 'added'` is the other half, and it is the one that was missing: a **staged** new file
+       * is drawn in `Changes` like any other row, and HEAD still has no pre-image for it, so
+       * `stage::rollback` removes it from disk and drops its index entry. The item said *Roll
+       * Back Changes* over it and the dialog promised "goes back to its last committed state"
+       * — the one wording in this panel that promises a restore and performs a delete, which
+       * `revertFiles` and `dirMenu` have both split on since they shipped.
+       *
+       * From `entry`, not from the group, because the group cannot answer it: an addition and
+       * a modification sit side by side in the same changelist.
+       */
+      const deletes = untracked || entry.index === 'added'
       /** This repository's work tree, for the one item below that needs an absolute path. */
       const root = repoRoot(row.repo)
 
@@ -199,7 +214,8 @@ export function GitPanel({ project, onOpenDiff, onShowHistory, onUpdate }: GitPa
         },
         {
           id: 'rollback',
-          label: 'Roll Back Changes',
+          // Same split as the directory row's verb, from the row's own state — see `deletes`.
+          label: deletes ? 'Delete File' : 'Roll Back Changes',
           danger: true,
           /*
            * `git_rollback` destroys uncommitted work and Rust will not ask first, so this
@@ -209,7 +225,7 @@ export function GitPanel({ project, onOpenDiff, onShowHistory, onUpdate }: GitPa
            * with the group menu and the file verb was moved behind it at the same time.
            */
           ...(staged || unstaged
-            ? { run: () => git.rollbackFile(row.repo, path) }
+            ? { run: () => git.rollbackFile(row.repo, path, deletes) }
             : { disabledReason: 'This file has no changes to roll back' }),
         },
         { kind: 'separator' },

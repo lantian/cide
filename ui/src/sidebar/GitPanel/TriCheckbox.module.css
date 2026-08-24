@@ -1,24 +1,22 @@
 /*
- * 12px box, per the mock. The mark inside it is drawn here rather than set in type.
+ * 12px box, per the mock. **The mark inside it is not drawn here.**
  *
- * `TriCheckbox.tsx` renders `✓` for checked and `–` for partial, and its own comment worries
- * about coverage — for the wrong character. U+2013 EN DASH is in the bundled subsets; **U+2713
- * CHECK MARK is not**. Neither `@fontsource` family declares a `unicode-range` that contains
- * it (the union stops at U+2000-206F plus a few singletons), so every ticked box in the git
- * panel was drawing its tick from whatever font fontconfig resolved to — a different weight
- * and a different optical size from the border around it, and a different one on someone
- * else's machine. `font-synthesis: none` does not catch this: a missing glyph is fallback,
- * not synthesis.
+ * It used to be, and the two halves of that arrangement outlived each other: this file drew
+ * the tick as two rotated borders on `::after` and the bar as a filled `::after`, because
+ * `TriCheckbox.tsx` rendered the characters `✓` and `–` and U+2713 is in no bundled subset —
+ * so every ticked box took its glyph from whatever fontconfig resolved to, at a different
+ * weight and optical size from the border around it. `font-size: 0` collapsed the character
+ * and the pseudo-element was what the user saw.
  *
- * So both marks are geometry now. `font-size: 0` collapses the text the component still
- * renders, and the `::after` below is what is seen. The alternative that lost was an inline
- * `<svg>` in the component: it would have been sharper about nothing — these are a stroke and
- * a bar — and it needs a change to a file this stylesheet does not own.
+ * The component draws an `<Icon>` now, and geometry is not text: `font-size: 0` does nothing
+ * to an `<svg>`, so both marks were painted, one on top of the other, offset by a pixel each
+ * — reported as *"strange check icon — like it two checks when checkbox is enabled"*. The
+ * pseudo-elements are the half that goes, because the icon is the app's own closed set
+ * (`check-ui-icons.mjs` holds its stroke in band at every size) and a mark spelled twice is a
+ * mark that can disagree with itself, which is exactly what it did.
  *
- * `flex` rather than the `grid` this used: with the mark on a pseudo-element there are two
- * children, and grid auto-placement would put them in two rows and centre neither. A flex line
- * holds the zero-width text and the mark together, and `line-height` stops mattering at all —
- * which was the other thing the old comment here was working around.
+ * So this box is now only a box: the border, the ground, and the flex line that centres
+ * whatever the component puts in it. `color` is what the mark reads, through `currentColor`.
  */
 .box {
   width: 12px;
@@ -31,42 +29,6 @@
   border-radius: var(--r-1);
   background: var(--panel-2);
   color: var(--bg);
-  font-size: 0;
-}
-
-/*
- * The tick: two borders of an empty box, rotated 45°, which is the shape a real check mark
- * has — a short arm and a long one meeting at a point. 3×6 inside a 10px content area, offset
- * up by a pixel because the mark's optical centre sits below its geometric one — the long arm
- * carries the weight and it hangs down.
- *
- * The `1.5px` stroke is the one fractional length in this file and it is deliberate: the arms
- * are at 45°, so every edge on them is antialiased whatever the number is, and a 1px stroke
- * inside a 12px box reads as a scratch. It is `border-width` on a border-box element, so the
- * arms are 1.5px thick and the whole mark is 3×6 — the numbers above are the drawn extent,
- * not a content box plus borders.
- *
- * Both marks land on whole pixels because `ChangesTree.module.css` puts the 12px box at y=6 in
- * its 24px row; the bar below is `(10 − 2) / 2 = 4` inside it. y=6 is unchanged from when that
- * row was 23px, but the margins that get it there are not — see the `.checkHit` note for why
- * they are symmetric now and were asymmetric then.
- */
-.box[data-state='checked']::after {
-  content: '';
-  width: 3px;
-  height: calc(6px * var(--ui-scale));
-  border: solid currentColor;
-  border-width: 0 1.5px 1.5px 0;
-  transform: translateY(-1px) rotate(45deg);
-}
-
-/* Partial: the en dash the mock draws, as a bar. 6×2 and centred, so it reads as "some of
-   this" against the tick's diagonal rather than as a smaller tick. */
-.box[data-state='partial']::after {
-  content: '';
-  width: 6px;
-  height: calc(2px * var(--ui-scale));
-  background: currentColor;
 }
 
 /*

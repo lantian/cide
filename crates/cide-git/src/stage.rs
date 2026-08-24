@@ -53,6 +53,41 @@ fn resolve(repo: &Repository, selection: &PathSelection, side: DiffSide) -> Resu
     Ok(file)
 }
 
+/// [`resolve`], plus the one state where a change has no diff at all.
+///
+/// A path can be a change with **no HEAD-to-working-tree delta**: a file added to the index
+/// whose working copy is then gone is `AD` in `git status`, and since HEAD never had the file
+/// and the working tree no longer does, the two agree and every diff of them is empty. The only
+/// trace is the index entry — which is precisely what rolling that row back has to remove, and
+/// what the panel is drawing the row from. `resolve` refuses it as [`GitError::NoSuchChange`],
+/// which made such a row permanent: nothing in the panel could clear it.
+///
+/// `None` here therefore means "no hunks, and the whole file is the selection", not "no change".
+/// A selection carrying a `rev` is still refused, because a pinned diff that has vanished is the
+/// stale-selection case and this is the code path where a wrong answer destroys work.
+fn resolve_or_index(
+    repo: &Repository,
+    selection: &PathSelection,
+    side: DiffSide,
+) -> Result<Option<RawFile>> {
+    let request = DiffRequest::new(side);
+    match diff::file_diff(repo, &selection.path, request)? {
+        Some(file) => {
+            diff::check_rev(selection, &file)?;
+            Ok(Some(file))
+        }
+        None if selection.rev.is_none() && in_index(repo, &selection.path)? => Ok(None),
+        None => Err(GitError::NoSuchChange {
+            path: selection.path.clone(),
+        }),
+    }
+}
+
+/// Whether the index holds a stage-0 entry for this path.
+fn in_index(repo: &Repository, path: &str) -> Result<bool> {
+    Ok(repo.index().wrap()?.get_path(Path::new(path), 0).is_some())
+}
+
 /// Whether the selection covers the entire file, one way or another.
 fn is_whole(file: &RawFile, selection: &Selection) -> Result<bool> {
     if matches!(selection, Selection::Whole) {
@@ -233,18 +268,31 @@ pub fn unstage(root: &Path, selections: &[PathSelection]) -> Result<()> {
 /// the changes the user chose to keep are applied on top. Nothing is inferred, nothing is
 /// merged.
 ///
-/// A path that is not in HEAD is untracked, so rolling it back means deleting it. Partially
-/// rolling one back truncates it to the lines that were kept.
+/// A path that is not in HEAD is untracked, so rolling it back means deleting it — from the
+/// index as well as from disk. Partially rolling one back truncates it to the lines that were
+/// kept.
 pub fn rollback(root: &Path, selections: &[PathSelection]) -> Result<()> {
     let repo = repo_mod::open(root)?;
     let head_tree = diff::head_tree(&repo)?;
+    // `git_reset_default` peels its target to a commit, so this has to be the commit and not the
+    // tree the rest of this function works with — the same split `unstage` makes above.
+    let head = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .map(|c| c.into_object());
 
     let mut plans: Vec<(String, bool, Option<Vec<u8>>)> = Vec::new();
     for selection in selections {
-        let file = resolve(&repo, selection, DiffSide::Combined)?;
         let tracked = head_tree
             .as_ref()
-            .is_some_and(|tree| tree.get_path(Path::new(&file.path)).is_ok());
+            .is_some_and(|tree| tree.get_path(Path::new(&selection.path)).is_ok());
+        // `None` is a change that exists only in the index — see `resolve_or_index`. There are
+        // no hunks to choose from, so it is a whole-file plan by construction.
+        let Some(file) = resolve_or_index(&repo, selection, DiffSide::Combined)? else {
+            plans.push((selection.path.clone(), tracked, None));
+            continue;
+        };
         if is_whole(&file, &selection.selection)? {
             plans.push((file.path.clone(), tracked, None));
             continue;
@@ -281,9 +329,37 @@ pub fn rollback(root: &Path, selections: &[PathSelection]) -> Result<()> {
         repo.checkout_head(Some(&mut checkout)).wrap()?;
     }
 
+    // Then the index, for **every** rolled-back path. This is what makes the gesture
+    // `git restore --staged --worktree`: rollback throws the change away, and a change half of
+    // which is still staged has not been thrown away.
+    //
+    // `checkout_head` above is not enough on its own, in two different ways, and both of them
+    // leave a row in the panel that says a file was reverted while git still holds the change:
+    //
+    // * An **untracked** path is not checked out at all, so an added file used to lose its
+    //   working copy and keep its index entry — `AD` in `git status`. The row stayed, now drawn
+    //   as a deletion, and every further rollback of it failed `NoSuchChange`, because HEAD and
+    //   the working tree then agreed the file was not there. That is the bug this reset fixes;
+    //   `resolve_or_index` is what lets an already-`AD` row out of it.
+    // * A **tracked** path whose working copy already matches HEAD is skipped by libgit2's
+    //   checkout — nothing to write — and skipped files get no index update either. So a file
+    //   staged as `b` and then edited back to `a` in the working tree kept its staged `b`.
+    //
+    // A `None` target — an unborn branch — removes the entries outright, which is the right
+    // answer there: no HEAD content exists for anything to go back to.
+    if !plans.is_empty() {
+        let specs: Vec<String> = plans
+            .iter()
+            .map(|(path, _, _)| escape_pathspec(path))
+            .collect();
+        repo.reset_default(head.as_ref(), specs.iter().map(String::as_str))
+            .wrap()?;
+    }
+
     for (path, is_tracked, _) in &plans {
         if !is_tracked {
-            // Untracked: HEAD has nothing to restore, so its pre-image is "absent".
+            // Untracked: HEAD has nothing to restore, so its pre-image is "absent" — on disk as
+            // well as in the index, which the reset above has already seen to.
             match std::fs::remove_file(workdir.join(path)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

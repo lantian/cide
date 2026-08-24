@@ -951,6 +951,7 @@
    * them (and the dispatch guard in `EditorSurface.tsx` stopped the once-a-second repaint
    * that used to close them first), so the remaining piece is letting the text be text.
    */
+  -webkit-user-select: text;
   user-select: text;
   cursor: text;
 }

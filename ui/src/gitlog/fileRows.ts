@@ -1,5 +1,5 @@
 /**
- * The details pane's changed-file list, flat or grouped into directories.
+ * The details pane's changed-file list, flat or as a real directory tree.
  *
  * Import-free, and compiled standalone by `ui/scripts/check-log.mjs`. Tree building is the kind
  * of code that is obviously right and quietly wrong — the cases that break it are a file at the
@@ -7,13 +7,25 @@
  * and a rename whose two halves live in different directories. None of those are reachable from a
  * component test.
  *
- * # What a group is
+ * # It is a tree, not a list of directories
  *
- * The **longest common directory prefix is not collapsed away**, deliberately. IDEA collapses a
- * chain of single-child directories into `a/b/c` and this does too, because the alternative is
- * three rows of nothing but indentation. What it does not do is hoist the whole list under one
- * root: a commit touching only `crates/cide-git/src/` would otherwise draw one directory row and
- * then a flat list, which is the flat listing with an extra line above it.
+ * Until M27 this bucketed files by their whole directory path and drew one row per bucket, which
+ * looks like a tree in a commit that touches two directories and stops looking like one the
+ * moment it touches four: `ui/src/panes` and `ui/src/sidebar` were two unrelated top-level rows
+ * with no shared parent, in a pane whose whole job is *which areas did this touch*. Nesting was
+ * not merely absent — it was unrepresentable, because a bucket key has no parent.
+ *
+ * So this builds the same `DirNode` tree `sidebar/GitPanel/model.ts` builds, walks it the same
+ * way, and emits the same three rules:
+ *
+ * - **Single-child chains are compacted.** `crates/cide-git/src` is one row, not three, because
+ *   three rows of nothing but indentation carry no information per level. The compacted row keeps
+ *   the *deepest* path, so its id and the set of files under it are unchanged by the collapsing —
+ *   which is what lets a fold survive the commit it was made in.
+ * - **Directories before files at every level.** What every file manager and both other trees in
+ *   this app do; a folder buried between two files is a folder nobody finds. It is the one place
+ *   the row order is not the input's, and it is structural rather than a sort.
+ * - **Otherwise the input's order**, never alphabetical — see [`groupedRows`].
  */
 
 /** One entry the pane was given. Structural, not the generated DTO — see the header. */
@@ -103,16 +115,17 @@ export function flatRows(files: readonly ChangedFile[]): FileRow[] {
 }
 
 /**
- * The grouped reading: a heading per directory, files under it by basename.
+ * The tree reading: a row per directory level, files under their own directory by basename.
  *
  * **Order is the input's order, not alphabetical.** The backend returns a commit's files in the
- * order the diff produced them, and re-sorting here would mean the grouped and flat readings
+ * order the diff produced them, and re-sorting here would mean the tree and flat readings
  * disagree about which file is first — two views of one commit that cannot be compared by eye.
- * Directories therefore appear in the order their first file does.
+ * Directories therefore appear in the order their first file does, at every level. The one
+ * departure is that a level draws its directories before its own files: see the header.
  *
  * A file at the repository root gets no heading rather than a heading called `/` or `(root)`.
  * There is no directory to name, and inventing one puts a row on screen that matches nothing the
- * user could search for.
+ * user could search for. It is also why the root is the one node whose *own* row is never drawn.
  *
  * A **renamed** file is filed under its *new* directory and keeps the arrow in its label, with
  * the old path shown whole when the two directories differ. Filing it under the old one would
@@ -122,11 +135,16 @@ export function flatRows(files: readonly ChangedFile[]): FileRow[] {
 export function groupedRows(
   files: readonly ChangedFile[],
   /**
-   * Directories whose files are hidden.
+   * Directories whose contents are hidden.
    *
    * A set of directory paths and not a per-row flag, because the row list is rebuilt from
    * scratch on every render and on every commit: state that lived on a row would be lost the
    * moment the list was recomputed, which is every keystroke in the filter box.
+   *
+   * The path is a compacted node's **deepest** segment — `crates/cide-git/src`, never the
+   * `crates` this commit did not draw a row for — because that is what the row itself publishes
+   * as its `dir`. Folding one hides everything below it, nested directories included: a fold
+   * that left grandchildren on screen would be a disclosure that discloses nothing.
    *
    * Unknown entries are ignored rather than being an error. The set outlives the commit it was
    * built against — a user who folded `crates/cide-git/src` almost certainly wants it folded in
@@ -134,50 +152,142 @@ export function groupedRows(
    */
   collapsed: ReadonlySet<string> = EMPTY,
 ): FileRow[] {
-  const order: string[] = []
-  const byDir = new Map<string, ChangedFile[]>()
-  for (const file of files) {
-    const dir = dirOf(file.path)
-    const bucket = byDir.get(dir)
-    if (bucket === undefined) {
-      order.push(dir)
-      byDir.set(dir, [file])
-    } else {
-      bucket.push(file)
-    }
-  }
-
   const rows: FileRow[] = []
-  for (const dir of order) {
-    const bucket = byDir.get(dir) ?? []
-    const depth = dir === '' ? 0 : 1
-    const shut = dir !== '' && collapsed.has(dir)
-    if (dir !== '') {
-      rows.push({
-        kind: 'dir',
-        id: `dir:${dir}`,
-        label: dir,
-        depth: 0,
-        dir,
-        collapsed: shut,
-        count: bucket.length,
-      })
-    }
-    // A file at the repository root has no heading, so there is nothing to fold it into — it
-    // stays visible however many directories are shut. Folding it under an invented root would
-    // hide a file behind a row that does not name it.
-    if (shut) continue
-    for (const file of bucket) {
-      rows.push({
-        kind: 'file',
-        id: file.path,
-        label: labelInDir(file, dir),
-        depth,
-        file,
-      })
-    }
-  }
+  walk(rows, dirTree(files), 0, collapsed)
   return rows
+}
+
+/**
+ * One level of the tree: a directory, what it holds, and where it sits.
+ *
+ * The same shape `sidebar/GitPanel/model.ts` uses, deliberately — the two panes draw the same
+ * picture of the same repository and a second arrangement of the same data would be a second
+ * place for the compaction rule to drift. It is not *imported* from there because that module
+ * reaches the generated DTOs and this one is compiled standalone by `check-log.mjs`.
+ */
+interface DirNode {
+  /** Repo-relative directory, e.g. `crates/cide-git/src`. `''` for the root, which draws no row. */
+  path: string
+  /** What the row shows: the last segment, or several joined when the chain was compacted. */
+  label: string
+  dirs: DirNode[]
+  files: ChangedFile[]
+}
+
+/** Fold the paths into a tree, then compact its single-child chains. */
+function dirTree(files: readonly ChangedFile[]): DirNode {
+  const root: DirNode = { path: '', label: '', dirs: [], files: [] }
+  /*
+   * Prefix to node, for the whole build. The obvious `node.dirs.find(d => d.path === prefix)` is
+   * a linear scan of the siblings for *every segment of every path*, which is quadratic in the
+   * width of a directory — and this runs on every render of a pane whose list can be the four
+   * hundred files of a release merge. Insertion order is unchanged: the map only answers "have I
+   * made this one already", so directories still appear in the order their first file did.
+   */
+  const index = new Map<string, DirNode>()
+  for (const file of files) {
+    const parts = file.path.split('/')
+    // The basename never becomes a directory, so a path with no slash lands straight in the root
+    // and reads exactly as it did before directories existed.
+    parts.pop()
+    let node = root
+    let prefix = ''
+    for (const part of parts) {
+      // A leading or doubled slash would otherwise mint a directory called `''`, which draws as
+      // a nameless row you can fold. Skipped rather than rejected: the file itself is real, and
+      // hiding it would understate what the commit touched.
+      if (part === '') continue
+      prefix = prefix === '' ? part : `${prefix}/${part}`
+      const found = index.get(prefix)
+      if (found === undefined) {
+        const made: DirNode = { path: prefix, label: part, dirs: [], files: [] }
+        node.dirs.push(made)
+        index.set(prefix, made)
+        node = made
+      } else {
+        node = found
+      }
+    }
+    node.files.push(file)
+  }
+  compact(root)
+  return root
+}
+
+/**
+ * `crates/cide-git/src` is one row, not three.
+ *
+ * A chain of directories with one child and no files of its own carries no information per
+ * level — three rows and three twisties to reach one file, at 19px of indent each. IDEA compacts
+ * the same way and so does the git panel, whose note this is copied from. The compacted row keeps
+ * the **deepest** path, so its id, its fold and the set of files under it are unchanged by the
+ * collapsing.
+ *
+ * This is also why a commit touching only `crates/cide-git/src/` still draws one heading and then
+ * its files rather than three headings: the chain above it says nothing this list does not.
+ */
+function compact(node: DirNode): void {
+  node.dirs = node.dirs.map((dir) => {
+    let at = dir
+    while (at.files.length === 0 && at.dirs.length === 1) {
+      const only = at.dirs[0]
+      if (only === undefined) break
+      at = { path: only.path, label: `${at.label}/${only.label}`, dirs: only.dirs, files: only.files }
+    }
+    compact(at)
+    return at
+  })
+}
+
+/** How many files sit at or below a node — what a folded heading says it is hiding. */
+function countFiles(node: DirNode): number {
+  let total = node.files.length
+  for (const dir of node.dirs) total += countFiles(dir)
+  return total
+}
+
+/**
+ * Emit one level: its subdirectories (each followed by everything under it), then its own files.
+ *
+ * `depth` is where *this node's children* are drawn, which is why the root is walked at 0 and its
+ * own files land at 0 beside the top-level headings. A folded directory keeps its row and emits
+ * nothing below it — dropping the heading too would leave no way to unfold it.
+ */
+function walk(
+  rows: FileRow[],
+  node: DirNode,
+  depth: number,
+  collapsed: ReadonlySet<string>,
+): void {
+  for (const dir of node.dirs) {
+    const shut = collapsed.has(dir.path)
+    rows.push({
+      kind: 'dir',
+      id: `dir:${dir.path}`,
+      label: dir.label,
+      depth,
+      dir: dir.path,
+      collapsed: shut,
+      // Read off the node and not off the rows below it: a folded directory emits no rows at all,
+      // and a rows-derived count would say `0` for the thing it is hiding. Same rule as the git
+      // panel's directory row.
+      count: countFiles(dir),
+    })
+    if (shut) continue
+    walk(rows, dir, depth + 1, collapsed)
+  }
+  // A file at the repository root has no heading, so there is nothing to fold it into — it stays
+  // visible however many directories are shut. Folding it under an invented root would hide a
+  // file behind a row that does not name it.
+  for (const file of node.files) {
+    rows.push({
+      kind: 'file',
+      id: file.path,
+      label: labelInDir(file, node.path),
+      depth,
+      file,
+    })
+  }
 }
 
 /**

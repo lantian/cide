@@ -59,7 +59,13 @@ export interface ProjectTab {
 }
 
 export interface AppHeaderProps {
-  projects?: ProjectTab[] | undefined
+  /**
+   * `readonly` because the host hands over the answer to a rule rather than an array of its
+   * own: `windows/windowTabs.ts`'s `shownProjects` returns the projects THIS window draws, and
+   * a `readonly` return is what stops a caller mutating a list the rule owns. The header only
+   * ever maps and finds over it.
+   */
+  projects?: readonly ProjectTab[] | undefined
   activeProject?: string | null | undefined
   onActivate?: ((id: string) => void) | undefined
   onClose?: ((id: string) => void) | undefined

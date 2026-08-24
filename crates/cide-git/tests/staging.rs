@@ -996,6 +996,105 @@ fn rolling_an_untracked_file_back_removes_it() {
     assert!(!repo.root.join("junk.txt").exists());
 }
 
+/// Rolling back a **staged** new file has to clear the index entry too.
+///
+/// Reported as *"i'm not able to delete files that was added"*: the working copy went away and
+/// the index entry stayed, so `git status` said `AD` and the panel redrew the row — now as a
+/// deletion — for a file that was no longer anywhere. `git restore --staged --worktree` is the
+/// oracle because it is the gesture this one claims to be, and the comparison is the whole
+/// porcelain status so that a leftover index entry cannot hide in a passing assert.
+#[test]
+fn rolling_back_an_added_file_leaves_nothing_staged() {
+    let ours = TempRepo::new("rollback-added");
+    let theirs = TempRepo::new("rollback-added-git");
+    for repo in [&ours, &theirs] {
+        repo.write("seed.txt", b"seed\n");
+        repo.commit_all("base");
+        repo.write("added.txt", b"never committed\n");
+        repo.git(&["add", "added.txt"]);
+        assert_eq!(repo.git(&["status", "--porcelain"]).trim(), "A  added.txt");
+    }
+
+    stage::rollback(&ours.root, &[selection("added.txt", Selection::Whole)]).expect("rollback");
+    theirs.git(&["restore", "--staged", "--worktree", "added.txt"]);
+
+    assert!(!ours.root.join("added.txt").exists());
+    assert_eq!(
+        ours.git(&["status", "--porcelain"]).trim(),
+        theirs.git(&["status", "--porcelain"]).trim(),
+        "the file is gone from disk but the index still holds the addition"
+    );
+}
+
+/// The same, on an unborn branch: every path is an addition and there is no HEAD to reset to.
+#[test]
+fn rolling_back_an_added_file_before_the_first_commit_leaves_nothing_staged() {
+    let repo = TempRepo::new("rollback-added-unborn");
+    repo.write("added.txt", b"never committed\n");
+    repo.git(&["add", "added.txt"]);
+
+    stage::rollback(&repo.root, &[selection("added.txt", Selection::Whole)]).expect("rollback");
+
+    assert!(!repo.root.join("added.txt").exists());
+    assert_eq!(repo.git(&["status", "--porcelain"]).trim(), "");
+}
+
+/// A row whose change lives **only** in the index must still be rollable back.
+///
+/// `AD` — added to the index, then gone from the working tree — is the state cide used to leave
+/// behind, and it is reachable from outside cide as well (`git add f && rm f`). HEAD never had
+/// the file and the working tree no longer does, so every HEAD-to-worktree diff of it is empty
+/// and `resolve` called it `NoSuchChange`: the panel drew a row that no gesture could clear.
+/// `git rollback unavailable — git: noSuchChange`, for ever.
+#[test]
+fn a_change_that_exists_only_in_the_index_can_be_rolled_back() {
+    let repo = TempRepo::new("rollback-index-only");
+    repo.write("seed.txt", b"seed\n");
+    repo.commit_all("base");
+    repo.write("added.txt", b"never committed\n");
+    repo.git(&["add", "added.txt"]);
+    repo.remove("added.txt");
+    assert_eq!(repo.git(&["status", "--porcelain"]).trim(), "AD added.txt");
+
+    stage::rollback(&repo.root, &[selection("added.txt", Selection::Whole)]).expect("rollback");
+
+    assert_eq!(repo.git(&["status", "--porcelain"]).trim(), "");
+}
+
+/// The staged half of a change is thrown away even when the working tree hides it.
+///
+/// libgit2's checkout skips a file whose working copy already matches the target — nothing to
+/// write — and a skipped file gets no index update either. So a path staged as `b` and then
+/// edited back to `a` in the working tree survived its own rollback with `b` still in the index,
+/// and the panel redrew it as staged. The index reset is what covers the gap.
+#[test]
+fn rollback_resets_the_index_when_the_working_tree_already_matches_head() {
+    let repo = TempRepo::new("rollback-cancelled");
+    repo.write("f.txt", b"a\n");
+    repo.commit_all("base");
+    repo.write("f.txt", b"b\n");
+    repo.git(&["add", "f.txt"]);
+    repo.write("f.txt", b"a\n");
+
+    stage::rollback(&repo.root, &[selection("f.txt", Selection::Whole)]).expect("rollback");
+
+    assert_eq!(repo.git(&["status", "--porcelain"]).trim(), "");
+    assert_eq!(repo.read("f.txt"), b"a\n".to_vec());
+}
+
+/// The index fallback is a fallback, not an amnesty: a path that is a change nowhere is still
+/// refused, because the alternative is a destructive command that quietly does nothing.
+#[test]
+fn a_path_with_no_change_anywhere_is_still_refused() {
+    let repo = TempRepo::new("rollback-ghost");
+    repo.write("seed.txt", b"seed\n");
+    repo.commit_all("base");
+
+    let err = stage::rollback(&repo.root, &[selection("ghost.txt", Selection::Whole)])
+        .expect_err("a path with no change must not roll back");
+    assert!(matches!(err, GitError::NoSuchChange { .. }), "{err:?}");
+}
+
 /// libgit2 takes *pathspecs*, not paths, in `checkout_head` and `reset_default`. A file whose
 /// name contains an fnmatch metacharacter would otherwise drag its neighbours along — and on
 /// the rollback path that means overwriting a file the user never named with its HEAD content.

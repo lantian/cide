@@ -264,6 +264,17 @@ one crate that links tauri, and both errors in the table above were in `cide-app
 have caught either of them. It is worth running before touching a `cfg` arm in a domain crate, and
 it is not a substitute for the `macos` CI job.
 
+**A `cfg(macos)` module inside `cide-app` can still be checked, by lifting it out.** The exclusion
+above is about `git2`, not about the module — so a throwaway crate carrying a *verbatim* copy of
+the module, with only the cide-side types stubbed and the same third-party dependencies at the
+versions the workspace pins, checks under the recipe above with nothing excluded. That is how
+`dock.rs`'s AppKit half was checked, and it earned its keep immediately: a missing
+`objc2::MainThreadOnly` import (a hard error) and two `clippy::missing_transmute_annotations`
+(errors under CI's `-D warnings`). It proves nothing about linking or runtime and it is not
+committed — a stubbed copy is a copy, and a committed one drifts — but the recipe is: copy the
+module, stub what it imports from this crate, pin the same dependency versions, run the command
+above plus `cargo clippy --all-targets`.
+
 
 ### What the Mac itself needs, and what it will spend
 
@@ -380,6 +391,23 @@ now says all of that instead of naming a call that does not exist.
 Everything here is a decision, not a port, and each one has a consequence somebody has to look
 at before choosing:
 
+* **The dock icon's own menu — written, checked for Darwin, never run.** Right-clicking the dock
+  icon should list every open project and bring the picked one to the front, and
+  `crates/cide-app/src/dock.rs` does that: `entries` is the model (all open projects in header
+  order, names disambiguated by path only when they collide) and a `cfg(target_os = "macos")`
+  module adds `applicationDockMenu:` to tao's app delegate class at runtime, because AppKit offers
+  exactly one hook for a dock menu and neither tauri, tao nor muda exposes it. It refuses to
+  shadow an implementation that is already there, and the pick goes through
+  `cmd::window::focus_project`, which is mode-independent by construction — the menu says the
+  same thing in `Stacked` and `PerProject`, and only *which window* a pick raises differs.
+  The model is unit-tested here; the AppKit half type-checks and passes `clippy -D warnings` for
+  `aarch64-apple-darwin` (see the note in *Type-checking for macOS from Linux* below, which is how
+  two real errors in it were found); and **none of it has ever been linked or run.** What a Mac
+  has to confirm: that the delegate's class at runtime is what tao's source says, that
+  `class_addMethod` returns true against it, that the rows draw live rather than disabled, and
+  that a pick on a background app both activates cide and raises the right window. Note this is
+  deliberately *not* tied to the window mode — see the module header for why the mode that most
+  needs it is the one where the desktop cannot see projects at all.
 * **The title bar.** The window is built `decorations(false)` (ADR 0006). The macOS idiom is
   `TitleBarStyle::Overlay` + `hidden_title(true)`, which restores native edge resize, rounded
   corners, the window shadow and real traffic lights — at which point `windowControls.ts`'s
@@ -4790,6 +4818,38 @@ names a different symbol.
 
 The git diff pane has a **blame column** too, on the new side, off by default and toggled per tab.
 
+### The changed-file list is a tree, and for two milestones it only looked like one
+
+Reported as *"changed files in commit view (bottom panel) currently has wrong tree — each folder
+is a row, but this should be a real tree, like file tree."*
+
+The list has had a **grouped** reading and a **flat** one since it grew the toggle, and the grouped
+one bucketed files by their whole directory path and drew one row per bucket. That is
+indistinguishable from a tree in a commit touching two directories, which is what every fixture in
+the suite had, and stops being one at four: `ui/src/panes` and `ui/src/sidebar/GitPanel` were two
+unrelated top-level rows spelling `ui/src/` twice, with no shared parent to fold and nothing nested
+inside anything, in a pane whose whole job is *which areas did this touch*. Nesting was not merely
+missing — a bucket key has no parent, so it was **unrepresentable**.
+
+It is now the same `DirNode` tree the Git panel builds, walked the same way and with the same three
+rules: single-child chains compacted so `crates/cide-git/src` is one row rather than three;
+directories before files at every level; and otherwise the input's order, never alphabetical,
+because the backend returns a commit's files in the order the diff produced them and re-sorting
+would make the grouped and flat readings disagree about which file is first. A compacted row keeps
+the **deepest** path as its id, which is what lets a fold outlive the commit it was made in, and
+folding a parent takes its nested headings with it. A heading now carries the same `depth * INDENT`
+margin a file row has always carried, because it is a row *in* the tree rather than a label pinned
+to the left edge.
+
+**Why the whole suite stayed green through it**, which is the part worth writing down: a flat list
+of directories and a real tree emit the *same labels in the same order* for any commit whose
+directories are each a single chain from the root — and both fixtures were. Only the margins differ.
+So the fix came with a `nested` story shaped to be the one that can tell them apart — three
+directories under one shared parent, one of them a chain worth compacting *below* a heading, one
+compacted *at* the root, and a file at the repository root that must land last rather than vanish —
+and `check:log-render` now asserts on each heading's indent, not just on its text. `check:log`
+drives the same shape through the model directly, including a fold aimed at a nested row.
+
 ### The actions are reachable, and every refusal is a sentence
 
 Right-clicking a commit offers Revert, Cherry-pick, *Reset here…*, *Tag…*, *New branch from
@@ -5949,6 +6009,22 @@ touched at all (this runs on a scroll frame, and most frames move no shape — t
 step); runs far outside the viewport are never built; and a run whose boundary has not been measured
 yet is skipped explicitly, because a `NaN` in a path renders as nothing *and* logs nothing.
 
+**Only the right column selects, and its box follows the line number.** The split view drew a tick
+box in both columns and a hunk bar in both as well — a tri-state box on the left facing a blank row
+on the right, twice per hunk. Two boxes facing each other across the gutter read as two independent
+selections of one file, which is the opposite of what the model does: a mark is one `hunk:line`
+position and the two sides are two views of one set. The bar went entirely from the whole-file
+rendering, because its landmark value is the `@@` header and a whole-file view has none to show —
+the line numbers are continuous and on screen — so all that was left of it was the affordance. The
+hunks-only fallback keeps its bars, where those headers are the only landmark between discontinuous
+line numbers, with the controls moved to the new side alongside the per-line boxes.
+
+**The cost is real and is written down rather than left to be found: a deletion cannot be ticked in
+the split layout.** A deletion exists only on the old side, so its position rides the left column
+and there is no longer a box on it. The row still *paints* as selected when it is, so split shows a
+selection faithfully — it just cannot originate one there. Unified is the layout that stages, and
+it is unchanged; split is the one that reads.
+
 **The current change is a rail and not a wash**, and the first version got that wrong. It shipped
 with a 7% `--accent` wash layered over the origin tint, the way `data-selected` layers its 14% one.
 `--accent` is a terracotta, and 7% of it over `--diff-add-bg`'s green composites to an olive that is
@@ -6113,6 +6189,42 @@ Ctrl+Tab's switcher can still reach a torn-out tab from the shell — deliberate
 "go to where I was", and choosing one raises its window — while `tab.next`/`tab.prev` step over
 it, because a positional walk should match the strip on screen. Sizing: the new window opens at
 the tab panel's measured size, or `DETACHED_WIDTH×HEIGHT` when nothing measured.
+
+## One window per project draws one project, and an open now opens a window (M26)
+
+The report: with *Settings → Appearance → One window per project* chosen, every window's header
+still carried a tab for **every** open project instead of the one that window shows.
+
+**The header now draws `shownProjects(role, …)`.** `App.tsx` passed
+`Object.values(workspace.projects)` — every project in the *process* — to `AppHeader`, so three
+projects in per-project mode gave three windows the same three-tab strip. That was not only
+cosmetic: two of each window's three tabs were **inert**, because `workspace::activate_project`
+sets `active` only on shells whose `projects` contains the id, so clicking another window's tab
+moved *that* window's active project and left this one with a highlighted tab over content it
+does not render. The strip was also the only place offering to close a project this window has no
+view of. The rule lives in `windows/windowTabs.ts` beside `shownTabs`, which is the same
+invariant one ring in — *a thing is drawn by exactly one window* — and `check:detached` drives
+both. `keys/target.ts::windowProjectsOf` had already learned this for Ctrl+`; it reads the same
+`role.projects` and stays a separate function only because `check-commands` compiles that module
+alone, so it may not import a value. Neither may derive a strip from `workspace.projects`, and
+that is what the two checks pin.
+
+**And the bug the first fix uncovered: in per-project mode, opening a project named a window
+nobody built.** `workspace::open_project` ends in `rebuild_windows`, which mints a
+`shell:<uuid>` role for the new project, and **no command turned that role into an OS window** —
+`reconcile` was called after a project or tab *close* and never after an open. The project
+existed, held a console tab with a live `claude`, and had no window anywhere; the only reason it
+was ever visible is the bug above, which drew it as a tab in some other window. `open_project_here`
+now reconciles, which is a no-op in stacked mode. `cmd::window::focus_project` — "bring this
+project to the front, whatever that means in this mode" — reconciles too when the role names a
+window the desktop has lost, so the repair is not one call site's.
+
+**Not verified on screen.** `check:detached` pins the filter and both source seams,
+`cargo test -p cide-app` covers the dock model beside it, and the mode flip itself is
+`CIDE_AUDIT_WINDOWS=1`, which is still unrun. `focus_project` has exactly one caller today and it
+is on macOS (see *Platforms* — the dock menu), so on Linux it is compiled, type-checked and
+never called: that is deliberate, and the `allow(dead_code)` on it says so rather than a `cfg`
+that would stop it being compiled at all.
 
 ## cide's own rust-analyzer: the bundled fork (M25), and what is not verified
 
@@ -6302,7 +6414,7 @@ Problems populating, the per-profile cache filling) has not been watched on scre
 packaged bundle carrying both sidecars has been built with `--run`. The flatpak golang SDK
 extension is stated in the manifest but a flatpak build has not been attempted.
 
-## Reformat code — Ctrl+Alt+F (M26), and what is not verified
+## Reformat code — Shift+Alt+F (M26), and what is not verified
 
 cide had no formatting at all. The only appearances of `cargo fmt` in the tree were as *the
 antagonist*: it is the worked example in `cide_core::document`'s
@@ -6349,11 +6461,37 @@ tab goes dirty like any other edit, and Ctrl+S is unchanged.
    the caret jumps, the scroll jumps, every fold and diagnostic is rebuilt, and the undo step
    becomes the whole file.
 
-**The chord.** `ctrl+alt+f`, `editorFocused`. IDEA's Ctrl+Alt+L is KDE's Lock Screen and never
-reaches the app — `keymap.rs` already avoided it once for `alt+l` — so this follows VS Code's
-chord instead, which is also what ⌥⌘F becomes on macOS. The clause is not optional:
-`terminal/keys.ts` encodes a control byte only for ctrl *without* alt, so Ctrl+Alt+F reaches a
-shell as `ESC ^F`, readline's `forward-word`, and the gate is a window capture listener.
+**The chord, and the bug that changed it.** `alt+shift+f`, `editorFocused` — VS Code's own
+chord for Format Document on Windows and macOS. IDEA's Ctrl+Alt+L is not available: it is KDE's
+Lock Screen on a stock install and never reaches the app, which `keymap.rs` had already recorded
+once at `alt+l`.
+
+It shipped as `ctrl+alt+f`, and **the first person to press it got nothing.** Their
+`~/.config/kxkbrc` carries `altwin:swap_lalt_lwin` — an Apple keyboard on Linux — so the key
+*labelled* Alt emits `meta`, the stroke arriving at the gate was `ctrl+meta+f`, and nothing was
+bound to it.
+
+**Nothing about that is diagnosable from inside the app**, and that is the part worth
+remembering rather than the chord: the gate correctly matches no binding, passes the event
+through, and says nothing — which is indistinguishable from the feature being broken, and was
+reported as exactly that. Separating "not wired" from "not typable" took `cide-headless keymap`
+(the binding is there), a harness driving the real gate against the real table (it resolves and
+dispatches), zero `cide::ui` lines in the log (the handler was never reached), and finally
+reading `kxkbrc`. The palette row was what proved the feature itself had worked all along.
+**A "no binding matched this chord" trace would have made it a one-minute answer, and there
+isn't one.**
+
+One thing the audit turned up and left standing: `Alt+Shift+F` appears in this machine's
+`kglobalshortcutsrc` as `1-capture-full-page=none,Alt+Shift+F,Capture > Full Page`. That format
+is `active,default,description` and the **active field is `none`**, so the chord is free — it is
+a *latent* grab, not a present one. Enabling that capture would take the key globally and cide
+would never see it. `alt+shift+s` (`scratch.new`) has sat beside the same entry for Capture >
+Selected Area since M15 on exactly this reasoning.
+
+The `editorFocused` clause is not optional: the gate is a window capture listener, so an
+unscoped chord is swallowed in every terminal pane in every window. On macOS the chord carries
+no Ctrl, so `platform_layer` rewrites nothing and it stays ⇧⌥F — which is what VS Code binds
+Format Document to there.
 
 **What the servers actually answer, measured rather than assumed.**
 `rust_analyzer_formats_a_misformatted_file` and `gopls_formats_a_misformatted_file` print the
@@ -6365,7 +6503,7 @@ gopls:         documentFormattingProvider=Some(true) documentRangeFormattingProv
 ```
 
 So **neither shipped server offers range formatting, and the whole-document fallback is what runs
-today, always** — Ctrl+Alt+F with a selection formats the file. The range branch is still there
+today, always** — Shift+Alt+F with a selection formats the file. The range branch is still there
 and is still probed, because rust-analyzer gates its own behind an `initializationOptions` key
 that only a bundled build receives, and a contributed server may answer `true` outright; the
 probe is what lets either light it up with no code change. gopls' reply is also the strongest

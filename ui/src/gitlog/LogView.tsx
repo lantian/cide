@@ -806,7 +806,15 @@ export function ChangedFileList({
             title={row.collapsed ? `Show ${row.count} files in ${row.dir}` : `Hide ${row.dir}`}
             onClick={() => onToggleDir?.(row.dir)}
           >
-            <span className={styles.twisty} aria-hidden="true">
+            {/* The same slot a file row carries, and the same `depth * INDENT` on it — a
+                heading is a row *in* the tree now, not a top-level bucket label, so a nested
+                directory that kept a zero margin would draw its children indented under a
+                parent sitting at the left edge beside its own siblings. */}
+            <span
+              className={styles.twisty}
+              style={{ marginLeft: row.depth * INDENT }}
+              aria-hidden="true"
+            >
               <Icon name={row.collapsed ? 'chevron-right' : 'chevron-down'} size={1} />
             </span>
             {/* The folder icon comes from the same table the file tree's does, so a directory

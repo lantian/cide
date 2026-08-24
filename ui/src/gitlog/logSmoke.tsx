@@ -34,6 +34,7 @@ export interface LogDigest {
   logColumns?: string | null
   dirExpanded?: (string | undefined)[]
   rowIndents?: string[]
+  dirIndents?: string[]
   foldedLabels?: string[]
   foldedDirs?: string[]
   foldedExpanded?: (string | undefined)[]
@@ -412,6 +413,21 @@ const digests: LogDigest[] = LOG_STORIES.map((story) => {
     rowIndents: [...html.matchAll(/data-audit="logFile"[\s\S]{0,1500}?margin-left:([^;"]*)/g)].map(
       (m) => (m[1] ?? '').trim(),
     ),
+    /*
+     * And the same slot on each *directory* heading, which is the render half of M27. (M27)
+     *
+     * A heading is a row in the tree now rather than a bucket label, so it carries the depth
+     * indent a file row has always carried. Without this field the whole change is invisible to
+     * this check: the labels and the order of a nested tree and of a flat list of directories are
+     * the same strings in the same sequence, and only the margins say which one is on screen.
+     *
+     * Bounded by the markup and not by a character count, for the reason the icon counts above
+     * record: a fixed window is a claim about how much `<svg>` sits inside a twisty, and it broke
+     * the day the twisty stopped being a character.
+     */
+    dirIndents: [
+      ...html.matchAll(/data-audit="logFileDir"(?:(?!data-audit=)[\s\S])*?margin-left:([^;"]*)/g),
+    ].map((m) => (m[1] ?? '').trim()),
     /* The same story with the first directory folded: its files are gone, its count is drawn,
        and everything under every other heading is untouched. */
     foldedLabels: all(foldedHtml, 'logFile', 'button').map(fileLabel),

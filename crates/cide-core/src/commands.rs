@@ -731,7 +731,7 @@ fn build() -> Vec<Command> {
         Command::new("file.save", "Save file", FILE).when("editorFocused"),
         Command::new("file.saveAll", "Save all files", FILE).when("editorOpen"),
         /*
-         * Reformat code — Ctrl+Alt+F. (M26)
+         * Reformat code — Shift+Alt+F. (M26)
          *
          * [`FILE`] and deliberately not [`VIEW`]. The fold family's comment above `editor.fold`
          * defines this group boundary as *changes what is on screen and changes nothing about

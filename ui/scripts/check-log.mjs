@@ -1958,11 +1958,19 @@ try {
     )
     eq(
       fr.groupedRows(FILES).map((r) => `${r.kind}:${r.label}`),
-      ['dir:ui/src', 'file:a.ts', 'file:b.ts', 'file:README.md', 'dir:crates/x', 'file:y.rs'],
-      'grouped gathers each directory’s files under one heading, in the order each directory '
+      ['dir:ui/src', 'file:a.ts', 'file:b.ts', 'dir:crates/x', 'file:y.rs', 'file:README.md'],
+      'the tree gathers each directory’s files under its heading, in the order each directory '
         + 'FIRST appeared — not alphabetically. Re-sorting would make the two arrangements '
         + 'disagree about which file is first, which is two views of one commit that cannot be '
         + 'compared by eye',
+    )
+    eq(
+      fr.groupedRows(FILES).at(-1)?.label,
+      'README.md',
+      '…with one departure from the input order, and only one: a level draws its DIRECTORIES '
+        + 'before its own files, so the root-level `README.md` sits below both headings rather '
+        + 'than between them. That is what both other trees in this app do, and what every file '
+        + 'manager does — a folder buried between two files is a folder nobody finds',
     )
     ok(
       fr.groupedRows(FILES).find((r) => r.label === 'README.md')?.depth === 0,
@@ -1984,10 +1992,12 @@ try {
           { path: 'src/apple/core.ts', oldPath: null, counts: null },
         ])
         .filter((r) => r.kind === 'dir')
-        .map((r) => r.label),
-      ['src/app', 'src/apple'],
-      '`src/app` and `src/apple` are two directories, not one. A prefix test rather than a '
-        + 'segment test files them together and nothing else notices',
+        .map((r) => `${r.depth}:${r.label}`),
+      ['0:src', '1:app', '1:apple'],
+      '`src/app` and `src/apple` are two directories under one parent, not one directory and not '
+        + 'two roots. A prefix test rather than a segment test files them together and nothing '
+        + 'else notices; a bucket-per-path grouper draws them as two unrelated top-level rows, '
+        + 'which is what this list did until M27',
     )
 
     // Renames, which are the reason the choice is offered at all.
@@ -2009,6 +2019,93 @@ try {
       'a rename ACROSS directories shows the old path whole. Filed under the new directory and '
         + 'trimmed to basenames it would read `old.rs → new.ts` with no hint that the file moved',
     )
+    // --- it is a TREE, not a list of directories (M27) --------------------------------------------
+    //
+    // > *"changed files in commit view (bottom panel) currently has wrong tree - each folder is a
+    // > row, but this should be a real tree, like file tree"*
+    //
+    // The old grouper bucketed files by their whole directory path and drew one row per bucket.
+    // With two directories that is indistinguishable from a tree, which is why every assertion
+    // above kept passing; with four it is a flat list of long paths and `ui/src/panes` and
+    // `ui/src/sidebar/GitPanel` are two unrelated top-level rows with no shared parent. Nesting
+    // was not merely missing — a bucket key has no parent, so it was unrepresentable.
+    //
+    // This is the fixture that can tell the two apart: three directories under one shared parent,
+    // one of which is itself a chain worth compacting.
+
+    const DEEP = [
+      { path: 'ui/src/panes/GitDiffPane.tsx', oldPath: null, counts: null },
+      { path: 'ui/src/panes/mergeModel.ts', oldPath: null, counts: null },
+      { path: 'ui/src/sidebar/GitPanel/model.ts', oldPath: null, counts: null },
+      { path: 'ui/src/store/workspace.ts', oldPath: null, counts: null },
+      { path: 'crates/cide-git/src/stage.rs', oldPath: null, counts: null },
+      { path: 'README.md', oldPath: null, counts: null },
+    ]
+
+    eq(
+      fr.groupedRows(DEEP).map((r) => `${r.depth}:${r.kind}:${r.label}`),
+      [
+        '0:dir:ui/src',
+        '1:dir:panes',
+        '2:file:GitDiffPane.tsx',
+        '2:file:mergeModel.ts',
+        '1:dir:sidebar/GitPanel',
+        '2:file:model.ts',
+        '1:dir:store',
+        '2:file:workspace.ts',
+        '0:dir:crates/cide-git/src',
+        '1:file:stage.rs',
+        '0:file:README.md',
+      ],
+      'three directories under one `ui/src` parent are drawn UNDER it, one level deeper — not as '
+        + 'three top-level rows spelling `ui/src/` three times. Depth is the whole claim: the '
+        + 'labels alone were right in the flat grouper too',
+    )
+    eq(
+      fr.groupedRows(DEEP).filter((r) => r.kind === 'dir').map((r) => r.dir),
+      ['ui/src', 'ui/src/panes', 'ui/src/sidebar/GitPanel', 'ui/src/store', 'crates/cide-git/src'],
+      'a compacted row publishes its DEEPEST path as `dir`, however many segments its label '
+        + 'joined. That is the id `toggleCollapsed` is handed and the one a fold outlives its '
+        + 'commit under — keying it on the shallow end would fold a different directory in the '
+        + 'next commit, or none at all',
+    )
+    eq(
+      fr.groupedRows(DEEP).find((r) => r.dir === 'ui/src')?.count,
+      4,
+      '\u2026and its count is every file at or BELOW it, not the files it holds directly \u2014 '
+        + '`ui/src` holds none of its own, and a folded heading saying `0` is a heading claiming '
+        + 'to hide nothing while hiding four',
+    )
+    eq(
+      fr.groupedRows(DEEP, new Set(['ui/src'])).map((r) => `${r.depth}:${r.kind}:${r.label}`),
+      ['0:dir:ui/src', '0:dir:crates/cide-git/src', '1:file:stage.rs', '0:file:README.md'],
+      'folding a parent takes its nested HEADINGS with it, not just its own files. A fold that '
+        + 'left `panes` and `store` on screen under a shut parent would be a disclosure that '
+        + 'discloses nothing \u2014 and is exactly what a bucket-per-path grouper does, because '
+        + 'it never knew `ui/src/panes` was inside `ui/src`',
+    )
+    eq(
+      fr.groupedRows(DEEP, new Set(['ui/src/panes'])).map((r) => `${r.kind}:${r.label}`),
+      [
+        'dir:ui/src',
+        'dir:panes',
+        'dir:sidebar/GitPanel',
+        'file:model.ts',
+        'dir:store',
+        'file:workspace.ts',
+        'dir:crates/cide-git/src',
+        'file:stage.rs',
+        'file:README.md',
+      ],
+      '\u2026and folding a nested one hides only what is under it, leaving its parent and its '
+        + 'siblings alone',
+    )
+    eq(
+      fr.groupedRows(DEEP).filter((r) => r.kind === 'file').length,
+      DEEP.length,
+      'nesting regroups and never hides: every file is still a row',
+    )
+
     eq(
       fr.fileRows(FILES, true).length,
       fr.groupedRows(FILES).length,

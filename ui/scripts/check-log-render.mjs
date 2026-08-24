@@ -111,6 +111,7 @@ try {
       'loading',
       'mock',
       'multi',
+      'nested',
       'revealOutside',
       'revealed',
     ],
@@ -689,6 +690,88 @@ try {
     (byName.compare.foldedLabels?.length ?? 0) < byName.compare.groupedLabels.length,
     '\u2026so folding really does remove rows',
   )
+  // --- it is a TREE, not a list of directories (M27) --------------------------------------------
+  //
+  // > *"changed files in commit view (bottom panel) currently has wrong tree - each folder is a
+  // > row, but this should be a real tree, like file tree"*
+  //
+  // Every assertion above is about the `compare` story, whose four files sit in two directories
+  // that are each a single chain from the root. That story renders identically whether the pane
+  // builds a real tree or merely buckets files by their whole directory path, which is why it
+  // stayed green for two milestones while the list drew one flat row per directory. The `nested`
+  // story exists to be the fixture that can tell them apart — three directories under one shared
+  // parent, one of them a chain worth compacting below a heading.
+
+  eq(
+    byName.nested.fileDirs,
+    ['ui/src', 'panes', 'sidebar/GitPanel', 'store', 'crates/cide-git/src'],
+    'the shared parent `ui/src` gets a heading of its OWN, and its three children are named by '
+      + 'their own segment under it \u2014 not `ui/src/panes`, `ui/src/store`, `ui/src/sidebar/'
+      + 'GitPanel` as three unrelated top-level rows, which is what a bucket-per-directory '
+      + 'grouper draws and what was on screen',
+  )
+  eq(
+    byName.nested.dirIndents,
+    ['0', '19px', '19px', '19px', '0'],
+    '\u2026and the three children are indented one level under it while both roots sit at zero. '
+      + 'This is the whole change stated as a number: a heading is a row IN the tree now rather '
+      + 'than a bucket label, and the labels and their order are the same strings in the same '
+      + 'sequence either way \u2014 only the margins say which picture is on screen',
+  )
+  eq(
+    byName.nested.rowIndents,
+    ['38px', '38px', '38px', '38px', '19px', '0'],
+    'a file sits one level below its own heading, so a file in `ui/src/panes` is two levels in, '
+      + 'one in `crates/cide-git/src` is one, and `README.md` at the repository root is none. '
+      + 'Four files at the same depth as the one in the compacted root is the flat list again',
+  )
+  eq(
+    byName.nested.groupedLabels,
+    ['GitDiffPane.tsx', 'mergeModel.ts', 'model.ts', 'workspace.ts', 'stage.rs', 'README.md'],
+    'a row is still its basename \u2014 the heading chain above it says the rest \u2014 and the '
+      + 'root-level `README.md` is LAST rather than between two headings: a level draws its '
+      + 'directories before its own files, which is what both other trees in this app do',
+  )
+  eq(
+    byName.nested.groupedLabels.length,
+    byName.nested.flatLabels.length,
+    '\u2026and nesting regroups without hiding: the same six files either way round',
+  )
+  eq(
+    byName.nested.flatFileDirs,
+    [],
+    'the flat reading of the same commit draws no headings at all, which is still the whole '
+      + 'difference between the two arrangements',
+  )
+  eq(
+    byName.nested.dirIcons,
+    5,
+    'one folder icon per heading, the parent included \u2014 five headings for six files, which '
+      + 'a flat grouper could not produce from this commit at all (it has four directories)',
+  )
+
+  // Folded, and the fold lands on a NESTED directory: `logSmoke` folds the first file's own
+  // directory, which here is `ui/src/panes` rather than a top-level row.
+
+  eq(
+    byName.nested.foldedExpanded,
+    ['true', 'false', 'true', 'true', 'true'],
+    'folding a nested directory shuts that row and leaves its PARENT open \u2014 a fold that '
+      + 'closed `ui/src` with it, or that could not be aimed at a child at all, is the flat list '
+      + 'showing through',
+  )
+  eq(
+    byName.nested.foldedLabels,
+    ['model.ts', 'workspace.ts', 'stage.rs', 'README.md'],
+    '\u2026and it takes only its own two files, leaving its siblings\u2019 files on screen',
+  )
+  eq(
+    byName.nested.foldedDirs,
+    byName.nested.fileDirs,
+    '\u2026and every heading is still drawn, the folded one included: a heading that vanished '
+      + 'with its contents would leave no way to bring them back',
+  )
+
   eq(
     byName.compare.rangeTruncated,
     null,

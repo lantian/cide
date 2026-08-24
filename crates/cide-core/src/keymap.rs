@@ -427,37 +427,55 @@ pub fn defaults() -> Vec<Binding> {
             // would be the only entry in that list not justified by the OS eating the chord.
             ("ctrl+g", "navigate.line", "editorFocused"),
             /*
-             * Reformat code. (M26)
+             * Reformat code — Shift+Alt+F. (M26)
+             *
+             * VS Code's own chord for Format Document on Windows and macOS, and the one most
+             * people arriving from another editor reach for. IDEA's Ctrl+Alt+L is not available:
+             * it is KDE's Lock Screen on a stock install and never reaches the app, which this
+             * table already recorded once at `alt+l`.
+             *
+             * # Why it is not `ctrl+alt+f`, which is what shipped first
+             *
+             * Because the first person to press that got nothing, silently. Their
+             * `~/.config/kxkbrc` carries `altwin:swap_lalt_lwin` — an Apple keyboard on Linux —
+             * so the key **labelled** Alt emits `meta` and the stroke arriving at the gate was
+             * `ctrl+meta+f`, bound to nothing.
+             *
+             * **None of that is diagnosable from inside the app**, and that is the part worth
+             * remembering rather than the chord: the gate correctly matches no binding, passes
+             * the event through, and says nothing — which is indistinguishable from the feature
+             * being broken, and was reported as exactly that. Separating "not wired" from "not
+             * typable" took `cide-headless keymap`, a harness driving the real gate against the
+             * real table, an empty `cide::ui` log, and finally reading `kxkbrc`.
              *
              * # What it costs, checked in every layer rather than assumed
              *
-             * * **In `defaults()`**: the Ctrl+Alt entries are the two splits
-             *   (`ctrl+alt+right`/`down`), the four pane moves (`ctrl+alt+h/j/k/l`),
-             *   `ctrl+alt+shift+n`, `ctrl+alt+b` and the recursive folds
-             *   (`ctrl+alt+minus`/`equal`/`plus`). Nothing uses `ctrl+alt+f`. Free.
-             * * **In CodeMirror**: `searchKeymap` binds `Mod-f`, `F3`, `Mod-g`, `Mod-Shift-l`,
-             *   `Mod-Alt-g` and `Mod-d`; `defaultKeymap` binds `Alt-u`, `Alt-l`, `Alt-A`,
-             *   `Mod-Alt-\` and the `Alt`-arrow family; `editorKeys.ts` adds `Mod-d`,
-             *   `Mod-Alt-d` and `Alt-j`. **No installed keymap binds `Mod-Alt-f`.** Free.
-             * * **On KDE, the development platform**: `ctrl+alt+f` is not a stock global. Note
-             *   what this chord is *not*: IDEA's own Reformat Code is Ctrl+Alt+L, which is KDE's
-             *   Lock Screen and never reaches the app at all — the same reason `alt+l` above
-             *   rejected it. So this diverges from IDEA knowingly, and Ctrl+Alt+F is what VS
-             *   Code puts Format Document on, which is the next-best precedent a user carries.
-             * * **In xterm**: `terminal/keys.ts` encodes a control byte only for ctrl *without*
-             *   alt, so Ctrl+Alt+F reaches a shell as `ESC ^F` — readline's `forward-word` on a
-             *   terminal that maps Alt to an Escape prefix. That is a real byte a shell user
-             *   wants, which is precisely why the clause below is not optional.
+             * * **In `defaults()`**: the Alt+Shift entries are `alt+shift+d`, `alt+shift+s`,
+             *   `ctrl+alt+shift+n` and `ctrl+alt+shift+s`. No `f`. Free.
+             * * **In CodeMirror**: `editorKeys.ts` claims `Shift-Alt-ArrowUp`/`Down` for move-line
+             *   and `defaultKeymap` claims the `Alt-Shift` arrow family; neither claims a
+             *   `Shift-Alt` *letter*. `searchKeymap` claims `Mod-Shift-l` and nothing with Alt
+             *   and Shift together. Free.
+             * * **On KDE, the development platform**: `Alt+Shift+F` appears in
+             *   `kglobalshortcutsrc` as `1-capture-full-page=none,Alt+Shift+F,Capture > Full
+             *   Page`. The format is `active,default,description` and the **active field is
+             *   `none`**, so it is a default that is not bound and the chord is free. It is a
+             *   *latent* grab rather than a present one: enabling that capture would take the
+             *   key globally and cide would never see it — the same class of failure this
+             *   binding exists because of. `alt+shift+s` (`scratch.new`) has sat beside the same
+             *   entry for Capture > Selected Area since M15 on exactly this reasoning.
+             * * **In xterm**: Shift+Alt+F encodes as `ESC` `F`, the same shape the module header
+             *   describes for Shift+Alt+S. Moot under the clause below, but a terminal is never
+             *   offered the stroke rather than merely tolerating it.
              *
              * `editorFocused`, for the reason `ctrl+b` above states at length: the gate is a
              * window **capture** listener, so an unscoped chord is swallowed in every terminal
              * pane in every window, for a command that needs a buffer to mean anything.
              *
-             * macOS: `platform_layer` rewrites Ctrl to Meta and leaves Alt alone, so this
-             * becomes ⌥⌘F. Not in `MACOS_MENU_CHORDS`, so no exception is needed — and it is
-             * what VS Code binds Format Document to on macOS as well.
+             * macOS: the chord carries no Ctrl, so `platform_layer` rewrites nothing and it
+             * stays ⇧⌥F — which is exactly what VS Code binds Format Document to there.
              */
-            ("ctrl+alt+f", "editor.format", "editorFocused"),
+            ("alt+shift+f", "editor.format", "editorFocused"),
             /*
              * ⌥L — widen Ctrl+P to *External Libraries*, while Ctrl+P has the keyboard. (M16)
              *

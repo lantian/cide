@@ -78,6 +78,15 @@ export function activeTabOf(boot: Bootstrap | null): Tab | null {
  * is the defect this round exists to remove.
  *
  * Empty for a detached window: it has no strip, so nothing to cycle.
+ *
+ * **`windows/windowTabs.ts`'s `shownProjects` is the same field, filtering the other way**, and
+ * it is what the header strip itself is drawn from. Two functions rather than one delegating to
+ * the other, and the reason is this module's own compilability: `keys/target.ts` is driven from
+ * fixtures by `check-commands`, which compiles it *alone* — the module note above and that
+ * script's both say so — and a value import would emit a `require` nothing can resolve. They do
+ * not restate a rule between them; `role.projects` is the fact, and each reads it. What would be
+ * a drift is either one deriving the strip from `workspace.projects` instead, which is precisely
+ * the bug above.
  */
 export function windowProjectsOf(boot: Bootstrap | null): readonly ProjectId[] {
   return boot !== null && boot.role.kind === 'shell' ? boot.role.projects : []

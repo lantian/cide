@@ -164,6 +164,71 @@ export function gitTreeClick({
   return diffOpen ? SELECT_OPEN : SELECT
 }
 
+/**
+ * What an opening press in the git tree opens, or `null` when it opens nothing.
+ *
+ * `'diff'` is a diff tab (or a retarget of the one on screen — that second choice is
+ * `GitPanel/model.ts::diffOpenMode`'s, and it is a different question from this one).
+ * `'file'` is the working-tree file itself, in an editor tab.
+ */
+export type GitOpen = 'diff' | 'file' | null
+
+export interface GitTreePress {
+  /** What [`gitTreeClick`] decided for this press, reading nothing but the row and the gesture. */
+  readonly action: RowAction
+  readonly gesture: Gesture
+  /** Ctrl on Linux and Windows, ⌘ on macOS — the caller folds `metaKey` into this. */
+  readonly ctrl: boolean
+  readonly shift: boolean
+}
+
+/**
+ * The two halves of a press that a modifier can change.
+ *
+ * `toggle` is deliberately absent: the fold happens on the *release* (a press on a directory
+ * row is also how a drag of it begins), and a modifier has never had anything to say about it
+ * — ctrl-clicking a changelist header still folds it, exactly as it did.
+ */
+export interface GitPress {
+  readonly select: boolean
+  readonly open: GitOpen
+}
+
+/**
+ * The git tree's **modified** press: Ctrl or Shift held. (M27)
+ *
+ * > *"git tree: CTRL+mouse double click - should open current file (not diff). Note: CTRL +
+ * > one click is just a selection."*
+ *
+ * [`gitTreeClick`] answers for the row and the gesture alone, and that is worth keeping: the
+ * rule it states — one click selects, one click *while a diff is up* switches it, a double
+ * click opens — is the same rule whatever is held down. What the modifiers change is where an
+ * opening press lands, and whether the press touches the selection at all.
+ *
+ * * **Shift** opens nothing. It is building a range, and a press that also threw a diff on
+ *   screen would open a tab per row while the user assembles a selection.
+ * * **Ctrl, single** opens nothing either, for the same reason — it is `rowSelection.ts`'s
+ *   toggle, and the report says so in as many words.
+ * * **Ctrl, double** opens the **file**. A file row is a *change*, and there are two things a
+ *   user can mean by it: the change (the diff, which is the unmodified gesture) or the file
+ *   the change is in. Ctrl is what tells them apart, and it costs no binding — with no rule
+ *   here the second half of that gesture was already refused, so a ctrl double-click was a
+ *   press that visibly did nothing at all.
+ *
+ * `select` is false for exactly that last case, and it is not a detail. `click` fires twice on
+ * a double, so the first half has already toggled the row *into* the selection through
+ * `pressSelect`; a second toggle on the second half would take it straight back out, and the
+ * user would have opened a file and lost the row they were pointing at in one gesture. The
+ * cursor still moves — `ChangesTree` focuses the row on the press, and the focus is what calls
+ * `onCurrent`.
+ */
+export function gitTreePress({ action, gesture, ctrl, shift }: GitTreePress): GitPress {
+  if (shift) return { select: action.select, open: null }
+  if (!ctrl) return { select: action.select, open: action.open ? 'diff' : null }
+  if (gesture === 'single') return { select: action.select, open: null }
+  return { select: false, open: action.open ? 'file' : null }
+}
+
 export interface LogFileClick {
   readonly gesture: Gesture
   /** A directory heading in the grouped listing. File rows are the leaves. */

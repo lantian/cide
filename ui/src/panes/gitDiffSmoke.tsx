@@ -447,6 +447,10 @@ export interface DiffDigest {
   insertRight: string[]
   /** Whether the connector gutter is in the markup. Split layout only. */
   connector: boolean
+  /** `data-at` of every row in the LEFT column that draws a tick box. Must stay empty. */
+  leftBoxes: string[]
+  /** Whether the right column writes its tick box after its line number. */
+  rightBoxAfterNumber: boolean
   /**
    * Whether the left column writes its line number **after** the line text.
    *
@@ -512,6 +516,43 @@ function leftNumberLastOf(html: string): boolean {
   const text = row.lastIndexOf('text')
   const lineno = row.lastIndexOf('lineno')
   return text >= 0 && lineno > text
+}
+
+/** The left column's slice of the markup, or `''` outside the split layout. */
+function leftSliceOf(html: string): string {
+  const start = html.indexOf('data-side="old"')
+  if (start < 0) return ''
+  const end = html.indexOf('data-side="new"')
+  return html.slice(start, end < 0 ? undefined : end)
+}
+
+/**
+ * Rows in the left column that draw a tick box.
+ *
+ * Must be empty: since M25 only the new side selects. A box here would be the second of two
+ * selections facing each other across the gutter, which is not what the model does — a mark is
+ * one `hunk:line` position and the two sides are two views of one set.
+ */
+function leftBoxesOf(html: string): string[] {
+  const left = leftSliceOf(html)
+  return [...left.matchAll(/data-at="([\d:]+)"[\s\S]*?(?=data-at="|$)/g)]
+    .filter((m) => (m[0] ?? '').includes('data-audit="gitDiffLineBox"'))
+    .map((m) => m[1] ?? '')
+}
+
+/**
+ * Whether the right column's first row writes its tick box after its line number.
+ *
+ * A grid places by order, so this and the track list in the stylesheet are one decision written
+ * in two files; only this one is a fact about the DOM.
+ */
+function rightBoxAfterNumberOf(html: string): boolean {
+  const start = html.indexOf('data-side="new"')
+  if (start < 0) return false
+  const row = /class="[^"]*half[^"]*"[^>]*>([\s\S]*?)data-audit="gitDiffLineBox"/.exec(
+    html.slice(start),
+  )?.[1]
+  return row !== undefined && row.includes('lineno')
 }
 
 /** Every `cide-tk-*` span, as `class:text`, in document order. */
@@ -720,6 +761,8 @@ function digest(
     blameDisabled: toggle.disabled,
     blameTitle: toggle.title,
     connector: html.includes('data-audit="gitDiffConnector"'),
+    leftBoxes: leftBoxesOf(html),
+    rightBoxAfterNumber: rightBoxAfterNumberOf(html),
     leftNumberLast: leftNumberLastOf(html),
     current: rows.flatMap((m) => (m[3] === 'true' ? [m[1] ?? ''] : [])),
     stepDisabled: [...html.matchAll(/data-audit="gitDiffStep"([^>]*)>/g)].map((m) =>
@@ -803,6 +846,8 @@ function readOnlyDigest(
     blameDisabled: toggle.disabled,
     blameTitle: toggle.title,
     connector: html.includes('data-audit="gitDiffConnector"'),
+    leftBoxes: leftBoxesOf(html),
+    rightBoxAfterNumber: rightBoxAfterNumberOf(html),
     leftNumberLast: leftNumberLastOf(html),
     current: rows.flatMap((m) => (m[3] === 'true' ? [m[1] ?? ''] : [])),
     stepDisabled: [...html.matchAll(/data-audit="gitDiffStep"([^>]*)>/g)].map((m) =>

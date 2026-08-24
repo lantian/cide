@@ -970,6 +970,61 @@ try {
     'and a double click opens a tab of its own, which is what marks it kept in Rust',
   )
 
+  // --- and what a MODIFIED press does ----------------------------------------------------
+
+  /*
+   * > *"git tree: CTRL+mouse double click - should open current file (not diff). Note: CTRL +
+   * > one click is just a selection."*
+   *
+   * `gitTreeClick` above reads the row and the gesture and nothing else, which is what lets
+   * the file tree and the search results share the module. `gitTreePress` reads what is held
+   * down. Two functions because they answer two questions, and this half is the one that can
+   * open a *second* thing — the working-tree file, through `tab_open_file`, which is not a
+   * diff at all.
+   */
+  const press = (gesture, ctrl, shift, action = click(gesture, false, false)) =>
+    c.gitTreePress({ action, gesture, ctrl, shift })
+  const opens = (select, open) => ({ select, open })
+
+  eq(
+    press('single', false, false, click('single', false, true)),
+    opens(true, 'diff'),
+    'an unmodified press that opens still opens the DIFF — the modifier rule changes nothing '
+      + 'about the gesture everybody uses',
+  )
+  eq(
+    press('single', true, false, click('single', false, true)),
+    opens(true, null),
+    'ctrl + ONE click is just a selection, even with a diff on screen: it is '
+      + "`rowSelection.ts`'s toggle, and a diff per row while a selection is assembled is the "
+      + 'thirty-tabs bug through a different door',
+  )
+  eq(
+    press('double', true, false),
+    opens(false, 'file'),
+    'ctrl + DOUBLE click opens the working-tree FILE — the row is a change and this is how a '
+      + 'user asks for the file the change is in',
+  )
+  eq(
+    press('double', true, false).select,
+    false,
+    "\u2026and does NOT touch the selection again: `click` fires twice, so the gesture's first "
+      + 'half has already ctrl-toggled this row IN, and a second toggle would take it straight '
+      + 'back out — a file opened and the row lost, in one gesture',
+  )
+  eq(
+    press('double', false, true),
+    opens(true, null),
+    'shift + double opens nothing at all: shift is extending a range and has no second thing '
+      + 'to mean',
+  )
+  eq(
+    press('double', true, false, click('double', true, false)),
+    opens(false, null),
+    'and ctrl + double on a GROUP row opens no file: `gitTreeClick` said that gesture opens '
+      + 'nothing, and this rule only ever redirects an open that was already happening',
+  )
+
   /*
    * The mapping being right is worth nothing if nothing calls it, and this project has shipped
    * a feature that was correct and unreachable more than once — see the note at the end of
@@ -983,6 +1038,42 @@ try {
     'the mousedown handler routes through `diffOpenMode` — an inline ternary here is exactly '
       + 'the link no test can reach',
   )
+  ok(
+    /gitTreePress\(\{ action, gesture, ctrl: mods\.ctrl, shift: mods\.shift \}\)/.test(tree)
+      && /if \(press\.open === 'diff'\)/.test(tree)
+      && /else if \(press\.open === 'file'\) onOpenFile\(row\)/.test(tree),
+    'and it asks `gitTreePress` what the modifiers made of that, with BOTH answers wired: the '
+      + 'rules above are worth nothing if the ctrl arm falls off the end of the handler',
+  )
+  ok(
+    /if \(press\.select && onPress\(row\.id, mods\)\)/.test(tree)
+      && !/if \(action\.select && onPress/.test(tree),
+    'the selection follows `press.select` and not `action.select` — the two differ on exactly '
+      + 'one gesture, and reading the wrong one is how a ctrl double-click opens the file and '
+      + 'un-selects the row it opened',
+  )
+  ok(
+    /onOpenFile=\{git\.openFile\}/.test(
+      readFileSync(join(UI, 'src/sidebar/GitPanel/GitPanel.tsx'), 'utf8'),
+    ),
+    '\u2026and the panel hands the tree something to call: an unwired callback is a gesture '
+      + 'that type-checks and does nothing',
+  )
+  {
+    const hook = readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8')
+    const body = /const openFile = useCallback\(([\s\S]{0,1400}?)\n  \)/.exec(hook)?.[1] ?? ''
+    ok(
+      /entry\.worktree === 'deleted'/.test(body) && /entry\.index === 'deleted'/.test(body),
+      'the panel refuses a deletion itself. `tab_open_file` does not stat — it mints a tab for '
+        + 'whatever path it is handed, so a `git rm`-ed row would open a PERMANENT tab reading '
+        + '"This file could not be opened"',
+    )
+    ok(
+      /repoOf\(view, row\.repo\)\?\.root/.test(body) && /\$\{entry\.path\}/.test(body),
+      "and it joins the repo root onto the row's repo-relative path — every tab command takes "
+        + 'an absolute one, and sending `src/main.rs` would open a tab over nothing',
+    )
+  }
   /*
    * The directory rules above are worth nothing if the component answers `gitTreeClick` with
    * the wrong facts. Both gesture halves must agree — the press decides the selection and the
@@ -1751,13 +1842,43 @@ try {
       + '`node_modules/` are not part of any change, and the group row above it has refused '
       + 'the same verb since it shipped',
   )
+  const hookSrc = readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8')
   ok(
     /git\.revertFiles\(row\.repo, paths, untracked\)/.test(host)
-      && /\(repo: RepoId, paths: string\[\], untracked = false\)/.test(
-        readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8'),
-      ),
+      && /\(repo: RepoId, paths: string\[\], deletes = false\)/.test(hookSrc),
     'and the fact travels to the confirmation rather than stopping at the label: one dialog, '
       + 'worded by what the command will actually do',
+  )
+  /*
+   * The *file* row's half of the same fact, which the group kind cannot answer.
+   *
+   * A **staged** new file is drawn in `Changes` beside the modifications, and HEAD has no
+   * pre-image for it either: `stage::rollback` deletes it from disk and drops its index entry.
+   * The row said *Roll Back Changes* and the dialog promised "goes back to its last committed
+   * state" over a file it was about to erase. `entry.index === 'added'` is what splits it, and
+   * it has to reach `rollbackFile` — a label that split on its own would be a different lie.
+   */
+  ok(
+    /const deletes = untracked \|\| entry\.index === 'added'/.test(host)
+      && /label: deletes \? 'Delete File' : 'Roll Back Changes'/.test(host)
+      && /git\.rollbackFile\(row\.repo, path, deletes\)/.test(host)
+      && /\(repo: RepoId, path: string, deletes = false\) => revertFiles\(repo, \[path\], deletes\)/
+        .test(hookSrc),
+    'a STAGED ADDITION says Delete File, not Roll Back Changes, and carries the fact to the '
+      + 'confirmation: git has nothing committed to restore it from, so the command removes '
+      + 'the file and its index entry',
+  )
+  /*
+   * And the delete wording says *never committed* rather than *not tracked*. Git is tracking a
+   * staged addition — in the index — so the old sentence is one the user can see is false
+   * about the row they just right-clicked, in the dialog that is the last thing between them
+   * and a destructive command.
+   */
+  ok(
+    !/Git is not tracking these files/.test(hookSrc)
+      && (hookSrc.match(/These files were never committed/g) ?? []).length === 2,
+    'the delete dialog is worded from "never committed", in both places that open it — the '
+      + 'file/path list and the unversioned group',
   )
   const tree2 = readFileSync(join(UI, 'src/sidebar/GitPanel/ChangesTree.tsx'), 'utf8')
   ok(
@@ -1796,7 +1917,7 @@ try {
    * — the press would collapse the selection to one row before the pointer had moved.
    */
   ok(
-    /if \(action\.select && onPress\(row\.id, mods\)\) deferred\.current = row\.id/.test(tree2)
+    /if \(press\.select && onPress\(row\.id, mods\)\) deferred\.current = row\.id/.test(tree2)
       && /if \(deferred\.current === row\.id\) \{\s*deferred\.current = null\s*onRelease\(row\.id\)/
         .test(tree2),
     'a press that `rowSelection` deferred is remembered and answered on the mouseup, so a drag '
@@ -1855,8 +1976,10 @@ try {
   )
   const model = readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8')
   ok(
-    !/rollbackFile = useCallback\(\s*\(repo: RepoId, path: string\) => \{[\s\S]{0,200}gitApi\.rollback/.test(model)
-      && /rollbackFile = useCallback\(\s*\(repo: RepoId, path: string\) => revertFiles/.test(model),
+    !/rollbackFile = useCallback\(\s*\(repo: RepoId, path: string[^)]*\) => \{[\s\S]{0,200}gitApi\.rollback/
+      .test(model)
+      && /rollbackFile = useCallback\(\s*\(repo: RepoId, path: string, deletes = false\) => revertFiles/
+        .test(model),
     'every route to `git_rollback` goes through the confirmation: the unguarded call is '
       + 'private to the hook, which is what stops the next caller skipping the dialog',
   )

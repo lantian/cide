@@ -397,51 +397,50 @@
 
 .half {
   display: grid;
-  grid-template-columns: 16px 5ch 2ch minmax(0, 1fr);
   align-items: start;
   padding-right: 8px;
   min-width: 0;
 }
 
 /*
- * The same conditional column lists for a split row, scoped to the column now. Four rules
- * are written and the left column only ever uses the first two: it is never blamed
- * (`data-blamed` is hard-coded `'false'` on it — annotating the old side needs a second
- * blame at the other revision, see `cell()`), and with the columns independently laid out
- * there is nothing a missing track could push out of alignment any more.
+ * The split row's track lists, one per column, because since M25 the two columns are read from
+ * opposite directions and no longer draw the same cells. (M25)
+ *
+ * **The left column: `[sign] [text] [number]`.** Its number is at its *right* edge, IDEA's
+ * arrangement, so that the two columns' numbers meet either side of the connector rather than
+ * sitting at the pane's two outer margins with all the code between them. It carries no tick box
+ * (see `boxSide` in `cell()`) and it is never blamed — annotating the old side needs a second
+ * blame at the other revision, see `blameFor` — so it has exactly one list and no combinations.
+ *
+ * **The right column: `[number] [box] [blame?] [sign] [text]`.** Its number is at its *left*
+ * edge, meeting the left column's across the gutter, and the tick box follows it rather than
+ * leading the row: a box at the outer margin of the right column would be as far from the change
+ * it selects as the layout allows.
+ *
+ * A grid places its children **by order**, so every one of these lists is the same decision as
+ * the fragment order in `cell()`, written in a second file. That is the failure these rules were
+ * split up for in M18 — a track for a cell that was not rendered moves every later cell one
+ * column across — and it is why `check:diff-render` reads the order back off the markup instead
+ * of trusting either half.
  */
-.column[data-boxed='false'] .half {
+.column[data-side='old'] .half {
+  grid-template-columns: 2ch minmax(0, 1fr) 5ch;
+}
+
+.column[data-side='new'] .half {
   grid-template-columns: 5ch 2ch minmax(0, 1fr);
 }
 
-.column[data-blamed='true'] .half {
-  grid-template-columns: 16px var(--blame-col) 5ch 2ch minmax(0, 1fr);
+.column[data-side='new'][data-boxed='true'] .half {
+  grid-template-columns: 5ch 16px 2ch minmax(0, 1fr);
 }
 
-.column[data-boxed='false'][data-blamed='true'] .half {
-  grid-template-columns: var(--blame-col) 5ch 2ch minmax(0, 1fr);
+.column[data-side='new'][data-blamed='true'] .half {
+  grid-template-columns: 5ch var(--blame-col) 2ch minmax(0, 1fr);
 }
 
-/*
- * The left column's own track list: the number moves to the **right** edge. (M25)
- *
- * IDEA's arrangement, and the reason is legibility rather than taste. With a number at each
- * outer margin the two columns' numbers are the two things furthest apart on screen, and
- * comparing "line 204 there" with "line 206 here" is a saccade across the whole pane. Meeting
- * them either side of the connector puts the two numbers, and the ribbon that says how they
- * correspond, in one place.
- *
- * The left column is never blamed and never boxed on the read-only arm, but both combinations
- * are written anyway, for the reason the four rules above are written: a template with a track
- * for a cell that was not rendered puts every later cell one column across, and the left column
- * having a tick box is one `partialOk` away.
- */
-.column[data-side='old'] .half {
-  grid-template-columns: 16px 2ch minmax(0, 1fr) 5ch;
-}
-
-.column[data-side='old'][data-boxed='false'] .half {
-  grid-template-columns: 2ch minmax(0, 1fr) 5ch;
+.column[data-side='new'][data-boxed='true'][data-blamed='true'] .half {
+  grid-template-columns: 5ch 16px var(--blame-col) 2ch minmax(0, 1fr);
 }
 
 /*

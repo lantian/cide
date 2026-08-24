@@ -141,16 +141,17 @@ try {
 
   // --- the detached-TAB rules: src/windows/windowTabs.ts --------------------------------------
 
-  const { clusterPlan, detachedTabs, shownTabs } = await import(
+  const { clusterPlan, detachedTabs, shownProjects, shownTabs } = await import(
     `file://${join(out, 'windowTabs.js')}`
   )
 
   const TABS = [{ id: 'console' }, { id: 'a' }, { id: 'b' }]
   const WINDOWS = {
-    'shell:1': { kind: 'shell' },
-    'tab:1': { kind: 'detachedTab', tab: 'b' },
-    'pane:1': { kind: 'detachedPane', tab: 'a' },
+    'shell:1': { kind: 'shell', projects: ['alpha'] },
+    'tab:1': { kind: 'detachedTab', project: 'alpha', tab: 'b' },
+    'pane:1': { kind: 'detachedPane', project: 'alpha', tab: 'a' },
   }
+  const SHELL = WINDOWS['shell:1']
 
   eq(
     [...detachedTabs(WINDOWS)],
@@ -159,26 +160,69 @@ try {
       '`tab` is the home the pane re-docks into, still drawn by the shell',
   )
   eq(
-    shownTabs({ kind: 'shell' }, TABS, WINDOWS).map((t) => t.id),
+    shownTabs(SHELL, TABS, WINDOWS).map((t) => t.id),
     ['console', 'a'],
     'THE LOAD-BEARING FILTER: the shell must not draw a torn-out tab. The tab stays in ' +
       '`project.tabs` (quit guards and restore plans walk that list), so this filter is the ' +
       'only thing between one file tab and two live buffers over one file',
   )
   eq(
-    shownTabs({ kind: 'detachedTab', tab: 'b' }, TABS, WINDOWS).map((t) => t.id),
+    shownTabs(WINDOWS['tab:1'], TABS, WINDOWS).map((t) => t.id),
     ['b'],
     'a tab window draws exactly its own tab',
   )
   eq(
-    shownTabs({ kind: 'detachedPane', tab: 'a' }, TABS, WINDOWS).map((t) => t.id),
+    shownTabs(WINDOWS['pane:1'], TABS, WINDOWS).map((t) => t.id),
     [],
     'a pane window draws no tab at all — its pane lives outside every tree',
   )
   eq(
-    shownTabs({ kind: 'shell' }, TABS, { 'shell:1': { kind: 'shell' } }),
+    shownTabs(SHELL, TABS, { 'shell:1': SHELL }),
     TABS,
     'with nothing torn out the shell draws every tab',
+  )
+
+  // --- which PROJECTS a window draws ---------------------------------------------------------
+
+  const PROJECTS = [{ id: 'alpha' }, { id: 'beta' }, { id: 'gamma' }]
+
+  eq(
+    shownProjects({ kind: 'shell', projects: ['alpha', 'beta', 'gamma'] }, PROJECTS).map(
+      (p) => p.id,
+    ),
+    ['alpha', 'beta', 'gamma'],
+    'the stacked shell draws every project — one window, one strip, which is the default mode',
+  )
+  eq(
+    shownProjects({ kind: 'shell', projects: ['beta'] }, PROJECTS).map((p) => p.id),
+    ['beta'],
+    'THE PER-PROJECT FILTER: each window names exactly one project and must draw exactly that ' +
+      'one. Rendering the workspace map instead gave three windows the same three-tab strip, ' +
+      'and the two tabs a window does not draw are inert — `activate_project` only moves ' +
+      '`active` on shells whose `projects` holds the id, so the click landed in another window',
+  )
+  eq(
+    shownProjects({ kind: 'shell', projects: ['gamma', 'alpha'] }, PROJECTS).map((p) => p.id),
+    ['alpha', 'gamma'],
+    'and the order is the CALLER\'s — workspace insertion order, which is what the strip draws ' +
+      'and `reorder_project` rewrites — never the role list\'s',
+  )
+  eq(
+    shownProjects({ kind: 'shell', projects: ['alpha', 'ghost'] }, PROJECTS).map((p) => p.id),
+    ['alpha'],
+    'a role naming a project the workspace no longer has draws nothing for it, rather than a ' +
+      'tab over a project that is gone',
+  )
+  eq(
+    shownProjects(WINDOWS['tab:1'], PROJECTS),
+    [],
+    'a detached window has no project strip. `keys/target.ts::windowProjectsOf` is these ids, ' +
+      'so this is also what stops Ctrl+` walking a list the window does not draw',
+  )
+  eq(
+    shownProjects(WINDOWS['pane:1'], PROJECTS),
+    [],
+    'and neither does a pane window',
   )
 
   eq(
@@ -212,6 +256,21 @@ try {
   ok(
     app.includes('shownTabs(boot.role, activeProject.tabs, boot.workspace.windows)'),
     'and the filtered list comes from this module rather than being re-derived in place',
+  )
+  ok(
+    /<AppHeader[\s\S]{0,400}projects=\{projects\}/.test(app) &&
+      app.includes('shownProjects(boot.role, Object.values(boot.workspace.projects))'),
+    'the header strip is fed the FILTERED project list from this module. ' +
+      '`Object.values(workspace.projects)` on its own is every project in the PROCESS, which is ' +
+      'what put three identical strips in three windows under *One window per project*',
+  )
+  const targets = readFileSync(join(UI, 'src/keys/target.ts'), 'utf8')
+  ok(
+    /export function windowProjectsOf[\s\S]{0,200}role\.projects/.test(targets),
+    'and the switcher reads the same `role.projects` this module filters by. It is a second ' +
+      'function (that module is compiled alone by check-commands, so it may not import a value) ' +
+      'but it must not become a second SOURCE: Ctrl+` walking `workspace.projects` is the same ' +
+      'dead keystroke one ring out',
   )
   ok(
     app.includes('clusterPlan('),

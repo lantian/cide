@@ -81,6 +81,7 @@ export type LogStoryName =
   | 'revealed'
   | 'revealOutside'
   | 'compare'
+  | 'nested'
 
 // --- the repositories -------------------------------------------------------------------------
 //
@@ -378,6 +379,47 @@ const DETAIL: CommitDetail = {
   total: TOTAL,
 }
 
+/**
+ * A commit that touches several directories under one shared parent. (M27)
+ *
+ * `DETAIL` above cannot exhibit a tree: all three of its files are in one directory, and the
+ * compare story's four are in two directories that are each a single chain from the root. Both
+ * render identically whether the pane builds a real tree or merely buckets files by their whole
+ * directory path — which is why the list spent two milestones drawing one row per directory with
+ * nothing nested inside anything, and every render assertion stayed green.
+ *
+ * So this one is shaped to tell them apart, and every part of it is load-bearing:
+ *
+ * - `panes`, `sidebar/GitPanel` and `store` share the parent `ui/src`, so a bucketing grouper
+ *   draws three top-level rows spelling `ui/src/` three times and a tree draws one heading with
+ *   three under it.
+ * - `sidebar/GitPanel` is a chain worth compacting *below* a heading, which is the case that
+ *   distinguishes "compact single-child chains" from "compact the root".
+ * - `crates/cide-git/src` is a chain compacted *at* the root, so the two cases sit side by side.
+ * - `README.md` is at the repository root, which draws no heading at all and must survive the
+ *   directories-before-files rule by landing last rather than by vanishing.
+ */
+const NESTED_TOTAL: CommitTotals = { files: 6, added: 132, deleted: 47, partial: false }
+
+const NESTED: CommitDetail = {
+  commit: pick(0),
+  message: 'Changed files are a tree, not a list of directories\n',
+  committer: 'Ivan Vorontsov',
+  committerEmail: 'ivan@example.com',
+  against: { kind: 'parent', index: 0, oid: full('b2c3d4e') },
+  files: [
+    file('ui/src/panes/GitDiffPane.tsx', 38, 11),
+    file('ui/src/panes/mergeModel.ts', 12, 4),
+    file('ui/src/sidebar/GitPanel/model.ts', 27, 9),
+    file('ui/src/store/workspace.ts', 6, 2),
+    file('crates/cide-git/src/stage.rs', 44, 21),
+    file('README.md', 5, 0),
+  ],
+  filesTruncated: false,
+  merge: false,
+  total: NESTED_TOTAL,
+}
+
 // --- the range between two commits (M20) -------------------------------------------------------
 
 /**
@@ -628,6 +670,10 @@ export const LOG_STORIES: readonly LogStory[] = [
   story('loading', { page: null, busy: true }),
 
   story('detail', { selected: full('a1b2c3d'), detail: DETAIL }),
+
+  // The same pane over a commit that actually nests — see `NESTED` for why `detail` cannot make
+  // the claim and this one can.
+  story('nested', { selected: full('a1b2c3d'), detail: NESTED }),
 
   /*
    * The budget stop, which is the whole reason `LogStop` has six variants.

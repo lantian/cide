@@ -146,6 +146,26 @@ fn open_project_here(
             remember(&root, &name)
         }));
     }
+
+    // **In `PerProject` mode an open names a window nobody had built.**
+    //
+    // `workspace::open_project` ends in `rebuild_windows`, which mints a `shell:<uuid>` role for
+    // the new project — and until this line nothing turned that role into an OS window. The
+    // project existed, held a console tab with a live `claude`, and had no window anywhere: the
+    // only reason it was ever visible was that the header rendered every project in the process
+    // rather than the ones its own window names, so it appeared as a tab in some *other*
+    // window — over content that window does not draw, and inert, because `activate_project`
+    // only moves `active` on shells whose `projects` contains the id. Both halves are fixed
+    // together; see `ui/src/windows/windowTabs.ts`.
+    //
+    // A no-op in `Stacked`: the one shell already exists, `reconcile` skips it, and nothing is
+    // doomed because the open added a role rather than dropping one. `project_close` and
+    // `close_tab` below call it for the mirror-image reason.
+    //
+    // Reported rather than logged, exactly as `window_set_mode` does: at this point the domain
+    // has already committed the open, so a caller that sees this error still has the project —
+    // what it does not have is the window, which is worth saying out loud.
+    crate::cmd::window::reconcile(app, state)?;
     Ok(id)
 }
 

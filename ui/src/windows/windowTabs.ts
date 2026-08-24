@@ -1,11 +1,16 @@
 /**
- * Which tabs a window draws, and what a tab's pane cluster acts on. (Detached tabs)
+ * Which projects and tabs a window draws, and what a tab's pane cluster acts on.
  *
- * Two rules, one module, because they are two halves of one invariant: **a tab is drawn by
- * exactly one window**. A `WindowRole::DetachedTab` names a tab that stays in `project.tabs`
- * — `unsaved_tabs`, `plan_restore` and the awaiting arithmetic all walk that list and must
- * keep seeing it — so the *only* thing keeping the shell from rendering the same tab a
- * second time is the filter below. Two windows rendering one file tab is two live
+ * Three rules, one module, because they are three views of one invariant: **a thing is drawn
+ * by exactly one window**. [`shownProjects`] is the outer ring of it and the newest — the
+ * header used to render every project in the *process*, so *One window per project* opened
+ * three windows that each drew the same three-tab strip. The rest of this note is the tab
+ * ring, which came first.
+ *
+ * **A tab is drawn by exactly one window.** A `WindowRole::DetachedTab` names a tab that stays
+ * in `project.tabs` — `unsaved_tabs`, `plan_restore` and the awaiting arithmetic all walk
+ * that list and must keep seeing it — so the *only* thing keeping the shell from rendering
+ * the same tab a second time is the filter below. Two windows rendering one file tab is two live
  * CodeMirror buffers over one file, and whichever saves second silently discards the
  * other's edits; that is the exact failure `editor/openBuffers.ts` registers buffers per
  * tab to prevent, and it is why `windows/detachedPane.ts` refuses to render an editor at
@@ -28,11 +33,20 @@
  * `App.tsx` and `keys/dispatch.ts`.
  */
 
-/** The part of `WindowRole` these rules read. */
+/**
+ * The part of `WindowRole` these rules read.
+ *
+ * `projects` on the shell arm and `project` on the two detached ones are what
+ * [`shownProjects`] answers from; the tab rules below read neither. Declared required rather
+ * than optional on purpose: an absent field would have to mean *"unknown, so show
+ * everything"*, and "show everything" is precisely the bug — a window drawing a project it
+ * does not render. The generated `WindowRole` carries all three, so nothing in the app has
+ * to invent one.
+ */
 export type WindowRoleLike =
-  | { readonly kind: 'shell' }
-  | { readonly kind: 'detachedPane'; readonly tab: string }
-  | { readonly kind: 'detachedTab'; readonly tab: string }
+  | { readonly kind: 'shell'; readonly projects: readonly string[] }
+  | { readonly kind: 'detachedPane'; readonly project: string; readonly tab: string }
+  | { readonly kind: 'detachedTab'; readonly project: string; readonly tab: string }
 
 /**
  * The tabs of one project that have windows of their own, from the workspace's window map.
@@ -73,6 +87,43 @@ export function shownTabs<T extends { readonly id: string }>(
   }
   const torn = detachedTabs(windows)
   return torn.size === 0 ? tabs : tabs.filter((tab) => !torn.has(tab.id))
+}
+
+/**
+ * The projects this window's header draws, in workspace order.
+ *
+ * `Stacked` and `PerProject` are nothing but two mappings from `ProjectId` to shell window
+ * (`WindowRole`'s own doc says so), and the role already carries this window's half of the
+ * mapping: `projects` is every project it is responsible for — all of them stacked, exactly
+ * one per-project. Reading it is the whole rule.
+ *
+ * **What it replaces.** `App.tsx` passed `Object.values(workspace.projects)` — every project
+ * in the *process* — so choosing *One window per project* opened three windows that each drew
+ * the same three-tab strip, one tab of which was the window's own. Nothing about that was
+ * cosmetic: `activate_project` sets `active` on every shell whose `projects` contains the id,
+ * so clicking another window's tab moved *that* window's active project and left this one
+ * showing a header tab highlighted over content it does not render. The strip was also the
+ * only place offering to close a project this window has no view of.
+ *
+ * **Empty for a detached window.** A `pane:` or `tab:` window has no project strip — `App.tsx`
+ * gives each its own header — and the switcher must not offer one either. That second half is
+ * `keys/target.ts`'s `windowProjectsOf`, which reads the same `role.projects` and answers the
+ * same shape in ids; it is a separate function only because `check-commands` compiles that
+ * module *alone* and a value import would emit a `require` nothing can resolve. Both read the
+ * role; neither may derive a strip from `workspace.projects`, which is the whole bug.
+ *
+ * The order is the caller's, which is the workspace's `projects` insertion order and therefore
+ * the header order `reorder_project` writes. Filtering preserves it; mapping `role.projects`
+ * instead would only agree by luck — it agrees today because `reorder_project` ends in
+ * `rebuild_windows`, and that is a fact about another crate rather than a property of this one.
+ */
+export function shownProjects<T extends { readonly id: string }>(
+  role: WindowRoleLike,
+  projects: readonly T[],
+): readonly T[] {
+  if (role.kind !== 'shell') return []
+  const own = new Set(role.projects)
+  return projects.filter((project) => own.has(project.id))
 }
 
 /** What one button in the pane cluster should do. `hidden` draws nothing at all. */
