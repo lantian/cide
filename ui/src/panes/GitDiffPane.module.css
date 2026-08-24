@@ -334,7 +334,19 @@
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  /*
+   * Three tracks since M25: the two documents and the connector between them. (M25)
+   *
+   * A real track and not an overlay. An overlay would have to be positioned over two columns
+   * that then reserve space for it by hand, and every change to either column's padding would
+   * be a change to that reservation; a track takes its width out of the layout once and the
+   * columns simply get what is left.
+   *
+   * `--w-diff-connector` is deliberately narrow. IDEA's is about this wide, and the shape has to
+   * read as a *join* between two documents rather than as a region of its own — wider, and the
+   * ribbons start to look like a third column with content in it.
+   */
+  grid-template-columns: minmax(0, 1fr) var(--w-diff-connector) minmax(0, 1fr);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   line-height: 1.45;
@@ -408,6 +420,97 @@
 
 .column[data-boxed='false'][data-blamed='true'] .half {
   grid-template-columns: var(--blame-col) 5ch 2ch minmax(0, 1fr);
+}
+
+/*
+ * The left column's own track list: the number moves to the **right** edge. (M25)
+ *
+ * IDEA's arrangement, and the reason is legibility rather than taste. With a number at each
+ * outer margin the two columns' numbers are the two things furthest apart on screen, and
+ * comparing "line 204 there" with "line 206 here" is a saccade across the whole pane. Meeting
+ * them either side of the connector puts the two numbers, and the ribbon that says how they
+ * correspond, in one place.
+ *
+ * The left column is never blamed and never boxed on the read-only arm, but both combinations
+ * are written anyway, for the reason the four rules above are written: a template with a track
+ * for a cell that was not rendered puts every later cell one column across, and the left column
+ * having a tick box is one `partialOk` away.
+ */
+.column[data-side='old'] .half {
+  grid-template-columns: 16px 2ch minmax(0, 1fr) 5ch;
+}
+
+.column[data-side='old'][data-boxed='false'] .half {
+  grid-template-columns: 2ch minmax(0, 1fr) 5ch;
+}
+
+/*
+ * Its number sits against the connector, so it is padded away from the seam rather than from
+ * the text: the gap that reads as "these belong to different documents" is the one in the
+ * middle.
+ */
+.column[data-side='old'] .lineno {
+  padding-right: 6px;
+}
+
+/*
+ * The gutter between the two columns, and the ribbons in it. (M25)
+ *
+ * `overflow: hidden` because the paths are drawn in the gutter's own coordinates with each
+ * column's scroll already subtracted, so a shape well above or below the viewport is simply
+ * clipped rather than needing to be excluded exactly. `connectorShapes` still drops the ones far
+ * outside, which is about how many paths get built rather than about what is seen.
+ *
+ * It takes no pointer events: it is a picture of a relationship the rows already state, and a
+ * gutter that swallowed a click between two columns of selectable text would be a trap.
+ */
+.connector {
+  position: relative;
+  overflow: hidden;
+  pointer-events: none;
+  /* The seam continues through the gutter, so the two columns still read as two documents. */
+  border-right: 1px solid var(--border-soft);
+}
+
+.connectorSvg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/*
+ * One ribbon. Filled with the same tint the rows carry, so the gutter says nothing the columns
+ * do not — an added block is green on the right and the band arriving at it is the same green.
+ *
+ * The stroke is what makes a *collapsed* ribbon visible at all: a pure insertion has no lines on
+ * the left, so its shape tapers to a zero-height point there and a fill alone would vanish into a
+ * hairline. `vector-effect` keeps that hairline one pixel however the SVG is scaled.
+ */
+.ribbon {
+  vector-effect: non-scaling-stroke;
+  stroke-width: 1;
+}
+
+.ribbon[data-tone='add'] {
+  fill: var(--diff-add-bg);
+  stroke: var(--green);
+}
+
+.ribbon[data-tone='del'] {
+  fill: var(--diff-del-bg);
+  stroke: var(--red);
+}
+
+/*
+ * A replacement — lines on both sides. Painted as an addition, because the band arrives at the
+ * new side and that is the side a reader is reviewing; the deletion it replaces is already red
+ * in the left column and does not need the gutter to repeat it.
+ */
+.ribbon[data-tone='pair'] {
+  fill: var(--diff-add-bg);
+  stroke: var(--green);
 }
 
 /*
@@ -525,6 +628,54 @@
     color-mix(in srgb, var(--accent) 14%, transparent) 0 100%
   );
   box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/*
+ * The change the iterator is on. (M25)
+ *
+ * **Nothing here may change a row's height**, and that is a hard constraint rather than a
+ * preference: the split view's scroll anchors are measured once per render and again only after
+ * a *settled* resize (`whenResizeSettles`), so a border or a padding on the current run would
+ * silently invalidate every anchor below it until the next settle — the two columns would drift
+ * apart by the added pixels with nothing throwing. A background wash and an inset shadow paint
+ * inside the box the row already had.
+ *
+ * The rail is on the **right** edge, because `data-selected` above owns the left one. A change
+ * that is also ticked for staging has to read as both, and two rails on the same edge would be
+ * one rail in whichever colour won.
+ *
+ * # A rail and no wash, which the first version of this rule got wrong
+ *
+ * It shipped with a 7% `--accent` wash as well, layered over the origin tint the way
+ * `data-selected` layers its 14% one. That reads fine on a context row and destroys the two rows
+ * that matter: `--accent` is a terracotta (`#d97757` dark, `#c4452a` light) and 7% of it over
+ * `--diff-add-bg`'s green composites to an olive that is neither. Reported as *"line 206 is not
+ * marked as added, it should be green"*, which is exactly right — the wash was answering "this is
+ * the current change" by taking away "this is an addition".
+ *
+ * That is the same failure `data-selected`'s comment above records, arriving from the other side:
+ * that rule learned not to *replace* the origin tint, and this one had to learn that at these
+ * alphas a warm wash over green is a replacement whatever the compositing says. A tick is a state
+ * of the row and can afford to tint it; being walked past is not, and a rail carries it without
+ * touching a colour that means something else. IDEA frames its current block for the same reason.
+ *
+ * The ticked-and-current pair below keeps its wash, because that one is `data-selected`'s own and
+ * was already argued for; it only adds the second rail.
+ */
+.row[data-current='true'],
+.half[data-current='true'] {
+  box-shadow: inset -2px 0 0 var(--accent);
+}
+
+/* Both at once: the staging rail on the left, the current-change rail on the right. */
+.row[data-selected='true'][data-current='true'],
+.half[data-selected='true'][data-current='true'] {
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--accent) 14%, transparent) 0 100%
+  );
+  box-shadow:
+    inset 2px 0 0 var(--accent),
+    inset -2px 0 0 var(--accent);
 }
 
 /*

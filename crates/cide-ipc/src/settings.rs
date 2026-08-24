@@ -443,6 +443,31 @@ pub struct EditorSettings {
     /// How a diff is laid out. See [`DiffView`].
     pub diff_view: DiffView,
 
+    /// Offer code completion from the language servers at all. (M25)
+    ///
+    /// On by default. Off means the popup never appears and Ctrl+Space does nothing — the
+    /// extension is not mounted, so no request is ever made and nothing is spent on a feature
+    /// somebody has turned off.
+    ///
+    /// **No `persist` migration, unlike [`Self::autosave`] beside it, and the difference is worth
+    /// stating because the shapes look identical.** That field is written into every upgraded
+    /// workspace because it is an inference that *writes the user's files*: the day the default
+    /// changed, every existing install would silently start or stop saving. A completion popup
+    /// that stops appearing by itself is visible, harmless and one click to undo, so
+    /// `#[serde(default)]` is the honest reading of a field an older workspace never had.
+    pub completion: bool,
+    /// Open the popup while typing, as opposed to only on Ctrl+Space. (M25)
+    ///
+    /// On by default, which is what every editor cide is measured against does. Off is for
+    /// somebody who finds the popup intrusive or is working over a slow link, and it leaves the
+    /// feature fully usable on demand rather than removing it — which is why it is a second
+    /// toggle and not a third state of the first.
+    ///
+    /// The *delay* is deliberately not here. `ui/src/editor/completionGate.ts::TYPING_DELAY_MS` is
+    /// its one home, for the reason [`Self::autosave`] gives about its own interval: Rust does
+    /// nothing with the number, and one home cannot disagree with itself.
+    pub completion_on_typing: bool,
+
     /// Which colour scheme paints the buffer, under each [`crate::Theme`]. (M24)
     ///
     /// **Two fields rather than one, and the pair is the design.** A scheme owns the editor's
@@ -476,6 +501,8 @@ impl Default for EditorSettings {
             trim_trailing_whitespace_on_save: false,
             autosave: true,
             diff_view: DiffView::Unified,
+            completion: true,
+            completion_on_typing: true,
             color_scheme_light: crate::BUILTIN_SCHEME.into(),
             color_scheme_dark: crate::BUILTIN_SCHEME.into(),
         }

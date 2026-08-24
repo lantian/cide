@@ -78,6 +78,7 @@ import { ctrlLink, wordTargetAt } from './ctrlLink'
 import { trailNames, type OutlineNode } from './memberNav'
 import { lintRanges, type LintSource } from './lintMap'
 import { lintGutter, setDiagnostics } from '@codemirror/lint'
+import { completionExtensions } from './completion'
 
 /*
  * One extension value for every editor's lint gutter, for the same reason `blame.ts` keeps
@@ -185,6 +186,18 @@ export interface EditorSurfaceProps {
    * `CodeMenuOptions.project` for why deriving it from the window's role is wrong.
    */
   project?: string | undefined
+  /**
+   * Code completion, from `settings.editor`. (M25)
+   *
+   * A prop rather than a `useWorkspace` read in here, for the reason every other setting on this
+   * component is one: `EditorSurface` is mounted by `DiffPane` and `MergePane` as well as by
+   * `EditorPane`, and only the last of those has a document a language server has been told
+   * about. A store read here would turn completion on in a diff pane, where `docSync` never sent
+   * a `didOpen` and every request would be about a file the server has never seen.
+   *
+   * Absent means off, which is what those surfaces want and what a fixture gets for free.
+   */
+  completion?: { readonly enabled: boolean; readonly onTyping: boolean } | undefined
   /** The file exactly as it came off disk, line endings included. */
   doc: string
   /**
@@ -406,6 +419,38 @@ export interface EditorSurfaceProps {
  */
 export type SaveCause = 'manual' | 'autosave'
 
+/**
+ * The completion extensions this buffer should carry, or none.
+ *
+ * One function, called from the build effect and from the settings effect, so the four reasons to
+ * withhold completion cannot be spelled two different ways:
+ *
+ * * **the setting is off**, or there is no project to resolve against;
+ * * **the buffer is read-only** — a `~/.cargo/registry` source, a revision, a toolchain file.
+ *   Suggesting an insertion into something that cannot be edited is an affordance that lies, which
+ *   is the failure `codeIntel.ts`'s header is written against;
+ * * **the buffer is oversize.** Above `HIGHLIGHT_LIMIT_BYTES` `diagnostics_did_change` refuses to
+ *   sync at all (`MAX_SYNC_BYTES`), so the server's copy is permanently stale and every answer
+ *   would be about a file that no longer exists. Withholding the feature is the honest reading,
+ *   and it is the same judgement the grammar, bracket matching and folding already make about the
+ *   same buffers.
+ */
+function completionFor(
+  settings: { readonly enabled: boolean; readonly onTyping: boolean } | undefined,
+  project: string | undefined,
+  path: string,
+  readOnly: boolean,
+  oversize: boolean,
+): Extension {
+  if (settings === undefined || readOnly || oversize) return []
+  return completionExtensions({
+    project,
+    path,
+    enabled: settings.enabled,
+    onTyping: settings.onTyping,
+  })
+}
+
 export function cursorLabel(state: EditorState): string {
   const head = state.selection.main.head
   const line = state.doc.lineAt(head)
@@ -423,6 +468,7 @@ export function EditorSurface({
   doc,
   reloadKey = 0,
   readOnly = false,
+  completion,
   onDirtyChange,
   onSave,
   autosave,
@@ -447,6 +493,17 @@ export function EditorSurface({
   const viewRef = useRef<EditorView | null>(null)
   /** The live view's lint compartment, so the push effect can reconfigure it. */
   const lintSlotRef = useRef<Compartment | null>(null)
+  /** The live view's completion compartment, so a settings change can reconfigure it. */
+  const completionSlotRef = useRef<Compartment | null>(null)
+  /*
+   * The completion config as it stands, for the build effect to seed from.
+   *
+   * A ref for `blameSlot`'s reason: this effect is keyed `[path, reloadKey]` and adding a setting
+   * to that array rebuilds the view — scrollback, undo history, unsaved edits — every time
+   * somebody toggles it. The ref is what makes a `reloadKey` bump come back with the same answer.
+   */
+  const completionRef = useRef(completion)
+  completionRef.current = completion
   /*
    * The last diagnostics actually dispatched into this view, as a serialized fingerprint.
    * A ref and not state: it exists to *suppress* renders' side effects, and its doc-position
@@ -708,6 +765,17 @@ export function EditorSurface({
      * come back with the column still on.
      */
     const blameSlot = new Compartment()
+    /*
+     * Code completion, in a compartment for the same reason as the three above. (M25)
+     *
+     * Its position in `shared` is load-bearing twice over and is pinned by `check:completion`:
+     * **after** `findExtensions()`, so Escape closes an open find bar before it closes the popup,
+     * and **before** the main `keymap.of([...])`, so Tab is offered to `acceptCompletion` before
+     * `indentWithTab` indents. CodeMirror runs same-precedence keymaps in extension order, which
+     * is the whole mechanism — no `Prec` is involved, and adding one would break the first of the
+     * two orderings.
+     */
+    const completionSlot = new Compartment()
     /*
      * Which polarity CodeMirror thinks it is drawing in. (M24)
      *
@@ -980,6 +1048,7 @@ export function EditorSurface({
       EditorState.tabSize.of(4),
       languageSlot.of([]),
       lintSlot.of([]),
+      completionSlot.of(completionFor(completionRef.current, project, path, readOnly, oversize)),
       // `Prec` is not needed here: this keymap is added before `defaultKeymap`, and
       // CodeMirror runs same-precedence keymaps in order, so Mod-s is claimed before
       // anything else can look at it.
@@ -1256,6 +1325,7 @@ export function EditorSurface({
     lintFingerprintRef.current = null
     const stopPolarity = watchPolarity(view, polarity)
     lintSlotRef.current = lintSlot
+    completionSlotRef.current = completionSlot
     blameSlotRef.current = blameSlot
     /*
      * The markers the column was already showing, pushed into the buffer that replaced it.
@@ -1740,6 +1810,41 @@ export function EditorSurface({
       console.error('[cide] could not paint diagnostics', error)
     }
   }, [diagnostics, highlight])
+
+  /*
+   * Follow the completion settings, without rebuilding the view. (M25)
+   *
+   * Shaped like the lint and blame effects beside it and simpler than either, because completion
+   * has no second half: there is no state field to clear, only an extension to be present or not.
+   * The compartment is the whole mechanism — see its declaration for why its *position* in
+   * `shared` matters as much as its contents.
+   *
+   * `readOnly` and `oversize` are read here as well as at build time so that neither can be the
+   * reason a toggle silently does nothing. They cannot actually change for a live view (`readOnly`
+   * only ever arrives with a new file, and a buffer does not cross a megabyte without a reload),
+   * and computing the answer in one function rather than in two places is what keeps that true
+   * whether or not it stays true.
+   */
+  useEffect(() => {
+    const view = viewRef.current
+    const slot = completionSlotRef.current
+    if (view === null || slot === null) return
+    view.dispatch({
+      effects: slot.reconfigure(
+        completionFor(
+          completion,
+          project,
+          path,
+          readOnly,
+          exceedsBytes(view.state.doc.toString(), HIGHLIGHT_LIMIT_BYTES),
+        ),
+      ),
+    })
+    // `path` and `project` are here because a compartment survives neither — but they also key
+    // the build effect, so in practice this runs a second time on a file change and reconfigures
+    // the slot to what it was just seeded with. Idempotent, and cheaper than a rule about which
+    // of the two owns the seeding.
+  }, [completion, project, path, readOnly])
 
   /*
    * Put the blame column up, and keep it filled. (M18)

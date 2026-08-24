@@ -2515,6 +2515,7 @@ Four keys, and one of them is a chord that moved.
 | **Ctrl+`** | walk this window's **projects**, most-recently-used (was Ctrl+Tab) |
 | **Ctrl+1** | go to the pinned Claude console |
 | **F4** | hide the left panel, or bring back the last one that was open |
+| **F7** / **Shift+F7** | next / previous change, in a diff or the conflict resolver (M25) |
 
 **The two switchers are one implementation.** `ui/src/keys/switcher.ts` is the arithmetic over
 opaque id strings — hold the modifier, press the key to walk, release to commit, Escape to cancel —
@@ -3473,6 +3474,96 @@ gestures share `interfaceMethod` on the wire so Ctrl+click and Ctrl+B cannot dri
 redirect is *injected by the caller* rather than called from inside `goToDefinition`: that
 function is `goToImplementation`'s own empty-answer fallback, so wiring it the other way round
 would make an interface nobody implements bounce between the two for ever.
+
+## Code completion, and the handshake key that turns it on (M25)
+
+Typing in a Rust or Go buffer now opens a popup of what the language server thinks can go under
+the caret. **Tab and Enter both accept.** Ctrl+Space opens it on demand, including on an empty
+line. Function completions arrive as snippets — accepting `push` gives
+`push(value)` with the argument selected and Tab walking the fields — and accepting an unimported
+symbol brings its `use` line with it.
+
+Nothing about it is language-specific. `cide_lsp::discover::Server` is a registry rather than an
+enum, so one `textDocument/completion` path serves rust-analyzer, gopls and any server an
+extension declares; a contributed one gets completion by existing. Two settings live under
+**Settings → Editor**: whether to suggest at all, and whether the popup opens while typing or only
+on Ctrl+Space.
+
+### The assumption this was built on was backwards, and a test found out on day one
+
+The plan said: declare no `completionItem.resolveSupport`, and servers will compute import edits
+eagerly and ship them inside each item, so accepting `HashMap` costs no second round trip. That
+reasoning is what the capability *means*, and it is wrong for rust-analyzer in the direction that
+deletes the feature.
+
+Measured against 1.92: with `resolveSupport` absent, the completion list at a position naming an
+unimported `HashMap` contains `Vec`, `String`, `Option` and 114 other in-scope items, and **no
+`HashMap` at all**. rust-analyzer gates flyimport on the client being able to resolve
+`additionalTextEdits` lazily, because computing an import path for every candidate in std is work
+it will not do up front. Declaring nothing does not buy eager edits — it buys no auto-import.
+
+So cide declares `resolveSupport: ["documentation", "additionalTextEdits"]` and asks
+`completionItem/resolve` for the row the user commits to.
+`crates/cide-lsp/tests/real_servers.rs::a_real_rust_analyzer_offers_an_import_edit_with_the_item`
+is the standing proof, end to end through cide's own conversion, and it asserts the *absence* of
+the naive reading — because dropping that key reads like deleting an unused option.
+
+`documentation` is deferred for an unrelated reason and it is the one that pays for itself:
+rust-analyzer sends it eagerly otherwise, it is markdown, and `HashMap`'s alone is six kilobytes.
+One 118-item reply measures **44 KB** with it deferred. `detail` is deliberately *not* deferred —
+it is the dimmed type the popup draws on every row, and it costs short strings rather than
+kilobytes.
+
+### The three things that are wrong in ways nothing shows you
+
+**The document is synced first.** `docSync.ts` is a 300 ms trailing throttle, so the server's copy
+of the buffer is routinely behind it — and a completion computed against text that does not
+contain the caret is not late, it is about a different file. `syncNow` sends the exact text
+CodeMirror's immutable `context.state` holds and resolves when the notification is queued;
+`diagnostics_did_change` pushes into the same bounded outbox the request will use, so the ordering
+is a property of the channel rather than a race that was won.
+
+**`label` is the filter text and `displayLabel` is the label.** CodeMirror matches typing against
+`Completion.label`. LSP's `label` is a *display* string — rust-analyzer sends `push(…)`, ellipsis
+included — and `filterText` is the match target. Feeding the display string to the matcher scores
+`push(…)` against `pus` and produces the complaint that the popup "stops narrowing when you type",
+with every row still visibly present.
+
+**A failed resolve refuses the accept.** Inserting `HashMap` and silently not adding its `use`
+line leaves a file that does not compile and looks exactly like a successful completion. Not
+completing at all is recoverable in one keystroke and says so out loud.
+
+### What it does not do
+
+- **No documentation panel.** The payload is deferred and dropped in `convert::completion`; the
+  honest way back is one `completionItem/resolve` for the selected row, not a thousand.
+- **No signature help.** `textDocument/signatureHelp` is still asked nowhere.
+- **No palette command.** Ctrl+Space, Tab and Enter are editor-local CodeMirror bindings, as
+  Ctrl+F and F3 are, and `nothing_binds_the_editors_completion_chords` keeps them out of
+  `cide-core::keymap` — the key gate is a window *capture* listener, so a binding there would
+  swallow Tab in every text input in the window and Ctrl+Space's `NUL` in every shell pane.
+- **Nothing above 1 MB.** `diagnostics_did_change` refuses to sync a buffer that large, so the
+  server's copy is permanently stale and any answer would be a confident lie. The same judgement
+  the grammar, bracket matching and folding already make about the same buffers.
+- **No commit characters.** Declared `false`: an accept that fires as a side effect of typing
+  punctuation — `(` completing the function you were only half looking at — is a third, invisible
+  accept key on top of Tab and Enter, and it is the behaviour people turn off first.
+
+**Tab-only shipped first, and was wrong.** Enter was deliberately left to insert a newline, on the
+argument that Enter-accepts eats a line break whenever the popup is open and the user had not
+noticed it. That hazard is real; it is also not what anyone expects on first meeting a completion
+popup, and the first report this feature drew was that Enter "does nothing". Both accept now. The
+fallthrough is what makes it safe enough to be the default: `acceptCompletion` returns `false`
+with no popup open, so Enter reaches `insertNewlineAndIndent` untouched in every buffer where
+nothing is being suggested.
+- **Snippets degrade rather than mangle.** CodeMirror reads `#{` as a field opener as well as
+  `${` and its placeholder default is `[^{}]*`, so a nested LSP placeholder has no representation
+  at all. `lspSnippet.ts` falls back to plain text in both cases — a completion with no
+  placeholders is a small loss, one that inserts `${1` into a user's file is a bug.
+- **Not confirmed on screen.** `check:completion` (111 checks) drives the decisions and pins the
+  call sites, and the two real-server tests prove the protocol path — but nobody has yet watched
+  the popup appear, accepted a snippet, or seen an import land. `cargo test -p cide-lsp --
+  --ignored` is not in CI.
 
 ## Hidden and ignored files in the trees (M18)
 
@@ -5757,6 +5848,123 @@ file, so the render is pixel-identical); the left column is never blamed (a seco
 other revision is a real feature, not an omission of this one); and the unified whole-file view
 drops the sticky `@@` headers rather than making them float — the line numbers are on screen,
 and the staging affordances moved to a slim non-sticky bar per hunk.
+
+### Syntax colour, and a changes iterator (M25)
+
+The diff was monochrome from the day it shipped: `panes/GitDiffPane.tsx` draws plain DOM rows and
+emitted the line text raw. It is coloured now by **the buffer's own grammars** — one table, so a
+file open in an editor tab and in a diff beside it cannot be two different colours. The road
+already existed: `editor/markdown/fenceTokens.ts` was built for the markdown preview, which is the
+same problem (colour a string in plain DOM with no `EditorView` anywhere), and it is pointed at
+two documents here instead of one fence. Both sides are tokenized, because a deletion exists only
+on the old one.
+
+**The whole thing rests on one string compare.** The text and the patch reach the pane as two
+claims — the same pair `wholeFileSegments` validates — and every way they can disagree (CRLF, an
+ident-expanded keyword, a rev that moved under an open pane) lands as a row whose content is not
+the text's line at that number. Colouring one of those paints a *plausible* lie: a keyword-red
+`if` on a line with no `if` in it, no gap, no artefact, nothing in any log. So `diffTokens`
+compares each row against the line its tokens spell and refuses on any difference, which makes
+every misalignment degrade to plain text instead. `check:diff-render` drives both directions of
+that failure — right number with wrong text, and right text at the wrong number.
+
+The tokenizer is behind a **dynamic `import()`** and the pane holds only plain data. That is not
+guarding a crash — `@codemirror/language` imports cleanly under node, and `check:markdown` already
+runs `fenceTokens.ts` there — it is what lets `check:diff-render` assert on the emitted SSR bundle
+that no CodeMirror package is linked into the surface it renders under node. Matched on the import
+*statement*, because `diffBlame.ts` says the words "@codemirror/merge" in prose and that comment
+survives into the bundle.
+
+**Next / previous change** is `navigate.nextChange` / `navigate.prevChange`, on **F7** and
+**Shift+F7** — IDEA's chords — plus a pair of chevrons in the pane header. The unit is one changed
+**run**, not one hunk: `diffRows.columnRows` already groups a deletion run and the addition run
+after it into one edit, and the iterator is simply a fourth consumer of that run table, so the two
+columns, the scroll sync and the walk cannot disagree about where a change begins. A hunk bundles
+several edits plus context and would skip past distinct changes.
+
+Three things about it are decisions rather than defaults:
+
+* **It clamps, it does not wrap**, and `MergePane`'s block stepper — which *did* wrap — was
+  changed to match. One gesture must not have two rules, and both now go through one `stepIndex`,
+  so they cannot drift apart again. A refusal is reportable (`unmet(…)` puts a line in the log)
+  where a wrap on a one-change diff is indistinguishable from a chord that did nothing, and the
+  ends being reachable is what lets the buttons draw themselves disabled.
+* **Exactly one scroller is written.** The split view's `follow` treats a programmatic `scrollTop`
+  as a person's, maps it through `mapScroll` and moves the other column itself, so the iterator
+  touches neither the echo set nor `diffSync`. Writing both columns would be the bug: two writes
+  are two events, each moving the other, and the reader lands where neither asked. The row is
+  found by `data-at` and never by index — the columns interleave zero-height insertion markers, so
+  a child index is not a row index.
+* **The marker changes no row's height.** A background wash and an inset shadow, on the *right*
+  edge because staging owns the left one. The scroll anchors are measured once per render and then
+  only after a *settled* resize, so a border on the current run would silently drift the two
+  columns apart by its own pixels with nothing throwing.
+
+The chord is scoped `diffFocused && !terminalFocused`, the first compound clause in the shipped
+table. F7 is `ESC [ 18 ~` and `mc` puts a menu on it; the gate is a window capture listener, so
+`diffFocused` alone would take the key from a shell pane split beside a diff tab. A diff pane and a
+merge pane are both `kind == "editor"`, so the second half costs the feature nothing. To give it
+back:
+
+```json
+{"key": "f7", "command": "-navigate.nextChange", "when": "diffFocused && !terminalFocused"}
+```
+
+— with the clause, because a removal matches on all three and one that forgets it matches nothing.
+
+`diffFocused` is a **host** flag, read from a claim stack in the webview
+(`panes/changeNav.ts`), and no derived spelling works: a tab kind misses the log tool window's
+revision diff, which is not a tab, and is *true* for a Claude `openDiff`, which is out of scope.
+
+### IDEA's split gutter (M25)
+
+Two changes to the side-by-side layout, both of them about the same thing: making it legible which
+block on the left is which block on the right.
+
+**The left column's line numbers moved to its right edge.** With a number at each outer margin the
+two columns' numbers are the two things furthest apart on screen, and comparing "line 204 there"
+with "line 206 here" is a saccade across the whole pane. They now meet either side of the gutter.
+A grid places by order, so this is a real reordering of the row's children with a matching track
+list on `.column[data-side='old']`, and `check:diff-render` reads the child order off the markup
+rather than off the stylesheet — the two have to agree and only one of them is a fact about the
+DOM.
+
+**And the gutter draws a ribbon per changed block.** A third grid track between the columns, with
+a filled shape joining each block's top and bottom on the left to the same block's top and bottom
+on the right. A run that is one line on one side and six on the other reads as a *taper*; a pure
+insertion has no lines on the left at all, so its shape collapses to a point there, which is what
+makes an insertion legible as arriving *between* two lines rather than replacing one.
+
+`panes/diffConnector.ts` is the geometry and it is import-free, because none of this is visible in
+a markup snapshot: a wrong path is a shape in the wrong place, not a missing element. It is fed
+`columnRows`' run table — the same table the two columns, the scroll sync and the changes iterator
+read, so the gutter cannot come to disagree with any of them about what a change is — plus each
+column's measured row tops. Scroll is subtracted **per column** rather than by transforming the
+SVG, because the follower is written after the leader's event and for a frame the two are genuinely
+at different offsets, which one transform cannot express.
+
+Three things it does that are about cost rather than looks: coordinates are rounded to a tenth of a
+pixel and the whole path set is rebuilt as one string and compared with the last before the DOM is
+touched at all (this runs on a scroll frame, and most frames move no shape — the columns scroll in
+step); runs far outside the viewport are never built; and a run whose boundary has not been measured
+yet is skipped explicitly, because a `NaN` in a path renders as nothing *and* logs nothing.
+
+**The current change is a rail and not a wash**, and the first version got that wrong. It shipped
+with a 7% `--accent` wash layered over the origin tint, the way `data-selected` layers its 14% one.
+`--accent` is a terracotta, and 7% of it over `--diff-add-bg`'s green composites to an olive that is
+neither — reported as *"line 206 is not marked as added, it should be green"*, which was exactly
+right: the wash answered "this is the current change" by taking away "this is an addition". That is
+the same failure `data-selected`'s own comment records, arriving from the other side. A tick is a
+state of the row and can afford to tint it; being walked past is not.
+
+**Still unmet.** `panes/DiffPane.tsx` — Claude's `openDiff`, a `@codemirror/merge` view — is still
+uncoloured and has no chord for its chunks; it was left out deliberately rather than missed, and
+it is the one surface where highlighting is a five-line change (`loadLanguage` into the shared
+extension array, one compartment per side). Nothing about the scroll, the marker or the claim
+stack is covered by a check script: none of them constructs a live DOM, so they were confirmed by
+hand and belong in the `CIDE_AUDIT_PANES=1` harness. And a step during a live splitter drag lands
+the driven column correctly while the follower may be off by the drag's delta until the next
+scroll — the bounded `whenResizeSettles` imprecision `diffSync.ts` already admits, not a new one.
 
 ## Narrowing a search to a folder and a file pattern (M25), and what is not verified
 

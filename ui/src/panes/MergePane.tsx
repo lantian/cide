@@ -84,6 +84,13 @@ import { afterResolve } from '@/chrome/conflictsStore'
 import { useSettings } from '@/settings/useSettings'
 import { paint, paintedField } from './mergeDecorations'
 import { conflictGutter, setGutter } from './mergeGutter'
+import {
+  NO_CURSOR,
+  claimChangeNav,
+  stepIndex,
+  type ChangeNav,
+  type ChangeNavSlot,
+} from './changeNav'
 import { Icon, type IconName } from '@/icons/Icon'
 
 import styles from './MergePane.module.css'
@@ -112,6 +119,8 @@ export interface MergePaneViewProps {
   onAbandon: () => void
   /** Ctrl+Z over the block decisions. See the handler for why it is on the wrapper. */
   onKeyDown?: ((event: React.KeyboardEvent<HTMLDivElement>) => void) | undefined
+  /** Takes the changes-iterator slot. See `panes/changeNav.ts`. */
+  onPointerDown?: (() => void) | undefined
   /** Mounts the three editors. Absent in an SSR render, which has no DOM to mount into. */
   mountEditors?:
     | ((host: HTMLDivElement | null, side: 'ours' | 'result' | 'theirs') => void)
@@ -179,7 +188,12 @@ export function MergePaneView(props: MergePaneViewProps) {
   }
 
   return (
-    <div className={styles.host} data-audit="mergePane" onKeyDown={props.onKeyDown}>
+    <div
+      className={styles.host}
+      data-audit="mergePane"
+      onKeyDown={props.onKeyDown}
+      onPointerDown={props.onPointerDown}
+    >
       <div className={styles.bar} data-audit="mergePaneBar">
         <span
           className={`${styles.counter} ${
@@ -206,7 +220,9 @@ export function MergePaneView(props: MergePaneViewProps) {
               type="button"
               className={styles.action}
               onClick={() => props.onStep(-1)}
-              disabled={busy || doc.regions.length < 2}
+              // Disabled at the ends since M25, when the walk stopped wrapping. The control
+              // states where the walk stops rather than leaving it to be discovered.
+              disabled={busy || doc.regions.length === 0 || position === 1}
               title="Previous block"
             >
               <Icon name="chevron-left" size={1} />
@@ -215,7 +231,7 @@ export function MergePaneView(props: MergePaneViewProps) {
               type="button"
               className={styles.action}
               onClick={() => props.onStep(1)}
-              disabled={busy || doc.regions.length < 2}
+              disabled={busy || doc.regions.length === 0 || position === doc.regions.length}
               title="Next block"
             >
               <Icon name="chevron-right" size={1} />
@@ -356,9 +372,17 @@ export interface MergePaneProps {
   repo: string
   path: string
   tab: string
+  /**
+   * Whether this tab is the one in front, for the changes iterator's slot.
+   *
+   * `TabContent` never unmounts an inactive tab, so several change-walkable surfaces hold live
+   * claims at once and the slot has to know which of them the user is looking at. Optional and
+   * defaulting to `true` so a host that does not track it gets the old behaviour.
+   */
+  onScreen?: boolean
 }
 
-export function MergePane({ project, repo, path, tab }: MergePaneProps) {
+export function MergePane({ project, repo, path, tab, onScreen = true }: MergePaneProps) {
   const [file, setFile] = useState<ConflictFile | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
   const [decisions, setDecisions] = useState<Decisions>({})
@@ -390,6 +414,10 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
   const [edited, setEdited] = useState<string | null>(null)
   /** Which region the toolbar's Reset acts on. */
   const [at, setAt] = useState<string | null>(null)
+  // Read from inside the mount-once claim effect, which must not re-run when the tab changes
+  // front-ness — moving the claim is the `focus()` effect's job.
+  const onScreenRef = useRef(onScreen)
+  onScreenRef.current = onScreen
   const [autoApplied, setAutoApplied] = useState(false)
   const hosts = useRef<Record<string, HTMLDivElement | null>>({})
   const views = useRef<Record<string, EditorView | null>>({})
@@ -502,13 +530,26 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
     }
   })
 
-  const step = (delta: 1 | -1) => {
+  /*
+   * Walk the conflict blocks.
+   *
+   * **Clamped since M25, where it used to wrap**, and through the very function
+   * `panes/GitDiffPane.tsx`'s changes iterator uses. One gesture must not have two rules: a
+   * reader who learns that Next change stops at the last one in a diff must not find that the
+   * same key in the resolver silently returns them to the top. Sharing `stepIndex` makes the
+   * two unable to disagree, rather than merely agreeing today.
+   *
+   * Answers whether it moved, so `keys/dispatch.ts` can report a refusal through `unmet(...)`
+   * instead of leaving a chord that did nothing with no trace.
+   */
+  const step = (delta: 1 | -1): boolean => {
     const ids = doc.regions.map((r) => r.id)
-    if (ids.length === 0) return
     const here = at === null ? -1 : ids.indexOf(at)
-    const next = ids[(here + delta + ids.length) % ids.length] ?? null
+    const to = stepIndex(ids.length, here, delta)
+    if (to === null) return false
+    const next = ids[to] ?? null
     setAt(next)
-    if (next === null) return
+    if (next === null) return false
     for (const side of ['ours', 'result', 'theirs'] as const) {
       const view = views.current[side]
       const span =
@@ -521,7 +562,46 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
         effects: EditorView.scrollIntoView(view.state.doc.line(line).from, { y: 'center' }),
       })
     }
+    return true
   }
+
+  /*
+   * Announcing the resolver to `navigate.nextChange` / `navigate.prevChange`. (M25)
+   *
+   * The chevrons in the pane heading have driven this since the resolver shipped; the slot is
+   * what gives the gesture a key as well. Nothing about the existing `onKeyDown` handoff below
+   * changes and nothing needs to: the command arrives through the window-capture key gate, which
+   * resolves before any React handler or CodeMirror keymap sees the event, so it never travels
+   * through this pane's own listener at all.
+   *
+   * Same ref delegation as `GitDiffView` — the object handed over is what `release` removes, so
+   * it has to keep one identity while the answers behind it change every render.
+   */
+  const navImpl = useRef<ChangeNav>({ step: () => false, cursor: () => NO_CURSOR })
+  const navStable = useRef<ChangeNav>({
+    step: (delta) => navImpl.current.step(delta),
+    cursor: () => navImpl.current.cursor(),
+  })
+  navImpl.current = {
+    step,
+    cursor: () => ({
+      index: at === null ? -1 : doc.regions.findIndex((r) => r.id === at),
+      count: doc.regions.length,
+    }),
+  }
+  const navRef = useRef<ChangeNavSlot | null>(null)
+  useEffect(() => {
+    const slot = claimChangeNav(navStable.current, onScreenRef.current)
+    navRef.current = slot
+    return () => {
+      slot.release()
+      navRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  useEffect(() => {
+    if (onScreen) navRef.current?.focus()
+  }, [onScreen])
 
   // The centre pane is a real editor and the tab carries a real dirty flag, so a stray Ctrl+W
   // asks before discarding the work. Cleared by Apply, which is the only thing that writes.
@@ -965,6 +1045,7 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
         remember((d) => resolveSimple(doc, d))
       }}
       onStep={step}
+      onPointerDown={() => navRef.current?.focus()}
       onApply={apply}
       onAbandon={() => {
         void (async () => {

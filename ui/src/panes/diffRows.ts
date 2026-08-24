@@ -390,3 +390,124 @@ export function columnRows(
 }
 
 const EMPTY_COLLAPSED: ReadonlySet<number> = new Set<number>()
+
+/**
+ * Where one change begins or ends, addressed the way both layouts address a row.
+ *
+ * `hunk:at` is the pair a `LineRef` carries and staging resolves, and it is the **only**
+ * identity the three renderings share — the split columns, the whole-file unified body and
+ * the hunks-only fallback all put it on the row as `data-at`. A row index would not do: the
+ * unified body nests gap rows inside a per-segment element and has no flat row list at all.
+ */
+export interface ChangeRowRef {
+  readonly hunk: number
+  readonly at: number
+  readonly column: 'left' | 'right'
+}
+
+/**
+ * One changed run — one edit.
+ *
+ * A `pair` counts **once**: a deletion run and the addition run immediately after it are one
+ * edit, which is the grouping [`columnRows`] already performs and which git's `-`-before-`+`
+ * ordering is what makes detectable. Stepping per hunk would be coarser than this and stepping
+ * per line finer; a run is the unit a reader means by "the next change".
+ */
+export interface ChangeAnchor {
+  readonly kind: 'add' | 'del' | 'pair'
+  /** Index into [`SplitColumns.runs`] — the join to `rowSpans` and `insertMarkers`. */
+  readonly run: number
+  readonly first: ChangeRowRef
+  readonly last: ChangeRowRef
+  readonly leftFrom: number
+  readonly leftTo: number
+  readonly rightFrom: number
+  readonly rightTo: number
+}
+
+/**
+ * Every change in the diff, in file order.
+ *
+ * A **fourth consumer of the run table**, which is the property [`columnRows`]' comment claims
+ * for the existing three: the left column, the right column and `diffSync.ts` cannot disagree
+ * about where a run begins, and now neither can the iterator. Enumerating changes from
+ * `segments` instead would be a second implementation of the deletion/addition grouping — the
+ * duplication this module's header refuses — and it would answer differently the moment
+ * `flushEdit`'s rule changed.
+ *
+ * Because the caller builds the columns from whatever it is *drawing* — collapsed hunks skipped,
+ * gaps folded — the anchors are exactly the changes currently in the DOM. That is what makes
+ * "Next change never scrolls to something invisible" true by construction rather than by a
+ * filter someone has to remember to apply.
+ */
+export function changeAnchors(columns: SplitColumns): ChangeAnchor[] {
+  const out: ChangeAnchor[] = []
+  columns.runs.forEach((run, index) => {
+    if (run.kind === 'shared') return
+    // A `del` run lives entirely on the left, an `add` run entirely on the right, and a `pair`
+    // begins on the left (the deletion) and ends on the right (the addition). Reading the
+    // boundary rows rather than assuming them keeps this honest if the layout ever changes.
+    const first =
+      run.kind === 'add'
+        ? rowRef(columns.right, run.rightFrom, 'right')
+        : rowRef(columns.left, run.leftFrom, 'left')
+    const last =
+      run.kind === 'del'
+        ? rowRef(columns.left, run.leftTo - 1, 'left')
+        : rowRef(columns.right, run.rightTo - 1, 'right')
+    // Defensive, and unreachable: `flushEdit` pushes only `line` rows and every one of them
+    // carries a position on the column it rides. `--noUncheckedIndexedAccess` asks anyway, and a
+    // run with no addressable boundary is one the iterator could not scroll to.
+    if (first === null || last === null) return
+    out.push({
+      kind: run.kind,
+      run: index,
+      first,
+      last,
+      leftFrom: run.leftFrom,
+      leftTo: run.leftTo,
+      rightFrom: run.rightFrom,
+      rightTo: run.rightTo,
+    })
+  })
+  return out
+}
+
+/** One column row as a `hunk:at` reference, or `null` when it carries no position. */
+function rowRef(
+  rows: readonly ColumnRow[],
+  index: number,
+  column: 'left' | 'right',
+): ChangeRowRef | null {
+  const row = rows[index]
+  if (row === undefined || row.kind !== 'line' || row.at === null) return null
+  return { hunk: row.hunk, at: row.at, column }
+}
+
+/**
+ * Every `hunk:at` inside one run.
+ *
+ * The set the view paints as current. Separate from [`changeAnchors`] and called for **one**
+ * anchor at a time: a diff of forty thousand lines has thousands of changes, and building a
+ * position list for every one of them on every render — to use exactly one — is the kind of
+ * cost that only shows up on the file somebody actually needs this for.
+ *
+ * Both columns, because a `pair` is one change with rows on either side and marking only the
+ * additions would read as two.
+ */
+export function changePositions(
+  columns: SplitColumns,
+  anchor: ChangeAnchor,
+): Array<{ hunk: number; at: number }> {
+  const out: Array<{ hunk: number; at: number }> = []
+  const take = (rows: readonly ColumnRow[], from: number, to: number): void => {
+    for (let i = from; i < to; i++) {
+      const row = rows[i]
+      if (row === undefined || row.kind !== 'line' || row.at === null) continue
+      out.push({ hunk: row.hunk, at: row.at })
+    }
+  }
+  take(columns.left, anchor.leftFrom, anchor.leftTo)
+  take(columns.right, anchor.rightFrom, anchor.rightTo)
+  return out
+}

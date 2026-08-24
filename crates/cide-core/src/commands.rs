@@ -120,6 +120,22 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     "contextMenuOpen",
     "sidebarFiles",
     "sidebarGit",
+    // A diff surface is mounted and in front — the git diff tab, the log tool window's revision
+    // diff, or the **conflict resolver**, which is a diff of three documents and walks its
+    // blocks with the same command.
+    //
+    // A host flag rather than a derived one, and the reason is the host/derived split above
+    // rather than convenience: the answer comes from a claim stack in the webview
+    // (`ui/src/panes/changeNav.ts`), which is transient chrome of exactly the kind only React
+    // knows about. Every derived spelling was tried and is wrong in **both** directions. A tab
+    // kind misses the tool window's revision diff, which is not a tab at all; and it is *true*
+    // for a Claude `openDiff`, which is also `TabKind::Diff` and whose chunk walk is not wired
+    // to this command. `fileTabActive` is not reusable either — `focusedTabPath` answers for a
+    // diff tab only when its `new_path` is absolute, and a git-origin one is repo-relative.
+    //
+    // It cannot degenerate into the constant `repoOpen` became: the value is the length of a
+    // stack that mounting, tab activation and a pointer press all move.
+    "diffFocused",
 ];
 
 /// Every command cide can run, in palette display order.
@@ -1054,6 +1070,45 @@ fn build() -> Vec<Command> {
         )
         .when("editorFocused")
         .keywords(&["method", "function", "up"]),
+        /*
+         * Next / previous change, in a diff or the conflict resolver. (M25)
+         *
+         * Modelled on the member walk directly above, down to the clamp: both answer from a
+         * model the webview already has, neither costs a round trip, and both stop at the ends
+         * and say so rather than wrapping.
+         *
+         * `NAVIGATE` and not `GIT`, although every surface that answers is a git one. This is
+         * where a reader looks for "next X", it belongs beside the walk it is modelled on, and
+         * the group a command sits in is about where it is found rather than about which
+         * subsystem implements it.
+         *
+         * The clause is `diffFocused` alone. The *binding* carries more — see
+         * `keymap::defaults` — for the reason `picker.libraries` sets out at length: a `when`
+         * here decides what the palette offers, and the palette should still offer this when
+         * focus happens to be in a terminal split beside the diff.
+         */
+        Command::new("navigate.nextChange", "Next change", NAVIGATE)
+            .when("diffFocused")
+            .keywords(&[
+                "diff",
+                "difference",
+                "hunk",
+                "conflict",
+                "merge",
+                "block",
+                "down",
+            ]),
+        Command::new("navigate.prevChange", "Previous change", NAVIGATE)
+            .when("diffFocused")
+            .keywords(&[
+                "diff",
+                "difference",
+                "hunk",
+                "conflict",
+                "merge",
+                "block",
+                "up",
+            ]),
         // View.
         Command::new("picker.files", "Go to file", VIEW).when("projectOpen"),
         /*

@@ -395,6 +395,29 @@ struct Caps {
     references: std::sync::atomic::AtomicU8,
     /// `textDocument/implementation` — see [`LspHandle::supports_implementation`].
     implementation: std::sync::atomic::AtomicU8,
+    /// `textDocument/completion` — see [`LspHandle::supports_completion`].
+    completion: std::sync::atomic::AtomicU8,
+    /// The characters that open a completion by themselves — see
+    /// [`LspHandle::completion_triggers`].
+    ///
+    /// # Why this one is a mutex when its three neighbours are atomics
+    ///
+    /// Because it is the only capability in this struct that carries **data** rather than a
+    /// yes/no, and a `Vec<char>` does not fit in an `AtomicU8`. The argument the struct's own
+    /// header makes still holds — this belongs here rather than as a fourth parameter through
+    /// `supervise`/`supervise_lives`/`run_once` — it simply cannot be spelled the same way.
+    ///
+    /// A mutex is affordable here for a reason that is worth stating, because it would not be
+    /// two fields up: `references` and `implementation` are read on the path a *keystroke*
+    /// takes, and `completion` on the path a keystroke takes many times a second, so all three
+    /// are atomics deliberately. This one is read once per completion request, on the blocking
+    /// pool, beside a round trip to another process — the lock is free by comparison and is
+    /// never taken by the polled pump.
+    ///
+    /// `Arc<[char]>` and not `Vec<char>`: the reader clones it out from under the guard and
+    /// drops the guard, the same discipline `Requester` follows about `handles`, so the lock is
+    /// never held while anything else happens.
+    triggers: parking_lot::Mutex<Arc<[char]>>,
 }
 
 impl Caps {
@@ -404,6 +427,13 @@ impl Caps {
             .store(Capability::Unknown as u8, Ordering::Release);
         self.implementation
             .store(Capability::Unknown as u8, Ordering::Release);
+        self.completion
+            .store(Capability::Unknown as u8, Ordering::Release);
+        // Emptied along with the tri-state, and it has to be: a trigger list left over from the
+        // previous life would be read beside a `Unknown` completion capability, and the caller's
+        // "ask anyway while it starts" branch would build a `TriggerCharacter` context out of a
+        // list the running server never declared.
+        *self.triggers.lock() = Arc::from(Vec::new());
     }
 
     /// Record what this life's `initialize` result said.
@@ -416,6 +446,18 @@ impl Caps {
             Capability::of(session.supports_implementation()),
             Ordering::Release,
         );
+        let completion = session.completion_support();
+        // The list first, the flag second, and the order is not arbitrary: a reader that saw
+        // `Yes` would go straight on to read the triggers, so publishing the flag first opens a
+        // window where a completion is attributed `TriggerKind::Invoked` when the server did
+        // declare the character. Harmless — one request answered slightly differently — but it
+        // is free to not have, and the reverse order has no window at all.
+        *self.triggers.lock() = match &completion {
+            Some(support) => Arc::from(support.triggers.clone()),
+            None => Arc::from(Vec::new()),
+        };
+        self.completion
+            .store(Capability::of(completion.is_some()), Ordering::Release);
     }
 
     fn read(slot: &std::sync::atomic::AtomicU8) -> Option<bool> {
@@ -553,6 +595,27 @@ impl LspHandle {
     /// servers answer `true`, so today this only ever prevents a lie in the future.
     pub fn supports_references(&self) -> Option<bool> {
         Caps::read(&self.caps.references)
+    }
+
+    /// Does this server answer `textDocument/completion`? `None` while it is still starting.
+    ///
+    /// The same three states as [`Self::supports_references`], and the `None` matters more here
+    /// rather than less. This is consulted on every burst of typing, so a client that folded
+    /// `None` into `false` would decide *"this server cannot complete"* during the two minutes
+    /// rust-analyzer indexes — and, because the popup fails silently by design, would do it with
+    /// nothing on screen to say why. Ask anyway; the deadline answers.
+    pub fn supports_completion(&self) -> Option<bool> {
+        Caps::read(&self.caps.completion)
+    }
+
+    /// The characters this server said open a completion by themselves.
+    ///
+    /// Empty before the handshake, and empty afterwards for a server that declared none — which
+    /// is a real answer meaning *"only when the client asks"* and **not** a refusal. The caller
+    /// must not read emptiness as "cannot complete"; that question is
+    /// [`Self::supports_completion`]'s.
+    pub fn completion_triggers(&self) -> Arc<[char]> {
+        Arc::clone(&self.caps.triggers.lock())
     }
 
     /// Does this server answer `textDocument/implementation`? `None` while it is still starting.

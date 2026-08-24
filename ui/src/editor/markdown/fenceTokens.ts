@@ -132,11 +132,34 @@ export function fenceIsHighlightable(text: string): boolean {
  * the re-render it causes very much is not.
  */
 const loaded = new Map<LanguageId, Grammar | null>()
-const pending = new Map<LanguageId, Promise<void>>()
+const promises = new Map<LanguageId, Promise<Grammar | null>>()
 
 /** The grammar for `id` if it is already here. Null means "not loaded, or will not load". */
 export function grammarIfReady(id: LanguageId): Grammar | null {
   return loaded.get(id) ?? null
+}
+
+/**
+ * The grammar for `id`, loaded at most once per window.
+ *
+ * The promise-shaped half of this cache, and the one every other entry point is built on. A
+ * caller that is *already* async — `panes/diffHighlight.ts`, which has to await a dynamic
+ * `import()` before it can tokenize anything — wants this rather than the callback below, and
+ * giving it a second cache of its own would be the duplication this file's header refuses.
+ *
+ * `loadGrammar` never rejects (it answers `null` for a language with no module and for a chunk
+ * that will not load), so neither does this, and no caller needs a `.catch` to keep a render
+ * from breaking on a missing grammar.
+ */
+export function grammarFor(id: LanguageId): Promise<Grammar | null> {
+  const already = promises.get(id)
+  if (already !== undefined) return already
+  const run = loadGrammar(id).then((spec) => {
+    loaded.set(id, spec)
+    return spec
+  })
+  promises.set(id, run)
+  return run
 }
 
 /**
@@ -146,19 +169,24 @@ export function grammarIfReady(id: LanguageId): Grammar | null {
  * awaits is a render that has already returned. The contract is "paint uncoloured now, and I will
  * tell you when there is something better", which is also what makes a fence in a language whose
  * chunk fails to load render as monospace instead of as nothing.
+ *
+ * **Every requester is called back, not just the first.** This used to return early when a
+ * grammar was already in flight, which silently dropped the callback of anyone who asked during
+ * that window — so a second consumer painted plain until some unrelated re-render happened to
+ * come along. It was invisible while the markdown preview was the only caller, because one
+ * re-render there refreshes every fence in the document at once; it stops being invisible the
+ * moment a second component tree wants the same language, which `panes/diffHighlight.ts` is.
+ * Building on `grammarFor` fans the one load out to every awaiter instead.
  */
 export function requestGrammar(id: LanguageId, then: () => void): void {
-  if (loaded.has(id) || pending.has(id)) return
-  const run = loadGrammar(id).then((spec) => {
-    loaded.set(id, spec)
-    pending.delete(id)
+  if (loaded.has(id)) return
+  void grammarFor(id).then((spec) => {
     if (spec !== null) then()
   })
-  pending.set(id, run)
 }
 
 /** Testing seam. Never called by the app. */
 export function resetGrammarCacheForTest(): void {
   loaded.clear()
-  pending.clear()
+  promises.clear()
 }

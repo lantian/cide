@@ -216,6 +216,24 @@ export function EditorPane({
    */
   const autosaveOn = useWorkspace((s) => s.boot?.workspace.settings.editor.autosave ?? true)
   /**
+   * `settings.editor.completion` and `.completionOnTyping`, from the mirror. (M25)
+   *
+   * Both default to **on** before bootstrap, matching `EditorSettings::default()`.
+   *
+   * A `useMemo` over two scalars rather than one selector returning an object, and that is not a
+   * style choice: `check:selectors` exists because a `useWorkspace` selector that *builds* a fresh
+   * object re-renders for ever and ends at *Maximum update depth exceeded*, which unmounts the
+   * whole root. Two scalar reads and a memo is the shape that cannot do that.
+   */
+  const completionOn = useWorkspace((s) => s.boot?.workspace.settings.editor.completion ?? true)
+  const completionOnTyping = useWorkspace(
+    (s) => s.boot?.workspace.settings.editor.completionOnTyping ?? true,
+  )
+  const completion = useMemo(
+    () => ({ enabled: completionOn, onTyping: completionOnTyping }),
+    [completionOn, completionOnTyping],
+  )
+  /**
    * Is a Claude Code diff of **this file** on screen, with the agent blocked on it?
    *
    * `crates/cide-app/src/ide.rs`: *"`openDiff` blocks an agent turn. The CLI sends it and waits;
@@ -1236,6 +1254,7 @@ export function EditorPane({
           }}
           diagnostics={diagnostics}
           highlight={level}
+          completion={completion}
           blame={blame}
           blameOn={blameOn}
           onShowCommit={onShowCommit}

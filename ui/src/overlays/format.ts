@@ -162,6 +162,71 @@ export function symbolBadge(kind: string): KindBadge {
 }
 
 /**
+ * The badge for a completion's kind — `FN`, `ST`, `KW`. (M25)
+ *
+ * Beside [`symbolBadge`] and deliberately **not** the same function, because the two vocabularies
+ * genuinely differ: an outline has `Impl`, which no server ever offers as a completion, and a
+ * completion list is a third keywords, snippets and text, none of which an outline contains.
+ * Folding them together would have meant a lossy mapping with `·` doing most of the work.
+ *
+ * What they *do* share is the tone vocabulary and the rule at the bottom, and sharing those is
+ * the point of the two living in one file: a `function` is blue in the popup, in the File
+ * Structure list and in Go-to-Symbol, or the same symbol reads as three different things.
+ *
+ * `string` and not `CompletionKind`, for [`symbolBadge`]'s reason: the value is annotated by a
+ * wire type, which is a promise from another process, and the fallback exists precisely for when
+ * that promise is not kept. An unrecognised kind gets the neutral marker and is **never dropped** —
+ * a completion you cannot label is still a completion.
+ *
+ * The kinds cide's `CompletionKind` can produce are all here; the `default` is for a build of the
+ * frontend that is older than the Rust that fed it.
+ */
+export function completionBadge(kind: string): KindBadge {
+  switch (kind) {
+    case 'function':
+    case 'method':
+      return { label: 'FN', tone: 'blue' }
+    case 'constructor':
+      return { label: 'NEW', tone: 'blue' }
+    case 'field':
+    case 'property':
+      return { label: 'FLD', tone: 'faint' }
+    case 'variable':
+      return { label: 'VAR', tone: 'yellow' }
+    case 'constant':
+      return { label: 'CO', tone: 'yellow' }
+    case 'struct':
+      return { label: 'ST', tone: 'cyan' }
+    case 'enum':
+      return { label: 'EN', tone: 'cyan' }
+    case 'enumMember':
+      return { label: 'EM', tone: 'cyan' }
+    case 'typeParameter':
+      return { label: 'TY', tone: 'cyan' }
+    case 'interface':
+      return { label: 'IF', tone: 'purple' }
+    case 'module':
+      return { label: 'MOD', tone: 'green' }
+    case 'keyword':
+      return { label: 'KW', tone: 'purple' }
+    case 'snippet':
+      return { label: 'SNP', tone: 'accent' }
+    case 'operator':
+      return { label: 'OP', tone: 'dim' }
+    case 'event':
+      return { label: 'EV', tone: 'accent' }
+    case 'file':
+      return { label: 'FIL', tone: 'green' }
+    case 'folder':
+      return { label: 'DIR', tone: 'green' }
+    case 'text':
+      return { label: 'TXT', tone: 'faint' }
+    default:
+      return { label: '·', tone: 'faint' }
+  }
+}
+
+/**
  * What the file picker says when it has no rows to draw. (M16)
  *
  * # Why this is a function and not a ternary in the JSX it came out of

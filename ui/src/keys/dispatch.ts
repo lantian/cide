@@ -101,6 +101,7 @@ import {
   type TabId,
 } from '@/ipc/client'
 import { focusedCaret, focusedFolds, focusedWord } from '@/editor/caretTrack'
+import { focusedChangeNav } from '@/panes/changeNav'
 import { goToDefinition } from '@/editor/goToDefinition'
 import { findUsages, goToImplementation } from '@/editor/codeIntel'
 import { refreshDiagnostics } from '@/sidebar/ProblemsPanel/actions'
@@ -1683,6 +1684,44 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           column: to.startColumn,
           endColumn: to.endColumn,
         })
+        return
+      }
+
+      case 'navigate.nextChange':
+      case 'navigate.prevChange': {
+        /*
+         * The changes iterator, in a diff or the conflict resolver. (M25)
+         *
+         * The member walk directly above is the template, and this is the same shape: answered
+         * from a model the surface already has, no IPC, and a refusal reported rather than a
+         * chord that silently did nothing.
+         *
+         * `panes/changeNav.ts` is how a command with no pane and no DOM node reaches the surface
+         * that can answer — the predicament `focusedCaret()` exists for, and its header says why
+         * this is a second stack rather than a field on that one.
+         *
+         * **No `jumpTo` and no navigation-history entry**, deliberately, for the reason the
+         * member walk gives: this is bound to F7, it is held and repeated, and ten presses would
+         * be ten entries `navHistory`'s merge rule cannot collapse. Whatever opened the diff
+         * recorded an entry, so Back still leaves it.
+         */
+        const nav = focusedChangeNav()
+        if (nav === null) return unmet(command, 'no diff or conflict view is in front')
+        const forwards = command === 'navigate.nextChange'
+        if (!nav.step(forwards ? 1 : -1)) {
+          // Clamped, never wrapped — see `changeNav.stepIndex`. Reported for the same reason the
+          // member walk reports: a chord that does nothing with no trace is the complaint this
+          // whole file exists to answer.
+          const { count } = nav.cursor()
+          return unmet(
+            command,
+            count === 0
+              ? 'this diff has no changes'
+              : forwards
+                ? 'already at the last change'
+                : 'already at the first change',
+          )
+        }
         return
       }
 

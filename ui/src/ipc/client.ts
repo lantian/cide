@@ -16,6 +16,8 @@ import type {
   Axis,
   Bootstrap,
   ColorScheme,
+  CompletionAnswer,
+  CompletionResolveAnswer,
   DefinitionAnswer,
   DiagnosticSourceId,
   DiagnosticsSnapshot,
@@ -862,6 +864,72 @@ export const diagnostics = {
    */
   usagesCancel: (projectId: ProjectId) =>
     invoke<void>('diagnostics_usages_cancel', { project: projectId }),
+
+  /**
+   * The completion list at a position. (M25)
+   *
+   * Waits **two** seconds server-side, the shortest deadline of any of these, and the reason is
+   * the gesture: this popup opens by itself while the user is still typing, so a list computed
+   * for a prefix from two seconds ago is not late — it is wrong, and drawing it would move the
+   * selection under somebody mid-keystroke.
+   *
+   * `before` is the character immediately left of the caret, or `null` at the start of a line.
+   * Rust compares it against what the server declared as a trigger character and shapes the LSP
+   * `context` accordingly; the trigger list never crosses this seam.
+   *
+   * **Sync the document first.** The server's copy is up to 300 ms behind the buffer
+   * (`editor/docSync.ts`), and completing against text that does not contain the caret is
+   * meaningless. `editor/completion.ts` awaits `syncNow` before calling this and is the only
+   * caller.
+   *
+   * Never rejects. An `unavailable` answer is usually shown to nobody at all — see
+   * `CompletionAnswer`.
+   */
+  completion: (
+    projectId: ProjectId,
+    path: string,
+    line: number,
+    column: number,
+    before: string | null,
+  ) =>
+    invoke<CompletionAnswer>('diagnostics_completion', {
+      project: projectId,
+      path,
+      line,
+      column,
+      before,
+    }),
+
+  /**
+   * The deferred edits of one completion item — the `use` line, the `import` block. (M25)
+   *
+   * Only for a row that arrived with a non-null `resolve`, which is the minority: rust-analyzer
+   * offers **no auto-import candidates at all** unless the client can fetch their edits lazily,
+   * so for those rows the edit genuinely does not exist until this is called. Every other accept
+   * skips it and is instant.
+   *
+   * `token` names the reply the row came from and `index` the row within it. An `unavailable`
+   * answer is **not** "no edits": accepting a symbol without its import leaves the file not
+   * compiling, so the caller must refuse the accept rather than do half of it.
+   */
+  completionResolve: (projectId: ProjectId, token: number, index: number) =>
+    invoke<CompletionResolveAnswer>('diagnostics_completion_resolve', {
+      project: projectId,
+      token,
+      index,
+    }),
+
+  /**
+   * Withdraw the outstanding completion for this project.
+   *
+   * Releases the blocked thread *and* sends `$/cancelRequest`, for [`usagesCancel`]'s reason with
+   * the volume argument on top: a user typing at speed supersedes a request per keystroke, and
+   * without the protocol half each one leaves the server computing a list nobody will read.
+   *
+   * A no-op when nothing is outstanding, which is most calls.
+   */
+  completionCancel: (projectId: ProjectId) =>
+    invoke<void>('diagnostics_completion_cancel', { project: projectId }),
 
   /**
    * Every place the symbol at this position is *implemented*. (M18)

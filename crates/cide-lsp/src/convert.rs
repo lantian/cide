@@ -468,3 +468,370 @@ mod location_tests {
         assert!(locations(&loc(1, 1)).is_none());
     }
 }
+
+// ==========================================================================================
+// Completion. (M25)
+// ==========================================================================================
+
+/// cide's cap on one completion reply.
+///
+/// A `Ctrl+Space` on an empty line in a large workspace legitimately offers thousands of items —
+/// rust-analyzer will name every public item of every dependency — and every one of them crosses
+/// a Tauri IPC channel as JSON. The cap is high because it must not bite in the case that
+/// matters: a list narrowed by even one typed character is two orders of magnitude smaller than
+/// this, so the popup the user is actually reading is never truncated.
+///
+/// Truncating is reported rather than hidden ([`cide_ipc::CompletionAnswer::Items::truncated`]),
+/// and it forbids the client's *"further typing filters this list locally"* fast path — the same
+/// discipline `MAX_USAGES` follows one crate over, for the same reason: a capped list that
+/// claims to be complete is worse than a slow one.
+pub const MAX_COMPLETIONS: usize = 1500;
+
+/// A `textDocument/completion` reply in cide's shapes.
+pub struct CompletionReply {
+    pub items: Vec<cide_ipc::CompletionItem>,
+    /// The raw items that [`cide_ipc::CompletionItem::resolve`] indexes name, in that order.
+    ///
+    /// # Why the originals are kept, and only some of them
+    ///
+    /// `completionItem/resolve` takes **the item back**, whole — `data`, `label`, `sortText` and
+    /// all — because that opaque `data` is how a server finds its way back to what it was about
+    /// to compute. cide's converted DTO has thrown most of that away by design, so the original
+    /// has to survive somewhere until the user accepts a row.
+    ///
+    /// Only the rows that actually have something deferred are kept. rust-analyzer attaches
+    /// `data` to a minority of a list — the auto-import candidates — so this is typically a small
+    /// fraction of `items`, which is what makes holding a couple of replies in memory
+    /// unremarkable rather than a leak with a nice name.
+    pub resolvable: Vec<serde_json::Value>,
+    /// LSP's `isIncomplete`. Absent means `false` — a bare array reply is complete by definition.
+    pub incomplete: bool,
+    /// [`MAX_COMPLETIONS`] was hit.
+    pub truncated: bool,
+}
+
+/// A `textDocument/completion` reply, converted.
+///
+/// # The three shapes, and why they are picked apart by hand
+///
+/// `CompletionItem[] | CompletionList | null`, which is `location`'s problem again and gets
+/// `location`'s answer: `lsp_types` models it with an untagged enum whose failure message names
+/// neither the field nor the shape it saw, and a completion list that silently fails to parse is
+/// an empty popup that looks exactly like "there is nothing here". Both live servers exercise
+/// different branches — gopls answers with a `CompletionList`, rust-analyzer with a bare array —
+/// so neither is hypothetical and `real_servers.rs` drives both.
+///
+/// # Per-item failures drop the item, not the batch
+///
+/// [`locations`]' rule rather than [`location`]'s, and the argument is stronger here: a reply is a
+/// *list*, one malformed entry among nine hundred good ones is a server bug in one row, and
+/// failing the batch would turn "nine hundred completions" into "no completions" — the
+/// confident-empty-list failure this whole surface is built to avoid. The only per-item
+/// requirement is a non-empty `label`, because that is the one field with no fallback.
+///
+/// # `documentation` is dropped here
+///
+/// Deliberately, at the point of conversion rather than at the DTO — see
+/// [`cide_ipc::CompletionItem`]. It is markdown, it is often a whole doc comment, no surface
+/// draws it in this milestone, and a thousand of them is the difference between a payload that
+/// crosses the IPC channel in a frame and one that does not.
+pub fn completion(value: &serde_json::Value) -> Option<CompletionReply> {
+    if value.is_null() {
+        return None;
+    }
+    let (raw, incomplete) = if let Some(array) = value.as_array() {
+        (array.as_slice(), false)
+    } else {
+        (
+            value.get("items")?.as_array()?.as_slice(),
+            value
+                .get("isIncomplete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        )
+    };
+
+    let truncated = raw.len() > MAX_COMPLETIONS;
+
+    /*
+     * Sorted before the cap, and that ordering is the whole point of doing it here.
+     *
+     * `sortText` is a *sort key*, not a score — `"ffff0000"` says nothing on its own — so the
+     * only useful thing to hand the client is a rank, and a rank is only meaningful once the
+     * list is in order. Capping first would keep the thousand items the server happened to emit
+     * first rather than the thousand it considers best, which for rust-analyzer is close to the
+     * opposite of what the user wants.
+     *
+     * `sort_by` and not `sort_unstable_by`: LSP's tie-break for equal `sortText` is the server's
+     * own order, and a stable sort is what preserves it.
+     */
+    let mut ordered: Vec<&serde_json::Value> = raw.iter().collect();
+    ordered.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+
+    let mut items = Vec::new();
+    let mut resolvable: Vec<serde_json::Value> = Vec::new();
+    for (rank, raw) in ordered.into_iter().take(MAX_COMPLETIONS).enumerate() {
+        let Some(mut item) = one_completion(raw, rank) else {
+            continue;
+        };
+        // The index is assigned here rather than inside `one_completion`, because it names a
+        // position in a list that function cannot see — and because a row dropped by the filter
+        // above must not consume an index, or every later row's handle would point one item off.
+        if needs_resolve(raw, &item) {
+            item.resolve = Some(u32::try_from(resolvable.len()).unwrap_or(u32::MAX));
+            resolvable.push(raw.clone());
+        }
+        items.push(item);
+    }
+
+    Some(CompletionReply {
+        items,
+        resolvable,
+        incomplete,
+        truncated,
+    })
+}
+
+/// Does this row have something worth a `completionItem/resolve` before it is accepted?
+///
+/// Two conditions, and both are needed:
+///
+/// * **nothing already attached.** A server that computed its edits eagerly has answered the
+///   question; asking again would put a round trip in front of a keystroke to learn nothing.
+/// * **the server left a `data` blob.** That is what a server attaches when it has deferred
+///   something, and it is the handle it needs to find its way back. Resolving an item without
+///   one is legal and, for both servers cide ships, pointless.
+///
+/// The second condition is the one with a trade in it, so it is worth naming: a hypothetical
+/// server that defers `additionalTextEdits` and attaches no `data` would have its import edit
+/// missed. That server would also be answering `resolve` from the label alone, which no server
+/// cide has met does. The alternative — resolving every accepted row — puts a language server
+/// between the user and the Tab key for the majority of accepts that have nothing to fetch, and
+/// that cost is paid on every single completion rather than in an imagined one.
+fn needs_resolve(raw: &serde_json::Value, item: &cide_ipc::CompletionItem) -> bool {
+    item.extra_edits.is_empty() && raw.get("data").is_some()
+}
+
+/// What this item sorts by: `sortText`, or the label when it sent none.
+///
+/// The fallback is the spec's — *"when omitted the label is used"* — and it is not optional. A
+/// server that sets `sortText` on some items and not others (gopls does) would otherwise sort
+/// every unset one into one bucket, which scrambles exactly the rows it left unmarked because it
+/// had no opinion about them.
+fn sort_key(item: &serde_json::Value) -> (&str, &str) {
+    let label = item
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let sort = item
+        .get("sortText")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(label);
+    // The label is the tie-break, so two items with one `sortText` keep a deterministic order
+    // across runs rather than inheriting the server's hash iteration order.
+    (sort, label)
+}
+
+/// One item. `None` drops just this row — see [`completion`].
+fn one_completion(item: &serde_json::Value, rank: usize) -> Option<cide_ipc::CompletionItem> {
+    let str_at = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
+
+    let label = str_at("label")?.trim();
+    if label.is_empty() {
+        return None;
+    }
+
+    /*
+     * The insert text, resolved once, from LSP's three sources in the spec's own order of
+     * precedence: `textEdit.newText` beats `insertText` beats `label`.
+     *
+     * Doing this here rather than in the webview is not tidiness. The precedence is a protocol
+     * rule, the fallback to `label` is the case that keeps a minimal server usable at all, and a
+     * client that got the order wrong would insert `push(…)` — the *display* label, ellipsis
+     * included — into the user's source. That failure is invisible in review and obvious in a
+     * file, which is the shape of bug this crate converts eagerly to avoid.
+     */
+    let edit = item.get("textEdit");
+    let replace = edit.and_then(text_edit);
+    let insert = match edit
+        .and_then(|e| e.get("newText"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(text) => text,
+        None => str_at("insertText").unwrap_or(label),
+    };
+
+    /*
+     * An `InsertReplaceEdit` is refused, and refusing it is the point.
+     *
+     * cide declares `insertReplaceSupport: false`, so a conforming server may not send one — it
+     * carries `insert` and `replace` ranges where a `TextEdit` carries a single `range`. Reading
+     * `newText` off it and then finding no `range` would leave `replace: None`, and the client
+     * would splice the text over whatever *it* thinks the current word is, at an offset the
+     * server never named. Dropping the row instead is visible (an item that is missing) rather
+     * than silent (an item that corrupts a line), and `session.rs` says this is the second of the
+     * two places that change if the capability is ever flipped on.
+     */
+    if let Some(edit) = edit
+        && edit.get("range").is_none()
+        && edit.get("insert").is_some()
+    {
+        return None;
+    }
+
+    let snippet = item
+        .get("insertTextFormat")
+        .and_then(serde_json::Value::as_u64)
+        == Some(2);
+
+    // Both spellings, because the field was deprecated in favour of the tag in LSP 3.15 and
+    // servers still send either — see the handshake's `deprecatedSupport` note.
+    let deprecated = item
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || item
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tags| {
+                tags.iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .any(|tag| tag == 1)
+            });
+
+    Some(cide_ipc::CompletionItem {
+        // The label is what the popup draws; `filterText` is what typing is matched against, and
+        // for rust-analyzer they routinely differ (`push(…)` against `push`). Collapsing them is
+        // what makes a popup stop narrowing as the user types.
+        filter_text: str_at("filterText").unwrap_or(label).to_string(),
+        label: label.to_string(),
+        // `labelDetails.detail` and nothing else: it is the string drawn *against* the label, and
+        // for an auto-import row it is the only visible warning that accepting also edits the top
+        // of the file. Falling back to `detail` here would put a type in that position, which is
+        // where the popup draws a sentence.
+        detail: item
+            .get("labelDetails")
+            .and_then(|d| d.get("detail"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        // The type, from either spelling. `labelDetails.description` is where a modern server
+        // puts it once the client declares `labelDetailsSupport`; `detail` is where every server
+        // has always put it, and is the fallback that keeps a minimal one's popup readable.
+        description: item
+            .get("labelDetails")
+            .and_then(|d| d.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| str_at("detail"))
+            .map(str::to_string),
+        kind: completion_kind(item.get("kind").and_then(serde_json::Value::as_u64)),
+        insert: insert.to_string(),
+        snippet,
+        replace,
+        // `usize` → `u32`: unreachable past `MAX_COMPLETIONS`, and saturating rather than
+        // wrapping so that a future cap raised past `u32::MAX` degrades to "ranked last"
+        // instead of to "ranked first".
+        sort: u32::try_from(rank).unwrap_or(u32::MAX),
+        extra_edits: item
+            .get("additionalTextEdits")
+            .and_then(serde_json::Value::as_array)
+            .map(|edits| edits.iter().filter_map(text_edit).collect())
+            .unwrap_or_default(),
+        // Filled in by `completion`, which is the only place that knows the index — see there.
+        resolve: None,
+        deprecated,
+    })
+}
+
+/// The `additionalTextEdits` of a `completionItem/resolve` reply.
+///
+/// `None` only for a reply that is not an object at all. An object with no `additionalTextEdits`
+/// is `Some(vec![])` and means what it says: the server resolved the item and it needs no extra
+/// edits. Collapsing the two would make "the server said nothing to add" indistinguishable from
+/// "the reply was unreadable", and only the first is safe to accept on.
+pub fn resolved_edits(value: &serde_json::Value) -> Option<Vec<cide_ipc::CompletionEdit>> {
+    if !value.is_object() {
+        return None;
+    }
+    Some(
+        value
+            .get("additionalTextEdits")
+            .and_then(serde_json::Value::as_array)
+            .map(|edits| edits.iter().filter_map(text_edit).collect())
+            .unwrap_or_default(),
+    )
+}
+
+/// One LSP `TextEdit` in cide's units. `None` for any shape that is not one.
+fn text_edit(edit: &serde_json::Value) -> Option<cide_ipc::CompletionEdit> {
+    let range = edit.get("range")?;
+    // 0-based on the wire, 1-based in cide; the column stays UTF-16 because the consumer is
+    // CodeMirror. The same conversion `one_location` makes, and it must stay the same one — an
+    // import edit landing a line off is a `use` statement inside a function body.
+    let point = |at: &serde_json::Value| -> Option<(u32, u32)> {
+        let line = u32::try_from(at.get("line")?.as_u64()?)
+            .ok()?
+            .wrapping_add(1);
+        let column = u32::try_from(at.get("character")?.as_u64()?)
+            .ok()?
+            .wrapping_add(1);
+        Some((line, column))
+    };
+    let (line, column) = point(range.get("start")?)?;
+    let (end_line, end_column) = point(range.get("end")?)?;
+    Some(cide_ipc::CompletionEdit {
+        line,
+        column,
+        end_line,
+        end_column,
+        // Absent `newText` is an empty string, not a failure: a pure deletion is a legal edit and
+        // gopls emits them when it rewrites an import block.
+        text: edit
+            .get("newText")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// LSP's `CompletionItemKind` number into cide's badge vocabulary.
+///
+/// The merges are stated once, here, rather than in the renderer — see
+/// [`cide_ipc::CompletionKind`] for why the two enums are not one. An unknown number becomes
+/// `Other` rather than dropping the row: the spec grows, and a completion you cannot label is
+/// still a completion.
+fn completion_kind(kind: Option<u64>) -> cide_ipc::CompletionKind {
+    use cide_ipc::CompletionKind as K;
+    match kind {
+        Some(1) => K::Text,
+        Some(2) => K::Method,
+        Some(3) => K::Function,
+        Some(4) => K::Constructor,
+        Some(5) => K::Field,
+        Some(6) => K::Variable,
+        // `Class` and `Struct` are one badge: Rust has only the second, Go only the first, and no
+        // language cide targets shows both in one list.
+        Some(7) | Some(22) => K::Struct,
+        Some(8) => K::Interface,
+        Some(9) => K::Module,
+        Some(10) => K::Property,
+        // `Unit` — a measurement suffix in a stylesheet. No cide language emits one, and it has
+        // no badge worth inventing.
+        Some(11) => K::Other,
+        // `Value` and `Constant` are indistinguishable to a reader of a popup.
+        Some(12) | Some(21) => K::Constant,
+        Some(13) => K::Enum,
+        Some(14) => K::Keyword,
+        Some(15) => K::Snippet,
+        // `Color` — a swatch this popup does not draw.
+        Some(16) => K::Other,
+        Some(17) => K::File,
+        // `Reference` is "a variable, indirectly" everywhere it is actually used.
+        Some(18) => K::Variable,
+        Some(19) => K::Folder,
+        Some(20) => K::EnumMember,
+        Some(23) => K::Event,
+        Some(24) => K::Operator,
+        Some(25) => K::TypeParameter,
+        _ => K::Other,
+    }
+}

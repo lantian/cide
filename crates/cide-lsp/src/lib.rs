@@ -59,4 +59,4 @@ pub mod session;
 
 pub use discover::{Found, Server};
 pub use server::{LspError, LspEvent, LspHandle, RequestError, Requester};
-pub use session::{Effect, Session};
+pub use session::{CompletionSupport, Effect, Session};

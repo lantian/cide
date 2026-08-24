@@ -364,6 +364,112 @@ pub fn diagnostics_usages_cancel(registry: State<'_, DiagnosticsRegistry>, proje
     }
 }
 
+/// How long a completion waits before giving up. (M25)
+///
+/// **The shortest deadline in this file, and it is short for the gesture rather than for the
+/// plumbing.** Go to definition is five seconds because a user pressed a key and is watching;
+/// Find usages is twenty because it draws a popup that says it is searching. A completion popup
+/// says nothing and is racing the user's own typing: a list computed for a prefix the user typed
+/// two seconds ago is not late, it is *wrong*, and drawing it would move the selection under
+/// somebody mid-keystroke. Past this point the honest thing is to have no popup.
+///
+/// It is also the one deadline that is hit routinely rather than exceptionally — rust-analyzer
+/// spends its first minutes indexing, and every keystroke during them ends here. That is
+/// precisely why the webview drops an implicit failure in silence.
+const COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The completion list at a position. (M25)
+///
+/// `async` + `spawn_blocking` for [`diagnostics_definition`]'s reason, and it matters more here:
+/// this is called on a burst of typing, so a version polled on the main thread would freeze the
+/// GTK loop — every window, every terminal — for up to two seconds per keystroke.
+///
+/// `before` is the character immediately left of the caret, or `None` at the start of a line.
+/// A `String` on the wire and not a `char`, because `char` has no JSON representation of its own
+/// and one-character strings are what the webview naturally has; only the first character is
+/// read, so a caller that sends more is narrowed rather than refused.
+///
+/// Never `Err`, for the reason [`cide_ipc::CompletionAnswer`] gives — and note that its
+/// `Unavailable` is, uniquely in this file, usually shown to nobody.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn diagnostics_completion(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    path: std::path::PathBuf,
+    line: u32,
+    column: u32,
+    before: Option<String>,
+) -> Result<cide_ipc::CompletionAnswer, ()> {
+    let Some(diagnostics) = registry.get(project) else {
+        return Ok(cide_ipc::CompletionAnswer::Unavailable {
+            reason: "No language server is running for this project.".to_string(),
+        });
+    };
+    let before = before.and_then(|text| text.chars().next());
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        diagnostics.completion(&path, line, column, before, COMPLETION_TIMEOUT)
+    })
+    .await
+    .unwrap_or(cide_ipc::CompletionAnswer::Unavailable {
+        reason: "The completion did not finish.".to_string(),
+    }))
+}
+
+/// How long a resolve waits. (M25)
+///
+/// Longer than [`COMPLETION_TIMEOUT`] and for the opposite reason. That deadline is short because
+/// the user is still typing and a late list is a wrong list. This one is behind a **Tab the user
+/// has already pressed**: they have chosen, nothing is racing it, and the alternative to waiting
+/// is refusing an accept. Two seconds would refuse one every time rust-analyzer is busy.
+///
+/// Still finite, and still shorter than Go to definition's, because the thing being computed is
+/// one import path rather than a whole-workspace answer.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The deferred edits of one completion item, fetched as the user accepts it. (M25)
+///
+/// `async` + `spawn_blocking` like its neighbours. Called at most once per accepted completion,
+/// and only for the rows that said they had something deferred
+/// ([`cide_ipc::CompletionItem::resolve`]) — an ordinary accept never reaches here.
+///
+/// Never `Err`; an `Unavailable` is a sentence and, uniquely among the completion commands, one
+/// the user *does* see, because the accept it was blocking has to be refused rather than done by
+/// halves.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn diagnostics_completion_resolve(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    token: u32,
+    index: u32,
+) -> Result<cide_ipc::CompletionResolveAnswer, ()> {
+    let Some(diagnostics) = registry.get(project) else {
+        return Ok(cide_ipc::CompletionResolveAnswer::Unavailable {
+            reason: "No language server is running for this project.".to_string(),
+        });
+    };
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        diagnostics.resolve_completion(token, index, RESOLVE_TIMEOUT)
+    })
+    .await
+    .unwrap_or(cide_ipc::CompletionResolveAnswer::Unavailable {
+        reason: "The lookup did not finish.".to_string(),
+    }))
+}
+
+/// Withdraw the outstanding completion. The popup closing, and the editor losing its buffer.
+///
+/// **Not** `spawn_blocking`, for [`diagnostics_usages_cancel`]'s reason. The volume argument is
+/// the extra one: this is called whenever a popup closes, which under normal typing is many times
+/// a minute, and a blocking-pool hop per close would be a thread handoff to take a mutex.
+///
+/// A no-op when nothing is outstanding, which is most calls.
+#[tauri::command(rename_all = "camelCase")]
+pub fn diagnostics_completion_cancel(registry: State<'_, DiagnosticsRegistry>, project: ProjectId) {
+    if let Some(diagnostics) = registry.get(project) {
+        diagnostics.cancel_completion();
+    }
+}
+
 /// Every place the symbol at this position is *implemented*. (M18)
 ///
 /// The Go half of the M18 report: `textDocument/definition` on a call through an interface

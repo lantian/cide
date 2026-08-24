@@ -328,6 +328,46 @@ pub fn defaults() -> Vec<Binding> {
              */
             ("alt+f7", "navigate.usages", "editorFocused"),
             /*
+             * Next / previous change, in a diff or the conflict resolver. (M25)
+             *
+             * IDEA's own chords for Next/Previous Difference, and the cost checked in each layer
+             * the way this table asks rather than assumed.
+             *
+             * * **In `defaults()`**: the only F-keys here are `f4` (`sidebar.toggle`) and
+             *   `ctrl+f12` (`structure.file`), and `alt+f7` directly above. Bare `f7` and
+             *   `shift+f7` are free, and neither displaces the other — a modifier is part of
+             *   the stroke, so ⌥F7 goes on meaning Find usages in an editor.
+             * * **In CodeMirror**: nothing installed here binds an F-key above F3, and the
+             *   resolver's three panes are CodeMirror. Free.
+             * * **In a terminal**: F7 is `ESC [ 18 ~`, a key `mc` puts a menu on. **This is why
+             *   the clause is not optional**, and it is the same sentence ⌥F7's note above
+             *   makes. The gate is a window *capture* listener, so `diffFocused` on its own
+             *   would swallow F7 in a shell pane split beside a diff tab that happens to be in
+             *   front. A diff pane and a merge pane are both `kind == "editor"`, so
+             *   `terminalFocused` is false in exactly the states this needs and true in exactly
+             *   the states a terminal needs it back — `!terminalFocused` therefore costs the
+             *   feature nothing at all.
+             * * **On macOS**: `platform_layer` only rewrites chords containing Ctrl, so bare
+             *   F-keys pass through untouched, and F7 is not in `MACOS_MENU_CHORDS`. It is
+             *   previous-track on the system keyboard, so it needs Fn — the same tax F4 already
+             *   pays, and recorded in README's Platforms rather than worked around.
+             *
+             * The first compound clause in this table. To give F7 back:
+             * `{"key":"f7","command":"-navigate.nextChange","when":"diffFocused && !terminalFocused"}`
+             * — with the clause, because a removal matches on all three and one that forgets it
+             * matches nothing.
+             */
+            (
+                "f7",
+                "navigate.nextChange",
+                "diffFocused && !terminalFocused",
+            ),
+            (
+                "shift+f7",
+                "navigate.prevChange",
+                "diffFocused && !terminalFocused",
+            ),
+            /*
              * Go to implementation — IDEA's own chord, unchanged. (M18)
              *
              * # What it costs, checked in every layer rather than assumed
@@ -1540,6 +1580,48 @@ mod tests {
         }
     }
 
+    /// **Tab and Ctrl+Space are not bound here, and for the fourth version of the argument.** (M25)
+    ///
+    /// Both belong to the completion popup (`ui/src/editor/completion.ts`), and both are claimed
+    /// there as ordinary CodeMirror bindings rather than as commands — exactly as `Mod-f`, `F3`
+    /// and `Escape` are, and for the reason [`nothing_binds_the_find_bars_f_keys`] gives: the key
+    /// gate's second entry point is a window **capture** listener, so a binding in this table is
+    /// resolved *before* the event reaches the DOM and CodeMirror is never offered the stroke.
+    ///
+    /// What each one would cost, because they are not the same loss:
+    ///
+    /// * **Tab.** The stroke does three things depending on context — accept a completion, move
+    ///   to the next snippet field, indent — and only the surface with the caret in it knows
+    ///   which. A keymap entry here would take all three, in every editor, permanently. It would
+    ///   also take Tab from every text input in the window, since a `when` clause cannot help:
+    ///   `editorFocused` is derived from the focused *pane*, not from the caret, and stays true
+    ///   while somebody types in a rename field or the commit box.
+    /// * **Ctrl+Space.** It is a terminal's `NUL` (`^@`, set-mark in readline and Emacs), so
+    ///   binding it here would swallow it in every shell pane in the application to give the
+    ///   editor a chord it already has.
+    ///
+    /// A user who wants either as a command can still write one line of `keymap.json`. What must
+    /// not happen is cide shipping that line.
+    #[test]
+    fn nothing_binds_the_editors_completion_chords() {
+        for binding in defaults().into_iter().chain(platform_defaults()) {
+            let key = normalize_key(&binding.key);
+            assert!(
+                key != "tab" && key != "shift+tab",
+                "{key} is bound to {} — Tab accepts a completion and walks snippet fields inside \
+                 the editor, and the window capture gate would take it from the buffer and from \
+                 every text input in the window at once",
+                binding.command
+            );
+            assert!(
+                key != "ctrl+space",
+                "{key} is bound to {} — Ctrl+Space opens the completion popup inside the editor, \
+                 and binding it here would also swallow a terminal's NUL in every shell pane",
+                binding.command
+            );
+        }
+    }
+
     /// **Ctrl+F is not bound here either, and for the third version of the same argument.**
     ///
     /// It means two different things in two different panes, and the keymap can express neither
@@ -2293,8 +2375,11 @@ mod tests {
                     && r.when.as_deref() == Some("editorFocused")),
             "unscoped, this takes ⌥F7 from every terminal in the app"
         );
-        // Nothing else in the table wants an F-key with Alt, so nothing is being displaced.
-        assert_eq!(command_for(&shipped, "f7"), Vec::<String>::new());
+        // Nothing else in the table wants an F-key with **Alt**, so nothing is being displaced.
+        // Bare F7 is the changes iterator since M25 (`navigate.nextChange`) and that is not a
+        // displacement: a modifier is part of the stroke, so the two resolve independently and
+        // ⌥F7 goes on meaning Find usages wherever there is a caret.
+        assert_eq!(command_for(&shipped, "f7"), ["navigate.nextChange"]);
 
         let scoped = resolve(&[Binding::new("alt+f7", "-navigate.usages").when("editorFocused")]);
         assert!(

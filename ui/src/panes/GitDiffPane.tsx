@@ -109,12 +109,23 @@ import {
   columnRows,
   hunkSegments,
   presentSegments,
+  changeAnchors,
+  changePositions,
   splitLines,
   wholeFileSegments,
   type ColumnRow,
   type DisplaySegment,
 } from './diffRows'
+import { connectorShapes } from './diffConnector'
 import { insertMarkers, mapScroll, rowSpans, type SyncGeometry } from './diffSync'
+import { lineTokens, type DiffTokens } from './diffTokens'
+import {
+  NO_CURSOR,
+  claimChangeNav,
+  stepIndex,
+  type ChangeNav,
+  type ChangeNavSlot,
+} from './changeNav'
 import { diffTabOnScreen } from './diffTabs'
 import { Icon } from '@/icons/Icon'
 
@@ -188,6 +199,15 @@ function rowClass(origin: LineOrigin): string {
  * appears not to work is worse than one that says why.
  */
 export const DIFF_SPLIT_MIN_PX = 860
+
+/**
+ * Breathing room above a change the iterator scrolled to, in pixels.
+ *
+ * Only reached for a run taller than the viewport, where the run is top-aligned instead of
+ * centred. A few rows of the preceding context is what makes it read as a position in a file
+ * rather than as a jump cut.
+ */
+const SCROLL_PAD = 24
 
 /**
  * What one drawn line carries beside its text: the wire position, or none.
@@ -333,6 +353,42 @@ interface GitDiffViewCommon {
    * from a prop the caller set.
    */
   onBlame?: ((on: boolean) => void) | undefined
+  /**
+   * Both sides tokenized, or `null` for a diff drawn in one colour.
+   *
+   * Deliberately **not** the three-state shape `blame` has. That prop tells "off" apart from
+   * "asked for, no answer yet" because a toggle has to draw the middle state; colour has no
+   * toggle, and both of its absent states spell the same markup, so one nullable optional
+   * carries it. Optional so every existing call site and `panes/gitDiffSmoke.tsx` compile
+   * unchanged — the rule `view` and `expandedGaps` already follow.
+   *
+   * Plain data, never a grammar: the tokenizer reaches `@codemirror/language`, and this
+   * component is SSR-bundled and run under node by `check-diff-render.mjs`. The wiring below
+   * does that work behind a dynamic `import()` and hands the answer down as arrays of strings.
+   */
+  tokens?: DiffTokens | null | undefined
+  /**
+   * Whether this diff is the one in front.
+   *
+   * Only the changes iterator reads it: `TabContent` never unmounts an inactive tab, so several
+   * diff tabs hold live claims at once and the slot has to know which of them the user is
+   * looking at. Defaults to `true` — the log tool window mounts only its active history tab, and
+   * the SSR fixture has no tabs at all.
+   */
+  visible?: boolean | undefined
+  /**
+   * Which change is current, as an index into the changed runs, or `-1` for none yet.
+   *
+   * State in the *wiring* rather than here, which is the shape `MergePaneView` already uses, and
+   * for two reasons. The fixture can drive it — with `useState` in here the SSR render would
+   * always be `-1` and `check:diff-render` could prove nothing about the marker at all. And
+   * staleness gets an owner: `GitDiff` keys on `${repo} ${path}` and does not remount on a
+   * refetch, so a diff that shrank under an open pane has to reset this where the marks and the
+   * opened gaps are already reset.
+   */
+  currentChange?: number | undefined
+  /** Absent ⇒ the stepper is drawn disabled, with the reason in its title. */
+  onCurrentChange?: ((index: number) => void) | undefined
   onCollapse: (hunk: number) => void
   /**
    * Gaps the user has opened in a folded whole-file view. Optional, like `view`, so every
@@ -454,6 +510,11 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    */
   const blameOn = props.blame !== undefined
   const blame = props.blame ?? null
+  // Beside `blame` rather than in the destructure above, because the two are the same kind of
+  // thing: an optional the view draws when it is there and ignores when it is not.
+  const tokens = props.tokens ?? null
+  const onCurrentChange = props.onCurrentChange
+  const visible = props.visible ?? true
   const painted =
     staging === null || staging.diff === null
       ? new Set<string>()
@@ -551,12 +612,52 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    * only where there is a staging affordance to hold; a read-only whole file has its line
    * numbers for landmarks and a bar would say nothing they do not.
    */
-  const split = useMemo(() => {
-    if (layout !== 'split' || diff === null || diff.hunks.length === 0) return null
+  /*
+   * Built whatever the layout, because the **changes iterator** reads the run table too and a
+   * unified diff has changes to walk exactly as a split one does. (M25)
+   *
+   * Hoisting it out of the `layout === 'split'` test is safe, and the reason is worth stating
+   * rather than assumed: `bar` rows are `shared` runs, so drawing them or not cannot change
+   * *which* runs are changes — only their row indices, and the unified rendering never uses a
+   * row index (it addresses rows by `hunk:at`). The `collapsed` set does change the answer, and
+   * it changes it **correctly**: `columnRows` folds a collapsed hunk's lines away and the
+   * unified fallback renders `{!shut && …}`, so the anchors are exactly the changes currently in
+   * the DOM. That is what makes "Next change never scrolls to something invisible" true by
+   * construction rather than by a filter somebody has to remember to apply.
+   */
+  const model = useMemo(() => {
+    if (diff === null || diff.hunks.length === 0) return null
     return segments === null
       ? columnRows(hunkSegments(diff.hunks), { bars: true, collapsed })
       : columnRows(segments, { bars: selectable })
-  }, [layout, diff, segments, collapsed, selectable])
+  }, [diff, segments, collapsed, selectable])
+  /** The same table, when it is what the split layout is drawing from. Rendering is unchanged. */
+  const split = layout === 'split' ? model : null
+
+  /*
+   * The changes to walk, and which one is current. (M25)
+   *
+   * `changeAnchors` is a fourth consumer of the run table above, which is the property
+   * `columnRows`' comment claims for the existing three: the two columns and `diffSync` cannot
+   * disagree about where a run begins, and now neither can the iterator.
+   */
+  const anchors = useMemo(() => (model === null ? [] : changeAnchors(model)), [model])
+  // Clamped on read rather than written back during render: the wiring owns the number, and a
+  // diff that shrank under an open pane must not make this component set state while rendering.
+  const currentChange =
+    props.currentChange === undefined ? -1 : Math.min(props.currentChange, anchors.length - 1)
+  const currentAnchor = currentChange < 0 ? null : (anchors[currentChange] ?? null)
+  /*
+   * Every row of the current change, as `hunk:at` keys.
+   *
+   * Through `mark()` — the same function `painted` uses — so the two spellings of "which rows
+   * does this position set contain" cannot drift. Every row of the run and not merely its first:
+   * an eight-line paired edit is one change and has to read as one block.
+   */
+  const currentKeys = useMemo(() => {
+    if (model === null || currentAnchor === null) return new Set<string>()
+    return new Set(changePositions(model, currentAnchor).map((p) => mark(p.hunk, p.at)))
+  }, [model, currentAnchor])
 
   /*
    * Keeping the two columns in step.
@@ -582,6 +683,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    * `diffSync.mapScroll` over anchors measured once per render and after a *settled* resize
    * (`check:resize`'s rule), never per scroll frame.
    */
+  const [connector, setConnector] = useState<SVGSVGElement | null>(null)
   const [leftCol, setLeftCol] = useState<HTMLElement | null>(null)
   const [rightCol, setRightCol] = useState<HTMLElement | null>(null)
   const echoes = useRef<Set<'left' | 'right'>>(new Set())
@@ -668,6 +770,240 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
       echoSet.clear()
     }
   }, [leftCol, rightCol, split, blame])
+
+  /*
+   * Drawing the connector's ribbons. (M25)
+   *
+   * A second effect rather than a branch inside the sync above, and the split is by *what
+   * triggers it*: the sync reacts to a scroll by writing the other column, which is a one-shot
+   * correction, while this has to redraw on every frame of every scroll of either column and on
+   * every relayout. Folding them together would mean the sync's echo guard — whose whole job is
+   * to make the *second* of a pair of events do nothing — swallowing half the redraws.
+   *
+   * It measures with the same rule `rowTops` uses (skip the zero-height insertion markers, and
+   * carry one extra entry for the content height) because it is indexing the same `ColumnRow`
+   * arrays. That rule is stated twice in this file and both statements name each other; a third
+   * copy would be the one that drifts.
+   */
+  useEffect(() => {
+    if (connector === null || leftCol === null || rightCol === null || split === null) return
+    const runs = split.runs
+    let raf = 0
+    let last = ''
+
+    const topsOf = (column: HTMLElement): number[] | null => {
+      const content = column.firstElementChild
+      if (!(content instanceof HTMLElement)) return null
+      const tops: number[] = []
+      for (const child of Array.from(content.children)) {
+        if (!(child instanceof HTMLElement)) continue
+        if (child.dataset['audit'] === 'gitDiffInsertMark') continue
+        tops.push(child.offsetTop)
+      }
+      tops.push(content.offsetHeight)
+      return tops
+    }
+
+    const paint = (): void => {
+      raf = 0
+      const leftTops = topsOf(leftCol)
+      const rightTops = topsOf(rightCol)
+      if (leftTops === null || rightTops === null) return
+      const width = connector.clientWidth
+      const height = connector.clientHeight
+      const shapes = connectorShapes(
+        runs,
+        leftTops,
+        rightTops,
+        leftCol.scrollTop,
+        rightCol.scrollTop,
+        width,
+        height,
+      )
+      /*
+       * Rebuilt as one markup string and compared with the last one before touching the DOM.
+       *
+       * This runs on a scroll frame. A diff of a few hundred changes would otherwise be a few
+       * hundred `setAttribute` calls sixty times a second while somebody drags a scrollbar, and
+       * the great majority of those frames move no shape at all — the columns scroll in step, so
+       * a ribbon only moves relative to the gutter when the two sides disagree about how far.
+       * That is also why `connectorShapes` rounds its coordinates.
+       */
+      const markup = shapes
+        .map((shape) => `<path d="${shape.d}" class="${styles.ribbon ?? ''}" data-tone="${shape.kind}"/>`)
+        .join('')
+      if (markup === last) return
+      last = markup
+      connector.innerHTML = markup
+    }
+
+    const schedule = (): void => {
+      if (raf === 0) raf = requestAnimationFrame(paint)
+    }
+
+    paint()
+    leftCol.addEventListener('scroll', schedule, { passive: true })
+    rightCol.addEventListener('scroll', schedule, { passive: true })
+    // The columns' content, not the columns: a fold opening changes the content's height without
+    // the scroller's box moving at all, and that is precisely when every ribbon below it moves.
+    const observer =
+      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => schedule())
+    for (const column of [leftCol, rightCol, connector]) {
+      const target = column === connector ? connector : column.firstElementChild
+      if (observer !== null && target !== null) observer.observe(target)
+    }
+    return () => {
+      if (raf !== 0) cancelAnimationFrame(raf)
+      leftCol.removeEventListener('scroll', schedule)
+      rightCol.removeEventListener('scroll', schedule)
+      observer?.disconnect()
+      connector.innerHTML = ''
+    }
+  }, [connector, leftCol, rightCol, split, blame])
+
+  /*
+   * Scrolling the current change into view. (M25)
+   *
+   * # One scroller is written, never two
+   *
+   * `follow` above treats a programmatic `scrollTop` write exactly as it treats a person's: it
+   * finds no mark in `echoes`, maps through `mapScroll`, and moves the *other* column itself.
+   * That is what we want, and it is why nothing here touches the echo set or `diffSync` at all.
+   *
+   * Writing **both** columns would be the bug. Two writes are two scroll events, each of which
+   * moves the other column, and the second write is then overwritten by the first one's
+   * follow-up — so the reader lands somewhere neither call asked for. The other column is
+   * *derived*, through the only code that knows both geometries.
+   *
+   * # Found by attribute, never by index
+   *
+   * The columns interleave zero-height `.insertMark` divs between rows — which is why `rowTops`
+   * skips them — so a child index is not a row index, and reproducing that skip in a second
+   * place is how the two come to disagree. `data-at` is the one identity all three renderings
+   * share (split columns, whole-file unified, hunks-only fallback), and `ColumnRow`'s contract
+   * guarantees every position occurs exactly once across both columns, so the query is
+   * unambiguous within the pane.
+   *
+   * # `scrollTop`, never `scrollIntoView`
+   *
+   * `scrollIntoView` walks *ancestor* scrollers as well, which in this app can move the tab
+   * content and the window under a reader who asked for the next change in one pane.
+   */
+  useEffect(() => {
+    if (root === null || currentAnchor === null) return
+    const first = root.querySelector<HTMLElement>(
+      `[data-at="${currentAnchor.first.hunk}:${currentAnchor.first.at}"]`,
+    )
+    if (first === null) return
+    const scroller = first.closest<HTMLElement>('[data-audit="gitDiffScroller"]')
+    if (scroller === null) return
+    const last =
+      root.querySelector<HTMLElement>(
+        `[data-at="${currentAnchor.last.hunk}:${currentAnchor.last.at}"]`,
+      ) ?? first
+    /*
+     * Rects rather than `offsetTop`, unlike the sync's `rowTops` above.
+     *
+     * That one can use `offsetTop` because `.column` is `position: relative` and is therefore the
+     * offset parent of its own rows — a fact `check:diff-render` pins in the stylesheet. The
+     * unified `.body` carries no such rule, so a row's `offsetTop` there is measured against
+     * whatever happens to be positioned further up the tree. Rects are relative to the viewport
+     * and need no such assumption, and this runs once per keypress rather than per frame.
+     */
+    const box = scroller.getBoundingClientRect()
+    const firstRect = first.getBoundingClientRect()
+    const lastRect = last.getBoundingClientRect()
+    const top = firstRect.top - box.top + scroller.scrollTop
+    const height = Math.max(lastRect.bottom - firstRect.top, firstRect.height)
+    const view = scroller.clientHeight
+    // Centred, matching MergePane's `y: 'center'` so the two surfaces feel the same — except for
+    // a run taller than the viewport, which is the case centring gets wrong: it would put the
+    // start of a 200-line block off the top of the screen.
+    const want = height >= view - SCROLL_PAD * 2 ? top - SCROLL_PAD : top - (view - height) / 2
+    scroller.scrollTop = Math.max(0, Math.min(want, scroller.scrollHeight - view))
+    // `model` and `blame` are in the list because both change every row's geometry; the effect
+    // and not the click handler, so `data-current` is committed and the scroll lands together.
+  }, [root, currentAnchor, layout, model, blame])
+
+  /*
+   * Announcing this diff to `navigate.nextChange` / `navigate.prevChange`. (M25)
+   *
+   * The `ChangeNav` handed over must keep one identity for the life of the claim — it is what
+   * `release` removes — so the live answers ride a ref that is written during render. That is
+   * this file's existing idiom; see `marksRef` below.
+   */
+  const visibleRef = useRef(visible)
+  visibleRef.current = visible
+  const navImpl = useRef<ChangeNav>({ step: () => false, cursor: () => NO_CURSOR })
+  const navStable = useRef<ChangeNav>({
+    step: (delta) => navImpl.current.step(delta),
+    cursor: () => navImpl.current.cursor(),
+  })
+  navImpl.current = {
+    step: (delta) => {
+      const next = stepIndex(anchors.length, currentChange, delta)
+      if (next === null || onCurrentChange === undefined) return false
+      onCurrentChange(next)
+      return true
+    },
+    cursor: () => ({ index: currentChange, count: anchors.length }),
+  }
+  const navRef = useRef<ChangeNavSlot | null>(null)
+  useEffect(() => {
+    const slot = claimChangeNav(navStable.current, visibleRef.current)
+    navRef.current = slot
+    return () => {
+      slot.release()
+      navRef.current = null
+    }
+    // Once per mount. `visible` moves the claim through the effect below rather than by
+    // retaking it, so that a tab switch does not drop and re-add a slot the dispatcher may be
+    // reading between the two.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  useEffect(() => {
+    if (visible) navRef.current?.focus()
+  }, [visible])
+
+  /*
+   * Next / previous change. (M25)
+   *
+   * The same gesture `navigate.nextChange` fires, and the same clamp: disabled at the ends
+   * rather than wrapping, so the control states where the walk stops instead of leaving the
+   * reader to discover it by being teleported. `MergePane`'s block stepper is the same pair of
+   * chevrons for the same reason.
+   *
+   * Drawn even when there is nothing to walk — a control that appears and disappears as diffs
+   * are opened reads as a bug rather than as a refusal — with the reason in the title.
+   */
+  const stepChange = (delta: 1 | -1): void => {
+    const next = stepIndex(anchors.length, currentChange, delta)
+    if (next !== null) onCurrentChange?.(next)
+  }
+  const changeStepper = (
+    <div className={styles.sides} role="group" aria-label="Changes">
+      {([-1, 1] as const).map((delta) => (
+        <button
+          key={delta}
+          type="button"
+          className={styles.side}
+          data-audit="gitDiffStep"
+          data-delta={delta === 1 ? 'next' : 'prev'}
+          disabled={onCurrentChange === undefined || stepIndex(anchors.length, currentChange, delta) === null}
+          title={
+            anchors.length === 0
+              ? 'This diff has no changes to step through.'
+              : delta === 1
+                ? `Next change (${Math.max(currentChange + 1, 0)} of ${anchors.length})`
+                : `Previous change (${Math.max(currentChange + 1, 0)} of ${anchors.length})`
+          }
+          onClick={() => stepChange(delta)}
+        >
+          <Icon name={delta === 1 ? 'chevron-down' : 'chevron-up'} size={0} />
+        </button>
+      ))}
+    </div>
+  )
 
   const layoutSwitcher = (
     <div className={styles.sides} role="group" aria-label="Diff layout">
@@ -767,6 +1103,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
       {/* One right-aligned group, so a long path clips against both switchers rather than
           having the free space split between two `margin-left: auto` siblings. */}
       <div className={styles.controls}>
+        {changeStepper}
         {layoutSwitcher}
         {blameSwitcher}
         {revisions !== null ? (
@@ -811,7 +1148,15 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
 
   if (diff === null) {
     return (
-      <div className={styles.pane} data-audit="gitDiffPane" ref={setRoot}>
+      <div className={styles.pane}
+        data-audit="gitDiffPane"
+        ref={setRoot}
+        // Settles the one tie `visible` cannot: a git diff tab in front and the log
+        // tool window open on a revision diff are both mounted and both claim, and
+        // without this the slot would keep whichever mounted last however long the
+        // reader worked in the other. A pointer press is the cheapest true answer to
+        // "which of them am I in".
+        onPointerDown={() => navRef.current?.focus()}>
         {header}
         <div className={styles.notice}>
           {reason === null ? (
@@ -874,6 +1219,14 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
      * the rendered rows, whatever their widths.
      */
     const annotated = blame !== null && which !== 'old' ? blameFor(blame, line) : null
+    /*
+     * The runs to draw this line with, or `null` for "draw it plain".
+     *
+     * `lineTokens` compares the row's content against the line its tokens spell and refuses on
+     * any difference — see `diffTokens.ts` for why that guard is the whole point of the module.
+     * A miss here costs this row its colour and nothing else.
+     */
+    const coloured = lineTokens(tokens, line)
     return (
       <div
         key={key}
@@ -884,6 +1237,10 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
               'data-audit': 'gitDiffRow',
               'data-at': `${hunkIndex}:${at}`,
               'data-selected': on ? 'true' : 'false',
+              // **Appended last, and it has to stay last.** `gitDiffSmoke.tsx`'s row regex
+              // matches these three attributes in order; inserting anywhere above would leave
+              // it matching nothing and every positional digest silently empty.
+              'data-current': currentKeys.has(mark(hunkIndex, at)) ? 'true' : 'false',
             })}
       >
         {selectable && (
@@ -949,16 +1306,51 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
             <span className={styles.lineno}>{line.oldLineno ?? ''}</span>
             <span className={styles.lineno}>{line.newLineno ?? ''}</span>
           </>
-        ) : (
+        ) : which === 'new' ? (
           <span className={styles.lineno}>{numbered ?? ''}</span>
-        )}
+        ) : null}
         <span className={styles.sign}>
           {line.origin === 'addition' ? '+' : line.origin === 'deletion' ? '-' : ' '}
         </span>
         <span className={styles.text}>
-          {line.content}
+          {/*
+            * Token spans, or the bare string exactly as this pane drew it before M25.
+            *
+            * Three things this deliberately does not disturb, each a silent bug if it did.
+            * **Grid placement**: `.row`/`.half` are grids and a grid lays out only its *direct*
+            * children, so these spans — inside `.text`, the last track — leave the four
+            * `data-boxed`/`data-blamed` column lists alone. **The scroll anchors**: the spans are
+            * inline inside a `pre-wrap` box, so they change no box and no line breaking, and the
+            * sync's measured row tops are unmoved. **Selection and copy-out**: the `::selection`
+            * rules are descendant selectors, and adjacent inline spans introduce no whitespace,
+            * so a dragged selection still copies the characters that are on screen.
+            *
+            * A run with no role gets a `Fragment` and no element at all, so it keeps the pane's
+            * own `var(--text)`. Not `--tk-fg`: this is chrome that contains code — its line
+            * numbers, sign column and blame cell are all in the chrome family — and letting an
+            * imported scheme's ink fight them is a worse answer than leaving the body text be.
+            */}
+          {coloured === null
+            ? line.content
+            : coloured.map((token, index) =>
+                token.cls === null ? (
+                  <Fragment key={index}>{token.text}</Fragment>
+                ) : (
+                  <span key={index} className={token.cls}>
+                    {token.text}
+                  </span>
+                ),
+              )}
           {line.noNewline && <span className={styles.noNewline}> ⏎ no newline at end of file</span>}
         </span>
+        {/*
+          * The left column numbers on its **right** edge, IDEA's arrangement, so the two
+          * columns' numbers meet either side of the connector instead of sitting at the two
+          * outer margins of the pane with the code between them. A grid places by order, so
+          * this is a real reordering of the children and `.column[data-side='old'] .half`
+          * carries the matching track list.
+          */}
+        {which === 'old' && <span className={styles.lineno}>{numbered ?? ''}</span>}
       </div>
     )
   }
@@ -1101,6 +1493,9 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
       <div
         className={styles.column}
         data-side={side}
+        // What the changes iterator writes `scrollTop` on. Marked rather than found by class,
+        // because the unified body is a different element with the same job.
+        data-audit="gitDiffScroller"
         data-boxed={selectable ? 'true' : 'false'}
         data-blamed={side === 'new' && blame !== null ? 'true' : 'false'}
         ref={side === 'old' ? setLeftCol : setRightCol}
@@ -1111,7 +1506,15 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
   }
 
   return (
-    <div className={styles.pane} data-audit="gitDiffPane" ref={setRoot}>
+    <div className={styles.pane}
+        data-audit="gitDiffPane"
+        ref={setRoot}
+        // Settles the one tie `visible` cannot: a git diff tab in front and the log
+        // tool window open on a revision diff are both mounted and both claim, and
+        // without this the slot would keep whichever mounted last however long the
+        // reader worked in the other. A pointer press is the cheapest true answer to
+        // "which of them am I in".
+        onPointerDown={() => navRef.current?.focus()}>
       {header}
 
       {note !== null && (
@@ -1149,10 +1552,21 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
          */
         <div className={styles.splitBody} data-audit="gitDiffSplit">
           {column('old', split.left)}
+          {/*
+            * The gutter between the columns, and the ribbons in it. (M25)
+            *
+            * A third grid track rather than an overlay, so it takes its own width out of the
+            * layout once instead of covering two columns that then have to reserve space for
+            * it. The paths are drawn by the effect above, which is also the only thing that
+            * knows where either column is scrolled to.
+            */}
+          <div className={styles.connector} data-audit="gitDiffConnector" aria-hidden="true">
+            <svg ref={setConnector} className={styles.connectorSvg} preserveAspectRatio="none" />
+          </div>
           {column('new', split.right)}
         </div>
       ) : (
-        <div className={styles.body}>
+        <div className={styles.body} data-audit="gitDiffScroller">
           {diff.hunks.length === 0 && (
             <p className={styles.notice}>No text changes on this side.</p>
           )}
@@ -1337,6 +1751,7 @@ export function GitDiffPane({ project, spec, visible }: GitDiffPaneProps): React
         path={path}
         next={next}
         prev={prev}
+        {...(visible === undefined ? {} : { visible })}
       />
     )
   }
@@ -1358,6 +1773,65 @@ export function GitDiffPane({ project, spec, visible }: GitDiffPaneProps): React
       visible={visible}
     />
   )
+}
+
+/**
+ * Both sides of a diff, tokenized, once per (path, texts).
+ *
+ * Takes a [`DrawnDiff`] so the working-tree pane and the revision pane share one implementation,
+ * which is the whole reason that interface exists.
+ *
+ * # Why the tokenizer arrives through `import()`
+ *
+ * `panes/diffHighlight.ts` reaches `editor/languages.ts` and `editor/markdown/fenceTokens.ts`,
+ * and through them `@codemirror/language` and `@lezer/highlight`. `check-diff-render.mjs`
+ * SSR-bundles `GitDiffView` and runs it under node to prove that what this pane highlights is
+ * what it stages, and `editor/diffViewMode.ts` records at length why that bundle is kept free of
+ * the editor's dependencies. Those packages do import cleanly under node today — `check:markdown`
+ * already runs `fenceTokens.ts` there — so this is not a fix for a crash; it is the difference
+ * between a property that holds and one that is *asserted* to hold, and the check now greps the
+ * emitted bundle rather than trusting this comment. It also keeps the grammar chunks out of the
+ * download until somebody opens a diff.
+ *
+ * # Why the previous answer is not cleared first
+ *
+ * A refetch — an agent writing the file, a `nonce` bump from an unrelated path — replaces `diff`
+ * several times a second. Clearing to `null` on each one would blink the whole diff to plain.
+ * Keeping the old tokens is safe because `lineTokens` checks every row's content against the line
+ * its tokens spell: a row the previous text no longer describes draws plain, and one it still
+ * describes draws runs that are, by construction, that exact string's.
+ */
+function useDiffTokens(diff: DrawnDiff | null): DiffTokens | null {
+  const [tokens, setTokens] = useState<DiffTokens | null>(null)
+  const path = diff?.path ?? null
+  const oldPath = diff?.oldPath ?? null
+  const oldText = diff?.oldText ?? null
+  const newText = diff?.newText ?? null
+
+  useEffect(() => {
+    if (path === null || (oldText === null && newText === null)) return
+    let disposed = false
+    void import('./diffHighlight')
+      .then((mod) => mod.diffTokens(path, oldPath, oldText, newText))
+      .then((built) => {
+        if (!disposed) setTokens(built)
+      })
+      .catch((e: unknown) => {
+        // Colour is the one thing in this pane nothing else depends on, so a chunk that will not
+        // load costs the colour and nothing else — the same trade `loadGrammar` makes for a
+        // grammar. Logged rather than swallowed, because "the diff is never coloured" is
+        // otherwise an absence with no symptom to search for.
+        void diag.log(`git diff pane: highlighting ${path} failed: ${String(e)}`)
+      })
+    return () => {
+      disposed = true
+    }
+    // The texts, not the `diff` object: `Object.is` on a string is a value comparison, so a
+    // refetch that returned the same bytes re-tokenizes nothing. `oldPath` is in the key because
+    // a rename can change the extension, and the old side is then a different language.
+  }, [path, oldPath, oldText, newText])
+
+  return tokens
 }
 
 interface GitDiffProps {
@@ -1394,6 +1868,8 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => new Set<number>())
   /** Gaps opened in a folded whole-file view. Cleared with the marks: same staleness rule. */
   const [expandedGaps, setExpandedGaps] = useState<ReadonlySet<number>>(() => new Set<number>())
+  /** Which change the iterator is on, or `-1` for none yet. See `GitDiffViewCommon`. */
+  const [currentChange, setCurrentChange] = useState(-1)
   const [note, setNote] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   /** Bumped to re-run the fetch; a git mutation anywhere invalidates this view. */
@@ -1513,6 +1989,7 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
     () => (blameFile === null ? null : blameLookup(blameFile, Math.floor(Date.now() / 1000))),
     [blameFile],
   )
+  const tokens = useDiffTokens(diff)
 
   useEffect(() => {
     let disposed = false
@@ -1540,6 +2017,10 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
           // The gap indices are positions in the previous reconstruction; a moved file has
           // different gaps, and index 3 of the new set is not what the user opened.
           setExpandedGaps(new Set<number>())
+          // And the walk, for the same reason: change 3 of the new diff is not the edit the
+          // reader was looking at. Back to "nothing current", not to the first change — a
+          // scroll nobody asked for is worse than a stepper that starts again.
+          setCurrentChange(-1)
         }
         revRef.current = fresh.rev
         // The collapse-by-default guard is the *fallback's*; the whole-file view bounds its
@@ -1786,6 +2267,10 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
       // Absent when off, `null` while the answer is in flight or refused. Spelling "off" as an
       // absent prop rather than as `blame={null}` is what lets the view tell the two apart with
       // no third prop — see `GitDiffViewCommon.blame`.
+      tokens={tokens}
+      currentChange={currentChange}
+      onCurrentChange={setCurrentChange}
+      visible={visible}
       {...(blameOn ? { blame } : {})}
       // Withheld on the staged side, which is the same rule the view's disabled title states.
       {...(blameRefused === null ? { onBlame: setBlameOn } : {})}
@@ -1836,6 +2321,14 @@ export interface RevisionDiffPaneProps {
   path: string
   next: RevSide
   prev: RevSide
+  /**
+   * Whether this diff is the one in front, for the changes iterator's slot.
+   *
+   * Defaults to `true`, which is right for the git tool window: `ToolWindowHost` mounts only the
+   * active history tab, so a mounted one is by definition the one being looked at. The tab route
+   * through `GitDiffPane` passes the host's own answer.
+   */
+  visible?: boolean
 }
 
 /**
@@ -1872,6 +2365,7 @@ export function RevisionDiffPane({
   path,
   next,
   prev,
+  visible = true,
 }: RevisionDiffPaneProps): ReactNode {
   // The shared unified/split preference. See the `view` prop below for why this pane needs it.
   const diffView = useSyncExternalStore(subscribeDiffView, getDiffView, getServerDiffView)
@@ -1880,6 +2374,8 @@ export function RevisionDiffPane({
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => new Set<number>())
   /** Gaps opened in a folded whole-file view. Reset by each fetch — the indices are its. */
   const [expandedGaps, setExpandedGaps] = useState<ReadonlySet<number>>(() => new Set<number>())
+  /** Which change the iterator is on, or `-1` for none yet. See `GitDiffViewCommon`. */
+  const [currentChange, setCurrentChange] = useState(-1)
   /** Bumped to re-run the fetch. Only a moving side can bump it — see the module note above. */
   const [nonce, setNonce] = useState(0)
   /** One line under the header. On this arm it only ever carries a blame refusal. */
@@ -1903,6 +2399,8 @@ export function RevisionDiffPane({
         setDiff(fresh)
         setReason(null)
         setExpandedGaps(new Set<number>())
+        // The walk too: change 3 of the new diff is not the edit the reader was on.
+        setCurrentChange(-1)
         // Fallback only, as in `GitDiff`: the whole-file view folds gaps instead.
         if (wholeFileSegments(fresh.hunks, fresh.newText) === null) {
           const rows = fresh.hunks.reduce((n, hunk) => n + hunk.lines.length, 0)
@@ -2033,6 +2531,7 @@ export function RevisionDiffPane({
     () => (blameFile === null ? null : blameLookup(blameFile, Math.floor(Date.now() / 1000))),
     [blameFile],
   )
+  const tokens = useDiffTokens(diff)
 
   return (
     <GitDiffView
@@ -2065,6 +2564,10 @@ export function RevisionDiffPane({
        */
       view={diffView.view}
       {...(diffView.writable ? { onView: setDiffView } : {})}
+      tokens={tokens}
+      currentChange={currentChange}
+      onCurrentChange={setCurrentChange}
+      visible={visible}
       {...(blameOn ? { blame } : {})}
       /*
        * Offered until the answer proves there is nothing to offer. A diff whose new side is a

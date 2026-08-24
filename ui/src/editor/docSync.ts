@@ -103,17 +103,58 @@ function fire(call: Promise<void>): void {
 
 /** Send whatever is pending for `path` now, and cancel the timer. */
 function flush(path: string): void {
+  void send(path, null)
+}
+
+/**
+ * Send `text` — or whatever is pending — immediately, and say when the server has been told.
+ *
+ * The returned promise is the whole reason this function exists separately from [`flush`]; see
+ * [`syncNow`]. Resolves immediately when there is nothing to send.
+ */
+function send(path: string, text: string | null): Promise<void> {
   const doc = docs.get(path)
-  if (doc === undefined) return
+  if (doc === undefined) return Promise.resolve()
   if (doc.timer !== null) {
     clearTimeout(doc.timer)
     doc.timer = null
   }
-  const read = doc.pending
+  const read = text !== null ? () => text : doc.pending
   doc.pending = null
-  if (read === null) return
+  if (read === null) return Promise.resolve()
   doc.version += 1
-  fire(diagnosticsApi.didChange(doc.project, path, doc.version, read()))
+  const call = diagnosticsApi.didChange(doc.project, path, doc.version, read())
+  fire(call)
+  // The same promise `fire` is already swallowing the rejection of. Handing it back here is safe
+  // precisely because of that: `fire` attached a `.catch` first, so a caller that ignores this
+  // one cannot produce an unhandled rejection.
+  return call.catch(() => {})
+}
+
+/**
+ * Bring the server's copy of this buffer up to date **now**, and resolve when it has been told.
+ *
+ * # Why completion cannot use the throttle
+ *
+ * Everything else here is allowed to be up to `SYNC_MS` behind, because a diagnostic that arrives
+ * 300 ms late is still about the same code. A completion is not: it asks *"what can go at this
+ * position"*, and against text that does not contain the position the question has no meaning.
+ * The server would answer about the buffer as it was a moment ago, confidently, and the popup
+ * would offer the members of whatever used to be under the caret.
+ *
+ * # Why awaiting this is enough to order the two messages
+ *
+ * `diagnostics_did_change` is a plain synchronous `#[tauri::command]`: it resolves the server,
+ * builds the notification and pushes it into that server's bounded outbox before returning. The
+ * completion request goes into **the same outbox**, and the pump drains it in order onto one
+ * stdin. So the notification is queued ahead of the request by the time this promise settles, and
+ * the ordering is a property of the channel rather than of a race we won.
+ *
+ * The caller passes text from CodeMirror's immutable `context.state`, so the text sent here and
+ * the position asked about cannot disagree even if the user keeps typing.
+ */
+export function syncNow(path: string, text: string): Promise<void> {
+  return send(path, text)
 }
 
 /** A pane opened this file. Only the first one tells the server. */
@@ -146,10 +187,7 @@ export function scheduleDoc(path: string, read: () => string): void {
  * where the server's copy is most obviously wrong.
  */
 export function resetDoc(path: string, text: string): void {
-  const doc = docs.get(path)
-  if (doc === undefined) return
-  doc.pending = () => text
-  flush(path)
+  void send(path, text)
 }
 
 /**

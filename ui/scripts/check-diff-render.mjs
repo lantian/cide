@@ -539,6 +539,9 @@ try {
       'src/panes/diffBlame.ts',
       'src/panes/diffRows.ts',
       'src/panes/diffSync.ts',
+      'src/panes/diffTokens.ts',
+      'src/panes/diffConnector.ts',
+      'src/panes/changeNav.ts',
       'src/editor/blameModel.ts',
       '--rootDir', 'src',
       '--outDir', out,
@@ -852,6 +855,337 @@ try {
     'and a collapsed hunk keeps its bar and folds its lines away',
   )
 
+  // --- the changes iterator, in the markup (M25) ---------------------------------------------
+  //
+  // The half no pure module can reach: that the change the model names is the change the reader
+  // sees marked, in both layouts, and that the stepper states where the walk stops.
+
+  eq(byName.changeNone.current, [], 'a fresh diff marks nothing — the walk has not started')
+  eq(
+    byName.changeNone.stepDisabled,
+    [false, false],
+    '…and both buttons are live, because a first step in either direction lands on the first '
+      + 'change rather than wrapping to the last',
+  )
+  ok(byName.changeFirst.current.length > 0, 'the first change is marked')
+  eq(
+    byName.changeFirst.stepDisabled,
+    [true, false],
+    'and Previous is disabled there — CLAMPED, so the control states where the walk stops '
+      + 'instead of leaving it to be discovered by being teleported',
+  )
+  eq(byName.changeLast.stepDisabled, [false, true], 'as Next is at the other end')
+  ok(
+    byName.changeFirst.current.every((p) => byName.changeFirst.positions.includes(p)),
+    'every marked row is a row that exists',
+  )
+  eq(
+    byName.changeFirst.current.filter((p) => byName.changeSecond.current.includes(p)),
+    [],
+    'and the changes are disjoint — stepping moves the mark rather than growing it',
+  )
+  ok(
+    byName.changeSecond.current.length > 1,
+    'the paired edit marks BOTH its sides: one deletion and its addition are one change, and '
+      + 'marking only the additions would read as two',
+  )
+  eq(
+    byName.changeSecond.plainText,
+    byName.changeNone.plainText,
+    'marking a change changes not one character of the diff',
+  )
+  eq(
+    byName.changeSplit.current.length >= byName.changeSecond.current.length,
+    true,
+    'the split layout marks the same change, across its two columns',
+  )
+  eq(
+    byName.changeAndSelected.selected,
+    byName.wholeUnified.selected,
+    'a ticked row is still ticked when it is also the current change — the two rails are on '
+      + 'opposite edges precisely so neither answer is lost',
+  )
+  ok(
+    byName.changeAndSelected.current.includes('1:2'),
+    '…and that same row carries both marks',
+  )
+
+  // --- the split layout's gutter and its line numbers (M25) ----------------------------------
+
+  ok(byName.wholeSplit.connector, 'the split layout draws the connector gutter')
+  ok(!byName.wholeUnified.connector, '…and the unified one does not, having nothing to connect')
+  ok(
+    byName.wholeSplit.leftNumberLast,
+    'the left column writes its line number AFTER its text — IDEA’s arrangement, so the two '
+      + 'columns’ numbers meet either side of the gutter instead of sitting at the pane’s two '
+      + 'outer margins with all the code between them',
+  )
+  ok(
+    !byName.wholeUnified.leftNumberLast,
+    'while the unified row is unchanged: it has both numbers, side by side, before the text',
+  )
+  eq(
+    byName.wholeSplit.positions,
+    byName.wholeSplit.positions,
+    'reordering the cells moves no position',
+  )
+  eq(
+    byName.wholeSplit.leftPositions.length + byName.wholeSplit.rightPositions.length,
+    byName.wholeSplit.positions.length,
+    '…and every position is still in exactly one column, which is the rule the whole selection '
+      + 'contract rests on',
+  )
+
+  // --- the connector's ribbons (M25) ---------------------------------------------------------
+  //
+  // None of this is visible in markup: a wrong path is a shape in the wrong place, not a missing
+  // element, and the arithmetic is the kind that looks right and is off by one column of scroll.
+
+  const { connectorShapes } = await import(`file://${resolve(out, 'panes/diffConnector.js')}`)
+
+  /** Row tops for a column of `n` equal rows of `h` pixels, plus the content-height sentinel. */
+  const tops = (n, h) => Array.from({ length: n + 1 }, (_, i) => i * h)
+
+  {
+    const shapes = connectorShapes(cols.runs, tops(40, 10), tops(40, 10), 0, 0, 34, 400)
+    eq(
+      shapes.map((s) => s.kind),
+      ['add', 'pair', 'add'],
+      'one ribbon per changed run and none for a shared one — the same three stops the iterator '
+        + 'walks, so the gutter and the walk cannot disagree about what a change is',
+    )
+    eq(
+      shapes.map((s) => s.run),
+      cols.runs.map((r, i) => (r.kind === 'shared' ? -1 : i)).filter((i) => i >= 0),
+      '…and they name their own runs, in file order, which is the join back to the run table '
+        + 'the two columns and the scroll sync all read',
+    )
+    ok(
+      shapes.every((s) => !s.d.includes('NaN')),
+      'no path carries NaN — SVG renders that as nothing at all and logs nothing, so it has to '
+        + 'be impossible rather than merely unobserved',
+    )
+    ok(
+      shapes.every((s) => s.d.startsWith('M 0 ') && s.d.endsWith('Z')),
+      'every ribbon starts at the left column and closes',
+    )
+  }
+
+  {
+    // A pure insertion: no rows on the left, so the shape must taper to a POINT there. That is
+    // what makes an insertion read as arriving *between* two lines rather than replacing one,
+    // and it is the whole reason the gutter is drawn at all.
+    const add = [{ kind: 'add', leftFrom: 3, leftTo: 3, rightFrom: 3, rightTo: 8 }]
+    const [shape] = connectorShapes(add, tops(20, 10), tops(20, 10), 0, 0, 34, 400)
+    const ys = [...shape.d.matchAll(/M 0 (-?[\d.]+)|L 34 (-?[\d.]+)|, 0 (-?[\d.]+)/g)]
+    eq(shape.d.startsWith('M 0 30 '), true, 'it begins at the insertion point on the left')
+    ok(shape.d.includes('C 6.1 30, 27.9 30, 34 30'), 'the top edge runs from y=30 to y=30')
+    ok(shape.d.includes('L 34 80'), 'the right edge spans the five inserted rows')
+    ok(shape.d.endsWith('C 27.9 80, 6.1 30, 0 30 Z'), 'and the bottom edge returns to the point')
+    ok(ys.length > 0, 'the path is parseable as coordinates at all')
+  }
+
+  {
+    // Scroll is subtracted per column, not once for both: the follower is written after the
+    // leader's event, so for a frame the two are genuinely at different offsets and one
+    // transform could not express it.
+    const one = [{ kind: 'del', leftFrom: 2, leftTo: 5, rightFrom: 2, rightTo: 2 }]
+    const flat = connectorShapes(one, tops(20, 10), tops(20, 10), 0, 0, 34, 400)[0]
+    const rolled = connectorShapes(one, tops(20, 10), tops(20, 10), 100, 40, 34, 400)[0]
+    ok(flat.d.startsWith('M 0 20 '), 'unscrolled, the left edge is where the rows are')
+    ok(rolled.d.startsWith('M 0 -80 '), 'and the left edge follows the LEFT column’s scroll')
+    ok(rolled.d.includes('L 34 -20'), 'while the right edge follows the right column’s, which is '
+      + 'a different number')
+  }
+
+  eq(
+    connectorShapes(
+      [{ kind: 'add', leftFrom: 0, leftTo: 0, rightFrom: 0, rightTo: 2 }],
+      tops(20, 10),
+      tops(20, 10),
+      100000,
+      100000,
+      34,
+      400,
+    ),
+    [],
+    'a ribbon scrolled far off screen is not built at all — a forty-thousand-line diff has '
+      + 'thousands of runs and the browser only needs the dozen that are visible',
+  )
+  eq(
+    connectorShapes([{ kind: 'add', leftFrom: 0, leftTo: 0, rightFrom: 0, rightTo: 99 }], [0], [0], 0, 0, 34, 400),
+    [],
+    'and a run whose boundary has not been measured yet is skipped rather than drawn from '
+      + 'undefined — the column can be a render behind on first paint',
+  )
+
+  // --- the token lookup, compiled standalone (M25) ------------------------------------------
+  //
+  // Colour is the one thing this pane can get wrong without looking wrong. A row drawn with
+  // another line's runs still looks like syntax highlighting — a keyword-red word on a line
+  // with no keyword in it — with no gap, no artefact and nothing in any log. One string compare
+  // per row is what prevents it, and this is where that compare is measured.
+
+  const { lineTokens, tokenLines, DIFF_HIGHLIGHT_LIMIT_BYTES } = await import(
+    `file://${resolve(out, 'panes/diffTokens.js')}`
+  )
+
+  /** Runs for a text, one span per line, the shape a tokenizer hands over. */
+  const runsOf = (text) => text.split('\n').map((line) => [{ text: line, cls: 'cide-tk-keyword' }])
+  const spell = (tokens) => (tokens === null ? null : tokens.map((t) => t.text).join(''))
+
+  {
+    const text = 'fn main() {\n    let a = 0;\n}\n'
+    const lines = tokenLines(runsOf(text))
+    eq(
+      lines.map((l) => l.text),
+      splitLines(text),
+      'tokenLines numbers a text exactly as splitLines does — they describe the same document, '
+        + 'and one phantom trailing entry would put every lookup after it one line out',
+    )
+    eq(
+      lines.map((l) => l.tokens.map((t) => t.text).join('')),
+      lines.map((l) => l.text),
+      'and the runs spell what the line says they spell — a strip applied to the joined text '
+        + 'but not to the runs would draw a character the line does not have',
+    )
+  }
+  {
+    // libgit2 filters the worktree side of a diff, so hunk lines arrive with the `\r` already
+    // gone while the text is raw disk bytes. Without the strip every line of a Windows-authored
+    // file spells one character more than the row it describes, every guard below refuses, and
+    // the file silently never gets coloured — an absence with no symptom.
+    const lines = tokenLines(runsOf('fn main() {\r\n    let a = 0;\r\n}\r\n'))
+    eq(lines.map((l) => l.text), ['fn main() {', '    let a = 0;', '}'], 'CRLF strips one \\r')
+    eq(
+      lines.map((l) => l.tokens.map((t) => t.text).join('')),
+      ['fn main() {', '    let a = 0;', '}'],
+      '…from the runs as well as from the line',
+    )
+  }
+
+  {
+    const NEW_SRC = 'fn main() {\n    let b = 2;\n}\n'
+    const OLD_SRC = 'fn main() {\n    let b = 1;\n}\n'
+    const tokens = { oldLines: tokenLines(runsOf(OLD_SRC)), newLines: tokenLines(runsOf(NEW_SRC)) }
+    const row = (content, oldLineno, newLineno) => ({ content, oldLineno, newLineno })
+
+    eq(
+      spell(lineTokens(tokens, row('fn main() {', 1, 1))),
+      'fn main() {',
+      'a context row is coloured — both numbers, one content',
+    )
+    eq(
+      spell(lineTokens(tokens, row('    let b = 2;', null, 2))),
+      '    let b = 2;',
+      'an addition takes the new side',
+    )
+    eq(
+      spell(lineTokens(tokens, row('    let b = 1;', 2, null))),
+      '    let b = 1;',
+      'and a deletion falls back to the OLD side — which is the whole reason both sides are '
+        + 'tokenized, and it is answered by line NUMBER, so a row numbered on the wrong side '
+        + 'cannot start colouring from the wrong document',
+    )
+
+    // Both directions of the same failure. Each is what a rev that moved under an open pane
+    // looks like, and each must degrade to plain rather than to a plausible lie.
+    eq(lineTokens(tokens, row('    let b = 9;', null, 2)), null, 'right number, wrong text: '
+      + 'refused — this is the misalignment that would otherwise paint a believable falsehood')
+    eq(lineTokens(tokens, row('fn main() {', null, 2)), null, 'right text, wrong number: refused. '
+      + 'The guard is per row, so one bad row costs its own colour and not the file’s')
+    eq(lineTokens(tokens, row('}', null, 99)), null, 'past the end of the text: refused')
+    eq(
+      lineTokens(tokens, row('}', null, 0)),
+      null,
+      'line 0 is not a line — git numbers a zero-length range by the line BEFORE it',
+    )
+    eq(
+      lineTokens(null, row('}', 3, 3)),
+      null,
+      'no tokens at all answers null rather than throwing: this runs once per drawn row from '
+        + 'inside a render, and the absent case is the common one',
+    )
+  }
+
+  eq(
+    DIFF_HIGHLIGHT_LIMIT_BYTES,
+    512 * 1024,
+    'the cap is half the editor’s megabyte, because there are two sides and neither has a '
+      + 'viewport to tokenize through',
+  )
+
+  // --- the changes iterator (M25) -----------------------------------------------------------
+  //
+  // A fourth consumer of the run table above, and the assertions are about the join: the
+  // iterator must agree with the columns about where a run begins, or Next change scrolls to
+  // one place and paints another.
+
+  const { changeAnchors, changePositions } = rowsMod
+  const { stepIndex } = await import(`file://${resolve(out, 'panes/changeNav.js')}`)
+
+  const anchors = changeAnchors(cols)
+  eq(
+    anchors.map((a) => a.kind),
+    ['add', 'pair', 'add'],
+    'three changes in the fixture, and the deletion-then-addition is ONE stop — a pair is one '
+      + 'edit, which is the grouping columnRows already performs',
+  )
+  eq(
+    anchors.map((a) => a.run),
+    cols.runs.map((r, i) => (r.kind === 'shared' ? -1 : i)).filter((i) => i >= 0),
+    'and each names its own index in the run table, which is the join to rowSpans/insertMarkers',
+  )
+  eq(anchors[0].first.column, 'right', 'an add run begins on the right — it has no left rows')
+  eq(anchors[1].first.column, 'left', 'a pair begins on the left: git writes `-` before `+`')
+  eq(anchors[1].last.column, 'right', '…and ends on the right, with the addition')
+  for (const anchor of anchors) {
+    const positions = changePositions(cols, anchor)
+    ok(positions.length > 0, `change ${anchor.run} has rows to scroll to and paint`)
+    eq(
+      positions[0],
+      { hunk: anchor.first.hunk, at: anchor.first.at },
+      'the row the view SCROLLS to is the first row of the set it PAINTS — a disagreement here '
+        + 'lands the reader above or below the block that is marked as current',
+    )
+  }
+  eq(
+    changePositions(cols, anchors[1]).length,
+    anchors[1].leftTo - anchors[1].leftFrom + (anchors[1].rightTo - anchors[1].rightFrom),
+    'a pair paints both its sides — marking only the additions would read as two changes',
+  )
+  eq(
+    changeAnchors(columnRows(segments, { bars: true })).map((a) => a.kind),
+    anchors.map((a) => a.kind),
+    'bars are shared runs, so drawing them cannot change WHICH runs are changes — only their '
+      + 'row indices, which the unified layout never uses',
+  )
+  eq(
+    changeAnchors(barred).some((a) => a.first.hunk === 1),
+    false,
+    'a collapsed hunk contributes no changes: the anchors are exactly what is in the DOM, so '
+      + 'Next change can never scroll to something invisible',
+  )
+
+  // The clamp, shared by the diff and the conflict resolver so they cannot come to disagree.
+  eq(stepIndex(0, -1, 1), null, 'nothing to walk')
+  eq(stepIndex(3, -1, 1), 0, 'a first Next lands on the first change')
+  eq(
+    stepIndex(3, -1, -1),
+    0,
+    '…and so does a first Previous. The reader is at the top of a file they just opened, and '
+      + '"jump to the bottom" is the wrap this refuses, spelled differently',
+  )
+  eq(stepIndex(3, 0, 1), 1, 'forwards')
+  eq(stepIndex(3, 1, -1), 0, 'and back')
+  eq(
+    stepIndex(3, 2, 1),
+    null,
+    'CLAMPED at the last, never wrapped — a refusal is reportable through unmet(), where a wrap '
+      + 'on a one-change diff is indistinguishable from a chord that did nothing',
+  )
+  eq(stepIndex(3, 0, -1), null, 'and clamped at the first')
+
   // --- the scroll mapping, on its own (M25) --------------------------------------------------
 
   const syncMod = await import(`file://${resolve(out, 'panes/diffSync.js')}`)
@@ -1075,6 +1409,151 @@ try {
   ok(
     /import[^;]*from '\.\/diffRows'/s.test(paneSrc) && /import[^;]*from '\.\/diffSync'/s.test(paneSrc),
     'the pane consumes the two pure modules this script drives, not private copies of them',
+  )
+
+  // --- syntax colour in the markup (M25) ----------------------------------------------------
+  //
+  // Every claim here is paired against the uncoloured render of the same diff, because the thing
+  // worth proving is that colour changed nothing else. `plainText` is the one that could not be
+  // made any other way: splitting a line into spans is the single way to gain or lose a
+  // character without any other digest field moving.
+
+  eq(
+    byName.coloured.plainText,
+    byName.wholeUnified.plainText,
+    'colour changes not one character of the diff — the same document, with spans in it',
+  )
+  eq(byName.coloured.positions, byName.wholeUnified.positions, 'nor which positions are written')
+  eq(
+    byName.coloured.selected,
+    byName.wholeUnified.selected,
+    'nor what is painted as selected — a colour is a colour, not a filter',
+  )
+  eq(byName.coloured.rows, byName.wholeUnified.rows, 'nor how many rows there are')
+  eq(byName.coloured.gaps, byName.wholeUnified.gaps, 'nor where the unchanged stretches are')
+  eq(
+    byName.wholeUnified.tokenSpans,
+    [],
+    'and a diff handed no tokens draws exactly as it did before M25 — one colour, no spans',
+  )
+
+  ok(
+    byName.coloured.tokenSpans.includes('cide-tk-keyword:let'),
+    'the runs reach the markup, under the class the buffer paints the same word with',
+  )
+  ok(
+    byName.coloured.tokenSpans.includes('cide-tk-keyword:fn'),
+    '…on the context lines as well as the changed ones',
+  )
+  eq(
+    byName.colouredSplit.plainText,
+    byName.wholeSplit.plainText,
+    'the split layout gains no character either',
+  )
+  ok(
+    byName.colouredSplit.tokenSpans.length > byName.coloured.tokenSpans.length,
+    'and colours MORE runs than the unified one, because it draws every context line twice — '
+      + 'once per column — which is the shape that would break if the left column were fed the '
+      + 'new side',
+  )
+
+  // The guard, and the reason this fixture exists. `TOKENS_STALE` describes a document whose
+  // line 11 is `STALE` where the diff's is `let a = 0;`.
+  ok(
+    byName.colouredStale.tokenSpans.length > 0,
+    'a stale token set still colours the rows it does describe',
+  )
+  eq(
+    byName.colouredStale.tokenSpans.filter((s) => s.includes('a = 0')),
+    [],
+    '…and draws the one row it does NOT describe plain, rather than painting it with another '
+      + 'line’s runs — which would still look exactly like syntax highlighting',
+  )
+  eq(
+    byName.colouredStale.plainText,
+    byName.colouredStale.plainText,
+    'and the row is still there, in full',
+  )
+  ok(
+    byName.colouredStale.plainText.includes('let a = 0;'),
+    '…with its own text, not the token set’s',
+  )
+
+  ok(
+    byName.colouredHunks.tokenSpans.length > 0,
+    'a hunks-only diff is coloured too: highlighting is decided from the texts, independently '
+      + 'of whether wholeFileSegments could reconstruct the file, and the per-row guard is what '
+      + 'makes that safe',
+  )
+  eq(
+    byName.colouredHunks.plainText,
+    byName.empty.plainText,
+    '…changing not one character of the fallback rendering',
+  )
+  eq(
+    byName.colouredMismatch.tokenSpans,
+    [],
+    'while tokens for an unrelated document colour NOTHING — together with colouredStale, that '
+      + 'pins the guard as per-row rather than once per file',
+  )
+  eq(
+    byName.colouredMismatch.plainText,
+    byName.wholeUnified.plainText,
+    '…and that render is byte-identical to the uncoloured one',
+  )
+  eq(
+    byName.colouredRevision.tokenSpans,
+    byName.coloured.tokenSpans,
+    'a diff of two commits is coloured identically — the wiring differs, the view does not',
+  )
+
+  // --- colour reaches the rows without the tokenizer reaching this bundle (M25) -------------
+  //
+  // `panes/diffHighlight.ts` reaches `@codemirror/language` and `@lezer/highlight`, and this
+  // script builds an SSR bundle and runs it under node to prove that what the pane highlights is
+  // what it stages. `editor/diffViewMode.ts` records at length why that bundle is kept free of
+  // the editor's dependencies. Those packages do import cleanly under node today — check:markdown
+  // runs `fenceTokens.ts` there — so this is not guarding a crash; it is what turns "they happen
+  // to be safe" into a property with a test, and it keeps the grammar chunks out of the diff
+  // pane's download until somebody opens a diff.
+  //
+  // Matched on the *import statement* and not on the bare package name: `diffBlame.ts`'s header
+  // says the words "@codemirror/merge" in prose, that comment survives into the bundle, and an
+  // assertion a comment can fail is an assertion somebody will delete.
+
+  const entry = readFileSync(resolve(out, 'gitDiffSmoke.js'), 'utf8')
+  ok(
+    !/from\s*["']@codemirror\//.test(entry),
+    'the SSR entry imports no CodeMirror package — the pane colours its rows from plain data '
+      + 'handed down as a prop, and the module that produces that data is behind a dynamic '
+      + 'import() in an effect, which renderToStaticMarkup never runs',
+  )
+  ok(!/from\s*["']@lezer\//.test(entry), '…and no Lezer package')
+  ok(
+    /import\('\.\/diffHighlight'\)/.test(paneSrc),
+    'the tokenizer is reached through a dynamic import',
+  )
+  ok(
+    !/from '\.\/diffHighlight'/.test(paneSrc),
+    '…and never statically, which is the only thing keeping it out of the bundle above',
+  )
+  ok(
+    /import \{ lineTokens, type DiffTokens \} from '\.\/diffTokens'/.test(paneSrc),
+    'while the row lookup IS imported statically — it is import-free data handling, and it is '
+      + 'what this script drives standalone',
+  )
+
+  const diffCss = readFileSync('src/panes/GitDiffPane.module.css', 'utf8')
+  ok(
+    !diffCss.includes('--tk-'),
+    'the diff pane declares no token colours of its own: the roles are painted by the global '
+      + '`editor/highlight.css`, so a file open in an editor tab and in a diff beside it cannot '
+      + 'be two different colours',
+  )
+  const highlightCss = readFileSync('src/editor/highlight.css', 'utf8')
+  ok(
+    highlightCss.includes('.cide-tk-keyword'),
+    '…and that stylesheet is where the class the pane writes is actually painted',
   )
 
   if (failed === 0) console.log('git diff view render: ok')

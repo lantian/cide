@@ -14,6 +14,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { GitDiffView, blameLookup } from './GitDiffPane'
 import { blameRefusal, type BlameLookup } from './diffBlame'
+import type { DiffToken, DiffTokens, TokenLine } from './diffTokens'
 import { toSelection, resolve, type Marks } from '@/sidebar/GitPanel/diffSelection'
 import type { BlameFile, DiffSide, DiffView, FileDiff, LineOrigin, RevisionDiff } from '@/ipc/client'
 
@@ -184,6 +185,64 @@ export const WHOLE: FileDiff = {
   path: 'src/whole.rs',
   oldText: WHOLE_OLD,
   newText: WHOLE_TEXT,
+}
+
+/*
+ * Tokens for the two sides above, from a **fake grammar**. (M25)
+ *
+ * Two words are keywords and everything else is plain. Deliberately not a real one: what the
+ * markup has to prove is that runs reach the row, that no character is gained or lost on the way,
+ * and that a row the tokens do not describe draws plain — none of which is a claim about Rust's
+ * keyword table, which `check:markdown` already drives token by token against the real grammar.
+ * Reaching for `loadGrammar` here would also put `@codemirror/language` into the very SSR bundle
+ * `check-diff-render.mjs` asserts is free of it.
+ */
+const KEYWORDS = new Set(['fn', 'let'])
+
+/** One text as per-line runs, splitting on whitespace and coalescing equal roles. */
+function fakeSide(text: string): TokenLine[] {
+  return text.split('\n').map((line) => {
+    const tokens: DiffToken[] = []
+    for (const piece of line.split(/(\s+)/)) {
+      if (piece === '') continue
+      const cls = KEYWORDS.has(piece) ? 'cide-tk-keyword' : null
+      const last = tokens[tokens.length - 1]
+      if (last !== undefined && last.cls === cls) {
+        tokens[tokens.length - 1] = { text: last.text + piece, cls }
+      } else tokens.push({ text: piece, cls })
+    }
+    return { text: line, tokens }
+  })
+}
+
+export const TOKENS: DiffTokens = {
+  oldLines: fakeSide(WHOLE_OLD).slice(0, -1),
+  newLines: fakeSide(WHOLE_TEXT).slice(0, -1),
+}
+
+/**
+ * The same, with one new-side line the diff does not have.
+ *
+ * The fixture for the per-row guard: `let a = 0;` is line 11 of the real text and `STALE` here,
+ * so that row must draw plain while its neighbours keep their colour. This is what a rev that
+ * moved under an open pane looks like, and it is the failure worth a fixture — a row drawn with
+ * the wrong line's runs still looks exactly like syntax highlighting.
+ */
+export const TOKENS_STALE: DiffTokens = {
+  oldLines: TOKENS.oldLines,
+  newLines: fakeSide(WHOLE_TEXT.replace('let a = 0;', 'STALE')).slice(0, -1),
+}
+
+/**
+ * Tokens for an unrelated document entirely.
+ *
+ * The wholesale version of the same failure: not one line agrees, so not one row may be
+ * coloured. Distinct from [`TOKENS_STALE`], which disagrees about a single line — together they
+ * pin that the guard is applied *per row* rather than once per file.
+ */
+export const TOKENS_OTHER: DiffTokens = {
+  oldLines: fakeSide('let zzz = 9;\nlet yyy = 8;\nlet xxx = 7;'),
+  newLines: fakeSide('let qqq = 1;\nlet www = 2;\nlet eee = 3;'),
 }
 
 /**
@@ -386,6 +445,15 @@ export interface DiffDigest {
   /** `data-tone` of every insertion marker, per column. Empty outside the split layout. */
   insertLeft: string[]
   insertRight: string[]
+  /** Whether the connector gutter is in the markup. Split layout only. */
+  connector: boolean
+  /**
+   * Whether the left column writes its line number **after** the line text.
+   *
+   * IDEA's arrangement, and a grid places by order, so this is the claim that the reordering
+   * actually happened in the DOM rather than only in a stylesheet nothing here reads.
+   */
+  leftNumberLast: boolean
 
   /* --- the blame column (M18) --- */
 
@@ -405,6 +473,68 @@ export interface DiffDigest {
   blamePressed: boolean
   blameDisabled: boolean
   blameTitle: string
+
+  /* --- syntax colour (M25) --- */
+
+  /**
+   * Every `cide-tk-*` span in document order, as `class:text`.
+   *
+   * An empty array means the diff is drawn in one colour, which is what every render that
+   * predates this and every refusal path must still produce.
+   */
+  /** `hunk:line` of every row marked as the current change, in document order. */
+  current: string[]
+  /** Whether the prev / next stepper buttons are disabled. */
+  stepDisabled: boolean[]
+  tokenSpans: string[]
+  /**
+   * The whole markup with tags stripped and entities decoded.
+   *
+   * The claim colour has to answer: **it changes not one character of the diff.** Splitting a
+   * line into spans is the one way to gain or lose text without any other digest field moving.
+   */
+  plainText: string
+}
+
+/**
+ * Whether the left column's first row writes its number after its text.
+ *
+ * Read off the markup rather than off the stylesheet: the track list and the child order have to
+ * agree, and only one of the two is a fact about the DOM. A row is `…<span class=…text…>…</span>`
+ * then, on the left column only, `<span class=…lineno…>`.
+ */
+function leftNumberLastOf(html: string): boolean {
+  const start = html.indexOf('data-side="old"')
+  if (start < 0) return false
+  const end = html.indexOf('data-side="new"')
+  const left = html.slice(start, end < 0 ? undefined : end)
+  const row = /class="[^"]*half[^"]*"[^>]*>([\s\S]*?)<\/div>/.exec(left)?.[1] ?? ''
+  const text = row.lastIndexOf('text')
+  const lineno = row.lastIndexOf('lineno')
+  return text >= 0 && lineno > text
+}
+
+/** Every `cide-tk-*` span, as `class:text`, in document order. */
+function tokensOf(html: string): string[] {
+  return [...html.matchAll(/<span class="(cide-tk-[a-z-]+)">([^<]*)<\/span>/g)].map(
+    (m) => `${m[1] ?? ''}:${m[2] ?? ''}`,
+  )
+}
+
+/**
+ * The markup as text.
+ *
+ * The naive tag strip is safe here because React escapes `<` and `>` inside attribute values, so
+ * no `>` inside a tag can be content.
+ */
+function plainOf(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&amp;/g, '&')
 }
 
 /** Every blame cell's `data-blame` and `data-age`, in document order. */
@@ -420,7 +550,11 @@ function blameOf(html: string): { cells: string[]; ages: string[] } {
 
 /** The positional row regex, over one slice of the markup. */
 function rowsOf(html: string): Array<RegExpMatchArray> {
-  return [...html.matchAll(/data-audit="gitDiffRow" data-at="([\d:]+)" data-selected="(\w+)"/g)]
+  return [
+    ...html.matchAll(
+      /data-audit="gitDiffRow" data-at="([\d:]+)" data-selected="(\w+)" data-current="(\w+)"/g,
+    ),
+  ]
 }
 
 /**
@@ -518,6 +652,10 @@ function digest(
     blame?: BlameLookup | null
     /** Gaps opened in a folded whole-file view. */
     expanded?: ReadonlySet<number>
+    /** Both sides tokenized. Absent ⇒ the diff draws in one colour, as it did before M25. */
+    tokens?: DiffTokens
+    /** Which change the iterator is on. Absent ⇒ none, which is what a fresh diff shows. */
+    currentChange?: number
   },
 ): DiffDigest {
   const html = renderToStaticMarkup(
@@ -530,6 +668,9 @@ function digest(
       busy={false}
       note={over.note ?? null}
       reason={over.reason ?? null}
+      {...(over.tokens === undefined ? {} : { tokens: over.tokens })}
+      {...(over.currentChange === undefined ? {} : { currentChange: over.currentChange })}
+      onCurrentChange={() => {}}
       held={over.held ?? null}
       {...(over.view === undefined ? {} : { view: over.view })}
       {...('blame' in over ? { blame: over.blame } : {})}
@@ -578,6 +719,14 @@ function digest(
     blamePressed: toggle.pressed,
     blameDisabled: toggle.disabled,
     blameTitle: toggle.title,
+    connector: html.includes('data-audit="gitDiffConnector"'),
+    leftNumberLast: leftNumberLastOf(html),
+    current: rows.flatMap((m) => (m[3] === 'true' ? [m[1] ?? ''] : [])),
+    stepDisabled: [...html.matchAll(/data-audit="gitDiffStep"([^>]*)>/g)].map((m) =>
+      (m[1] ?? '').includes('disabled'),
+    ),
+    tokenSpans: tokensOf(html),
+    plainText: plainOf(html),
   }
 }
 
@@ -599,7 +748,7 @@ function readOnlyDigest(
   name: string,
   diff: RevisionDiff | null,
   view?: DiffView,
-  over: { blame?: BlameLookup | null } = {},
+  over: { blame?: BlameLookup | null; tokens?: DiffTokens } = {},
 ): DiffDigest {
   const html = renderToStaticMarkup(
     <GitDiffView
@@ -612,6 +761,7 @@ function readOnlyDigest(
       note={null}
       reason={null}
       {...(view === undefined ? {} : { view })}
+      {...(over.tokens === undefined ? {} : { tokens: over.tokens })}
       {...('blame' in over ? { blame: over.blame } : {})}
       // Always offered on this arm. `RevisionDiffPane` blames at `new_rev`, so there is no side
       // here that cannot be answered — see its comment for why the read-only arm shows the column
@@ -652,6 +802,14 @@ function readOnlyDigest(
     blamePressed: toggle.pressed,
     blameDisabled: toggle.disabled,
     blameTitle: toggle.title,
+    connector: html.includes('data-audit="gitDiffConnector"'),
+    leftNumberLast: leftNumberLastOf(html),
+    current: rows.flatMap((m) => (m[3] === 'true' ? [m[1] ?? ''] : [])),
+    stepDisabled: [...html.matchAll(/data-audit="gitDiffStep"([^>]*)>/g)].map((m) =>
+      (m[1] ?? '').includes('disabled'),
+    ),
+    tokenSpans: tokensOf(html),
+    plainText: plainOf(html),
   }
 }
 
@@ -764,6 +922,63 @@ const digests: DiffDigest[] = [
   digest('wholeSplit', new Set(['1:2']), { diff: WHOLE, side: 'unstaged', view: 'split' }),
   readOnlyDigest('wholeRevision', REVISION_WHOLE),
   readOnlyDigest('wholeRevisionSplit', REVISION_WHOLE, 'split'),
+
+  /*
+   * Syntax colour. (M25)
+   *
+   * Paired with `wholeUnified` / `wholeSplit` above deliberately: every claim worth making here
+   * is a claim that colour changed *nothing else*, and the pairs are what let the check say so
+   * field by field rather than eyeballing one render.
+   *
+   * `colouredStale` is the one that earns its place. Its tokens describe a document one line
+   * different from the diff's, which is what a rev that moved under an open pane produces — and
+   * a row drawn with the wrong line's runs still looks exactly like syntax highlighting, so it
+   * is the failure that would otherwise ship.
+   */
+  digest('coloured', new Set(['1:2']), { diff: WHOLE, side: 'unstaged', tokens: TOKENS }),
+  digest('colouredSplit', new Set(['1:2']), {
+    diff: WHOLE,
+    side: 'unstaged',
+    view: 'split',
+    tokens: TOKENS,
+  }),
+  digest('colouredStale', new Set(), { diff: WHOLE, side: 'unstaged', tokens: TOKENS_STALE }),
+  // A hunks-only diff handed tokens for a *different* file: nothing matches, everything is plain.
+  // A hunks-only diff whose lines the tokens DO describe: still coloured. Highlighting is
+  // decided from the texts, independently of whether `wholeFileSegments` could reconstruct the
+  // file, and the per-row guard is what makes that safe.
+  digest('colouredHunks', new Set(), { diff: FIXTURE, side: 'unstaged', tokens: TOKENS }),
+  // And the wholesale mismatch: tokens for an unrelated document colour nothing at all.
+  digest('colouredMismatch', new Set(['1:2']), {
+    diff: WHOLE,
+    side: 'unstaged',
+    tokens: TOKENS_OTHER,
+  }),
+  readOnlyDigest('colouredRevision', REVISION_WHOLE, undefined, { tokens: TOKENS }),
+
+  /*
+   * The changes iterator. (M25)
+   *
+   * `currentChange` is driven from here rather than held inside the view precisely so these
+   * exist: with `useState` in the component the SSR render would always be "nothing current"
+   * and the marker could not be asserted at all.
+   */
+  digest('changeFirst', new Set(), { diff: WHOLE, side: 'unstaged', currentChange: 0 }),
+  digest('changeSecond', new Set(), { diff: WHOLE, side: 'unstaged', currentChange: 1 }),
+  digest('changeLast', new Set(), { diff: WHOLE, side: 'unstaged', currentChange: 2 }),
+  digest('changeNone', new Set(), { diff: WHOLE, side: 'unstaged' }),
+  digest('changeSplit', new Set(), {
+    diff: WHOLE,
+    side: 'unstaged',
+    view: 'split',
+    currentChange: 1,
+  }),
+  // The current change and a staging tick on the same row: both rails, neither lost.
+  digest('changeAndSelected', new Set(['1:2']), {
+    diff: WHOLE,
+    side: 'unstaged',
+    currentChange: 1,
+  }),
   digest('wholeBig', new Set(), { diff: WHOLE_BIG, side: 'unstaged' }),
   digest('wholeBigOpen', new Set(), {
     diff: WHOLE_BIG,

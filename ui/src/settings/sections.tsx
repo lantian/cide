@@ -450,6 +450,19 @@ function Editor({ settings, patch }: SectionProps) {
           checked={editor.autosave}
           onChange={(v) => set({ autosave: v })}
         />
+        <ToggleRow
+          label="Suggest completions"
+          hint="Offers what the language server thinks can go under the caret. Tab or Enter accepts, Escape dismisses. Needs a server for the language — Rust and Go have one built in."
+          checked={editor.completion}
+          onChange={(v) => set({ completion: v })}
+        />
+        <ToggleRow
+          label="Open suggestions while typing"
+          hint="Off means the popup appears only on Ctrl+Space. The feature stays fully usable either way."
+          checked={editor.completionOnTyping}
+          onChange={(v) => set({ completionOnTyping: v })}
+          disabled={!editor.completion}
+        />
       </Group>
     </>
   )

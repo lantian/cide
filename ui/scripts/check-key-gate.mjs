@@ -305,6 +305,18 @@ try {
     { key: 'ctrl+alt+equal', command: 'editor.unfoldRecursively', when: 'editorFocused' },
     { key: 'ctrl+alt+plus', command: 'editor.unfoldRecursively', when: 'editorFocused' },
     { key: 'ctrl+period', command: 'editor.toggleFold', when: 'editorFocused' },
+    /*
+     * M25. The changes iterator, and the first shipped bindings with a **compound** clause.
+     *
+     * `diffFocused` alone would swallow F7 in a shell pane split beside a diff tab that is in
+     * front — the gate is a window capture listener and F7 is `ESC [ 18 ~`, which `mc` puts a
+     * menu on. A diff pane and a merge pane are both `kind == 'editor'`, so `!terminalFocused`
+     * is false in exactly the states the feature needs and true in exactly the states a
+     * terminal needs the key back. `F7` is already in the sweep corpus below, so all sixteen
+     * modifier combinations on it are swept in every context.
+     */
+    { key: 'f7', command: 'navigate.nextChange', when: 'diffFocused && !terminalFocused' },
+    { key: 'shift+f7', command: 'navigate.prevChange', when: 'diffFocused && !terminalFocused' },
   ]
 
   /* The fixture is a mirror, so check it against the thing it mirrors before trusting it. */
@@ -468,6 +480,15 @@ try {
      * user of `mc` in a detached pane is relying on.
      */
     { shellWindow: true, terminalFocused: true },
+    /*
+     * M25. A diff in front, and the same diff with a terminal focused beside it.
+     *
+     * Both are needed or the compound clause is never actually exercised: without the first,
+     * F7 is only ever swept in states its clause excludes; without the second, the half that
+     * gives the key back to `mc` is asserted nowhere.
+     */
+    { diffFocused: true },
+    { diffFocused: true, terminalFocused: true },
   ]
 
   const event = (spec) => ({

@@ -9,7 +9,7 @@
  * The pane grid is still M0's hard-coded 2x2. M4 replaces it with the real split tree
  * rendered from `tab.tree`.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { AppHeader } from '@/chrome/AppHeader'
 import { ActivityRail } from '@/chrome/ActivityRail'
 import { PanelBoundary } from '@/chrome/PanelBoundary'
@@ -98,6 +98,7 @@ import { buildKeymap } from '@/keys/keymap'
 import { PaneFrame } from '@/layout/PaneTitleBar'
 import { PaneBody } from '@/panes/PaneBody'
 import { GitDiffPane } from '@/panes/GitDiffPane'
+import { changeNavPresent, subscribeChangeNav } from '@/panes/changeNav'
 import { liveHosts } from '@/layout/paneHosts'
 import { SettingsTab } from '@/settings/SettingsTab'
 import { toggleTheme as togglePersistedTheme } from '@/settings/useSettings'
@@ -233,6 +234,18 @@ export function App() {
   const focusPane = useWorkspace((st) => st.focusPane)
   const maximizePane = useWorkspace((st) => st.maximizePane)
   const contextMenuOpen = useContextMenuOpen()
+  /*
+   * Whether a change-walkable diff surface holds the slot, for the `diffFocused` key-context
+   * flag below.
+   *
+   * The snapshot is a **boolean** and must stay one. `useSyncExternalStore` compares snapshots
+   * with `Object.is`, so a getter returning a fresh `{ index, count }` would never compare equal
+   * and the re-render loop that followed would end at *Maximum update depth exceeded* with the
+   * whole root unmounted — which is the failure `check:selectors` exists for, arriving through a
+   * different hook. The server snapshot is `false`: a detached window's first paint has nothing
+   * mounted yet, and claiming otherwise would arm a chord against a pane that is not there.
+   */
+  const diffFocused = useSyncExternalStore(subscribeChangeNav, changeNavPresent, () => false)
   const setRatio = useWorkspace((st) => st.setRatio)
   const bindSession = useWorkspace((st) => st.bindSession)
   const newClaudeTab = useWorkspace((st) => st.newClaudeTab)
@@ -833,6 +846,11 @@ export function App() {
     claudePaneFocused: focused?.pane.kind === 'claude',
     sidebarFiles: sidebar.view === 'files',
     sidebarGit: sidebar.view === 'git',
+    // A diff surface is mounted and in front — a git diff tab, the log tool window's revision
+    // diff, or the conflict resolver. Read from the claim stack rather than from the tree,
+    // because that is where the answer actually is; `panes/changeNav.ts` has the argument, and
+    // `cide_core::commands::CONTEXT_FLAGS` has why no derived spelling of it works.
+    diffFocused,
   }
 
   /*

@@ -318,7 +318,15 @@ export function PaneBody({
    * diff states: a document must never be offered a Resume.
    */
   if (merge && mergeTab && pane.kind === 'editor' && project) {
-    return <MergePane project={project} repo={merge.repo} path={merge.path} tab={mergeTab} />
+    return (
+      <MergePane
+        project={project}
+        repo={merge.repo}
+        path={merge.path}
+        tab={mergeTab}
+        {...(onScreen === undefined ? {} : { onScreen })}
+      />
+    )
   }
 
   if (revision && pane.kind === 'editor' && project) {

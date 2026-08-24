@@ -82,6 +82,7 @@ pub mod diagnostics;
 pub mod symbols;
 
 pub use diagnostics::{
+    CompletionAnswer, CompletionEdit, CompletionItem, CompletionKind, CompletionResolveAnswer,
     DefinitionAnswer, Diagnostic, DiagnosticKind, DiagnosticSourceId, DiagnosticsSnapshot,
     ProbeAnswer, Severity, SourceReport, SourceStatus, Usage, UsagesAnswer,
 };

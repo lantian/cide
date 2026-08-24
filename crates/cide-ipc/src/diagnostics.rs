@@ -625,3 +625,227 @@ pub enum UsagesAnswer {
     /// Nobody could be asked, or the wait ran out. `reason` is shown verbatim.
     Unavailable { reason: String },
 }
+
+// ==========================================================================================
+// Completion. (M25)
+// ==========================================================================================
+
+/// What kind of thing a completion offers, as far as a badge is concerned.
+///
+/// # Why this is not [`crate::SymbolKind`]
+///
+/// They overlap and they are not the same question. `SymbolKind` is *what an outline found in a
+/// file* — it carries `Impl`, which no language server ever offers as a completion, and it lacks
+/// `Keyword`, `Snippet`, `File` and `Folder`, which are a third of what a real completion list
+/// is made of. Reusing it would have meant a lossy mapping in `convert` and an `Other` bucket
+/// doing most of the work, and the badge would then have been wrong for the majority of rows.
+///
+/// LSP's `CompletionItemKind` is 25 numeric variants; this is that list with the four pairs
+/// nobody can tell apart on a badge already merged (`Class`/`Struct`, `Value`/`Constant`,
+/// `Reference`/`Variable`, `Color`/`Unit` into `Other`). The merging happens **here**, in the
+/// type, rather than in the renderer, so there is one answer to "what does this look like".
+///
+/// A number cide has never heard of — the spec grows — becomes [`Self::Other`] rather than being
+/// dropped. That is the same `other`-bucket rule `Severity` and `symbolBadge` follow, and it is
+/// load-bearing for the same reason: a completion you cannot label is still a completion, and
+/// hiding it would make the list quietly wrong rather than visibly plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum CompletionKind {
+    Function,
+    Method,
+    Constructor,
+    Field,
+    Variable,
+    Struct,
+    Interface,
+    Module,
+    Property,
+    Enum,
+    EnumMember,
+    Keyword,
+    Snippet,
+    Text,
+    File,
+    Folder,
+    TypeParameter,
+    Constant,
+    Operator,
+    Event,
+    /// Anything else, including a kind this build has never heard of. Never a dropped row.
+    Other,
+}
+
+/// One replacement, in cide's units — 1-based lines, 1-based UTF-16 columns, end exclusive.
+///
+/// The same units [`Usage::column`] carries and for the same reason: these become CodeMirror
+/// document offsets, and CodeMirror counts in UTF-16 code units. Converting once, in Rust, at the
+/// point the LSP range is read is what keeps a `use` statement from landing one character off in
+/// a file with a non-ASCII identifier above it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CompletionEdit {
+    pub line: u32,
+    pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    /// May be empty — a deletion — and may contain newlines.
+    pub text: String,
+}
+
+/// One row of the completion popup.
+///
+/// # What is deliberately not here
+///
+/// **`documentation`.** Every server sends it, it is markdown, it is frequently a whole doc
+/// comment, and a thousand-item reply carrying all of them is megabytes across an IPC channel
+/// for a panel this milestone does not draw. `convert::completion` drops it at the point of
+/// conversion rather than here, so nothing downstream can grow a dependency on it being present
+/// and then find it truncated. When the documentation panel is built, the honest way back is
+/// `completionItem/resolve` for the *selected* row — one request, not a thousand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CompletionItem {
+    /// What the popup shows. rust-analyzer puts a signature in here — `push(…)` — so it is a
+    /// display string and **not** what typing is matched against. See [`Self::filter_text`].
+    pub label: String,
+    /// What the user's typing is matched against: LSP's `filterText`, or the label when the
+    /// server sent none.
+    ///
+    /// Separate from `label` because for rust-analyzer they routinely differ, and using the
+    /// label for both is the mistake that makes a popup stop narrowing as you type — it matches
+    /// `push(…)` against `pus` and scores it worse than an unrelated row.
+    pub filter_text: String,
+    /// The dimmed text drawn immediately after the label, with no gap — LSP's
+    /// `labelDetails.detail`.
+    ///
+    /// For an auto-import candidate this is the whole reason the row is distinguishable:
+    /// rust-analyzer puts `(use std::collections::HashMap)` here, which is the popup's only
+    /// warning that accepting will also edit the top of the file. Falls back to nothing rather
+    /// than to `detail` below, because the two are drawn in different places and swapping them
+    /// puts a type where a sentence belongs.
+    pub detail: Option<String>,
+    /// The type or signature, drawn away from the label — `labelDetails.description`, or the
+    /// item's own `detail` for a server that does not send label details.
+    ///
+    /// The fallback is what keeps a minimal server's popup from being a column of bare
+    /// identifiers, and it is the right way round: `detail` is *defined* as "a human-readable
+    /// string with additional information about this item, like type or symbol information",
+    /// which is what `labelDetails.description` was later carved out of.
+    pub description: Option<String>,
+    pub kind: CompletionKind,
+    /// The text to insert, already reduced to one form from LSP's three
+    /// (`textEdit.newText` → `insertText` → `label`).
+    ///
+    /// LSP snippet syntax when [`Self::snippet`] is set, plain text otherwise.
+    pub insert: String,
+    /// [`Self::insert`] is a snippet template rather than literal text.
+    pub snippet: bool,
+    /// The range the insert replaces, when the server sent a `textEdit` that says so.
+    ///
+    /// `None` means "replace whatever the client thinks the current word is", which is what an
+    /// `insertText`-only item means and what CodeMirror does by default. Believing a server's
+    /// range when it sent one matters for the cases where it is *wider* than the word — gopls
+    /// replacing `fmt.Pri` including the dot, rust-analyzer replacing a whole `use` path.
+    pub replace: Option<CompletionEdit>,
+    /// This row's rank in the server's own `sortText` order, 0 first.
+    ///
+    /// An integer and not the `sortText` string, because the string is a sort key with no meaning
+    /// outside a comparison — `"ffff0000"` is not a score — and the client needs a *number* to
+    /// hand CodeMirror as a boost. Sorting once, in Rust, is also what keeps every consumer from
+    /// re-implementing LSP's "absent `sortText` falls back to `label`" rule.
+    pub sort: u32,
+    /// Edits that must land with this one — the `use` line, the `import` block. Usually empty.
+    ///
+    /// Always outside the completion range, per the spec, which is what lets the client apply
+    /// them in their own transaction and map the insert through it.
+    ///
+    /// **Usually empty even for an auto-import row**, and that is not a bug — see [`Self::resolve`].
+    pub extra_edits: Vec<CompletionEdit>,
+    /// This row has edits that have not been computed yet: resolve it before accepting.
+    ///
+    /// `Some(index)` is the handle to pass to `diagnostics_completion_resolve`, alongside the
+    /// [`CompletionAnswer::Items::token`] this row arrived with.
+    ///
+    /// # Why this exists at all
+    ///
+    /// cide declares `resolveSupport: ["documentation", "additionalTextEdits"]`, which it must:
+    /// rust-analyzer offers **no auto-import candidates whatsoever** to a client that cannot
+    /// resolve edits lazily (measured — see the handshake in `cide_lsp::session`). So the import
+    /// edit for `HashMap` genuinely does not exist at the moment the popup is drawn, and the one
+    /// round trip that computes it happens when the user commits to the row.
+    ///
+    /// `None` means there is nothing deferred and accepting is instant, which is the common case:
+    /// a local variable, a keyword, a method already in scope. Paying a round trip on every
+    /// accept to cover the minority would put a language server between the user and the Tab key.
+    pub resolve: Option<u32>,
+    /// The server marked it deprecated, through either `deprecated` or a `tags` entry of `1`.
+    pub deprecated: bool,
+}
+
+/// The completion list at a position — or why cide cannot offer one.
+///
+/// # `Unavailable` is usually not shown to anyone, and that is the design
+///
+/// Every other answer in this module exists to put a sentence in front of the user, because every
+/// other one is behind a key the user pressed. This popup opens **by itself**, many times a
+/// minute, so an implicit query that fails must fail *silently* — the alternative is a
+/// notification storm that trains the user to ignore the notice channel entirely. Only a query
+/// the user made explicitly (Ctrl+Space) reports the reason. `reason` is therefore populated
+/// exactly as carefully as its neighbours' and read far less often.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum CompletionAnswer {
+    /// The list. Possibly empty, which is a real answer — there is nothing to offer here.
+    Items {
+        /// Which reply this is, for [`CompletionItem::resolve`] to name.
+        ///
+        /// Monotonic per project. A resolve quoting a token the server no longer holds is
+        /// answered as such rather than with an empty edit list, because "there was no import to
+        /// add" and "I have forgotten which item you mean" are opposite claims and only one of
+        /// them is safe to act on silently.
+        token: u32,
+        items: Vec<CompletionItem>,
+        /// LSP's `isIncomplete`: this list was computed for *this* prefix and the server wants to
+        /// be asked again as the user types. The client must not cache it across keystrokes.
+        incomplete: bool,
+        /// cide's own cap was hit — see `MAX_COMPLETIONS`. Distinct from `incomplete`, because
+        /// they are different claims: `incomplete` is the server saying "ask me again", this is
+        /// cide saying "I dropped some". Both independently forbid the client's fast path.
+        truncated: bool,
+    },
+    /// Nobody could be asked, or the wait ran out. Shown only for an explicit request.
+    Unavailable { reason: String },
+}
+
+/// The deferred half of one completion item, fetched when the user commits to it.
+///
+/// Deliberately **not** a whole [`CompletionItem`], though `completionItem/resolve` returns one.
+/// The client already has every field it draws; the only thing it lacks is the edits, and
+/// widening this would invite a caller to believe a second copy of a label that may have been
+/// re-rendered by the server in the meantime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum CompletionResolveAnswer {
+    /// The edits, possibly empty — the server resolved the item and it needs none after all.
+    Edits { extra_edits: Vec<CompletionEdit> },
+    /// The reply this item came from is no longer held, or the server could not be asked.
+    ///
+    /// **The caller must not treat this as "no edits".** Inserting `HashMap` without its `use`
+    /// line leaves the file not compiling, which is a worse outcome than not completing at all —
+    /// so the client refuses the accept and says why, rather than doing half of it.
+    Unavailable { reason: String },
+}

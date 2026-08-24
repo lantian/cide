@@ -16,6 +16,7 @@
     "check:claude-env": "node scripts/check-claude-env.mjs",
     "check:close": "node scripts/check-close-confirm.mjs",
     "check:commands": "node scripts/check-commands.mjs",
+    "check:completion": "node scripts/check-completion.mjs",
     "check:css-prefix": "node scripts/check-css-prefix.mjs",
     "check:detached": "node scripts/check-detached.mjs",
     "check:diff": "node scripts/check-diff-selection.mjs",

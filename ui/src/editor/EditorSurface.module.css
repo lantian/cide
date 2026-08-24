@@ -978,3 +978,138 @@
   font-size: var(--fs-ui-11);
   padding-left: 6px;
 }
+
+/* ==========================================================================================
+   The completion popup. (M25)
+
+   CodeMirror's `autocompletion()` brings a base theme whose colours are literals — the same
+   hazard `find.ts` cites as the reason the search panel was replaced — so every visible property
+   is restated here against the palette. Reached through `:global()` because the tooltip is
+   CodeMirror's DOM, and scoped under `.body` so it cannot leak to another surface's editor.
+
+   `icons: false` is set in `completion.ts`, which is what keeps CodeMirror's own Unicode glyphs
+   out of `::after` and lets `check:ui-icons` stay true. It also means CodeMirror creates **no**
+   icon element — the whole thing is inside `if (config.icons)` — so the kind badge below is not a
+   restyling of one, it is the replacement: `completion.ts` writes the text and a `data-cide-badge`
+   tone into the row itself, from the same `overlays/format.ts` table the File Structure popup and
+   Go-to-Symbol use.
+   ========================================================================================== */
+
+.body :global(.cm-tooltip.cm-tooltip-autocomplete) {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  /* `--shadow-2`: a free-floating surface the pointer (or a keystroke) summoned, which is the
+     rung menus, pickers and the switcher already sit on. */
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+  padding: 0;
+}
+
+.body :global(.cm-tooltip-autocomplete > ul) {
+  font-family: var(--font-mono);
+  font-size: var(--fs-code);
+  max-height: 17em;
+  margin: 0;
+  padding: var(--sp-1) 0;
+}
+
+.body :global(.cm-tooltip-autocomplete > ul > li) {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: 2px var(--sp-4);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.body :global(.cm-tooltip-autocomplete > ul > li[aria-selected]) {
+  background: var(--sel);
+  color: var(--text-hi);
+}
+
+/* The characters the user has actually typed, inside the label. CodeMirror wraps each matched
+   run in this, which is the one piece of feedback that makes filtering legible. */
+.body :global(.cm-completionMatchedText) {
+  text-decoration: none;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.body :global(.cm-tooltip-autocomplete > ul > li[aria-selected]) :global(.cm-completionMatchedText) {
+  color: var(--accent-hi);
+}
+
+/* `(use std::collections::HashMap)` — the import hint, and the popup's only warning that
+   accepting will also edit the top of the file. Dimmed, but not to `--faint`: it is the
+   difference between two otherwise identical rows. */
+.body :global(.cm-completionDetail) {
+  margin-left: 0;
+  font-style: normal;
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+
+/* The kind badge. Its *text* comes from `overlays/format.ts::completionBadge` and is written into
+   the DOM by `completion.ts` — CodeMirror's own icon element does not exist here, because
+   `icons: false` skips building it entirely, which is what keeps its Unicode glyphs out of
+   `::after` and `check:ui-icons` honest.
+
+   Fixed width so the labels line up whatever the badge says — `SNP` is three glyphs and `·` is
+   one, the same reason `Overlay.module.css`'s `.badge` is a fixed box. */
+.body :global([data-cide-badge]) {
+  flex: none;
+  width: 30px;
+  text-align: center;
+  font-size: var(--fs-ui-11);
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+}
+
+/* The tones, one per `BadgeTone`, in the same mapping `Overlay.module.css` uses for its own
+   badges — so a `function` reads blue in the completion popup, in the File Structure list and in
+   Go-to-Symbol rather than looking like three different things. `check:completion` pins that
+   every tone `completionBadge` can return has a rule here. */
+.body :global([data-cide-badge='accent']) {
+  color: var(--accent);
+}
+.body :global([data-cide-badge='blue']) {
+  color: var(--blue);
+}
+.body :global([data-cide-badge='cyan']) {
+  color: var(--cyan);
+}
+.body :global([data-cide-badge='yellow']) {
+  color: var(--yellow);
+}
+.body :global([data-cide-badge='green']) {
+  color: var(--green);
+}
+.body :global([data-cide-badge='purple']) {
+  color: var(--purple);
+}
+.body :global([data-cide-badge='dim']) {
+  color: var(--dim);
+}
+.body :global([data-cide-badge='faint']) {
+  color: var(--faint);
+}
+
+/* The label takes the rest of the row and clips rather than wrapping: a completion list whose
+   rows are different heights cannot be walked with the arrow keys at a glance, and rust-analyzer
+   emits labels long enough to wrap in a narrow split. */
+.body :global(.cm-completionLabel) {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A deprecated row is struck through and dimmed, never hidden — hiding one would be an editor
+   deciding a user may not call a function they can plainly see in their own dependency. It is
+   also already ranked last, by `completionGate.ts`'s boost. */
+.body :global(.cm-tooltip-autocomplete > ul > li:has([data-cide-deprecated])) :global(.cm-completionLabel) {
+  color: var(--faint);
+  text-decoration: line-through;
+}

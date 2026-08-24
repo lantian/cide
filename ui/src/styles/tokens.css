@@ -744,6 +744,15 @@
   --w-sidebar-ext: 252px;
   --w-minimap: 96px;
   /*
+   * The gutter between a split diff's two columns, where the connector ribbons are drawn. (M25)
+   *
+   * Theme-independent, so it is declared once here rather than in both palette blocks. Narrow on
+   * purpose: the ribbon has to read as a *join* between two documents, and past about 40px it
+   * starts to look like a third column that happens to have shapes in it. IDEA's is about this
+   * wide for the same reason.
+   */
+  --w-diff-connector: 34px;
+  /*
    * The one gutter width: the pane dividers, the sidebar's drag edge and the tool window's are
    * all this token, and the pane canvas pads its window-facing edge by half of it. 6px from the
    * mock originally; halved at the user's request — the visible line thins, while every

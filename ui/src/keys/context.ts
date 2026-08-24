@@ -79,6 +79,7 @@ export const HOST_FLAGS = [
   'contextMenuOpen',
   'sidebarFiles',
   'sidebarGit',
+  'diffFocused',
 ] as const
 
 /** Flags [`deriveContext`] computes. Every one is a fact about the workspace mirror. */

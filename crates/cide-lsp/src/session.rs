@@ -115,6 +115,20 @@ pub struct Session {
     init_options: Option<Value>,
 }
 
+/// What a server said about completion — see [`Session::completion_support`].
+///
+/// A struct with one field rather than a bare `Vec<char>`, so that the next thing this capability
+/// carries (`resolveProvider`, when a documentation panel wants it, or `allCommitCharacters`)
+/// costs a field rather than a change to every signature it passes through. That is the same
+/// argument `server::Caps` makes about itself one crate module over, at the scale where it has
+/// already been paid twice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionSupport {
+    /// The characters that open a completion by themselves, one `char` each. Possibly empty,
+    /// which means "only when the client asks" and is not a refusal.
+    pub triggers: Vec<char>,
+}
+
 impl Session {
     /// A session that has just sent `initialize`.
     ///
@@ -374,6 +388,47 @@ impl Session {
             Some(Value::Bool(yes)) => *yes,
             Some(Value::Object(_)) => true,
             _ => false,
+        }
+    }
+
+    /// Does this server answer `textDocument/completion`, and on which characters?
+    ///
+    /// The same `boolean | Options` reading [`Self::supports_references`] makes, with one
+    /// difference that is the reason this returns a struct rather than a `bool`:
+    /// `completionProvider` is the **only** capability cide consults that carries data as well as
+    /// a yes. `triggerCharacters` is a list — `[".", "::"]` for rust-analyzer, `["."]` for gopls —
+    /// and it decides whether a query counts as `TriggerKind::TriggerCharacter` or
+    /// `TriggerKind::Invoked`, which some servers answer differently.
+    ///
+    /// Note the asymmetry with its two neighbours: a bare `true` is a complete answer here
+    /// (a server may offer completion and declare no trigger characters at all, which means
+    /// "only when the client asks"), so an empty list is **not** a refusal.
+    ///
+    /// `None` before the handshake completes, and that is "nothing has said yet" rather than a
+    /// refusal — see [`crate::LspHandle::supports_completion`], where the racing-against-startup
+    /// case is decided, exactly as it is for references.
+    pub fn completion_support(&self) -> Option<CompletionSupport> {
+        match self.capabilities.get("completionProvider") {
+            Some(Value::Bool(true)) => Some(CompletionSupport::default()),
+            Some(Value::Object(options)) => Some(CompletionSupport {
+                triggers: options
+                    .get("triggerCharacters")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            // Single characters only. The spec says these *are* characters, but
+                            // a server sending `"->"` is not hypothetical (some do, meaning the
+                            // last character of it), and a multi-character entry can never match
+                            // the one character the caller looked at. Taking the last character
+                            // is what makes `"->"` behave as the `>` it effectively is; dropping
+                            // the entry would silently lose the trigger.
+                            .filter_map(|entry| entry.chars().next_back())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
+            _ => None,
         }
     }
 
@@ -669,6 +724,108 @@ fn initialize_params(
                  * `references` block gives.
                  */
                 "implementation": { "dynamicRegistration": false, "linkSupport": false },
+                /*
+                 * Code completion. (M25)
+                 *
+                 * Every key below is a statement about what `convert::completion` and
+                 * `ui/src/editor/completion.ts` actually do with the reply, and three of them
+                 * change what a *conforming* server is allowed to send. Each is declared
+                 * explicitly rather than omitted, for the reason `definition`'s `linkSupport`
+                 * gives: an absent capability and one declared false are the same thing to a
+                 * server and very different things to the next person reading this list.
+                 *
+                 * # `resolveSupport` is the auto-import switch, and it works backwards
+                 *
+                 * This is the load-bearing key in the block, and the plan for this feature had
+                 * it exactly inverted. The reasoning that looks right is: `resolveSupport` means
+                 * *"defer the expensive fields, I will ask again"*, so a client that declares
+                 * nothing gets complete items including `additionalTextEdits`, and auto-import
+                 * costs no second round trip.
+                 *
+                 * **Measured against rust-analyzer 1.92, that is not what happens.** With this
+                 * key absent it offers *no auto-import candidates at all* — `HashMap` is simply
+                 * not in the list, alongside `Vec` and `String` which are already in scope. It
+                 * gates flyimport on the client's ability to resolve `additionalTextEdits`
+                 * lazily, because computing an import edit for every candidate in std eagerly is
+                 * work it will not do. So declaring nothing does not buy eager edits; it buys no
+                 * feature. `real_servers.rs::a_real_rust_analyzer_offers_an_import_edit_with_the_item`
+                 * is the standing proof, and it asserts the *absence* of the naive reading.
+                 *
+                 * `documentation` is in the list for a second, independent reason: it is sent
+                 * eagerly otherwise, it is markdown, and `HashMap`'s alone is six kilobytes. One
+                 * reply of 118 items measured **44 KB with it deferred**; the same reply carrying
+                 * documentation is an order of magnitude larger, for a panel this milestone does
+                 * not draw. `convert::completion` drops it even when it arrives.
+                 *
+                 * `detail` is deliberately **not** in the list. Deferring it would empty the
+                 * dimmed type beside every row until the user selected it, which is the one piece
+                 * of eager text the popup actually renders — and it costs 72 short strings, not
+                 * six kilobytes.
+                 *
+                 * # `labelDetailsSupport: true`
+                 *
+                 * Not cosmetic. With it false rust-analyzer folds the import hint *into the
+                 * label*, so the row reads `HashMap(use std::collections::HashMap)` and the popup
+                 * has no way to draw the two halves differently. With it true the label is
+                 * `HashMap`, `labelDetails.detail` is `(use std::collections::HashMap)` and
+                 * `labelDetails.description` is the type — three fields the popup can style,
+                 * instead of one string it would have to parse.
+                 *
+                 * # `snippetSupport: true`
+                 *
+                 * Without it rust-analyzer offers `push` where it would have offered
+                 * `push(${1:value})`, and gopls drops its parameter placeholders too. cide can
+                 * honour it because CodeMirror's snippet syntax is very nearly LSP's — see
+                 * `ui/src/editor/lspSnippet.ts`, which owns the differences and, where a template
+                 * cannot be represented faithfully, degrades to plain text rather than inserting
+                 * something mangled into the user's file.
+                 *
+                 * # `insertReplaceSupport: false`
+                 *
+                 * The same refusal `definition` makes about `LocationLink`, and it fails the same
+                 * way. With it true a server may answer with an `InsertReplaceEdit` — an object
+                 * carrying `insert` and `replace` ranges instead of a single `range` — and
+                 * `convert::completion` reads `range`. It would find none, fall through to the
+                 * client's own idea of the word, and splice the text at an offset the server
+                 * never named. Declared false and pinned by the handshake test, so turning it on
+                 * has to be a deliberate edit in two places.
+                 *
+                 * # `commitCharactersSupport: false`
+                 *
+                 * A commit character accepts the highlighted row *as a side effect of typing
+                 * something else* — `(` completing the function you were only half looking at.
+                 * Tab and Enter are the accept keys here, and a third invisible one that fires
+                 * as a side effect of typing punctuation is the behaviour people turn off first.
+                 * Nothing reads `commitCharacters`, so nothing is lost by saying so.
+                 *
+                 * # `contextSupport: true`
+                 *
+                 * We send `context.triggerKind`, and `triggerCharacter` when the character before
+                 * the caret is one the server declared. `cide_app::lsp::ProjectDiagnostics::
+                 * completion` builds it; the trigger list never leaves Rust.
+                 *
+                 * # `deprecatedSupport` and `tagSupport` together
+                 *
+                 * The field was deprecated in favour of the tag in LSP 3.15 and servers still
+                 * send both, so cide reads both and says so twice. `tagSupport.valueSet: [1]` is
+                 * `Deprecated`; there is no second tag in the spec.
+                 */
+                "completion": {
+                    "dynamicRegistration": false,
+                    "contextSupport": true,
+                    "completionItem": {
+                        "snippetSupport": true,
+                        "insertReplaceSupport": false,
+                        "commitCharactersSupport": false,
+                        "deprecatedSupport": true,
+                        "preselectSupport": false,
+                        "labelDetailsSupport": true,
+                        "tagSupport": { "valueSet": [1] },
+                        "resolveSupport": {
+                            "properties": ["documentation", "additionalTextEdits"],
+                        },
+                    },
+                },
             },
         },
     });
@@ -843,6 +1000,53 @@ mod tests {
             caps["textDocument"]["implementation"]["linkSupport"],
             json!(false)
         );
+        /*
+         * Completion. (M25)
+         *
+         * `resolveSupport` is asserted **present, and containing `additionalTextEdits`**, which is
+         * the opposite of what it looks like it should be and is the whole auto-import feature.
+         * rust-analyzer offers *no auto-import candidates at all* to a client that cannot resolve
+         * edits lazily — measured, and pinned by
+         * `real_servers.rs::a_real_rust_analyzer_offers_an_import_edit_with_the_item`. Dropping
+         * this key reads like removing an unused option and silently deletes the feature, which is
+         * why it is asserted here as well as there: this test runs in CI and that one does not.
+         */
+        let completion = &caps["textDocument"]["completion"];
+        let resolves = completion["completionItem"]["resolveSupport"]["properties"]
+            .as_array()
+            .expect("resolveSupport.properties must be declared — see the handshake");
+        assert!(
+            resolves.contains(&json!("additionalTextEdits")),
+            "without `additionalTextEdits` in `resolveSupport`, rust-analyzer offers no \
+             auto-import candidates whatsoever"
+        );
+        // `documentation` is deferred too, for payload rather than for correctness: it is markdown,
+        // `HashMap`'s alone is 6 KB, and no surface in this milestone draws it.
+        assert!(resolves.contains(&json!("documentation")));
+        // Snippets, and the two refusals. `insertReplaceSupport: false` is the same refusal
+        // `definition` makes about `LocationLink` and fails the same way — `convert::completion`
+        // reads `range`, so an `InsertReplaceEdit` would splice text at an offset the server never
+        // named.
+        assert_eq!(completion["completionItem"]["snippetSupport"], json!(true));
+        assert_eq!(
+            completion["completionItem"]["insertReplaceSupport"],
+            json!(false)
+        );
+        // A commit character accepts a row as a side effect of typing punctuation. Tab is the
+        // accept key here, deliberately, and nothing reads `commitCharacters`.
+        assert_eq!(
+            completion["completionItem"]["commitCharactersSupport"],
+            json!(false)
+        );
+        // Without this rust-analyzer folds the import hint into the *label* —
+        // `HashMap(use std::collections::HashMap)` — and the popup cannot style the halves apart.
+        assert_eq!(
+            completion["completionItem"]["labelDetailsSupport"],
+            json!(true)
+        );
+        // We send `context.triggerKind`, so we must say we can.
+        assert_eq!(completion["contextSupport"], json!(true));
+
         // We answer `workspace/configuration`, so we must say we can.
         assert_eq!(caps["workspace"]["configuration"], json!(true));
         assert_eq!(

@@ -853,3 +853,275 @@ fn gopls_re_diagnoses_a_file_it_was_told_changed_on_disk() {
          Go file the user has not opened depends on this notification. Seen after it: {after:#?}"
     );
 }
+
+// ==========================================================================================
+// Completion. (M25)
+// ==========================================================================================
+
+/// Drive `textDocument/completion` against a live server until `enough` is satisfied.
+///
+/// # Why the predicate, and not "until the list is non-empty"
+///
+/// That was the first version and it is subtly useless against rust-analyzer, which was worth
+/// six wasted seconds to learn: **a non-empty completion list arrives long before a useful one**.
+/// Within a second of `Ready` the server will happily offer every macro in the prelude —
+/// `assert!(…)`, `format!(…)`, `self::` — because those need no dependency graph. Anything that
+/// requires std to have been indexed, which is every auto-import candidate, appears tens of
+/// seconds later. A loop that stops at the first non-empty reply therefore always samples the
+/// macro list and concludes the feature does not work.
+///
+/// So the caller says what it is waiting *for*. `Ready` is not a readiness signal for this
+/// question at all, and there is no other one to wait on — the honest thing is to keep asking.
+fn complete_until(
+    handle: &LspHandle,
+    uri: &str,
+    line: u32,
+    character: u32,
+    timeout: Duration,
+    enough: impl Fn(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    let requester = handle.requester();
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": character },
+        "context": { "triggerKind": 1 },
+    });
+    let deadline = Instant::now() + timeout;
+    let mut last = Vec::new();
+    while Instant::now() < deadline {
+        match requester.request(
+            "textDocument/completion",
+            params.clone(),
+            Duration::from_secs(15),
+        ) {
+            Ok(value) => {
+                // `CompletionItem[] | CompletionList | null` — the three shapes `convert` has to
+                // pick apart. Read all three here too, so this test cannot pass against a server
+                // whose shape `convert` would refuse.
+                let items = if value.is_array() {
+                    value.as_array().cloned().unwrap_or_default()
+                } else {
+                    value
+                        .get("items")
+                        .and_then(|i| i.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                if enough(&items) {
+                    return items;
+                }
+                // Kept so a failure can print the best list it ever saw rather than the empty one
+                // the last poll happened to return.
+                if items.len() > last.len() {
+                    last = items;
+                }
+            }
+            Err(error) => panic!("the completion request failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    last
+}
+
+/// **The claim the whole auto-import feature rests on — and it is not the obvious one.**
+///
+/// The plan for this feature assumed that declaring *no* `completionItem.resolveSupport` would
+/// make servers compute import edits eagerly, so accepting `HashMap` would bring its `use` line
+/// with it at no extra round trip. This test was written first to check that, and it is a good
+/// thing it was: **the reasoning is exactly backwards for rust-analyzer.**
+///
+/// Measured against 1.92, with `resolveSupport` absent, the completion list at a position naming
+/// an unimported `HashMap` contains `Vec`, `String`, `Option` and 114 other in-scope items, and
+/// **no `HashMap` at all**. rust-analyzer gates flyimport on the client's ability to resolve
+/// `additionalTextEdits` lazily, because computing an import path for every candidate in std is
+/// work it will not do up front. Declaring nothing does not buy eager edits — it buys no feature.
+///
+/// So this asserts the corrected shape, end to end through cide's own conversion rather than
+/// against raw JSON: the row exists, `convert` marks it as needing a resolve, and the resolve
+/// answers with the `use` line. It fails if any of the three regresses — including if somebody
+/// "simplifies" the handshake by dropping `resolveSupport`, which reads like removing an unused
+/// option and silently deletes auto-import.
+///
+/// It also pins two shapes that quietly break the popup rather than the feature: the label and
+/// the filter text differ (`HashMap` filters, and with `labelDetailsSupport` the import hint is a
+/// separate field rather than being glued into the label), and the reply is a bare array, which
+/// is one of the three shapes `convert::completion` has to pick apart.
+#[test]
+#[ignore = "spawns the real rust-analyzer"]
+fn a_real_rust_analyzer_offers_an_import_edit_with_the_item() {
+    let dir = std::env::temp_dir().join(format!("cide-lsp-cmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"cmp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write");
+    // `HashMap` is named with no `use` in scope, so the only correct completion of it carries an
+    // import edit. Line 1 (0-based), character 19 — the end of `    let _x = HashMa`.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f() {\n    let _x = HashMa\n}\n",
+    )
+    .expect("write");
+
+    let handle = LspHandle::start(Server::RUST_ANALYZER, vec![dir.clone()]).expect("start");
+    let (up, seen) = wait_for(&handle, Duration::from_secs(180), ready);
+    assert!(
+        up,
+        "rust-analyzer never reached Ready.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => String::new(),
+        }
+    );
+
+    let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RUST_ANALYZER);
+    let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
+    if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
+        handle.send(message);
+    }
+
+    // Note the predicate — see `complete_until`. `Ready` is not a readiness signal for this
+    // question: the macro list arrives within a second of it and std minutes later.
+    let raw = complete_until(&handle, &uri, 1, 19, Duration::from_secs(180), |items| {
+        items
+            .iter()
+            .any(|item| item.get("label").and_then(|l| l.as_str()) == Some("HashMap"))
+    });
+    let labels: Vec<&str> = raw
+        .iter()
+        .filter_map(|i| i.get("label").and_then(|l| l.as_str()))
+        .take(20)
+        .collect();
+    let saw_hash_map = raw
+        .iter()
+        .any(|i| i.get("label").and_then(|l| l.as_str()) == Some("HashMap"));
+
+    // Through cide's own conversion, so this test covers the code that ships rather than a
+    // parallel reading of the same JSON.
+    let reply = cide_lsp::convert::completion(&serde_json::Value::Array(raw.clone()));
+    let converted = reply.as_ref().map(|reply| {
+        let row = reply
+            .items
+            .iter()
+            .find(|item| item.filter_text == "HashMap")
+            .cloned();
+        (row, reply.resolvable.clone())
+    });
+
+    // The resolve, driven the way `ProjectDiagnostics::resolve_completion` drives it: the
+    // *original* item back, whole, because the opaque `data` is how the server finds its way to
+    // the edit it deferred.
+    let resolved = converted.as_ref().and_then(|(row, resolvable)| {
+        let index = row.as_ref()?.resolve? as usize;
+        let original = resolvable.get(index)?.clone();
+        handle
+            .requester()
+            .request("completionItem/resolve", original, Duration::from_secs(20))
+            .ok()
+    });
+
+    // Everything read out before the handle drops, so a failing assertion cannot leave a 1–4 GB
+    // indexer behind.
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !raw.is_empty(),
+        "rust-analyzer offered no completions at all"
+    );
+    assert!(
+        saw_hash_map,
+        "rust-analyzer never offered `HashMap` within the deadline. If the list contains `Vec` \
+         and `String` this is **not** a timeout — it is the handshake: dropping \
+         `completionItem.resolveSupport` turns flyimport off entirely. The first 20 labels were \
+         {labels:?}"
+    );
+    let (row, _) = converted.expect("convert::completion refused a reply rust-analyzer sent");
+    let row = row.expect("`convert::completion` dropped the HashMap row");
+    assert_eq!(
+        row.label, "HashMap",
+        "the label should be the bare name — with `labelDetailsSupport` the import hint is a \
+         separate field, and a label of `HashMap(use std::collections::HashMap)` means that \
+         capability stopped being declared"
+    );
+    assert!(
+        row.detail
+            .is_some_and(|d| d.contains("use std::collections::HashMap")),
+        "the import hint should reach the popup as `labelDetails.detail`"
+    );
+    assert!(
+        row.resolve.is_some(),
+        "`convert::completion` did not mark the row as needing a resolve, so the client would \
+         accept it without ever fetching the import edit"
+    );
+    let resolved = resolved.expect("the resolve request failed");
+    let edits =
+        cide_lsp::convert::resolved_edits(&resolved).expect("the resolve reply was not an item");
+    let text: String = edits.iter().map(|edit| edit.text.as_str()).collect();
+    assert!(
+        text.contains("use std::collections::HashMap"),
+        "the resolve returned no import edit. **This is the claim the auto-import design rests \
+         on**; without it, accepting `HashMap` leaves the file not compiling. The edits were: \
+         {edits:?}"
+    );
+}
+
+/// The second server, and the proof this path is not rust-analyzer-shaped.
+///
+/// gopls answers with a `CompletionList` rather than a bare array, which is the other of the
+/// three reply shapes `convert::completion` has to pick apart — so this test fails if that
+/// branch is ever lost.
+#[test]
+#[ignore = "spawns the real gopls"]
+fn a_real_gopls_completes_a_struct_field() {
+    let dir = std::env::temp_dir().join(format!("cide-lsp-gocmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("go.mod"), "module cmp\n\ngo 1.21\n").expect("write");
+    std::fs::write(
+        dir.join("main.go"),
+        "package main\n\ntype Point struct {\n\tXCoord int\n\tYCoord int\n}\n\nfunc main() {\n\tp := Point{}\n\t_ = p.X\n}\n",
+    )
+    .expect("write");
+
+    let handle = LspHandle::start(Server::GOPLS, vec![dir.clone()]).expect("start");
+    let (up, seen) = wait_for(&handle, Duration::from_secs(120), ready);
+    assert!(
+        up,
+        "gopls never reached Ready.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => String::new(),
+        }
+    );
+
+    let uri = cide_lsp::convert::path_to_uri(&dir.join("main.go"));
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::GOPLS);
+    let text = std::fs::read_to_string(dir.join("main.go")).expect("read");
+    if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "go", 1, text) {
+        handle.send(message);
+    }
+
+    // Line 9 (0-based) is `\t_ = p.X`; character 8 is just after the `X`.
+    let items = complete_until(&handle, &uri, 9, 8, Duration::from_secs(90), |items| {
+        items
+            .iter()
+            .any(|item| item.get("label").and_then(|l| l.as_str()) == Some("XCoord"))
+    });
+    let labels: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.get("label").and_then(|l| l.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        labels.iter().any(|l| l == "XCoord"),
+        "gopls did not offer the field `XCoord`; it offered {labels:?}"
+    );
+}

@@ -205,6 +205,18 @@ impl DiagnosticsRegistry {
 /// working — the exact half-cancellation `cancel_usages` was written to prevent.
 type Outstanding = Mutex<Option<(cide_lsp::Requester, i64)>>;
 
+/// One completion reply's originals, kept until a newer one displaces it.
+/// See [`ProjectDiagnostics::completion_cache`].
+struct CompletionReplyCache {
+    token: u32,
+    server: Server,
+    /// Only the rows that had something deferred — `convert::CompletionReply::resolvable`.
+    items: Vec<serde_json::Value>,
+}
+
+/// How many replies' originals are held. See the field for why it is not one.
+const COMPLETION_CACHE_DEPTH: usize = 2;
+
 /// What the pump still owes the servers and the panel after a disk change. (M18)
 ///
 /// # Why the work is parked here rather than done where it is discovered
@@ -281,6 +293,39 @@ pub struct ProjectDiagnostics {
     stop: Arc<AtomicBool>,
     pump: Mutex<Option<std::thread::JoinHandle<()>>>,
     usages_in_flight: Outstanding,
+    /// The completion request in flight, if any — **its own slot, never `usages_in_flight`**.
+    ///
+    /// Sharing one slot is what `usages` and `implementations` deliberately do, because they
+    /// share one popup and starting either genuinely means abandoning the other. Completion
+    /// shares nothing with them: it fires on a keystroke, many times a second, and folding it in
+    /// would mean every character typed cancels a Find usages the user is waiting on. The
+    /// superseding *within* completion is still wanted — a newer keystroke's list is the only one
+    /// anybody will read — which is why it is a slot at all rather than nothing.
+    completion_in_flight: Outstanding,
+    /// The raw items of the last few completion replies, so an accepted row can be resolved.
+    ///
+    /// # Why a cache rather than a round trip through the webview
+    ///
+    /// `completionItem/resolve` takes the original item back, `data` and all. The webview could
+    /// carry it — an opaque string in the DTO, handed back on accept — and that is a real design
+    /// with no staleness in it at all. It was rejected on payload: the converted items measure
+    /// ~44 KB for a 118-row reply, and shipping the originals beside them roughly doubles that,
+    /// several times a second, while somebody types.
+    ///
+    /// # Why **two** replies and not one
+    ///
+    /// One is very nearly enough and fails in a way nobody would find. CodeMirror keeps showing
+    /// the list it has while a newer query is in flight, so there is a window — between a newer
+    /// reply landing here and CodeMirror swapping its options — where a Tab accepts a row from
+    /// the *previous* reply. With one slot that row's handle is already gone and its import is
+    /// silently not added. Holding the previous reply as well closes the window, and the cost is
+    /// one more list of the minority of rows that had anything deferred at all.
+    ///
+    /// Newest last. `Server` rides along because the resolve must go back to the server that
+    /// answered, and by then the path is not in the caller's hands.
+    completion_cache: Mutex<Vec<CompletionReplyCache>>,
+    /// Names each reply, so a resolve can say which one it means. Monotonic, never reused.
+    completion_token: std::sync::atomic::AtomicU32,
     /// What the pump owes after a disk change. See [`Kick`].
     kick: Arc<Kick>,
 }
@@ -326,6 +371,9 @@ impl ProjectDiagnostics {
             stop,
             pump: Mutex::new(pump),
             usages_in_flight: Mutex::new(None),
+            completion_in_flight: Mutex::new(None),
+            completion_cache: Mutex::new(Vec::new()),
+            completion_token: std::sync::atomic::AtomicU32::new(0),
             kick,
         }
     }
@@ -662,6 +710,264 @@ impl ProjectDiagnostics {
     /// popup that is gone.
     pub fn cancel_usages(&self) {
         let outstanding = self.usages_in_flight.lock().take();
+        if let Some((requester, id)) = outstanding {
+            requester.cancel(id);
+        }
+    }
+
+    /// The completion list at a position. (M25)
+    ///
+    /// **Blocks for up to `timeout`.** Blocking pool only, and the handles lock is cloned out and
+    /// dropped before the wait — the same two rules [`Self::definition`] states at length, and
+    /// they bite harder here: this runs on a keystroke, so holding the lock would stall the
+    /// project's diagnostics pump every time somebody types.
+    ///
+    /// `before` is the character immediately left of the caret, or `None` at the start of a line.
+    /// The webview sends it and this function decides what it *means*, because the meaning is the
+    /// server's declared `triggerCharacters` list and that list lives here. Handing the list to
+    /// the webview instead would have been a whole plumbing path — an event, a per-language
+    /// cache, an invalidation on restart — to move a fact three lines away from its only reader.
+    ///
+    /// Never returns an error type, like every one of its neighbours. Unlike them, the answer is
+    /// usually never read by anyone: an implicit query that fails is dropped silently in the
+    /// webview, because a popup that opens by itself cannot report its failures without becoming
+    /// a notification storm. See [`cide_ipc::CompletionAnswer`].
+    pub fn completion(
+        &self,
+        path: &std::path::Path,
+        line: u32,
+        column: u32,
+        before: Option<char>,
+        timeout: std::time::Duration,
+    ) -> cide_ipc::CompletionAnswer {
+        use cide_ipc::CompletionAnswer;
+
+        let (server, requester) = match self.requester_for(path) {
+            Ok(pair) => pair,
+            Err(missing) => {
+                return CompletionAnswer::Unavailable {
+                    reason: missing.sentence("Code completion"),
+                };
+            }
+        };
+
+        /*
+         * The capability, and the trigger list, read together in one pass over the handles.
+         *
+         * `Some(false)` is refused outright for `usages`' reason — asking a server that declared
+         * no `completionProvider` spends the whole deadline to learn what the handshake already
+         * said. `None` is *not* refused: rust-analyzer spends its first two minutes indexing and
+         * a user types during them.
+         *
+         * The lock is taken once for both. Two separate takes would be two chances to observe a
+         * restart half-way through and pair one life's capability with another's triggers.
+         */
+        let (known, triggers) = {
+            let handles = self.handles.lock();
+            match handles.iter().find(|handle| handle.server() == server) {
+                Some(handle) => (handle.supports_completion(), handle.completion_triggers()),
+                None => (None, std::sync::Arc::from(Vec::new())),
+            }
+        };
+        if known == Some(false) {
+            return CompletionAnswer::Unavailable {
+                reason: format!(
+                    "{} does not offer completion. It answered the handshake without \
+                     `completionProvider`.",
+                    server.binary()
+                ),
+            };
+        }
+
+        let mut params = position_params(path, line, column);
+        /*
+         * `context`, which cide declared `contextSupport: true` for.
+         *
+         * `2` is `TriggerCharacter` and `1` is `Invoked`. The distinction is not decoration: a
+         * server may legitimately answer a `.` differently from a Ctrl+Space at the same
+         * position — offering only members for the first and everything in scope for the second —
+         * and a client that always said `Invoked` would get the second answer for both.
+         *
+         * A character the server did **not** declare is `Invoked`, not `TriggerCharacter` with
+         * the character attached. Claiming a trigger the server never asked for is a statement
+         * about its own configuration that we are in no position to make.
+         */
+        params["context"] = match before.filter(|char| triggers.contains(char)) {
+            Some(char) => serde_json::json!({
+                "triggerKind": 2,
+                "triggerCharacter": char.to_string(),
+            }),
+            None => serde_json::json!({ "triggerKind": 1 }),
+        };
+
+        // Supersede whatever was outstanding — a newer keystroke's list is the only one anybody
+        // will read, and the old request is a whole-crate scan nobody is waiting for. Never
+        // touches `usages_in_flight`; see the field.
+        self.cancel_completion();
+        let slot = &self.completion_in_flight;
+        let mine = std::cell::Cell::new(0i64);
+        let answer = requester.request_tracked("textDocument/completion", params, timeout, |id| {
+            mine.set(id);
+            *slot.lock() = Some((requester.clone(), id));
+        });
+        // Cleared only if it is still ours — the race `usages` writes out at length, and it is
+        // reached far more often here because the superseding request is one keystroke away.
+        {
+            let mut in_flight = slot.lock();
+            if in_flight.as_ref().map(|(_, id)| *id) == Some(mine.get()) {
+                *in_flight = None;
+            }
+        }
+
+        match answer {
+            Ok(value) => match cide_lsp::convert::completion(&value) {
+                Some(reply) => {
+                    let token = self.remember_completion(server, reply.resolvable);
+                    CompletionAnswer::Items {
+                        token,
+                        items: reply.items,
+                        incomplete: reply.incomplete,
+                        truncated: reply.truncated,
+                    }
+                }
+                // `null` — the server has nothing to offer here. An empty *list* is the same
+                // thing to this caller, unlike `references` where the two mean opposite things,
+                // because "no symbol here" and "no completions here" both draw no popup.
+                None => CompletionAnswer::Items {
+                    // No rows, so nothing can name this reply. A token is still issued rather
+                    // than reusing zero, because "the reply with no resolvable rows" must not
+                    // collide with a real one in the cache.
+                    token: self.remember_completion(server, Vec::new()),
+                    items: Vec::new(),
+                    incomplete: false,
+                    truncated: false,
+                },
+            },
+            // Superseded by the next keystroke, which is the common outcome rather than an
+            // unusual one. It must stay distinguishable from an empty list all the same: the
+            // webview drops a cancellation without touching the popup, where an empty answer
+            // would close it — and a popup that blinks shut on every third character is the
+            // symptom this branch exists to prevent.
+            Err(cide_lsp::RequestError::Cancelled) => CompletionAnswer::Unavailable {
+                reason: "The completion request was superseded.".to_string(),
+            },
+            Err(cide_lsp::RequestError::Timeout) => CompletionAnswer::Unavailable {
+                reason: format!(
+                    "{} did not answer in time — it is probably still indexing. Try again in a moment.",
+                    server.binary()
+                ),
+            },
+            Err(error) => CompletionAnswer::Unavailable {
+                reason: format!("{}: {error}", server.binary()),
+            },
+        }
+    }
+
+    /// File this reply's originals and hand back the token that names them.
+    fn remember_completion(&self, server: Server, items: Vec<serde_json::Value>) -> u32 {
+        let token = self
+            .completion_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut cache = self.completion_cache.lock();
+        cache.push(CompletionReplyCache {
+            token,
+            server,
+            items,
+        });
+        // Oldest first out. A `Vec` and `remove(0)` rather than a `VecDeque`, because the depth
+        // is two: the shift is one move and the type stays the one a reader can hold in their
+        // head while checking the staleness rule below.
+        while cache.len() > COMPLETION_CACHE_DEPTH {
+            cache.remove(0);
+        }
+        token
+    }
+
+    /// Fetch the deferred half of one completion item — the `use` line, the `import` block. (M25)
+    ///
+    /// **Blocks for up to `timeout`.** Blocking pool only, same as its neighbours. Unlike them it
+    /// runs on an *accept* rather than on a keystroke, so it happens once per completion the user
+    /// commits to and its latency is directly in front of a Tab press.
+    ///
+    /// `token` and `index` name a row of a reply this project handed out. A token that is no
+    /// longer held is [`cide_ipc::CompletionResolveAnswer::Unavailable`] and **not** an empty edit
+    /// list — see that type for why the difference is the whole point.
+    pub fn resolve_completion(
+        &self,
+        token: u32,
+        index: u32,
+        timeout: std::time::Duration,
+    ) -> cide_ipc::CompletionResolveAnswer {
+        use cide_ipc::CompletionResolveAnswer as Answer;
+
+        // The item is cloned out and the guard dropped before anything waits — the same rule
+        // `requester_for` follows about `handles`, and for the same reason: the pump takes this
+        // lock too, through `remember_completion`, every time a completion answers.
+        let found = {
+            let cache = self.completion_cache.lock();
+            cache
+                .iter()
+                .find(|reply| reply.token == token)
+                .and_then(|reply| {
+                    reply
+                        .items
+                        .get(index as usize)
+                        .map(|item| (reply.server, item.clone()))
+                })
+        };
+        let Some((server, item)) = found else {
+            return Answer::Unavailable {
+                reason: "That completion is no longer available — the list moved on before it \
+                         could be accepted."
+                    .to_string(),
+            };
+        };
+
+        let requester = {
+            let handles = self.handles.lock();
+            handles
+                .iter()
+                .find(|handle| handle.server() == server)
+                .map(cide_lsp::LspHandle::requester)
+        };
+        let Some(requester) = requester else {
+            return Answer::Unavailable {
+                reason: format!("{} is no longer running.", server.binary()),
+            };
+        };
+
+        // Deliberately *not* tracked in `completion_in_flight`. That slot exists so a newer
+        // keystroke supersedes an older list; a resolve is the opposite kind of request — the
+        // user has already chosen, nothing supersedes it, and cancelling it would abandon an
+        // edit the accept is waiting on.
+        match requester.request("completionItem/resolve", item, timeout) {
+            Ok(value) => match cide_lsp::convert::resolved_edits(&value) {
+                Some(extra_edits) => Answer::Edits { extra_edits },
+                None => Answer::Unavailable {
+                    reason: format!("{} answered the resolve with no item.", server.binary()),
+                },
+            },
+            Err(cide_lsp::RequestError::Timeout) => Answer::Unavailable {
+                reason: format!(
+                    "{} did not finish working out the edit in time.",
+                    server.binary()
+                ),
+            },
+            Err(error) => Answer::Unavailable {
+                reason: format!("{}: {error}", server.binary()),
+            },
+        }
+    }
+
+    /// Withdraw the outstanding completion, if there is one.
+    ///
+    /// Called by the superseding request above and by the webview when the popup closes. Releases
+    /// the blocking-pool thread *and* sends `$/cancelRequest`, for [`Self::cancel_usages`]'
+    /// reason — with the volume argument on top: a user typing at speed supersedes a request per
+    /// keystroke, and without the protocol half each one leaves rust-analyzer computing a list
+    /// nobody will read, several deep, each starving the one the user is actually waiting for.
+    pub fn cancel_completion(&self) {
+        let outstanding = self.completion_in_flight.lock().take();
         if let Some((requester, id)) = outstanding {
             requester.cancel(id);
         }
