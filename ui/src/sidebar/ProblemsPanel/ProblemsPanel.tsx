@@ -298,7 +298,10 @@ function ProblemsPanelImpl({
                         </span>
                         <span className={styles.message}>{item.message}</span>
                         {item.code !== undefined && (
-                          <span className={styles.code}>{item.code}</span>
+                          // Its own `title`, because the column is now clippable (see the
+                          // stylesheet): a code ellipsized to `Undeclared…` must still be
+                          // readable somewhere, and the row's label does not carry it.
+                          <span className={styles.code} title={item.code}>{item.code}</span>
                         )}
                         <span className={styles.where}>{where}</span>
                       </>

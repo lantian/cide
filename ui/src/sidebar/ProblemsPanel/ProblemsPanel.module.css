@@ -265,14 +265,26 @@
 
 .message {
   flex: 1;
-  min-width: 0;
   /* Two lines of message beat an ellipsis in a 252px panel: a truncated compiler error is
      usually truncated exactly where it becomes useful. */
   overflow-wrap: anywhere;
+  /* A floor, not `min-width: 0`. With 0 here and `flex: none` on `.code`, a long diagnostic
+     code owned the row — gopls's `UndeclaredImportedName` left this span one character wide,
+     and `overflow-wrap: anywhere` then broke the message one letter per line down the panel.
+     rust-analyzer never showed it because its codes are `E0308`-short. The floor makes the
+     code column the one that gives way instead. */
+  min-width: 50%;
 }
 
 .code {
-  flex: none;
+  /* Shrinkable, unlike `.where`: a code is a name and survives clipping (the span carries the
+     full code in its `title`), a position does not. `flex: none` here is what let
+     `UndeclaredImportedName` squeeze the message out of its own row — see `.message`. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--faint);
