@@ -29,7 +29,7 @@
  * a closure rather than an import so `paneHosts.ts` never depends on this module (this
  * module imports it, and the pair would otherwise be a cycle).
  */
-import { getHost, noteParsed, setHostBusy } from '@/layout/paneHosts'
+import { getHost, noteParsed, setHostBusy, takeSavedScrollback } from '@/layout/paneHosts'
 import {
   diag,
   events,
@@ -421,16 +421,38 @@ async function attach(link: Link): Promise<void> {
   const { term } = handle
   const geo = measureGeometry(paneId)
 
-  // The ack goes in `term.write`'s completion callback, not at delivery. Delivery only
+  // The ack is taken in `term.write`'s completion callback, not at delivery. Delivery only
   // means the bytes arrived; the callback fires once xterm has actually parsed them, which
   // is the rate the session should be pacing itself against. Acking on arrival would report
   // a speed this renderer cannot sustain and would turn credit control back into no control
   // at all. A parked pane keeps parsing — the write pipeline does not pause with the
   // renderer — so a parked pane keeps acking, which is what lets output flow while the
   // user is in another project.
+  //
+  // Taken in the callback, *reported* per task: xterm's write loop parses several queued
+  // chunks per ~12ms slice and fires their completion callbacks in one JS task, and each
+  // ack is an `invoke` — a full trip across the GTK main loop. At `FLUSH_INTERVAL`'s 125
+  // frames/s per busy session that overhead is real, so the byte counts accumulate in the
+  // callback and one microtask flushes them: identical totals, one invoke per parse slice
+  // instead of one per chunk, and an ack never delayed past the task that earned it.
+  // `queueMicrotask` and nothing looser, deliberately — an occluded window throttles rAF
+  // and WebKit throttles hidden-window timers, a parked pane must keep acking by design,
+  // and `cide-pty`'s credit watchdog reads a 5s ack silence as a wedged sink.
+  let unacked = 0
+  let flushQueued = false
+  const flushAck = () => {
+    flushQueued = false
+    const bytes = unacked
+    unacked = 0
+    if (bytes > 0) paneSession.ack(paneId, session, bytes)
+  }
   const deliver = (bytes: Uint8Array) => {
     term.write(bytes, () => {
-      paneSession.ack(paneId, session, bytes.byteLength)
+      unacked += bytes.byteLength
+      if (!flushQueued) {
+        flushQueued = true
+        queueMicrotask(flushAck)
+      }
       // The same moment, told to the render watchdog. The bytes are in xterm's buffer
       // here; whether they ever reach the screen is a separate question, and the one
       // `terminal/renderStall.ts` exists to ask.
@@ -498,12 +520,18 @@ async function attach(link: Link): Promise<void> {
    * child's prompt; stuck on the normal one, cursor-addressed repaints land in rows that
    * have scrolled away. It costs one round trip per genuine attach.
    */
+  // Read-and-clear, before the plan: eviction parked the terminal's serialized buffer in
+  // the ledger so the scrollback the one-screen mirror cannot carry survives the round
+  // trip. Taking it here (rather than inside the `if` below) is what makes "exactly once"
+  // structural — a second attach finds nothing whatever the flags say.
+  const saved = takeSavedScrollback(paneId)
   const plan = hydrationPlan({
     hydrated: host.hydrated,
     needsReset: host.needsReset,
     termOnAlt: term.buffer.active.type === 'alternate',
     mirrorOnAlt: alt,
     snapshotEmpty: screen.byteLength === 0,
+    savedScrollback: saved !== null,
   })
   if (plan.dropHydratedForAltDrift) {
     host.hydrated = false
@@ -521,6 +549,10 @@ async function attach(link: Link): Promise<void> {
     // mirror replaces that rather than following it.
     if (plan.reset) term.reset()
     if (host.needsReset) host.needsReset = false
+    // Before the snapshot, which opens with a clear-screen and paints the *current* rows
+    // over the replayed viewport — see `HydrationPlan.replayScrollback` for the ordering
+    // argument. The scrollback above the fold is what survives.
+    if (plan.replayScrollback && saved !== null) term.write(saved)
     if (plan.writeSnapshot) term.write(new Uint8Array(screen))
     host.hydrated = true
   }

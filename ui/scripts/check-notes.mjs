@@ -364,7 +364,9 @@ try {
   )
   const appCode = stripComments(app)
   ok(
-    /onOpenPin=\{\(id\) =>/.test(appCode) && /runCommand\('file\.projectNotes'/.test(appCode),
+    // The handler moved into a pinned `useCallback` (`onOpenPin`) for the memoised
+    // Explorer's sake; the command routing it asserts is unchanged.
+    /onOpenPin=\{onOpenPin\}/.test(appCode) && /runCommand\('file\.projectNotes'/.test(appCode),
     "`App.tsx` routes the pin's open through the COMMAND, so the double-click, the menu item " +
       'and the palette row cannot behave in three ways',
   )

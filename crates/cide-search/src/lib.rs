@@ -234,6 +234,17 @@ impl Default for NucleoMatcher {
     }
 }
 
+/// Worker threads per matcher.
+///
+/// `None` asks nucleo for a rayon pool of `available_parallelism()` threads, each of which
+/// zero-allocates a ~125 KiB scoring slab up front — and cide builds a matcher per concern
+/// per project (files, symbols, libraries), so on a 32-core host three open projects held
+/// **288 idle worker threads** and ~12 MiB of slabs per project, measured on the live
+/// process. Four workers score a 100k-candidate frame well inside a keystroke;
+/// `tests/latency.rs` is the gate that says so, and the `min` keeps a two-core host from
+/// being asked for threads it does not have.
+const MATCH_WORKERS: usize = 4;
+
 impl NucleoMatcher {
     pub fn new() -> Self {
         let dirty = std::sync::Arc::new(AtomicBool::new(false));
@@ -244,7 +255,10 @@ impl NucleoMatcher {
         // `match_paths` is not cosmetic: it changes the bonus table so that a match after a
         // `/` scores like a match at the start of a word. Without it `mod.rs` ranks the same
         // wherever the characters land, and typing `srmn` does not find `src/main.rs`.
-        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), notify, None, 1);
+        let workers = std::thread::available_parallelism()
+            .map_or(MATCH_WORKERS, std::num::NonZeroUsize::get)
+            .min(MATCH_WORKERS);
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), notify, Some(workers), 1);
         let injector = RwLock::new(nucleo.injector());
         Self {
             inner: Mutex::new(nucleo),

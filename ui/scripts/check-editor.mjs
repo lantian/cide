@@ -2133,8 +2133,12 @@ try {
     'App.tsx routes navigation through `jumpTo` — without it a search hit opens the file at ' +
       'the top, and the jump is missing from the Back stack',
   )
+  // The handler moved into a pinned `useCallback` (`onOpenHit`) so the memoised SearchPanel's
+  // props stay stable; the assertion follows it there — same intent, all four arguments.
   ok(
-    /onOpenHit=\{\(path, line, column, endColumn\)/.test(appSrc),
+    /const onOpenHit = useCallback\(\s*\(path: string, line: number, column: number, endColumn: number\)/.test(
+      appSrc,
+    ) && /onOpenHit=\{onOpenHit\}/.test(appSrc),
     'App.tsx receives all four `onOpenHit` arguments — dropping them is how this shipped dead',
   )
 

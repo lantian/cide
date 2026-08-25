@@ -36,7 +36,7 @@
  * the pane, so by the time `term.focus()` fires its event there is nothing left for it to do.
  */
 import { peekHost } from '@/layout/paneHosts'
-import { project as projectApi, sendFocus, type PaneId, type ProjectId } from '@/ipc/client'
+import { sendFocus, type PaneId, type ProjectId } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { planReveal } from './revealTarget'
 
@@ -92,14 +92,12 @@ export async function revealPane(project: ProjectId, pane: PaneId): Promise<stri
        * then brings a window forward still showing a different project, which is the silent
        * nothing this whole change exists to fix.
        *
-       * Its own `hydrate` rather than leaning on `activateTab`'s: the tab may already be the
+       * Its own wait rather than leaning on `activateTab`'s: the tab may already be the
        * project's active one, in which case `activateTab` is skipped and the mirror would
-       * keep naming the old project until some unrelated event moved it.
+       * keep naming the old project until some unrelated event moved it. Through the store's
+       * mutator, which waits for the broadcast that moves `role.active`.
        */
-      if (plan.activateProject) {
-        await projectApi.activate(project)
-        await ws.hydrate()
-      }
+      if (plan.activateProject) await ws.activateProject(project)
       if (plan.activateTab) await ws.activateTab(project, tab)
       if (plan.clearMaximize) await ws.maximizePane(project, tab, null)
       if (plan.focusPane) await ws.focusPane(project, tab, pane)

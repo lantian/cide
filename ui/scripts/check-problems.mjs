@@ -551,8 +551,11 @@ try {
     /<ProblemsPanel[\s\S]{0,400}snapshot=\{/.test(app),
     'App.tsx passes a live snapshot to ProblemsPanel rather than letting it default to NO_SOURCE',
   )
+  // The derivation moved into one `useMemo` (`diagCounts`) so the rail and the status bar
+  // share one identity per snapshot — same intent, one call instead of two.
   ok(
-    app.includes('diagnostics={statusBarCounts('),
+    /const diagCounts = useMemo\(\(\) => statusBarCounts\(diagnostics\.snapshot\)/.test(app) &&
+      app.includes('diagnostics={diagCounts}'),
     'and derives the status bar’s counts from that same snapshot, so the two cannot disagree',
   )
   ok(
@@ -733,7 +736,9 @@ try {
     'App.tsx wires the Re-run control, so the button is not merely renderable',
   )
   ok(
-    /<ProblemsPanel[\s\S]{0,900}onRestartSource=\{/.test(app),
+    // The window is wider than `onRefresh`'s above because the routing comments sit between
+    // the two props since the handlers moved into pinned `useCallback`s.
+    /<ProblemsPanel[\s\S]{0,1600}onRestartSource=\{/.test(app),
     'and the per-source Restart, which is the first caller `diagnostics.restart` has ever had',
   )
   {

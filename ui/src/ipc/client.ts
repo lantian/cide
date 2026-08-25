@@ -15,6 +15,7 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   Axis,
   Bootstrap,
+  Capabilities,
   ColorScheme,
   CompletionAnswer,
   CompletionResolveAnswer,
@@ -116,6 +117,15 @@ export const app = {
    * degraded IPC path is visible as flicker.
    */
   getBootstrap: () => invoke<Bootstrap>('app_get_bootstrap'),
+
+  /**
+   * The current workspace revision — one lock, one number.
+   *
+   * For `synced()` in the workspace store: a mutation whose command answers with no `rev`
+   * of its own still needs a target revision to wait for, and this is that target at the
+   * cost of a `u64` rather than a whole `Bootstrap`.
+   */
+  workspaceRev: () => invoke<number>('workspace_rev'),
 
   /**
    * What each pane should become on launch: resume its conversation, or start clean.
@@ -1280,6 +1290,19 @@ export const events = {
   onSchemesChanged: (handler: (schemes: ColorScheme[]) => void) =>
     listen<{ schemes: ColorScheme[] }>('cide://schemes-changed', (e) =>
       handler(e.payload.schemes),
+    ),
+
+  /**
+   * The configured Claude CLI changed, so what this build can do changed with it.
+   *
+   * `onKeymapChanged`'s reason again: capabilities ride `Bootstrap` and no workspace
+   * snapshot carries them, and the per-gesture hydrates that used to refresh them
+   * opportunistically are gone — this event is the only road a binary change has into the
+   * headers of the other windows.
+   */
+  onCapabilitiesChanged: (handler: (capabilities: Capabilities) => void) =>
+    listen<{ capabilities: Capabilities }>('cide://capabilities-changed', (e) =>
+      handler(e.payload.capabilities),
     ),
 
   /**

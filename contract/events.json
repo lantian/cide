@@ -1,5 +1,6 @@
 [
   "cide://agents-changed",
+  "cide://capabilities-changed",
   "cide://close-blocked",
   "cide://diagnostics",
   "cide://ext-changed",

@@ -6,6 +6,7 @@
 // M18: the `$CIDE_AGENT_SOCK` server — the task tools a dispatched agent and the project's own
 // orchestrator reach over a unix socket, scoped from the connection's header line.
 pub mod agent_rpc;
+pub mod caps;
 // M18: the run registry — the queue, the slots and every dispatched subagent run. The spawn
 // itself is the ordinary session path (`SpawnSpec` -> `PtySession` -> `SessionRegistry`), which
 // is what makes the shutdown ladder and the orphan sweep cover runs with no second
@@ -332,10 +333,15 @@ pub fn run() {
         // number of installed extensions, and doing it lazily would mean the first window's
         // bootstrap raced it.
         .manage(ext_state::ExtState::new())
+        // The cached `claude --version`. Managed empty and warmed from `setup` on a blocking
+        // worker, so the first window's bootstrap is a cache hit instead of a fork on the
+        // main loop — see `caps::ClaudeVersion`.
+        .manage(caps::ClaudeVersion::default())
         .invoke_handler(tauri::generate_handler![
             cmd::app::app_quit_requested,
             cmd::app::app_ready,
             cmd::app::app_get_bootstrap,
+            cmd::app::workspace_rev,
             cmd::app::window_set_viewport,
             cmd::diag::diag_echo_bytes,
             cmd::diag::diag_push_bytes,
@@ -636,10 +642,12 @@ pub fn run() {
 
                 // A window that has gone takes its focus record with it, so a reused label
                 // can never inherit "the user is already in there" and fall silent for ever.
+                // The announcement cache goes with it for the same reason: a stale entry
+                // would swallow the first real title of a window that reused the label.
                 tauri::WindowEvent::Destroyed => {
-                    crate::windows::forget_focused(&cide_ipc::WindowLabel(
-                        window.label().to_string(),
-                    ));
+                    let label = cide_ipc::WindowLabel(window.label().to_string());
+                    crate::windows::forget_focused(&label);
+                    crate::windows::forget_announced(&label);
                 }
 
                 _ => {}
@@ -652,6 +660,20 @@ pub fn run() {
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());
+
+            // Warm the `claude --version` cache off the main thread, against the binary the
+            // restored workspace names, so the first window's bootstrap is a lookup rather
+            // than a fork racing the fork. Losing the race costs one extra probe, not a
+            // wrong answer — see `caps::ClaudeVersion::get`.
+            {
+                let versions = app.state::<caps::ClaudeVersion>().inner().clone();
+                let binary = app
+                    .state::<WorkspaceState>()
+                    .with(|ws| ws.settings.claude.cli.binary.clone());
+                tauri::async_runtime::spawn_blocking(move || {
+                    versions.get(&binary, cmd::app::claude_version);
+                });
+            }
 
             // The view-position store's own flusher. Its own thread and its own timer because
             // there is no app tick to hang it on — `WorkspaceState::flush_if_due` documents one

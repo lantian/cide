@@ -67,11 +67,14 @@ try {
     termOnAlt: false,
     mirrorOnAlt: false,
     snapshotEmpty: false,
+    savedScrollback: false,
   }
+  /** The plan's quiet fields, so each case below states only what it is about. */
+  const noReplay = { replayScrollback: false }
 
   eq(
     hydrationPlan(fresh),
-    { hydrate: true, reset: false, writeSnapshot: true, dropHydratedForAltDrift: false },
+    { hydrate: true, reset: false, ...noReplay, writeSnapshot: true, dropHydratedForAltDrift: false },
     'a fresh terminal reads the mirror, without a reset — there is nothing to replace',
   )
 
@@ -79,7 +82,7 @@ try {
   // must not be handed them again.
   eq(
     hydrationPlan({ ...fresh, hydrated: true }),
-    { hydrate: false, reset: false, writeSnapshot: false, dropHydratedForAltDrift: false },
+    { hydrate: false, reset: false, ...noReplay, writeSnapshot: false, dropHydratedForAltDrift: false },
     'a hydrated terminal on the right buffer writes nothing — a second write is a second transcript',
   )
 
@@ -87,7 +90,7 @@ try {
   // snapshot replaces rather than follows.
   eq(
     hydrationPlan({ ...fresh, needsReset: true }),
-    { hydrate: true, reset: true, writeSnapshot: true, dropHydratedForAltDrift: false },
+    { hydrate: true, reset: true, ...noReplay, writeSnapshot: true, dropHydratedForAltDrift: false },
     'a released host resets before the snapshot — append would show the stale screen twice',
   )
 
@@ -95,7 +98,7 @@ try {
   // skipped, because an undefined screen is not a screen.
   eq(
     hydrationPlan({ ...fresh, needsReset: true, snapshotEmpty: true }),
-    { hydrate: true, reset: true, writeSnapshot: false, dropHydratedForAltDrift: false },
+    { hydrate: true, reset: true, ...noReplay, writeSnapshot: false, dropHydratedForAltDrift: false },
     'an empty snapshot skips the write but not the phase — the flags are consumed exactly once',
   )
 
@@ -104,13 +107,35 @@ try {
   // carries the buffer switch *and* the screen that belongs to it.
   eq(
     hydrationPlan({ ...fresh, hydrated: true, mirrorOnAlt: true }),
-    { hydrate: true, reset: false, writeSnapshot: true, dropHydratedForAltDrift: true },
+    { hydrate: true, reset: false, ...noReplay, writeSnapshot: true, dropHydratedForAltDrift: true },
     'a hydrated terminal on the primary buffer while the child paints the alternate repaints',
   )
   eq(
     hydrationPlan({ ...fresh, hydrated: true, termOnAlt: true }),
-    { hydrate: true, reset: false, writeSnapshot: true, dropHydratedForAltDrift: true },
+    { hydrate: true, reset: false, ...noReplay, writeSnapshot: true, dropHydratedForAltDrift: true },
     'and the other direction — stuck on the alternate buffer — repaints too',
+  )
+
+  // The eviction-scrollback replay: an evicted host's serialized buffer is written before
+  // the snapshot on the fresh host's FIRST hydration, and nowhere else. The mirror is one
+  // screen, so without the replay an evicted pane came back with no history at all.
+  eq(
+    hydrationPlan({ ...fresh, savedScrollback: true }),
+    {
+      hydrate: true,
+      reset: false,
+      replayScrollback: true,
+      writeSnapshot: true,
+      dropHydratedForAltDrift: false,
+    },
+    'a fresh host with a saved buffer replays it before the snapshot — eviction must not cost the scrollback',
+  )
+  eq(
+    hydrationPlan({ ...fresh, hydrated: true, mirrorOnAlt: true, savedScrollback: true })
+      .replayScrollback,
+    false,
+    'the drift repair never replays — the terminal already holds a transcript, and a replay ' +
+      'there is the split-remount duplication bug rebuilt out of the eviction fix',
   )
 
   // Drift is a claim about a *hydrated* terminal. A fresh one on a different buffer than
@@ -195,14 +220,33 @@ try {
   // The ack is taken from `term.write`'s completion callback, beside `noteParsed`: acking on
   // arrival reports a speed the renderer cannot sustain and turns credit control back into
   // no control at all, and `noteParsed` anywhere else makes a claim about the transport
-  // rather than the renderer.
+  // rather than the renderer. The *report* is coalesced per JS task — the callback
+  // accumulates the byte count and a microtask flushes it — so the invariant splits into
+  // three pins: the count is taken in the callback, the flush that spends it is the one
+  // caller of `paneSession.ack`, and the flush rides `queueMicrotask` and nothing looser
+  // (rAF stops in occluded windows and WebKit throttles hidden-window timers, while a
+  // parked pane must keep acking and the pty credit watchdog reads silence as a wedge).
   const sink = src('src/panes/sessionSink.ts')
   const writeCb = sink.slice(sink.indexOf('term.write(bytes, () => {'))
   const cbBody = writeCb.slice(0, writeCb.indexOf('})'))
   ok(
-    cbBody.includes('paneSession.ack(') && cbBody.includes('noteParsed('),
-    'sessionSink.ts acks and notes parsing inside term.write s completion callback — both are ' +
-      'claims about bytes xterm has parsed, not bytes that merely arrived',
+    cbBody.includes('unacked += bytes.byteLength') && cbBody.includes('noteParsed('),
+    'sessionSink.ts counts parsed bytes and notes parsing inside term.write s completion ' +
+      'callback — both are claims about bytes xterm has parsed, not bytes that merely arrived',
+  )
+  const flush = sink.slice(sink.indexOf('const flushAck = () => {'))
+  const flushBody = flush.slice(0, flush.indexOf('\n  }'))
+  ok(
+    flushBody.includes('paneSession.ack('),
+    'the microtask flush is what spends the accumulated count on paneSession.ack — the byte ' +
+      'totals must be identical to per-chunk acking, only the invoke count drops',
+  )
+  ok(
+    cbBody.includes('queueMicrotask(flushAck)') &&
+      !cbBody.includes('requestAnimationFrame') &&
+      !cbBody.includes('setTimeout'),
+    'the ack flush rides queueMicrotask, never rAF or a timer — both stop in hidden windows, ' +
+      'and a parked pane keeps acking by design',
   )
 
   // Watchdog fix 1 stays wired: the mount path arms a stall check for a pane that returns

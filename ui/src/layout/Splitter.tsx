@@ -87,11 +87,21 @@ export function trackTemplate(f: number[]): string {
   return f.map((w) => `${w}fr`).join(' var(--w-splitter) ')
 }
 
-/** Write the template for `axis` onto a grid element, bypassing React entirely. */
+/**
+ * Write the template for `axis` onto a grid element, bypassing React entirely.
+ *
+ * Skips the write when the element already carries the exact string. `ChainNode` calls this
+ * from a no-dependency `useLayoutEffect` — deliberately, to repair a drag the domain clamped
+ * — so in the common case the value here is the one React just committed via the `style`
+ * prop, and re-writing it dirties style on every chain of every mounted tab in the same
+ * commit where `TabStrip` then reads layout. The drag path always writes a genuinely new
+ * string, so drags never hit the skip.
+ */
 export function applyTracks(grid: HTMLElement, axis: Axis, f: number[]): void {
   const template = trackTemplate(f)
-  if (axis === 'row') grid.style.gridTemplateColumns = template
-  else grid.style.gridTemplateRows = template
+  const prop = axis === 'row' ? 'gridTemplateColumns' : 'gridTemplateRows'
+  if (grid.style[prop] === template) return
+  grid.style[prop] = template
 }
 
 /** The two members divider `k` separates, and how much of the chain they own between them. */

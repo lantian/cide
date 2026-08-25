@@ -862,6 +862,11 @@ pub fn forget_focused(label: &WindowLabel) {
 /// One struct because they are one fact — *does this window hold a session that wants the
 /// user* — applied to the two surfaces a desktop offers. Returning them separately is how a
 /// window ends up flashing with `Awaiting: 0` in its title.
+///
+/// `PartialEq` because [`apply_announcement`] compares against what a window already wears:
+/// the *decision* stays a level, recomputed from the facts on every mutation, and only the
+/// redundant GTK calls are skipped.
+#[derive(Clone, PartialEq)]
 pub struct Announcement {
     /// The OS window title, `Awaiting: N` and all.
     pub title: String,
@@ -912,6 +917,55 @@ pub fn announce(base: &str, count: usize, focused: bool) -> Announcement {
         title: title_with(base, count),
         attention: count > 0 && !focused,
     }
+}
+
+/// What each window was last told to announce, so a repeat can be skipped.
+///
+/// Keyed by label string, same lifetime discipline as the focus set above: pruned on
+/// `Destroyed` so a reused label can never inherit a stale "already applied" and swallow
+/// the first real announcement of a new window.
+fn announced() -> &'static Mutex<std::collections::HashMap<String, Announcement>> {
+    static ANNOUNCED: OnceLock<Mutex<std::collections::HashMap<String, Announcement>>> =
+        OnceLock::new();
+    ANNOUNCED.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Apply one window's announcement, skipping the GTK calls when it is what the window
+/// already wears.
+///
+/// `retitle` runs on every accepted workspace mutation and recomputes every window's
+/// announcement from the current facts — that recomputation is the level and it stays. What
+/// does not need to stay is the *application*: `set_title` emits a GTK `notify` per call
+/// even for an identical string, and `request_user_attention` re-pokes the WM hint, and on
+/// every-mutation × every-window that is measurable stall on the main loop. Skipping the
+/// unchanged ones loses nothing, because a fact that moved always changes the computed
+/// `Announcement` for the window it moved in.
+///
+/// A window that does not exist yet is neither applied nor cached, so the first `retitle`
+/// after it appears cannot be swallowed by a cache entry written while it was absent.
+pub fn apply_announcement(app: &AppHandle, label: &WindowLabel, say: Announcement) {
+    if app.get_webview_window(label.as_str()).is_none() {
+        return;
+    }
+    {
+        let mut applied = announced()
+            .lock()
+            .expect("the announcement cache is never poisoned");
+        if applied.get(label.as_str()) == Some(&say) {
+            return;
+        }
+        applied.insert(label.as_str().to_string(), say.clone());
+    }
+    set_title(app, label, &say.title);
+    demand_attention(app, label, say.attention);
+}
+
+/// Forget a destroyed window's announcement, for [`forget_focused`]'s reason.
+pub fn forget_announced(label: &WindowLabel) {
+    announced()
+        .lock()
+        .expect("the announcement cache is never poisoned")
+        .remove(label.as_str());
 }
 
 /// Set one window's title, if it still exists.

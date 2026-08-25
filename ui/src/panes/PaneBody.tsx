@@ -28,6 +28,7 @@ import { RevisionPane } from './RevisionPane'
 import { MergePane } from './MergePane'
 import { ResumeSplash } from '@/windows/ResumeSplash'
 import { paneSessionId } from '@/layout/paneHosts'
+import { useShallow } from 'zustand/react/shallow'
 import { useWorkspace } from '@/store/workspace'
 import type { Bootstrap, DiffSpec, Pane, PaneId, PaneRestore, TabKind } from '@/ipc/client'
 
@@ -38,9 +39,7 @@ type RevisionTab = Extract<TabKind, { kind: 'revision' }>
 type MergeTab = Extract<TabKind, { kind: 'merge' }>
 
 /**
- * The revision tab this pane belongs to, or `null`.
- *
- * # Why this is read off the mirror instead of being passed in
+ * # Why the tab kind is read off the mirror instead of being passed in
  *
  * Every other document branch below is told what its tab is: `App.tsx` computes `diff` and
  * `editor` from `tab.kind` and hands them down. That is one shape, and a `revision` prop beside
@@ -53,72 +52,53 @@ type MergeTab = Extract<TabKind, { kind: 'merge' }>
  * to thread a prop through. This project's most repeated defect is a prop that stops one
  * component short — `check:editor` asserts that `onScreen` is passed on in two files for exactly
  * that reason — and a tab kind that silently renders as a terminal is that defect with a spawn
- * on the end of it.
+ * on the end of it. The alternative — a `panes` index keyed by `PaneId` — would be a second
+ * structure to keep in step with the tree that already holds one.
  *
- * A `find` over a handful of tabs per render, on a component that already re-renders on every
- * snapshot because `App.tsx` maps the whole tree. The alternative — a `panes` index keyed by
- * `PaneId` — would be a second structure to keep in step with the tree that already holds one.
+ * # One walk, three answers
+ * What the owning tab makes of this pane: a revision document, a merge resolver, or neither.
+ *
+ * `revisionTabFor`'s siblings (`mergeTabFor`, `mergeTabIdFor`) used to be two more selectors
+ * of the same shape, and the trio cost three linear walks over every tab of the project, per
+ * pane, per store notification — O(panes × tabs) twice per gesture, which is real arithmetic
+ * with a dozen tabs and a dozen panes open. One walk answers all three questions, and it
+ * stops at the pane's *owning* tab: a pane lives in exactly one tab, so once that tab is
+ * found there is nothing further down the strip worth looking at.
+ *
+ * **Never a fresh object per hit** — the members are the mirror's own `tab.kind`, a plain
+ * string, or `null`, and every miss shares `NO_DOCUMENT`. The composite itself is fresh per
+ * call, which is exactly why the caller must read it through `useShallow`: member-wise the
+ * answer is stable between snapshots that did not move the tab, and `Object.is` on the
+ * wrapper would re-render this pane for every unrelated workspace change. That trap is the
+ * one `check:selectors` cannot see (the fresh value is built inside a named function rather
+ * than inline in the selector), which is why it is spelled out here. A spread like
+ * `{ ...tab.kind, id: tab.id }` would smuggle the same bug into a *member* — do not.
  */
-function revisionTabFor(
-  boot: Bootstrap | null,
-  project: string | undefined,
-  pane: PaneId,
-): RevisionTab | null {
-  if (boot === null || project === undefined) return null
-  const tabs = boot.workspace.projects[project]?.tabs
-  if (tabs === undefined) return null
-  for (const tab of tabs) {
-    if (tab.kind.kind === 'revision' && pane in tab.tree.panes) return tab.kind
-  }
-  return null
+interface DocumentTab {
+  revision: RevisionTab | null
+  merge: MergeTab | null
+  /** The merge tab's own id — the resolver closes its tab once the file is written. */
+  mergeTab: string | null
 }
 
-/**
- * The merge tab this pane belongs to, or `null`.
- *
- * `revisionTabFor`'s twin, and its header carries the argument for reading this off the mirror
- * rather than threading a prop.
- *
- * **Returns `tab.kind` itself, never a copy**, and the resolver's tab id is read by a *second*
- * selector below rather than folded in here. A spread — `{ ...tab.kind, id: tab.id }` — is a
- * fresh object on every store snapshot, which under `Object.is` equality re-renders this pane
- * for every unrelated workspace change. `check:selectors` exists for exactly that class and
- * does not catch it in this shape, because the fresh value is built inside a named function
- * rather than inline in the selector.
- */
-function mergeTabFor(
-  boot: Bootstrap | null,
-  project: string | undefined,
-  pane: PaneId,
-): MergeTab | null {
-  if (boot === null || project === undefined) return null
-  const tabs = boot.workspace.projects[project]?.tabs
-  if (tabs === undefined) return null
-  for (const tab of tabs) {
-    if (tab.kind.kind === 'merge' && pane in tab.tree.panes) return tab.kind
-  }
-  return null
-}
+const NO_DOCUMENT: DocumentTab = { revision: null, merge: null, mergeTab: null }
 
-/**
- * The id of the merge tab this pane belongs to — a plain string, so it compares by value.
- *
- * Split from `mergeTabFor` for the reason that function's header gives. The resolver needs it
- * because it closes its own tab once the file is written, and a pane cannot ask the workspace
- * which tab contains it from the inside.
- */
-function mergeTabIdFor(
+function documentTabFor(
   boot: Bootstrap | null,
   project: string | undefined,
   pane: PaneId,
-): string | null {
-  if (boot === null || project === undefined) return null
+): DocumentTab {
+  if (boot === null || project === undefined) return NO_DOCUMENT
   const tabs = boot.workspace.projects[project]?.tabs
-  if (tabs === undefined) return null
+  if (tabs === undefined) return NO_DOCUMENT
   for (const tab of tabs) {
-    if (tab.kind.kind === 'merge' && pane in tab.tree.panes) return tab.id
+    if (!(pane in tab.tree.panes)) continue
+    if (tab.kind.kind === 'revision') return { revision: tab.kind, merge: null, mergeTab: null }
+    if (tab.kind.kind === 'merge') return { revision: null, merge: tab.kind, mergeTab: tab.id }
+    // The owning tab, and it is neither — stop scanning: no other tab can hold this pane.
+    return NO_DOCUMENT
   }
-  return null
+  return NO_DOCUMENT
 }
 
 export interface PaneBodyProps {
@@ -231,21 +211,21 @@ export function PaneBody({
   const [resumed, setResumed] = useState(false)
 
   /*
-   * Is this pane's tab a `TabKind::Revision`? (M18)
+   * What this pane's tab makes of it — revision document, merge resolver, or neither. (M18)
    *
-   * A hook, so it belongs up here with the other two rather than beside the branch that uses it
-   * — see the paragraph above about hook order, which is the rule that makes this placement
+   * A hook, so it belongs up here rather than beside the branches that use it — see the
+   * paragraph above about hook order, which is the rule that makes this placement
    * non-negotiable rather than tidy.
    *
-   * The selector returns the tab's `kind` object, which is reference-stable within a snapshot
-   * and replaced wholesale by the next one; that costs nothing, because `App.tsx` maps the whole
-   * pane tree off the same snapshot and this component re-renders with it either way. What it
-   * must not do is build a new object per call — zustand compares with `Object.is` — so the
-   * lookup returns the mirror's own value or `null` and never a wrapper.
+   * One subscription over three, and through `useShallow` — the sanctioned escape
+   * `check:selectors` names — because `documentTabFor` builds a small composite whose
+   * *members* are the mirror's own values (or the shared `NO_DOCUMENT`): shallow-equal
+   * between snapshots that did not move the owning tab, never `Object.is`-equal as a
+   * wrapper. Its header carries the cost argument and the fresh-object trap in full.
    */
-  const revision = useWorkspace((s) => revisionTabFor(s.boot, project, pane.id))
-  const merge = useWorkspace((s) => mergeTabFor(s.boot, project, pane.id))
-  const mergeTab = useWorkspace((s) => mergeTabIdFor(s.boot, project, pane.id))
+  const { revision, merge, mergeTab } = useWorkspace(
+    useShallow((s) => documentTabFor(s.boot, project, pane.id)),
+  )
 
   // A file is a document too: no session, no spawn, nothing to resume. (M9)
   //

@@ -27,6 +27,7 @@
  *    throws away the view of a live turn and the id it would have re-attached with.
  */
 import { createTerminal, promoteWebgl, releaseWebgl, type TerminalHandle } from '@/terminal/xterm'
+import { SerializeAddon } from '@xterm/addon-serialize'
 import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
 import { attachPathLinks } from '@/terminal/pathLinks'
 import type { TerminalPaneKind } from '@/terminal/keys'
@@ -162,14 +163,53 @@ export interface PaneHost {
 }
 
 /**
- * How many hosts may be resident at once, mounted or parked.
+ * How many hosts may be resident at once, mounted or parked — the **floor** of the budget.
  *
  * Each one holds an xterm instance and may hold a WebGL context, and WebKitGTK caps
- * concurrent contexts at roughly 8-16. Twelve is above any plausible working set — the
- * mock's grid is four — and low enough that a session spent splitting does not accumulate
- * renderers until the pane that matters stops painting.
+ * concurrent contexts at roughly 8-16 — but the GL contexts are pooled separately
+ * (`promoteWebgl`/`releaseWebgl`; a parked host holds none), so what this bounds is xterm
+ * instances and their buffers. Twelve is above any plausible single-project working set —
+ * the mock's grid is four — and low enough that a session spent splitting does not
+ * accumulate renderers until the pane that matters stops painting.
  */
 export const HOST_CAP = 12
+
+/**
+ * The working cap: the floor above, or the workspace's real terminal-pane population plus
+ * slack, whichever is larger — ceilinged at 32.
+ *
+ * A flat `HOST_CAP` was tuned for leaked hosts (panes closed and forgotten) and it punished
+ * the multi-project case instead: with two 8-pane projects open, every project switch parks
+ * eight hosts, the sweep evicts the overflow — always from the project just left, since
+ * eviction skips `mounted` — and switching back pays a full re-attach cycle per evicted
+ * pane (a fresh `term.open()`, `session_attach`, snapshot rehydrate, nudge resizes) *and*
+ * loses the scrollback, because the vt100 mirror a re-created host rehydrates from is one
+ * screen. Panes that still exist in the workspace are panes the user asked for; the budget
+ * follows them, and the cap's real job — bounding hosts whose panes are gone — is unchanged
+ * because those never count toward `livePaneIds`. The ceiling keeps a pathological
+ * workspace bounded: at ~5000 scrollback lines an xterm buffer is single-digit MiB, so 32
+ * is tens of MiB, not hundreds.
+ */
+let hostBudget = HOST_CAP
+
+/**
+ * Every terminal pane id the workspace currently holds, across all open projects and
+ * detached windows — fed from the mirror on every snapshot (`store/workspace.ts`). Read
+ * twice: to size the budget above, and to prefer evicting hosts whose pane no longer
+ * exists anywhere (closed in another window — before this they parked for ever).
+ */
+let livePaneIds: ReadonlySet<string> = new Set()
+
+export function noteLivePanes(ids: ReadonlySet<string>): void {
+  livePaneIds = ids
+  hostBudget = Math.min(32, Math.max(HOST_CAP, ids.size + 2))
+  scheduleEviction()
+}
+
+/** The working cap right now, for the pane audit's residency assertion. */
+export function hostBudgetNow(): number {
+  return hostBudget
+}
 
 const hosts = new Map<string, PaneHost>()
 
@@ -195,6 +235,18 @@ interface PaneRecord {
    * qualifies, or the fix has a hole in it the size of `HOST_CAP`.
    */
   mirrored?: boolean | undefined
+  /**
+   * The terminal's serialized buffer, taken at eviction, spent on the next attach.
+   *
+   * The vt100 mirror an evicted pane rehydrates from is **one screen**, so eviction used to
+   * cost the pane its whole scrollback with nothing anywhere saying so. Serialized on the
+   * way out (`evictBeyondCap`), replayed exactly once before the mirror snapshot on the
+   * fresh host's first hydration (`attachModel.ts::hydrationPlan` owns the rule), and
+   * cleared with `sessionId` when the pane is genuinely finished. Not taken for a terminal
+   * sitting on the alternate buffer: the alt screen has no scrollback to save, and a
+   * serialize mid-TUI would replay half-drawn frame state under the snapshot.
+   */
+  scrollback?: string | undefined
 }
 
 const ledger = new Map<string, PaneRecord>()
@@ -723,6 +775,10 @@ export function destroyHost(paneId: string): void {
   if (entry) {
     entry.sessionId = undefined
     entry.mirrored = undefined
+    // A finished pane's saved buffer goes with its session: nothing can ever attach to
+    // replay it, and a megabyte of serialized transcript per closed pane would be the
+    // ledger's "not a size worth managing" claim quietly becoming false.
+    entry.scrollback = undefined
   }
 
   const host = hosts.get(paneId)
@@ -771,7 +827,7 @@ let sweepQueued = false
  * runs after the whole commit, by which point every `mountHost` has been called and
  * `mounted` means what it says.
  *
- * The cost is that `hostCount()` may sit one or two above `HOST_CAP` until the stack
+ * The cost is that `hostCount()` may sit one or two above the budget until the stack
  * unwinds. Nothing reads it inside a commit, and the audit reads it after `settle()`.
  */
 function scheduleEviction(): void {
@@ -795,15 +851,55 @@ function scheduleEviction(): void {
  * to satisfy a number would be the bug, not the fix.
  */
 function evictBeyondCap(): void {
-  while (hosts.size > HOST_CAP) {
+  while (hosts.size > hostBudget) {
     const victim = evictionCandidate()
     if (!victim) return
     const entry = record(victim.paneId)
     entry.evictions += 1
     if (victim.sessionId !== undefined) entry.sessionId = victim.sessionId
     if (victim.mirrored !== undefined) entry.mirrored = victim.mirrored
+    entry.scrollback = serializeForEviction(victim)
     teardown(victim)
   }
+}
+
+/**
+ * The victim's buffer as a replayable byte string, or `undefined` when there is nothing
+ * worth saving — see `PaneRecord.scrollback` for what this exists to stop losing.
+ *
+ * The addon is loaded for the one call and disposed: serialization is an eviction-time
+ * event, not a per-frame concern, and a permanently loaded addon per host would be twelve
+ * observers doing nothing. A serialize that throws (a disposed-mid-teardown terminal, an
+ * addon/xterm version skew) degrades to exactly the old behaviour — the pane comes back
+ * with the mirror's one screen — which is why the catch is empty on purpose.
+ */
+function serializeForEviction(victim: PaneHost): string | undefined {
+  const term = victim.terminal?.term
+  if (!term || term.buffer.active.type === 'alternate') return undefined
+  try {
+    const addon = new SerializeAddon()
+    term.loadAddon(addon)
+    const bytes = addon.serialize()
+    addon.dispose()
+    return bytes.length > 0 ? bytes : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The serialized buffer eviction parked for this pane, read once and cleared.
+ *
+ * Read-and-clear so the drift repair — which re-runs the hydration phase on a terminal
+ * that already holds a transcript — can never replay it a second time, whatever the
+ * caller's flags say.
+ */
+export function takeSavedScrollback(paneId: string): string | null {
+  const entry = ledger.get(paneId)
+  if (!entry || entry.scrollback === undefined) return null
+  const saved = entry.scrollback
+  entry.scrollback = undefined
+  return saved
 }
 
 function evictionCandidate(): PaneHost | undefined {
@@ -818,6 +914,15 @@ function evictionCandidate(): PaneHost | undefined {
     // any merely-parked host however recently it was used.
     if (host.released !== best.released) {
       if (host.released) best = host
+      continue
+    }
+    // Then a parked host whose pane no longer exists in any project's tree — closed in
+    // another window, so nothing can ever mount it again — before one the user can switch
+    // back to. Eviction is the only exit such a host has.
+    const hostGone = !livePaneIds.has(host.paneId)
+    const bestGone = !livePaneIds.has(best.paneId)
+    if (hostGone !== bestGone) {
+      if (hostGone) best = host
       continue
     }
     if (host.lastUsed < best.lastUsed) best = host
@@ -898,7 +1003,7 @@ export function hostCount(): number {
 export interface HostStats {
   /** Hosts currently sitting in a slot. */
   live: number
-  /** Hosts resident but detached; `live + parked` is what `HOST_CAP` bounds. */
+  /** Hosts resident but detached; `live + parked` is what the host budget bounds. */
   parked: number
   /**
    * How many times `term.open()` has run, per pane, including panes whose host has since

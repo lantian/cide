@@ -57,14 +57,15 @@ pub fn settings_set(
 ) -> Result<Settings, CoreError> {
     // Read before the patch, so the comparisons below are against what the windows are
     // actually wearing rather than against the value we just wrote.
-    let (was_theme, was_explorer, was_binaries, was_working_set, was_memory_limit) =
-        state.with(|ws| {
+    let (was_theme, was_explorer, was_binaries, was_working_set, was_memory_limit, was_cli) = state
+        .with(|ws| {
             (
                 ws.settings.theme,
                 ws.settings.explorer,
                 ws.settings.inspections.server_binaries.clone(),
                 ws.settings.inspections.server_index_working_set_pct,
                 ws.settings.inspections.server_memory_limit_mb,
+                ws.settings.claude.cli.binary.clone(),
             )
         });
     state.update(|ws| {
@@ -124,6 +125,21 @@ pub fn settings_set(
         && let Some(registry) = app.try_state::<crate::lsp::DiagnosticsRegistry>()
     {
         registry.restart_everywhere(&app, cide_ipc::DiagnosticSourceId::for_server("gopls"));
+    }
+    // A new Claude binary means a new version string in every window's header. The probe is
+    // a fork of a Node process, so it runs on a blocking worker rather than making the
+    // settings form wait ~70ms for its own submit to resolve; the event is what reaches the
+    // windows, because capabilities ride `Bootstrap` and no workspace snapshot carries them
+    // (`emit::CAPABILITIES_CHANGED`).
+    if settings.claude.cli.binary != was_cli {
+        let versions = app.state::<crate::caps::ClaudeVersion>().inner().clone();
+        let binary = settings.claude.cli.binary.clone();
+        let handle = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            versions.invalidate();
+            let capabilities = crate::cmd::app::capabilities(&binary, &versions);
+            emit::capabilities_changed(&handle, capabilities);
+        });
     }
     Ok(settings)
 }

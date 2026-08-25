@@ -366,7 +366,6 @@ export async function navigate(direction: NavDirection): Promise<WalkRefusal | n
     return `${outcome.path} is no longer there`
   }
 
-  useWorkspace.getState().hydrate()
   /*
    * And reveal a second time, because the first one lands in the wrong place for the most
    * common Back there is.
@@ -381,16 +380,23 @@ export async function navigate(direction: NavDirection): Promise<WalkRefusal | n
    * point the reveal has been spent and there is nothing left to re-focus: the caret is
    * placed but the keyboard is on `<body>`, and the next thing typed goes nowhere.
    *
-   * A frame after the hydrate, so React has committed the visibility flip. Re-issuing is
-   * cheap and idempotent — it sets the same selection and focuses the same view — which is
-   * why this is a second call rather than a scheduler that tries to guess which case it is
-   * in. Guessing is what would have to be right every time; this only has to be harmless
-   * when it is redundant.
+   * `synced()` then a frame, so React has committed the visibility flip against the
+   * snapshot the reopen broadcast — strictly stronger than the unawaited `hydrate()` that
+   * stood here, whose comment overclaimed an ordering the promise never provided.
+   * Re-issuing is cheap and idempotent — it sets the same selection and focuses the same
+   * view — which is why this is a second call rather than a scheduler that tries to guess
+   * which case it is in. Guessing is what would have to be right every time; this only has
+   * to be harmless when it is redundant.
    *
    * A `restored` tab needs it just as much: `reinsert_tab` mounts a whole pane tree, so the
    * editor that will spend the reveal appears strictly after this point either way.
    */
-  if (to.line !== UNKNOWN_LINE) requestAnimationFrame(reveal)
+  if (to.line !== UNKNOWN_LINE) {
+    void useWorkspace
+      .getState()
+      .synced()
+      .then(() => requestAnimationFrame(reveal))
+  }
   return null
 }
 

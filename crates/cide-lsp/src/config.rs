@@ -134,6 +134,7 @@ pub fn extra_env(server: Server, provenance: Provenance, tuning: Tuning) -> Vec<
 fn rust_analyzer_options(disk_index: &std::path::Path, tuning: Tuning) -> Value {
     let mut options = json!({
         "cachePriming": { "enable": true },
+        // The symbol half of priming stays off: `cide.primeCaches.symbols` is the fork's
         // A *stock* key, `true` meaning "check under `target/rust-analyzer`, not `target`".
         // cide is an IDE whose panes run the user's own `cargo build` in the same workspace,
         // and cargo serialises everything under one target dir behind one lock — so a
@@ -142,8 +143,16 @@ fn rust_analyzer_options(disk_index: &std::path::Path, tuning: Tuning) -> Value 
         // indistinguishable from a hang. The price is a second set of check artefacts on
         // disk; the alternative was a progress bar whose stillness is somebody else's build.
         "cargo": { "targetDir": true },
+        // One `cide` object — `json!` silently keeps only the LAST duplicate key, so a
+        // second `"cide"` block would erase this one without a warning anywhere.
         "cide": {
             "diskIndex": { "dir": disk_index.to_string_lossy() },
+            // The symbol half of priming stays off: the fork's gate for the per-module
+            // symbol index, which serves `workspace/symbol` — a request cide never sends
+            // (symbol navigation is cide-lang's tree-sitter outline). The index is
+            // unbounded residency rebuilt every start, for a consumer that does not exist
+            // here.
+            "primeCaches": { "symbols": false },
         },
     });
     if tuning.index_working_set_pct != 0 {
@@ -301,6 +310,9 @@ mod tests {
         // Explicitly `true` rather than unstated-and-defaulted: an upstream default flip
         // must not silently change what cide's bundled build does.
         assert_eq!(options["cachePriming"]["enable"], true);
+        assert_eq!(options["cide"]["primeCaches"]["symbols"], false);
+        // The duplicate-key trap above, pinned: both halves of the one `cide` object.
+        assert!(options["cide"]["diskIndex"]["dir"].is_string());
         // The default handshake carries no cap overrides at all — absent, not zeros: absent
         // is how the fork knows to keep its compiled tuning.
         assert_eq!(options["cide"]["diskIndex"].get("lru"), None);

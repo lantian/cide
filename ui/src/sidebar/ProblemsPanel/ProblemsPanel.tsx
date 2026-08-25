@@ -43,7 +43,7 @@
  *   writes (an agent's edit, a `git checkout`) move the file underneath it. The row now says so
  *   rather than silently sending the user to whatever is at that line now.
  */
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import type { ProjectId } from '@/ipc/client'
 import {
   NO_SOURCE,
@@ -161,7 +161,16 @@ export interface ProblemsPanelProps {
   onRestartSource?: ((id: string, label: string) => void) | undefined
 }
 
-export function ProblemsPanel({
+/**
+ * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
+ * re-renders on every store notification it subscribes to, and everything this panel draws
+ * arrives through its own store subscriptions or through props `App` pins with `useCallback`
+ * for exactly this. Without the memo, every App render re-walked the panel's full
+ * unvirtualized row list for events that had nothing to do with it.
+ */
+export const ProblemsPanel = memo(ProblemsPanelImpl)
+
+function ProblemsPanelImpl({
   project,
   // Omitting the prop *is* the v1 answer, not a missing one. See `NO_SOURCE`.
   snapshot = NO_SOURCE,

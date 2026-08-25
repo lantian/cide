@@ -19,7 +19,14 @@
  * scrollback survived means reading the screen mirror back, which belongs to M2's PTY
  * tests and needs a session doing predictable work.
  */
-import { evictionCounts, hostFaults, hostStats, liveHosts, peekHost, HOST_CAP } from './paneHosts'
+import {
+  evictionCounts,
+  hostBudgetNow,
+  hostFaults,
+  hostStats,
+  liveHosts,
+  peekHost,
+} from './paneHosts'
 
 /**
  * The pane tree, flattened to what the audit actually reasons about.
@@ -210,7 +217,11 @@ export async function runPaneAudit(
     }
 
     const resident = stats.live + stats.parked
-    if (resident > HOST_CAP && !reportedOverCap) {
+    // Against the live budget rather than the `HOST_CAP` floor: the budget follows the
+    // workspace's real terminal-pane population (`noteLivePanes`), and this audit runs over
+    // the real domain, so its own panes legitimately raise it.
+    const cap = hostBudgetNow()
+    if (resident > cap && !reportedOverCap) {
       // Eviction declines to take a mounted or mid-turn host, so the only way to stay above
       // the cap is that every resident host claims to be one or the other — a `mounted` flag
       // left set by a slot that unmounted without parking, or a `busy` flag never cleared.
@@ -218,7 +229,7 @@ export async function runPaneAudit(
       // reclaims them and residency stays legal. `closed but still registered` below is the
       // check for that. Reported once: it stays true for the rest of the run.
       reportedOverCap = true
-      fail(cycle, `${resident} hosts resident, cap is ${HOST_CAP}; ${stats.live} of them mounted, at ${step}`)
+      fail(cycle, `${resident} hosts resident, cap is ${cap}; ${stats.live} of them mounted, at ${step}`)
     }
   }
 

@@ -31,6 +31,15 @@ export interface AttachState {
   mirrorOnAlt: boolean
   /** The snapshot carries no bytes at all. */
   snapshotEmpty: boolean
+  /**
+   * An evicted host's serialized buffer is waiting to be replayed (`paneHosts`' ledger).
+   *
+   * The mirror is one screen, so an evicted-and-recreated pane used to come back with no
+   * scrollback at all — eviction silently cost the user their history. The serialized
+   * buffer is taken at eviction time and replayed exactly once, on the fresh host's first
+   * hydration.
+   */
+  savedScrollback: boolean
 }
 
 export interface HydrationPlan {
@@ -41,6 +50,16 @@ export interface HydrationPlan {
   hydrate: boolean
   /** `term.reset()` first — a released host replaces its stale screen, never appends. */
   reset: boolean
+  /**
+   * The serialized pre-eviction buffer is written before the snapshot, restoring the
+   * scrollback eviction dropped. The snapshot then opens with a clear-screen
+   * (`vt100::write_contents_formatted` leads with one), which erases the replayed
+   * *viewport* in place and paints the current screen — so the history above the fold
+   * survives and the live rows are the mirror's, with no duplicated screenful between
+   * them. What the clear erases is the eviction-time viewport, which in the common
+   * nothing-happened-while-evicted case is exactly what the snapshot repaints.
+   */
+  replayScrollback: boolean
   /** The snapshot bytes are actually written (skipped when empty — nothing to paint). */
   writeSnapshot: boolean
   /**
@@ -59,6 +78,11 @@ export interface HydrationPlan {
  * have provably diverged. `reset` rides on `needsReset` alone — a restarted pane keeps its
  * predecessor's transcript on screen (the flag is deliberately not set there), a released
  * one must not show its pre-detach screen followed by a second copy of the current one.
+ *
+ * The replay is confined to a host's **first** hydration (`!s.hydrated`, not merely
+ * `hydrate`): the drift repair re-runs the phase on a terminal that already holds a
+ * transcript, and replaying the saved buffer there would prepend a second copy of
+ * everything — the split-remount duplication bug, rebuilt out of the fix for eviction.
  */
 export function hydrationPlan(s: AttachState): HydrationPlan {
   const dropHydratedForAltDrift = s.hydrated && s.mirrorOnAlt !== s.termOnAlt
@@ -66,6 +90,7 @@ export function hydrationPlan(s: AttachState): HydrationPlan {
   return {
     hydrate,
     reset: hydrate && s.needsReset,
+    replayScrollback: hydrate && !s.hydrated && s.savedScrollback,
     writeSnapshot: hydrate && !s.snapshotEmpty,
     dropHydratedForAltDrift,
   }

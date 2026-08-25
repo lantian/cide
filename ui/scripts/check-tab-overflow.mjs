@@ -230,17 +230,23 @@ try {
   /*
    * Three triggers, three assertions, because each covers a case the other two miss:
    *
-   *  - the layout effect with no dep array: a tab going dirty swaps a 12px `×` for a 14px `•`,
-   *    an agent renames a `claudeFull` tab. No box changes size, so the observer is silent;
+   *  - the per-commit effect with no dep array: a tab going dirty swaps a 12px `×` for a 14px
+   *    `•`, an agent renames a `claudeFull` tab. No box changes size, so the observer is silent;
    *  - the ResizeObserver: the window is resized, the sidebar splitter is dragged. No commit
    *    happens, so the effect never runs;
    *  - `fonts.ready`: the webfont swaps under an ALREADY overfull strip, so every tab changes
    *    width while `.tabs` does not — no commit and no resize.
+   *
+   * `useEffect`, NOT `useLayoutEffect`: this was a layout effect once, and its DOM reads before
+   * paint forced a synchronous layout of the entire window — every editor, every terminal — on
+   * every App commit. After paint the same reads are free. The regex pins the passive form so a
+   * well-meaning "make it never a frame late" revert has to argue with this comment first.
    */
   ok(
-    /useLayoutEffect\(measure\)/.test(strip_),
-    'the measurement runs on every commit with NO dependency array — an array here is how the '
-      + 'list goes stale, and a stale list is worse than none',
+    /\n {2}useEffect\(measure\)/.test(strip_),
+    'the measurement runs on every commit with NO dependency array, as a PASSIVE effect '
+      + '(useEffect, after paint) — an array here is how the list goes stale, and a '
+      + 'useLayoutEffect here is a forced whole-document reflow per commit',
   )
   ok(
     /new ResizeObserver\(/.test(strip_) && /ro\??\.observe\(box\)/.test(strip_),

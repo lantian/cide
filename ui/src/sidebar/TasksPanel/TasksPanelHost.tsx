@@ -69,7 +69,7 @@
  * back — which is the silent data loss the compose dialog exists to prevent, arriving by a
  * different door.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { memo, useCallback, useEffect, useState } from 'react'
 import { fsReveal, type ProjectId } from '@/ipc/client'
 import { notifyFailure } from '@/chrome/notices'
 import { useTasks } from '@/sidebar/tasksStore'
@@ -87,7 +87,16 @@ export interface TasksPanelProps {
   project: ProjectId | null
 }
 
-export function TasksPanel({ project }: TasksPanelProps) {
+/**
+ * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
+ * re-renders on every store notification it subscribes to, and everything this panel draws
+ * arrives through its own store subscriptions or through props `App` pins with `useCallback`
+ * for exactly this. Without the memo, every App render re-walked the panel's full
+ * unvirtualized row list for events that had nothing to do with it.
+ */
+export const TasksPanel = memo(TasksPanelImpl)
+
+function TasksPanelImpl({ project }: TasksPanelProps) {
   const board = useTasks((s) => s.board)
   const selected = useTasks((s) => s.selected)
   const compose = useTasks((s) => s.compose)

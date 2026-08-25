@@ -30,8 +30,8 @@
  * Not a second ownership signal — two answers to "does this pane own its child" is how the first
  * one gets out of date. `SplitIntent::Mirror` *is* this gesture ("a second sink on an existing
  * session, no new process"), and its path is correct by construction: `addRow` calls
- * `rememberSpawnPlan(created.pane, created.intent)` **before** `hydrate()`, an ordering its own
- * comment calls load-bearing, so `TerminalPane` finds the plan, takes the mirror branch, sets
+ * `rememberSpawnPlan(created.pane, created.intent)` **before** waiting for the snapshot that
+ * makes the pane renderable, so `TerminalPane` finds the plan, takes the mirror branch, sets
  * `mirrored`, adopts the id and spawns nothing. Every property the panel wants falls out of it,
  * including the one nobody asked for: sinks are pane-keyed, so two panes — or two windows — may
  * mirror one run without either of them owning it.
@@ -187,7 +187,7 @@ export async function openRunInPane(run: RunView): Promise<void> {
   /*
    * 4. The mirror itself.
    *
-   * The intent is the whole of it. `addRow` records the spawn plan before the hydrate that makes
+   * The intent is the whole of it. `addRow` records the spawn plan before the snapshot that makes
    * the pane renderable — the other order races, and `TerminalPane` mounts, finds no plan, and
    * spawns a fresh `claude` where the user asked to watch an existing one — and the mirror branch
    * on the far side adopts the id, marks the host `mirrored`, and starts no process at all.

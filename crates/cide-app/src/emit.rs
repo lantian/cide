@@ -214,8 +214,9 @@ pub fn fs_status(app: &AppHandle, project: cide_ipc::ProjectId, status: &cide_ip
 ///
 /// The keymap is not in the workspace. `app_get_bootstrap` resolves it from
 /// `~/.config/cide/keymap.json` on every call, which is what makes a hand-edited file take
-/// effect in the next window that hydrates for any reason at all — and there are three dozen
-/// reasons. But `store/workspace.ts::applySnapshot` builds `{ ...current, workspace }`, so it
+/// effect in the next window that hydrates — and hydrating is a boot-and-refresh event now,
+/// not a per-gesture one, so this event is the only road a rebind has into a live window.
+/// `store/workspace.ts::applySnapshot` builds `{ ...current, workspace }`, so it
 /// keeps the *old* `keymap` array: `cide://workspace-changed`, the one thing already broadcast
 /// to every window, is precisely the path that cannot refresh a binding. Without this event a
 /// rebind reaches the window that made it and no other, and the second window keeps the old
@@ -271,6 +272,33 @@ struct SchemesChanged {
 pub fn schemes_changed(app: &AppHandle, schemes: Vec<cide_ipc::ColorScheme>) {
     if let Err(error) = app.emit(SCHEMES_CHANGED, SchemesChanged { schemes }) {
         tracing::debug!(%error, "colour scheme broadcast reached no window");
+    }
+}
+
+// --- capabilities -------------------------------------------------------------------------
+
+/// The configured Claude CLI changed, so what this build can do changed with it.
+/// Sent to **every** window after Settings → Claude writes a new binary path.
+///
+/// # Why this is not `workspace_changed`, on `KEYMAP_CHANGED`'s exact argument
+///
+/// Capabilities are not in the workspace — they ride `Bootstrap`, and
+/// `store/workspace.ts::applySnapshot` builds `{ ...current, workspace }`, keeping the old
+/// struct. The gesture-time hydrates that used to refresh it opportunistically are gone, so
+/// without this event a binary changed in one window would leave every other window's header
+/// naming the old CLI version until reload. Carries the whole struct rather than a signal to
+/// re-fetch, and no `rev`, both for `KEYMAP_CHANGED`'s reasons.
+pub const CAPABILITIES_CHANGED: &str = "cide://capabilities-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapabilitiesChanged {
+    capabilities: cide_ipc::Capabilities,
+}
+
+pub fn capabilities_changed(app: &AppHandle, capabilities: cide_ipc::Capabilities) {
+    if let Err(error) = app.emit(CAPABILITIES_CHANGED, CapabilitiesChanged { capabilities }) {
+        tracing::debug!(%error, "capabilities broadcast reached no window");
     }
 }
 

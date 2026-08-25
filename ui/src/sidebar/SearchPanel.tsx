@@ -28,7 +28,7 @@
  * anything: opening at the top of the file beats not opening at all, and it is what this
  * panel already did before it could say where to look.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useSearch } from './SearchStore'
 import {
@@ -88,7 +88,16 @@ export interface SearchPanelProps {
   onOpenHit?: OpenHit | undefined
 }
 
-export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
+/**
+ * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
+ * re-renders on every store notification it subscribes to, and everything this panel draws
+ * arrives through its own store subscriptions or through props `App` pins with `useCallback`
+ * for exactly this. Without the memo, every App render re-walked the panel's full
+ * unvirtualized row list for events that had nothing to do with it.
+ */
+export const SearchPanel = memo(SearchPanelImpl)
+
+function SearchPanelImpl({ project, onOpenHit }: SearchPanelProps) {
   const query = useSearch((s) => s.query)
   const hits = useSearch((s) => s.hits)
   const total = useSearch((s) => s.total)

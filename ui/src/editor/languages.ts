@@ -193,8 +193,20 @@ function grammarFrom(dto: GrammarSpecDto): GrammarSpec | null {
  * Later entries win, which is what makes an extension supersede a builtin — the resolved list
  * arrives with builtins first and extensions after, in install order, and `cide-ext::contribute`
  * has already reported every displacement.
+ *
+ * Idempotent over equal tables: this is called on every `hydrate` (boot, an explicit refresh,
+ * an extension change), and the set genuinely changes only when an extension is installed,
+ * removed or superseded — rebuilding six maps and recompiling a fresh `RegExp` per contributed
+ * rule for a table that did not move was pure churn. The problems were already reported the
+ * first time this exact table registered, so `[]` on a skip is the honest answer, not a lie of
+ * omission. `JSON.stringify` is a faithful key: `LanguageDef` is a plain generated DTO.
  */
+let lastDefsJson: string | null = null
+
 export function registerLanguages(defs: readonly LanguageDef[]): string[] {
+  const json = JSON.stringify(defs)
+  if (json === lastDefsJson) return []
+  lastDefsJson = json
   LANGUAGES = defs
   return rebuild()
 }

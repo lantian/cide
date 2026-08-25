@@ -9,7 +9,7 @@
  * This is also where the store is pointed at a project and where the watcher is subscribed,
  * so `FileTree` stays a pure render target over `treeStore`.
  */
-import { useEffect } from 'react'
+import { memo, useEffect } from 'react'
 import { FileTree } from './FileTree'
 import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
@@ -78,7 +78,16 @@ export interface ExplorerProps {
   onShowHistory?: ((path: string) => void) | undefined
 }
 
-export function Explorer({
+/**
+ * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
+ * re-renders on every store notification it subscribes to, and everything this panel draws
+ * arrives through its own store subscriptions or through props `App` pins with `useCallback`
+ * for exactly this. Without the memo, every App render re-walked the panel — listeners,
+ * virtualizer and all — for events that had nothing to do with files.
+ */
+export const Explorer = memo(ExplorerImpl)
+
+function ExplorerImpl({
   project,
   onOpenFile,
   onOpenFileToSide,

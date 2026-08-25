@@ -68,7 +68,9 @@ export function ProjectMenu() {
         reopen: (path) => {
           // `void` on purpose: a rejection — the folder went away between the fetch and the
           // click — is caught by `Failures`, which is the surface that exists to say so.
-          void projectMenu.reopen(path).then(() => useWorkspace.getState().hydrate())
+          // The reopened project arrives on the mutation's own broadcast; nothing here
+          // reads the mirror afterwards, so there is no re-read and nothing to wait for.
+          void projectMenu.reopen(path)
         },
         forgetMissing: () => {
           // Sequential rather than `Promise.all`: each call is a read-modify-write of one file,

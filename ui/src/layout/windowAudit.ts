@@ -511,6 +511,31 @@ export async function runWindowAudit(
     }
     sessionsBefore = second
   }
+  // The buffer state gets the same courtesy, held longer. A freshly spawned fullscreen TUI
+  // starts on the primary screen and enters the alternate one when its first real frame
+  // lands — seconds later on a machine that is also building a project's dependencies. The
+  // round-trip assertion compares each session's buffer before its detach and after its
+  // re-dock, so a run that starts mid-boot reads "primary", watches the child finish
+  // booting *inside* the round trip, and reports the child's own transition as a mirror
+  // fault. Settled means two readings two seconds apart agree for every session; the cap
+  // keeps a genuinely oscillating child from wedging the audit, and says so.
+  {
+    const deadline = performance.now() + 30_000
+    let previous: Map<string, boolean | null> | null = null
+    for (;;) {
+      const current = new Map<string, boolean | null>()
+      for (const id of sessionsBefore) current.set(id, await altScreenOf(id))
+      const settled =
+        previous !== null && sessionsBefore.every((id) => current.get(id) === previous?.get(id))
+      if (settled) break
+      if (performance.now() > deadline) {
+        notes.push('alt-screen states were still moving after 30s; the run proceeded anyway')
+        break
+      }
+      previous = current
+      await sleep(2000)
+    }
+  }
   const baseline = new Set(sessionsBefore)
   let sessionsAfter = sessionsBefore
 

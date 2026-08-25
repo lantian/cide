@@ -627,16 +627,17 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
        * **Where the caret ends up.** `revealPane`, the way `tab.console` below does. Rust has
        * already made the tab active, but "active" and "typing in it" are two different things —
        * `TabContent` keeps every tab mounted and hides the inactive ones, so the keyboard is
-       * still wherever it was. `hydrate` first, because the pane to reveal is read out of the
-       * snapshot: the `cide://workspace-changed` broadcast would deliver the same tree a moment
-       * later, and racing it would reveal a pane the mirror has not heard of yet.
+       * still wherever it was. `synced()` first, because the pane to reveal is read out of the
+       * snapshot: the `cide://workspace-changed` broadcast delivers the tree the reopen built,
+       * and racing it would reveal a pane the mirror has not heard of yet. Waiting is all the
+       * old `hydrate()` here was for — the re-read itself was redundant with the broadcast.
        */
       case 'tab.reopenClosed': {
         const project = activeProjectOf(boot())
         if (project === null) return unmet(command, 'no open project')
         return void tabApi.reopenClosed(project.id).then(async (tab) => {
           if (tab === null) return unmet(command, 'nothing to reopen')
-          await ws.hydrate()
+          await ws.synced()
           const reopened = boot()?.workspace.projects[project.id]?.tabs.find((t) => t.id === tab)
           if (reopened === undefined) return
           const refusal = await revealPane(project.id, reopened.tree.focused)
@@ -1509,8 +1510,9 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         const notesProject = activeProjectOf(boot())
         if (notesProject === null) return unmet(command, 'no open project')
         void fsApi.notesEnsure(notesProject.id).then(async (path) => {
+          // The tab rides the open's own broadcast; the panel and the tree reveal below read
+          // nothing from the mirror, so there is no snapshot to wait for either.
           await fileApi.open(notesProject.id, path)
-          await useWorkspace.getState().hydrate()
           // Unread, as the `?.` before it was: the role check at the top of this arm has
           // already refused every window where nothing can reveal a panel.
           requestPanel('files')
@@ -1861,7 +1863,8 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         const project = activeProjectOf(boot())
         if (project === null) return unmet(command, 'no open project')
         const section = command === 'settings.keymap' ? 'keymap' : null
-        void settingsApi.openTab(project.id, section).then(() => ws.hydrate())
+        // The tab appears on the mutation's own broadcast — no re-read.
+        void settingsApi.openTab(project.id, section)
         return
       }
 

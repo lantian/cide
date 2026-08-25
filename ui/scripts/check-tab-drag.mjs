@@ -299,11 +299,12 @@ try {
       + 'at pointer-move time names a different tab by the time the drop lands',
   )
   ok(
-    /reorderTab: async \(project, tab, before\) => \{[\s\S]{0,200}?await tabApi\.reorder\(project, tab, before\)[\s\S]{0,120}?await get\(\)\.hydrate\(\)/.test(
+    /reorderTab: async \(project, tab, before\) => \{[\s\S]{0,200}?await tabApi\.reorder\(project, tab, before\)[\s\S]{0,120}?await synced\(rev\)/.test(
       store,
     ),
-    'and the store re-reads the tree afterwards, or the strip paints the old order until '
-      + 'something else hydrates',
+    'and the store waits for the snapshot the reorder broadcast, or the strip paints the old '
+      + 'order until something else moves the mirror — `synced(rev)` is the wait, and the '
+      + 'broadcast out of `WorkspaceState::update` is the repaint',
   )
 
   // The click guard. Without it a drop ALSO activates the tab it just moved, yanking the user

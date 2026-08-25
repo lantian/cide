@@ -287,8 +287,13 @@ try {
   ok(/\.headerAction \{/.test(css), 'and the class it names exists in the stylesheet')
 
   const app = read('../src/App.tsx')
+  // Two assertions where one inline closure used to be pinned: the handler moved into a
+  // `useCallback` so the memoised Explorer's props stay stable, and the intent — the click
+  // routes through the command — is asserted on the callback body while the JSX assertion
+  // confirms the pinned handler is the one actually wired.
   ok(
-    /onSelectOpened=\{\(\) => runCommand\('file\.reveal', null\)\}/.test(app),
+    /const onSelectOpened = useCallback\(\(\) => runCommand\('file\.reveal', null\)/.test(app) &&
+      /onSelectOpened=\{onSelectOpened\}/.test(app),
     'the click runs the **command**, not `treeStore.reveal`. A second call site with its own ' +
       'copy of the preconditions is how a button, a chord and a palette row come to behave in ' +
       'three different ways',

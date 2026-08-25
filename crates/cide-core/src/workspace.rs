@@ -166,15 +166,24 @@ pub fn open_project(
 ///
 /// Separate from [`open_project`] because "open this path" and "show me this project" are
 /// the same gesture from the user's side and must not be two different outcomes.
+///
+/// Bumps only when some window's `active` actually moves, like [`activate_tab`]: clicking
+/// the header tab that is already active is a no-op, and reporting it as a change would
+/// cost every window a broadcast and a re-render for news that isn't.
 pub fn activate_project(ws: &mut Workspace, project: ProjectId) {
+    let mut changed = false;
     for role in ws.windows.values_mut() {
         if let WindowRole::Shell { projects, active } = role
             && projects.contains(&project)
+            && *active != Some(project)
         {
             *active = Some(project);
+            changed = true;
         }
     }
-    bump(ws);
+    if changed {
+        bump(ws);
+    }
 }
 
 /// Close a project and every window that existed only to show part of it.
@@ -2980,6 +2989,33 @@ mod tests {
         let before = ws.rev;
         activate_tab(&mut ws, id, tab).expect("activates");
         assert_eq!(ws.rev, before, "no bump, so no broadcast");
+    }
+
+    /// The header-tab twin of the test above: clicking the project that is already at the
+    /// front must not bump. `activate_project` bumped unconditionally until the no-op
+    /// suppression in `WorkspaceState::update` made an honest answer matter — a gratuitous
+    /// bump there would be undone by the suppressor, but a mutator that reports `ws.rev`
+    /// from inside its closure would then hand the caller a revision that never broadcasts.
+    #[test]
+    fn re_activating_the_active_project_changes_nothing() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+
+        let before = ws.rev;
+        activate_project(&mut ws, id);
+        assert_eq!(ws.rev, before, "no bump, so no broadcast");
+
+        // And a real switch still moves rev, which is what a second window follows.
+        // (Opening a second project does not activate it — `rebuild_windows` keeps the
+        // previously active one — so switching *to* it is the genuine change here.)
+        let other = open(&mut ws, "/home/dev/work/other");
+        let before = ws.rev;
+        activate_project(&mut ws, other);
+        assert_eq!(
+            ws.rev,
+            before + 1,
+            "a real switch is a change and is broadcast"
+        );
     }
 
     /// …and does repair the order when it is the one thing out of step.

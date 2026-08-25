@@ -685,8 +685,9 @@ pub fn project_close(
 /// exposed it. So with two projects open, clicking the other one did nothing — the same
 /// dead-control failure the sidebar's search button had.
 ///
-/// Idempotent, and cheap: activating the project that is already active still bumps `rev`
-/// through `update`, which is what makes a second window follow along.
+/// Idempotent, and cheap: activating the project that is already active changes nothing,
+/// bumps nothing, and broadcasts nothing (`WorkspaceState::update` suppresses no-ops) — a
+/// second window follows along on the mutations that do move `active`, because those bump.
 ///
 /// It also **ensures the project's IDE server**, which is the other half of the cap that
 /// `ide::servable_projects` applies at launch. That cap binds at most 32 ports, ordered so a

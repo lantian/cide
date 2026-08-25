@@ -108,7 +108,7 @@
  * `onDispatchSubmit?: (agent: string, task: string, prompt: string) => void`, with `onDispatch`
  * becoming the form-opening gesture rather than the send. Until then, this.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { fsReveal, type ProjectId } from '@/ipc/client'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { useAgents } from '@/sidebar/agentsStore'
@@ -147,7 +147,16 @@ export interface AgentsPanelProps {
   onShowTasks?: (() => void) | undefined
 }
 
-export function AgentsPanel({ project, onShowTasks }: AgentsPanelProps) {
+/**
+ * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
+ * re-renders on every store notification it subscribes to, and everything this panel draws
+ * arrives through its own store subscriptions or through props `App` pins with `useCallback`
+ * for exactly this. Without the memo, every App render re-walked the panel's full
+ * unvirtualized row list for events that had nothing to do with it.
+ */
+export const AgentsPanel = memo(AgentsPanelImpl)
+
+function AgentsPanelImpl({ project, onShowTasks }: AgentsPanelProps) {
   const roster = useAgents((s) => s.roster)
   const enable = useAgents((s) => s.enable)
   const dispatch = useAgents((s) => s.dispatch)

@@ -234,5 +234,6 @@
   "window_reveal_pane",
   "window_set_awaiting",
   "window_set_mode",
-  "window_set_viewport"
+  "window_set_viewport",
+  "workspace_rev"
 ]

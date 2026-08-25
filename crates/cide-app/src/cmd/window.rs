@@ -394,11 +394,12 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
 /// have just left must, if it is still holding a finished turn they have not read.
 ///
 /// **Everything this computes is a level, never an edge.** That is the correction to the
-/// reported bug and the property to preserve: nothing here remembers what it announced last
-/// time, so there is no state to get stuck and no "it already fired" to be wrong about. Every
-/// call recomputes both surfaces for every window from the current facts, and the cost of the
-/// ones that did not move is a `set_title` with the string it already has. See
-/// [`windows::announce`] for why the hint could not stay an edge.
+/// reported bug and the property to preserve: every call recomputes both surfaces for every
+/// window from the current facts, so there is no "it already fired" to be wrong about. What
+/// [`windows::apply_announcement`] remembers is only the *applied* value, so a window whose
+/// answer did not move costs a map lookup rather than a GTK `set_title` and a WM hint poke
+/// per mutation — the decision has no memory, the syscall does. See [`windows::announce`]
+/// for why the hint could not stay an edge.
 ///
 /// The two go together deliberately and must stay together. They are one fact — *does this
 /// window hold a session that wants the user* — asked once and applied to the two surfaces the
@@ -436,10 +437,11 @@ pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
         );
         // One call for both surfaces, so they cannot be computed from two different readings
         // of the same facts. The focus is read per window: "is the user here" is a question
-        // about one OS window, not about the application.
+        // about one OS window, not about the application. `apply_announcement` skips the GTK
+        // calls when the answer is what the window already wears — the level is the
+        // recomputation above, not the redundant syscall.
         let say = windows::announce(&title_for(ws, role), count, windows::is_focused(label));
-        windows::set_title(app, label, &say.title);
-        windows::demand_attention(app, label, say.attention);
+        windows::apply_announcement(app, label, say);
     }
 }
 

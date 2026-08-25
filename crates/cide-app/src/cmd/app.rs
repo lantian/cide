@@ -1,10 +1,23 @@
 //! Application-lifecycle commands.
 
-use cide_core::{commands, keymap};
+use cide_core::{CoreError, commands, keymap};
 use cide_ipc::{Bootstrap, Capabilities, WindowLabel, WindowRole};
 use tauri::{AppHandle, Manager, State, Window};
 
 use crate::workspace_state::WorkspaceState;
+
+/// Run a handler's blocking half on the blocking pool. Same shape as `cmd::fs::blocking`
+/// and `cmd::file::blocking`, and for the same reasons — the join only fails if the job
+/// panicked or the runtime is shutting down, and a command that never resolves is
+/// indistinguishable from a hung app.
+async fn blocking<T: Send + 'static>(
+    what: &'static str,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, CoreError> {
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|error| CoreError::Invariant(format!("the worker running {what} failed: {error}")))
+}
 
 /// Called by the frontend once it has painted its first frame.
 ///
@@ -37,12 +50,24 @@ pub fn app_ready(app: AppHandle, window: Window) {
 /// One call rather than four: a window that has to ask separately for its role, the
 /// workspace, the keymap and the command list will render three intermediate states on the
 /// way, and on the slow IPC path that is visible as flicker.
+///
+/// # Why this is `async`, and why that was worth changing
+///
+/// A plain `#[tauri::command]` runs inline on the thread that receives the IPC message —
+/// the GTK main loop — and this one read `keymap.json`, parsed every scheme file, and (until
+/// `caps::ClaudeVersion`) forked `claude --version` and waited for a Node process to start.
+/// In the hydrate-per-gesture era that block landed after nearly every mutation; even at
+/// boot-and-refresh frequency it is disk work per window on the thread that also delivers
+/// keystrokes and terminal frames. Same split as `cmd::fs`: resolve the `State` arguments up
+/// front (clones and map lookups, microseconds under their locks), hand the rest to
+/// [`blocking`].
 #[tauri::command]
-pub fn app_get_bootstrap(
+pub async fn app_get_bootstrap(
     window: Window,
     state: State<'_, WorkspaceState>,
     extensions: State<'_, crate::ext_state::ExtState>,
-) -> Bootstrap {
+    versions: State<'_, crate::caps::ClaudeVersion>,
+) -> Result<Bootstrap, CoreError> {
     let workspace = state.snapshot();
     let label = WindowLabel(window.label().to_string());
 
@@ -58,42 +83,61 @@ pub fn app_get_bootstrap(
         });
 
     let resolved = extensions.snapshot().resolved;
+    let versions = versions.inner().clone();
 
-    Bootstrap {
-        window: label,
-        role,
-        workspace,
-        keymap: keymap::resolve(&user_keymap()),
-        commands: {
-            // Builtins, then whatever the enabled extensions contribute. One list and not two,
-            // on `cide-core::commands`' own rule: two tables would let a command be bindable but
-            // unlistable, and both would drift silently. `Command::id` is a plain `String`
-            // precisely so this concatenation is possible — every extension row is
-            // `ext.<marketplace>.<extension>.<id>`, which `ui/src/keys/dispatch.ts` handles with
-            // one prefixed `case`.
-            let mut rows = commands::registry().to_vec();
-            rows.extend(
-                resolved
-                    .commands
-                    .iter()
-                    .map(|row| commands::extension_command(&row.id, &row.title, &row.keywords)),
-            );
-            rows
-        },
+    blocking("app_get_bootstrap", move || {
         // Read from the workspace this window already holds, so the version in the header is
-        // the version of the binary this workspace's panes will actually spawn.
-        capabilities: capabilities(&state.with(|ws| ws.settings.claude.cli.binary.clone())),
-        // Here rather than behind a command of its own, and the reason is one line of the editor:
-        // `foldSpecFor` runs inside the mount dispatch and cannot await, so a fold table that
-        // arrived a round trip after first paint would restore a remembered scroll position
-        // against unfolded heights. See `cide_ipc::lang::FoldSpecDto`.
-        extensions: resolved,
-        // Read from disk on every bootstrap rather than cached in `WorkspaceState`, and the
-        // cheapness is why: a handful of small files in a directory the user rarely touches,
-        // against a cache that a second window's import would have to invalidate. `load_all`
-        // never fails — an unreadable scheme costs its own row and nothing else.
-        schemes: cide_core::scheme::load_all(),
-    }
+        // the version of the binary this workspace's panes will actually spawn. A cache hit
+        // in the steady state; a miss forks the probe on this worker, not on the GTK loop.
+        let capabilities = capabilities(&workspace.settings.claude.cli.binary, &versions);
+        Bootstrap {
+            window: label,
+            role,
+            keymap: keymap::resolve(&user_keymap()),
+            commands: {
+                // Builtins, then whatever the enabled extensions contribute. One list and not two,
+                // on `cide-core::commands`' own rule: two tables would let a command be bindable but
+                // unlistable, and both would drift silently. `Command::id` is a plain `String`
+                // precisely so this concatenation is possible — every extension row is
+                // `ext.<marketplace>.<extension>.<id>`, which `ui/src/keys/dispatch.ts` handles with
+                // one prefixed `case`.
+                let mut rows = commands::registry().to_vec();
+                rows.extend(
+                    resolved
+                        .commands
+                        .iter()
+                        .map(|row| commands::extension_command(&row.id, &row.title, &row.keywords)),
+                );
+                rows
+            },
+            capabilities,
+            // Here rather than behind a command of its own, and the reason is one line of the editor:
+            // `foldSpecFor` runs inside the mount dispatch and cannot await, so a fold table that
+            // arrived a round trip after first paint would restore a remembered scroll position
+            // against unfolded heights. See `cide_ipc::lang::FoldSpecDto`.
+            extensions: resolved,
+            // Read from disk on every bootstrap rather than cached in `WorkspaceState`, and the
+            // cheapness is why: a handful of small files in a directory the user rarely touches,
+            // against a cache that a second window's import would have to invalidate. `load_all`
+            // never fails — an unreadable scheme costs its own row and nothing else. Off the main
+            // thread now, and bootstrap runs at boot-and-refresh frequency, so the read stays.
+            schemes: cide_core::scheme::load_all(),
+            workspace,
+        }
+    })
+    .await
+}
+
+/// The current workspace revision — one lock, one `u64`.
+///
+/// Exists for the frontend's `synced()`: a mutator whose command answers with no `rev` of
+/// its own (`project_open`, `pane_split`, `window_detach_*`) needs a target revision to wait
+/// for so its promise keeps meaning "the mirror reflects the mutation" — and re-reading the
+/// whole `Bootstrap` for that number is the per-gesture cost this command exists to retire.
+/// See `ui/src/store/workspace.ts::synced`.
+#[tauri::command]
+pub fn workspace_rev(state: State<'_, WorkspaceState>) -> u64 {
+    state.rev()
 }
 
 /// The user's keybinding overrides, or none.
@@ -163,11 +207,12 @@ pub fn window_set_viewport(
 ///
 /// `binary` is the user's configured `claude`, which is why this takes an argument at all: the
 /// header's version string has to be about the binary panes will actually run, or a user who
-/// pinned an old CLI reads the version of one they are not using.
-fn capabilities(binary: &str) -> Capabilities {
+/// pinned an old CLI reads the version of one they are not using. `versions` is the cache that
+/// keeps the probe off the bootstrap path — see `caps::ClaudeVersion`.
+pub(crate) fn capabilities(binary: &str, versions: &crate::caps::ClaudeVersion) -> Capabilities {
     Capabilities {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        claude_version: claude_version(binary),
+        claude_version: versions.get(binary, claude_version),
         // **This flag's meaning changed in M12, and the change matters.**
         //
         // It used to mean "a language server ships", which was a *runtime* claim wearing a
@@ -192,7 +237,10 @@ fn capabilities(binary: &str) -> Capabilities {
 /// Recorded because the IDE-integration protocol is unversioned and the CLI self-updates:
 /// knowing which version a session was spawned against is the only way to tell a protocol
 /// change from a bug in this code.
-fn claude_version(binary: &str) -> Option<String> {
+///
+/// The probe primitive, never called on a hot path directly: `caps::ClaudeVersion` is the
+/// cache in front of it, warmed at setup and invalidated when the configured binary moves.
+pub(crate) fn claude_version(binary: &str) -> Option<String> {
     // Not spawned at all when the configured binary cannot be run. This is on the bootstrap
     // path — every window pays for it — and forking something already known to be missing spends
     // a `fork`/`exec` to learn what `resolve` answered from a `stat`. The screen has the

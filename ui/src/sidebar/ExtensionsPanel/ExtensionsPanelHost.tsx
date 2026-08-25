@@ -7,7 +7,7 @@
  * draws nothing. A `useExtStore` call moved down into the view would drag `@/ipc/client`, and with
  * it `@tauri-apps/api`, into a check whose whole value is that it needs neither.
  */
-import { useMemo, useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 
 import { notifyFailure } from '@/chrome/notices'
 import { ext as extApi } from '@/ipc/client'
@@ -36,7 +36,16 @@ import {
   type ProblemIn,
 } from './model'
 
-export function ExtensionsPanel({ project }: ExtensionsPanelProps): React.JSX.Element {
+/**
+ * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
+ * re-renders on every store notification it subscribes to, and everything this panel draws
+ * arrives through its own store subscriptions or through props `App` pins with `useCallback`
+ * for exactly this. Without the memo, every App render re-walked the panel's full
+ * unvirtualized row list for events that had nothing to do with it.
+ */
+export const ExtensionsPanel = memo(ExtensionsPanelImpl)
+
+function ExtensionsPanelImpl({ project }: ExtensionsPanelProps): React.JSX.Element {
   const snapshot = useExtStore((state) => state.snapshot)
   const busy = useExtStore((state) => state.busy)
   const run = useExtStore((state) => state.run)

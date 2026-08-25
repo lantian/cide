@@ -31,7 +31,7 @@
  * difference between a menu that acts on what you right-clicked and one that acts on whatever
  * was last hovered.
  */
-import { useCallback } from 'react'
+import { memo, useCallback } from 'react'
 import type { FileDiff, ProjectId, RepoId } from '@/ipc/client'
 import { useIconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
@@ -77,7 +77,16 @@ export interface GitPanelProps {
   onUpdate?: (() => void) | undefined
 }
 
-export function GitPanel({ project, onOpenDiff, onShowHistory, onUpdate }: GitPanelProps) {
+/**
+ * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
+ * re-renders on every store notification it subscribes to, and everything this panel draws
+ * arrives through its own store subscriptions or through props `App` pins with `useCallback`
+ * for exactly this. Without the memo, every App render re-walked the panel's full
+ * unvirtualized row list for events that had nothing to do with it.
+ */
+export const GitPanel = memo(GitPanelImpl)
+
+function GitPanelImpl({ project, onOpenDiff, onShowHistory, onUpdate }: GitPanelProps) {
   const git = useGitPanel(project, { onOpenDiff })
   const iconTheme = useIconTheme()
 

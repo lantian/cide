@@ -15,18 +15,20 @@ import { reconcile, restack } from '@/keys/switcher'
 import { windowProjectsOf } from '@/keys/target'
 import { useMemo } from 'react'
 import { create } from 'zustand'
-import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
+import { destroyHost, noteLivePanes, peekHost, releaseHost } from '@/layout/paneHosts'
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import type { CloseScope } from '@/chrome/closeConfirmModel'
 import { planFileIndex, type IndexTarget } from './fileIndex'
 import {
   app as appApi,
   events,
+  extEvents,
   fs as fsApi,
   pane as paneApi,
   pendingCommand,
   session as sessionApi,
   unsavedChanges,
+  windowLabel,
   windows as windowApi,
   project as projectApi,
   tab as tabApi,
@@ -55,6 +57,74 @@ export type Theme = 'dark' | 'light'
 function nextFrame(): Promise<void> {
   return new Promise((resolve) => {
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  })
+}
+
+/* ------------------------------------------------------------------ waiting on the broadcast */
+
+/**
+ * Waiters for "the mirror has reached revision N", flushed by `applySnapshot` — and by
+ * `hydrate`, which can also move the mirror forward.
+ *
+ * This is what keeps every mutator's contract — *resolves once the mirror reflects the
+ * mutation* — without the `hydrate()` each of them used to run afterwards. Every command
+ * that reaches `WorkspaceState::update` already broadcasts `cide://workspace-changed` to
+ * every window *including this one*, and `applySnapshot` is the single place a snapshot
+ * lands; the hydrate on top was a second full `app_get_bootstrap` round trip — a
+ * synchronous Rust command that forked `claude --version` on the GTK main loop, ~70ms warm
+ * and unbounded under memory pressure — plus a second `set({ boot })`, each a re-render of
+ * the entire tree under `App`. Per gesture. That pairing was the visible lag on every file
+ * switch, project switch, pane focus and maximize, and `setRatio` below was the first
+ * mutator to shed it.
+ *
+ * Waiting for the broadcast instead costs nothing extra when the command's answer carries
+ * `rev` (most do — `Mutated { rev }`), and one `workspace_rev` fetch — a `u64`, not a
+ * `Bootstrap` — when it does not. The contract itself is load-bearing: `closePane` destroys
+ * the host only after the commit that unmounted the pane, the detach mutators release hosts
+ * only after the tree has moved, and `dispatch.ts`'s reopen reads the reopened tab from the
+ * mirror. All of that keeps working because the wait lives *inside* the mutators rather
+ * than at their call sites.
+ */
+let syncWaiters: { rev: number; resolve: () => void }[] = []
+
+/**
+ * A lost broadcast must not wedge a caller for ever — a window mid-teardown can drop one,
+ * and `closeProject` in per-project mode is *asking* for this window to go. Resolving stale
+ * after this long degrades to a snapshot that arrives late, which every caller already
+ * survives; the warning is there so a systematic loss shows up in the console rather than
+ * as a mystery half-second on every gesture.
+ */
+const SYNC_TIMEOUT_MS = 1500
+
+function flushSynced(rev: number): void {
+  if (syncWaiters.length === 0) return
+  const ready = syncWaiters.filter((w) => w.rev <= rev)
+  if (ready.length === 0) return
+  syncWaiters = syncWaiters.filter((w) => w.rev > rev)
+  for (const w of ready) w.resolve()
+}
+
+/**
+ * Resolve once the mirror's revision is at least `rev` — the one the mutation's answer
+ * named, or the backend's current revision when the answer carried none. Resolves
+ * immediately when the broadcast beat the command's own response, which it often does.
+ */
+async function synced(rev?: number): Promise<void> {
+  const target = rev ?? (await appApi.workspaceRev())
+  const have = useWorkspace.getState().boot?.workspace.rev
+  if (have !== undefined && Number(have) >= target) return
+  await new Promise<void>((resolve) => {
+    let settled = false
+    const once = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    syncWaiters.push({ rev: target, resolve: once })
+    setTimeout(() => {
+      if (!settled) console.warn(`[cide] synced(${target}) timed out waiting for a broadcast`)
+      once()
+    }, SYNC_TIMEOUT_MS)
   })
 }
 
@@ -217,6 +287,31 @@ let indexedProjects = new Map<string, string>()
  * begins by clearing the matcher and dropping the watcher, so it would empty the *first*
  * window's Ctrl+P and stop its file events. `cmd::fs::tests` pins both halves.
  */
+/**
+ * Tell `paneHosts` which terminal panes the workspace currently holds, everywhere.
+ *
+ * Every project's every tab, not just the active one's: the host budget exists precisely so
+ * a *background* project's parked terminals survive a project switch, and a live-pane set
+ * that only counted the visible project would evict them the moment the user left. Claude
+ * and shell panes only — editors and diffs have no host to budget for.
+ */
+function syncHostBudget(workspace: Workspace): void {
+  const ids = new Set<string>()
+  for (const project of Object.values(workspace.projects)) {
+    for (const tab of project.tabs) {
+      for (const pane of Object.values(tab.tree.panes)) {
+        if (pane.kind === 'claude' || pane.kind === 'shell') ids.add(pane.id)
+      }
+    }
+    // A pane torn out into its own window leaves its tab's tree for `project.detached`;
+    // it is exactly as alive as one still docked.
+    for (const pane of Object.values(project.detached)) {
+      if (pane.kind === 'claude' || pane.kind === 'shell') ids.add(pane.id)
+    }
+  }
+  noteLivePanes(ids)
+}
+
 function syncFileIndex(workspace: Workspace): void {
   const open: IndexTarget[] = Object.values(workspace.projects).map((project) => ({
     project: project.id,
@@ -455,6 +550,13 @@ interface WorkspaceStore {
   hydrate: () => Promise<void>
   /** Start following `cide://workspace-changed`. Returns an unlisten function. */
   subscribe: () => Promise<() => void>
+  /**
+   * Resolve once the mirror has caught up to `rev` — or to the backend's current revision
+   * when none is given. The building block every mutator below awaits; exposed for the call
+   * sites that used to `hydrate()` merely to *wait* (the switcher's reopen, a jump's second
+   * reveal, `revealPane`'s activation), which now wait without the re-read.
+   */
+  synced: (rev?: number) => Promise<void>
   /** Open a project and re-read the tree. */
   openProject: (paths: string[]) => Promise<void>
   /**
@@ -610,6 +712,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // the store, and an index that started against a project the window has not adopted yet
     // would race the components that are about to ask it questions.
     syncFileIndex(boot.workspace)
+    syncHostBudget(boot.workspace)
+    // A hydrate moves the mirror forward exactly as a snapshot does, so waiters that were
+    // racing it must not be left hanging for the timeout.
+    flushSynced(Number(boot.workspace.rev))
   },
 
   /**
@@ -657,24 +763,55 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
       if (boot === null) return
       set({ boot: { ...boot, schemes } })
     })
+    /*
+     * Capabilities are a fourth subscription, for the keymap's reason one field along: they
+     * ride `Bootstrap`, `applySnapshot` keeps the old struct, and the per-gesture hydrates
+     * that used to refresh them opportunistically are gone. Without this line, changing the
+     * Claude binary in one window updates that window's header (Settings re-reads it) and no
+     * other window's until reload.
+     */
+    const unlistenCapabilities = await events.onCapabilitiesChanged((capabilities) => {
+      const boot = get().boot
+      if (boot === null) return
+      set({ boot: { ...boot, capabilities } })
+    })
+    /*
+     * And an extension change is the one event answered with a full re-read. `boot.commands`
+     * and `boot.extensions` were only ever refreshed by gesture hydrates; with those gone, an
+     * extension installed in window A would never reach window B's palette until reload. The
+     * event's payload carries the snapshot but not the *merged command list* — that concat
+     * lives in Rust (`app_get_bootstrap`), and duplicating it here would drift silently. An
+     * ext change is a settings-panel gesture, rare by construction, and the bootstrap is now
+     * cheap and off the main thread, so one honest hydrate is the right price. This is the
+     * one hydrate left outside boot.
+     */
+    const unlistenExt = await extEvents.onChanged(() => {
+      void get().hydrate()
+    })
     return () => {
       unlisten()
       unlistenKeymap()
       unlistenSchemes()
+      unlistenCapabilities()
+      unlistenExt()
     }
   },
 
-  // Every mutation re-reads the whole tree rather than patching the mirror locally. The
-  // snapshot is small, the round trip is already paid for, and a local patch that drifts
-  // from Rust's answer is a class of bug worth not having. `cide://workspace-changed`
-  // replaces the re-read in a later milestone.
+  synced,
+
+  // No mutator re-reads the tree, and none patches the mirror locally either. The broadcast
+  // out of `WorkspaceState::update` is the one road a snapshot takes into this store — the
+  // "later milestone" the old comment here promised — and what each mutator awaits is
+  // `synced(...)`: the mirror catching up to the revision the mutation produced. See the
+  // note on `syncWaiters` for why the promise contract lives inside the mutators, and
+  // `setRatio` below for the one that does not even wait.
   openProject: async (paths) => {
     await projectApi.open(paths)
-    await get().hydrate()
+    await synced()
   },
   activateProject: async (id) => {
-    await projectApi.activate(id)
-    await get().hydrate()
+    const { rev } = await projectApi.activate(id)
+    await synced(rev)
   },
   closeProject: async (id, force = false) => {
     // Asked *before* the command, unlike `closeTab`, because a project close can be blocked
@@ -695,26 +832,29 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     }
     // Still guarded on the way out: a buffer can go dirty between the question and the
     // answer, and the refusal is the thing that makes that race harmless.
+    let rev: number | undefined
     const parked = await refused(
       'project',
-      () => projectApi.close(id, force),
+      async () => {
+        rev = (await projectApi.close(id, force)).rev
+      },
       () => get().closeProject(id, true),
     )
     if (parked) return
-    await get().hydrate()
+    await synced(rev)
   },
   newClaudeTab: async (project) => {
     const created = await tabApi.newClaude(project)
-    await get().hydrate()
+    await synced()
     return created
   },
   activateTab: async (project, tab) => {
-    await tabApi.activate(project, tab)
-    await get().hydrate()
+    const { rev } = await tabApi.activate(project, tab)
+    await synced(rev)
   },
   reorderTab: async (project, tab, before) => {
-    await tabApi.reorder(project, tab, before)
-    await get().hydrate()
+    const { rev } = await tabApi.reorder(project, tab, before)
+    await synced(rev)
   },
   closeTabs: async (project, tabs, force = false) => {
     if (tabs.length === 0) return
@@ -748,10 +888,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
      * `refused`, which is the pre-existing per-tab path doing what it is for — catching a race,
      * rather than being the ordinary way this gesture asks.
      */
+    let rev: number | undefined
     for (const tab of tabs) {
       const parked = await refused(
         'tab',
-        () => tabApi.close(project, tab, force),
+        async () => {
+          rev = (await tabApi.close(project, tab, force)).rev
+        },
         () => get().closeTab(project, tab, true),
       )
       // A refusal we did not anticipate stops the batch rather than closing the tabs after it
@@ -759,7 +902,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
       // mean answering it decides the fate of files it never named.
       if (parked) break
     }
-    await get().hydrate()
+    // The last successful close's revision; when the very first one parked, `synced` asks
+    // the backend and finds the mirror already current.
+    await synced(rev)
   },
   closeTab: async (project, tab, force = false) => {
     // Mostly no pre-flight question here, unlike `closeProject`: the unsaved case comes back
@@ -784,35 +929,38 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
         return
       }
     }
+    let rev: number | undefined
     const parked = await refused(
       'tab',
-      () => tabApi.close(project, tab, force),
+      async () => {
+        rev = (await tabApi.close(project, tab, force)).rev
+      },
       () => get().closeTab(project, tab, true),
     )
     if (parked) return
-    await get().hydrate()
+    await synced(rev)
   },
 
   splitPane: async (project, tab, pane, axis, side, intent = null) => {
     const created = await paneApi.split(project, tab, pane, axis, side, intent)
-    // Recorded before the hydrate that makes the pane renderable, so the spawn plan is
+    // Recorded before the wait that makes the pane renderable, so the spawn plan is
     // already in place by the time `TerminalPane` mounts and asks for one. The other order
     // races: the pane appears, spawns a fresh session, and the fork is lost.
     if (created.intent.kind === 'forkPrimary' || created.intent.kind === 'mirror') {
       rememberSpawnPlan(created.pane, created.intent)
     }
-    await get().hydrate()
+    await synced()
     return created
   },
   addRow: async (project, tab, after = null, side = 'after', intent = null) => {
     const created = await paneApi.addRow(project, tab, after, side, intent)
     // Same ordering as `splitPane`, and for the same reason: the plan has to be in place
-    // before the hydrate that makes the pane renderable, or `TerminalPane` mounts, finds no
+    // before the snapshot that makes the pane renderable, or `TerminalPane` mounts, finds no
     // plan and spawns a fresh session where the user asked to branch one.
     if (created.intent.kind === 'forkPrimary' || created.intent.kind === 'mirror') {
       rememberSpawnPlan(created.pane, created.intent)
     }
-    await get().hydrate()
+    await synced()
     return created
   },
   closePane: async (project, tab, pane, force = false) => {
@@ -822,19 +970,22 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     //    go, nor a tab's last, nor an editor pane holding unsaved edits — so nothing may be
     //    disposed until it has succeeded. The unsaved refusal parks the same dialog a tab
     //    close does; discarding re-issues with `force: true`.
+    let rev: number | undefined
     const parked = await refused(
       'pane',
-      () => paneApi.close(project, tab, pane, force),
+      async () => {
+        rev = (await paneApi.close(project, tab, pane, force)).rev
+      },
       () => get().closePane(project, tab, pane, true),
     )
     if (parked) return
 
-    // 2. Re-read and let React commit. The pane's `TerminalPane` unmounts here: its effect
-    //    cleanup detaches the sink, clears the exit poll and parks the host. Disposing
-    //    before this point destroys a host that is still mounted, and any async
-    //    continuation still in flight would call `getHost` and resurrect it — leaving a
-    //    freshly created host carrying a session nobody is watching.
-    await get().hydrate()
+    // 2. Wait for the snapshot and let React commit. The pane's `TerminalPane` unmounts
+    //    here: its effect cleanup detaches the sink, clears the exit poll and parks the
+    //    host. Disposing before this point destroys a host that is still mounted, and any
+    //    async continuation still in flight would call `getHost` and resurrect it — leaving
+    //    a freshly created host carrying a session nobody is watching.
+    await synced(rev)
     await nextFrame()
 
     // 3. Only now is the pane genuinely finished, so the child and the host go with it.
@@ -855,43 +1006,34 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     if (session) await sessionApi.kill(session)
   },
   focusPane: async (project, tab, pane) => {
-    await paneApi.focus(project, tab, pane)
-    await get().hydrate()
+    const { rev } = await paneApi.focus(project, tab, pane)
+    await synced(rev)
   },
   maximizePane: async (project, tab, pane) => {
-    await paneApi.maximize(project, tab, pane)
-    await get().hydrate()
+    const { rev } = await paneApi.maximize(project, tab, pane)
+    await synced(rev)
   },
   /**
-   * The one mutator here that does **not** re-hydrate afterwards, and the reason is the drag.
+   * The one mutator that does not even wait for the snapshot, and the reason is the drag.
    *
-   * Every command that reaches `WorkspaceState::update` already broadcasts
-   * `cide://workspace-changed` to every window *including this one* (`crates/cide-app/src/emit.rs`),
-   * and `applySnapshot` below is what receives it. The `hydrate()` its neighbours add on top is a
-   * second round trip and a second `set({ boot })` — and with no `React.memo` anywhere in this
-   * frontend, each of those is a re-render of the entire tree under `App`.
-   *
-   * Harmless at the end of a click. Not harmless here: this is what `pointerup` calls at the end
-   * of a divider drag, so it was landing two whole-app re-renders — each of which resizes every
-   * pane in every tab — in the frame the user let go of the mouse. That is the visible hitch at
-   * the end of a resize.
-   *
-   * Left in place everywhere else deliberately: the pattern is load-bearing for commands whose
-   * answer is not only the workspace, and rewriting eighteen call sites is not this change's to
-   * make.
+   * This is what `pointerup` calls at the end of a divider drag, and by then the drag has
+   * already written the final tracks to the DOM — the snapshot confirms what is on screen
+   * rather than moving anything. It was also the first mutator to shed the hydrate its
+   * neighbours carried (see `syncWaiters` for that whole story), because here the cost
+   * landed in the frame the user let go of the mouse: the visible hitch at the end of a
+   * resize. Nothing reads the mirror after this resolves, so there is nothing to wait for.
    */
   setRatio: async (project, tab, split, ratio) => {
     await paneApi.setRatio(project, tab, split, ratio)
   },
   /*
-   * Hydrates, unlike `setRatio` above, and the difference is that this one is a menu click
+   * Waits, unlike `setRatio` above, and the difference is that this one is a menu click
    * rather than the last frame of a drag: nothing has written the new tracks to the DOM
    * ahead of the round trip, so the snapshot *is* the only thing that moves the dividers.
-   * One re-render at the end of a click is what every other mutator here costs.
    */
   distributePanes: async (project, tab, pane, axis) => {
-    await paneApi.distribute(project, tab, pane, axis)
-    await get().hydrate()
+    const { rev } = await paneApi.distribute(project, tab, pane, axis)
+    await synced(rev)
   },
   navigatePane: async (project, tab, pane, direction) => {
     // Two calls because the domain separates "where would focus go" from "move it": the
@@ -899,12 +1041,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // wrapping around, which is what stops Alt+Left cycling forever in a two-pane tab.
     const target = await paneApi.navigate(project, tab, pane, direction)
     if (target === null) return
-    await paneApi.focus(project, tab, target)
-    await get().hydrate()
+    const { rev } = await paneApi.focus(project, tab, target)
+    await synced(rev)
   },
   bindSession: async (project, tab, pane, session) => {
-    await paneApi.bindSession(project, tab, pane, session)
-    await get().hydrate()
+    const { rev } = await paneApi.bindSession(project, tab, pane, session)
+    await synced(rev)
   },
 
   detachPane: async (project, tab, pane) => {
@@ -916,7 +1058,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
         ? { width: el.clientWidth, height: el.clientHeight }
         : undefined
     await windowApi.detachPane(project, tab, pane, rect)
-    await get().hydrate()
+    await synced()
     await nextFrame()
     // Released rather than destroyed. The pane has left this window's tree but its session
     // is still running and the new window is attaching to it; destroying the host here
@@ -924,8 +1066,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     releaseHost(pane)
   },
   redockPane: async (label) => {
-    await windowApi.redockPane(label)
-    await get().hydrate()
+    const { rev } = await windowApi.redockPane(label)
+    await synced(rev)
   },
   detachTab: async (project, tab) => {
     // Read before the call: the ids do not change — the tab stays in `project.tabs` — but
@@ -942,7 +1084,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
         ? { width: el.clientWidth, height: el.clientHeight }
         : undefined
     await windowApi.detachTab(project, tab, rect)
-    await get().hydrate()
+    await synced()
     await nextFrame()
     // Released rather than destroyed, per pane, exactly as `detachPane` releases its one:
     // any terminal split into this tab keeps its child running and the new window attaches
@@ -950,28 +1092,44 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     for (const pane of panes) releaseHost(pane)
   },
   redockTab: async (label) => {
-    await windowApi.redockTab(label)
-    await get().hydrate()
+    const { rev } = await windowApi.redockTab(label)
+    await synced(rev)
   },
   setWindowMode: async (mode) => {
-    await windowApi.setMode(mode)
-    await get().hydrate()
+    const { rev } = await windowApi.setMode(mode)
+    await synced(rev)
   },
 
   applySnapshot: (workspace) => {
     const current = get().boot
     if (!current) return
-    // Events carry the revision precisely so a snapshot that arrives out of order can be
-    // dropped rather than winding the UI backwards.
-    if (workspace.rev < current.workspace.rev) return
-    const boot = { ...current, workspace }
+    // Events carry the revision precisely so a snapshot that arrives out of order — or a
+    // duplicate of one this window already holds — can be dropped rather than winding the
+    // UI backwards or re-rendering it for nothing. `<=` became correct the day
+    // `WorkspaceState::update` started enforcing bump-on-change: every accepted broadcast
+    // now carries a strictly newer rev, so "not newer" means "not news". (The boot race is
+    // the common duplicate: a broadcast emitted just before `app_get_bootstrap` read the
+    // same tree lands just after the bootstrap set it.)
+    if (workspace.rev <= current.workspace.rev) return
+    // The role rides the snapshot: `workspace.windows` is the very map `app_get_bootstrap`
+    // read `role` from, keyed by the label in this window's URL. Deriving it here is what
+    // let `activateProject` and every other mutator drop their bootstrap re-read —
+    // `role.active` is how a shell window knows which project it shows, and keeping the
+    // boot-time copy left it stale until something happened to hydrate. Kept from `current`
+    // when the map stops naming this window: that is a window mid-close (a redock pruned
+    // the role), and repainting its last frame as an empty shell is a flash nobody wants.
+    const role = workspace.windows[windowLabel()] ?? current.role
+    const boot = { ...current, workspace, role }
     // Both MRU stacks follow the snapshot, not the action: a project or a tab activated, opened
     // or closed in another window reaches this one only here. See `nextMru`, `nextTabMru`.
+    // (`nextMru` also finally sees the *fresh* `role.active` on a cross-window switch.)
     set({ boot, mru: mruFor(get().mru, boot), tabMru: nextTabMru(get().tabMru, boot) })
     // A project opened or closed in *another* window reaches this one only here. Without
     // this line the second window's tree and picker stay empty until something in it happens
     // to call `hydrate`.
     syncFileIndex(workspace)
+    syncHostBudget(workspace)
+    flushSynced(Number(workspace.rev))
   },
 
   rememberMru: (order) => {

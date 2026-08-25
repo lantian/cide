@@ -7,6 +7,9 @@
 //! Mutation goes through [`WorkspaceState::update`] rather than by handing out the guard,
 //! so that advancing `rev`, re-validating and marking the file dirty cannot be forgotten at
 //! a call site. A command handler that could skip validation would eventually skip it.
+//! `update` also compares the tree before and after: a mutation that changed nothing is not
+//! bumped, not persisted and not broadcast, and one that changed something is guaranteed a
+//! bump even when its mutator forgot — so every broadcast carries a strictly newer `rev`.
 
 use std::path::PathBuf;
 
@@ -89,6 +92,16 @@ impl WorkspaceState {
     /// A mutation that leaves the tree invalid is rolled back and reported: `cide-core`'s
     /// operations are individually invariant-preserving, so reaching here means either a
     /// compound edit that was not, or a bug — and neither should be persisted.
+    ///
+    /// A mutation that changed **nothing** is also not broadcast. That is not an
+    /// optimisation nicety: `pane_focus` lands on every click including clicks on the
+    /// already-focused pane, and `note_conversation` repeats the same id on every hook
+    /// frame of a busy Claude turn — before this guard each of those cost every window a
+    /// full snapshot parse and a full re-render, which is where "the app lags while an
+    /// agent is working" came from. And a mutation that changed something without bumping
+    /// `rev` has the bump applied here, which is what makes the module doc's "cannot be
+    /// forgotten at a call site" true rather than aspirational: every broadcast carries a
+    /// strictly newer `rev`, so the frontend can drop non-newer snapshots as duplicates.
     pub fn update<T>(
         &self,
         f: impl FnOnce(&mut Workspace) -> cide_core::Result<T>,
@@ -111,6 +124,33 @@ impl WorkspaceState {
             return outcome;
         }
 
+        // `before` is already paid for as the rollback copy; reuse it to answer "did this
+        // mutation change anything?" — one structural compare, no second clone. `rev` is
+        // masked out of the question in both directions: a mutator that bumps gratuitously
+        // cannot make a no-op look like news, and one that forgot to bump cannot hide a
+        // change.
+        let rev_before = before.rev;
+        let mut content_before = before;
+        content_before.rev = guard.rev;
+        if *guard == content_before {
+            // A genuine no-op. Nothing to persist, nothing to broadcast, no titles to
+            // move. Un-bumping keeps `rev` meaning "number of accepted changes", so a
+            // closure that read `ws.rev` after a gratuitous bump would return a revision
+            // that never broadcasts — mutators must bump only when they change something
+            // (`activate_project` and `activate_tab` are the pattern), and the layout
+            // commands read `state.rev()` after this returns, which is always honest.
+            guard.rev = rev_before;
+            return outcome;
+        }
+        if guard.rev == rev_before {
+            // Changed, but the mutator never bumped — true of every layout mutation in
+            // `cmd/pane.rs` (`focus`, `maximize`, `set_ratio`, `distribute`, `swap`),
+            // which historically leaned on the frontend accepting equal-rev snapshots.
+            // Enforcing the bump here is what lets the frontend's `applySnapshot` treat
+            // "not strictly newer" as "duplicate, drop it".
+            guard.rev += 1;
+        }
+
         self.debounce.note_change();
 
         // Broadcast while still holding the lock, so two concurrent mutations cannot emit
@@ -130,11 +170,13 @@ impl WorkspaceState {
             // the version of this that goes stale the first time somebody adds a mutation and
             // does not know they have to.
             //
-            // Cheap enough to be unconditional, and it has to be unconditional to be a level:
-            // a window count in the low single digits, a few string builds, and a `set_title`
-            // per window with the string it already has. `retitle` reads its own two mutexes
-            // (the awaiting set and the focus set) and never re-enters this state, and the
-            // workspace guard is dropped above, so there is no lock to deadlock on.
+            // Run on every *accepted change*, which is still what makes it a level: every
+            // fact a title reads lives in this tree, and a suppressed no-op moved no fact,
+            // so skipping it there loses nothing. The other title inputs (the awaiting set,
+            // the focus set) recompute through their own paths — `window_set_awaiting` and
+            // `focus_changed` — not through here. `retitle` reads its own two mutexes and
+            // never re-enters this state, and the workspace guard is dropped above, so
+            // there is no lock to deadlock on.
             //
             // Note that this is *after* the broadcast and outside the lock, deliberately: a
             // GTK call is the slowest thing in this function and the webviews should not wait
@@ -158,5 +200,108 @@ impl WorkspaceState {
         if let Err(error) = persist::save_atomic(&self.path, &workspace) {
             tracing::error!(path = %self.path.display(), %error, "failed to save the workspace");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cide_ipc::Theme;
+
+    /// A state with no `AppHandle` attached, so `update` skips the emit/retitle tail —
+    /// which is exactly what lets the rev discipline be tested without a Tauri app.
+    ///
+    /// Holds one open project rather than `Workspace::default()`, because `update`
+    /// re-validates after every closure and a default workspace has no shell window yet.
+    fn state() -> WorkspaceState {
+        let mut ws = Workspace::default();
+        workspace::open_project(
+            &mut ws,
+            vec![std::path::PathBuf::from("/tmp/cide-test")],
+            None,
+        )
+        .expect("a rooted project opens");
+        WorkspaceState {
+            inner: Mutex::new(ws),
+            path: std::env::temp_dir().join("cide-workspace-state-test.json"),
+            debounce: Debouncer::new(persist::SAVE_DEBOUNCE),
+            app: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn a_no_op_mutation_leaves_rev_untouched() {
+        let s = state();
+        let before = s.rev();
+        // The closure runs and succeeds but changes nothing — the `pane_focus`-on-the-
+        // focused-pane shape.
+        s.update(|_ws| Ok(())).expect("a no-op succeeds");
+        assert_eq!(s.rev(), before, "a no-op must not look like news");
+    }
+
+    #[test]
+    fn a_gratuitous_bump_with_no_change_is_undone() {
+        let s = state();
+        let before = s.rev();
+        s.update(|ws| {
+            workspace::bump(ws);
+            Ok(())
+        })
+        .expect("succeeds");
+        assert_eq!(
+            s.rev(),
+            before,
+            "rev counts accepted changes, not bump calls"
+        );
+    }
+
+    #[test]
+    fn a_change_that_forgot_to_bump_is_bumped_exactly_once() {
+        let s = state();
+        let before = s.rev();
+        s.update(|ws| {
+            // A real content change with no `bump` — the historical shape of every
+            // layout mutation in `cmd/pane.rs`.
+            ws.settings.theme = match ws.settings.theme {
+                Theme::Dark => Theme::Light,
+                Theme::Light => Theme::Dark,
+            };
+            Ok(())
+        })
+        .expect("succeeds");
+        assert_eq!(s.rev(), before + 1, "every accepted change advances rev");
+    }
+
+    #[test]
+    fn a_change_that_bumped_itself_is_not_bumped_again() {
+        let s = state();
+        let before = s.rev();
+        s.update(|ws| {
+            ws.settings.theme = match ws.settings.theme {
+                Theme::Dark => Theme::Light,
+                Theme::Light => Theme::Dark,
+            };
+            workspace::bump(ws);
+            Ok(())
+        })
+        .expect("succeeds");
+        assert_eq!(s.rev(), before + 1);
+    }
+
+    #[test]
+    fn a_failing_mutation_still_rolls_back() {
+        let s = state();
+        let before = s.with(|ws| ws.clone());
+        let out: cide_core::Result<()> = s.update(|ws| {
+            ws.settings.theme = Theme::Dark;
+            workspace::bump(ws);
+            Err(cide_core::CoreError::Invariant("deliberate".into()))
+        });
+        assert!(out.is_err());
+        assert_eq!(
+            s.with(|ws| ws.clone()),
+            before,
+            "failure restores everything, rev included"
+        );
     }
 }

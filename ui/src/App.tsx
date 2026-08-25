@@ -9,7 +9,16 @@
  * The pane grid is still M0's hard-coded 2x2. M4 replaces it with the real split tree
  * rendered from `tab.tree`.
  */
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useInsertionEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import { AppHeader } from '@/chrome/AppHeader'
 import { ActivityRail } from '@/chrome/ActivityRail'
 import { PanelBoundary } from '@/chrome/PanelBoundary'
@@ -108,7 +117,6 @@ import {
   benchMode,
   file as fileApi,
   fs as fsApi,
-  project as projectApi,
   windows as windowApi,
   diag,
   events,
@@ -119,9 +127,12 @@ import {
   windowLabel,
   windowRole,
   type PaneRestore,
+  type Project,
   type ProjectId,
   type SplitIntent,
+  type Tab,
   type TabId,
+  type WindowRole,
 } from '@/ipc/client'
 import { DetachedTabHeader } from '@/windows/DetachedTabHeader'
 import { clusterPlan, shownProjects, shownTabs } from '@/windows/windowTabs'
@@ -191,9 +202,57 @@ function activeProjectIdOfState() {
   return boot.role.active
 }
 
+/**
+ * Give the windows audit something a detach can legally take. Audit-only.
+ *
+ * `seedAuditWorkspace` produces two tabs of one pane each, and the domain refuses to
+ * detach both of them: `take_pane` refuses a tab's last pane, and the console's founding
+ * pane is `Primary` and refused outright. So the audit's detach criterion needs an
+ * *auxiliary* pane in a *non-console* tab — which is exactly what its own failure message
+ * asks for ("seed a tab with a second pane before running"). A shell rather than a Claude
+ * session, so a hundred audit runs do not spend the user's quota starting agents.
+ */
+async function seedDetachablePane(
+  splitPane: ReturnType<typeof useWorkspace.getState>['splitPane'],
+): Promise<void> {
+  const boot = useWorkspace.getState().boot
+  const project = activeProjectIdOfState()
+  if (!boot || !project) return
+  const tabs = boot.workspace.projects[project]?.tabs ?? []
+  const tab = tabs.find((t, at) => at > 0 && Object.keys(t.tree.panes).length === 1)
+  if (!tab) return
+  await splitPane(project, tab.id, tab.tree.focused, 'row', 'after', { kind: 'shell' })
+}
+
+/**
+ * Resolve once the bootstrap has landed. Audit-only.
+ *
+ * The pane and window audits run from mount effects, and a mount effect always beats the
+ * bootstrap's IPC round trip — so `seedAuditWorkspace`'s deliberate bootless refusal made
+ * both audits silently no-op ("no project to run against") on every launch where the race
+ * fell that way. The chrome audit re-runs on `[boot]`; these two are one-shots, so they
+ * wait here instead of re-running on every later snapshot.
+ */
+async function bootLanded(cancelled: () => boolean): Promise<boolean> {
+  while (!cancelled()) {
+    if (useWorkspace.getState().boot !== null) return true
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return false
+}
+
 /** The viewport the design mock is drawn at, and the one the audit must measure in. */
 const MOCK_WIDTH = 1440
 const MOCK_HEIGHT = 900
+
+/**
+ * Stable empties for the memoised derivations below, so a bootless window (and every render
+ * before the first snapshot) hands React the same array identity every time — the rule
+ * `useProjects`' `NO_PROJECTS` writes down in the store. `never[]` so each site keeps the
+ * element type its non-empty arm derives.
+ */
+const NO_PROJECT_LIST: never[] = []
+const NO_TAB_LIST: never[] = []
 
 /**
  * Ask for a directory and open it as a project.
@@ -223,16 +282,12 @@ export function App() {
   const theme = useWorkspace((s) => s.theme)
   const hydrate = useWorkspace((s) => s.hydrate)
   const openProject = useWorkspace((s) => s.openProject)
+  const activateProject = useWorkspace((s) => s.activateProject)
   const closeProject = useWorkspace((s) => s.closeProject)
-  const activateTab = useWorkspace((s) => s.activateTab)
-  const closeTab = useWorkspace((s) => s.closeTab)
-  const closeTabs = useWorkspace((s) => s.closeTabs)
-  const reorderTab = useWorkspace((s) => s.reorderTab)
-
+  // The strip and grid actions moved to `WorkspaceContent` below, which reads them itself;
+  // what stays here is what App's own chrome — the header, the dispatcher fallback, the
+  // detached-pane branch — still dispatches.
   const splitPane = useWorkspace((st) => st.splitPane)
-  const closePane = useWorkspace((st) => st.closePane)
-  const focusPane = useWorkspace((st) => st.focusPane)
-  const maximizePane = useWorkspace((st) => st.maximizePane)
   const contextMenuOpen = useContextMenuOpen()
   /*
    * Whether a change-walkable diff surface holds the slot, for the `diffFocused` key-context
@@ -246,12 +301,10 @@ export function App() {
    * mounted yet, and claiming otherwise would arm a chord against a pane that is not there.
    */
   const diffFocused = useSyncExternalStore(subscribeChangeNav, changeNavPresent, () => false)
-  const setRatio = useWorkspace((st) => st.setRatio)
   const bindSession = useWorkspace((st) => st.bindSession)
   const newClaudeTab = useWorkspace((st) => st.newClaudeTab)
   const detachPane = useWorkspace((st) => st.detachPane)
   const redockPane = useWorkspace((st) => st.redockPane)
-  const detachTab = useWorkspace((st) => st.detachTab)
   const redockTab = useWorkspace((st) => st.redockTab)
 
   /*
@@ -472,6 +525,9 @@ export function App() {
     // started, `newClaudeTab` then made a different tab active, and the audit waited two
     // seconds for a pane that had landed somewhere it was no longer looking.
     void (async () => {
+      // …and the seeding after the bootstrap, or it refuses to seed at all — see
+      // `bootLanded` for the race that made this audit a silent no-op.
+      if (!(await bootLanded(() => cancelled))) return
       await seedAuditWorkspace(openProject, newClaudeTab)
       if (cancelled) return
       const driver = createAppPaneDriver()
@@ -495,7 +551,12 @@ export function App() {
     void (async () => {
       // Two projects, so a mode flip has something to distribute, and a second tab so the
       // console's pane is not the only one — detaching a tab's last pane is refused.
+      // Seeded only after the bootstrap, for the pane audit's reason (`bootLanded`), and
+      // with one auxiliary pane the domain will actually let a detach take.
+      if (!(await bootLanded(() => cancelled))) return
       await seedAuditWorkspace(openProject, newClaudeTab)
+      if (cancelled) return
+      await seedDetachablePane(splitPane)
       if (cancelled) return
       const driver = createAppWindowDriver()
       if (!driver) {
@@ -552,8 +613,17 @@ export function App() {
    * why every project in the process is the wrong answer: in `PerProject` mode each window's
    * role names exactly one, and rendering the other two put tabs in the strip that activate a
    * project this window does not show.
+   *
+   * Memoised on `boot` (this one and `visibleTabs` below): a snapshot replaces `boot`, so
+   * these still recompute exactly once per mutation — what the memo removes is the fresh
+   * array per *non-snapshot* render (an overlay opening, a statusline tick), which is what
+   * lets `WorkspaceContent`'s memo below actually hold.
    */
-  const projects = boot ? shownProjects(boot.role, Object.values(boot.workspace.projects)) : []
+  const projects = useMemo(
+    () =>
+      boot ? shownProjects(boot.role, Object.values(boot.workspace.projects)) : NO_PROJECT_LIST,
+    [boot],
+  )
   // A detached pane or tab window shows one project too, and naming it here keeps the
   // header honest in those windows rather than rendering no active tab at all.
   const activeProjectId =
@@ -571,10 +641,13 @@ export function App() {
    * file tab and two live buffers over one file. A shell subtracts the torn-out tabs; a
    * `tab:` window keeps exactly its own.
    */
-  const visibleTabs =
-    boot !== null && activeProject !== null
-      ? shownTabs(boot.role, activeProject.tabs, boot.workspace.windows)
-      : []
+  const visibleTabs = useMemo(
+    () =>
+      boot !== null && activeProject !== null
+        ? shownTabs(boot.role, activeProject.tabs, boot.workspace.windows)
+        : NO_TAB_LIST,
+    [boot, activeProject],
+  )
   const tabRole = boot !== null && boot.role.kind === 'detachedTab' ? boot.role : null
   // The tab a `tab:` window shows — the role's, never the project's `activeTab`, which the
   // domain deliberately keeps pointed at a tab the *shell* draws. `null` while the mirror
@@ -659,6 +732,10 @@ export function App() {
     () => applyFilters(rawDiagnostics, diagnosticFilters),
     [rawDiagnostics, diagnosticFilters],
   )
+  // One derivation for the rail's badge and the status bar — the panel-model rule about not
+  // computing a count twice, applied to identity as well: `statusBarCounts` builds a fresh
+  // object, and two inline calls handed two consumers two identities per render.
+  const diagCounts = useMemo(() => statusBarCounts(diagnostics.snapshot), [diagnostics])
 
   useEffect(() => {
     void attachDiagnostics(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
@@ -765,6 +842,25 @@ export function App() {
   useEffect(() => attachExtensions(), [])
 
   /*
+   * The rail's contributed buttons, in registry order. (M22) Derived here rather than inline
+   * in the JSX so a render that changed nothing about extensions hands `ActivityRail` the
+   * same array identity — the JSX spelling built a fresh array per render, which is exactly
+   * the class of prop the memo boundary below cannot see through. The comment on *what* the
+   * filter means stays at the JSX site.
+   */
+  const railExtras = useMemo(
+    () =>
+      extPanels
+        .filter((panel) => panel.def.location === 'sidebar')
+        .map((panel) => ({
+          id: panel.view as ActivityView,
+          path: panel.def.icon ?? '',
+          label: panel.def.label,
+        })),
+    [extPanels],
+  )
+
+  /*
    * The other half of the extension host: what a worker can learn about an open file, and what it
    * can put back.
    *
@@ -777,9 +873,11 @@ export function App() {
       attachEditorBridge((path, line, column) => {
         if (!activeProjectId) return
         jumpTo(activeProjectId, { path, line, column })
-        void fileApi.open(activeProjectId, path).then(() => hydrate())
+        // No hydrate afterwards: `tab_open_file` broadcasts the snapshot that makes the
+        // tab appear, exactly as `gitDiff.openTab` documents.
+        void fileApi.open(activeProjectId, path)
       }),
-    [activeProjectId, hydrate],
+    [activeProjectId],
   )
   useEffect(() => {
     setBridgeProject(activeProjectId ?? null)
@@ -862,8 +960,21 @@ export function App() {
   /*
    * The one dispatcher. The key gate and the command palette both call it, which is what
    * stops a binding and its palette entry drifting into two different behaviours.
+   *
+   * Built fresh every commit — a stale `focused`/`activeProject` in a dispatcher is a real
+   * bug the closures below guard against — but *published* through a ref behind a stable
+   * wrapper. The identity is what every consumer keys on: `WorkspaceContent`'s memo, the
+   * pinned `onSelectOpened` callback, the key gate's own `live` ref. `useInsertionEffect`
+   * so the ref is reassigned before any layout effect or event handler of this commit can
+   * run; `runCommand` is only ever called from handlers and the gate, never during render,
+   * so it always dispatches against the tree the user is looking at.
    */
-  const runCommand = createDispatcher({
+  const dispatcherRef = useRef<(command: string, args: unknown) => void>(() => {})
+  const runCommand = useCallback(
+    (command: string, args: unknown) => dispatcherRef.current(command, args),
+    [],
+  )
+  const dispatcher = createDispatcher({
     fallback: (command) => {
 
       /*
@@ -924,6 +1035,68 @@ export function App() {
      */
     focusedTab: () => focused?.tab.id ?? null,
   })
+  useInsertionEffect(() => {
+    dispatcherRef.current = dispatcher
+  })
+
+  /*
+   * Stable handlers for the sidebar panels. Each panel host is `memo`ised (its definition
+   * site says why), and a memo over a prop rebuilt every render is a memo that never holds
+   * — so everything a panel receives from here is pinned with `useCallback` over at most
+   * `activeProjectId` (a string) and the already-stable `runCommand`. The comments about
+   * *what* each handler routes, and why through the command, stay at the JSX sites below,
+   * where a reader meets them.
+   */
+  const onShowHistory = useCallback(
+    (path: string) => runCommand('git.history.file', { path }),
+    [runCommand],
+  )
+  const onSelectOpened = useCallback(() => runCommand('file.reveal', null), [runCommand])
+  const onOpenPin = useCallback(
+    (id: string) => {
+      if (id === PROJECT_NOTES) runCommand('file.projectNotes', null)
+    },
+    [runCommand],
+  )
+  const onOpenTreeFile = useCallback(
+    (path: string) => {
+      if (!activeProjectId) return
+      // `UNKNOWN_LINE`: the Explorer names a file and not a place in it, so the per-file
+      // view memory decides where it opens. See `editor/navHistory.ts`.
+      jumpTo(activeProjectId, { path, line: UNKNOWN_LINE, column: 1 })
+      void fileApi.open(activeProjectId, path)
+    },
+    [activeProjectId],
+  )
+  const onGitUpdate = useCallback(() => runCommand('git.pull', null), [runCommand])
+  const onOpenHit = useCallback(
+    (path: string, line: number, column: number, endColumn: number) => {
+      if (!activeProjectId) return
+      jumpTo(activeProjectId, { path, line, column, endColumn })
+      void fileApi.open(activeProjectId, path)
+    },
+    [activeProjectId],
+  )
+  const onOpenLocation = useCallback(
+    (path: string, line: number, column: number) => {
+      if (!activeProjectId) return
+      jumpTo(activeProjectId, { path, line, column })
+      void fileApi.open(activeProjectId, path)
+    },
+    [activeProjectId],
+  )
+  const onRefreshProblems = useCallback(() => {
+    if (activeProjectId !== null) refreshDiagnostics(activeProjectId)
+  }, [activeProjectId])
+  const onRestartSource = useCallback(
+    (id: string, label: string) => {
+      if (activeProjectId !== null && isDiagnosticSourceId(id)) {
+        restartDiagnosticSource(activeProjectId, id, label)
+      }
+    },
+    [activeProjectId],
+  )
+  const onShowTasks = useCallback(() => setSidebar((s) => showPanel(s, 'tasks')), [])
 
   /*
    * Entry point 2 of the key gate: the window listener.
@@ -941,10 +1114,16 @@ export function App() {
   // The status bar reports the session the user is looking at, not "a" session. With two
   // Claude panes side by side, showing whichever reported last would make the token figure
   // flicker between two conversations and belong to neither.
-  const statusBySession = useSessionStatus((s) => s.bySession)
-  const claudeReadout = focusedSession
-    ? formatClaude(statusBySession[focusedSession])
-    : undefined
+  //
+  // The selector formats *inside* the store read and returns the string, never the
+  // `bySession` map itself. The map's identity changes on every statusline frame — about
+  // once a second per running session, for as long as it lives — and `App` has no memo
+  // boundary above the pane grid, so selecting the map here re-rendered the entire window
+  // once a second *per background session*, forever. A primitive compares by value, so this
+  // component now re-renders only when the focused session's readout text actually moves.
+  const claudeReadout = useSessionStatus((s) =>
+    focusedSession ? formatClaude(s.bySession[focusedSession]) : undefined,
+  )
 
   /**
    * Ctrl+click on a file path in a terminal pane's output.
@@ -1038,10 +1217,12 @@ export function App() {
           void fileApi
             .openFromTerminal(project, path, approvedTarget)
             .then(() => {
-              // Before the hydrate, so the entry is on the stack by the time anything can render
-              // — and after the open, so a refusal never becomes a place the user has been.
+              // After the open, so a refusal never becomes a place the user has been. The
+              // snapshot that makes the tab renderable rides the open's own broadcast — no
+              // re-read here — and the comment above already concedes that broadcast can
+              // beat this promise, which is why `arrived` is a parked commit rather than an
+              // ordering guarantee.
               arrived?.()
-              hydrate()
             })
             .catch((reason: unknown) => {
               const ask = outsideAsk(reason)
@@ -1051,7 +1232,7 @@ export function App() {
         }
         attempt()
       },
-    [hydrate],
+    [],
   )
 
   // A `pane:<uuid>` window shows exactly one pane. It shares the workspace mirror with the
@@ -1135,9 +1316,10 @@ export function App() {
            * Clicking a project tab did nothing until now. `activate_project` has been in the
            * domain since projects went multi-window and no command exposed it, so with two
            * projects open there was no way to switch between them — the same dead control
-           * the sidebar's search button was.
+           * the sidebar's search button was. Through the store's mutator, which is where the
+           * wait-for-the-snapshot lives.
            */
-          onActivate={(id) => void projectApi.activate(id as ProjectId).then(() => hydrate())}
+          onActivate={(id) => void activateProject(id as ProjectId)}
           onClose={(id) => void closeProject(id)}
           onNew={() => void pickProject(openProject)}
           onToggleTheme={togglePersistedTheme}
@@ -1173,7 +1355,7 @@ export function App() {
           <ActivityRail
             active={sidebar.view}
             changed={auditMode() ? AUDIT_GIT_CHANGES : gitChanged}
-            errors={statusBarCounts(diagnostics.snapshot)?.errors ?? null}
+            errors={diagCounts?.errors ?? null}
             /* "Something is looking right now" — the panel-model rule (`anyScanning`), not a
                local re-derivation: the first pass and a later re-index report it through
                different arms of the snapshot, and this is the one place that must not
@@ -1211,13 +1393,7 @@ export function App() {
              * put markup. A panel with no icon gets an empty path, which draws a blank button —
              * and the manifest reader has already warned its author about exactly that.
              */
-            extra={extPanels
-              .filter((panel) => panel.def.location === 'sidebar')
-              .map((panel) => ({
-                id: panel.view as ActivityView,
-                path: panel.def.icon ?? '',
-                label: panel.def.label,
-              }))}
+            extra={railExtras}
             onSelect={(next) => {
               // What a click means — the lit one toggles shut, any other switches, ⚙ has no
               // panel to hide — is `selectView`'s, in `chrome/sidebarView.ts`, along with the
@@ -1226,7 +1402,8 @@ export function App() {
               // sidebar view, so choosing it also opens (or re-activates) the project's tab.
               setSidebar((s) => selectView(s, next))
               if (next === 'settings' && activeProjectId) {
-                void settingsApi.openTab(activeProjectId).then(() => hydrate())
+                // The tab appears on the mutation's own broadcast — no re-read.
+                void settingsApi.openTab(activeProjectId)
               }
             }}
             toolWindowOpen={activeProject?.toolWindow.open ?? false}
@@ -1287,7 +1464,7 @@ export function App() {
                    * `treeStore.reveal` itself would be a second call site to keep in step.
                    */
                   openedFile={focusedTabPath(boot)}
-                  onSelectOpened={() => runCommand('file.reveal', null)}
+                  onSelectOpened={onSelectOpened}
                   /*
                    * A pinned row's open, routed through the **command** for the same reason
                    * `onSelectOpened` above is: the double-click, the palette row and any chord a
@@ -1296,24 +1473,15 @@ export function App() {
                    * heard of (an older webview against a newer backend) does nothing rather than
                    * running a command that does not exist.
                    */
-                  onOpenPin={(id) => {
-                    if (id === PROJECT_NOTES) runCommand('file.projectNotes', null)
-                  }}
+                  onOpenPin={onOpenPin}
                   /*
                    * *Show File History* on a tree row, through `runCommand` for the reason the two
                    * handlers above route that way: the preconditions — is this a shell window, does
                    * the project hold a repository, which repository is this path in — live in one
                    * dispatch case, and the tab strip's copy of this item already goes through it.
                    */
-                  onShowHistory={(path) => runCommand('git.history.file', { path })}
-                  onOpenFile={(path) => {
-                    if (!activeProjectId) return
-                    // `UNKNOWN_LINE`: the Explorer names a file and not a place in it, so the
-                    // per-file view memory decides where it opens. The history records the visit
-                    // without inventing a line — see `editor/navHistory.ts`.
-                    jumpTo(activeProjectId, { path, line: UNKNOWN_LINE, column: 1 })
-                    void fileApi.open(activeProjectId, path).then(() => hydrate())
-                  }}
+                  onShowHistory={onShowHistory}
+                  onOpenFile={onOpenTreeFile}
                 />
               </PanelBoundary>
             )}
@@ -1332,12 +1500,12 @@ export function App() {
                   // The same routing again, from the changes tree's file rows. The panel joins its
                   // repo-relative path to the repository's root before calling this, because every
                   // other surface hands over an absolute one and `git.history.file` expects it.
-                  onShowHistory={(path) => runCommand('git.history.file', { path })}
+                  onShowHistory={onShowHistory}
                   // And the toolbar's *Update project*, which had no command to call until M20.
                   // Through `runCommand` rather than `branchApi.pull`, so the divergence dialog,
                   // the retry and the aggregated notice are the key's code path and not a second
                   // copy of it.
-                  onUpdate={() => runCommand('git.pull', null)}
+                  onUpdate={onGitUpdate}
                 />
               </PanelBoundary>
             )}
@@ -1345,21 +1513,16 @@ export function App() {
               <PanelBoundary name="Search" onClose={() => setSidebar((st) => selectView(st, 'search'))}>
                 <SearchPanel
                   project={activeProjectId}
-                  onOpenHit={(path, line, column, endColumn) => {
-                    if (!activeProjectId) return
-                    // The caret, which is the half the user reported missing — a search result
-                    // that opens the file at the top has not gone to the found place. `jumpTo`
-                    // also records the visit, so the mouse's Back button returns here.
-                    //
-                    // Requested BEFORE the open, and that ordering is the design rather than a
-                    // preference: the editor for this path usually does not exist yet, so the
-                    // request is parked and spent by the mount the `file.open` below causes. A
-                    // file already open is revealed immediately instead. See
-                    // `editor/revealRequest.ts` — the parked request expires, so one for a file
-                    // that never opens cannot fire when the user opens it by hand an hour later.
-                    jumpTo(activeProjectId, { path, line, column, endColumn })
-                    void fileApi.open(activeProjectId, path).then(() => hydrate())
-                  }}
+                  // The caret, which is the half the user reported missing — a search result
+                  // that opens the file at the top has not gone to the found place. `jumpTo`
+                  // also records the visit, so the mouse's Back button returns here — and it is
+                  // requested BEFORE the open, which is the design rather than a preference:
+                  // the editor for this path usually does not exist yet, so the request is
+                  // parked and spent by the mount the `file.open` causes. A file already open
+                  // is revealed immediately instead. See `editor/revealRequest.ts` — the parked
+                  // request expires, so one for a file that never opens cannot fire when the
+                  // user opens it by hand an hour later.
+                  onOpenHit={onOpenHit}
                 />
               </PanelBoundary>
             )}
@@ -1373,33 +1536,18 @@ export function App() {
                   // `sidebar/ProblemsPanel/actions.ts`, which `keys/dispatch.ts` also calls for
                   // `problems.refresh` — one implementation, so the button and the palette row cannot
                   // drift into doing different things.
-                  onRefresh={
-                    activeProjectId === null
-                      ? undefined
-                      : () => refreshDiagnostics(activeProjectId)
-                  }
-                  onRestartSource={
-                    activeProjectId === null
-                      ? undefined
-                      : (id, label) => {
-                          // Checked rather than cast: `SourceRow.id` is a plain string because
-                          // `model.ts` imports nothing, so this is where the two meet. The set is
-                          // open since M22 — an extension may contribute a server — so what is
-                          // asserted here is the one property the id must have, and `sourceRows`
-                          // is what decides which rows offer the button at all.
-                          if (isDiagnosticSourceId(id)) {
-                            restartDiagnosticSource(activeProjectId, id, label)
-                          }
-                        }
-                  }
-                  onOpenLocation={(path, line, column) => {
-                    if (!activeProjectId) return
-                    // Requested BEFORE the open — the editor for this path usually does not exist
-                    // yet, so the request is parked and spent by the mount the open causes. The same
-                    // ordering the search panel's `onOpenHit` uses; see `editor/revealRequest.ts`.
-                    jumpTo(activeProjectId, { path, line, column })
-                    void fileApi.open(activeProjectId, path).then(() => hydrate())
-                  }}
+                  onRefresh={activeProjectId === null ? undefined : onRefreshProblems}
+                  // `onRestartSource` checks rather than casts its id: `SourceRow.id` is a
+                  // plain string because `model.ts` imports nothing, so the pinned handler is
+                  // where the two meet. The set is open since M22 — an extension may
+                  // contribute a server — so what is asserted is the one property the id must
+                  // have, and `sourceRows` decides which rows offer the button at all.
+                  onRestartSource={activeProjectId === null ? undefined : onRestartSource}
+                  // Requested BEFORE the open — the editor for this path usually does not
+                  // exist yet, so the request is parked and spent by the mount the open
+                  // causes. The same ordering the search panel's `onOpenHit` uses; see
+                  // `editor/revealRequest.ts`.
+                  onOpenLocation={onOpenLocation}
                 />
               </PanelBoundary>
             )}
@@ -1436,10 +1584,7 @@ export function App() {
               */}
             {sidebar.view === 'agents' && (
               <PanelBoundary name="Agents" onClose={() => setSidebar((st) => selectView(st, 'agents'))}>
-                <AgentsPanel
-                  project={activeProjectId}
-                  onShowTasks={() => setSidebar((s) => showPanel(s, 'tasks'))}
-                />
+                <AgentsPanel project={activeProjectId} onShowTasks={onShowTasks} />
               </PanelBoundary>
             )}
             {sidebar.view === 'extensions' && (
@@ -1500,221 +1645,15 @@ export function App() {
             )}
 
             <div className={styles.content}>
-              {/* An open project always has a console tab, so its `activeTab` is always live —
-                  but only once a project exists at all. */}
-              {/* A real project opens with only its console tab, so a live app never renders
-                  a file tab or a language badge. The fixture covers every shape the strip has
-                  to get right; see chrome/auditFixture.ts. */}
-              {/* No strip in a torn-out tab window: it shows exactly one tab, whose name is
-                  already in its header, and every strip gesture — activate, reorder, close
-                  others — is about tabs this window does not hold. */}
-              {tabWindow ? null : auditMode() ? (
-                <TabStrip tabs={AUDIT_TABS} activeTab={AUDIT_ACTIVE_TAB} />
-              ) : (
-                activeProject && (
-                  <TabStrip
-                    // The window's own view of the strip, not `activeProject.tabs`: a tab
-                    // torn out into its own window keeps its slot in the domain's list, and
-                    // drawing it here would be two windows claiming one tab.
-                    tabs={visibleTabs}
-                    activeTab={activeProject.activeTab}
-                    onActivate={(id) => void activateTab(activeProject.id, id)}
-                    onClose={(id) => void closeTab(activeProject.id, id)}
-                    onCloseMany={(ids) => void closeTabs(activeProject.id, ids)}
-                    onReorder={(id, before) => void reorderTab(activeProject.id, id, before)}
-                    // Through `runCommand`, not straight to the store, and for the reason
-                    // `onSelectOpened` routes the same way: the preconditions — is this a shell
-                    // window, does the project hold a repository, which repository is this path in
-                    // — live in one dispatch case, and a second copy in a menu handler is a second
-                    // copy that stops matching.
-                    onShowHistory={(path) => runCommand('git.history.file', { path })}
-                    onSplit={() => {
-                      // Splits the focused pane sideways with the tab's default intent —
-                      // a shell in the pinned console, a new session in a ClaudeFull tab.
-                      // Which intent that is belongs to the domain, so `null` asks for it.
-                      const tab = activeProject.tabs.find((t) => t.id === activeProject.activeTab)
-                      if (!tab) return
-                      void splitPane(activeProject.id, tab.id, tab.tree.focused, 'row', 'after')
-                    }}
-                  />
-                )
-              )}
-
-              {/* No terminals during a benchmark run: four live PTYs competing for the same
-                  IPC channel would be measuring the wrong thing. The chrome audit skips them
-                  for a different reason — it measures chrome, and four `claude` processes are
-                  a slow way to take a ruler to a status bar. */}
-              {/* `restorePlan !== null` gates the whole tree, not just the prop: a pane that
-                  renders before the plan lands latches `PaneBody`'s splash decision without it.
-                  See the note on the state itself. */}
-              {!benchMode() && !auditMode() && activeProject && restorePlan !== null && (
-                <TabContent
-                  // The same filtered list the strip draws — `windows/windowTabs.ts` — and
-                  // here it is the load-bearing copy: `TabContent` MOUNTS every tab it is
-                  // handed, hidden or not, so an unfiltered list would put a second live
-                  // editor (and a second buffer) behind the shell for every torn-out file.
-                  tabs={visibleTabs}
-                  // A `tab:` window's one tab comes from its role; the project's
-                  // `activeTab` deliberately points at a tab the *shell* draws.
-                  activeTab={tabRole !== null ? tabRole.tab : activeProject.activeTab}
-                  renderTree={(tab, active) =>
-                    // A settings tab has a pane tree — every tab does, which is the invariant
-                    // that makes "promote pane to tab" one code path — but nothing to render
-                    // into it. The screen replaces the tree rather than living inside a pane.
-                    tab.kind.kind === 'settings' ? (
-                      <SettingsTab project={activeProject.id} section={tab.kind.section} />
-                    ) : tab.kind.kind === 'extension' ? (
-                      /*
-                       * An extension's page, replacing the pane tree the way Settings does — and
-                       * for the same reason: it is a page *about* cide rather than a document in
-                       * the project, so there is nothing for a split to split.
-                       */
-                      <ExtensionTab
-                        id={{ marketplace: tab.kind.marketplace, extension: tab.kind.extension }}
-                        name={tab.kind.name}
-                      />
-                    ) : (
-                    <SplitTree
-                      tree={tab.tree}
-                      onFocus={(id) => void focusPane(activeProject.id, tab.id, id)}
-                      onRatioCommit={(split, ratio) =>
-                        void setRatio(activeProject.id, tab.id, split, ratio)
-                      }
-                      renderPane={(paneNode, index) => {
-                        /*
-                         * What this pane's corner cluster acts on — `windows/windowTabs.ts`
-                         * holds the rule. A tab's only pane closes and detaches as the
-                         * *tab*: `layout::close` and `layout::take_pane` both refuse a
-                         * tab's last pane, and these two buttons used to run straight into
-                         * that refusal and print `lastPane` at the user. Its maximize is
-                         * withheld outright — one pane already fills its tab. The pinned
-                         * console is exempt so its primary pane keeps the role-based
-                         * refusals `PaneFrame` already words.
-                         */
-                        const plan = clusterPlan(
-                          Object.keys(tab.tree.panes).length,
-                          activeProject.tabs[0]?.id === tab.id,
-                        )
-                        const tabScoped = plan.close === 'tab'
-                        return (
-                        <PaneFrame
-                          pane={paneNode}
-                          index={index}
-                          focused={tab.tree.focused === paneNode.id}
-                          maximized={tab.tree.maximized === paneNode.id}
-                          tabScoped={tabScoped}
-                          onFocus={() => void focusPane(activeProject.id, tab.id, paneNode.id)}
-                          // `row` is a tile beside this one, in this pane's own row — the axis
-                          // the command layer routes to `add_tile`. The row gesture is on the
-                          // tree, not here, because it is not about any one pane.
-                          onAddTile={() =>
-                            void splitPane(activeProject.id, tab.id, paneNode.id, 'row', 'after')
-                          }
-                          // Both were drawn disabled, and that mattered more once the pane's
-                          // title bar was deleted: the right-click menu became the primary route
-                          // to splitting, so two of its items naming "use the header instead"
-                          // was most of the gesture missing.
-                          onSplitDown={() =>
-                            void splitPane(activeProject.id, tab.id, paneNode.id, 'col', 'after')
-                          }
-                          onAddRow={() =>
-                            void splitPane(activeProject.id, tab.id, tab.tree.focused, 'col', 'after')
-                          }
-                          onMaximize={
-                            plan.maximize
-                              ? () =>
-                                  void maximizePane(
-                                    activeProject.id,
-                                    tab.id,
-                                    tab.tree.maximized === paneNode.id ? null : paneNode.id,
-                                  )
-                              : undefined
-                          }
-                          onDetach={
-                            plan.detach === 'tab'
-                              ? // A tab already in a window of its own has nowhere further
-                                // out to go; withholding the handler hides the button and
-                                // greys the menu row with that sentence.
-                                tabWindow
-                                ? undefined
-                                : () => void detachTab(activeProject.id, tab.id)
-                              : () => void detachPane(activeProject.id, tab.id, paneNode.id)
-                          }
-                          onClose={
-                            plan.close === 'tab'
-                              ? // Through `closeTab`, which asks about a live session or an
-                                // unsaved buffer before it discards either — the same dialog
-                                // the strip's × raises for this tab.
-                                () => void closeTab(activeProject.id, tab.id)
-                              : () => void closePane(activeProject.id, tab.id, paneNode.id)
-                          }
-                        >
-                          {/*
-                            * A git diff replaces the pane rather than living in one, the way a
-                            * settings tab does. A Claude diff is different and stays in
-                            * `PaneBody`: it is answering a blocked agent turn and belongs
-                            * beside the terminal that is waiting on it.
-                            */}
-                          {tab.kind.kind === 'diff' && tab.kind.spec.origin.kind === 'git' ? (
-                            <GitDiffPane project={activeProject.id} spec={tab.kind.spec} />
-                          ) : (
-                          <PaneBody
-                            pane={paneNode}
-                            cwd={activeProject.roots[0]?.path ?? PROJECT_ROOT}
-                            project={activeProject.id}
-                            primarySession={activeProject.primarySession}
-                            diff={tab.kind.kind === 'diff' ? tab.kind.spec : undefined}
-                            editor={
-                              tab.kind.kind === 'file'
-                                ? { tab: tab.id, path: tab.kind.path }
-                                : undefined
-                            }
-                            restore={restorePlan.get(paneNode.id)}
-                            roots={activeProject.roots.map((r) => r.path)}
-                            onOpenPath={openTerminalPath(activeProject.id)}
-                            /*
-                             * A ctrl+click on a *directory* in terminal output.
-                             *
-                             * Straight to `file.reveal` and to nothing else, so the sidebar is
-                             * brought to Files first and a path with no row reports itself in a
-                             * sentence — both of which are that arm's rules, and neither of which
-                             * is worth a second copy here. It is the same routing
-                             * `Explorer`'s ⌖ button makes (`onSelectOpened` above), for the same
-                             * reason: a second call site with its own preconditions is how three
-                             * gestures come to behave in three ways.
-                             *
-                             * Passed only in the shell branch. The detached-pane window above has
-                             * no sidebar, so it passes no handler, and `pathLinks.ts` then draws
-                             * no directory underline there at all rather than one whose command
-                             * would refuse.
-                             */
-                            onRevealPath={(path) => runCommand('file.reveal', { path })}
-                            onSessionBound={(session) =>
-                              void bindSession(activeProject.id, tab.id, paneNode.id, session)
-                            }
-                            /*
-                             * Which tab is in front, which `TabContent` computes and has offered
-                             * through this callback's second argument since M4 — and which this
-                             * call site wrote `(tab) =>` and discarded.
-                             *
-                             * The editor is the only pane kind that needs it, and needs it because
-                             * the hiding here is pure CSS: a background tab's panes are mounted,
-                             * laid out at full size and painting, so nothing below can tell them
-                             * from the visible one. Without it the status bar's file readout was
-                             * claimed by whichever restored tab's `file_read` resolved last, and a
-                             * Ctrl+Tab moved nothing. See `editor/statusReadout.ts`.
-                             */
-                            onScreen={active}
-                          />
-                          )}
-                        </PaneFrame>
-                        )
-                      }}
-                    />
-                    )
-                  }
-                />
-              )}
+              <WorkspaceContent
+                activeProject={activeProject}
+                visibleTabs={visibleTabs}
+                tabRole={tabRole}
+                tabWindow={tabWindow}
+                restorePlan={restorePlan}
+                runCommand={runCommand}
+                openTerminalPath={openTerminalPath}
+              />
             </div>
             </div>
 
@@ -1805,7 +1744,7 @@ export function App() {
                  * of the body under it.
                  */
                 jumpTo(activeProjectId, { path, line, column, endColumn, focus: true, align: 'center' })
-                void fileApi.open(activeProjectId, path).then(() => hydrate())
+                void fileApi.open(activeProjectId, path)
               },
               /*
                * Go to line. No `file.open`: the popup will not open without a caret, so the file
@@ -1831,12 +1770,12 @@ export function App() {
                 closeOverlay()
                 // No position: the picker names a file. See the Explorer above.
                 jumpTo(activeProjectId, { path, line: UNKNOWN_LINE, column: 1 })
-                void fileApi.open(activeProjectId, path).then(() => hydrate())
+                void fileApi.open(activeProjectId, path)
               },
               openFileInSplit: (path) => {
                 closeOverlay()
                 jumpTo(activeProjectId, { path, line: UNKNOWN_LINE, column: 1 })
-                void fileApi.open(activeProjectId, path).then(() => hydrate())
+                void fileApi.open(activeProjectId, path)
               },
               mentionFile: (path) => {
                 closeOverlay()
@@ -1885,8 +1824,9 @@ export function App() {
               createScratch: (ext) => {
                 closeOverlay()
                 void fsApi.scratchNew(activeProjectId, ext).then(async (path) => {
+                  // The tab rides the open's own broadcast; `useFileTree.reveal` below asks
+                  // the tree store, not the mirror, so nothing here waits on a snapshot.
                   await fileApi.open(activeProjectId, path)
-                  hydrate()
                   setSidebar((s) => showPanel(s, 'files'))
                   const shown = await useFileTree.getState().reveal(path)
                   if (!shown) {
@@ -1983,7 +1923,7 @@ export function App() {
           claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
           /* The *filtered* snapshot, so the bar and the panel cannot disagree — and `null`
              whenever nothing has looked, which is what makes it print `✗ — ⚠ —`. */
-          diagnostics={statusBarCounts(diagnostics.snapshot)}
+          diagnostics={diagCounts}
           revealRoots={revealRoots}
           /*
            * A crumb of the open file's path trail, straight to `file.reveal` and to nothing
@@ -2031,6 +1971,290 @@ export function App() {
     </WindowFrame>
   )
 }
+
+
+
+/**
+ * The pane grid and its tab strip — the workspace's centre — behind the frontend's one
+ * load-bearing memo boundary.
+ *
+ * `App` subscribes to the whole `boot` and re-renders on every store notification: an
+ * overlay opening, a diagnostics push, a context menu, `pendingClose`. Before this boundary
+ * existed each of those walked every `PaneFrame`/`PaneBody`/editor/terminal frame of every
+ * tab of the active project — `TabContent` deliberately keeps every tab mounted — so the
+ * biggest subtree in the app re-rendered at the frequency of its noisiest neighbour. The
+ * memo holds because every prop is either snapshot-derived (`activeProject`, `visibleTabs`,
+ * `tabRole` — a new identity exactly once per accepted mutation, which is the one time the
+ * grid should re-render) or pinned (`runCommand` and `openTerminalPath` are stable
+ * `useCallback` wrappers, `restorePlan` is a `useState` value written once at boot,
+ * `tabWindow` is a window-lifetime constant). A new prop added here must be one of those
+ * two things, or it silently reopens the hole this component closes.
+ *
+ * The store *actions* are read here rather than passed as props: zustand actions are
+ * created once, so these subscriptions never fire, and everything that can go stale still
+ * arrives through the memoised props. In the same file as `App` (like `ExtSidebarPanel`
+ * below) because several check scripts assert on this JSX by scanning `App.tsx`.
+ */
+const WorkspaceContent = memo(function WorkspaceContent({
+  activeProject,
+  visibleTabs,
+  tabRole,
+  tabWindow,
+  restorePlan,
+  runCommand,
+  openTerminalPath,
+}: {
+  activeProject: Project | null
+  visibleTabs: readonly Tab[]
+  tabRole: Extract<WindowRole, { kind: 'detachedTab' }> | null
+  tabWindow: boolean
+  restorePlan: ReadonlyMap<string, PaneRestore> | null
+  runCommand: (command: string, args: unknown) => void
+  openTerminalPath: (
+    project: ProjectId,
+  ) => (path: string, at: { line: number; column: number } | null) => void
+}) {
+  const activateTab = useWorkspace((s) => s.activateTab)
+  const closeTab = useWorkspace((s) => s.closeTab)
+  const closeTabs = useWorkspace((s) => s.closeTabs)
+  const reorderTab = useWorkspace((s) => s.reorderTab)
+  const splitPane = useWorkspace((s) => s.splitPane)
+  const closePane = useWorkspace((s) => s.closePane)
+  const focusPane = useWorkspace((s) => s.focusPane)
+  const maximizePane = useWorkspace((s) => s.maximizePane)
+  const setRatio = useWorkspace((s) => s.setRatio)
+  const bindSession = useWorkspace((s) => s.bindSession)
+  const detachPane = useWorkspace((s) => s.detachPane)
+  const detachTab = useWorkspace((s) => s.detachTab)
+
+  // Hoisted out of `renderPane`, which built them per pane per render: both depend only on
+  // the project.
+  const rootPaths = useMemo(
+    () => (activeProject === null ? [] : activeProject.roots.map((r) => r.path)),
+    [activeProject],
+  )
+  const onOpenPath = useMemo(
+    () => (activeProject === null ? undefined : openTerminalPath(activeProject.id)),
+    [openTerminalPath, activeProject],
+  )
+
+  return (
+    <>
+              {tabWindow ? null : auditMode() ? (
+                <TabStrip tabs={AUDIT_TABS} activeTab={AUDIT_ACTIVE_TAB} />
+              ) : (
+                activeProject && (
+                  <TabStrip
+                    // The window's own view of the strip, not `activeProject.tabs`: a tab
+                    // torn out into its own window keeps its slot in the domain's list, and
+                    // drawing it here would be two windows claiming one tab.
+                    tabs={visibleTabs}
+                    activeTab={activeProject.activeTab}
+                    onActivate={(id) => void activateTab(activeProject.id, id)}
+                    onClose={(id) => void closeTab(activeProject.id, id)}
+                    onCloseMany={(ids) => void closeTabs(activeProject.id, ids)}
+                    onReorder={(id, before) => void reorderTab(activeProject.id, id, before)}
+                    // Through `runCommand`, not straight to the store, and for the reason
+                    // `onSelectOpened` routes the same way: the preconditions — is this a shell
+                    // window, does the project hold a repository, which repository is this path in
+                    // — live in one dispatch case, and a second copy in a menu handler is a second
+                    // copy that stops matching.
+                    onShowHistory={(path) => runCommand('git.history.file', { path })}
+                    onSplit={() => {
+                      // Splits the focused pane sideways with the tab's default intent —
+                      // a shell in the pinned console, a new session in a ClaudeFull tab.
+                      // Which intent that is belongs to the domain, so `null` asks for it.
+                      const tab = activeProject.tabs.find((t) => t.id === activeProject.activeTab)
+                      if (!tab) return
+                      void splitPane(activeProject.id, tab.id, tab.tree.focused, 'row', 'after')
+                    }}
+                  />
+                )
+              )}
+
+              {/* No terminals during a benchmark run: four live PTYs competing for the same
+                  IPC channel would be measuring the wrong thing. The chrome audit skips them
+                  for a different reason — it measures chrome, and four `claude` processes are
+                  a slow way to take a ruler to a status bar. */}
+              {/* `restorePlan !== null` gates the whole tree, not just the prop: a pane that
+                  renders before the plan lands latches `PaneBody`'s splash decision without it.
+                  See the note on the state itself. */}
+              {!benchMode() && !auditMode() && activeProject && restorePlan !== null && (
+                <TabContent
+                  // The same filtered list the strip draws — `windows/windowTabs.ts` — and
+                  // here it is the load-bearing copy: `TabContent` MOUNTS every tab it is
+                  // handed, hidden or not, so an unfiltered list would put a second live
+                  // editor (and a second buffer) behind the shell for every torn-out file.
+                  tabs={visibleTabs}
+                  // A `tab:` window's one tab comes from its role; the project's
+                  // `activeTab` deliberately points at a tab the *shell* draws.
+                  activeTab={tabRole !== null ? tabRole.tab : activeProject.activeTab}
+                  renderTree={(tab, active) =>
+                    // A settings tab has a pane tree — every tab does, which is the invariant
+                    // that makes "promote pane to tab" one code path — but nothing to render
+                    // into it. The screen replaces the tree rather than living inside a pane.
+                    tab.kind.kind === 'settings' ? (
+                      <SettingsTab project={activeProject.id} section={tab.kind.section} />
+                    ) : tab.kind.kind === 'extension' ? (
+                      /*
+                       * An extension's page, replacing the pane tree the way Settings does — and
+                       * for the same reason: it is a page *about* cide rather than a document in
+                       * the project, so there is nothing for a split to split.
+                       */
+                      <ExtensionTab
+                        id={{ marketplace: tab.kind.marketplace, extension: tab.kind.extension }}
+                        name={tab.kind.name}
+                      />
+                    ) : (
+                    <SplitTree
+                      tree={tab.tree}
+                      onFocus={(id) => void focusPane(activeProject.id, tab.id, id)}
+                      onRatioCommit={(split, ratio) =>
+                        void setRatio(activeProject.id, tab.id, split, ratio)
+                      }
+                      renderPane={(paneNode, index) => {
+                        /*
+                         * What this pane's corner cluster acts on — `windows/windowTabs.ts`
+                         * holds the rule. A tab's only pane closes and detaches as the
+                         * *tab*: `layout::close` and `layout::take_pane` both refuse a
+                         * tab's last pane, and these two buttons used to run straight into
+                         * that refusal and print `lastPane` at the user. Its maximize is
+                         * withheld outright — one pane already fills its tab. The pinned
+                         * console is exempt so its primary pane keeps the role-based
+                         * refusals `PaneFrame` already words.
+                         *
+                         * (`clusterPlan` reads the tab, not the pane, and is cheap enough
+                         * that a per-pane call costs only tidiness — it stays here because
+                         * this comment is about *what the plan means*, and the callback is
+                         * where a reader meets it.)
+                         */
+                        const plan = clusterPlan(
+                          Object.keys(tab.tree.panes).length,
+                          activeProject.tabs[0]?.id === tab.id,
+                        )
+                        const tabScoped = plan.close === 'tab'
+                        return (
+                        <PaneFrame
+                          pane={paneNode}
+                          index={index}
+                          focused={tab.tree.focused === paneNode.id}
+                          maximized={tab.tree.maximized === paneNode.id}
+                          tabScoped={tabScoped}
+                          onFocus={() => void focusPane(activeProject.id, tab.id, paneNode.id)}
+                          // `row` is a tile beside this one, in this pane's own row — the axis
+                          // the command layer routes to `add_tile`. The row gesture is on the
+                          // tree, not here, because it is not about any one pane.
+                          onAddTile={() =>
+                            void splitPane(activeProject.id, tab.id, paneNode.id, 'row', 'after')
+                          }
+                          // Both were drawn disabled, and that mattered more once the pane's
+                          // title bar was deleted: the right-click menu became the primary route
+                          // to splitting, so two of its items naming "use the header instead"
+                          // was most of the gesture missing.
+                          onSplitDown={() =>
+                            void splitPane(activeProject.id, tab.id, paneNode.id, 'col', 'after')
+                          }
+                          onAddRow={() =>
+                            void splitPane(activeProject.id, tab.id, tab.tree.focused, 'col', 'after')
+                          }
+                          onMaximize={
+                            plan.maximize
+                              ? () =>
+                                  void maximizePane(
+                                    activeProject.id,
+                                    tab.id,
+                                    tab.tree.maximized === paneNode.id ? null : paneNode.id,
+                                  )
+                              : undefined
+                          }
+                          onDetach={
+                            plan.detach === 'tab'
+                              ? // A tab already in a window of its own has nowhere further
+                                // out to go; withholding the handler hides the button and
+                                // greys the menu row with that sentence.
+                                tabWindow
+                                ? undefined
+                                : () => void detachTab(activeProject.id, tab.id)
+                              : () => void detachPane(activeProject.id, tab.id, paneNode.id)
+                          }
+                          onClose={
+                            plan.close === 'tab'
+                              ? // Through `closeTab`, which asks about a live session or an
+                                // unsaved buffer before it discards either — the same dialog
+                                // the strip's × raises for this tab.
+                                () => void closeTab(activeProject.id, tab.id)
+                              : () => void closePane(activeProject.id, tab.id, paneNode.id)
+                          }
+                        >
+                          {/*
+                            * A git diff replaces the pane rather than living in one, the way a
+                            * settings tab does. A Claude diff is different and stays in
+                            * `PaneBody`: it is answering a blocked agent turn and belongs
+                            * beside the terminal that is waiting on it.
+                            */}
+                          {tab.kind.kind === 'diff' && tab.kind.spec.origin.kind === 'git' ? (
+                            <GitDiffPane project={activeProject.id} spec={tab.kind.spec} />
+                          ) : (
+                          <PaneBody
+                            pane={paneNode}
+                            cwd={activeProject.roots[0]?.path ?? PROJECT_ROOT}
+                            project={activeProject.id}
+                            primarySession={activeProject.primarySession}
+                            diff={tab.kind.kind === 'diff' ? tab.kind.spec : undefined}
+                            editor={
+                              tab.kind.kind === 'file'
+                                ? { tab: tab.id, path: tab.kind.path }
+                                : undefined
+                            }
+                            restore={restorePlan.get(paneNode.id)}
+                            roots={rootPaths}
+                            onOpenPath={onOpenPath}
+                            /*
+                             * A ctrl+click on a *directory* in terminal output.
+                             *
+                             * Straight to `file.reveal` and to nothing else, so the sidebar is
+                             * brought to Files first and a path with no row reports itself in a
+                             * sentence — both of which are that arm's rules, and neither of which
+                             * is worth a second copy here. It is the same routing
+                             * `Explorer`'s ⌖ button makes (`onSelectOpened` above), for the same
+                             * reason: a second call site with its own preconditions is how three
+                             * gestures come to behave in three ways.
+                             *
+                             * Passed only in the shell branch. The detached-pane window above has
+                             * no sidebar, so it passes no handler, and `pathLinks.ts` then draws
+                             * no directory underline there at all rather than one whose command
+                             * would refuse.
+                             */
+                            onRevealPath={(path) => runCommand('file.reveal', { path })}
+                            onSessionBound={(session) =>
+                              void bindSession(activeProject.id, tab.id, paneNode.id, session)
+                            }
+                            /*
+                             * Which tab is in front, which `TabContent` computes and has offered
+                             * through this callback's second argument since M4 — and which this
+                             * call site wrote `(tab) =>` and discarded.
+                             *
+                             * The editor is the only pane kind that needs it, and needs it because
+                             * the hiding here is pure CSS: a background tab's panes are mounted,
+                             * laid out at full size and painting, so nothing below can tell them
+                             * from the visible one. Without it the status bar's file readout was
+                             * claimed by whichever restored tab's `file_read` resolved last, and a
+                             * Ctrl+Tab moved nothing. See `editor/statusReadout.ts`.
+                             */
+                            onScreen={active}
+                          />
+                          )}
+                        </PaneFrame>
+                        )
+                      }}
+                    />
+                    )
+                  }
+                />
+              )}
+    </>
+  )
+})
 
 
 /**

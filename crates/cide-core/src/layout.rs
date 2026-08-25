@@ -561,6 +561,10 @@ pub fn add_row(
 /// every other pane and there is no way to focus one you cannot see. That makes
 /// "maximize, then navigate away" behave the way a user expects rather than typing into a
 /// hidden pane.
+///
+/// Like the rest of this module it never touches `rev` — a focus change *is* broadcastable
+/// news (other windows track `tree.focused`), and `WorkspaceState::update` enforces the
+/// bump for any mutation that changed the tree, this one included.
 pub fn focus(tree: &mut PaneTree, pane: PaneId) -> Result<()> {
     if !contains_leaf(&tree.root, pane) {
         return Err(CoreError::NoSuchPane(pane));

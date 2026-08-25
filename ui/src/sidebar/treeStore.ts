@@ -416,6 +416,28 @@ function resetCache(): void {
 }
 
 /**
+ * Invalidate from `chunk` onward, keeping the module state of the chunks strictly below it.
+ *
+ * The fold case: expanding or collapsing the row at flat index `i` re-flattens everything
+ * *after* `i` and moves nothing before it, so the chunks above the fold still describe the
+ * tree exactly. Dropping them anyway — which `toggle` did with a plain `resetCache()` — is
+ * the one-frame blank of the whole visible viewport on every fold, the exact flicker this
+ * module's header is about, delivered by the gesture users make most.
+ *
+ * `stale` and `touched` are filtered rather than cleared: a retained chunk that a watcher
+ * burst had already marked stale must stay stale, or its re-request is silently forgotten
+ * and it draws old rows for ever. The generation still moves — an in-flight reply describes
+ * the previous flattening even for a low chunk, and `loadChunk` bails on the check.
+ */
+function retainCacheBelow(chunk: number): void {
+  inFlight = new Set()
+  visible = new Set()
+  touched = touched.filter((c) => c < chunk)
+  stale = new Set([...stale].filter((c) => c < chunk))
+  generation += 1
+}
+
+/**
  * Every field of `TreeRow`, named where the compiler checks the list.
  *
  * `sameRows` below is what decides that a burst moved nothing and that the tree therefore
@@ -485,6 +507,16 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   draft: null,
 
   async attach(project) {
+    // A remount over the SAME project — the rail toggling Files shut and back open, or a
+    // panel switch away and back — must not blank a tree the user was just looking at:
+    // the reset below zeroes the count, so the virtualizer draws nothing until three
+    // sequential round trips resolve. `refresh()` is already the no-flicker revalidation
+    // (it re-reads the count and the visible rows, writes only what moved, and self-heals
+    // the writable and revealable sets), so a reattach *is* a refresh. The full reset is
+    // for a genuinely different project — and a caller that someday reuses a project id
+    // across a roots change must add an explicit reset flag here; today no such caller
+    // exists (`Explorer`'s effect keys on the id).
+    if (project !== null && get().project === project) return get().refresh()
     resetCache()
     // The selection goes with the project. A path from the old one names nothing in the new
     // tree, and keeping it would leave a highlight the user cannot see and the arrows
@@ -644,13 +676,24 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       : () => fsApi.expand(project, row.path)
     const name = row.expanded ? 'fs_collapse' : 'fs_expand'
 
+    // The toggled row's flat index, read from the resident cache *before* the round trip:
+    // rows strictly above the fold cannot move when a subtree folds or unfolds, so their
+    // chunks survive the invalidation and the viewport above the fold keeps its rows on
+    // screen for the length of the trip. `null` — the row is somehow not resident — falls
+    // back to keeping nothing, which is the old full reset.
+    const at = get().indexOf(row.path)
+
     // The count comes back from the same call rather than a follow-up `fs_tree_count`: the
     // two would be separate round trips against a tree that another expand could change
     // between them, and the virtualizer would briefly size itself to a count that never
     // matched the rows.
     const count = await tree(name, call, get().count)
-    resetCache()
-    set({ count, chunks: new Map(), degraded: isDegraded(name) })
+    // The toggled row's own chunk is dropped with everything after it — its `expanded` flag
+    // changed, so its rows genuinely differ.
+    const keepBelow = at === null ? 0 : chunkOf(at)
+    retainCacheBelow(keepBelow)
+    const kept = new Map([...get().chunks].filter(([index]) => index < keepBelow))
+    set({ count, chunks: kept, degraded: isDegraded(name) })
   },
 
   async reveal(path) {

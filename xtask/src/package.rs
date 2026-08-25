@@ -870,6 +870,13 @@ impl Step {
         println!("\n$ {}", self.display());
         let status = Command::new(&self.program)
             .args(&self.args)
+            // xtask runs under *this* workspace's cargo, and cargo exports the toolchain
+            // `rust-toolchain.toml` pins as `RUSTUP_TOOLCHAIN` to every child. A step that
+            // builds a *different* workspace — the rust-analyzer fork, whose `rust-version`
+            // is years ahead of cide's pin — must resolve its own toolchain from its own
+            // directory, or it fails with "requires rustc 1.xx" against a compiler nobody
+            // chose on purpose.
+            .env_remove("RUSTUP_TOOLCHAIN")
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(root.join(&self.cwd))
             .status()

@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use cide_fs::filter::FilterInput;
 use cide_fs::{
@@ -424,7 +424,13 @@ pub struct ProjectFs {
     // `Ctrl+Alt+Shift+N` answer different queries at the same time, and `Matcher::query` holds
     // one query per matcher. Sharing would make each keystroke in one overlay reset the other.
     /// The symbol picker's candidates. May lag [`Self::symbol_store`] — see `crate::symbols`.
-    symbol_matcher: Arc<NucleoMatcher>,
+    ///
+    /// Lazy — built on first use — where the file matcher above is eager, and the difference
+    /// is who fills it: the walk fills `matcher` the moment a project opens, while this one
+    /// is documented empty until somebody opens the symbol picker. Each `NucleoMatcher` owns
+    /// a rayon pool (`cide_search::MATCH_WORKERS` threads and their scoring slabs), so paying
+    /// for it at project open bought threads that mostly idled for the life of the process.
+    symbol_matcher: OnceLock<Arc<NucleoMatcher>>,
     /// The authoritative index the matcher is derived from.
     symbol_store: RwLock<crate::symbols::SymbolStore>,
     /// Candidates the matcher still holds that the store no longer backs.
@@ -451,8 +457,9 @@ pub struct ProjectFs {
     // this touches `Index` nowhere. `dir_paths()` — the watcher's watch list — `Filter::build`,
     // `show_roots` and `path_of` are the project's alone. "Library sources are never watched"
     // stays true because there is still no code that could watch them.
-    /// Candidates from the resolved dependency packages. Empty until somebody asks.
-    library_matcher: Arc<NucleoMatcher>,
+    /// Candidates from the resolved dependency packages. Empty until somebody asks — and
+    /// lazy for `symbol_matcher`'s reason: its pool should not exist until they do.
+    library_matcher: OnceLock<Arc<NucleoMatcher>>,
     libraries_indexing: AtomicBool,
     /// A library walk has run to completion for this project.
     ///
@@ -487,12 +494,12 @@ impl ProjectFs {
             }),
             indexing: AtomicBool::new(false),
             walked: AtomicBool::new(false),
-            symbol_matcher: Arc::new(NucleoMatcher::new()),
+            symbol_matcher: OnceLock::new(),
             symbol_store: RwLock::new(crate::symbols::SymbolStore::new()),
             symbols_stale: AtomicU32::new(0),
             symbols_indexing: AtomicBool::new(false),
             symbols_started: AtomicBool::new(false),
-            library_matcher: Arc::new(NucleoMatcher::new()),
+            library_matcher: OnceLock::new(),
             libraries_indexing: AtomicBool::new(false),
             libraries_walked: AtomicBool::new(false),
             library_packages: AtomicU32::new(0),
@@ -501,8 +508,15 @@ impl ProjectFs {
 
     // --- M12: symbols ---------------------------------------------------------------------
 
+    /// The matcher, built on first use. Construction takes no other lock, so it cannot
+    /// interleave with the lock-order rule `NucleoMatcher` documents.
+    fn symbol_matcher_arc(&self) -> &Arc<NucleoMatcher> {
+        self.symbol_matcher
+            .get_or_init(|| Arc::new(NucleoMatcher::new()))
+    }
+
     pub fn symbol_matcher(&self) -> &NucleoMatcher {
-        &self.symbol_matcher
+        self.symbol_matcher_arc()
     }
 
     pub fn symbol_store(&self) -> &RwLock<crate::symbols::SymbolStore> {
@@ -568,7 +582,7 @@ impl ProjectFs {
             &mut |file| {
                 let (candidates, stale) = self.symbol_store.write().insert(file);
                 for candidate in candidates {
-                    self.symbol_matcher.push(candidate);
+                    self.symbol_matcher().push(candidate);
                 }
                 if stale > 0 {
                     self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
@@ -582,8 +596,14 @@ impl ProjectFs {
 
     // --- M16: the library scope of the file picker ------------------------------------------
 
+    /// Built on first use, like [`Self::symbol_matcher_arc`].
+    fn library_matcher_arc(&self) -> &Arc<NucleoMatcher> {
+        self.library_matcher
+            .get_or_init(|| Arc::new(NucleoMatcher::new()))
+    }
+
     pub fn library_matcher(&self) -> &NucleoMatcher {
-        &self.library_matcher
+        self.library_matcher_arc()
     }
 
     pub fn is_indexing_libraries(&self) -> bool {
@@ -715,7 +735,7 @@ impl ProjectFs {
         self.library_packages
             .store(roots.len() as u32, Ordering::Release);
 
-        let matcher = Arc::clone(&self.library_matcher);
+        let matcher = Arc::clone(self.library_matcher_arc());
         Index::walk_roots(
             &roots,
             // `threads: 1`, and the default is the trap. See `Index::walk_roots`: 593 roots at
@@ -783,7 +803,7 @@ impl ProjectFs {
         if !self.libraries_walked.swap(false, Ordering::AcqRel) {
             return;
         }
-        self.library_matcher.clear();
+        self.library_matcher().clear();
         self.library_packages.store(0, Ordering::Release);
     }
 
@@ -831,7 +851,7 @@ impl ProjectFs {
                 symbols,
             });
             for candidate in candidates {
-                self.symbol_matcher.push(candidate);
+                self.symbol_matcher().push(candidate);
             }
             self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
         }
@@ -853,9 +873,9 @@ impl ProjectFs {
         // `clear` then one `extend`: `NucleoMatcher::clear` replaces the injector under the same
         // lock precisely so a concurrent pusher cannot fill a queue nobody reads. Same sequence
         // `Indexing::run` uses for the file matcher.
-        self.symbol_matcher.clear();
+        self.symbol_matcher().clear();
         let candidates = self.symbol_store.read().candidates();
-        self.symbol_matcher.extend(&mut candidates.into_iter());
+        self.symbol_matcher().extend(&mut candidates.into_iter());
         self.symbols_stale.store(0, Ordering::Release);
     }
 

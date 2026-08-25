@@ -55,7 +55,7 @@
  * and a horizontal reserve taken out of the thing being reserved against has been rejected in
  * this app once already (the pane cluster over the find bar, README's M16).
  */
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
 import { useAwaitingInTab } from '@/panes/awaiting'
@@ -203,7 +203,7 @@ export function TabStrip({
   }, [])
 
   /*
-   * Trigger 1: every commit, before paint.
+   * Trigger 1: every commit, after paint.
    *
    * No dependency array on purpose. Anything that changes a tab's *width* changes the answer,
    * and the list of those is not enumerable: a file going dirty swaps a 12px `×` for a 14px `•`,
@@ -211,10 +211,17 @@ export function TabStrip({
    * opened or closed or reordered. A dependency array here is how the chevron goes stale, and
    * stale is worse than absent — it lists a tab that is on screen, or hides while three are not.
    *
-   * `useLayoutEffect` rather than `useEffect` so the control is never one painted frame late; the
-   * reads are ~12 `offsetLeft`/`offsetWidth` on elements the engine has just laid out.
+   * `useEffect`, deliberately, where this was `useLayoutEffect` until the optimisation pass.
+   * The old comment argued "so the control is never one painted frame late", and that is the
+   * claim being reversed: a layout effect runs before paint, when the commit that triggered it
+   * has just dirtied style across the document — every CodeMirror, every xterm, every chain's
+   * grid tracks — so its `offsetLeft`/`offsetWidth` reads forced a full synchronous layout of
+   * the whole window on *every* App render. After paint the tree is clean and the same reads
+   * cost nothing. The trade is the overflow chevron updating at most one painted frame late,
+   * against a whole-document reflow per commit; the identity-stable `setHidden` above keeps
+   * the passive effect from looping.
    */
-  useLayoutEffect(measure)
+  useEffect(measure)
 
   /*
    * Trigger 2: the box changing size — or scrolling — without the tabs changing.

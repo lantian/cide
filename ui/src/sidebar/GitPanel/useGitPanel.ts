@@ -153,6 +153,21 @@ function wholeFiles(paths: string[]): PathSelection[] {
 const EMPTY: StatusView = { repos: [] }
 
 /**
+ * The last authoritative tree and merge map each project's panel adopted, per window.
+ *
+ * Module scope on `treeStore`'s argument (nothing renders from the map itself), and per
+ * window because a detached window is its own realm. What it buys: the panel is unmounted on
+ * every rail switch, and a remount that starts from `EMPTY` paints a blank column until a
+ * full `git status` of every repo resolves — on a large repo, visibly long, on a gesture
+ * made dozens of times an hour. Seeding the remount from here paints the last-known answer
+ * immediately while the mount `refresh()` revalidates. Only ever written with authoritative
+ * payloads, so a failed status (`EMPTY`, `authoritative: false`) can neither blank the cache
+ * nor be served from it.
+ */
+const lastStatus = new Map<ProjectId, StatusView>()
+const lastMerges = new Map<ProjectId, Record<string, MergeState>>()
+
+/**
  * The repository's name, or `''` when there is only one and naming it would be noise.
  *
  * The dialogs show it because a changelist belongs to exactly one repository's sidecar, and a
@@ -538,7 +553,25 @@ export function useGitPanel(
   // Read once. A story is a property of how the window was opened; re-reading the URL each
   // render would let a navigation swap the panel's data source mid-session.
   const [story] = useState<GitStory | null>(() => storyFromQuery())
-  const initial = useMemo(() => (story ? normalizeStatus(story.status) : EMPTY), [story])
+  /*
+   * Seeded from the story, or from the last tree this window adopted for the project. The
+   * panel unmounts on every rail switch (keep-alive was rejected — a hidden panel's
+   * listeners would keep running `git status` across every repo for nobody), so without the
+   * cache each switch back painted an empty panel for the length of a full multi-repo
+   * status walk. Stale-then-revalidate, the same bargain `treeStore.refresh` documents: the
+   * mount effect's `refresh()` still runs and still overwrites, but it does so under a
+   * painted tree rather than in front of a blank one. The story wins when present — a story
+   * window is a fixture and must not inherit a live window's state.
+   */
+  const initial = useMemo(
+    () =>
+      story
+        ? normalizeStatus(story.status)
+        : ((project !== null ? lastStatus.get(project) : undefined) ?? EMPTY),
+    // Initializer-only, hence the empty deps: the `useState` calls below read this once, on
+    // mount, and the mount effect re-adopts on any later project change.
+    [],
+  )
 
   const [view, setView] = useState<StatusView>(initial)
   const [shelf, setShelf] = useState<readonly ShelfRow[]>(() => story?.shelf ?? [])
@@ -567,7 +600,11 @@ export function useGitPanel(
    * Synthesised rather than carried on `GitStory`, because everything it needs is already in
    * the story's own `ChangesTree`: which repository is mid-operation, and which paths.
    */
-  const [merges, setMerges] = useState<Record<string, MergeState>>(() => storyMerges(story))
+  const [merges, setMerges] = useState<Record<string, MergeState>>(
+    // The cache, on `initial`'s terms: a remount paints the last-known merge bar while the
+    // mount effect's conflict probe revalidates it.
+    () => (story ? storyMerges(story) : ((project !== null ? lastMerges.get(project) : undefined) ?? {})),
+  )
   const [message, setMessage] = useState('')
   const [amend, setAmendFlag] = useState(false)
   const [amendOf, setAmendOf] = useState<AmendTarget | null>(null)
@@ -720,6 +757,10 @@ export function useGitPanel(
    * destroys state the user cannot get back by waiting.
    */
   const adopt = useCallback((next: StatusView, authoritative = true) => {
+    // Remembered for the next mount of this project's panel — see `lastStatus`. Real
+    // answers only: adopting `EMPTY` on a failed status or a project switch is not
+    // evidence about the repository.
+    if (authoritative && project !== null) lastStatus.set(project, next)
     const live = allFiles(next)
     // A partial selection outlives the panel that made it (it lives in a module store shared
     // with the diff pane), so the payload that says a file is gone is also the only signal
@@ -796,7 +837,9 @@ export function useGitPanel(
       const still = new Set([...prev].filter((id) => stillDiverged.has(id)))
       return still.size === prev.size ? prev : still
     })
-  }, [])
+    // `project` is the one dependency: the effects that hold `adopt` in their arrays all
+    // key on `project` too, so its identity moves exactly when theirs re-run anyway.
+  }, [project])
 
   /**
    * `viewOf`, plus the two facts in a tree that outlive the panel.
@@ -885,6 +928,8 @@ export function useGitPanel(
     // Checked again after the second await, not only after the first: this is a whole extra
     // round trip per repository, so it is the half most likely to be overtaken.
     if (generation.current !== mine) return
+    // Remembered beside the tree it was probed with — see `lastMerges`.
+    lastMerges.set(project, found)
     setMerges(found)
   }, [project, story, guarded, adopt, absorb])
 

@@ -682,10 +682,27 @@ try {
   const rust = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
   const retitle = rust('crates/cide-app/src/cmd/window.rs')
   const body = retitle.slice(retitle.indexOf('pub(crate) fn retitle'))
-  if (!body.slice(0, body.indexOf('\n}\n')).includes('demand_attention')) {
+  // Both surfaces go through `apply_announcement`, which is the one place allowed to skip
+  // the GTK calls when a window already wears the computed answer — the decision stays a
+  // level, only the redundant syscall is elided. Pinned in two halves: retitle routes
+  // through the applier, and the applier still touches both surfaces.
+  if (!body.slice(0, body.indexOf('\n}\n')).includes('apply_announcement')) {
     console.error(
       'FAIL retitle raises and lowers the urgency hint with the title\n' +
-        '  cmd/window.rs sets the title alone, which a task bar need not render at all',
+        '  cmd/window.rs no longer routes through `windows::apply_announcement`, which is ' +
+        'the one call that moves both surfaces from one decision',
+    )
+    failed++
+  }
+  const windowsRs = rust('crates/cide-app/src/windows.rs')
+  const applier = windowsRs.slice(windowsRs.indexOf('pub fn apply_announcement'))
+  const applierBody = applier.slice(0, applier.indexOf('\n}\n'))
+  if (!applierBody.includes('set_title(') || !applierBody.includes('demand_attention(')) {
+    console.error(
+      'FAIL apply_announcement moves the title AND the urgency hint together\n' +
+        '  windows.rs applies one surface without the other, which is how a window ends up ' +
+        'flashing with `Awaiting: 0` in its title — or titled `Awaiting: 1` in a task bar ' +
+        'that never renders titles',
     )
     failed++
   }
