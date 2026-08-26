@@ -223,9 +223,14 @@ for (const file of sources(SRC, ['.ts', '.tsx'])) {
    * `check-agents.mjs` compiles each standalone with no `--rootDir` and imports the output
    * directly. They cannot import the icon API even for a type, so their phase and status tables
    * hold plain strings and `asIcon` narrows at the render site. Without these two lines every
-   * mark only they name reads as dead.
+   * mark only they name reads as dead. `markdownTools.ts` is the third of the family — the
+   * formatting toolbar's tool table, import-free for the same check.
    */
-  const TABLE_FILES = ['sidebar/AgentsPanel/model.ts', 'sidebar/TasksPanel/model.ts']
+  const TABLE_FILES = [
+    'sidebar/AgentsPanel/model.ts',
+    'sidebar/TasksPanel/model.ts',
+    'sidebar/TasksPanel/markdownTools.ts',
+  ]
   const usesIcons =
     TABLE_FILES.includes(rel) || /from '(@\/icons[\w/]*|\.\.?\/[\w/.]*icons?[\w/]*)'/.test(text)
 

@@ -551,7 +551,9 @@ pub struct MarketplaceEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub installed: Option<String>,
-    /// Whether the marketplace's copy is newer than the installed one.
+    /// Whether the marketplace's copy declares a `version` different from the installed one —
+    /// the only thing an update offer compares, so a commit that ships code without a bump is
+    /// deliberately invisible here.
     pub update_available: bool,
     /// One sentence, when this row cannot be installed — a manifest that did not parse, a
     /// capability this build does not know. The row is still drawn; see [`Capability`].

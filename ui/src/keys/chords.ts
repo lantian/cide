@@ -153,6 +153,15 @@ const ALIASES: Readonly<Record<string, string>> = {
   // distinguish Ctrl+` from Ctrl+Shift+` by writing the tilde; Shift is a modifier here and is
   // written as one.
   '~': 'backquote',
+  // The same rule for the spawn chords, which were asked for in exactly this spelling:
+  // "CTRL+( - new claude panel, CTRL+) - new claude row, CTRL+{ - new bash panel, CTRL+} -
+  // new bash row". The defaults bind the physical keys (`ctrl+shift+9` and friends, see
+  // `cide_core::keymap::defaults`); these folds make the ask's own spellings mean the same
+  // chords in a `keymap.json`. US-layout faces, like the tilde above.
+  '(': '9',
+  ')': '0',
+  '{': 'bracketleft',
+  '}': 'bracketright',
 }
 
 /** Fold one key name onto its canonical spelling. Total: unknown names pass through lowercased. */

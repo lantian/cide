@@ -53,8 +53,9 @@ import type {
   TaskAuthor as WireAuthor,
   TaskBoard as WireBoard,
   TaskComment as WireComment,
+  TaskStatusChange as WireStatusChange,
 } from '@/ipc/client'
-import type { Board, CommentAuthor, CommentView, TaskView } from './model'
+import type { Board, CommentAuthor, CommentView, StatusChangeView, TaskView } from './model'
 
 /**
  * `bigint` → `number`, in one place so the argument above is made once.
@@ -93,6 +94,16 @@ function comment(from: WireComment): CommentView {
   }
 }
 
+/** One status transition. (M27) The same `bigint` and author conversions a comment gets. */
+function statusChange(from: WireStatusChange): StatusChangeView {
+  return {
+    from: from.from,
+    to: from.to,
+    by: author(from.by),
+    atMs: ms(from.atUnixMs),
+  }
+}
+
 function task(from: WireTask): TaskView {
   return {
     id: from.id,
@@ -117,6 +128,9 @@ function task(from: WireTask): TaskView {
     // Who asked for it. Through the same `author` switch as a comment's, because it is the same
     // union — and a `createdBy` passed through raw would go on compiling after a variant was
     // added in Rust that this panel has never heard of.
+    // The status log, unfiltered: a history row has no tombstone to drop — no `TaskEdit`
+    // variant deletes one, which is the property that makes it an audit trail.
+    history: from.history.map(statusChange),
     createdBy: author(from.createdBy),
     createdMs: ms(from.createdUnixMs),
     updatedMs: ms(from.updatedUnixMs),

@@ -68,6 +68,21 @@ try {
     mounted: true,
     onScreen: true,
     atBottom: true,
+    lastResizedAt: null,
+  }
+
+  /**
+   * The same pane, idle, whose only unanswered event is a resize.
+   *
+   * This is the maximise report: a pane that is printing nothing, fitted to a new box, with
+   * no byte on the way to arm anything. Under the original rule — `lastParsedAt` as the only
+   * debt — every assertion in this block answered "not stalled".
+   */
+  const resized = {
+    ...stalled,
+    lastParsedAt: 10_000 - 60_000,
+    lastRenderedAt: 10_000 - 60_000 + 1,
+    lastResizedAt: 10_000 - STALL_MS,
   }
 
   // --- the state the watchdog exists for -----------------------------------------------
@@ -95,6 +110,61 @@ try {
     isRenderStalled({ ...stalled, lastParsedAt: null }),
     false,
     'a terminal that has taken no bytes owes no frame',
+  )
+
+  // --- the resize debt -----------------------------------------------------------------
+  //
+  // A geometry change owes a frame as much as bytes do, and on an idle pane it is the only
+  // debt there is: nothing else will ever arm the check. Every case below was reported as
+  // "fullscreen makes the screen empty until i scroll in it".
+  eq(isRenderStalled(resized), true, 'a resize with no frame after it is a stall')
+  eq(shouldRepairRender(resized), true, 'and it is repaired')
+  eq(
+    isRenderStalled({ ...resized, now: resized.lastResizedAt + STALL_MS - 1 }),
+    false,
+    'the threshold is measured against the resize too',
+  )
+  eq(
+    isRenderStalled({ ...resized, lastRenderedAt: resized.lastResizedAt }),
+    false,
+    'a frame at the instant of the resize answers it',
+  )
+  eq(
+    isRenderStalled({ ...resized, lastResizedAt: null }),
+    false,
+    'without the resize that same pane owes nothing',
+  )
+
+  // The one guard the resize debt does **not** carry. A scrolled-back viewport excuses bytes
+  // that landed below the fold; it excuses nothing about a reflow, which moves every row the
+  // reader can see — and the pane whose viewport is the thing that is wrong is exactly the
+  // one this has to reach.
+  eq(
+    isRenderStalled({ ...resized, atBottom: false }),
+    true,
+    'a scrolled-back pane still owes a frame for a resize',
+  )
+  eq(
+    isRenderStalled({ ...stalled, lastResizedAt: stalled.lastParsedAt, atBottom: false }),
+    true,
+    'the resize debt survives the veto that kills the bytes debt beside it',
+  )
+  // The other two guards still hold: a parked or off-screen pane is correctly painting
+  // nothing whatever it owes.
+  eq(isRenderStalled({ ...resized, mounted: false }), false, 'a parked host is not stalled')
+  eq(isRenderStalled({ ...resized, onScreen: false }), false, 'an off-screen host is not stalled')
+
+  // Both debts at once: the clock runs from the *earlier* of them, because the question is
+  // how long a frame has been owed and not how recently something asked for one. A resize
+  // arriving late must not push a deadline the bytes already blew.
+  eq(
+    isRenderStalled({
+      ...stalled,
+      lastResizedAt: stalled.now - 1,
+      lastRenderedAt: stalled.lastParsedAt - 1,
+    }),
+    true,
+    'a fresh resize does not reset the deadline the bytes already passed',
   )
 
   // --- a terminal that is keeping up ---------------------------------------------------

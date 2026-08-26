@@ -74,6 +74,7 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // whatever the source already recorded; this pane learns its own from the next hook
         // frame rather than copying a value that may be a turn out of date.
         conversation: None,
+        conversation_since: None,
         title: format!("{project_name} : {suffix}"),
     }
 }
@@ -344,6 +345,7 @@ mod tests {
             role: PaneRole::Primary,
             session: None,
             conversation: None,
+            conversation_since: None,
             title: "cide : claude".into(),
         };
         let mut tree = new_tree(first);

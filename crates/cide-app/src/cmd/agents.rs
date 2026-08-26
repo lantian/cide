@@ -27,8 +27,10 @@
 //! makes the argument in full: those files are committed, so a teammate's commit or a
 //! `git checkout` can change them under the running app, and a cached roster is a roster that is
 //! wrong for as long as nobody happens to invalidate it. A read costs a `read_dir` and a handful
-//! of small files. `cide_fs::filter` already watches `<root>/.cide`, so a change arrives as an
-//! ordinary `cide://fs-changed` and the panel simply asks again.
+//! of small files. `cide_fs::filter` already watches `<root>/.cide`, and `crate::dotcide` turns
+//! a change there into `AgentRegistry::mark_changed`, whose coalesced flush re-reads and
+//! broadcasts — so a role file written by an agent or moved by a `git pull` reaches the panel
+//! without the panel ever polling.
 //!
 //! **`unavailable` now means only a real fault.** It used to carry a synthetic
 //! "dispatch arrives in a later slice" sentence on every role, because a role that reported
@@ -61,7 +63,7 @@ use cide_core::{CoreError, workspace};
 use cide_ipc::agents::{AgentDraft, AgentSaveOutcome, AgentScope};
 use cide_ipc::{
     AgentDef, AgentId, AgentRoster, DispatchRequest, OrchestrationConfig, OrchestrationPatch,
-    ProjectId, RunId, Task,
+    ProjectId, RunId, Task, TaskId,
 };
 use cide_tasks::TaskStore;
 use tauri::{AppHandle, Manager, State};
@@ -579,16 +581,23 @@ pub async fn agents_integrate(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     agent: AgentId,
+    task: Option<TaskId>,
 ) -> Result<AgentIntegration> {
     // Resolved on the caller's thread, so no workspace guard crosses the await. See `blocking`.
     let root = project_root(&state, project)?;
-    blocking(move || integrate(&root, &agent)).await
+    blocking(move || integrate(&root, &agent, task.as_ref())).await
 }
 
 /// [`agents_integrate`]'s body, as a free function over a path — so it is reachable from a test
 /// without an `AppHandle`, which is the shape every other decision in this module is kept in.
-fn integrate(root: &Path, agent: &AgentId) -> Result<AgentIntegration> {
-    match cide_git::worktree::integrate(root, agent.as_str()) {
+///
+/// `task` names which of the role's branches to merge, since worktrees went per-task: a task's
+/// work lives on `cide/<role>-<task>` and `None` targets the role's base branch — the one its
+/// taskless dispatches commit to. Composed with the same `checkout_name` a dispatch uses, so
+/// the branch integrated is by construction the branch that run committed to.
+fn integrate(root: &Path, agent: &AgentId, task: Option<&TaskId>) -> Result<AgentIntegration> {
+    let name = cide_agents::checkout_name(agent, task);
+    match cide_git::worktree::integrate(root, &name) {
         Ok(cide_git::worktree::Integration::UpToDate) => Ok(AgentIntegration::UpToDate),
         Ok(cide_git::worktree::Integration::Merged { commit, files }) => {
             Ok(AgentIntegration::Merged { commit, files })
@@ -599,9 +608,9 @@ fn integrate(root: &Path, agent: &AgentId) -> Result<AgentIntegration> {
         // The one rewrite. See the doc comment above: git is right and its sentence names a ref
         // the user never chose.
         Err(cide_ipc::git::GitError::NoSuchBranch { .. }) => Err(CoreError::Io(format!(
-            "{agent} has no branch in this project yet, so there is nothing to integrate. A \
-             role gets its cide/{agent} branch the first time it is dispatched, and commits to \
-             it from its own worktree under .cide/worktrees/{agent}."
+            "there is nothing to integrate: no branch cide/{name} exists in this project yet. \
+             A run mints it the first time it is dispatched into that checkout, and commits to \
+             it from .cide/worktrees/{name}."
         ))),
         Err(error) => Err(CoreError::Io(error.to_string())),
     }
@@ -684,10 +693,25 @@ fn plan_dispatch(
         // `/resume`, and those must still read correctly after the task has been renamed.
         task_title: task.as_ref().map(|task| task.title.clone()),
         prompt,
-        // Already clamped to 1 by worktree isolation, and clamped *here* so the number the queue
-        // enforces is the number the project had when the run was dispatched.
+        // Stamped *here* so the numbers the queue enforces are the numbers the project had
+        // when the run was dispatched. The old worktree clamp to 1 is gone — worktrees are
+        // per task now, and the two-children-one-checkout hazard it guarded against is the
+        // checkout gate's business, below.
         agent_limit: cide_agents::effective_max_concurrent(agent, &project.config.agents),
         project_limit: project.config.agents.max_concurrent,
+        // The directory this run will stand in, for the admission gate: two runs may never
+        // share a checkout, and under worktree isolation the checkout is named by the
+        // (role, task) pair — so tasks parallelise and taskless dispatches serialise on the
+        // role's base worktree. `None` under shared isolation, where runs sharing the project
+        // root is the setting's stated meaning — and for a role whose file says
+        // `worktree: false`, which opted into exactly that posture for its own runs.
+        checkout: match project.config.agents.isolation {
+            Isolation::Worktree if agent.def.worktree => Some(cide_agents::checkout_name(
+                &agent.def.id,
+                request.task.as_ref(),
+            )),
+            Isolation::Worktree | Isolation::Shared => None,
+        },
     })
 }
 
@@ -714,9 +738,20 @@ fn plan_dispatch(
 fn opening_prompt(task: Option<&Task>, extra: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(task) = task {
+        // The middle sentence is P4's checkpoint discipline (the preamble carries the durable
+        // copy; this is the copy that lands while the run is deciding what to do first): the
+        // plan comment is what proves the run is alive on the board, and per-step commits are
+        // what a death cannot erase — the debug report's runs died mid-turn leaving neither.
+        // The closing clause is the done-workflow convention's opening half; the durable mirror
+        // rides every run's system prompt in `cide_agents::harness::TRACKER_PREAMBLE`, and the
+        // orchestrator's side of the loop is taught in `roster_paragraph`.
         parts.push(format!(
             "Work on task {} ({}). Read it with mcp__cide__cide_task_get, and record what you do \
-             with the cide_task_* tools rather than by editing the tracker file.",
+             with the cide_task_* tools rather than by editing the tracker file. Comment your \
+             plan on the task before you start, and commit each coherent step as you go — your \
+             branch is the record that survives if this run dies. When the work \
+             is complete, set the task's status to review with mcp__cide__cide_task_update and \
+             leave a comment summarising what you did and where.",
             task.id,
             one_line(&task.title)
         ));
@@ -808,11 +843,12 @@ pub(crate) fn project_roster(app: &AppHandle, project: ProjectId) -> Option<Agen
 /// `allowDangerousPermissions`. That refusal names the key that fixes it, which is precisely the
 /// sentence a greyed row should carry.
 ///
-/// `max_concurrent` is passed through **as the author wrote it**, not clamped by
-/// `cide_agents::effective_max_concurrent`. Worktree isolation does pin it to 1, but the clamp
-/// comes with `concurrency_note`'s sentence and the wire has nowhere to put that sentence; a
-/// silently reduced number is how a user concludes their setting does not work. The dispatch
-/// slice enforces the cap where it can also explain it.
+/// `max_concurrent` is passed through **as the author wrote it** — and since worktrees went
+/// per-task that is also the number the queue enforces: a role genuinely runs that many tasks
+/// at once, each in its own checkout. (The paragraph that used to stand here explained why the
+/// wire could not carry the worktree clamp's explanatory sentence; the clamp is gone with its
+/// premise, and the panel's figure stopped being a lie the same day a user asked why their
+/// `parall = 2` role queued its second task.)
 fn wire_def(agent: &LoadedAgent, project: &ProjectAgents) -> AgentDef {
     let mut def = agent.def.clone();
     def.unavailable = cide_agents::dispatch_refusal(agent, &project.config.agents);
@@ -920,8 +956,9 @@ fn worktree_refusal(root: &Path, config: &CideConfig) -> Option<String> {
 /// likely to be staring at, because a role that failed to parse never made the project look
 /// enabled to them — additionally names the first of them outright.
 ///
-/// It logs on every roster read, and a roster is read on every `.cide/` filesystem event, so a
-/// project with a broken file will repeat these lines. That is deliberate: the alternative is
+/// It logs on every roster read, and a roster is read on every `.cide/agents` or
+/// `.cide/config.json` filesystem event (`crate::dotcide`, through the registry's coalescer), so
+/// a project with a broken file will repeat these lines. That is deliberate: the alternative is
 /// remembering what has already been reported, which is a cache, and this whole path is
 /// cacheless for `cide_agents`' stated reason. A repeated line in a log is cheap next to a
 /// definition that disappeared without one.
@@ -1149,6 +1186,7 @@ mod tests {
             status: cide_ipc::TaskStatus::Todo,
             agent: None,
             comments: Vec::new(),
+            history: Vec::new(),
             created_by: cide_ipc::TaskAuthor::User,
             created_unix_ms: 0,
             updated_unix_ms: 0,
@@ -1160,6 +1198,23 @@ mod tests {
         assert!(
             prompt.contains("cide_task_get"),
             "say how to read it: {prompt}"
+        );
+        // The done-workflow convention's opening half: finish → review + comment. The durable
+        // mirror is `TRACKER_PREAMBLE`'s last sentence.
+        assert!(
+            prompt.contains("status to review with mcp__cide__cide_task_update"),
+            "say how to hand the work back: {prompt}"
+        );
+        // P4's checkpoint discipline, both halves: the plan comment that proves liveness, and
+        // the per-step commits that survive a mid-turn death. `TRACKER_PREAMBLE` carries the
+        // durable copy; this is the one that lands before the run's first decision.
+        assert!(
+            prompt.contains("Comment your plan"),
+            "ask for the plan comment: {prompt}"
+        );
+        assert!(
+            prompt.contains("commit each coherent step"),
+            "ask for the checkpoint commits: {prompt}"
         );
         assert!(prompt.contains("mind the tabs"), "{prompt}");
 
@@ -1236,7 +1291,7 @@ mod tests {
     fn an_agent_id_that_is_a_path_is_refused_and_nothing_is_created() {
         let root = temp("integrate-traversal");
 
-        let why = integrate(&root, &AgentId("../../etc".into()))
+        let why = integrate(&root, &AgentId("../../etc".into()), None)
             .expect_err("an id that is a path is refused");
         assert!(
             why.to_string().contains("../../etc"),
@@ -1253,7 +1308,7 @@ mod tests {
     fn integrating_outside_a_repository_says_that_and_not_something_about_branches() {
         let root = temp("integrate-not-a-repo");
 
-        let why = integrate(&root, &AgentId("developer".into()))
+        let why = integrate(&root, &AgentId("developer".into()), None)
             .expect_err("/tmp is not a git repository");
         let sentence = why.to_string();
         assert!(sentence.contains("git repository"), "{sentence}");

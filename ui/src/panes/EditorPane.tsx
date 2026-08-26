@@ -39,6 +39,7 @@ import {
   revisionFile,
 } from '@/ipc/client'
 import { registerBuffer, unregisterBuffer } from '@/editor/openBuffers'
+import { registerPaneFocus } from './paneFocus'
 import {
   fetchOutline,
   forgetOutline,
@@ -90,6 +91,14 @@ export interface EditorPaneProps {
    * active one. (M16)
    */
   onScreen?: boolean | undefined
+  /**
+   * The pane this editor fills, for the keyboard registry (`panes/paneFocus.ts`).
+   *
+   * Optional because a caller outside the pane tree — a fixture, the markdown frame's
+   * standalone use — has no pane to name; without it the editor simply cannot be focused by
+   * `pane.navigate.*`, which is the state every editor was in before the registry existed.
+   */
+  pane?: string | undefined
 }
 
 /**
@@ -154,6 +163,7 @@ export function EditorPane({
   project,
   tab,
   onScreen,
+  pane,
 }: EditorPaneProps): ReactNode {
   /*
    * This file's structure, for the status bar's symbol trail.
@@ -403,6 +413,25 @@ export function EditorPane({
   const onSyncHandle = useCallback((follow: ((topLine: number) => void) | null) => {
     followRef.current = follow
   }, [])
+
+  /*
+   * The keyboard half of `pane.navigate.*`. (M27)
+   *
+   * The surface hands `view.focus` in through `onFocusHandle` and hands `null` back when the
+   * view is torn down or rebuilt, so the ref never holds a destroyed view; the registry entry
+   * closes over the ref rather than the closure, so a `reloadKey` rebuild does not need to
+   * re-register. While the markdown preview has replaced the surface entirely the ref is
+   * `null` and the entry answers by doing nothing — `focusPaneDom` still reports `true`, which
+   * is honest enough: the pane took the gesture, and the preview has no caret to give.
+   */
+  const focusViewRef = useRef<(() => void) | null>(null)
+  const onFocusHandle = useCallback((focus: (() => void) | null) => {
+    focusViewRef.current = focus
+  }, [])
+  useEffect(() => {
+    if (pane === undefined) return undefined
+    return registerPaneFocus(pane, () => focusViewRef.current?.())
+  }, [pane])
 
   /*
    * Who wrote each line — subscribe here, and read the store directly below. (M18)
@@ -1259,6 +1288,7 @@ export function EditorPane({
           blameOn={blameOn}
           onShowCommit={onShowCommit}
           onScrollHandle={onScrollHandle}
+          onFocusHandle={onFocusHandle}
           {...(onAnnotateParent === null ? {} : { onAnnotateParent })}
         />
         </MaybeMarkdown>

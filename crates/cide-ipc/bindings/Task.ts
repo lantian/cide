@@ -4,6 +4,7 @@ import type { TaskAuthor } from "./TaskAuthor";
 import type { TaskComment } from "./TaskComment";
 import type { TaskId } from "./TaskId";
 import type { TaskStatus } from "./TaskStatus";
+import type { TaskStatusChange } from "./TaskStatusChange";
 
 /**
  * One task.
@@ -41,6 +42,16 @@ agent: AgentId | null,
  * Oldest first, which is the order the panel renders and the order an agent reads.
  */
 comments: Array<TaskComment>, 
+/**
+ * Every status transition, oldest first. (M27)
+ *
+ * `#[serde(default)]` so every task file that already exists parses — the same posture
+ * [`Self::created_by`] took when it landed: `.cide/tasks.json` is the user's committed
+ * data, and a build that refused last week's file over a field it added would be the
+ * tracker locking the team out of its own repository. Recorded only on an actual change:
+ * a `SetStatus` naming the status the task already has writes no row.
+ */
+history: Array<TaskStatusChange>, 
 /**
  * Who asked for this task: the person at the keyboard, the orchestrator, or a subagent.
  * (M21)

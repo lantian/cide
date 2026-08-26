@@ -88,6 +88,10 @@ impl FsEvents for AppHandle {
         if let Some(diagnostics) = registry.get(project) {
             diagnostics.files_changed(paths);
         }
+        // The second Rust-side consumer: `.cide/` is state this process mirrors (the task
+        // tracker, the agent roster), and an agent's Write or a `git pull` moves it with no
+        // Tauri command involved. See `dotcide`'s header for the routes and the worktrees trap.
+        crate::dotcide::files_changed(self, project, paths);
     }
 }
 

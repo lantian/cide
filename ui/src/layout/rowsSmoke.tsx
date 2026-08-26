@@ -22,6 +22,7 @@ const pane = (n: number): Pane => ({
   role: n === 1 ? 'primary' : 'auxiliary',
   session: null,
   conversation: null,
+  conversationSince: null,
   title: `cide : ${n}`,
 })
 

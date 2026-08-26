@@ -411,9 +411,11 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef]) -> String {
     let roles = if roles.is_empty() {
         // Said rather than omitted: a session told it is the product owner and handed no roles
         // would call `cide_agents_list`, get an empty answer, and have no idea whether that is a
-        // failure or the truth. Naming the file is the only action available.
-        "This project defines no roles yet — they are markdown files at `.cide/agents/<name>.md`, \
-         and only the user can add one — so there is nobody to dispatch to until one appears."
+        // failure or the truth. The mechanics sentence below names the way to make one — this
+        // used to claim "only the user can add one", which stopped being true the moment the
+        // fs router (`crate::dotcide`) made a written role file take effect live.
+        "This project defines no roles yet — write one as described below — so there is nobody \
+         to dispatch to until one exists."
             .to_string()
     } else {
         format!(
@@ -433,20 +435,45 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef]) -> String {
         )
     };
 
+    // The orchestrator's operating manual, and the only channel that arrives before the first
+    // turn. Every mechanic named here is real (each has a pointer to the code that makes it
+    // true); a sentence here that outlives its mechanism is a model confidently doing the wrong
+    // thing, so treat this prose as code.
     format!(
         "You are the product owner for this project in cide. You do not have to do everything \
          yourself: this project has subagents, and you can decompose a goal into tasks, hand each \
          one to a role, and check the result. {roles} That list was read when this session \
-         started; `mcp__cide__cide_agents_list` is the current one. Dispatch with \
-         `mcp__cide__cide_agent_dispatch`, which takes a role and a task id and returns a run id \
-         immediately without waiting for the run; watch with `mcp__cide__cide_agent_runs`; stop a \
-         run that is going the wrong way with `mcp__cide__cide_agent_stop`; and take a role's \
-         finished work back into this branch with `mcp__cide__cide_agent_integrate`. Track the \
-         work itself with the `mcp__cide__cide_task_*` tools, which read and write this project's \
-         shared task tracker at `.cide/tasks.json`: create the task before you dispatch it, \
-         because a run is pointed at its task and reads the statement of the work from there. A \
-         run reports back only through that tracker, so read a task's comments to find out what \
-         its run did."
+         started; `mcp__cide__cide_agents_list` is the current one. A role is a markdown file at \
+         `.cide/agents/<name>.md` — frontmatter `name:` and `description:` (optionally \
+         `harness:`, `model:`, `tools:`, `permission-mode:`, `max-concurrent:`, and \
+         `worktree: false` for a role that should work in the project root instead of its own \
+         checkout — right for read-only roles, wrong for anything that edits), the body is the \
+         role's system prompt, the name lowercase letters, digits and dashes, at most 32 \
+         characters — and you may create or edit one with your ordinary file tools: it takes \
+         effect immediately, no restart, and a project file shadows a global one of the same \
+         name. Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
+         write this project's shared task tracker at `.cide/tasks.json`: create the task before \
+         you hand it to anybody, because a run is pointed at its task and reads the statement of \
+         the work from there. Assigning a todo or doing task to a role — with \
+         `mcp__cide__cide_task_assign` or `mcp__cide__cide_task_update`, by creating the task \
+         with an assignee, or by @mentioning a role in a task's body or a comment — starts that \
+         role on it automatically; `mcp__cide__cide_agent_dispatch` (a role and a task id, \
+         returns a run id immediately without waiting) is only needed to re-run a role or to add \
+         a one-line extra instruction. A role runs up to its `max-concurrent` tasks at once, \
+         each task in its own worktree on branch `cide/<role>-<task>` (a dispatch with no task \
+         uses the role's base worktree, one at a time), and the project caps concurrent runs — \
+         anything past a cap queues in order, so fan out across tasks and roles freely. A run \
+         that starts moves its task to doing; when the work is done it sets the task to review \
+         and comments what it did. A run reports back only through that tracker, so read those \
+         comments, take work you accept into this branch with `mcp__cide__cide_agent_integrate` \
+         — naming the task, which picks that task's branch — and set the task done, or comment \
+         what to change and hand it back. Watch runs with \
+         `mcp__cide__cide_agent_runs`; stop one going the wrong way with \
+         `mcp__cide__cide_agent_stop`. Keep the plan in the tracker: hold the goal in one task \
+         and decompose from it, and when cide tells you a run ended, re-read that goal task and \
+         the board before deciding what is next — the board, not your context, is the plan of \
+         record. When you need the user, end your turn with a direct question: cide marks the \
+         pane and the window title while you are awaiting input."
     )
 }
 
@@ -617,10 +644,26 @@ pub async fn session_spawn(
     // the spawn. Cloned, both of them: `ClaudeSettings` stopped being `Copy` when it grew the
     // launch configuration, which is a `String` and two `Vec`s. One allocation on a path that
     // is about to `fork`.
-    let (proxy, claude_settings) = app
+    // The job threshold rides too: one more scalar out of the same lock, converted here so
+    // the `!is_claude` branch below has a value and not a second state lookup.
+    let (proxy, claude_settings, job_notify_after) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
-        .map(|state| state.with(|ws| (ws.settings.proxy.clone(), ws.settings.claude.clone())))
-        .unwrap_or_default();
+        .map(|state| {
+            state.with(|ws| {
+                (
+                    ws.settings.proxy.clone(),
+                    ws.settings.claude.clone(),
+                    crate::lifecycle::job_notify_after(&ws.settings),
+                )
+            })
+        })
+        .unwrap_or_else(|| {
+            (
+                Default::default(),
+                Default::default(),
+                crate::lifecycle::job_notify_after(&cide_ipc::Settings::default()),
+            )
+        });
 
     // The user's launch configuration, filtered. Enforced *here* as well as on the Settings
     // screen and not instead of it: `workspace.json` is hand-editable and `settings_set` is one
@@ -922,10 +965,13 @@ pub async fn session_spawn(
     // both would have two writers disagreeing about one `SessionState`, with whichever polled
     // last winning.
     //
-    // See `cide_pty::jobs` for what is observed, and `lifecycle::JOB_NOTIFY_AFTER` for why a
-    // job has to run for a while before anything is said about it.
+    // See `cide_pty::jobs` for what is observed, and `lifecycle::job_notify_after` for why a
+    // job has to run for a while before anything is said about it — how long is the user's
+    // setting, read above out of the same lock as the proxy. A later settings change reaches
+    // this session too: `settings_set` retunes every running watch, so this value is only
+    // ever the starting point.
     if !is_claude {
-        spec = spec.watch_jobs(crate::lifecycle::JOB_NOTIFY_AFTER);
+        spec = spec.watch_jobs(job_notify_after);
     }
 
     let session = blocking(move || {
@@ -1471,8 +1517,35 @@ pub fn session_resumable(app: tauri::AppHandle, cwd: String, session: SessionId)
     crate::lifecycle::resumable(std::path::Path::new(&cwd), session, resume_enabled)
 }
 
+/// Kill a session — **unless it is a subagent run's**, in which case closing the pane closes
+/// the view and nothing else.
+///
+/// The refusal is the fix for the debug report's single-pane deaths (run e83a75fe: exit 129
+/// after nine minutes of work, while its sibling in the same period lived). The chain: a
+/// mirror pane's spawn plan is a **per-window JS map**, so in a multi-window layout the pane
+/// can render in a window that never heard of the plan; `TerminalPane` then adopts the run's
+/// session through the domain fallback *without* the `mirrored` flag, and `closePane` — whose
+/// last line is this command — SIGHUPed the agent mid-turn. Silently: the run row just moved
+/// to History as though it had finished, which is exactly what the report's table records.
+///
+/// Refused here, in the domain, rather than by a second ownership flag on `Pane`: the
+/// no-`agent_open_pane` note in `cmd/agents.rs` records why two answers to "does this pane own
+/// its child" is the design that rots. Runs die only through their owners — `agents_stop`, the
+/// idle wind-down, a respawn, the shutdown ladder — every one of which calls `pty.kill()`
+/// directly and never passes through this command, so the guard costs them nothing.
+///
+/// The `State` parameter does not drift `contract/commands.json` — `session_resumable`'s doc
+/// above carries that argument.
 #[tauri::command(rename_all = "camelCase")]
-pub fn session_kill(registry: State<'_, SessionRegistry>, session: SessionId) {
+pub fn session_kill(
+    registry: State<'_, SessionRegistry>,
+    agents: State<'_, Arc<crate::agents::AgentRegistry>>,
+    session: SessionId,
+) {
+    if agents.owns_session(session) {
+        tracing::info!(%session, "refusing to kill a subagent run's session from a pane close; the view closes, the run continues");
+        return;
+    }
     if let Some(s) = registry.get(session) {
         s.kill();
     }
@@ -1495,6 +1568,7 @@ mod tests {
             model: None,
             unavailable: None,
             max_concurrent: 1,
+            worktree: true,
         }
     }
 
@@ -1534,6 +1608,37 @@ mod tests {
         // And it must not promise the run will speak up on its own.
         assert!(
             paragraph.contains("only through that tracker"),
+            "{paragraph}"
+        );
+
+        // The mechanics the orchestrator can act on, each backed by real code — a sentence here
+        // without its mechanism is a model confidently doing the wrong thing:
+        // roles are files it may write, live (`crate::dotcide`)...
+        assert!(paragraph.contains(".cide/agents/<name>.md"), "{paragraph}");
+        assert!(
+            paragraph.contains("takes effect immediately"),
+            "{paragraph}"
+        );
+        // ...assignment and @mentions start the role (`crate::task_triggers`)...
+        assert!(
+            paragraph.contains("starts that role on it automatically"),
+            "{paragraph}"
+        );
+        assert!(paragraph.contains("@mentioning a role"), "{paragraph}");
+        // ...limits queue rather than refuse (`AgentRegistry::admit_a_pass`), and a role's
+        // tasks genuinely parallelise, each in a per-task worktree (`checkout_name`)...
+        assert!(paragraph.contains("queues in order"), "{paragraph}");
+        assert!(paragraph.contains("its own worktree"), "{paragraph}");
+        assert!(paragraph.contains("cide/<role>-<task>"), "{paragraph}");
+        // ...the done-workflow convention (`opening_prompt` / `TRACKER_PREAMBLE` teach the run's
+        // half)...
+        assert!(paragraph.contains("sets the task to review"), "{paragraph}");
+        // ...the goal lives on the board, not in the context window...
+        assert!(paragraph.contains("plan of record"), "{paragraph}");
+        // ...and the way to summon the user is to end the turn asking (`windows::set_awaiting`
+        // badges the pane and retitles the window).
+        assert!(
+            paragraph.contains("end your turn with a direct question"),
             "{paragraph}"
         );
     }

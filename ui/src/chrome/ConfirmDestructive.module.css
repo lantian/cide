@@ -167,10 +167,13 @@
 }
 
 /*
- * Cancel is the default and the prominent one; the destructive button is the plain one.
+ * The default is the prominent one, and for every destructive caller the default is Cancel;
+ * the destructive button is the plain one.
  *
- * This dialog exists because something is about to be destroyed, and making the destruction
- * the eye-catching default is how it gets clicked by reflex.
+ * That dialog exists because something is about to be destroyed, and making the destruction
+ * the eye-catching default is how it gets clicked by reflex. The one caller that flips this
+ * — the file tree's trash move, reversible by construction (`ConfirmState.defaultButton`) —
+ * moves the class *with* the focus, so the accent never lies about what Enter does.
  */
 .buttonPrimary {
   background: var(--accent);

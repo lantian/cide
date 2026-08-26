@@ -2,13 +2,15 @@
  * Checks `src/panes/awaitingRule.ts` — the predicate behind the pane highlight, the tab and
  * project badges, and the `Awaiting: X` in the task bar — and the four surfaces that read it.
  *
- * Worth pinning because the whole feature is this one distinction and nothing else in the
- * chain can catch it being wrong. `SessionState::Idle` is two different situations wearing one
- * name: a session that started and has never been asked anything, and a session that has just
- * finished a turn. Rust cannot tell them apart from a single event — that is why the rule is
- * here and not in `hooks.rs` — so if this file regresses, every launch announces "3 sessions
- * are waiting for you" about three sessions that have never run, the user learns to ignore the
- * badge, and the one time it is true they will not look.
+ * Worth pinning because the whole feature is one distinction and nothing else in the chain
+ * can catch it being wrong. A finished turn is said outright on the wire —
+ * `cide_claude::next_state` turns a `Stop` out of `Busy` into `AwaitingInput` — and `Idle`
+ * therefore says *nothing* about waiting: it is a fresh prompt at launch, and it is also what
+ * `/clear` produces (the fresh conversation's `SessionStart`) on the pane the user is at that
+ * moment typing into. If this file regresses towards raising on `Idle`, typing `/clear`
+ * notifies the user about their own keystroke; towards clearing on it, a stray `Stop` eats a
+ * marker nobody has acknowledged. Either way the user learns to ignore the badge, and the one
+ * time it is true they will not look.
  *
  * Three sections:
  *
@@ -76,15 +78,28 @@ try {
 
   // --- the distinction the whole feature is ---------------------------------------------
   //
-  // Both of these end in `idle`. If they ever agree, the badge is noise.
+  // A finished turn arrives as `awaitingInput` — Rust decides that on the wire — and `idle`
+  // says nothing about waiting in either direction.
   const neverRan = replay('spawning', 'idle')
-  const justFinished = replay('spawning', 'idle', 'busy', 'idle')
+  const justFinished = replay('spawning', 'idle', 'busy', 'awaitingInput')
   eq(neverRan.awaiting, false, 'a session at a fresh prompt is NOT waiting for the user')
   eq(justFinished.awaiting, true, 'a session that finished a turn IS waiting for the user')
+
+  // `/clear`. The CLI opens a fresh conversation, whose `SessionStart` arrives as `idle` on a
+  // session with turns behind it — and the keystrokes that typed the command have already
+  // acknowledged. The old rule ("an idle after a busy means finished") re-raised right here,
+  // which notified the user about the pane they were typing into.
   eq(
-    neverRan.awaiting === justFinished.awaiting,
+    onState(onAcknowledge(justFinished), 'idle').awaiting,
     false,
-    'both paths end in `idle`; if they agree, every launch announces sessions nobody started',
+    'a conversation restart (/clear) must not announce the pane the user is typing into',
+  )
+  // ...and the other direction: an `idle` landing on a session already waiting (a `Stop`
+  // while the hook map says AwaitingInput) must not eat an unacknowledged marker.
+  eq(
+    onState(justFinished, 'idle').awaiting,
+    true,
+    'an `idle` says nothing: it must not clear a marker nobody has acknowledged either',
   )
 
   // --- the states that decide on their own ----------------------------------------------
@@ -102,17 +117,17 @@ try {
   eq(
     replay('awaitingInput').awaiting,
     true,
-    'AwaitingInput is declared in `SessionState` and never yet produced; when something ' +
-      'produces it, it must already count rather than needing this file changed again',
+    'AwaitingInput counts on the very first transition — it is what a finished turn and a ' +
+      'finished shell job both arrive as, and it does not consult history',
   )
   eq(replay('splash').awaiting, false, 'a resume splash is a control already on screen')
   eq(
-    replay('spawning', 'idle', 'busy', 'idle', 'exited').awaiting,
+    replay('spawning', 'idle', 'busy', 'awaitingInput', 'exited').awaiting,
     false,
     'a dead session waits for nobody',
   )
   eq(
-    replay('spawning', 'idle', 'busy', 'idle', 'exited').gone,
+    replay('spawning', 'idle', 'busy', 'awaitingInput', 'exited').gone,
     true,
     '`gone` is what tells the caller to drop the entry rather than count a corpse for ever',
   )
@@ -121,13 +136,13 @@ try {
   const seen = onAcknowledge(justFinished)
   eq(seen.awaiting, false, 'looking at the pane clears the marker')
   eq(
-    onState(seen, 'idle').awaiting,
+    onState(seen, 'awaitingInput').awaiting,
     true,
-    'acknowledging must not clear `ranATurn`: the NEXT turn ending has to raise it again, ' +
-      'or a session announces itself exactly once and then never again',
+    'the NEXT turn ending has to raise it again, or a session announces itself exactly once ' +
+      'and then never again',
   )
   eq(
-    onState(onState(seen, 'busy'), 'idle').awaiting,
+    onState(onState(seen, 'busy'), 'awaitingInput').awaiting,
     true,
     'the ordinary loop — reply, wait, finish — raises the marker every time round',
   )
@@ -142,10 +157,11 @@ try {
   // announces itself exactly once passes every single-turn test there is, and this one shipped
   // with tests that passed. Each round is the complete sequence a real turn produces: the
   // user's keystroke acknowledges, `UserPromptSubmit` makes it busy, tool calls keep it busy,
-  // `Stop` ends it. The state after every `Stop` is `awaiting`, and it is the *same* state
-  // every time — not merely truthy the first time.
-  let track = replay('spawning', 'idle', 'busy', 'idle') // the first turn has just finished
-  const step = (turn, at) => ({ turn, at, awaiting: track.awaiting, ranATurn: track.ranATurn })
+  // `Stop` ends it — arriving as `awaitingInput`, because Rust decides the finish on the
+  // wire. The state after every finish is `awaiting`, and it is the *same* state every time —
+  // not merely truthy the first time.
+  let track = replay('spawning', 'idle', 'busy', 'awaitingInput') // the first turn just finished
+  const step = (turn, at) => ({ turn, at, awaiting: track.awaiting })
   const turns = [step(1, 'finished')]
   for (let turn = 2; turn <= 5; turn++) {
     track = onAcknowledge(track) // the user clicks into the pane
@@ -153,7 +169,7 @@ try {
     track = onState(track, 'busy') // UserPromptSubmit: they typed the next thing
     track = onState(track, 'busy') // PreToolUse / PostToolUse: same state, no news
     turns.push(step(turn, 'working'))
-    track = onState(track, 'idle') // Stop
+    track = onState(track, 'awaitingInput') // Stop out of Busy
     turns.push(step(turn, 'finished'))
   }
   eq(
@@ -169,36 +185,31 @@ try {
       'is mid-turn, which is worse than announcing nothing',
   )
   eq(
-    turns.filter((t) => !t.ranATurn),
-    [],
-    'the one bit of history the whole rule turns on survives every step of every turn. An ' +
-      'acknowledgement that cleared it would make the next `idle` look like a session that ' +
-      'had never run — the same "announced itself once" symptom by a different road',
-  )
-  eq(
     track,
-    onState(onState(onAcknowledge(replay('spawning', 'idle', 'busy', 'idle')), 'busy'), 'idle'),
+    onState(
+      onState(onAcknowledge(replay('spawning', 'idle', 'busy', 'awaitingInput')), 'busy'),
+      'awaitingInput',
+    ),
     'the fifth finished turn is in exactly the state the second one was — the loop has no ' +
       'residue, so there is nothing that could wear out',
   )
   // The same loop with Rust's authoritative set in the middle of it, since that is what the
   // running app does: the window reports, Rust aggregates, Rust broadcasts, the window merges
-  // the answer back over its own table. A merge that lost `ranATurn` would make the NEXT
-  // `Stop` look like a session that had never run, which is the same one-shot symptom
-  // arriving by a different road.
-  let round = new Map([['s', replay('spawning', 'idle', 'busy', 'idle')]])
+  // the answer back over its own table. A merge that left residue behind would show up as a
+  // marker that sticks or a turn that stops announcing, so the loop is driven through it.
+  let round = new Map([['s', replay('spawning', 'idle', 'busy', 'awaitingInput')]])
   for (let turn = 1; turn <= 3; turn++) {
     round = mergeAuthoritative(round, ['s']) // Rust echoes the raise back
     round.set('s', onAcknowledge(round.get('s'))) // the user reads the pane
     round = mergeAuthoritative(round, []) // and Rust echoes the clear back
     eq(awaitingIn(round, ['s']), 0, `turn ${turn}: a session that has been read is not counted`)
     round.set('s', onState(round.get('s'), 'busy'))
-    round.set('s', onState(round.get('s'), 'idle'))
+    round.set('s', onState(round.get('s'), 'awaitingInput'))
     eq(
       awaitingIn(round, ['s']),
       1,
       `turn ${turn}: the next turn ending must raise it again even after a full round trip ` +
-        `through Rust's set — the broadcast carries no history, and the merge must not eat it`,
+        `through Rust's set`,
     )
   }
 
@@ -208,7 +219,7 @@ try {
   // session started waiting has no history of its own to derive the answer from.
   const local = new Map([
     ['a', onState(UNSEEN, 'busy')],
-    ['b', replay('spawning', 'idle', 'busy', 'idle')],
+    ['b', replay('spawning', 'idle', 'busy', 'awaitingInput')],
   ])
   const merged = mergeAuthoritative(local, ['a', 'c'])
   eq(merged.get('a').awaiting, true, 'the broadcast can raise a session this window called busy')
@@ -218,10 +229,9 @@ try {
     'absence from the set means "no longer waiting" — that is how one window acknowledging ' +
       'clears the marker in the other window showing the same pane',
   )
-  eq(merged.get('a').ranATurn, true, 'per-window history survives the merge')
   eq(
     merged.get('c'),
-    { ranATurn: true, awaiting: true, gone: false },
+    { awaiting: true, gone: false },
     'a session this window has never heard of is adopted from the broadcast, which is the ' +
       'entire reason the broadcast exists',
   )
@@ -239,22 +249,19 @@ try {
   const fresh = adopt(new Map(), ['a'])
   eq(
     fresh.get('a'),
-    { ranATurn: true, awaiting: true, gone: false },
+    { awaiting: true, gone: false },
     'a window that has heard nothing takes the whole answer, or a detached pane shows no ' +
       'marker under a title bar that says it is waiting',
   )
-  const raced = adopt(new Map([['b', replay('spawning', 'idle', 'busy', 'idle')]]), ['a'])
+  const raced = adopt(new Map([['b', replay('spawning', 'idle', 'busy', 'awaitingInput')]]), [
+    'a',
+  ])
   eq(
     raced.get('b').awaiting,
     true,
     'the answer was taken before the question landed, so a session that started waiting ' +
       'during the round trip must survive it — `mergeAuthoritative` would clear it, and a ' +
       'finished turn produces no later transition to raise it again',
-  )
-  eq(
-    adopt(new Map([['a', onState(UNSEEN, 'busy')]]), ['a']).get('a').ranATurn,
-    true,
-    'per-window history survives the catch-up too',
   )
 
   // --- the count a background tab shows -----------------------------------------------------
@@ -267,7 +274,7 @@ try {
   // for the same reason as the rest of the file: nothing else in the chain can catch it. A
   // count that never reached zero would leave a permanent "come back here" on a tab where
   // everything has been dealt with, and the user would learn to ignore the strip.
-  const waiting = () => replay('spawning', 'idle', 'busy', 'idle')
+  const waiting = () => replay('spawning', 'idle', 'busy', 'awaitingInput')
   const busy = () => onState(UNSEEN, 'busy')
 
   const table = new Map([
@@ -319,10 +326,10 @@ try {
   const dealtWithBoth = dealtWithOne.set('s2', onAcknowledge(dealtWithOne.get('s2')))
   eq(awaitingIn(dealtWithBoth, ['s1', 's2']), 0, 'the marker clears once the last one is seen')
   eq(
-    awaitingIn(new Map(dealtWithBoth).set('s1', onState(dealtWithBoth.get('s1'), 'idle')), [
-      's1',
-      's2',
-    ]),
+    awaitingIn(
+      new Map(dealtWithBoth).set('s1', onState(dealtWithBoth.get('s1'), 'awaitingInput')),
+      ['s1', 's2'],
+    ),
     1,
     'and the NEXT turn ending raises the tab again, or a tab announces itself exactly once',
   )
@@ -416,7 +423,7 @@ try {
     'the project badge clears only once the LAST of its panes has actually been seen',
   )
   agree(allSeen, projectPanes, 'a project with everything dealt with')
-  const againAfter = new Map(allSeen).set('b1', onState(allSeen.get('b1'), 'idle'))
+  const againAfter = new Map(allSeen).set('b1', onState(allSeen.get('b1'), 'awaitingInput'))
   eq(
     awaitingIn(againAfter, projectPanes),
     1,
@@ -727,9 +734,9 @@ try {
   if (!/JobEvent::Finished \{ \.\. \} => SessionState::AwaitingInput/.test(arms)) {
     console.error(
       'FAIL a finished shell job asks for the user rather than merely going idle\n' +
-        '  lifecycle.rs maps it to something else — `Idle` raises the marker only for a ' +
-        'session the frontend watched go Busy, and a pane in a background project need not ' +
-        'have been listening at the time',
+        '  lifecycle.rs maps it to something else — `Idle` says nothing about waiting at ' +
+        'all (`awaitingRule.ts` neither raises nor clears on it), so a finished job mapped ' +
+        'to it would light no surface anywhere',
     )
     failed++
   }

@@ -11,7 +11,9 @@ export type MarketplaceEntry = { id: ExtensionId, name: string, version: string,
  */
 installed?: string, 
 /**
- * Whether the marketplace's copy is newer than the installed one.
+ * Whether the marketplace's copy declares a `version` different from the installed one —
+ * the only thing an update offer compares, so a commit that ships code without a bump is
+ * deliberately invisible here.
  */
 updateAvailable: boolean, 
 /**

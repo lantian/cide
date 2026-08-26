@@ -189,6 +189,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "tools",
     "permission-mode",
     "max-concurrent",
+    "worktree",
 ];
 
 // ==========================================================================================
@@ -601,6 +602,7 @@ struct Parsed {
     tools: Vec<String>,
     permission_mode: Option<String>,
     max_concurrent: Option<u16>,
+    worktree: Option<bool>,
 }
 
 /// A definition that made it far enough to have an identity, and the file it came from.
@@ -744,6 +746,26 @@ fn read_definition(
                     format!("`max-concurrent: {value}` is not a whole number."),
                 )),
             },
+            // `worktree: false` opts the role out of the project's worktree isolation — its
+            // runs stand in the project root, on the user's own branch. An unparsable value
+            // greys the role rather than warns: the switch decides whether an unattended
+            // child edits the user's checkout directly, which is `permission-mode`'s class of
+            // stakes, and running under a posture the author did not choose is the failure
+            // both refusals exist to prevent.
+            "worktree" => match value.parse::<bool>() {
+                Ok(flag) => parsed.worktree = Some(flag),
+                Err(_) => {
+                    problems.push(AgentProblem::error(
+                        path,
+                        line,
+                        format!("`worktree: {value}` is not `true` or `false`."),
+                    ));
+                    note_first(
+                        &mut unavailable,
+                        format!("`worktree: {value}` is not `true` or `false`."),
+                    );
+                }
+            },
             other => {
                 // Two unknown keys, two different answers. A key that is a *near-miss* of one
                 // cide reads — `permission_mode` for `permission-mode` — is a typo, and the
@@ -868,10 +890,13 @@ fn read_definition(
                 system_prompt: doc.body,
                 model: parsed.model,
                 unavailable,
-                // 1 rather than 0-means-unlimited: worktree isolation pins a role to one run at
-                // a time anyway, and a default a user cannot regret beats one that starts two
-                // `claude` processes the first time somebody presses the button.
+                // 1 rather than 0-means-unlimited: a default a user cannot regret beats one
+                // that starts two `claude` processes the first time somebody presses the
+                // button. (Worktrees are per task now, so the declared number is real —
+                // which makes the conservative default matter *more*, not less.)
                 max_concurrent: parsed.max_concurrent.unwrap_or(1),
+                // Opt-*out*: the worktree is the safe posture, so absence means true.
+                worktree: parsed.worktree.unwrap_or(true),
             },
             origin: path.to_path_buf(),
             shadows: None,
@@ -1433,6 +1458,7 @@ pub fn normalize(draft: &AgentDraft) -> AgentDraft {
             .collect(),
         permission_mode: optional(&draft.permission_mode),
         max_concurrent: draft.max_concurrent,
+        worktree: draft.worktree,
         system_prompt: body(&draft.system_prompt),
     }
 }
@@ -1483,6 +1509,16 @@ pub fn render(draft: &AgentDraft) -> String {
     }
     if let Some(max) = draft.max_concurrent {
         field(&mut out, "max-concurrent", &max.to_string());
+    }
+    // Written whenever the draft says — `true` included, since a draft carries `Some` only
+    // when the file (or the user) actually said it, and dropping an explicit line a person
+    // wrote is the silent-deletion hazard `AgentDraft::worktree`'s doc names.
+    if let Some(worktree) = draft.worktree {
+        field(
+            &mut out,
+            "worktree",
+            if worktree { "true" } else { "false" },
+        );
     }
     out.push_str("---\n\n");
 
@@ -1587,6 +1623,7 @@ pub fn parse_draft(
         tools: value("tools").map(split_list).unwrap_or_default(),
         permission_mode: optional("permission-mode"),
         max_concurrent: value("max-concurrent").and_then(|value| value.parse::<u16>().ok()),
+        worktree: value("worktree").and_then(|value| value.parse::<bool>().ok()),
         system_prompt: doc.body,
     })
 }
@@ -2732,6 +2769,49 @@ Work one task at a time.
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `worktree: false` opts a role out of the checkout; anything else the key says greys
+    /// the role rather than running it under a posture its author did not choose — the switch
+    /// decides whether an unattended child edits the user's own branch, which is
+    /// `permission-mode`'s class of stakes. Absence is `true`: the worktree is the safe end.
+    #[test]
+    fn a_worktree_opt_out_is_read_and_a_mangled_one_greys_the_role() {
+        let dir = temp("worktree-flag");
+        let project = dir.join("project");
+        write(
+            &project,
+            "a.md",
+            "---\nname: a\ndescription: d\nworktree: false\n---\nP.\n",
+        );
+        write(&project, "b.md", "---\nname: b\ndescription: d\n---\nP.\n");
+        write(
+            &project,
+            "c.md",
+            "---\nname: c\ndescription: d\nworktree: nope\n---\nP.\n",
+        );
+        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        assert!(!agent(&catalog, "a").def.worktree);
+        assert!(
+            agent(&catalog, "b").def.worktree,
+            "absence means the checkout"
+        );
+        let mangled = agent(&catalog, "c");
+        assert!(
+            mangled.def.worktree,
+            "a mangled value falls to the safe end"
+        );
+        assert!(
+            mangled
+                .def
+                .unavailable
+                .as_deref()
+                .is_some_and(|why| why.contains("worktree")),
+            "…and the role is greyed with the key named: {:?}",
+            mangled.def.unavailable
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The harness spellings are the wire's, in both directions, so a file and a DTO agree.
     #[test]
     fn harness_names_round_trip() {
@@ -2763,6 +2843,7 @@ Work one task at a time.
             tools: Vec::new(),
             permission_mode: None,
             max_concurrent: None,
+            worktree: None,
             system_prompt: prompt.to_string(),
         }
     }
@@ -2800,7 +2881,18 @@ Work one task at a time.
                 ],
                 permission_mode: Some("acceptEdits".into()),
                 max_concurrent: Some(u16::MAX),
+                worktree: Some(false),
                 ..draft("developer", "You are the developer.")
+            },
+        ));
+        rows.push((
+            // `Some(true)` is the redundant spelling — the default written out — and it must
+            // survive the trip, because the alternative is a save deleting a line a person
+            // wrote. `Some(false)` rides the every-key row above.
+            "an explicit worktree: true",
+            AgentDraft {
+                worktree: Some(true),
+                ..draft("reviewer", "Read and report.")
             },
         ));
 

@@ -29,7 +29,13 @@
  * a closure rather than an import so `paneHosts.ts` never depends on this module (this
  * module imports it, and the pair would otherwise be a cycle).
  */
-import { getHost, noteParsed, setHostBusy, takeSavedScrollback } from '@/layout/paneHosts'
+import {
+  getHost,
+  noteParsed,
+  noteResized,
+  setHostBusy,
+  takeSavedScrollback,
+} from '@/layout/paneHosts'
 import {
   diag,
   events,
@@ -37,6 +43,7 @@ import {
   session as sessionApi,
   type Geometry,
 } from '@/ipc/client'
+import type { TerminalHandle } from '@/terminal/xterm'
 import { attachSequencer, hydrationPlan } from './attachModel'
 import { exitMarkerBytes, markFor } from './exitMarker'
 
@@ -59,6 +66,27 @@ export function plausible(cols: number, rows: number): boolean {
 }
 
 /**
+ * Fit the terminal to its box, and say whether that moved its cell geometry.
+ *
+ * `fit()` alone cannot answer the second half — it resizes or does nothing, silently — and
+ * two callers downstream need the answer for different reasons: `syncSize` spends a
+ * `session_resize` on it, and `noteResized` records that a frame is owed. Asking `fit()` twice
+ * or comparing after the fact at each call site would be two copies of the same three lines.
+ *
+ * The viewport is deliberately left alone. xterm keeps `viewportY === baseY` across a resize
+ * itself — `Buffer.resize` and both `_reflow*` paths decrement or increment `ydisp` in step
+ * with `ybase` precisely so a terminal that was following its output still is — so a
+ * `scrollToBottom` here would be a no-op with a comment claiming it prevented something.
+ */
+function refit(handle: TerminalHandle): boolean {
+  const { term } = handle
+  const cols = term.cols
+  const rows = term.rows
+  handle.fit.fit()
+  return term.cols !== cols || term.rows !== rows
+}
+
+/**
  * The pane's size right now, as a cell geometry.
  *
  * A function rather than a value computed once, because it is asked at moments minutes
@@ -71,7 +99,7 @@ export function measureGeometry(paneId: string): Geometry {
   const handle = getHost(paneId).terminal
   if (!handle) return FALLBACK
   try {
-    handle.fit.fit()
+    refit(handle)
   } catch {
     /* the slot may not be laid out yet on the very first frame */
   }
@@ -104,11 +132,26 @@ export function syncSize(paneId: string): Promise<void> {
   const host = getHost(paneId)
   const handle = host.terminal
   if (!handle) return Promise.resolve()
+  let refitted = false
   try {
-    handle.fit.fit()
+    refitted = refit(handle)
   } catch {
     return Promise.resolve()
   }
+  /*
+   * A resize owes a frame exactly as parsed bytes do, and on an idle pane it is the *only*
+   * debt that can be incurred — which is why maximising a quiet pane could leave it blank
+   * with nothing in the system able to notice. `noteResized` asks for that frame and arms the
+   * watchdog in case the ask goes unanswered.
+   *
+   * Only when the fit actually moved `cols`/`rows`: a `ResizeObserver` fires per frame of a
+   * drag and most of those frames are the geometry the terminal already had.
+   *
+   * Before the plausibility and cache gates below, which are both about what to tell the
+   * *child*. Whether this webview painted the reflow is a different question, and it is owed
+   * for a fit this host declined to forward just as much as for one it sent.
+   */
+  if (refitted) noteResized(paneId)
   // Never push a degenerate size at a live child. A pane that is momentarily unlaid-out
   // fits to 2x1, and forwarding that would reflow the TUI into garbage for no reason.
   if (!plausible(handle.term.cols, handle.term.rows)) return Promise.resolve()

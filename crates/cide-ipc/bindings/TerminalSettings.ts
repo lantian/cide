@@ -19,4 +19,28 @@ fontSize: number, scrollback: number,
  * software rasterizer, and `WEBGL_debug_renderer_info` is masked — on Linux it reports
  * "Apple GPU" regardless of hardware.
  */
-renderer: TerminalRenderer, };
+renderer: TerminalRenderer, 
+/**
+ * How long a shell pane's foreground job must run before the pane will say anything
+ * about it, in seconds.
+ *
+ * The notification policy behind the pane dot, both badges and the window title: a job
+ * this long gets announced, and its end then notifies. It gates the announcement of the
+ * *start*, not the end — see `cide_pty::jobs`, which carries the argument (an announced
+ * job's `Finished` maps to `AwaitingInput`, which raises the marker unconditionally, so
+ * nothing downstream can un-announce it). The question the threshold answers is *did I
+ * walk away from this?*, and the
+ * right number depends on what somebody runs all day — a two-minute incremental build
+ * wants a different answer than a twenty-second test suite — which is why this is a
+ * setting and not the constant it used to be.
+ *
+ * Seconds rather than a `Duration`: this crosses the wire, and TypeScript gets a plain
+ * number to put in an input. A `u32` deliberately — zero is a coherent choice (announce
+ * everything) and an hour is too (effectively off), so nothing here clamps.
+ *
+ * `#[serde(default = "…")]` for [`SidebarSettings::agents_width`]'s reason, which is
+ * worth re-reading before adding the next stored field: every existing `workspace.json`
+ * has a `terminal` object without this member, and the container's `#[serde(default)]`
+ * does not supply a member a *present* object happens not to mention.
+ */
+jobNotifyAfterSecs: number, };

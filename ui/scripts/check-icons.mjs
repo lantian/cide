@@ -134,6 +134,7 @@ try {
   eq(file('BENCH.md'), 'markdown', 'but an ordinary .md is markdown')
   eq(file('logo.png'), 'image', '.png')
   eq(file('run.sh'), 'console', '.sh is the console icon')
+  eq(file('user.proto'), 'proto', '.proto is the protobuf icon')
   eq(file('index.html'), 'html', '.html')
 
   // --- and known whole names beat any extension --------------------------------------------

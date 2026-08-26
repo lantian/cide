@@ -557,6 +557,39 @@ pub struct TerminalSettings {
     /// software rasterizer, and `WEBGL_debug_renderer_info` is masked — on Linux it reports
     /// "Apple GPU" regardless of hardware.
     pub renderer: TerminalRenderer,
+    /// How long a shell pane's foreground job must run before the pane will say anything
+    /// about it, in seconds.
+    ///
+    /// The notification policy behind the pane dot, both badges and the window title: a job
+    /// this long gets announced, and its end then notifies. It gates the announcement of the
+    /// *start*, not the end — see `cide_pty::jobs`, which carries the argument (an announced
+    /// job's `Finished` maps to `AwaitingInput`, which raises the marker unconditionally, so
+    /// nothing downstream can un-announce it). The question the threshold answers is *did I
+    /// walk away from this?*, and the
+    /// right number depends on what somebody runs all day — a two-minute incremental build
+    /// wants a different answer than a twenty-second test suite — which is why this is a
+    /// setting and not the constant it used to be.
+    ///
+    /// Seconds rather than a `Duration`: this crosses the wire, and TypeScript gets a plain
+    /// number to put in an input. A `u32` deliberately — zero is a coherent choice (announce
+    /// everything) and an hour is too (effectively off), so nothing here clamps.
+    ///
+    /// `#[serde(default = "…")]` for [`SidebarSettings::agents_width`]'s reason, which is
+    /// worth re-reading before adding the next stored field: every existing `workspace.json`
+    /// has a `terminal` object without this member, and the container's `#[serde(default)]`
+    /// does not supply a member a *present* object happens not to mention.
+    #[serde(default = "default_job_notify_after_secs")]
+    pub job_notify_after_secs: u32,
+}
+
+/// `serde(default)` for [`TerminalSettings::job_notify_after_secs`]: two minutes.
+///
+/// The threshold shipped as ten seconds, which announced every `cargo build` that touched
+/// more than a couple of crates — a notification per compile is a notification nobody reads.
+/// Two minutes is the walk-away point: below it people sit and watch, above it they have
+/// switched to something else and the pane saying "done" is the feature.
+fn default_job_notify_after_secs() -> u32 {
+    120
 }
 
 impl Default for TerminalSettings {
@@ -565,6 +598,7 @@ impl Default for TerminalSettings {
             font_size: DEFAULT_CODE_FONT_SIZE,
             scrollback: 5_000,
             renderer: TerminalRenderer::default(),
+            job_notify_after_secs: default_job_notify_after_secs(),
         }
     }
 }
@@ -1506,6 +1540,26 @@ mod tests {
             "a field the file does not mention keeps its default rather than becoming false"
         );
         assert!(partial.show_ignored_files);
+    }
+
+    /// A `terminal` object written before the job threshold existed still reads, at two
+    /// minutes.
+    ///
+    /// The literal shape every `workspace.json` on disk holds today, the way
+    /// `a_sidebar_written_before_the_agents_panel_existed_still_reads` pins its own: the
+    /// container's `#[serde(default)]` supplies an absent *member* of `Settings`, not an
+    /// absent field of a `terminal` object the file does mention, so this works only through
+    /// the field's own `#[serde(default = "…")]` — and losing that attribute would fail every
+    /// existing user's whole settings block on the first launch after an upgrade.
+    #[test]
+    fn a_terminal_block_written_before_the_job_threshold_still_reads() {
+        let terminal: TerminalSettings =
+            serde_json::from_str(r#"{"fontSize":12.5,"scrollback":5000,"renderer":"auto"}"#)
+                .expect("yesterday's terminal block");
+        assert_eq!(
+            terminal.job_notify_after_secs, 120,
+            "the default is two minutes, and it reaches workspaces stored before the field existed"
+        );
     }
 
     /// The password must not survive `{:?}`, however the settings are printed.

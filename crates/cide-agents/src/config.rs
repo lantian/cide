@@ -114,6 +114,12 @@ pub struct AgentsConfig {
     /// The refusal is at **dispatch**, never at load — see `crate::dispatch_refusal`. Refusing at
     /// load would make the role vanish from the roster, and a user staring at a missing agent has
     /// no thread to pull; a greyed row that names this key is a fix they can act on.
+    ///
+    /// [`Self::skip_permissions`] is the stated exception: while it is on (the default), the
+    /// project has already declared that every unattended child runs promptless, so refusing a
+    /// role for *writing down* the same stance would be a refusal about nothing. The two-acts
+    /// rule bites only in a project that switched skipping off — which is exactly the project
+    /// that meant to be asked.
     pub allow_dangerous_permissions: bool,
     /// Whether a subagent finishing its turn types one line into the product owner's terminal.
     ///
@@ -142,6 +148,45 @@ pub struct AgentsConfig {
     /// this file is committed, so a teammate's commit or a `git checkout` can switch it off under
     /// a running app, and a cached copy would go on typing into somebody who had already said no.
     pub nudge_orchestrator: bool,
+    /// Whether assigning a task to a role — or @mentioning one in a task's body or a comment —
+    /// starts that role working on it.
+    ///
+    /// `cide_agents::autodispatch` is the policy (who may trigger, which statuses, what a
+    /// mention does); this key is the master switch over all of it. It exists for
+    /// [`Self::nudge_orchestrator`]'s reason, sharpened: that key types a line into a terminal,
+    /// this one **spawns a billed `claude` process off a task edit**. On by default because the
+    /// loop it closes — plan on the board, assign, work starts — is what assignment is *for*;
+    /// the setting is the way out, not the way in. A project that wants assignment to stay pure
+    /// bookkeeping writes `"autoDispatch": false` here and keeps `cide_agent_dispatch` as the
+    /// explicit road.
+    ///
+    /// Disk-only and read fresh at each trigger, exactly like `nudge_orchestrator` and for the
+    /// same two reasons: no panel round trip can silently reset it, and a teammate's commit
+    /// switching it off is honoured from the next edit onward.
+    pub auto_dispatch: bool,
+    /// Whether a dispatched child runs with permission prompts switched off — `--permission-mode
+    /// bypassPermissions` for a `claude` run whose role names no mode of its own, `--auto` for
+    /// an `opencode` run.
+    ///
+    /// # On by default, which reverses a stance — and the reversal was measured, not argued
+    ///
+    /// [`Self::allow_dangerous_permissions`] exists so that a *role file* asking for bypass takes
+    /// two deliberate acts, and that rule stands unchanged for what a role asks. This key is
+    /// about what happens when the role asks nothing: the child is **unattended**, and an
+    /// unattended child cannot answer a prompt. What that costs was measured live, per harness:
+    /// `opencode run` auto-rejects the request and the **turn ends right there** — two real runs
+    /// died mid-investigation on their first out-of-project command, task never reported, which
+    /// reads on the board as an agent that did nothing — and a `claude` run parks in
+    /// `AwaitingPermission`, holding its slot and its role's only worktree, until a human
+    /// happens to open its pane. Neither is a safety property; both are the autonomy failing
+    /// silently. The blast-radius containment for an unattended child is worktree isolation,
+    /// which is on by default and refused outside a git repository.
+    ///
+    /// The role's own `permission-mode:` always wins over this default — an author who wrote a
+    /// mode meant it. Disk-only like its three neighbours, read fresh at each spawn (a `git
+    /// checkout` flipping it is honoured from the next dispatch), and the way back to prompts is
+    /// `"skipPermissions": false` in this file.
+    pub skip_permissions: bool,
 }
 
 impl Default for AgentsConfig {
@@ -155,6 +200,11 @@ impl Default for AgentsConfig {
             allow_dangerous_permissions: false,
             // On, and the field's own doc argues it: the setting is the way out, not the way in.
             nudge_orchestrator: true,
+            // Same argument, same default: assignment that does nothing is not assignment.
+            auto_dispatch: true,
+            // On, and the field's own doc carries the measurement that decided it: an
+            // unattended child cannot answer a prompt, and both harnesses fail silently on one.
+            skip_permissions: true,
         }
     }
 }
@@ -617,6 +667,8 @@ mod tests {
             isolation: Isolation::Shared,
             allow_dangerous_permissions: true,
             nudge_orchestrator: false,
+            auto_dispatch: false,
+            skip_permissions: false,
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
         assert_eq!(config.max_concurrent, 5);
@@ -634,6 +686,15 @@ mod tests {
         assert!(
             !config.nudge_orchestrator,
             "a round trip through the panel turned the orchestrator nudge back on"
+        );
+        assert!(
+            !config.auto_dispatch,
+            "a round trip through the panel turned assignment-starts-work back on"
+        );
+        assert!(
+            !config.skip_permissions,
+            "a round trip through the panel turned prompt-skipping back on — this is the one \
+             switch where a silent reset re-arms unattended children"
         );
     }
 

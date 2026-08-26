@@ -33,8 +33,13 @@
 //! already watches `<root>/.cide`, so a change arrives as an ordinary `cide://fs-changed` and
 //! the answer is simply read again — which costs a `read_dir` and a handful of small files.
 
+/// The assignment-starts-work policy: which task mutations dispatch which roles. Pure — the
+/// registry facts (live runs, slots) are checked by the caller, in `cide-app`.
+pub mod autodispatch;
 pub mod config;
 pub mod defs;
+/// `@role` mentions in task prose — the pure scanner; who acts on one is `cide-app`'s question.
+pub mod mentions;
 // No `///` summary here, deliberately: `harness.rs`'s own `//!` header is the summary, and an
 // outer doc comment on the `mod` item merges with it into one fragment that rustdoc then resolves
 // in *this* module's scope — so every `[`RunState`]` and `[`SpawnSpec`]` link inside that header
@@ -122,11 +127,16 @@ pub fn dispatch_refusal(agent: &LoadedAgent, config: &AgentsConfig) -> Option<St
     if let Some(reason) = &agent.def.unavailable {
         return Some(reason.clone());
     }
-    if is_dangerous(agent) && !config.allow_dangerous_permissions {
+    // `skip_permissions` passes this gate too, and that is coherence rather than a hole: while
+    // the project's own default sends every unattended child out promptless, a role that wrote
+    // the same stance down cannot be the one thing refused for it. The two-acts rule bites only
+    // where it means something — a project that switched skipping off. See the field's doc.
+    if is_dangerous(agent) && !config.allow_dangerous_permissions && !config.skip_permissions {
         return Some(format!(
             "`{}` asks for `permission-mode: {}`, which lets it edit, delete and run anything \
-             without asking. This project has not authorised that: set \
-             `agents.allowDangerousPermissions` to true in `{}/config.json` if you mean it.",
+             without asking. This project has switched `agents.skipPermissions` off and has not \
+             authorised this role either: set `agents.allowDangerousPermissions` to true in \
+             `{}/config.json` if you mean it.",
             agent.def.id,
             defs::BYPASS_PERMISSIONS,
             config::CIDE_DIR
@@ -154,36 +164,73 @@ pub fn is_dangerous(agent: &LoadedAgent) -> bool {
     agent.permission_mode.as_deref() == Some(defs::BYPASS_PERMISSIONS)
 }
 
-/// How many runs of this role may actually be live, once the project's isolation is accounted
-/// for.
+/// How many runs of this role may be live at once: its own `max-concurrent`, floored at 1.
 ///
-/// Worktree isolation pins it to 1: there is **one worktree per agent**, not per run, so a second
-/// concurrent run of the same role would be a second process editing one checkout with nothing
-/// arbitrating between them. That is the failure the isolation exists to prevent, so the role's
-/// own `max-concurrent` loses to it.
-///
-/// The clamp is never silent — [`concurrency_note`] is the sentence that goes with it, and the
-/// row that shows a role's concurrency shows that sentence beside it. A silently ignored setting
-/// is how a user concludes cide does not work.
-pub fn effective_max_concurrent(agent: &LoadedAgent, config: &AgentsConfig) -> u16 {
-    let declared = agent.def.max_concurrent.max(1);
-    match config.isolation {
-        Isolation::Worktree => 1,
-        Isolation::Shared => declared,
-    }
+/// This used to clamp to 1 under worktree isolation — one worktree per *agent* meant a second
+/// concurrent run of the role would be a second process editing one checkout — and the clamp
+/// came with a `concurrency_note` sentence so it was never silent. Both are gone, because the
+/// premise changed: a run with a task now takes a worktree **per task** ([`checkout_name`]),
+/// so two tasks of one role are two checkouts and the collision the clamp guarded against no
+/// longer exists between them. What still cannot run twice is two children in *one* checkout —
+/// the same (role, task) pair, or two dispatches with no task at all, which share the role's
+/// base worktree — and that is enforced where it is now a per-checkout fact rather than a
+/// per-role number: the registry's admission holds a run whose checkout is occupied, in the
+/// queue, until it is not.
+pub fn effective_max_concurrent(agent: &LoadedAgent, _config: &AgentsConfig) -> u16 {
+    agent.def.max_concurrent.max(1)
 }
 
-/// The sentence explaining a clamped `max-concurrent`, or `None` when nothing was clamped.
-pub fn concurrency_note(agent: &LoadedAgent, config: &AgentsConfig) -> Option<String> {
-    let declared = agent.def.max_concurrent.max(1);
-    let effective = effective_max_concurrent(agent, config);
-    (effective != declared).then(|| {
-        format!(
-            "`max-concurrent: {declared}` is capped at {effective} while this project uses \
-             worktree isolation: there is one worktree per agent, so a role runs one task at a \
-             time."
-        )
-    })
+/// The worktree a run stands in, as the name `cide_git::worktree` builds a path and branch from.
+///
+/// `<role>` for a dispatch with no task; `<role>-<task-slug>` for one pointed at a task — so a
+/// role's tasks parallelise in separate checkouts (each on branch `cide/<name>`), while its
+/// taskless dispatches share the base checkout and serialise there, and a *re*-dispatch of the
+/// same task lands in the checkout holding that task's earlier work, which the first live
+/// workstream's debug notes called the one reliable recovery channel.
+///
+/// The slug is the task id forced through the worktree grammar (`[a-z0-9-]`, lowercased,
+/// anything else becomes `-`), because `.cide/tasks.json` is hand-editable and this string
+/// becomes a directory name and a ref name. A task id that sanitises to nothing falls back to
+/// the base checkout rather than minting a name from thin air. The mapping must stay
+/// **deterministic** — a resumed run recomputes its checkout from the same (role, task) pair
+/// and has to arrive at the directory its transcript lives under.
+///
+/// The separator is `-`, which a role name may also contain, so the composite is not parseable
+/// back into its halves — nothing parses it, the registry always computes forward from the
+/// pair. The collision that ambiguity permits (a role literally named `developer-t-7` beside a
+/// role `developer` with task `t-7`) degrades to two runs sharing a checkout — the pre-feature
+/// status quo — not to corruption, and admission still serialises them.
+pub fn checkout_name(agent: &AgentId, task: Option<&cide_ipc::TaskId>) -> String {
+    let base = agent.0.as_str();
+    let Some(task) = task else {
+        return base.to_string();
+    };
+    let slug: String = task
+        .0
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        return base.to_string();
+    }
+    // The worktree grammar caps a name at 64; a role may already spend 32. Truncating the slug
+    // keeps determinism (same input, same cut) at the cost of a theoretical collision between
+    // two very long task ids — which degrades to a shared checkout, as above.
+    let room = 64 - base.len() - 1;
+    let slug: String = slug.chars().take(room).collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        return base.to_string();
+    }
+    format!("{base}-{slug}")
 }
 
 #[cfg(test)]
@@ -204,6 +251,7 @@ mod tests {
                 model: None,
                 unavailable: unavailable.map(str::to_string),
                 max_concurrent: 3,
+                worktree: true,
             },
             origin: PathBuf::from("/repo/.cide/agents/developer.md"),
             shadows: None,
@@ -246,43 +294,99 @@ mod tests {
         let agent = role(Some(defs::BYPASS_PERMISSIONS), None);
         assert!(is_dangerous(&agent));
 
-        let why = dispatch_refusal(&agent, &enabled()).expect("refused");
+        // The default project skips prompts for every unattended child
+        // (`AgentsConfig::skip_permissions`, and its doc carries the measurement), so a role
+        // that wrote the same stance down passes — refusing it would be a refusal about
+        // nothing, and the gate's own comment says so.
+        assert_eq!(dispatch_refusal(&agent, &enabled()), None);
+
+        // The two-acts rule bites where it means something: a project that switched skipping
+        // off is exactly the project that meant to be asked.
+        let asking = AgentsConfig {
+            skip_permissions: false,
+            ..enabled()
+        };
+        let why = dispatch_refusal(&agent, &asking).expect("refused");
         assert!(
             why.contains("allowDangerousPermissions"),
             "the refusal has to name its own fix: {why}"
+        );
+        assert!(
+            why.contains("skipPermissions"),
+            "and the switch that armed the gate: {why}"
         );
         assert!(why.contains("developer"), "and the role: {why}");
 
         let authorised = AgentsConfig {
             allow_dangerous_permissions: true,
-            ..enabled()
+            ..asking
         };
         assert_eq!(dispatch_refusal(&agent, &authorised), None);
 
-        // The ordinary case is untouched by the gate.
+        // The ordinary case is untouched by the gate whichever way skipping is set.
         assert_eq!(
             dispatch_refusal(&role(Some("acceptEdits"), None), &enabled()),
             None
         );
+        assert_eq!(
+            dispatch_refusal(&role(Some("acceptEdits"), None), &asking),
+            None
+        );
     }
 
-    /// One worktree per agent means one run at a time, and the clamp is never silent.
+    /// `max-concurrent` means what it says under both isolations. The worktree clamp this test
+    /// used to pin is gone — per-task checkouts ([`checkout_name`]) dissolved its premise — and
+    /// the remaining floor is 1, because a malformed `max-concurrent: 0` must not make a role
+    /// undispatchable with nothing anywhere saying why.
     #[test]
-    fn worktree_isolation_caps_a_role_at_one_run_and_says_so() {
+    fn a_roles_declared_concurrency_stands_under_both_isolations() {
         let agent = role(None, None);
         let config = enabled();
         assert_eq!(agent.def.max_concurrent, 3);
-        assert_eq!(effective_max_concurrent(&agent, &config), 1);
-        let note =
-            concurrency_note(&agent, &config).expect("a clamp nobody is told about is a bug");
-        assert!(note.contains("worktree"), "{note}");
-
+        assert_eq!(effective_max_concurrent(&agent, &config), 3);
         let shared = AgentsConfig {
             isolation: Isolation::Shared,
             ..config
         };
         assert_eq!(effective_max_concurrent(&agent, &shared), 3);
-        assert_eq!(concurrency_note(&agent, &shared), None);
+    }
+
+    /// The checkout mapping: deterministic, grammar-safe, and falling back rather than minting.
+    #[test]
+    fn a_checkout_is_named_by_role_and_task_and_survives_a_hostile_task_id() {
+        let role = AgentId("developer".into());
+        let task = |id: &str| cide_ipc::TaskId(id.to_string());
+
+        // The two ordinary shapes.
+        assert_eq!(checkout_name(&role, None), "developer");
+        assert_eq!(
+            checkout_name(&role, Some(&task("t-62"))),
+            "developer-t-62",
+            "a minted id passes through as itself"
+        );
+
+        // Hand-edited ids are forced through the worktree grammar, never trusted into a path.
+        assert_eq!(
+            checkout_name(&role, Some(&task("T 62/../x"))),
+            "developer-t-62----x",
+            "uppercase folds, everything else becomes a dash"
+        );
+        assert_eq!(
+            checkout_name(&role, Some(&task("///"))),
+            "developer",
+            "an id that sanitises to nothing falls back to the base checkout"
+        );
+
+        // Determinism is load-bearing: a resumed run recomputes this and must land in the
+        // directory its transcript lives under.
+        assert_eq!(
+            checkout_name(&role, Some(&task("t-62"))),
+            checkout_name(&role, Some(&task("t-62")))
+        );
+
+        // The 64 cap of the worktree grammar holds whatever the file says.
+        let long = task(&"x".repeat(200));
+        assert!(checkout_name(&role, Some(&long)).len() <= 64);
     }
 
     /// A project with no `.cide/` at all is off, whatever roles the user has defined globally.

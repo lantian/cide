@@ -74,6 +74,7 @@ import { notify, notifyFailure } from '@/chrome/notices'
 import { pasteIntoTerminal } from '@/terminal/clipboard'
 import { openTerminalFind } from '@/terminal/findStore'
 import { paneRestarter } from '@/panes/paneRestart'
+import { focusPaneDom } from '@/panes/paneFocus'
 import { useGitCount } from '@/chrome/gitCountStore'
 import { toggleBlame } from '@/editor/blameStore'
 import { requestFocus } from '@/chrome/focusRequests'
@@ -572,7 +573,17 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // The suffix *is* the direction, and `Direction`'s variants are spelled to match.
         // A four-arm lookup table would be the same four strings written twice.
         const direction = command.slice('pane.navigate.'.length) as Direction
-        return void ws.navigatePane(on.project, on.tab, on.pane, direction)
+        // The keyboard goes with the ring. `pane_focus` moved the domain's focus, which is
+        // the highlight and the context flags — and shipped for two milestones moving only
+        // that, so Alt+Arrow lit up the next pane while every keystroke still landed in the
+        // previous one. `revealPane`'s header states the rule this enforces: the domain's
+        // focus and the DOM's `activeElement` move together on every route, a click
+        // included. A pane kind that has not published a focuser is logged rather than
+        // silent, because a quiet `false` here is that bug back for one kind of pane.
+        return void ws.navigatePane(on.project, on.tab, on.pane, direction).then((landed) => {
+          if (landed === null || focusPaneDom(landed)) return
+          void diag.log(`[cide] ${command}: nothing in this window can take the keyboard for pane ${landed}`)
+        })
       }
 
       /* ----------------------------------------------------------------- Window: modes */
@@ -750,6 +761,18 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (on === null) return unmet(command, 'no focused pane')
         return split(on, 'col', { kind: 'newClaude' })
 
+      // The chord spellings of the two mouse gestures: a tile beside the focused pane — the
+      // same `('row', intent)` call the pane title bar's `⊞ claude pane` makes — and the
+      // header's full-width `⊞ claude row`, anchored on the focused pane so the row lands
+      // under the one the user is working in.
+      case 'claude.split.right':
+        if (on === null) return unmet(command, 'no focused pane')
+        return split(on, 'row', { kind: 'newClaude' })
+
+      case 'claude.addRow':
+        if (on === null) return unmet(command, 'no focused pane')
+        return void ws.addRow(on.project, on.tab, on.pane, 'after', { kind: 'newClaude' })
+
       case 'claude.fork':
         // Branches the focused conversation: shared history to this point, then divergent.
         if (on === null) return unmet(command, 'no focused pane')
@@ -838,6 +861,15 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       case 'terminal.splitBelow':
         if (on === null) return unmet(command, 'no focused pane')
         return split(on, 'col', { kind: 'shell' })
+
+      // The bash half of the spawn-chord family — see `claude.split.right` above.
+      case 'terminal.splitRight':
+        if (on === null) return unmet(command, 'no focused pane')
+        return split(on, 'row', { kind: 'shell' })
+
+      case 'terminal.addRow':
+        if (on === null) return unmet(command, 'no focused pane')
+        return void ws.addRow(on.project, on.tab, on.pane, 'after', { kind: 'shell' })
 
       case 'terminal.clear': {
         // xterm's own scrollback, not the child's and not the Rust screen mirror. Clearing

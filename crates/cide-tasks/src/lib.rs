@@ -57,7 +57,7 @@ use cide_core::persist::{self, Debouncer};
 use cide_core::{CoreError, Result, document};
 use cide_ipc::{
     CommentId, FileStamp, Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskId,
-    TaskNew,
+    TaskNew, TaskStatusChange,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -457,6 +457,7 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
     };
 
     winner.comments = union_comments(&mine.comments, &theirs.comments);
+    winner.history = union_history(&mine.history, &theirs.history);
     // The creation stamp is the earlier of the two by definition: a task cannot have been created
     // twice, and if the two disagree one of them was hand-edited. The earlier is the safer read.
     winner.created_unix_ms = mine.created_unix_ms.min(theirs.created_unix_ms);
@@ -479,8 +480,12 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
     };
     // `updated_unix_ms` follows the winner already, but a comment adopted from the loser is itself
     // an update, and a merged task whose stamp predates its own newest comment would lose the next
-    // merge it takes part in.
+    // merge it takes part in. A history row adopted from the loser is an update by the identical
+    // argument.
     if let Some(newest) = winner.comments.iter().map(|c| c.at_unix_ms).max() {
+        winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
+    }
+    if let Some(newest) = winner.history.iter().map(|c| c.at_unix_ms).max() {
         winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
     }
     winner
@@ -503,6 +508,27 @@ fn union_comments(mine: &[TaskComment], theirs: &[TaskComment]) -> Vec<TaskComme
     // — mine before theirs — rather than being shuffled by an unstable sort's pivot choice. The
     // DTO's contract is oldest first, and the panel and every agent read it that way. Sorted on
     // `at_unix_ms` and never on the edit stamp: editing a comment must not move it in the log.
+    out.sort_by_key(|c| c.at_unix_ms);
+    out
+}
+
+/// Both sides' status transitions, oldest first, with exact duplicates collapsed. (M27)
+///
+/// Structural identity, and that is sufficient where a comment needed an id: a history row is
+/// **immutable** — no `TaskEdit` variant edits or deletes one — so the two hazards that broke
+/// the comments' structural union (an edit changing the key, a delete the stale copy resurrects)
+/// cannot arise. Two sides that each recorded their own transitions keep both sets, which is the
+/// point: the orchestrator moving a task to `Review` while a stale worktree copy still carries
+/// the `Todo → Doing` row must lose neither.
+fn union_history(mine: &[TaskStatusChange], theirs: &[TaskStatusChange]) -> Vec<TaskStatusChange> {
+    let mut out: Vec<TaskStatusChange> = mine.to_vec();
+    for change in theirs {
+        if !out.contains(change) {
+            out.push(change.clone());
+        }
+    }
+    // Stable, on the stamp, for `union_comments`' reason: rows sharing a millisecond keep
+    // mine-before-theirs rather than an unstable pivot's choice.
     out.sort_by_key(|c| c.at_unix_ms);
     out
 }
@@ -1100,6 +1126,10 @@ impl TaskStore {
                 status: req.status.unwrap_or(cide_ipc::TaskStatus::Todo),
                 agent: req.agent.clone(),
                 comments: Vec::new(),
+                // Empty even when the caller named a starting status: the history records
+                // *changes*, and a task born in `Doing` did not move there — `created_by` and
+                // the status itself already carry that fact.
+                history: Vec::new(),
                 // Stamped from the caller's identity, which arrived with the connection rather
                 // than in the payload — the same rule `TaskEdit::Comment` states for a comment's
                 // author, and for the same reason: an agent that could name a creator could name
@@ -1128,7 +1158,23 @@ impl TaskStore {
             match edit {
                 TaskEdit::SetTitle { title } => task.title = title.trim().to_string(),
                 TaskEdit::SetBody { body } => task.body = body,
-                TaskEdit::SetStatus { status } => task.status = status,
+                // Records the transition beside applying it. (M27) Only on an actual change: a
+                // `SetStatus` naming the status the task already has is a no-op the panel's
+                // segment can send on a double click, and a history row saying `Doing → Doing`
+                // would be a log entry about nothing. `from` is read off the task here, never
+                // taken from the caller; `by` is the connection's identity, exactly as a
+                // comment's author is — see `TaskStatusChange`.
+                TaskEdit::SetStatus { status } => {
+                    if task.status != status {
+                        task.history.push(TaskStatusChange {
+                            from: task.status,
+                            to: status,
+                            by: author.clone(),
+                            at_unix_ms: now,
+                        });
+                        task.status = status;
+                    }
+                }
                 TaskEdit::Assign { agent } => task.agent = agent,
                 // **Appends.** There is no edit and no delete, here or on the wire, and that single
                 // restriction is what makes the log a channel between agents rather than a
@@ -1303,6 +1349,33 @@ impl TaskStore {
         merged
     }
 
+    /// The watcher's question: did the file move under us, ignoring our own writes?
+    ///
+    /// This is *not* [`Self::reload`], and the difference is the whole reason it exists. `reload`
+    /// is the panel's Retry — an unconditional re-read-and-merge that also heals `Unreadable` —
+    /// and calling it on every filesystem event would merge on every echo of our own debounced
+    /// write. This wraps [`Self::reconcile`], whose stamp compare is the echo suppression: the
+    /// stamp is recorded after every `write_shared`, so a notification caused by our own rename
+    /// compares equal and costs one `stat`. (The microscopic stamp-races that survive resolve
+    /// through `reconcile`'s `disk == *file` content check.)
+    ///
+    /// Returns the merged file when the board actually changed, so the caller can broadcast it —
+    /// the same contract as [`Self::flush_if_due`], for the same reason: this is a moment the
+    /// board changes without anybody in this process having asked.
+    ///
+    /// On a real change the debounce is re-armed: the merge may have kept tasks the disk copy did
+    /// not have, and those must reach the file — the same convergence `write_now` performs on
+    /// quit, here left to the ordinary flusher tick rather than done inline on a watcher thread.
+    pub fn refresh_from_disk(&self) -> Option<TaskFile> {
+        let mut guard = self.inner.lock();
+        let mut state = self.state.lock();
+        let merged = self.reconcile(&mut guard, &mut state);
+        if merged.is_some() {
+            self.debounce.note_change();
+        }
+        merged
+    }
+
     /// Layer 3: re-`stat`, and reload-and-merge when the file has moved under us.
     ///
     /// Returns the merged file when the in-memory copy actually changed, and `None` when there was
@@ -1445,6 +1518,7 @@ mod tests {
             status: TaskStatus::Todo,
             agent: None,
             comments: Vec::new(),
+            history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1_000,
             updated_unix_ms: updated,
@@ -2163,6 +2237,101 @@ mod tests {
         );
     }
 
+    /// `SetStatus` records who moved the task, from where to where, and when — and only on an
+    /// actual change. (M27)
+    ///
+    /// The status log the card renders collapsed is this vector verbatim, so a hop that went
+    /// unrecorded is a transition the user can never audit, and a row for a no-op set — which
+    /// the panel's segment can send on a repeated click — would be a log entry about nothing.
+    #[test]
+    fn a_status_change_is_recorded_with_its_author_and_a_no_op_set_is_not() {
+        let dir = TempDir::new("history");
+        let store = TaskStore::open(dir.root());
+        let task = store
+            .create(&new_task("history"), TaskAuthor::User)
+            .expect("create");
+        assert!(task.history.is_empty(), "creation is not a change");
+
+        let moved = store
+            .edit(
+                &task.id,
+                TaskEdit::SetStatus {
+                    status: TaskStatus::Doing,
+                },
+                TaskAuthor::Orchestrator,
+            )
+            .expect("move");
+        assert_eq!(moved.history.len(), 1);
+        assert_eq!(moved.history[0].from, TaskStatus::Todo);
+        assert_eq!(moved.history[0].to, TaskStatus::Doing);
+        assert_eq!(moved.history[0].by, TaskAuthor::Orchestrator);
+        assert_eq!(
+            moved.history[0].at_unix_ms, moved.updated_unix_ms,
+            "stamped where the mutation is applied, from the same clock read"
+        );
+
+        let same = store
+            .edit(
+                &task.id,
+                TaskEdit::SetStatus {
+                    status: TaskStatus::Doing,
+                },
+                TaskAuthor::User,
+            )
+            .expect("no-op");
+        assert_eq!(
+            same.history.len(),
+            1,
+            "a set to the status the task already has records nothing"
+        );
+
+        // The record survives the file: a second store over the same path is the next launch.
+        store.write_now();
+        let reopened = TaskStore::open(dir.root());
+        assert_eq!(
+            reopened.get(&task.id).expect("there").history,
+            moved.history
+        );
+    }
+
+    /// Both sides' transitions survive a merge, ordered by stamp, duplicates collapsed. (M27)
+    ///
+    /// The scenario is `union_comments`' one status over: the orchestrator moves a task to
+    /// `Review` while a stale worktree copy still carries only the `Todo → Doing` hop — and the
+    /// merged history must hold both, or the audit log loses whichever side read second.
+    #[test]
+    fn a_merge_unions_status_history() {
+        let hop = |from: TaskStatus, to: TaskStatus, at: u64| TaskStatusChange {
+            from,
+            to,
+            by: TaskAuthor::Orchestrator,
+            at_unix_ms: at,
+        };
+        let mut mine = a_task("t-1", "merge me", 5_000);
+        mine.history = vec![
+            hop(TaskStatus::Todo, TaskStatus::Doing, 2_000),
+            hop(TaskStatus::Doing, TaskStatus::Review, 9_000),
+        ];
+        let mut theirs = a_task("t-1", "merge me", 4_000);
+        theirs.history = vec![hop(TaskStatus::Todo, TaskStatus::Doing, 2_000)];
+
+        let file = |task: &Task| TaskFile {
+            schema_version: TaskFile::CURRENT_SCHEMA,
+            rev: 1,
+            tasks: vec![task.clone()],
+        };
+        let merged = merge(&file(&mine), &file(&theirs));
+        let task = &merged.tasks[0];
+        assert_eq!(
+            task.history, mine.history,
+            "the shared hop collapsed, the newer one adopted, oldest first"
+        );
+        assert!(
+            task.updated_unix_ms >= 9_000,
+            "a history row adopted from either side is itself an update, or this merge loses the next one"
+        );
+    }
+
     /// The failure [`TaskId`]'s doc is written about: a second `t-2` would silently re-point every
     /// comment, prompt and commit message that ever named the first one.
     #[test]
@@ -2375,6 +2544,115 @@ mod tests {
             on_disk.rev > 40,
             "rev landed past both sides: {}",
             on_disk.rev
+        );
+    }
+
+    /// The watcher's half of layer 3: `.cide/tasks.json` moved under us with no local write in
+    /// flight — a `git pull`, a teammate, an agent in another process — and the fs router asks
+    /// this rather than the panel's Retry, because `reload` merges unconditionally and would do
+    /// so on every echo of our own flush.
+    #[test]
+    fn refresh_adopts_an_external_rewrite_and_converges() {
+        let dir = TempDir::new("refresh");
+        let store = TaskStore::open(dir.root());
+        store
+            .create(&new_task("ours"), TaskAuthor::User)
+            .expect("create");
+        store.write_now();
+
+        dir.plant(
+            r#"{"schemaVersion":1,"rev":40,"tasks":[
+                {"id":"t-1","title":"ours","body":"","status":"todo","agent":null,
+                 "comments":[],"createdUnixMs":1,"updatedUnixMs":1},
+                {"id":"t-2","title":"theirs","body":"","status":"todo","agent":null,
+                 "comments":[],"createdUnixMs":2,"updatedUnixMs":2}]}"#,
+        );
+
+        let merged = store
+            .refresh_from_disk()
+            .expect("the change is reported so the caller can broadcast it");
+        assert_eq!(titles(&merged), ["ours", "theirs"]);
+        assert!(
+            store.refresh_from_disk().is_none(),
+            "asked twice, the second look found something new in an unchanged file"
+        );
+
+        // The merge left the in-memory board ahead of the file (`merge` lands `rev` past both
+        // sides), and `refresh_from_disk` re-armed the debounce so the ordinary flusher tick —
+        // not the watcher thread — writes the convergence.
+        std::thread::sleep(persist::SAVE_DEBOUNCE);
+        store.flush_if_due();
+        let on_disk = match read(&dir.tasks()) {
+            ReadOutcome::Ready { file, .. } => file,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_eq!(
+            on_disk,
+            store.snapshot(),
+            "the flusher converged the file to the merged board"
+        );
+    }
+
+    /// Our own flush is not an event. The stamp recorded after `write_shared`'s rename is the
+    /// echo suppression, and without it every debounced write would come back around through the
+    /// filesystem watcher as a merge — this is the difference between `refresh_from_disk` and
+    /// `reload`, and the reason the fs router must never call the latter.
+    #[test]
+    fn refresh_ignores_the_stores_own_write() {
+        let dir = TempDir::new("refresh-echo");
+        let store = TaskStore::open(dir.root());
+        store
+            .create(&new_task("ours"), TaskAuthor::User)
+            .expect("create");
+        store.write_now();
+        assert!(
+            store.refresh_from_disk().is_none(),
+            "the store's own bytes read as an external change"
+        );
+    }
+
+    /// An external change landing while a local edit is still inside the debounce window merges
+    /// rather than replaces — the guarantee `write_now` makes on the flush path, made again on
+    /// the watcher path, where the local edit has not reached disk yet and a replace would be
+    /// exactly the silent loss the merge exists to prevent.
+    #[test]
+    fn refresh_merges_with_an_edit_still_in_the_debounce_window() {
+        let dir = TempDir::new("refresh-pending");
+        let store = TaskStore::open(dir.root());
+        store
+            .create(&new_task("ours"), TaskAuthor::User)
+            .expect("create");
+        store.write_now();
+
+        store
+            .edit(
+                &TaskId("t-1".into()),
+                TaskEdit::Comment {
+                    text: "pending".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("comment");
+        dir.plant(
+            r#"{"schemaVersion":1,"rev":40,"tasks":[
+                {"id":"t-1","title":"ours","body":"","status":"todo","agent":null,
+                 "comments":[{"author":{"kind":"user"},"text":"from the teammate","atUnixMs":77}],
+                 "createdUnixMs":1,"updatedUnixMs":77},
+                {"id":"t-2","title":"theirs","body":"","status":"todo","agent":null,
+                 "comments":[],"createdUnixMs":2,"updatedUnixMs":2}]}"#,
+        );
+
+        let merged = store.refresh_from_disk().expect("merged");
+        assert_eq!(titles(&merged), ["ours", "theirs"]);
+        let texts: Vec<&str> = merged.tasks[0]
+            .comments
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["from the teammate", "pending"],
+            "one of the two comments was lost to the refresh"
         );
     }
 

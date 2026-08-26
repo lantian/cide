@@ -285,6 +285,10 @@ fn apply(
                 // `crate::agents::note_hook`, which also says why the *frame* travels rather than
                 // the `SessionState` beside it.
                 crate::agents::note_hook(app, &session, frame);
+                // And the second hop, under the same cheapness contract: a nudge held for a busy
+                // orchestrator is re-armed on any session's turn-end edge. The common case is
+                // one mutex and an `is_empty` — see `note_session_ready`'s own doc.
+                crate::agent_rpc::note_session_ready(app, state);
             }
             Effect::Conversation {
                 session,
@@ -293,9 +297,17 @@ fn apply(
                 // Best effort by design. Missing it costs the next launch a stale resume,
                 // which is what already happened; it must never cost the running turn, so a
                 // torn-down app or a closed pane is not an error here.
+                // Wall clock, read here rather than inside `cide_core`, which stays free of
+                // one so the rule can be driven from a test. It is only ever compared against
+                // the CLI's own `nameSince`, which is `Date.now()` in the same process tree on
+                // the same machine, so the two are the same clock.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
                 if let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() {
                     let _ = state.update(|ws| {
-                        cide_core::workspace::note_conversation(ws, session, conversation);
+                        cide_core::workspace::note_conversation(ws, session, conversation, now_ms);
                         Ok(())
                     });
                 }

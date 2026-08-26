@@ -1,7 +1,7 @@
 //! The whole road, against the real sibling marketplace.
 //!
-//! Connect a local path, clone it, read its index, install both extensions with the capabilities
-//! their manifests ask for, and check what the registry resolved to. Every step goes through the
+//! Connect a local path, clone it, read its index, install every extension with the capabilities
+//! its manifest asks for, and check what the registry resolved to. Every step goes through the
 //! same [`ExtStore`](cide_ext::ExtStore) the app uses — no shortcut past the consent check, the
 //! path jail or the merge.
 //!
@@ -85,7 +85,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
     let ids: Vec<&str> = market.entries.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(
         ids,
-        vec!["sql", "yaml", "showcase"],
+        vec!["sql", "yaml", "proto", "graphql", "showcase"],
         "every extension the index lists was read"
     );
     assert!(
@@ -102,7 +102,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             entry.unavailable
         );
     }
-    for id in ["sql", "yaml"] {
+    for id in ["sql", "yaml", "proto", "graphql"] {
         let entry = market
             .entries
             .iter()
@@ -142,9 +142,9 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
          the button being pressed"
     );
 
-    // --- install both -------------------------------------------------------------------------
+    // --- install all --------------------------------------------------------------------------
     let mut snapshot = snapshot;
-    for id in ["sql", "yaml", "showcase"] {
+    for id in ["sql", "yaml", "proto", "graphql", "showcase"] {
         let reference = cide_ipc::ext::ExtensionRef {
             marketplace: market.id.clone(),
             extension: cide_ipc::ids::ExtensionId(id.into()),
@@ -158,7 +158,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             .clone();
         snapshot = store.install(&reference, &granted).expect("install");
     }
-    assert_eq!(snapshot.extensions.len(), 3);
+    assert_eq!(snapshot.extensions.len(), 5);
     for installed in &snapshot.extensions {
         assert!(installed.enabled);
         assert!(
@@ -209,6 +209,26 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
              answerable without reading two manifests"
         );
     }
+    // The complement of the supersede loop: a language cide never shipped displaces nothing, and
+    // saying so is what keeps the panel's `was builtin` badge meaning something.
+    for id in ["proto", "graphql"] {
+        let binding = resolved
+            .languages
+            .iter()
+            .find(|b| b.def.id == id)
+            .unwrap_or_else(|| panic!("{id} is in the language registry"));
+        assert!(
+            matches!(
+                binding.source,
+                cide_ipc::ext::ContributionSource::Extension { .. }
+            ),
+            "{id} is contributed"
+        );
+        assert_eq!(
+            binding.supersedes, None,
+            "{id} has no builtin to displace, so it must not claim one"
+        );
+    }
     assert!(
         resolved
             .languages
@@ -216,7 +236,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             .filter(|b| b.source == cide_ipc::ext::ContributionSource::Builtin)
             .count()
             >= 9,
-        "installing two extensions displaced only the two languages they claim"
+        "installing four language extensions displaced only the two languages with builtins"
     );
 
     let servers: Vec<&str> = resolved
@@ -226,8 +246,13 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
         .collect();
     assert!(servers.contains(&"rust-analyzer") && servers.contains(&"gopls"));
     assert!(
-        servers.contains(&"sqls") && servers.contains(&"yaml-language-server"),
-        "both contributed servers reached the registry: {servers:?}"
+        servers.contains(&"sqls")
+            && servers.contains(&"yaml-language-server")
+            && servers.contains(&"protols")
+            && servers.contains(&"buf")
+            && servers.contains(&"graphql-lsp"),
+        "every contributed server reached the registry — proto's two share one languageId, \
+         which is first-installed-wins, not a conflict: {servers:?}"
     );
     let yaml_server = resolved
         .servers
@@ -240,11 +265,33 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
         "the field that made this milestone necessary: `cide-lsp` built `Command::new(binary)` \
          with no arguments, and both builtins happen not to need any"
     );
+    // Args are the load-bearing feature for both of these: `buf` without `lsp serve` is a CLI
+    // that reads stdin and exits, and `graphql-lsp` without `--method stream` binds a socket.
+    let buf = resolved
+        .servers
+        .iter()
+        .find(|s| s.def.binary == "buf")
+        .expect("buf");
+    assert_eq!(buf.def.args, vec!["lsp".to_string(), "serve".to_string()]);
+    let graphql_lsp = resolved
+        .servers
+        .iter()
+        .find(|s| s.def.binary == "graphql-lsp")
+        .expect("graphql-lsp");
+    assert_eq!(
+        graphql_lsp.def.args,
+        vec![
+            "server".to_string(),
+            "--method".to_string(),
+            "stream".to_string()
+        ]
+    );
 
     assert_eq!(
         resolved.panels.len(),
-        4,
-        "SQL's bottom tab, YAML's sidebar panel, and the showcase's one of each"
+        6,
+        "SQL's and GraphQL's bottom tabs, YAML's and proto's sidebar panels, and the showcase's \
+         one of each"
     );
     let sidebar = resolved
         .panels
@@ -289,7 +336,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
     );
     assert_eq!(
         snapshot.resolved.panels.len(),
-        3,
+        5,
         "and its panel — a disabled extension keeps its row and nothing else"
     );
     assert!(
@@ -300,7 +347,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
 
     // --- uninstalling removes the files ------------------------------------------------------
     let snapshot = store.uninstall(&sql_ref).expect("uninstall");
-    assert_eq!(snapshot.extensions.len(), 2);
+    assert_eq!(snapshot.extensions.len(), 4);
     assert!(
         !cide_ext::install_path(&market.id, &cide_ipc::ids::ExtensionId("sql".into())).exists(),
         "and the directory this crate created is the directory it removed"

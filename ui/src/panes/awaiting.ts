@@ -10,10 +10,11 @@
  *
  * # Why the frontend decides and Rust aggregates
  *
- * The decision needs *history* (see `awaitingRule.ts`), and history is exactly what
- * `cide://session-state` is — Rust emits one event per transition, to every window. So any
- * window can compute the answer for any session without the pane being mounted, which is
- * what makes a background project's session countable at all.
+ * The decision is a fold over `cide://session-state` (see `awaitingRule.ts`) — Rust emits one
+ * event per transition, to every window, so any window can compute the answer for any session
+ * without the pane being mounted, which is what makes a background project's session countable
+ * at all. And what only this end can supply is *acknowledgement*: a click or a keystroke into
+ * a pane is a webview event Rust never sees.
  *
  * The aggregation needs the *workspace* — which pane is in which window — and putting that
  * in the frontend would mean the shell window guessing about the contents of a detached
@@ -125,8 +126,9 @@ function applyState(session: string, phase: SessionPhase): void {
   const after = onState(before, phase)
   if (after.gone) {
     // Dropped, not kept as `awaiting: false`. A dead session's entry would otherwise sit in
-    // this map for the life of the window, and if the same pane later adopts a new session
-    // the stale `ranATurn` would make its very first `Idle` claim to be waiting.
+    // this map for the life of the window — and a pane's session id is reused when its child
+    // is relaunched (that is what makes resume free), so a stale entry would be the new
+    // child's starting state rather than `UNSEEN`.
     tracks.delete(session)
   } else {
     tracks.set(session, after)

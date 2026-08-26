@@ -1564,6 +1564,7 @@ mod tests {
             role: PaneRole::Primary,
             session: Some(SessionId::new()),
             conversation: None,
+            conversation_since: None,
             title: "cide : claude".into(),
         }
     }
@@ -1575,6 +1576,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: Some(SessionId::new()),
             conversation: None,
+            conversation_since: None,
             title: "cide : bash".into(),
         }
     }
@@ -2719,6 +2721,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: None,
             conversation: None,
+            conversation_since: None,
             title: "workspace.rs".into(),
         };
         let e = editor.id;

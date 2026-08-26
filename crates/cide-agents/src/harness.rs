@@ -116,8 +116,14 @@ pub use opencode::OpencodeHarness;
 /// told to reach for a vocabulary it cannot see, and it has nothing to say about why the call
 /// failed; `cmd/session.rs` gates its roster paragraph on the same question for the same reason.
 ///
-/// Kept to four sentences on purpose. This is prepended to every turn of every run for ever, and
-/// a page of cide's prose in front of the role's own is a role diluted by its host.
+/// Kept to six sentences on purpose. This is prepended to every turn of every run for ever, and
+/// a page of cide's prose in front of the role's own is a role diluted by its host. The fifth is
+/// the checkpoint discipline (P4 of the debug-report plan — its runs died mid-turn with an empty
+/// worktree branch and a silent task, so nothing said how far they got): the plan comment proves
+/// liveness on the board, and a commit per coherent step makes the worktree branch the durable
+/// record a death cannot erase. The sixth is the done-workflow convention's durable half (the
+/// opening prompt says it too, but an opening prompt is one turn ago by the time the work is
+/// done): finish → review + comment, and `done` belongs to whoever reviews.
 pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.json, and cide holds \
      the only writer for it: one process owns that file, so a write made behind its back is \
      either overwritten by that process's next write or merged unpredictably with it, and the \
@@ -127,7 +133,10 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
      set the role a task is for with mcp__cide__cide_task_assign, and open a new one with \
      mcp__cide__cide_task_create. Those comments are how you report back: whoever dispatched you \
      reads the task, not your transcript, so a run that finishes without leaving one has reported \
-     nothing.";
+     nothing. Before you start, comment your plan on the task, and commit each coherent step of \
+     the work as you finish it: a run can die mid-turn, and the plan comment plus your branch's \
+     commits are the only record of how far you got. When the work is done, set the task's status to review and comment what you did \
+     and where; done is the reviewer's call, not yours.";
 
 /// Everything one implementation of a CLI has to answer.
 ///
@@ -276,6 +285,13 @@ pub struct RunPlan<'a> {
     /// `CLAUDE_CODE_*` switches. A subagent is a Claude child and gets the same treatment a pane
     /// does, for the same reason `terminal_child_env` is shared rather than copied.
     pub claude: cide_ipc::ClaudeSettings,
+    /// [`crate::config::AgentsConfig::skip_permissions`], read fresh at this spawn.
+    ///
+    /// Carried on the plan rather than looked up here for the module's stated reason — nothing
+    /// in this crate reads disk — and what it turns on is per-harness: `--permission-mode
+    /// bypassPermissions` for a `claude` run whose role names no mode of its own, `--auto` for
+    /// an `opencode` run. The config field's doc carries the measured argument for the default.
+    pub skip_permissions: bool,
 }
 
 /// A child, described — plus the two things the caller cannot work out for itself.
@@ -313,7 +329,17 @@ pub enum SessionBinding {
     /// The harness mints its own and prints it; `capture` is run over each output line until it
     /// answers. Until it does, the run has a [`RunId`] and no session — listable, killable, but
     /// not yet resumable.
-    Harness { capture: fn(&str) -> Option<String> },
+    ///
+    /// `render` is the other consequence of an identity that arrives on stdout: a harness bound
+    /// this way speaks machine events on its output, which is simultaneously the channel the
+    /// app observes and the picture a pane shows. It turns one event line into display text —
+    /// `None` drops the line, and anything unrecognised should come back verbatim. The app
+    /// installs it as the session's `cide_pty::LineRender`, where its header carries the whole
+    /// argument for why the rendering happens once, upstream of the mirror and every sink.
+    Harness {
+        capture: fn(&str) -> Option<String>,
+        render: fn(&str) -> Option<String>,
+    },
 }
 
 impl PartialEq for SessionBinding {
@@ -549,11 +575,22 @@ mod tests {
             TRACKER_PREAMBLE.contains("report back"),
             "{TRACKER_PREAMBLE}"
         );
+        // The done-workflow convention's durable half: finish → review + comment, and `done`
+        // belongs to the reviewer. The opening prompt says it too, but that was one turn ago by
+        // the time the work is done.
+        assert!(
+            TRACKER_PREAMBLE.contains("status to review"),
+            "{TRACKER_PREAMBLE}"
+        );
 
         // Prepended to every turn of every run for ever. A budget rather than a measurement, so
         // that growing it is a deliberate edit to this line rather than a paragraph that crept.
+        // Raised from 900 when the review-workflow sentence was added, and from 1000 when the
+        // checkpoint sentence was (the debug report's runs died mid-turn leaving no plan comment
+        // and no commits, so nothing said how far they got) — each raise is the deliberate edit
+        // the budget exists to force.
         assert!(
-            TRACKER_PREAMBLE.len() < 900,
+            TRACKER_PREAMBLE.len() < 1_300,
             "{} characters is a page, not a paragraph",
             TRACKER_PREAMBLE.len()
         );
@@ -585,6 +622,7 @@ mod tests {
                     model: None,
                     unavailable: None,
                     max_concurrent: 1,
+                    worktree: true,
                 },
                 origin: PathBuf::from("/repo/.cide/agents/developer.md"),
                 shadows: None,
@@ -611,6 +649,9 @@ mod tests {
                 proxy: ProxyEnv::default(),
                 geometry: Geometry::default(),
                 claude: cide_ipc::ClaudeSettings::default(),
+                // Off in the fixture, so every argv assertion below is about what the role
+                // and the plan actually said; the skip default has tests of its own.
+                skip_permissions: false,
             }
         }
 

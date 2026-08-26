@@ -159,7 +159,7 @@ const FILE_ICONS = [
   // markup / data / style
   'json', 'yaml', 'toml', 'xml', 'html', 'css', 'sass', 'markdown', 'mdx', 'graphql',
   // other languages an ordinary Rust/TS/web checkout drags in
-  'python', 'go', 'c', 'cpp', 'h', 'hpp', 'console', 'vue', 'svelte', 'webassembly',
+  'python', 'go', 'c', 'cpp', 'h', 'hpp', 'console', 'vue', 'svelte', 'webassembly', 'proto',
   // assets & opaque blobs
   'svg', 'image', 'font', 'zip', 'pdf', 'database', 'document', 'log', 'lock', 'diff',
   // toolchain & config, matched by file name

@@ -764,6 +764,7 @@ pub fn tab_new_claude(
                 role: PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: format!("{name} : claude"),
             },
         )
@@ -1317,6 +1318,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "f".into(),
             },
         )
@@ -1382,6 +1384,7 @@ mod tests {
                     role: PaneRole::Auxiliary,
                     session: None,
                     conversation: None,
+                    conversation_since: None,
                     title: "f".into(),
                 },
             )
@@ -1553,6 +1556,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "lib.rs".into(),
             }),
         };
@@ -1574,6 +1578,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "lib.rs".into(),
             },
         )
@@ -1612,6 +1617,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "a.rs".into(),
             }),
         };

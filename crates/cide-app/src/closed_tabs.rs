@@ -224,6 +224,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: None,
             conversation: None,
+            conversation_since: None,
             title: "x".into(),
         })
     }

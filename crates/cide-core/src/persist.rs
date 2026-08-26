@@ -1076,6 +1076,7 @@ mod tests {
             role: PaneRole::Primary,
             session: Some(primary_session),
             conversation: None,
+            conversation_since: None,
             title: format!("{name} : claude"),
         };
         let mut tree = PaneTree {
@@ -1091,6 +1092,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: Some(SessionId::new()),
                 conversation: None,
+                conversation_since: None,
                 title: format!("{name} : bash"),
             };
             tree.root = LayoutNode::Split {
@@ -1115,6 +1117,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: None,
             conversation: None,
+            conversation_since: None,
             title: "settings".into(),
         };
         let settings = Tab {
@@ -1782,6 +1785,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: None,
             conversation: None,
+            conversation_since: None,
             title: "main.rs — diff".into(),
         };
         let project = workspace.projects.values_mut().next().expect("a project");
@@ -2033,6 +2037,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: None,
             conversation: None,
+            conversation_since: None,
             title: "main.rs".into(),
         };
         project.tabs.push(Tab {

@@ -174,6 +174,15 @@ try {
     { key: 'ctrl+shift+n', command: 'claude.split.newSession', when: null },
     { key: 'ctrl+shift+d', command: 'pane.detachToWindow', when: null },
     { key: 'ctrl+shift+`', command: 'terminal.splitBelow', when: null },
+    // The spawn chords, asked for as Ctrl+(/)/{/} and bound as the physical keys those are
+    // the shifted faces of. `Digit9`, `Digit0`, `BracketLeft` and `BracketRight` are in the
+    // sweep's key corpus below, so both entry points are held to swallowing them identically
+    // — and to leaving the *unshifted* ctrl+bracket chords alone, which matter: Ctrl+[ IS the
+    // ESC byte to a terminal, and a resolver that folded shift away would eat it.
+    { key: 'ctrl+shift+9', command: 'claude.split.right', when: null },
+    { key: 'ctrl+shift+0', command: 'claude.addRow', when: null },
+    { key: 'ctrl+shift+bracketleft', command: 'terminal.splitRight', when: null },
+    { key: 'ctrl+shift+bracketright', command: 'terminal.addRow', when: null },
     { key: 'ctrl+p', command: 'picker.files', when: null },
     { key: 'ctrl+shift+p', command: 'palette.commands', when: null },
     // Find in files. `KeyF` is in the sweep below, so this covers the property that matters
@@ -224,6 +233,13 @@ try {
     { key: 'ctrl+alt+l', command: 'pane.navigate.right', when: null },
     { key: 'ctrl+alt+k', command: 'pane.navigate.up', when: null },
     { key: 'ctrl+alt+j', command: 'pane.navigate.down', when: null },
+    // The pane moves' second spelling, asked for by name. The horizontal pair is
+    // unconditional — an editor pane needs some alt+arrow that still leaves it — and costs
+    // CodeMirror's syntax-step motion plus the pty's `ESC [ 1;3 D/C`. `ArrowLeft`/`ArrowRight`
+    // are in the sweep below, so both entry points are held to swallowing them identically:
+    // if they disagreed, the stroke that moved focus would also word-jump the shell's caret.
+    { key: 'alt+left', command: 'pane.navigate.left', when: null },
+    { key: 'alt+right', command: 'pane.navigate.right', when: null },
     { key: 'ctrl+comma', command: 'settings.open', when: null },
     { key: 'ctrl+k ctrl+s', command: 'settings.keymap', when: null },
     { key: 'ctrl+k ctrl+w', command: 'tab.closeOthers', when: null },
@@ -246,6 +262,16 @@ try {
     { key: 'ctrl+alt+shift+n', command: 'picker.symbols', when: null },
     { key: 'alt+down', command: 'navigate.nextMember', when: 'editorFocused' },
     { key: 'alt+up', command: 'navigate.prevMember', when: 'editorFocused' },
+    // The complement: the same two keys are the pane moves everywhere a buffer is not
+    // focused, and Alt+Enter is the maximize toggle under the same clause — inside a buffer
+    // that chord is CodeMirror's *send lines to Claude*, which the capture gate would kill
+    // rather than shadow. The first negated clause in the shipped table, so the sweep now
+    // exercises `!flag` on both entry points against `ArrowUp`/`ArrowDown`/`Enter`, in the
+    // editor-focused context where these must pass through and the terminal one where they
+    // must fire.
+    { key: 'alt+up', command: 'pane.navigate.up', when: '!editorFocused' },
+    { key: 'alt+down', command: 'pane.navigate.down', when: '!editorFocused' },
+    { key: 'alt+enter', command: 'pane.maximize', when: '!editorFocused' },
     // Go to Declaration. Scoped, and the scope is load-bearing: unconditional, the window
     // capture listener would swallow ⌃B in every terminal pane, which is `tmux`'s prefix key.
     // `KeyB` is in the sweep below, so both entry points are held to agreeing about it in a
@@ -461,6 +487,19 @@ try {
     { code: 'Period', key: '.' },
     // Shift on this key produces `~`, which is exactly why the gate reads `code`.
     { code: 'Backquote', key: '`' },
+    /*
+     * The spawn chords' keys. Shift on these produces `(`, `)`, `{` and `}` — the faces the
+     * ask was spelled in — so they are the folding keys' story one more time: the gate reads
+     * `code`, and `ALIASES` folds the faces onto these names so the literal spellings work in
+     * a `keymap.json`. The brackets carry the sharper claim: only the ctrl+shift combination
+     * is bound, and the *unshifted* Ctrl+[ is the ESC byte to every terminal ever made, so
+     * the fifteen other modifier combinations being passed through — measured in the
+     * terminal-focused contexts below — is most of what these two rows are here for.
+     */
+    { code: 'Digit9', key: '9' },
+    { code: 'Digit0', key: '0' },
+    { code: 'BracketLeft', key: '[' },
+    { code: 'BracketRight', key: ']' },
     { code: 'Enter', key: 'Enter' },
     { code: 'Escape', key: 'Escape' },
     { code: 'Tab', key: 'Tab' },

@@ -306,6 +306,15 @@ interface FileTreeStore {
   /** Expand or collapse a directory row. */
   toggle: (row: TreeRow) => Promise<void>
   /**
+   * Re-scan everything under one folder against the disk — the context menu's *Refresh*.
+   *
+   * Not [`refresh`], which revalidates the rows the index already holds: this one tells the
+   * *index* to re-read the disk, which is the only road to truth under an ignored directory
+   * — the watcher deliberately takes no descriptor there, so a `cargo build`'s churn under
+   * `target/` never arrives as an `fs-changed` burst.
+   */
+  refreshDir: (path: string) => Promise<void>
+  /**
    * Expand ancestors until `path` is visible, then scroll to it. `false` when there is no row.
    *
    * The answer is not decoration. `fs_reveal` is index-only, so it says `null` for a
@@ -694,6 +703,24 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     retainCacheBelow(keepBelow)
     const kept = new Map([...get().chunks].filter(([index]) => index < keepBelow))
     set({ count, chunks: kept, degraded: isDegraded(name) })
+  },
+
+  async refreshDir(path) {
+    const { project } = get()
+    if (project === null) return
+    // `toggle`'s cache discipline, for `toggle`'s reason: a refresh re-flattens everything
+    // under the folder and moves nothing above it, so the chunks strictly above the fold
+    // keep their rows on screen for the length of the round trip. The folder's own chunk is
+    // dropped with everything after it — its children share it.
+    const at = get().indexOf(path)
+    const count = await tree('fs_refresh', () => fsApi.refresh(project, path), get().count)
+    // The project can be swapped out from under the round trip — `reveal` carries the same
+    // guard — and writing this count into the next project's tree would size it wrongly.
+    if (get().project !== project) return
+    const keepBelow = at === null ? 0 : chunkOf(at)
+    retainCacheBelow(keepBelow)
+    const kept = new Map([...get().chunks].filter(([index]) => index < keepBelow))
+    set({ count, chunks: kept, degraded: isDegraded('fs_refresh') })
   },
 
   async reveal(path) {

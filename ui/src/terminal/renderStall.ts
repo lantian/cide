@@ -25,6 +25,24 @@
  * recompute the intersection and notice the element was visible all along. Nothing else the
  * user can do to a pane will.
  *
+ * # The second way a frame goes missing: a resize nobody answered
+ *
+ * The rule started as *bytes parsed, no frame*, which is one debt and not the only one. A
+ * **geometry change** owes a frame too: `panes/sessionSink.ts`'s `syncSize` fits the terminal
+ * to a new box and pushes the size at the child, and everything the user is looking at has
+ * moved whether or not another byte ever arrives. On an idle pane no byte does — so with
+ * `lastParsedAt` as the only debt, a resize that failed to repaint was a state nothing in the
+ * system could notice, for the rest of the session.
+ *
+ * That is the *maximise* report, which is the same sentence as above with the sign flipped:
+ * *"switching claude panel to fullscreen makes screen empty until i scroll in it"*. Maximising
+ * is the one gesture that changes a pane's size without changing its DOM, so it is both the
+ * gesture that repairs the pause above and a gesture that can leave a frame owed with no
+ * further output to arm anything.
+ *
+ * [`RenderStallInput.lastResizedAt`] is therefore a second debt, sitting beside the first, and
+ * the two are not guarded identically — see [`RenderStallInput.atBottom`].
+ *
  * # Why the rule is a pure function in its own file
  *
  * This project has no JS test runner: `ui/scripts/check-*.mjs` *are* the suite, and each one
@@ -95,23 +113,63 @@ export interface RenderStallInput {
    * is the correct behaviour there, and it is indistinguishable from the failure without this
    * flag. Reading somebody's scrollback would otherwise nudge the pane for as long as
    * they read.
+   *
+   * **It vetoes the bytes debt only, never the resize one.** The argument above is entirely
+   * about *where the bytes landed*: rows below the fold. A geometry change has no such
+   * excuse — it moves every row the user can see, whatever they have scrolled to — and the
+   * repair does not scroll, so answering it while somebody reads their scrollback costs them
+   * nothing. Vetoing both with this flag would have made the maximise case unreachable in
+   * exactly the state it was reported from: a pane whose viewport is *the thing that is
+   * wrong*.
    */
   readonly atBottom: boolean
+  /**
+   * When this terminal was last fitted to a new cell geometry, or `null` if it never has been.
+   *
+   * Stamped by `layout/paneHosts.ts`'s `noteResized`, which `syncSize` calls only on the path
+   * where `cols`/`rows` actually changed — a `ResizeObserver` fires per frame of a drag and
+   * most of those frames are the same geometry, so stamping every callback would arm a timer
+   * per frame for a terminal that owes nothing.
+   */
+  readonly lastResizedAt: number | null
 }
 
 /**
- * Whether this terminal owes a frame it has not painted.
+ * Whether an event that should have produced a frame has gone unanswered.
  *
- * "Owes" is `lastParsedAt` running ahead of `lastRenderedAt`: the bytes are in the buffer and
- * nothing has drawn since. A terminal that has never been written to owes nothing, and one
- * whose last frame came after its last bytes is simply up to date.
+ * "Owes" is an event stamp running ahead of `lastRenderedAt`: the bytes are in the buffer, or
+ * the terminal has been fitted to a new size, and nothing has drawn since. A terminal that has
+ * had neither owes nothing, and one whose last frame came after both is simply up to date.
+ */
+function owedSince(input: RenderStallInput): number | null {
+  const { lastParsedAt, lastRenderedAt, lastResizedAt } = input
+  const unanswered = (at: number | null): boolean =>
+    at !== null && (lastRenderedAt === null || lastRenderedAt < at)
+  // The bytes debt carries the scrollback veto; the resize debt does not. See `atBottom`.
+  const bytes = input.atBottom && unanswered(lastParsedAt) ? lastParsedAt : null
+  const resize = unanswered(lastResizedAt) ? lastResizedAt : null
+  if (bytes === null) return resize
+  if (resize === null) return bytes
+  // The *earliest* unanswered event, because the question the threshold asks is how long a
+  // frame has been owed, not how recently something asked for one. Taking the later stamp
+  // would let a steady trickle of output keep pushing the deadline out in front of a renderer
+  // that has already been dead for a minute — which is the same mistake `checkStall`'s
+  // re-arm branch in `layout/paneHosts.ts` exists to undo.
+  return Math.min(bytes, resize)
+}
+
+/**
+ * Whether this terminal owes a frame it has not painted, for long enough to be a fault.
+ *
+ * The three guards come first and are each a state in which painting nothing is *correct*:
+ * a parked host, an element with no box in a document the compositor is drawing, and — for
+ * bytes alone — a viewport the user has scrolled away from.
  */
 export function isRenderStalled(input: RenderStallInput): boolean {
-  const { now, lastParsedAt, lastRenderedAt } = input
-  if (!input.mounted || !input.onScreen || !input.atBottom) return false
-  if (lastParsedAt === null) return false
-  if (lastRenderedAt !== null && lastRenderedAt >= lastParsedAt) return false
-  return now - lastParsedAt >= STALL_MS
+  if (!input.mounted || !input.onScreen) return false
+  const owed = owedSince(input)
+  if (owed === null) return false
+  return input.now - owed >= STALL_MS
 }
 
 /** Whether to actually act on a stall now, or leave it to the cooldown. */

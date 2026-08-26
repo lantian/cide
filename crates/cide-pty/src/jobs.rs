@@ -29,15 +29,15 @@
 //!
 //! ## Why a threshold, and why it gates the *start*
 //!
-//! `awaitingRule.ts` raises the marker on the `Busy → Idle` edge, so announcing a job at all
-//! is what makes it notify. A bare `ls` finishing must not flash the dot, both badges and the
-//! window title, so the rule below does not announce a job until it has already been running
-//! for [`JobWatch::announce_after`] — a job shorter than that produces no `Started` and
-//! therefore no `Finished`, and the frontend never hears it existed. Suppressing at the
-//! *end* instead is not possible and it is worth writing down why: nothing in the frontend
-//! rule can retract a `Busy`, because `ranATurn` is deliberately sticky (a session that
-//! announced itself once must go on announcing every later turn), so a `Busy` emitted for a
-//! two-second job would raise the marker whatever came after it.
+//! An announced job's `Finished` is reported as `AwaitingInput`, which raises the marker
+//! outright, so announcing a job at all is what makes it notify. A bare `ls` finishing must
+//! not flash the dot, both badges and the window title, so the rule below does not announce a
+//! job until it has already been running for [`JobWatch::announce_after`] — a job shorter
+//! than that produces no `Started` and therefore no `Finished`, and the frontend never hears
+//! it existed. Suppressing at the *end* instead is not possible and it is worth writing down
+//! why: `AwaitingInput` raises the marker regardless of what the frontend saw before it (the
+//! same unconditional reading a finished Claude turn relies on), so a job announced once
+//! notifies at its end whatever came after the announcement.
 //!
 //! ## Why a fullscreen TUI is not a job
 //!
@@ -118,6 +118,18 @@ impl JobWatch {
             phase: Phase::AtPrompt,
             seen_prompt: false,
         }
+    }
+
+    /// Change the announce threshold on a watch that is already running.
+    ///
+    /// The threshold is user-tunable now, and a session outlives every pane, tab and window —
+    /// most shells are spawned once per app run — so a threshold fixed at spawn would make
+    /// the setting look dead in every pane the user already has open. Nothing else is
+    /// touched: a job already announced stays announced (nothing downstream can retract a
+    /// `Busy`), and a job still unannounced is simply measured against the new number on the
+    /// next observation, whichever direction it moved.
+    pub fn set_announce_after(&mut self, announce_after: Duration) {
+        self.announce_after = announce_after;
     }
 
     /// Fold one observation in, and say whether it changed anything worth reporting.
@@ -372,6 +384,38 @@ mod tests {
                 ran_for: Duration::from_secs(12)
             }),
             "and the state it was in survives the gap",
+        );
+    }
+
+    #[test]
+    fn a_lowered_threshold_reaches_a_job_already_running() {
+        // The live half of the setting: the user drops the threshold while a build runs, and
+        // the running build is announced against the new number rather than the one its pane
+        // was spawned with.
+        let (mut w, t0) = watch();
+        assert_eq!(w.observe(Some(JOB), false, t0), None);
+        w.set_announce_after(Duration::from_secs(2));
+        assert_eq!(
+            w.observe(Some(JOB), false, t0 + Duration::from_secs(3)),
+            Some(JobEvent::Started),
+            "three seconds in is past the new threshold, though short of the old one",
+        );
+    }
+
+    #[test]
+    fn a_raised_threshold_quiets_a_job_that_would_have_been_announced() {
+        let (mut w, t0) = watch();
+        assert_eq!(w.observe(Some(JOB), false, t0), None);
+        w.set_announce_after(Duration::from_secs(60));
+        assert_eq!(
+            w.observe(Some(JOB), false, t0 + AFTER),
+            None,
+            "the old threshold no longer announces anything",
+        );
+        assert_eq!(
+            w.observe(Some(SHELL), false, t0 + Duration::from_secs(30)),
+            None,
+            "and a job that was never announced ends silently",
         );
     }
 

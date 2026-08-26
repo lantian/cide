@@ -286,6 +286,18 @@ export interface EditorSurfaceProps {
    */
   onScrollHandle?: ((scrollTo: ((line: number) => void) | null) => void) | undefined
   /**
+   * Hand out a way to put the keyboard in this buffer, without moving the caret.
+   *
+   * The [`onScrollHandle`] shape and lifetime — handed out when the view is built, handed
+   * back as `null` in the cleanup. The caller is the pane, registering with
+   * `panes/paneFocus.ts` so `pane.navigate.*` can finish what `pane_focus` starts: the ring
+   * without the caret is the reported half-focus bug. Not a reveal — `revealRequest.ts` is
+   * keyed by path and deliberately delivers to *every* buffer on it, which is exactly wrong
+   * for a gesture aimed at one pane; and its `focus: true` travels with a line and column
+   * this caller does not have and must not invent.
+   */
+  onFocusHandle?: ((focus: (() => void) | null) => void) | undefined
+  /**
    * The buffer changed, and here is how to read it. (M12)
    *
    * **No text is passed.** This fires on every keystroke, and `doc.toString()` on a five-megabyte
@@ -477,6 +489,7 @@ export function EditorSurface({
   onSelection,
   onSaveHandle,
   onScrollHandle,
+  onFocusHandle,
   onDocChanged,
   symbols,
   diagnostics,
@@ -532,6 +545,8 @@ export function EditorSurface({
   saveHandleCb.current = onSaveHandle
   const scrollHandleCb = useRef(onScrollHandle)
   scrollHandleCb.current = onScrollHandle
+  const focusHandleCb = useRef(onFocusHandle)
+  focusHandleCb.current = onFocusHandle
   const docChangedCb = useRef(onDocChanged)
   docChangedCb.current = onDocChanged
   const viewCb = useRef(onView)
@@ -1369,6 +1384,11 @@ export function EditorSurface({
       }
     })
 
+    // And the way to put the keyboard in it, for `pane.navigate.*`. `view.focus()` reaches a
+    // read-only buffer too — the `contentAttributes` tabindex above is what makes that true,
+    // and its comment is the account of the milestone it was not.
+    focusHandleCb.current?.(() => view.focus())
+
     // Claimed after the view is built and released in the cleanup below, so the bar's line
     // and the buffer on screen have exactly the same lifetime. A view that failed to
     // construct returned above and never claims one.
@@ -1744,6 +1764,7 @@ export function EditorSurface({
       blameSlotRef.current = null
       saveHandleCb.current?.(null)
       scrollHandleCb.current?.(null)
+      focusHandleCb.current?.(null)
       /*
        * **The single most important line in this feature.**
        *

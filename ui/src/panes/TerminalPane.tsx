@@ -216,6 +216,33 @@ async function sessionIsLive(session: string): Promise<boolean> {
 }
 
 /**
+ * Whether the registry still holds this session at all — running, **or exited with its screen
+ * retained**, which `report_exit` keeps precisely so a pane can still paint the last thing the
+ * child printed.
+ *
+ * The adoption gate below used to ask [`sessionIsLive`], and the gap was reported before it was
+ * reasoned about: a mirror pane's spawn plan lives in the *clicking* window's JS realm, so in a
+ * multi-window layout the pane can render in a window that never heard of the plan and fall
+ * through to this gate — where a **running** run's session was adopted (Open on a live agent
+ * worked, by accident of this very fallback) and a **finished** run's session was refused, so
+ * the pane spawned a fresh `claude` over the transcript the user clicked Open to read. An
+ * opencode run's rendered event log, replaced by a claude splash.
+ *
+ * `exited` therefore adopts too: the attach paints the retained screen plus the `— exited —`
+ * marker, and closing the pane later `kill`s a process that is already gone, which is a no-op —
+ * so the missing `mirrored` flag costs nothing on this arm. `reaping` and `unknown` still
+ * refuse: the first is a corpse mid-reap that becomes `exited` moments later (the plan-carrying
+ * window never hits this race), and the second is an id from a previous process, which is the
+ * restore path's business.
+ */
+async function sessionIsHeld(session: string): Promise<boolean> {
+  return sessionApi.exit(session).then(
+    (answer) => answer.kind === 'running' || answer.kind === 'exited',
+    () => false,
+  )
+}
+
+/**
  * Paste into this pane, and copy out of it.
  *
  * Both bodies used to live here and both are now `terminal/clipboard.ts`, because the same two
@@ -758,8 +785,9 @@ export function TerminalPane({
     void (async () => {
       /*
        * The domain may already hold a session for this pane — one detached and re-docked, one
-       * re-mounting after a split, or one restored from `workspace.json`. Adopt it **only if
-       * the registry still holds a running child for it**.
+       * re-mounting after a split, one restored from `workspace.json`, or a mirror whose spawn
+       * plan lives in another window's realm. Adopt it **only if the registry still holds it**
+       * — a running child, or an exited one whose screen `report_exit` retained.
        *
        * The liveness check used to be skipped whenever the pane had no entry in the launch
        * plan, on the reasoning that a plan entry is the only thing that says `pane.session`
@@ -777,7 +805,11 @@ export function TerminalPane({
        * to pass `--resume`.
        */
       if (domainSession && !getHost(paneId).sessionId) {
-        if (await sessionIsLive(domainSession)) getHost(paneId).sessionId = domainSession
+        // `sessionIsHeld`, not `sessionIsLive`: an exited session the registry retains is a
+        // transcript this pane exists to show — a finished run opened from History, a pane
+        // whose child ended while it was parked. Spawning over it replaced an opencode run's
+        // rendered log with a fresh claude; the function's own doc carries the report.
+        if (await sessionIsHeld(domainSession)) getHost(paneId).sessionId = domainSession
         if (disposed) return
       }
       await startOrRecover(spec, false)

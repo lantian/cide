@@ -317,6 +317,7 @@ export const BY_EXTENSION: Readonly<Record<string, string>> = {
   'prop': 'settings',
   'properties': 'settings',
   'props': 'settings',
+  'proto': 'proto',
   'psql': 'database',
   'ptx': 'image',
   'publishsettings': 'xml',

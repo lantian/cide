@@ -80,7 +80,7 @@ export function harnessLabel(harness: string): string {
  * Where one run is — the tag of `RunState`, flattened.
  *
  * `RunState` is a tagged union whose payloads (`sinceUnixMs`, `code`, `reason`) belong to three
- * of its eight arms. The panel groups, glyphs and tones by the **tag** in every one of those
+ * of its nine arms. The panel groups, glyphs and tones by the **tag** in every one of those
  * places, so the tag is lifted out into its own type and the payloads are carried beside it on
  * [`RunView`]. A row that had to `switch` on the union to find out which section it belongs in
  * would be several `switch`es that can disagree.
@@ -101,10 +101,11 @@ export type RunPhase =
   | 'idle'
   | 'awaitingPermission'
   | 'paused'
+  | 'interrupted'
   | 'finished'
   | 'failed'
 
-/** The eight phases, in `RunState`'s declaration order. */
+/** The nine phases, in `RunState`'s declaration order. */
 export const RUN_PHASES: readonly RunPhase[] = [
   'queued',
   'starting',
@@ -112,12 +113,13 @@ export const RUN_PHASES: readonly RunPhase[] = [
   'idle',
   'awaitingPermission',
   'paused',
+  'interrupted',
   'finished',
   'failed',
 ]
 
 /**
- * Is this one of the eight phases?
+ * Is this one of the nine phases?
  *
  * Takes `string` rather than `RunPhase` on purpose, for [`isSeverity`'s reason one panel over]:
  * every caller has a value *annotated* `RunPhase` by a wire type, and the whole point of the
@@ -136,7 +138,7 @@ export function isRunPhase(value: string): value is RunPhase {
 /**
  * Colour roles a phase can take. Each maps to one token in `AgentsPanel.module.css`.
  *
- * Six names for eight phases. `starting` and `running` share `busy`, because "the child is
+ * Six names for nine phases. `starting` and `running` share `busy`, because "the child is
  * coming up" and "a turn is in flight" are the same thing to look at and differ only in the
  * glyph. `queued` and `idle` share `idle`: both are runs that are quiet, and the row's glyph
  * and label are what separate "has not started" from "has stopped for now, and is still there".
@@ -182,6 +184,10 @@ const PHASE_GLYPH: Record<RunPhase, string> = {
   idle: 'circle-dot',
   awaitingPermission: 'circle-alert',
   paused: 'circle-pause',
+  // A bar through the silhouette: the child was taken away (cide's shutdown ladder), which is
+  // neither `paused`'s two bars (a live child, frozen) nor `failed`'s ✗ (a result). Resumable,
+  // so it must not wear a terminal mark.
+  interrupted: 'circle-minus',
   finished: 'circle-check',
   failed: 'circle-x',
 }
@@ -193,6 +199,7 @@ const PHASE_LABEL: Record<RunPhase, string> = {
   idle: 'Idle',
   awaitingPermission: 'Awaiting permission',
   paused: 'Paused',
+  interrupted: 'Interrupted',
   finished: 'Finished',
   failed: 'Failed',
 }
@@ -204,6 +211,10 @@ const PHASE_TONE: Record<RunPhase, Tone> = {
   idle: 'idle',
   awaitingPermission: 'attention',
   paused: 'paused',
+  // `paused`'s tone, not `error`'s: the conversation is intact and resuming it is ordinary —
+  // `RunState::Interrupted`'s doc carries the whole not-Failed argument. A red row here would
+  // greet every restart of cide with a wall of alarms about its own shutdown ladder.
+  interrupted: 'paused',
   finished: 'done',
   failed: 'error',
 }
@@ -230,6 +241,28 @@ export function phaseLabel(phase: RunPhase): string {
 /** Which colour role the dot takes. Never `undefined`, for any input. */
 export function phaseTone(phase: RunPhase): Tone {
   return isRunPhase(phase) ? PHASE_TONE[phase] : UNKNOWN_TONE
+}
+
+/**
+ * The longer truth behind a one-word label, where one word is not the whole truth.
+ *
+ * Only `paused` carries one today, and it exists because a user watched their local model keep
+ * inferring after they pressed Pause and reasonably concluded the panel was lying. It was not —
+ * the child is frozen to the instruction — but a **model call already in flight is not a local
+ * fact**: the provider does not know its client froze, so it finishes generating server-side
+ * and the bytes wait in the kernel's socket buffer until Resume, when the child reads them and
+ * the turn continues without loss. cide cannot cancel that call — only the child could abort
+ * its own request, and the child cannot run an instruction; killing the connection instead
+ * would destroy the turn, which is Stop, not Pause. So the honest sentence rides the row as a
+ * `title` rather than the mechanism pretending otherwise.
+ */
+export function phaseHint(phase: RunPhase): string | null {
+  if (phase !== 'paused') return null
+  return (
+    'The child process is frozen mid-turn. A model call that was already in flight is not ' +
+    'cancelled — the provider finishes it on its side, and the answer is read when the run is ' +
+    'resumed. Nothing new starts while paused.'
+  )
 }
 
 /**
@@ -442,6 +475,32 @@ function roleName(def: AgentDefView): string {
 }
 
 /**
+ * Agent id → label, for the Tasks panel's assignee list and chips. `{}` unless ready.
+ *
+ * This is the join `TasksPanelHost` was written waiting for — its header spent a paragraph on
+ * "roles is empty, deliberately, until the Agents slice lands", and this function is the two
+ * lines that changed. A blank id is skipped (an option whose `value` is `""` would collide with
+ * the hardcoded Unassigned row), and a blank label falls back to the id so the option still has
+ * a face — [`roleName`]'s ladder, minus its final rung, because `assignableRoles` keys on the id
+ * and a "This role" entry would be a label with no key behind it.
+ *
+ * A plain object is safe here: every reader is prototype-proof (`roleLabel` goes through
+ * `Object.hasOwn`, `assignableRoles` through `Object.keys`), and `check:agents` pins an
+ * `id: 'constructor'` row to keep that true. Built through `Object.fromEntries` rather than
+ * `roles[id] = label`, because bracket assignment of `"__proto__"` on a literal hits the setter
+ * and silently creates nothing — no such id can come out of Rust's name rule, but this function
+ * must not be the one place in the file that trusts that.
+ */
+export function rosterRoles(roster: Roster): Readonly<Record<string, string>> {
+  if (roster.kind !== 'ready') return {}
+  return Object.fromEntries(
+    roster.agents
+      .filter((def) => def.id.trim() !== '')
+      .map((def) => [def.id, def.label.trim() !== '' ? def.label : def.id]),
+  )
+}
+
+/**
  * How many of this role's slots are held right now.
  *
  * Counted over [`WORKING_PHASES`], so a queued run of the same role does not block the dispatch
@@ -523,7 +582,11 @@ export function canDispatch(def: AgentDefView, roster: Roster): Dispatchable {
  * the function most exists for, so it is written down.
  */
 export function canOpen(run: RunView): boolean {
-  return run.session !== null && run.phase !== 'queued'
+  // `interrupted` still carries its session id — the registry needs it to build the resume —
+  // but the process behind it died with the old cide, so an Open aimed at it attaches to
+  // nothing and draws a resume splash over a run whose real affordance is the row's own
+  // Resume. Withheld, not disabled, per the queued rule above.
+  return run.session !== null && run.phase !== 'queued' && run.phase !== 'interrupted'
 }
 
 /**
@@ -684,6 +747,12 @@ export interface RunRow {
   canPause: boolean
   /** The stale-turn bar's sentence, or `null`. See [`staleTurnLine`]. */
   staleTurn: string | null
+  /**
+   * The `title` behind the phase label, where the one-word label is not the whole truth —
+   * see [`phaseHint`]. `null` for every phase whose word suffices, and the row then falls
+   * back to the label itself.
+   */
+  hint: string | null
 }
 
 /**
@@ -722,6 +791,10 @@ export const ACTIVE_PHASES: readonly RunPhase[] = [
   'running',
   'starting',
   'paused',
+  // After `paused` and before `idle`: both are runs that will not advance until somebody acts,
+  // and an interrupted one is a step further from running (no child at all) — but it still
+  // outranks the two that are quiet by their own choice.
+  'interrupted',
   'idle',
   'queued',
 ]
@@ -801,18 +874,13 @@ export interface RoleRow {
    *
    * # Why every active run is listed rather than only the first
    *
-   * `cide_agents::effective_max_concurrent` clamps a role to **one** working run whenever the
-   * project uses worktree isolation, which is the default: one worktree per *agent*, not per
-   * run, so a second concurrent run of a role would be two processes editing one checkout. So
-   * for almost every project this list has 0 or 1 entry and the question does not arise.
-   *
-   * It arises under `isolation: shared`, where a role's own `max-concurrent` stands — and there
-   * the honest answer is to draw them all. The alternative considered was one summary line plus
-   * an "and 2 more" count, and it fails the panel's own standing rule: a run that is on screen
-   * nowhere is a `claude` spending the user's quota that they cannot see, cannot open and cannot
-   * stop. An idle run makes it reachable in the default configuration too — `idle` is outside
-   * [`WORKING_PHASES`], so it holds no slot and a second run of the same role may start beside
-   * it, which is two entries here under worktree isolation and no misconfiguration at all.
+   * A role genuinely runs its `max-concurrent` tasks at once now — worktrees went per *task*,
+   * so two tasks of one role are two checkouts and the old one-run-per-role clamp is gone —
+   * which makes several entries here the **ordinary** state of a fanned-out role, not the
+   * `isolation: shared` curiosity it used to be. The honest answer is to draw them all: the
+   * alternative considered was one summary line plus an "and 2 more" count, and it fails the
+   * panel's own standing rule — a run that is on screen nowhere is a `claude` spending the
+   * user's quota that they cannot see, cannot open and cannot stop.
    *
    * The **order** is [`ACTIVE_PHASES`], then the oldest run first, then the run id: a total
    * order, for `groupByFile`'s reason one panel over — a partial one leaves two rows free to
@@ -888,6 +956,7 @@ function runRow(run: RunView, titles: Readonly<Record<string, string>>): RunRow 
     canOpen: canOpen(run),
     canPause: canPause(run),
     staleTurn: staleTurnLine(run),
+    hint: phaseHint(run.phase),
   }
 }
 
@@ -1046,7 +1115,11 @@ export function sections(roster: Roster, taskTitles: Readonly<Record<string, str
   if (recent.length > 0) {
     out.push({
       kind: 'recent',
-      label: 'Recent',
+      // 'History', because that is what it is now: the registry snapshots ended runs across
+      // restarts (50 kept per project), so this section is a durable record of what ran, not
+      // a per-process scratchpad. The *kind* stays 'recent' — it is an internal name in every
+      // fixture and check, and renaming a wire-adjacent identifier to chase a label is churn.
+      label: 'History',
       rows: recent.slice(0, RECENT_CAP).map((run) => runRow(run, taskTitles)),
     })
   }

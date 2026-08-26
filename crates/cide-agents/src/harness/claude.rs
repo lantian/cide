@@ -111,249 +111,24 @@ impl Harness for ClaudeHarness {
     }
 
     fn spawn_spec(&self, plan: &RunPlan<'_>) -> Result<HarnessSpawn, HarnessError> {
-        if plan.agent.def.harness != self.kind() {
-            return Err(HarnessError::WrongHarness {
-                plan: plan.agent.def.harness,
-                harness: self.kind(),
-            });
-        }
-        // Refused before anything is built: an interactive `claude` with no opening prompt starts
-        // perfectly and then does nothing for ever. See `HarnessError::NoPrompt`.
-        if plan.prompt.trim().is_empty() {
-            return Err(HarnessError::NoPrompt);
-        }
-
-        // The configured binary, passed through **exactly as stored** so a bare `claude` is still
-        // resolved by the OS at this spawn rather than pinned to whatever `which` answered at
-        // launch — the CLI updates itself underneath a running app. Not `resolve`d here: that is
-        // a `stat` per `PATH` entry, `crate::defs::installed` already asked the question at load,
-        // and the sentence it produced is on the role's `unavailable` where the panel is drawing
-        // it. A second wording of the same refusal would be a second thing to keep true.
-        let program = plan.claude.cli.binary.trim();
-        if program.is_empty() {
-            return Err(HarnessError::NoBinary);
-        }
-
-        // The user's launch configuration, filtered. Enforced here as well as on the Settings
-        // screen and not instead of it: `workspace.json` is hand-editable and `settings_set` is
-        // one `invoke` away from being bypassed.
-        //
-        // Note there is no `is_claude` question to ask. A pane has to decide, because a pane may
-        // be a shell; a run on this harness is a `claude` by construction, which is the whole
-        // difference between the two spawn sites' shapes.
-        let cli = cide_core::claude_cli::plan_here(&plan.claude.cli);
-        // One line, once, naming what was dropped. There is no screen involved in a dispatch at
-        // all, so the log is the only place this refusal can be seen.
-        for refused in cli.refusals() {
-            tracing::warn!(
-                token = %refused.text,
-                "refusing a claude launch argument or variable for an agent run: {}",
-                refused.verdict.note().unwrap_or_default()
-            );
-        }
-
-        // ---- the one question steps 3 and 5 both answer ----
-        //
-        // Whether this run gets the task tracker's tools at all. Computed once, here, because two
-        // places downstream depend on it and they must not be able to disagree: step 5 attaches
-        // `cide-hook mcp`, and step 3 tells the role to use the tools that server serves. A
-        // paragraph naming a vocabulary the session does not have is a run that tries, fails, and
-        // has nothing to say about why — the same argument `cmd/session.rs` makes at its roster
-        // paragraph, which is gated on the same question one lane over.
-        //
-        // `plan.hook_bin` is that question and the whole of it: the bridge is what carries every
-        // `cide_task_*` call, and the JSON below is the only other way this can come out empty.
-        //
-        // Deliberately **not** `cli.inject.has(Injection::McpConfig)`, although step 6 does ask
-        // that question about `--settings`. Step 5 writes `--mcp-config` from `hook_bin` alone, so
-        // in this lane the switch is not what decides whether the tools exist — and gating the
-        // prose on a condition that does not gate the tools would silently take the paragraph away
-        // from runs that have them. The two read one value so that they cannot answer differently;
-        // if step 5 ever starts consulting the switch, this reads it through the same expression.
-        let tracker = match &plan.hook_bin {
-            Some(hook) => match mcp_config(&hook.to_string_lossy()) {
-                Some(json) => Some(json),
-                // Serialising a two-key JSON object cannot realistically fail; skipping the flag
-                // rather than failing the spawn is still the right shape, because a run with no
-                // task tools is a run that works and reports, and a refused dispatch is not.
-                None => {
-                    tracing::warn!("cannot build an mcp config; this run gets no task tools");
-                    None
-                }
-            },
-            None => None,
-        };
-
-        // ---- 1. the user's own arguments, before every token cide adds ----
-        let mut args = cli.args.clone();
-
-        // ---- 2. `--session-id <uuid>` ----
-        //
-        // `resume: None, fork: false` — a run is always a fresh conversation. Resuming one is a
-        // separate gesture with a separate question behind it (which worktree the transcript is
-        // under; see the module header), and it is not this slice's.
-        //
-        // `cli.inject` and not a fresh resolution, so the flag folded here is the same value the
-        // refusal verdicts above were computed against: cide can never refuse a user's
-        // `--session-id` while passing none of its own.
-        let (effective, conversation) =
-            cide_claude::conversation(plan.session, None, false, &cli.inject);
-        debug_assert_eq!(
-            effective, plan.session,
-            "a fresh conversation is filed under the id it was handed"
-        );
-        args.extend(conversation);
-
-        // ---- 3. the role's system prompt ----
-        //
-        // Folded, never pushed: a second `--append-system-prompt` silently deletes the first, so a
-        // raw push would take the user's prompt away with nothing on screen saying so. The fold is
-        // a no-op when the role has no prompt, which cannot happen — `defs` marks an empty one
-        // `unavailable` — but the function is the one that decides that, not this line.
-        cide_core::claude_cli::fold_append_system_prompt(&mut args, &plan.agent.def.system_prompt);
-
-        // ---- 3b. and then cide's own paragraph about the task tracker ----
-        //
-        // The same fold, called a second time, and that is exactly its semantics rather than a
-        // reuse of a function meant for something else: the fold joins *whatever the argv already
-        // carries* with cide's addition, user's text first and cide's after it, separated by a
-        // blank line. So the first call leaves `<user>\n\n<role>` and this one leaves
-        // `<user>\n\n<role>\n\n<cide>` — the role's brief verbatim and ahead of cide's
-        // housekeeping, in exactly one `--append-system-prompt`, in the position the user put
-        // theirs. Composing the string by hand and folding once would produce the same argv and
-        // would have to re-derive the `=`-spelling and last-wins rules that function measured.
-        //
-        // Gated, so a run with no bridge is never told to call tools it does not have. See
-        // `tracker` above and `TRACKER_PREAMBLE`'s own header.
-        if tracker.is_some() {
-            cide_core::claude_cli::fold_append_system_prompt(&mut args, TRACKER_PREAMBLE);
-        }
-
-        // ---- 4. what the definition asked for, and nothing it did not ----
-        //
-        // Each of these is `Option`/empty-checked rather than defaulted. The CLI's own defaults
-        // are the safe end of every one of these ranges, and a value invented here would be a
-        // behaviour the role's author never wrote and cannot find in their file.
-        //
-        // These land *after* the user's launch arguments, which for a non-variadic option means
-        // the definition wins — commander keeps the last occurrence, the same last-wins rule
-        // `fold_append_system_prompt` measured for `--append-system-prompt`. That is the right
-        // precedence: the role file is a statement about *this run*, and the launch configuration
-        // is a default for every `claude` cide starts.
-        if let Some(model) = &plan.agent.def.model {
-            args.push("--model".into());
-            args.push(model.clone());
-        }
-        // Carried verbatim and deliberately unvalidated — `LoadedAgent::effort` says why: the set
-        // differs per harness and per release, and cide has no list to check it against that would
-        // not be wrong within a month. A bad value is the CLI's refusal to make, loudly, in the
-        // run's own transcript.
-        if let Some(effort) = &plan.agent.effort {
-            args.push("--effort".into());
-            args.push(effort.clone());
-        }
-        // Already validated against `defs::PERMISSION_MODES` at load, so it is not checked again
-        // here; what matters is that `None` emits nothing at all.
-        if let Some(mode) = &plan.agent.permission_mode {
-            args.push("--permission-mode".into());
-            args.push(mode.clone());
-        }
-        // Variadic, and safe here only because every token written after it begins with `-`. An
-        // argument added below this line has to think about that.
-        //
-        // There is no `--disallowedTools` counterpart because a definition cannot express one:
-        // the front matter has a `tools` key and no `disallowed-tools` key (`defs::KNOWN_KEYS`).
-        // Emitting an empty one would be a restriction the role's author never wrote.
-        if !plan.agent.tools.is_empty() {
-            args.push("--allowedTools".into());
-            args.extend(plan.agent.tools.iter().cloned());
-        }
-
-        // ---- 5. cide's own MCP server ----
-        //
-        // The value from the top of this function, so the flag and the paragraph in step 3b are
-        // one decision and cannot come apart.
-        if let Some(json) = tracker {
-            args.push("--mcp-config".into());
-            args.push(json);
-        }
-
-        // ---- 6. the hook payload ----
-        //
-        // Gated on the same injection switch a pane's is, so a user who turned `--settings` off
-        // gets the same answer in both lanes. The cost is stated at that toggle: no token
-        // figures, no state machine, and therefore a run whose row never moves.
-        if let (Some(hook), Some(flag)) = (&plan.hook_bin, cli.inject.flag(Injection::Settings)) {
-            match settings_json(&hook.to_string_lossy(), plan.theme) {
-                Some(json) => {
-                    args.push(flag.into());
-                    args.push(json);
-                }
-                None => tracing::warn!("cannot build inline settings; this run reports no state"),
-            }
-        }
-
-        // ---- 7. a name a human can read ----
-        args.push("-n".into());
-        args.push(session_name(plan));
-
-        let mut spec = SpawnSpec::new(program, plan.cwd.clone()).geometry(PtyGeometry::new(
-            plan.geometry.cols,
-            plan.geometry.rows,
-            plan.geometry.cell_width,
-            plan.geometry.cell_height,
-        ));
-        for arg in args {
-            spec = spec.arg(arg);
-        }
-
-        // The environment, in the same order a pane's is built, because the order is what makes
-        // "cide sets this list" a sentence about cide rather than about one spawn site.
-        //
-        // `CARGO_PKG_VERSION` is this crate's, which *is* the application's: every workspace
-        // member takes `version.workspace = true`, so there is one number. `TERM_PROGRAM_VERSION`
-        // therefore keeps reporting what a pane reports.
-        spec = spec.apply(cide_core::child_env::terminal_child_env(
-            &plan.claude,
-            env!("CARGO_PKG_VERSION"),
-            cli.env,
-        ));
-        spec = spec.apply(plan.proxy.changes().to_vec());
-
-        // The IDE integration, switched off. See the module header — this is the run-hangs-for-ever
-        // case, not a tidy-up.
-        spec = spec
-            .env_remove("CLAUDE_CODE_SSE_PORT")
-            .env_remove("CLAUDE_CODE_AUTO_CONNECT_IDE");
-
-        // The routing key. Everything about a run's liveness — the state machine, the panel's
-        // phase dot, the statusline's cost figure — is free because `cide-hook` reads this out of
-        // the child's own environment and echoes it back, so nothing depends on cide and the CLI
-        // agreeing about a uuid.
-        spec = spec.env("CIDE_SESSION", plan.session.to_string());
-        spec = spec.env("CIDE_RUN", plan.run.to_string());
-        if let Some(sock) = &plan.hook_sock {
-            spec = spec.env("CIDE_HOOK_SOCK", sock.to_string_lossy().to_string());
-        }
-        // Set even when `hook_bin` was missing and no `--mcp-config` was written, for the reason
-        // `cmd/session.rs` gives one scope up: it costs a harness that ignores it nothing, and a
-        // wrapper that ends up exec'ing the real `claude` with an `--mcp-config` of its own still
-        // finds this socket.
-        if let Some(sock) = &plan.agent_sock {
-            spec = spec.env("CIDE_AGENT_SOCK", sock.to_string_lossy().to_string());
-        }
-
-        Ok(HarnessSpawn {
-            spec,
-            // Written into the terminal rather than passed as a positional argument: a bare prompt
-            // does not begin with `-`, so `--mcp-config <configs...>` would swallow it into an MCP
-            // configuration list, with no error from anything. It also means a run's first turn
-            // and its fifth arrive by one code path — `deliver` below builds the same bytes.
-            opening: Some(submit(&plan.prompt)),
-            binding: SessionBinding::Caller,
-        })
+        assemble(plan, false)
     }
 
+    /// The continuing child for a run restored from the registry's snapshot — `claude
+    /// --resume`, into the same worktree the transcript lives under.
+    ///
+    /// `_session` is redundant by construction on this harness: [`SessionBinding::Caller`]
+    /// means the caller chose the id, and a resume rebinds the run to that same previous
+    /// [`cide_ipc::SessionId`] before the fork (`ResumePoint::rebind` in the registry), so
+    /// `plan.session` *is* the conversation being continued. The parameter exists because the
+    /// trait speaks the harness-minted shape, where the two ids genuinely differ.
+    fn respawn_spec(
+        &self,
+        plan: &RunPlan<'_>,
+        _session: &str,
+    ) -> Result<HarnessSpawn, HarnessError> {
+        assemble(plan, true)
+    }
     fn deliver(&self, text: &str) -> Delivery {
         Delivery::Stdin(submit(text))
     }
@@ -398,6 +173,267 @@ impl Harness for ClaudeHarness {
     }
 }
 
+/// Build the child, fresh (`resume: false`) or continuing. One function so the two differ in
+/// exactly the conversation tokens and nothing else — `opencode.rs::child`'s shape, on the
+/// harness where the difference is one argument to [`cide_claude::conversation`].
+fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessError> {
+    if plan.agent.def.harness != cide_ipc::Harness::Claude {
+        return Err(HarnessError::WrongHarness {
+            plan: plan.agent.def.harness,
+            harness: cide_ipc::Harness::Claude,
+        });
+    }
+    // Refused before anything is built: an interactive `claude` with no opening prompt starts
+    // perfectly and then does nothing for ever. See `HarnessError::NoPrompt`.
+    if plan.prompt.trim().is_empty() {
+        return Err(HarnessError::NoPrompt);
+    }
+
+    // The configured binary, passed through **exactly as stored** so a bare `claude` is still
+    // resolved by the OS at this spawn rather than pinned to whatever `which` answered at
+    // launch — the CLI updates itself underneath a running app. Not `resolve`d here: that is
+    // a `stat` per `PATH` entry, `crate::defs::installed` already asked the question at load,
+    // and the sentence it produced is on the role's `unavailable` where the panel is drawing
+    // it. A second wording of the same refusal would be a second thing to keep true.
+    let program = plan.claude.cli.binary.trim();
+    if program.is_empty() {
+        return Err(HarnessError::NoBinary);
+    }
+
+    // The user's launch configuration, filtered. Enforced here as well as on the Settings
+    // screen and not instead of it: `workspace.json` is hand-editable and `settings_set` is
+    // one `invoke` away from being bypassed.
+    //
+    // Note there is no `is_claude` question to ask. A pane has to decide, because a pane may
+    // be a shell; a run on this harness is a `claude` by construction, which is the whole
+    // difference between the two spawn sites' shapes.
+    let cli = cide_core::claude_cli::plan_here(&plan.claude.cli);
+    // One line, once, naming what was dropped. There is no screen involved in a dispatch at
+    // all, so the log is the only place this refusal can be seen.
+    for refused in cli.refusals() {
+        tracing::warn!(
+            token = %refused.text,
+            "refusing a claude launch argument or variable for an agent run: {}",
+            refused.verdict.note().unwrap_or_default()
+        );
+    }
+
+    // ---- the one question steps 3 and 5 both answer ----
+    //
+    // Whether this run gets the task tracker's tools at all. Computed once, here, because two
+    // places downstream depend on it and they must not be able to disagree: step 5 attaches
+    // `cide-hook mcp`, and step 3 tells the role to use the tools that server serves. A
+    // paragraph naming a vocabulary the session does not have is a run that tries, fails, and
+    // has nothing to say about why — the same argument `cmd/session.rs` makes at its roster
+    // paragraph, which is gated on the same question one lane over.
+    //
+    // `plan.hook_bin` is that question and the whole of it: the bridge is what carries every
+    // `cide_task_*` call, and the JSON below is the only other way this can come out empty.
+    //
+    // Deliberately **not** `cli.inject.has(Injection::McpConfig)`, although step 6 does ask
+    // that question about `--settings`. Step 5 writes `--mcp-config` from `hook_bin` alone, so
+    // in this lane the switch is not what decides whether the tools exist — and gating the
+    // prose on a condition that does not gate the tools would silently take the paragraph away
+    // from runs that have them. The two read one value so that they cannot answer differently;
+    // if step 5 ever starts consulting the switch, this reads it through the same expression.
+    let tracker = match &plan.hook_bin {
+        Some(hook) => match mcp_config(&hook.to_string_lossy()) {
+            Some(json) => Some(json),
+            // Serialising a two-key JSON object cannot realistically fail; skipping the flag
+            // rather than failing the spawn is still the right shape, because a run with no
+            // task tools is a run that works and reports, and a refused dispatch is not.
+            None => {
+                tracing::warn!("cannot build an mcp config; this run gets no task tools");
+                None
+            }
+        },
+        None => None,
+    };
+
+    // ---- 1. the user's own arguments, before every token cide adds ----
+    let mut args = cli.args.clone();
+
+    // ---- 2. `--session-id <uuid>` ----
+    //
+    // `resume: None, fork: false` — a run is always a fresh conversation. Resuming one is a
+    // separate gesture with a separate question behind it (which worktree the transcript is
+    // under; see the module header), and it is not this slice's.
+    //
+    // `cli.inject` and not a fresh resolution, so the flag folded here is the same value the
+    // refusal verdicts above were computed against: cide can never refuse a user's
+    // `--session-id` while passing none of its own.
+    let (effective, conversation) = cide_claude::conversation(
+        plan.session,
+        // A resume names the run's own previous id — see `respawn_spec` on the harness.
+        resume.then_some(plan.session),
+        false,
+        &cli.inject,
+    );
+    debug_assert_eq!(
+        effective, plan.session,
+        "a fresh conversation is filed under the id it was handed"
+    );
+    args.extend(conversation);
+
+    // ---- 3. the role's system prompt ----
+    //
+    // Folded, never pushed: a second `--append-system-prompt` silently deletes the first, so a
+    // raw push would take the user's prompt away with nothing on screen saying so. The fold is
+    // a no-op when the role has no prompt, which cannot happen — `defs` marks an empty one
+    // `unavailable` — but the function is the one that decides that, not this line.
+    cide_core::claude_cli::fold_append_system_prompt(&mut args, &plan.agent.def.system_prompt);
+
+    // ---- 3b. and then cide's own paragraph about the task tracker ----
+    //
+    // The same fold, called a second time, and that is exactly its semantics rather than a
+    // reuse of a function meant for something else: the fold joins *whatever the argv already
+    // carries* with cide's addition, user's text first and cide's after it, separated by a
+    // blank line. So the first call leaves `<user>\n\n<role>` and this one leaves
+    // `<user>\n\n<role>\n\n<cide>` — the role's brief verbatim and ahead of cide's
+    // housekeeping, in exactly one `--append-system-prompt`, in the position the user put
+    // theirs. Composing the string by hand and folding once would produce the same argv and
+    // would have to re-derive the `=`-spelling and last-wins rules that function measured.
+    //
+    // Gated, so a run with no bridge is never told to call tools it does not have. See
+    // `tracker` above and `TRACKER_PREAMBLE`'s own header.
+    if tracker.is_some() {
+        cide_core::claude_cli::fold_append_system_prompt(&mut args, TRACKER_PREAMBLE);
+    }
+
+    // ---- 4. what the definition asked for, and nothing it did not ----
+    //
+    // Each of these is `Option`/empty-checked rather than defaulted. The CLI's own defaults
+    // are the safe end of every one of these ranges, and a value invented here would be a
+    // behaviour the role's author never wrote and cannot find in their file.
+    //
+    // These land *after* the user's launch arguments, which for a non-variadic option means
+    // the definition wins — commander keeps the last occurrence, the same last-wins rule
+    // `fold_append_system_prompt` measured for `--append-system-prompt`. That is the right
+    // precedence: the role file is a statement about *this run*, and the launch configuration
+    // is a default for every `claude` cide starts.
+    if let Some(model) = &plan.agent.def.model {
+        args.push("--model".into());
+        args.push(model.clone());
+    }
+    // Carried verbatim and deliberately unvalidated — `LoadedAgent::effort` says why: the set
+    // differs per harness and per release, and cide has no list to check it against that would
+    // not be wrong within a month. A bad value is the CLI's refusal to make, loudly, in the
+    // run's own transcript.
+    if let Some(effort) = &plan.agent.effort {
+        args.push("--effort".into());
+        args.push(effort.clone());
+    }
+    // Already validated against `defs::PERMISSION_MODES` at load, so it is not checked again
+    // here; what matters is that the role's own word always wins — an author who wrote a
+    // mode meant it, restrictive or not, and the project default below never overrides one.
+    if let Some(mode) = &plan.agent.permission_mode {
+        args.push("--permission-mode".into());
+        args.push(mode.clone());
+    } else if plan.skip_permissions {
+        // The project's default for unattended children (`agents.skipPermissions`, on unless
+        // switched off): a headless run cannot answer a prompt, and a claude run that hits
+        // one parks in AwaitingPermission holding its slot and its role's only worktree
+        // until a human opens its pane. The config field's doc carries the whole argument;
+        // the spelling is the same validated mode a role could have written itself.
+        args.push("--permission-mode".into());
+        args.push(crate::defs::BYPASS_PERMISSIONS.into());
+    }
+    // Variadic, and safe here only because every token written after it begins with `-`. An
+    // argument added below this line has to think about that.
+    //
+    // There is no `--disallowedTools` counterpart because a definition cannot express one:
+    // the front matter has a `tools` key and no `disallowed-tools` key (`defs::KNOWN_KEYS`).
+    // Emitting an empty one would be a restriction the role's author never wrote.
+    if !plan.agent.tools.is_empty() {
+        args.push("--allowedTools".into());
+        args.extend(plan.agent.tools.iter().cloned());
+    }
+
+    // ---- 5. cide's own MCP server ----
+    //
+    // The value from the top of this function, so the flag and the paragraph in step 3b are
+    // one decision and cannot come apart.
+    if let Some(json) = tracker {
+        args.push("--mcp-config".into());
+        args.push(json);
+    }
+
+    // ---- 6. the hook payload ----
+    //
+    // Gated on the same injection switch a pane's is, so a user who turned `--settings` off
+    // gets the same answer in both lanes. The cost is stated at that toggle: no token
+    // figures, no state machine, and therefore a run whose row never moves.
+    if let (Some(hook), Some(flag)) = (&plan.hook_bin, cli.inject.flag(Injection::Settings)) {
+        match settings_json(&hook.to_string_lossy(), plan.theme) {
+            Some(json) => {
+                args.push(flag.into());
+                args.push(json);
+            }
+            None => tracing::warn!("cannot build inline settings; this run reports no state"),
+        }
+    }
+
+    // ---- 7. a name a human can read ----
+    args.push("-n".into());
+    args.push(session_name(plan));
+
+    let mut spec = SpawnSpec::new(program, plan.cwd.clone()).geometry(PtyGeometry::new(
+        plan.geometry.cols,
+        plan.geometry.rows,
+        plan.geometry.cell_width,
+        plan.geometry.cell_height,
+    ));
+    for arg in args {
+        spec = spec.arg(arg);
+    }
+
+    // The environment, in the same order a pane's is built, because the order is what makes
+    // "cide sets this list" a sentence about cide rather than about one spawn site.
+    //
+    // `CARGO_PKG_VERSION` is this crate's, which *is* the application's: every workspace
+    // member takes `version.workspace = true`, so there is one number. `TERM_PROGRAM_VERSION`
+    // therefore keeps reporting what a pane reports.
+    spec = spec.apply(cide_core::child_env::terminal_child_env(
+        &plan.claude,
+        env!("CARGO_PKG_VERSION"),
+        cli.env,
+    ));
+    spec = spec.apply(plan.proxy.changes().to_vec());
+
+    // The IDE integration, switched off. See the module header — this is the run-hangs-for-ever
+    // case, not a tidy-up.
+    spec = spec
+        .env_remove("CLAUDE_CODE_SSE_PORT")
+        .env_remove("CLAUDE_CODE_AUTO_CONNECT_IDE");
+
+    // The routing key. Everything about a run's liveness — the state machine, the panel's
+    // phase dot, the statusline's cost figure — is free because `cide-hook` reads this out of
+    // the child's own environment and echoes it back, so nothing depends on cide and the CLI
+    // agreeing about a uuid.
+    spec = spec.env("CIDE_SESSION", plan.session.to_string());
+    spec = spec.env("CIDE_RUN", plan.run.to_string());
+    if let Some(sock) = &plan.hook_sock {
+        spec = spec.env("CIDE_HOOK_SOCK", sock.to_string_lossy().to_string());
+    }
+    // Set even when `hook_bin` was missing and no `--mcp-config` was written, for the reason
+    // `cmd/session.rs` gives one scope up: it costs a harness that ignores it nothing, and a
+    // wrapper that ends up exec'ing the real `claude` with an `--mcp-config` of its own still
+    // finds this socket.
+    if let Some(sock) = &plan.agent_sock {
+        spec = spec.env("CIDE_AGENT_SOCK", sock.to_string_lossy().to_string());
+    }
+
+    Ok(HarnessSpawn {
+        spec,
+        // Written into the terminal rather than passed as a positional argument: a bare prompt
+        // does not begin with `-`, so `--mcp-config <configs...>` would swallow it into an MCP
+        // configuration list, with no error from anything. It also means a run's first turn
+        // and its fifth arrive by one code path — `deliver` below builds the same bytes.
+        opening: Some(submit(&plan.prompt)),
+        binding: SessionBinding::Caller,
+    })
+}
+
 /// What a run's current state looks like to [`cide_claude::next_state`], or `None` when no
 /// observation may move it.
 ///
@@ -432,6 +468,9 @@ fn session_state_of(state: &RunState) -> Option<SessionState> {
         RunState::Running => Some(SessionState::Busy),
         RunState::Idle => Some(SessionState::Idle),
         RunState::AwaitingPermission => Some(SessionState::AwaitingPermission),
+        // No child at all — restored from the registry's snapshot — so no session state can
+        // describe it, exactly as the terminal pair below.
+        RunState::Interrupted => None,
         RunState::Paused { .. } | RunState::Finished { .. } | RunState::Failed { .. } => None,
     }
 }
@@ -597,6 +636,7 @@ mod tests {
                 model: None,
                 unavailable: None,
                 max_concurrent: 1,
+                worktree: true,
             },
             origin: PathBuf::from("/repo/.cide/agents/developer.md"),
             shadows: None,
@@ -623,6 +663,9 @@ mod tests {
             proxy: cide_core::proxy::ProxyEnv::default(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
+            // Off in the fixture, so every argv assertion below is about what the role
+            // and the plan actually said; the skip default has tests of its own.
+            skip_permissions: false,
         }
     }
 
@@ -874,6 +917,31 @@ mod tests {
         assert_eq!(
             config["mcpServers"]["cide"]["command"],
             json!("/home/o\"brien/bin/cide-hook")
+        );
+    }
+
+    /// The project default (`agents.skipPermissions`) reaches the argv when the role said
+    /// nothing — and the role's own word, whatever it is, always wins over it.
+    #[test]
+    fn the_skip_default_injects_bypass_and_the_roles_word_wins() {
+        let agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.skip_permissions = true;
+        assert_eq!(
+            value_of(&spawn(&plan).spec.args, "--permission-mode"),
+            crate::defs::BYPASS_PERMISSIONS,
+            "an unattended child cannot answer a prompt — the config field's doc has the measurement"
+        );
+
+        // The author's word wins — including a *restrictive* one, which an override here would
+        // silently widen into exactly the behaviour their file says they did not want.
+        let mut strict = role();
+        strict.permission_mode = Some("plan".into());
+        let mut plan = plan_for(&strict, SessionId::new());
+        plan.skip_permissions = true;
+        assert_eq!(
+            value_of(&spawn(&plan).spec.args, "--permission-mode"),
+            "plan"
         );
     }
 

@@ -16,6 +16,12 @@
  * 3. **Cancel is the default.** Escape cancels, initial focus is on Cancel, and the
  *    destructive button is the plain one while the accent-filled button is the safe one — so
  *    a reflexive Enter, the keystroke already in flight when the dialog appeared, backs out.
+ *    One caller is exempt, by declaration rather than by accident — see
+ *    [`ConfirmState.defaultButton`]: the file tree's *Move to Trash* is reversible by
+ *    construction, and there Enter performs the move, the way every desktop file manager
+ *    answers it. The focus and the accent travel together whichever way the default points,
+ *    because a dialog whose prominent button and whose Enter answer disagree is lying about
+ *    what a keystroke will do.
  *
  * It takes a `run` rather than a specific verb because there are six of them now, and they
  * differ only in their wording and their command.
@@ -197,6 +203,21 @@ export interface ConfirmState {
    * this dialog exists for.
    */
   split?: boolean
+  /**
+   * Which button is the default — focused on mount, accent-filled, and therefore what a bare
+   * Enter does. Absent means `'cancel'`, and absent is correct for every act that destroys
+   * something: rule 3 exists so the keystroke already in flight when the dialog appeared backs
+   * out.
+   *
+   * `'confirm'` is for an act that is **reversible by construction** and whose dialog exists
+   * only because the gesture is easy to trigger by accident — the file tree's *Move to Trash*,
+   * where a bare Delete key opens this and every desktop file manager answers the Enter that
+   * follows with the trash move, not with a cancel the user then has to notice happened.
+   * Setting it also costs the caller the red: the accent replaces `buttonDanger` on the
+   * confirm button, because an act safe enough to confirm by reflex has no claim on the
+   * colour that means "this destroys work".
+   */
+  defaultButton?: 'confirm' | 'cancel'
   choices?: readonly ConfirmChoice[]
   /**
    * Which choice is selected, by `id`. An id no choice carries — including the `null` the
@@ -232,15 +253,20 @@ export interface ConfirmDestructiveProps {
 
 export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestructiveProps) {
   const cancel = useRef<HTMLButtonElement>(null)
+  const confirmBtn = useRef<HTMLButtonElement>(null)
   // Native `<input type="radio">`s group by `name`, and a fixed string would make two dialogs
   // mounted at once — which is not supposed to happen, but is one `&&` away from happening —
   // share one group and steal each other's selection. `useId` costs nothing and removes the
   // class of bug entirely.
   const group = useId()
 
+  // Rule 3's one dial. `false` — Cancel — unless the caller said `'confirm'`; see the field's
+  // doc for who may, and why it is exactly one caller today.
+  const confirmDefault = state.defaultButton === 'confirm'
+
   useEffect(() => {
-    cancel.current?.focus()
-  }, [])
+    ;(confirmDefault ? confirmBtn : cancel).current?.focus()
+  }, [confirmDefault])
 
   const onKeyDown = (ev: React.KeyboardEvent) => {
     if (ev.key === 'Escape') {
@@ -379,14 +405,19 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
             </label>
           )}
           {/*
-            * Never `buttonPrimary`. Rule 3 lives in this one className: the accent-filled
-            * button is Cancel, so the Enter already in flight when the dialog appeared backs
-            * out. `buttonDanger` is only the red *text*, and it is conditional now because a
-            * `--soft` reset destroys nothing and must not wear the colour that says it does.
+            * `buttonPrimary` only behind `confirmDefault`. Rule 3 lives in this one className:
+            * for every destructive caller the accent-filled button is Cancel, so the Enter
+            * already in flight when the dialog appeared backs out — and where a caller has
+            * declared the act reversible, the accent moves *with* the focus, never without it.
+            * The accent also displaces the red there: `buttonDanger` is only the red *text*,
+            * conditional since the log's reset because a `--soft` reset destroys nothing and
+            * must not wear the colour that says it does, and a trash move gives it up for the
+            * same reason.
             */}
           <button
+            ref={confirmBtn}
             type="button"
-            className={`${styles.button} ${danger ? styles.buttonDanger : ''}`}
+            className={`${styles.button} ${confirmDefault ? styles.buttonPrimary : danger ? styles.buttonDanger : ''}`}
             data-audit="confirmDestructiveRun"
             onClick={onConfirm}
           >
@@ -395,7 +426,7 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
           <button
             ref={cancel}
             type="button"
-            className={`${styles.button} ${styles.buttonPrimary}`}
+            className={`${styles.button} ${confirmDefault ? '' : styles.buttonPrimary}`}
             data-audit="confirmDestructiveCancel"
             onClick={onCancel}
           >

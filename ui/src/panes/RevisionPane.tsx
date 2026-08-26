@@ -78,8 +78,9 @@
  * worse here, because a wrong jump moves the user rather than mislabelling something in front of
  * them. Ctrl+F, folding and highlighting need nothing from the backend and are unaffected.
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { EditorSurface } from '@/editor/EditorSurface'
+import { registerPaneFocus } from './paneFocus'
 import { file as fileApi, git as gitApi, gitLog, revisionFile } from '@/ipc/client'
 import type { ProjectId, RepoId, RevisionBlob } from '@/ipc/client'
 import { describe, notify } from '@/chrome/notices'
@@ -109,6 +110,12 @@ export interface RevisionPaneProps {
    * visible one — hidden tabs are `visibility: hidden`, never unmounted.
    */
   onScreen?: boolean | undefined
+  /**
+   * The pane this document fills, for the keyboard registry — `EditorPaneProps.pane`'s
+   * story, and a read-only buffer needs it just as much: its keymap (find, folds, *send
+   * lines to Claude*) only answers once `view.focus()` has landed.
+   */
+  pane?: string | undefined
 }
 
 /** What the pane is showing instead of, or as well as, a buffer. */
@@ -160,8 +167,21 @@ export function RevisionPane({
   rev,
   from,
   onScreen,
+  pane,
 }: RevisionPaneProps): ReactNode {
   const [load, setLoad] = useState<Load>({ kind: 'loading' })
+
+  // The keyboard half of `pane.navigate.*` — `EditorPane`'s wiring, whose comment carries
+  // the reasoning: the entry closes over the ref, the surface swaps the closure in and out
+  // with the view's own lifetime, and no view yet (the load states below) is a no-op.
+  const focusViewRef = useRef<(() => void) | null>(null)
+  const onFocusHandle = useCallback((focus: (() => void) | null) => {
+    focusViewRef.current = focus
+  }, [])
+  useEffect(() => {
+    if (pane === undefined) return undefined
+    return registerPaneFocus(pane, () => focusViewRef.current?.())
+  }, [pane])
 
   /*
    * One fetch per identity, and no refetch ever after it.
@@ -404,6 +424,7 @@ export function RevisionPane({
                */
               highlight="none"
               onScreen={onScreen}
+              onFocusHandle={onFocusHandle}
             />
           </div>
         </>

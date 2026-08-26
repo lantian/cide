@@ -170,11 +170,12 @@ const IDLE = run({
 /*
  * A second run of QA, so `role-multi-run` has two lines under one role.
  *
- * Only reachable with `isolation: shared` — `effective_max_concurrent` clamps a role to one
- * working run under the default worktree isolation — which is exactly why it is a fixture: it is
- * a configuration almost nobody has, so the first time it is drawn must not be the first time
- * anybody has looked at it. It is `running` beside `ADRIFT`'s `awaitingPermission`, so the
- * role's one-word summary has to choose, and the choice is the assertion.
+ * This used to be reachable only with `isolation: shared`; per-task worktrees made it the
+ * ordinary shape of a fanned-out role (each task in its own checkout, up to the role's
+ * `max-concurrent`), so the fixture went from guarding a configuration almost nobody has to
+ * pinning one everybody with two assigned tasks will see. It is `running` beside `ADRIFT`'s
+ * `awaitingPermission`, so the role's one-word summary has to choose, and the choice is the
+ * assertion.
  */
 const QA_RUNNING = run({
   run: 'r-0011',

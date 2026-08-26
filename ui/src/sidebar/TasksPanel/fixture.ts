@@ -16,7 +16,7 @@
  * `TASKS_STORIES` are `TasksPanelViewProps` — the list, in every board state. `CARD_STORIES` are
  * `TaskDetailProps` — the open task's card, in every read/edit state. `COMPOSE_STORIES` are
  * `TaskComposeProps` — the new-task dialog, empty and filled in. (M21) They are separate because
- * the card is now mounted by `TasksPanelHost` beside the view rather than inside it, and because
+ * the card is now mounted by `TaskDetailHost` beside the view rather than inside it, and because
  * the thing that mounts it (`TaskDetailModal`, an `OverlayCard`) portals to `document.body`,
  * which `react-dom/server` refuses to render at all. `TaskDetail` is the whole card minus that
  * one wrapper, so every field, every mode and every control stays inside the render gate; what
@@ -40,6 +40,7 @@
 import type { ProjectId } from '@/ipc/client'
 import {
   EMPTY_DRAFT,
+  assigneeHint,
   type ArmedDelete,
   type Board,
   type CommentView,
@@ -49,6 +50,7 @@ import {
   type TaskStatus,
   type TaskView,
 } from './model'
+import { mentionOptions, type MentionOption } from './mentionModel'
 import type { TasksPanelViewProps } from './TasksPanel'
 import type { TaskDetailProps } from './TaskDetail'
 import type { TaskComposeProps } from './TaskCompose'
@@ -109,6 +111,7 @@ function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskVie
     status: 'todo',
     agent: null,
     comments: [],
+    history: [],
     // The user, by default, because that is what the panel's own New task button produces. The
     // stories that need the other answer say so; see `BARE`, which is the card's half of the pair
     // that pins the creator to the author enum rather than to a name.
@@ -126,6 +129,17 @@ const T14 = task({
   status: 'doing',
   agent: 'developer',
   comments: COMMENTS,
+  /*
+   * Out of order on purpose, `COMMENTS`' trick for the other log: the wire promises oldest
+   * first, a merge can break the promise, and the render check asserts the card prints the
+   * transitions straight anyway. The pair of authors is the point of the feature — the second
+   * hop is the orchestrator's automatic `Todo → Doing` on dispatch, and the row must say so.
+   */
+  history: [
+    { from: 'doing', to: 'review', by: { kind: 'user' }, atMs: NOW_MS - 900_000 },
+    { from: 'todo', to: 'doing', by: { kind: 'orchestrator' }, atMs: NOW_MS - 7_200_000 },
+    { from: 'review', to: 'doing', by: { kind: 'user' }, atMs: NOW_MS - 700_000 },
+  ],
 })
 
 const T15 = task({
@@ -161,6 +175,55 @@ const ROGUE = task({
   title: 'A task from the future',
   status: 'constructor' as unknown as TaskStatus,
 })
+
+/*
+ * The markdown card's task — `card-markdown`'s whole fixture. (M27)
+ *
+ * Kept off the list stories on purpose: T14's plain body is pinned byte-for-byte by the
+ * `fieldValues` assertion, and rewriting it would touch every story at once. This one exists
+ * so the render check can say "the fixture wrote `**strong**` and the markup contains
+ * `<strong>`" about a card whose other properties nothing else asserts on.
+ */
+const RICH = task({
+  id: 't-21',
+  title: 'Render tracker text as markdown',
+  status: 'doing',
+  agent: 'developer',
+  body: [
+    '## Scope',
+    '',
+    'Bodies and comments render **strong**, *emphasis* and `code` spans.',
+    '',
+    '- the body at rest',
+    '- every comment',
+    '',
+    '```rust',
+    'fn main() {}',
+    '```',
+    '',
+    'See [the markdown pane](https://example.invalid/preview) for the full grammar.',
+  ].join('\n'),
+  comments: [
+    comment({
+      text: 'Done — `TaskMarkdown.tsx` renders both:\n\n1. parse with `blocks.ts`\n2. render as elements',
+      atMs: NOW_MS - 500_000,
+      author: { kind: 'agent', agent: 'developer', label: 'Developer' },
+    }),
+  ],
+})
+
+/*
+ * Recency, as a fixture. (See `groups`'s doc for the ordering argument.)
+ *
+ * Three Todo tasks, in the file in the order they were created — which is the order an
+ * append-only tracker accretes, oldest activity first. A panel drawing the array as written
+ * would print exactly the reverse of what the check asserts, so the story is a statement about
+ * the sort rather than about the fixture. All three in one group, so the assertion cannot be
+ * satisfied by `GROUP_ORDER` doing the work.
+ */
+const T31 = task({ id: 't-31', title: 'Quiet since this morning', updatedMs: NOW_MS - 7_200_000 })
+const T32 = task({ id: 't-32', title: 'Stirred an hour ago', updatedMs: NOW_MS - 3_600_000 })
+const T33 = task({ id: 't-33', title: 'Touched a minute ago', updatedMs: NOW_MS - 60_000 })
 
 const REV = 42
 
@@ -207,6 +270,7 @@ const HANDLERS = {
   onSelectTask: () => {},
   onCreateTask: () => {},
   onFilter: () => {},
+  onQuery: () => {},
   /*
    * Both halves of the delete, on every story. The unarmed assertions — "no story shows the
    * confirming label unless it was armed" — are worth nothing against a fixture that was never
@@ -317,11 +381,14 @@ export type TasksStoryName =
   | 'list-with-live-run'
   | 'list-selected'
   | 'rogue-status'
+  | 'list-recent-first'
   | 'list-delete-armed'
   | 'list-delete-stale'
   | 'list-filtered'
   | 'list-filtered-rogue'
   | 'list-filter-no-match'
+  | 'list-searched'
+  | 'list-search-no-match'
 
 export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
   'no-project': story({ project: null, board: ready([T14]) }),
@@ -377,6 +444,13 @@ export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
    */
   'rogue-status': story({ board: ready([T14, T15, T16, ROGUE]) }),
 
+  /*
+   * The recency order, in markup. The file holds T31 → T32 → T33, oldest activity first, and
+   * the check asserts the rows come out reversed — see the constants' comment for why the
+   * story is a statement about the sort and not about the fixture.
+   */
+  'list-recent-first': story({ board: ready([T31, T32, T33]) }),
+
   /* ------------------------------------------------------------------ the delete gesture */
 
   /*
@@ -419,6 +493,27 @@ export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
    * its own control would leave no way back.
    */
   'list-filter-no-match': story({ board: ready([T14, T15, T16]), filter: 'done' }),
+
+  /* ------------------------------------------------------------------------- the search */
+
+  /*
+   * The board of `list`, narrowed by text. `Retry` — capitalised, over a title that says
+   * `retry` — so the story pins case-insensitivity in the markup, not only in the model. One
+   * task survives (t-14, whose title and body both say it); the other three must be absent
+   * from the markup entirely, and the header figure must still count all four, for the
+   * filter's reason.
+   */
+  'list-searched': story({ board: ready([T14, T15, T16, T17]), query: 'Retry' }),
+
+  /*
+   * A tracker with tasks in it and a query none of them contain.
+   *
+   * The screen must not be the empty tracker's, and it must not be the *filter's* either: the
+   * way out of this one is clearing what was typed, so the sentence names the query and the
+   * actions offer Clear search. The box itself stays drawn — a search that hid its own control
+   * on a miss would leave no way to clear it.
+   */
+  'list-search-no-match': story({ board: ready([T14, T15, T16]), query: 'quaternion' }),
 }
 
 /* ============================================================================== the card */
@@ -446,8 +541,10 @@ export type CardStoryName =
   | 'card-with-live-run'
   | 'card-editing-title'
   | 'card-editing-assignee'
+  | 'card-assignee-no-roles'
   | 'card-editing-body'
   | 'card-delete-armed'
+  | 'card-markdown'
 
 export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
   /*
@@ -471,6 +568,19 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
   /* The select, which commits on choice and therefore draws no Save. Clean: it was just opened. */
   'card-editing-assignee': card({ task: T14, editing: ASSIGNEE_EDIT }),
 
+  /*
+   * The same editor over an empty roster — a project with subagents off. The host now derives
+   * `roles` from the agents store, and this is the state the assignee dropdown shipped in for
+   * one whole milestone by accident; the hint is what keeps a legitimately-short list from
+   * reading as that bug, and the check asserts the sentence is on screen.
+   */
+  'card-assignee-no-roles': card({
+    task: T14,
+    editing: ASSIGNEE_EDIT,
+    roles: {},
+    assigneeHint: assigneeHint('disabled'),
+  }),
+
   'card-editing-body': card({ task: T14, editing: BODY_DRAFT }),
 
   /*
@@ -478,6 +588,18 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
    * It stays a two-click arming inside the modal rather than becoming a second dialog.
    */
   'card-delete-armed': card({ task: T14, deleteArmed: true }),
+
+  /*
+   * A body and a comment written the way agents actually write them: headings, emphasis, code
+   * spans, a fence, lists, a link. (M27)
+   *
+   * The check asserts two things off this story: that the syntax **renders** — a `<strong>` in
+   * the markup, not two asterisks in the text — and that it renders as *elements*, which
+   * server-rendered markup can show and an HTML-string renderer never would. The raw-marker
+   * greps (`**`, `` ``` ``) run over the flattened text, so this fixture must not use either
+   * sequence anywhere it is meant to survive as prose.
+   */
+  'card-markdown': card({ task: RICH }),
 }
 
 /**
@@ -500,7 +622,11 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
  * report was *"all fields are editable and task isn't created while not press Create"* — and it
  * is the exact inverse of the card's, which must draw **none** at rest.
  */
-export type ComposeStoryName = 'compose-empty' | 'compose-filled' | 'compose-busy'
+export type ComposeStoryName =
+  | 'compose-empty'
+  | 'compose-filled'
+  | 'compose-busy'
+  | 'compose-no-roles'
 
 /** A draft with something in every field, including a status that is not the default. */
 const FILLED_DRAFT: TaskDraft = {
@@ -519,4 +645,41 @@ export const COMPOSE_STORIES: Record<ComposeStoryName, TaskComposeProps> = {
 
   /* Create pressed, the write in flight. Still on screen, still holding the draft. */
   'compose-busy': compose(FILLED_DRAFT, { busy: true }),
+
+  /* An empty roster: one Unassigned option, and the sentence saying why — never a bare list. */
+  'compose-no-roles': compose(EMPTY_DRAFT, {
+    roles: {},
+    assigneeHint: assigneeHint('disabled'),
+  }),
+}
+
+/**
+ * The @mention popup's named states — `MentionList`, which is the open half `MentionTextarea`
+ * only ever mounts from DOM events a server render cannot fire. Options come through the real
+ * `mentionOptions`, so the scored order on screen is the scored order the model produces.
+ */
+export type MentionStoryName = 'mention-open' | 'mention-filtered'
+
+const MENTION_ROLES: Readonly<Record<string, string>> = {
+  developer: 'Developer',
+  qa: 'QA',
+  'code-reviewer': 'Code Reviewer',
+}
+
+export const MENTION_STORIES: Record<
+  MentionStoryName,
+  { options: readonly MentionOption[]; selected: number; listboxId: string }
+> = {
+  /* Everything on offer, second row highlighted — exactly one `aria-selected`. */
+  'mention-open': {
+    options: mentionOptions(MENTION_ROLES, ''),
+    selected: 1,
+    listboxId: 'mention-story-open',
+  },
+  /* A query narrowing to one role. */
+  'mention-filtered': {
+    options: mentionOptions(MENTION_ROLES, 'dev'),
+    selected: 0,
+    listboxId: 'mention-story-filtered',
+  },
 }

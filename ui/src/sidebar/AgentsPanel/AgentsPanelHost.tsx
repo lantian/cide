@@ -132,20 +132,20 @@ const NO_TASK_SELECTED =
 export interface AgentsPanelProps {
   /** The active project, or `null` — in a detached-pane window, and before one is open. */
   project: ProjectId | null
-  /**
-   * Show the Tasks panel. The second half of the agent→task link.
-   *
-   * A prop rather than something this host can do itself: which sidebar view is showing is
-   * `App.tsx`'s `useState` over `chrome/sidebarView.ts`, and a store reaching into it would be
-   * a second writer of the one piece of state that module exists to keep single. `App.tsx`
-   * passes `showPanel(s, 'tasks')`, the same mechanism the Tasks branch already uses.
-   *
-   * Optional, and when it is absent the run rows draw **no** task link at all rather than one
-   * that selects a task on a panel the user cannot see. A selection nobody is shown is the dead
-   * control this slice exists to remove, one gesture over.
-   */
-  onShowTasks?: (() => void) | undefined
 }
+
+/**
+ * What a task link says when its task cannot be opened. Two sentences, because the two
+ * failures are different facts: a board that cannot be read (the Tasks panel's `absent` and
+ * `unreadable` screens say why), and a task that was deleted after the run was dispatched —
+ * the row keeps drawing the id on purpose, so the click can land on a task that is gone.
+ * Either way the refusal goes on screen: a link that silently does nothing is the failure
+ * this project has paid for most often.
+ */
+const BOARD_NOT_READABLE =
+  'The task board cannot be read, so the task cannot be opened — the Tasks panel says why.'
+const taskGone = (task: string) =>
+  `${task} is not on the board any more — it was deleted after this run was dispatched against it.`
 
 /**
  * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
@@ -156,7 +156,7 @@ export interface AgentsPanelProps {
  */
 export const AgentsPanel = memo(AgentsPanelImpl)
 
-function AgentsPanelImpl({ project, onShowTasks }: AgentsPanelProps) {
+function AgentsPanelImpl({ project }: AgentsPanelProps) {
   const roster = useAgents((s) => s.roster)
   const enable = useAgents((s) => s.enable)
   const dispatch = useAgents((s) => s.dispatch)
@@ -398,25 +398,34 @@ function AgentsPanelImpl({ project, onShowTasks }: AgentsPanelProps) {
             onIntegrateArm: (agent: string) => setIntegrateArmed(agent),
             onIntegrate: integrate,
           })}
-      {...(onShowTasks === undefined
-        ? {}
-        : {
-            onRevealTask: (task: string) => {
-              /*
-               * Both halves, in this order. `select` first so the Tasks panel is already
-               * showing the right task on the frame it appears, rather than flashing the list.
-               * Read off the store rather than subscribed to, because this host does not draw
-               * anything from `select` and a subscription would re-render it on every selection
-               * change made in the other panel.
-               *
-               * `TaskId` is a bare `string` in `model.ts` — that file imports nothing — and the
-               * newtype is a `string` on the wire too, so this is the seam where the panel's
-               * plain id becomes the tracker's id again.
-               */
-              useTasks.getState().select(task)
-              onShowTasks()
-            },
-          })}
+      /*
+       * The agent→task link: selecting the task is the whole gesture now. `TaskDetailHost` is
+       * mounted from `App.tsx` outside the sidebar branches, so the card opens over THIS panel
+       * — the sidebar is not switched to Tasks, because a modal that dims the whole window
+       * needs no panel under it, and yanking the view out from under the user was ceremony.
+       *
+       * `select` is read off the store rather than subscribed to, because this host draws
+       * nothing from it and a subscription would re-render the panel on every selection change
+       * made elsewhere. `TaskId` is a bare `string` in `model.ts` — that file imports nothing —
+       * and the newtype is a `string` on the wire too, so this is the seam where the panel's
+       * plain id becomes the tracker's id again.
+       *
+       * The two refusals are the honest ends of the gesture: `openTask` keeps the card off
+       * screen when the board is not `ready` or the id is not on it, so a bare `select` in
+       * either state would be a click that visibly does nothing. The guard reads the `board`
+       * this render was drawn from — the same object the chips' titles came from.
+       */
+      onRevealTask={(task: string) => {
+        if (board.kind !== 'ready') {
+          notifyFailure(BOARD_NOT_READABLE)
+          return
+        }
+        if (!board.tasks.some((t) => t.id === task)) {
+          notifyFailure(taskGone(task))
+          return
+        }
+        useTasks.getState().select(task)
+      }}
       /*
        * Nothing is withheld here any more. Every handler `AgentsPanelViewProps` declares is
        * passed, and each one's control is drawn or not by the view's own gate.

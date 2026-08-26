@@ -43,10 +43,12 @@
  * # The open task's card is not here
  *
  * It used to be: `selected` replaced this whole body with `TaskDetail`. It is now a modal —
- * `TaskDetailModal`, mounted by `TasksPanelHost` **beside** this view rather than instead of it,
- * so the board stays on screen behind the scrim and the filter row does not vanish for as long
- * as a task is open. What is left here is one line of it: the open task's row is marked, so the
- * list behind the scrim says which of its rows the card belongs to.
+ * `TaskDetailModal`, mounted by `TaskDetailHost` from `App.tsx` **beside** this view rather
+ * than instead of it (and outside the sidebar branches entirely, so a task opened from the
+ * Agents panel appears without switching panels), so the board stays on screen behind the scrim
+ * and the filter row does not vanish for as long as a task is open. What is left here is one
+ * line of it: the open task's row is marked, so the list behind the scrim says which of its
+ * rows the card belongs to.
  *
  * The card lives in its own component because `OverlayCard` portals to `document.body`, and a
  * portal cannot be server-rendered at all. Rendering it from here would take this view — every
@@ -100,7 +102,7 @@ export interface TasksPanelViewProps {
   /**
    * Which task's card is open, or `null` for none.
    *
-   * The card itself is `TaskDetailModal`, mounted beside this view. What this prop does *here*
+   * The card itself is `TaskDetailModal`, mounted by `TaskDetailHost`. What this prop does *here*
    * is mark the row it belongs to: the list is still on screen behind the scrim, and a modal
    * over a list of four near-identical rows that does not say which one it came from makes the
    * user close it to find out. A prop rather than state, so this component stays a function of
@@ -127,6 +129,16 @@ export interface TasksPanelViewProps {
   /** Narrow the list, or (with `null`) widen it back to the whole board. */
   onFilter?: ((filter: StatusFilter) => void) | undefined
   /**
+   * The text the list is narrowed by, `''` for none.
+   *
+   * A prop for the reason `filter` is — the state is `TasksPanelHost`'s, and this component
+   * stays a function of its props so `check-agents-render.mjs` can render it under node. The
+   * two narrowings compose: `groups` takes both and draws the intersection.
+   */
+  query?: string | undefined
+  /** Narrow the list to tasks matching this text, or (with `''`) stop narrowing. */
+  onQuery?: ((query: string) => void) | undefined
+  /**
    * The delete the user has armed — **which task, and on which board**.
    *
    * Passed as the whole `ArmedDelete` rather than an id because `armedDelete` is what decides
@@ -148,6 +160,8 @@ export function TasksPanelView({
   selected = null,
   filter = null,
   onFilter,
+  query = '',
+  onQuery,
   deleteArmed = null,
   onDeleteArm,
   onDelete,
@@ -161,14 +175,16 @@ export function TasksPanelView({
    * offer a write" is how an `unreadable` board grows a New task button in a later edit.
    */
   const writable = canWrite(board)
-  const list = groups(board, filter)
+  const list = groups(board, filter, query)
   /*
-   * Why the list is empty, when it is — and the two answers are different screens. `'tracker'`
-   * is the one that already existed; `'filter'` is a board with tasks in it, none of which match,
-   * and drawing nothing for that is how a user concludes their tasks are gone. `null` when there
-   * is something to draw, and for every board arm that has its own designed screen.
+   * Why the list is empty, when it is — and the three answers are different screens.
+   * `'tracker'` is the one that already existed; `'filter'` and `'search'` are a board with
+   * tasks in it, none of which match, and drawing nothing for either is how a user concludes
+   * their tasks are gone — they differ in which control the sentence has to name and which
+   * way out it offers. `null` when there is something to draw, and for every board arm that
+   * has its own designed screen.
    */
-  const empty = listEmpty(board, filter)
+  const empty = listEmpty(board, filter, query)
   /*
    * Resolved **once**, here, and handed down as a boolean. `armedDelete` refuses an arming whose
    * board has moved on, and doing that in one place is what stops the row and the card from
@@ -187,6 +203,56 @@ export function TasksPanelView({
       >
         New task
       </button>
+    ) : null
+
+  /*
+   * The search row: one text box over the whole board, above the status toggles it composes
+   * with — the box narrows by content, the toggles by place, and `groups` draws the
+   * intersection.
+   *
+   * Drawn under the filter row's condition and for its reasons: there is nothing to find on
+   * the designed screens, and an empty tracker with a search box on it offers a control that
+   * cannot change anything. It **is** still drawn when the query matches nothing — a search
+   * that hid its own box on a miss would leave the user no way to clear what they typed.
+   *
+   * Escape follows `closeCard`'s rule — scoped to the innermost thing that is open: with text
+   * in the box it clears the box and goes no further, with nothing typed it is not this
+   * control's to swallow.
+   */
+  const searchRow =
+    board.kind === 'ready' && board.tasks.length > 0 && onQuery !== undefined ? (
+      <div className={styles.search} data-audit="tasksSearch">
+        <span className={styles.searchGlyph} aria-hidden="true">
+          <Icon name={asIcon('search')} size={1} />
+        </span>
+        <input
+          type="text"
+          className={styles.searchInput}
+          data-audit="tasksSearchInput"
+          placeholder="Search tasks"
+          aria-label="Search tasks"
+          value={query}
+          onChange={(event) => onQuery(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && query !== '') {
+              event.stopPropagation()
+              onQuery('')
+            }
+          }}
+        />
+        {query !== '' && (
+          <button
+            type="button"
+            className={styles.searchClear}
+            data-audit="tasksSearchClear"
+            aria-label="Clear search"
+            title="Clear search"
+            onClick={() => onQuery('')}
+          >
+            <Icon name={asIcon('x')} size={1} />
+          </button>
+        )}
+      </div>
     ) : null
 
   /*
@@ -354,33 +420,55 @@ export function TasksPanelView({
           </p>
           <div className={styles.actions} data-audit="tasksActions">{newTask}</div>
         </div>
-      ) : empty === 'filter' ? (
+      ) : empty === 'filter' || empty === 'search' ? (
         /*
-         * A board with tasks in it, and none of them in this group.
+         * A board with tasks in it, and none of them surviving the narrowing.
          *
          * **A different screen from the one above, deliberately.** The two states look identical
          * from inside the list — nothing to draw — and they are opposite facts about the user's
-         * project. A filtered board that silently drew nothing, or worse drew *"No tasks yet"*,
-         * is exactly how somebody concludes their tasks are gone; so the sentence names the
-         * filter, the count says how many tasks the tracker actually holds, and the way out is
-         * on screen twice — the filter row, which is deliberately still drawn, and a Show all
-         * button in the sentence's own actions.
+         * project. A narrowed board that silently drew nothing, or worse drew *"No tasks yet"*,
+         * is exactly how somebody concludes their tasks are gone; so the sentence names what is
+         * hiding them — the filtered status, or the typed query and (when one is also on) the
+         * status it ran inside — the count says how many tasks the tracker actually holds, and
+         * the way out is on screen twice: the control itself, which is deliberately still
+         * drawn, and a button in the sentence's own actions. The search's button clears the
+         * query and the filter's clears the filter, each undoing only what it names, because a
+         * single "show everything" would also take away a narrowing the user still meant.
          */
         <div className={styles.body} data-audit="tasksBody">
           <div className={styles.actions} data-audit="tasksActions">{newTask}</div>
+          {searchRow}
           {filterRow}
           <div className={styles.noMatch} data-audit="tasksNoMatch">
             <p className={cx(styles.claim, styles.claimQuiet)} data-audit="tasksClaim">
-              {`No tasks in ${filter === null ? 'this view' : statusLabel(filter)}.`}
+              {empty === 'search'
+                ? `No tasks match “${query.trim()}”${filter === null ? '' : ` in ${statusLabel(filter)}`}.`
+                : `No tasks in ${filter === null ? 'this view' : statusLabel(filter)}.`}
             </p>
             <p className={styles.detail}>
               {board.kind === 'ready' && board.tasks.length === 1
-                ? 'This tracker holds 1 task, in another group.'
-                : `This tracker holds ${board.kind === 'ready' ? board.tasks.length : 0} tasks, all in other groups.`}{' '}
-              Nothing has been deleted — the filter above is narrowing the list.
+                ? 'This tracker holds 1 task'
+                : `This tracker holds ${board.kind === 'ready' ? board.tasks.length : 0} tasks`}
+              {empty === 'search'
+                ? ', none matching the search.'
+                : board.kind === 'ready' && board.tasks.length === 1
+                  ? ', in another group.'
+                  : ', all in other groups.'}{' '}
+              Nothing has been deleted — the {empty === 'search' ? 'search box' : 'filter'} above
+              is narrowing the list.
             </p>
             <div className={styles.actions} data-audit="tasksActions">
-              {onFilter !== undefined && (
+              {empty === 'search' && onQuery !== undefined && (
+                <button
+                  type="button"
+                  className={styles.action}
+                  data-audit="tasksClearSearch"
+                  onClick={() => onQuery('')}
+                >
+                  Clear search
+                </button>
+              )}
+              {onFilter !== undefined && filter !== null && (
                 <button
                   type="button"
                   className={styles.action}
@@ -396,6 +484,7 @@ export function TasksPanelView({
       ) : (
         <div className={styles.body} data-audit="tasksBody">
           <div className={styles.actions} data-audit="tasksActions">{newTask}</div>
+          {searchRow}
           {filterRow}
           <div className={styles.groups} data-audit="tasksGroups">
             {list.map((group) => {
@@ -514,7 +603,17 @@ function TaskLine({
           data-audit="tasksChip"
           data-lit={chip.lit ? 'true' : 'false'}
           data-tone={chip.tone}
-          title={chip.lit ? `${chip.label} is working on this now` : `Assigned to ${chip.label}`}
+          /* Three sentences for the three unambiguous readings a hover can land on. The stalled
+             one says what the yellow means — the task claims work is under way and no run is
+             engaged — because a colour whose meaning is only in a check script is a colour the
+             user has to guess at. */
+          title={
+            chip.lit
+              ? `${chip.label} is working on this now`
+              : chip.tone === 'attention'
+                ? `Assigned to ${chip.label}, but no run is on it — the task says doing and nobody is working`
+                : `Assigned to ${chip.label}`
+          }
         >
           {/* The dot only when a run is actually behind the chip. `phaseGlyph` is
               `AgentsPanel/model.ts`'s, imported rather than restated: a second glyph table

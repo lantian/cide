@@ -130,6 +130,10 @@ function state(from: WireState): {
       return { phase: 'awaitingPermission', ...none }
     case 'paused':
       return { ...none, phase: 'paused', pausedSinceMs: ms(from.sinceUnixMs) }
+    // Restored from the registry's snapshot after a restart: no child, no code, nothing
+    // frozen — a row whose one affordance is Resume, which continues the conversation.
+    case 'interrupted':
+      return { phase: 'interrupted', ...none }
     case 'finished':
       return { ...none, phase: 'finished', exitCode: from.code }
     case 'failed':

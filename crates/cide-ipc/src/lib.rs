@@ -107,6 +107,7 @@ pub use agents::{
 };
 pub use tasks::{
     Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskNew, TaskStatus,
+    TaskStatusChange,
 };
 
 // --- M22: extensions, and the marketplaces they come from ---

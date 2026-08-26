@@ -482,6 +482,13 @@ export function FileTree({
    *
    * The body says the act is reversible, because it is. A dialog that implies otherwise about
    * a trash move is the kind of small lie that makes people stop reading dialogs.
+   *
+   * And because it is reversible, this is the one `ConfirmDestructive` caller that flips the
+   * default: Enter performs the move (`defaultButton: 'confirm'`), the way every desktop file
+   * manager answers it. Rule 3 — Cancel holds the focus so the reflexive Enter backs out — was
+   * written for the Git panel's rollbacks, which have no undo; applying it to a trash move made
+   * Delete, Enter silently do *nothing*, which reads as "the key is broken" precisely because
+   * the act is safe enough that nobody expects the dialog to resist them.
    */
   const askDelete = useCallback(
     (paths: readonly string[]) => {
@@ -503,6 +510,8 @@ export function FileTree({
           'Nothing is removed from disk.',
         files: [...paths],
         confirmLabel: paths.length > 1 ? `Move ${paths.length} items` : 'Move to Trash',
+        // Reversible act, so Enter confirms — see the header above and `ConfirmState`'s field.
+        defaultButton: 'confirm',
         run: () => {
           void fsApi
             .delete(project, [...paths])
@@ -1048,8 +1057,9 @@ export function FileTree({
    * Dismiss the trash confirmation, run whatever it was confirming, and give the tree back the
    * caret.
    *
-   * The last part is the one worth explaining. `ConfirmDestructive` focuses its Cancel button
-   * on mount, so answering it leaves the caret on a button that is about to be unmounted, i.e.
+   * The last part is the one worth explaining. `ConfirmDestructive` focuses its default button
+   * on mount (*Move to Trash* here — `defaultButton: 'confirm'`), so answering it leaves the
+   * caret on a button that is about to be unmounted, i.e.
    * on `<body>` — and Delete is a *repeatable* gesture. Without this, deleting two files in a
    * row means the second Delete goes nowhere and the tree looks like it stopped listening,
    * which is the exact "the key does nothing" report this panel is being fixed for. The
@@ -1818,6 +1828,32 @@ export function FileTree({
             : {
                 disabledReason:
                   'cide opens a file manager only on paths inside the project',
+              }),
+        },
+        {
+          /*
+           * *Refresh* — re-scan everything under this folder against the disk.
+           *
+           * The manual answer to a gap the watcher leaves on purpose: an ignored directory
+           * is never watched (a shown `target/` must cost no inotify descriptors — the
+           * settings hint under *Show ignored files* says so), so a build's churn in there
+           * drifts from the rows until something re-reads the disk. cide's own tree
+           * gestures fold themselves in; this is for everyone else's writes.
+           *
+           * A folder verb, like *Search in Folder* above — a refresh is about a subtree,
+           * and a file row has no subtree to re-scan. Disabled with a sentence rather than
+           * absent, per the house treatment: the two non-folder cases get different words
+           * because "click the folder instead" and "outside the project" are different
+           * problems.
+           */
+          id: 'refreshDir',
+          label: 'Refresh',
+          ...(row.isDir && rowRefusal === null
+            ? { run: () => void useFileTree.getState().refreshDir(row.path).catch(fail('Refresh')) }
+            : {
+                disabledReason: row.isDir
+                  ? 'cide refreshes only folders inside the project'
+                  : 'A file has nothing to re-scan — refresh its folder instead',
               }),
         },
         {

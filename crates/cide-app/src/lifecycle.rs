@@ -350,10 +350,20 @@ fn run_teardown(app: &AppHandle) {
     // M18: thaw before the ladder, and it is not optional. A `SIGSTOP`ped process does not *act*
     // on SIGHUP or SIGTERM — they go pending — so a paused session would spend the whole
     // `hup_grace + term_grace` (2.25 s) doing nothing and then be SIGKILLed, which is precisely
-    // the half-written transcript this module's header says the ladder exists to prevent. It is
-    // also why pause does not survive a restart, stated rather than attempted: the ladder ends
-    // the process either way, and a stopped-then-killed child is just a killed child.
+    // the half-written transcript this module's header says the ladder exists to prevent.
+    //
+    // The snapshot is written first, while the paused set and the run list still say what the
+    // user last arranged: the *processes* cannot survive the ladder, but the runs come back as
+    // `Interrupted` rows a Resume can continue — which is exactly what the ladder's graces buy,
+    // a transcript complete enough to resume from. (This paragraph used to say "pause does not
+    // survive a restart, stated rather than attempted"; the snapshot is the attempt.)
     if let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+        // **Sealed, then written** — one call, before the ladder. The first live restart found
+        // the race this order closes: the ladder's kills reached the reaper, the runs went
+        // `Finished`, and the coalescer's next flush overwrote this snapshot with the
+        // shutdown's own wreckage recorded as outcomes — two paused runs restored as history,
+        // and Resume had nothing to resume. The seal makes this write the last one.
+        agents.final_snapshot(&registry);
         agents.thaw_for_shutdown(&registry);
     }
 
@@ -1122,15 +1132,26 @@ fn watch_exit_with(session: &Arc<PtySession>, report: impl FnOnce(Exit) + Send +
 ///
 /// The notification policy, and the reason it is a *policy* rather than a constant in
 /// `cide-pty`: the crate below implements "announce jobs at least this long" and has no
-/// opinion about what long means. Ten seconds is the answer to the question this feature
-/// actually asks — *did I walk away from this?* A `git status` never reaches it, a build
-/// always does, and the cost of the threshold being slightly wrong is one notification too
-/// many or too few rather than a pane that behaves oddly.
+/// opinion about what long means. The number is the user's now —
+/// [`cide_ipc::TerminalSettings::job_notify_after_secs`], two minutes by default — because
+/// the question the threshold answers, *did I walk away from this?*, has an answer that
+/// depends on what somebody runs all day; it shipped as a ten-second constant and announced
+/// every medium `cargo build`, which is a notification per compile that nobody reads. The
+/// cost of the threshold being wrong is still only one notification too many or too few
+/// rather than a pane that behaves oddly.
 ///
 /// It gates the announcement of the *start*, not the end. See `cide_pty::jobs`, which carries
-/// the argument: nothing downstream can retract a `Busy`, because `awaitingRule.ts` keeps
-/// `ranATurn` sticky on purpose.
-pub const JOB_NOTIFY_AFTER: Duration = Duration::from_secs(10);
+/// the argument: an announced job's `Finished` maps to `AwaitingInput`, which raises the
+/// marker unconditionally, so nothing downstream can un-announce a job.
+///
+/// This helper is the one place the stored seconds become a `Duration`, read at spawn by
+/// `cmd::session` — and, when the setting moves, pushed into every *running* session by
+/// `cmd::settings::settings_set` through [`cide_pty::PtySession::set_job_announce_after`],
+/// because sessions outlive panes and a threshold fixed at spawn would make the settings row
+/// look dead in every shell already open.
+pub fn job_notify_after(settings: &cide_ipc::Settings) -> Duration {
+    Duration::from_secs(u64::from(settings.terminal.job_notify_after_secs))
+}
 
 /// Report a shell pane's foreground jobs as session state, so a finished `make` lights the
 /// same surfaces a finished Claude turn does.
@@ -1159,12 +1180,12 @@ pub fn watch_jobs(app: AppHandle, id: SessionId, session: &Arc<PtySession>) {
 /// that rebuilt it inline would assert nothing about what ships.
 ///
 /// `AwaitingInput` rather than `Idle` for a finished job, and the distinction is the whole
-/// point: `Idle` raises the marker only for a session the frontend saw go `Busy`, whereas
-/// `AwaitingInput` says "this pane wants you" outright. Both are true here — the `Busy` was
-/// emitted by this same watcher — but the direct answer does not depend on the frontend
-/// having been listening at the time, which a pane in a background project switched away
-/// from need not have been. It is the same choice `cide_claude::next_state` makes for
-/// `Stop`, and `awaitingRule.ts` already treats the state as unconditional.
+/// point: `Idle` raises the marker for nobody at all — `awaitingRule.ts` reads it as saying
+/// nothing about waiting, because raising on it was how typing `/clear` notified the user
+/// about the very pane they were typing into — whereas `AwaitingInput` says "this pane wants
+/// you" outright, wherever and whenever it lands. It is the same choice
+/// `cide_claude::next_state` makes for a `Stop` that ends work, and `awaitingRule.ts`
+/// treats the state as unconditional.
 fn job_state(event: JobEvent) -> SessionState {
     match event {
         JobEvent::Started => SessionState::Busy,
@@ -2214,6 +2235,22 @@ mod tests {
     }
 
     #[test]
+    fn the_default_job_threshold_is_two_minutes() {
+        // Pinned because the default is the feature's whole calibration and nothing else can
+        // see it: a wrong number here is not a failure anywhere, it is a `cargo build` that
+        // notifies on every compile (too low) or a walk-away build that never says done (too
+        // high). It lives in `cide_ipc::TerminalSettings` now; this asserts the conversion
+        // reads that field and that nobody quietly moves the default without meaning to.
+        assert_eq!(
+            job_notify_after(&cide_ipc::Settings::default()),
+            Duration::from_secs(120),
+        );
+        let mut settings = cide_ipc::Settings::default();
+        settings.terminal.job_notify_after_secs = 7;
+        assert_eq!(job_notify_after(&settings), Duration::from_secs(7));
+    }
+
+    #[test]
     fn an_unreadable_status_is_still_worth_a_log_line() {
         // The one case with no answer. It has to warn, because "this build could not tell"
         // is exactly the thing a user chasing a vanished pane needs to know.
@@ -2248,6 +2285,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: Some(SessionId::new()),
                 conversation: None,
+                conversation_since: None,
                 title: "secondary : claude".into(),
             },
         )
@@ -2263,6 +2301,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: Some(SessionId::new()),
                 conversation: None,
+                conversation_since: None,
                 title: "fixture : bash".into(),
             },
         )

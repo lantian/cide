@@ -5,18 +5,20 @@
  * {sidebar.view === 'tasks' && <TasksPanel project={activeProjectId} />}
  * ```
  *
- * # It mounts two things, and that is the shape of the change that made the card a modal
+ * # The open task's card is NOT mounted here any more
  *
- * `TasksPanelView` — the list, always — and, when a task is open, `TaskDetailModal` **beside**
- * it rather than in place of it. The card is an `OverlayCard`, which portals to `document.body`,
- * so it is not clipped by the 320px sidebar, is not capped by the tab panel's stacking context,
- * and leaves the board on screen behind its scrim. The list therefore never disappears while a
- * task is open, which is what makes the row-marking in the view worth drawing.
+ * It was — `TaskDetailModal`, beside the list — and that tied the card's existence to the Tasks
+ * panel being the sidebar view, which forced the Agents panel's task links to switch the sidebar
+ * before anything could open. The card is `TaskDetailHost`'s now, mounted from `App.tsx` outside
+ * every `sidebar.view` branch, so a task opened from a run row appears over whatever panel is
+ * showing. Its header carries the argument; what stays here is the list's half of the same
+ * gesture — `selected` still reaches the view, so the open task's row is still marked behind
+ * the card's scrim.
  *
- * The pair is mounted from here rather than from inside the view for the reason the whole file
- * exists: a portal cannot be server-rendered — `react-dom/server` throws on one — and rendering
- * the card from `TasksPanel.tsx` would take every board state, every group and both empty
- * screens out of `check-agents-render.mjs` along with it.
+ * The compose dialog is still mounted from here rather than from inside the view, for the
+ * reason the whole file exists: a portal cannot be server-rendered — `react-dom/server` throws
+ * on one — and rendering it from `TasksPanel.tsx` would take every board state, every group and
+ * both empty screens out of `check-agents-render.mjs` along with it.
  *
  * # Why this file exists at all
  *
@@ -31,37 +33,39 @@
  * a `useTasks` call moved down into the view would drag `@/ipc/client` — and with it
  * `@tauri-apps/api` — into a check whose whole value is that it needs neither.
  *
- * # `nowMs` is a prop, and the clock lives here
+ * # The clock left with the card
  *
- * The comment log prints ages ("4m ago"), so something has to tick. A `Date.now()` inside the
- * view would make its markup differ between two renders of the same fixture and the render
- * check could not digest it at all. The interval is 30 s rather than 1 s because the only thing
- * that moves faster than that is the seconds figure on a comment less than a minute old, and a
- * per-second repaint of a sidebar list for that is not a trade worth making. It is also re-armed
- * whenever the board changes, so a comment the user just wrote reads `0s ago` immediately rather
- * than inheriting the previous tick.
+ * The 30 s tick this host used to run fed exactly one reader: the comment log's ages, which
+ * are the card's. The list itself prints no relative time, so the tick moved to
+ * `TaskDetailHost` and this host reads the clock nowhere — which also means the list stops
+ * re-rendering twice a minute for a figure it never drew.
  *
- * # `runs` is empty, deliberately, until the Agents slice lands
+ * # `runs` and `roles` come from the agents store — the join this host was written waiting for
  *
- * `agentChip` takes the runs array and answers one of three things: a **live** run on this task
- * (lit, with its phase dot), the **assigned** role (dim), or nothing. With no runs it can only
- * ever answer the second or the third — which is the *correct* rendering of what this build
- * knows, not a stub: a task assigned to `developer` says so quietly, and cide never claims an
- * agent is working on it. `model.ts` says the same thing in its header. **Do not "fix" this by
- * inventing a run**; the fix is `agentsStore`, and when it lands this prop and `roles` are the
- * two lines that change.
+ * This header used to spend a paragraph on "`runs` is empty, deliberately, until the Agents
+ * slice lands", and the promised two-line change is now real: the host subscribes
+ * `useAgents((s) => s.roster)` and derives both props from it. `AgentsPanelHost` reaches the
+ * other way (it reads `useTasks` for its task titles) for the same reason — the two stores are
+ * two facts about one project, and each panel joins them at render. The years the paragraph
+ * was a promise are also why `check-agents-render.mjs` now greps this file for the
+ * subscription: the seam is exactly the one neither check mounts, and it shipped an
+ * empty-forever assignee dropdown once already.
  *
- * `roles` is empty for the same reason — it is the roster's `AgentDef.label` map. `agentChip`
- * falls back to printing the raw agent id, so an unassigned-role chip still reads correctly.
+ * With a roster that is not `ready` — disabled, empty, or nobody-has-looked — the props fall
+ * back to the empty constants, which is the *correct* rendering of what this window knows:
+ * `agentChip` answers the assigned role (dim) or nothing, and cide never claims an agent is
+ * working. `assigneeHint` is the sentence under the dropdown that keeps that emptiness from
+ * reading as the old bug.
  *
  * # Three pieces of state live here rather than in `tasksStore`
  *
- * The status filter, the armed delete, and the field the card has in edit. All three are
- * **transient gesture state** — which overlay is open, which button this window is looking at,
- * what is half-typed in this window's box — and that is the one category `docs/adr/0002` leaves
- * to the webview. None is durable, and none should reach another window: a second cide window
- * showing the same project must not find its list filtered, a delete armed, or a title field
- * open with somebody else's half-sentence in it.
+ * The status filter, the search query, and the armed delete for the list's row-level control.
+ * All three are **transient gesture state** — which overlay is open, which button this window
+ * is looking at, what is half-typed in this window's box — and that is the one category
+ * `docs/adr/0002` leaves to the webview. None is durable, and none should reach another window:
+ * a second cide window showing the same project must not find its list filtered or searched, or
+ * a delete armed. (The field the card has in edit moved to `TaskDetailHost` with the card — it
+ * is a claim about the card's controls, so it belongs to whatever mounts the card.)
  *
  * The store owns `selected` and `compose` instead, and both for the same reason, stated in their
  * own docs: they must **survive this panel unmounting**. The sidebar can be toggled shut or
@@ -69,18 +73,16 @@
  * back — which is the silent data loss the compose dialog exists to prevent, arriving by a
  * different door.
  */
-import { memo, useCallback, useEffect, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { fsReveal, type ProjectId } from '@/ipc/client'
 import { notifyFailure } from '@/chrome/notices'
 import { useTasks } from '@/sidebar/tasksStore'
+import { useAgents } from '@/sidebar/agentsStore'
+import { rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TasksPanelView } from './TasksPanel'
-import { TaskDetailModal } from './TaskDetail'
 import { TaskComposeModal } from './TaskCompose'
-import { activeEdit, armedDelete, filterAfterCreate, openTask } from './model'
-import type { ArmedDelete, FieldEdit, RunRef, StatusFilter } from './model'
-
-/** How often the comment log's ages are recomputed. See the header for why it is not 1 s. */
-const TICK_MS = 30_000
+import { assigneeHint, filterAfterCreate, queryAfterCreate } from './model'
+import type { ArmedDelete, RunRef, StatusFilter } from './model'
 
 export interface TasksPanelProps {
   /** The active project, or `null` — in a detached-pane window, and before one is open. */
@@ -107,7 +109,6 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
   const setDraft = useTasks((s) => s.setDraft)
   const endCompose = useTasks((s) => s.endCompose)
   const createTask = useTasks((s) => s.create)
-  const editTask = useTasks((s) => s.edit)
   /*
    * `task_delete`'s only caller. It has been a registered command with a `client.ts` wrapper and
    * a working store action since M18 and **nothing rendered a control that reached it** — the
@@ -116,6 +117,18 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    * when the deleted task was the open one, so the card falls back to the list on its own.
    */
   const removeTask = useTasks((s) => s.remove)
+
+  /*
+   * The join with the agents store — see the header. Both selectors return stored values
+   * (`check:selectors`' rule); `roles` is derived, so it is memoised on the roster's identity,
+   * which `adopt` replaces wholesale on every broadcast. The three run-strip handlers that used
+   * to sit beside `roster` moved to `TaskDetailHost` with the card — the strip is the card's.
+   */
+  const roster = useAgents((s) => s.roster)
+  const roles = useMemo(() => rosterRoles(roster), [roster])
+  /* `RunView` is structurally a `RunRef` — the five fields the chip reads, `phase` opaque. */
+  const runs: readonly RunRef[] = roster.kind === 'ready' ? roster.runs : NO_RUNS
+  const hint = assigneeHint(roster.kind)
 
   /**
    * Which status the list is narrowed to, or `null` for the whole board.
@@ -139,6 +152,26 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
   const [filter, setFilter] = useState<StatusFilter>(null)
 
   /**
+   * The text the list is narrowed by, `''` for none.
+   *
+   * Transient gesture state like the filter, and in this window only for the filter's reason: a
+   * second cide window on the same project must not find its list narrowed by somebody else's
+   * half-typed word.
+   *
+   * # Unlike the filter, it does NOT survive a project switch
+   *
+   * The filter's argument for surviving is that a status is not project-scoped — every board
+   * has the same four, so the value cannot mean something else after the switch. A query is the
+   * opposite: it is a sentence about one project's *content*, `selected`'s situation rather
+   * than the filter's, and carried across it silently narrows the new project's board by words
+   * typed about the old one. The filtered-to-nothing screen would name the query, so the
+   * failure is survivable — but a narrowing the user never asked of *this* project is wrong
+   * even when it happens to match something.
+   */
+  const [query, setQuery] = useState('')
+  useEffect(() => setQuery(''), [project])
+
+  /**
    * The delete the user has armed, and the board they armed it against.
    *
    * `AgentsPanelHost`'s `integrateArmed`, one panel over, and the same reasoning: the act is
@@ -155,35 +188,6 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    */
   const [deleteArmed, setDeleteArmed] = useState<ArmedDelete | null>(null)
 
-  /**
-   * The one field the card has in edit, and what has been typed into it.
-   *
-   * # Why the draft is here and not in the DOM
-   *
-   * The card's fields used to be uncontrolled — `defaultValue`, committing on blur — which was
-   * right for a form and is wrong for a read-first card: *is this field dirty* is now consulted
-   * by three separate gestures (opening another field, the scrim, Escape), and a decision that
-   * reads the DOM cannot be driven by `check-agents.mjs`. `model.ts` decides all three from this
-   * value, and the component executes what it is handed.
-   *
-   * The objection the old comment raised against controlled fields does not apply. It was about
-   * a field controlled *by the board* — `value={task.title}` — which a `tasks-changed` landing
-   * mid-sentence would overwrite. This is the user's own text, derived from nothing, so a
-   * snapshot cannot touch it; `activeEdit` is what decides when it stops applying, and a new
-   * `rev` deliberately is not one of those times.
-   *
-   * # Cleared when the open task changes, and not when the board does
-   *
-   * `armedDelete` is cleared on any board change because an arming is a claim about a screen
-   * that has been replaced. A draft is not: an agent appending a comment to the task somebody is
-   * retitling must not take the title away from them. What *does* clear it is the card closing
-   * or opening on a different task — including the store clearing `selected` when the open task
-   * is deleted by another writer, which is the case this effect exists for. `activeEdit` covers
-   * the frame before the effect runs, for the reason `armedDelete`'s pure gate does.
-   */
-  const [editing, setEditing] = useState<FieldEdit | null>(null)
-  useEffect(() => setEditing(null), [selected])
-
   /*
    * Disarm whenever the board moves, so a stale arming does not sit in state waiting for a `rev`
    * to come round again. `board` is the store's object identity, and `newerBoard` deliberately
@@ -191,16 +195,6 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    * changes nothing disarms nothing, and only a real change does.
    */
   useEffect(() => setDeleteArmed(null), [board])
-
-  const [nowMs, setNowMs] = useState(() => Date.now())
-  useEffect(() => {
-    setNowMs(Date.now())
-    const timer = setInterval(() => setNowMs(Date.now()), TICK_MS)
-    return () => clearInterval(timer)
-    // `board` on purpose: a new comment should be `0s ago` on the frame it appears, not on the
-    // next tick. It is the store's object identity, and `newerBoard` deliberately keeps that
-    // identical when it drops a snapshot, so a broadcast that changes nothing re-arms nothing.
-  }, [board])
 
   /*
    * `.cide/tasks.json`'s path, which only the two screens that print it have. `undefined`
@@ -223,27 +217,18 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
     void done.catch(notifyFailure)
   }, [])
 
-  /*
-   * The open task, and the edit that still applies to it — both resolved **once**, here, so the
-   * list's row marking and the card cannot disagree about which task is open, and so the pure
-   * gates run on every render rather than only in the effect above. `openTask` returns `null` on
-   * a board that is not `ready`, which is what keeps the card off screen over an unparseable
-   * tracker without a second `canWrite` call.
-   */
-  const open = openTask(board, selected)
-  const edit = activeEdit(board, open, editing)
-
   return (
     <>
       <TasksPanelView
         project={project}
         board={board}
-        /* See the header: empty is the honest value until the Agents store exists. */
-        runs={NO_RUNS}
-        roles={NO_ROLES}
+        runs={runs}
+        roles={roles}
         selected={selected}
         filter={filter}
         onFilter={setFilter}
+        query={query}
+        onQuery={setQuery}
         deleteArmed={deleteArmed}
         /*
          * Arming reads `board.rev` from *this* render — the same board object the view below was
@@ -298,7 +283,8 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
       {compose !== null && (
         <TaskComposeModal
           draft={compose}
-          roles={NO_ROLES}
+          roles={roles}
+          assigneeHint={hint}
           busy={creating}
           onDraft={setDraft}
           onCancel={endCompose}
@@ -306,75 +292,28 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
             guarded(
               createTask(draft).then(() => {
                 setFilter((current) => filterAfterCreate(current, draft.status))
+                // The search's half of the same rule: a query the new row does not match would
+                // hide the create exactly the way a wrong filter would. `queryAfterCreate`.
+                setQuery((current) => queryAfterCreate(current, draft))
               }),
             )
           }}
         />
       )}
       {/*
-        * The card. Mounted beside the list, never instead of it — see the header.
-        *
-        * `runs` and `roles` are the same empty constants the list gets, for the same stated
-        * reason, and `onOpenRun`/`onPauseRun`/`onResumeRun` are deliberately absent: each acts on
-        * a run id, and with no runs no chip is ever lit, so the live-run strip that carries them
-        * is never drawn. Passing handlers nothing can reach would be three more commands with no
-        * caller; passing ones that did nothing would be worse.
-        *
-        * The five writes are each one `TaskEdit` variant — an enum rather than a patch of
-        * options, for the reason its Rust doc gives: "assign to nobody" under a patch would need
-        * `Option<Option<AgentId>>`, which serialises as two spellings of the same absence. The
-        * card sends exactly one of them per gesture, which is what makes the per-field posture
-        * fit the wire rather than fight it.
+        * The card is NOT here — `TaskDetailHost` mounts it, from `App.tsx`, so it opens over
+        * whatever panel selected the task. Its `TaskEdit` writes and the live-run strip's
+        * handlers moved with it; see both headers.
         */}
-      {open !== null && (
-        <TaskDetailModal
-          /*
-           * Keyed on the task id. Nothing in the card is uncontrolled any more except the comment
-           * composer — and that is precisely what the key is for now: half a comment aimed at
-           * `t-14` must not still be in the box when `t-15` opens.
-           */
-          key={open.id}
-          task={open}
-          runs={NO_RUNS}
-          roles={NO_ROLES}
-          nowMs={nowMs}
-          editing={edit}
-          onEditing={setEditing}
-          onClose={() => select(null)}
-          deleteArmed={armedDelete(board, deleteArmed) === open.id}
-          onDeleteArm={(task) => {
-            if (board.kind !== 'ready') return
-            setDeleteArmed({ task, rev: board.rev })
-          }}
-          onDelete={(task) => {
-            setDeleteArmed(null)
-            guarded(removeTask(task))
-          }}
-          onSetTitle={(task, title) => guarded(editTask(task, { kind: 'setTitle', title }))}
-          onSetStatus={(task, status) => guarded(editTask(task, { kind: 'setStatus', status }))}
-          onSetAssignee={(task, agent) => guarded(editTask(task, { kind: 'assign', agent }))}
-          onSetBody={(task, body) => guarded(editTask(task, { kind: 'setBody', body }))}
-          onAddComment={(task, text) => guarded(editTask(task, { kind: 'comment', text }))}
-          /* The author is not sent and cannot be: `task_edit` passes `TaskAuthor::User`, decided
-             by the command rather than by this payload, which is what makes the Rust guard
-             unforgeable rather than merely checked. See `TaskComment`. */
-          onEditComment={(task, comment, text) =>
-            guarded(editTask(task, { kind: 'editComment', id: comment, text }))
-          }
-          onDeleteComment={(task, comment) =>
-            guarded(editTask(task, { kind: 'deleteComment', id: comment }))
-          }
-        />
-      )}
     </>
   )
 }
 
 /*
- * Module-level constants rather than fresh literals in the JSX. `TasksPanelView` re-renders on
+ * A module-level constant rather than a fresh literal in the JSX. `TasksPanelView` re-renders on
  * every tick of the clock above, and a new `[]` each time would be a new prop identity for a
  * value that has not changed — harmless today, and exactly the thing that stops being harmless
- * the moment anything downstream memoises on it.
+ * the moment anything downstream memoises on it. This is the non-`ready` fallback only; the
+ * ready value is the roster's own array, whose identity `adopt` already manages.
  */
 const NO_RUNS: readonly RunRef[] = []
-const NO_ROLES: Readonly<Record<string, string>> = {}

@@ -45,18 +45,21 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { TasksPanelView } from './TasksPanel'
 import { TaskDetail } from './TaskDetail'
 import { TaskCompose } from './TaskCompose'
+import { MentionList } from './MentionTextarea'
 import {
   CARD_STORIES,
   COMPOSE_STORIES,
+  MENTION_STORIES,
   TASKS_STORIES,
   type CardStoryName,
   type ComposeStoryName,
+  type MentionStoryName,
   type TasksStoryName,
 } from './fixture'
 
 /** What the check script asserts on. */
 export interface TasksDigest {
-  story: TasksStoryName | CardStoryName | ComposeStoryName
+  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName
   /** The header's right-hand figure. Empty when `metaFigure` withheld it. */
   meta: string
   claim: string | null
@@ -79,9 +82,18 @@ export interface TasksDigest {
   chipClasses: string[]
   /** Each chip's `data-lit`, in the same order. */
   chipLit: string[]
+  /**
+   * Each chip's `data-tone`, in the same order. `lit` alone cannot tell stalled from plain
+   * assigned — both are unlit — and the stalled reading only exists as the pair
+   * (`lit: false`, `tone: 'attention'`), so the check needs both discriminators in the digest
+   * to assert the pair rather than half of it.
+   */
+  chipTone: string[]
   /** Each chip's label. */
   chipLabels: string[]
-  /** Comment log lines, in the order drawn: `<author kind>|<text>`. */
+  /** Comment log lines, in the order drawn: `<author kind>|<text>`. The text is the rendered
+   *  markdown flattened back to prose, so `**bold**` digests as `bold` — which is itself the
+   *  assertion that the syntax was consumed rather than printed. */
   comments: string[]
   /**
    * How many per-comment Edit and Delete controls are drawn, and how many action rows hold them.
@@ -121,6 +133,23 @@ export interface TasksDigest {
   /** Whether the card draws an explicit close control. */
   close: boolean
   /**
+   * The status log. (M27) `historyDrawn` is whether the disclosure exists at all — it must not
+   * for a task that never moved. `historyOpen` is whether it is expanded, and the load-bearing
+   * assertion is that it never is: collapsed-by-default is the whole posture, and an `open`
+   * that crept onto the `<details>` would ship every card with its audit trail unfolded.
+   * `history` is one entry per row, in the order drawn: `<from> → <to>|<author>`.
+   */
+  historyDrawn: boolean
+  historyOpen: boolean
+  history: string[]
+  /**
+   * Every timestamp on the card — comment heads and history rows — as its rendered text. (M27)
+   *
+   * Asserted by *shape* (`HH:MM:SS (… ago)`) rather than by value, because the clock half is
+   * local time and the render check runs in whatever timezone the machine has.
+   */
+  times: string[]
+  /**
    * Whether the compose dialog is on screen at all, and what it drew. (M21)
    *
    * `composeControls` counts `<input>`/`<textarea>`/`<select>` inside the dialog's rows, exactly
@@ -148,6 +177,11 @@ export interface TasksDigest {
   runStrip: boolean
   /** The status filter's toggles, in the order drawn: `<label>|<on>`. Empty when not drawn. */
   filters: string[]
+  /** Whether the search box is on screen, and what is typed in it. */
+  search: boolean
+  searchValue: string
+  /** Whether the box's clear control is drawn — it must exist exactly when text does. */
+  searchClear: boolean
   /** Whether the filtered-to-nothing block is on screen. Never true beside a populated list. */
   noMatch: boolean
   /**
@@ -159,6 +193,45 @@ export interface TasksDigest {
    */
   deletes: number
   deleteConfirms: number
+  /**
+   * The sentence under the assignee control saying why the list is short, or `''` when none is
+   * drawn. The dropdown shipped empty-by-wiring-bug for one whole milestone; the hint is what
+   * makes a legitimately-short list look different from that, and this field is its gate.
+   */
+  assigneeHint: string
+  /** Every `<option>` on screen, in order. Only the assignee `<select>` renders any. */
+  assigneeOptions: string[]
+  /**
+   * The @mention popup's rows: `<text>|<aria-selected>`, in the order drawn. The scored order
+   * and the exactly-one-highlight rule are both read off this.
+   */
+  mentionRows: string[]
+  /**
+   * How many formatting-toolbar buttons are on screen. (M27)
+   *
+   * Counted rather than boolean because the toolbar rides `MentionTextarea` and every
+   * markdown-bearing textarea must carry one: the card at rest has exactly the composer's
+   * eight, a card with its body in edit has that editor's eight as well, and a story that
+   * drifts to "some textareas have tools" is the state the count makes visible.
+   */
+  mdTools: number
+  /**
+   * What the rendered markdown actually produced, as element counts over the whole story. (M27)
+   *
+   * The pair of claims these carry: markdown *renders* (a story whose fixture says `**bold**`
+   * must count a `<strong>`) and markdown renders **as elements, never as an HTML string** —
+   * these are matched against real tags in server-rendered markup, which no
+   * `dangerouslySetInnerHTML` output would ever have to contain.
+   */
+  md: {
+    strong: number
+    em: number
+    code: number
+    headings: number
+    items: number
+    fences: number
+    links: number
+  }
   /** See the Agents digest: hooked-but-unstyled elements, plus `class` lists carrying
    *  the literal token `undefined`. */
   unclassed: number
@@ -174,11 +247,14 @@ const digests: TasksDigest[] = [
   ...(Object.keys(COMPOSE_STORIES) as ComposeStoryName[]).map((story) =>
     digest(story, renderToStaticMarkup(<TaskCompose {...COMPOSE_STORIES[story]} />)),
   ),
+  ...(Object.keys(MENTION_STORIES) as MentionStoryName[]).map((story) =>
+    digest(story, renderToStaticMarkup(<MentionList {...MENTION_STORIES[story]} />)),
+  ),
 ]
 console.log(JSON.stringify(digests))
 
 function digest(
-  story: TasksStoryName | CardStoryName | ComposeStoryName,
+  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName,
   html: string,
 ): TasksDigest {
   /*
@@ -210,12 +286,15 @@ function digest(
     rows,
     chipClasses: [...html.matchAll(/class="([^"]*)"\s+data-audit="tasksChip"/g)].map((m) => m[1] ?? ''),
     chipLit: [...html.matchAll(/data-audit="tasksChip"[^>]*data-lit="([^"]*)"/g)].map((m) => m[1] ?? ''),
+    chipTone: [...html.matchAll(/data-audit="tasksChip"[^>]*data-tone="([^"]*)"/g)].map((m) => m[1] ?? ''),
     chipLabels: all(html, 'tasksChip').map((chip) =>
       text(/class="[^"]*chipLabel[^"]*"[^>]*>([^<]*)</.exec(chip)?.[1] ?? ''),
     ),
+    /* The whole `tasksCommentText` element, not a slice-to-`</p>`: a comment renders as
+       markdown now, so its container holds block elements of its own and the first close tag
+       is no longer the end of the text. */
     comments: all(html, 'tasksComment').map(
-      (entry) =>
-        `${attr(entry, 'data-author')}|${text(/class="[^"]*logText[^"]*"[^>]*>([\s\S]*?)<\/p>/.exec(entry)?.[1] ?? '')}`,
+      (entry) => `${attr(entry, 'data-author')}|${text(all(entry, 'tasksCommentText')[0] ?? '')}`,
     ),
     commentEdits: count(html, 'data-audit="tasksCommentEdit"'),
     commentDeletes: count(html, 'data-audit="tasksCommentDelete"'),
@@ -234,6 +313,16 @@ function digest(
       (value) => `${attr(value, 'data-field')}|${text(value)}`,
     ),
     close: html.includes('data-audit="tasksClose"'),
+    historyDrawn: html.includes('data-audit="tasksHistory"'),
+    historyOpen: /<details[^>]*data-audit="tasksHistory"[^>]*\sopen(?:=|\s|>)/.test(html),
+    history: all(html, 'tasksHistoryRow').map((row) => {
+      const move = text(/class="[^"]*historyMove[^"]*"[^>]*>([\s\S]*?)<\/span>/.exec(row)?.[1] ?? '')
+      const by = text(/class="[^"]*historyBy[^"]*"[^>]*>([\s\S]*?)<\/span>/.exec(row)?.[1] ?? '')
+      return `${move}|${by}`
+    }),
+    times: [
+      ...html.matchAll(/class="[^"]*(?:logTime|historyTime)[^"]*"[^>]*>([\s\S]*?)<\/span>/g),
+    ].map((m) => text(m[1] ?? '')),
     compose: html.includes('data-audit="taskCompose"'),
     composeControls: all(html, 'taskComposeRow').reduce(
       (n, row) => n + [...row.matchAll(/<(input|textarea|select)\b/g)].length,
@@ -258,9 +347,37 @@ function digest(
     filters: all(html, 'tasksFilter').map(
       (button) => `${text(/>([^<]*)<\/button>/.exec(button)?.[1] ?? '')}|${attr(button, 'data-on')}`,
     ),
+    search: html.includes('data-audit="tasksSearchInput"'),
+    /* The whole `<input>` tag rather than `all()`: a void element has no closing tag for
+       `outer` to count, and `value` is an attribute, so the tag is all there is to read. */
+    searchValue: attr(
+      /<input[^>]*data-audit="tasksSearchInput"[^>]*>/.exec(html)?.[0] ?? '',
+      'value',
+    ),
+    searchClear: html.includes('data-audit="tasksSearchClear"'),
     noMatch: html.includes('data-audit="tasksNoMatch"'),
     deletes: count(html, 'data-audit="tasksDelete"'),
     deleteConfirms: count(html, 'data-audit="tasksDeleteConfirm"'),
+    assigneeHint: text(all(html, 'tasksAssigneeHint')[0] ?? ''),
+    assigneeOptions: [...html.matchAll(/<option[^>]*>([^<]*)<\/option>/g)].map((m) =>
+      text(m[1] ?? ''),
+    ),
+    mdTools: count(html, 'data-audit="tasksMdTool"'),
+    md: {
+      strong: count(html, '<strong'),
+      em: [...html.matchAll(/<em[\s>]/g)].length,
+      code: count(html, 'mdCode'),
+      headings: count(html, 'mdHeading'),
+      items: count(html, '<li'),
+      fences: count(html, 'mdPre'),
+      links: count(html, 'mdLink'),
+    },
+    mentionRows: all(html, 'tasksMentionPopup').flatMap((popup) =>
+      [...popup.matchAll(/<div[^>]*role="option"[^>]*>([\s\S]*?)<\/div>/g)].map((m) => {
+        const selected = /aria-selected="([^"]*)"/.exec(m[0])?.[1] ?? ''
+        return `${text(m[1] ?? '')}|${selected}`
+      }),
+    ),
     unclassed: unclassed(html),
   }
 }

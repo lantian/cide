@@ -37,6 +37,7 @@ use cide_ipc::{ProjectId, TaskAuthor, TaskBoard, TaskEdit, TaskId, TaskNew};
 use cide_tasks::TaskStore;
 use tauri::State;
 
+use crate::task_triggers::{self, TaskMutation};
 use crate::tasks_state::{self, TasksStores};
 use crate::workspace_state::WorkspaceState;
 
@@ -106,14 +107,31 @@ pub async fn task_new(
     let project = req.project;
     let root = tasks_state::project_root(&state, project)?;
     let stores = Arc::clone(&stores);
-    let store = blocking(move || {
+    let (store, mutation) = blocking(move || {
         let store = tracker(&stores, project, root);
+        // Captured before `req` is consumed: the creation body is the fresh text a mention
+        // trigger may scan — see `TaskMutation::fresh_text`.
+        let fresh_text: Vec<String> = req.body.clone().into_iter().collect();
+        // A creation that names an assignee is an assignment gesture — the compose form's
+        // dropdown was just used — so the policy dispatches it as one.
+        let assign_gesture = req.agent.is_some();
         // `TaskAuthor::User`: see the module header for why no caller may name an author.
-        store.create(&req, TaskAuthor::User)?;
-        Ok(store)
+        let task = store.create(&req, TaskAuthor::User)?;
+        let mutation = TaskMutation {
+            before: None,
+            after: task,
+            author: TaskAuthor::User,
+            assign_gesture,
+            fresh_text,
+        };
+        Ok((store, mutation))
     })
     .await?;
-    Ok(answer(&app, project, &store))
+    let board = answer(&app, project, &store);
+    // After `answer`: the caller's board and the other windows' broadcast never wait on the
+    // trigger, which does its own disk read on the blocking pool.
+    task_triggers::consider(&app, project, vec![mutation]);
+    Ok(board)
 }
 
 /// Apply one change to one task.
@@ -132,13 +150,39 @@ pub async fn task_edit(
 ) -> Result<TaskBoard> {
     let root = tasks_state::project_root(&state, project)?;
     let stores = Arc::clone(&stores);
-    let store = blocking(move || {
+    let (store, mutation) = blocking(move || {
         let store = tracker(&stores, project, root);
-        store.edit(&task, edit, TaskAuthor::User)?;
-        Ok(store)
+        // The prose this mutation introduces, read before `edit` is consumed. Everything else —
+        // a status flip, a title, a comment edit — carries none, so an old mention in the stored
+        // body cannot re-fire.
+        let fresh_text: Vec<String> = match &edit {
+            TaskEdit::SetBody { body } => vec![body.clone()],
+            TaskEdit::Comment { text } => vec![text.clone()],
+            _ => Vec::new(),
+        };
+        // The dropdown's own edit shape, and only it: `Assign { Some }` is the user picking a
+        // role — the revive gesture the policy dispatches even when the role is unchanged.
+        // `Assign { None }` is an unassign and stays inert.
+        let assign_gesture = matches!(&edit, TaskEdit::Assign { agent: Some(_) });
+        // `before` under a second lock take, immediately ahead of the edit. A writer landing in
+        // the gap costs at worst one spurious or missed trigger (deduped against live runs
+        // anyway) and corrupts nothing; holding one lock across both would mean a closure API
+        // the store deliberately does not offer for edits.
+        let before = store.get(&task);
+        let after = store.edit(&task, edit, TaskAuthor::User)?;
+        let mutation = TaskMutation {
+            before,
+            after,
+            author: TaskAuthor::User,
+            assign_gesture,
+            fresh_text,
+        };
+        Ok((store, mutation))
     })
     .await?;
-    Ok(answer(&app, project, &store))
+    let board = answer(&app, project, &store);
+    task_triggers::consider(&app, project, vec![mutation]);
+    Ok(board)
 }
 
 /// Remove a task.

@@ -1102,6 +1102,7 @@ mod tests {
             role,
             session: session.then(SessionId::new),
             conversation: None,
+            conversation_since: None,
             title: title.into(),
         }
     }
@@ -1424,6 +1425,7 @@ mod tests {
                     deleted: false,
                 })
                 .collect(),
+            history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 2,
@@ -1506,6 +1508,7 @@ mod tests {
                 model: None,
                 unavailable: unavailable.map(str::to_string),
                 max_concurrent: 1,
+                worktree: true,
             },
             origin: PathBuf::from(format!("/p/.cide/agents/{id}.md")),
             shadows: None,

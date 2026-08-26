@@ -1,7 +1,7 @@
 /**
  * The Tasks panel's pure core: the status vocabulary, the grouping, the status filter, the
- * rev-drop rule, the gate on an armed delete, and the chip that says which agent is on a task
- * right now. (M18)
+ * text search, the rev-drop rule, the gate on an armed delete, and the chip that says which
+ * agent is on a task right now. (M18)
  *
  * # The Tasks panel does not depend on subagents being enabled
  *
@@ -204,6 +204,21 @@ export interface CommentView {
 }
 
 
+/**
+ * One status transition. Structural restatement of `TaskStatusChange`. (M27)
+ *
+ * `from`/`to` are `TaskStatus` by annotation and a hand-editable file by fact, the same promise
+ * every wire status carries — which is why the card renders them through `statusLabel`, whose
+ * guard answers `Unknown` rather than throwing on a value a future cide wrote.
+ */
+export interface StatusChangeView {
+  from: TaskStatus
+  to: TaskStatus
+  by: CommentAuthor
+  /** `TaskStatusChange::atUnixMs`, converted from `bigint` by `adapt.ts`. */
+  atMs: number
+}
+
 /** One task, as the panel draws it. Structural restatement of `Task`. */
 export interface TaskView {
   /** `t-17`. Short on purpose: agents quote task ids inside prompts and comments. */
@@ -222,6 +237,14 @@ export interface TaskView {
   agent: string | null
   /** Oldest first on the wire; [`commentOrder`] is the defence against a file that is not. */
   comments: readonly CommentView[]
+  /**
+   * Every status transition, oldest first; [`historyOrder`] is the same defence. (M27)
+   *
+   * Recorded in Rust where the mutation is applied, so "by whom" is the connection's identity
+   * and not a claim in a payload. The card draws it **collapsed** — it is the log you need
+   * rarely and must be able to trust absolutely when you do.
+   */
+  history: readonly StatusChangeView[]
   /**
    * Who asked for this task. Structural restatement of `Task::createdBy`.
    *
@@ -366,7 +389,14 @@ export interface Chip {
   label: string
   /** True only when a run that is *working* on this task — see [`WORKING_PHASES`] — backs it. */
   lit: boolean
-  /** `assigned` exactly when `lit` is false. `attention` is a live run awaiting permission. */
+  /**
+   * With `lit` true: `attention` is a live run awaiting permission, `live` is every other
+   * working phase. With `lit` false: `assigned` is a plain assignment, and `attention` is the
+   * **stalled** reading — a `doing` task whose role has no run engaged on it (see
+   * [`agentChip`]'s fourth arm). The pair is the vocabulary on purpose: a fourth `ChipTone`
+   * member would let a view render stalled without consulting `lit`, and collapsing the two
+   * discriminators is exactly what the type exists to prevent.
+   */
   tone: ChipTone
   /** The run's phase verbatim, unvalidated, or `null` when only an assignment backs the chip. */
   phase: string | null
@@ -394,14 +424,41 @@ function roleLabel(roles: Readonly<Record<string, string>>, id: string | null): 
 /**
  * **The cross-link, and the one place the two directions meet.**
  *
- * A *live run* on this task wins and is marked `lit`; otherwise the assigned role is marked
- * dim; otherwise there is nothing to say and the answer is `null`. **Three renderings for three
+ * A *live run* on this task wins and is marked `lit`; otherwise a `doing` task whose role has
+ * no run engaged on it is marked **stalled**; otherwise the assigned role is marked dim;
+ * otherwise there is nothing to say and the answer is `null`. **Four renderings for four
  * facts.** A chip that looked the same either way would claim an exited agent is still working,
  * which is the single wrong statement this panel is in a position to make: the row would be
  * telling the user that work is under way when the process is gone and nothing is coming.
  *
+ * # The stalled reading, and its exact boundary
+ *
+ * The orchestrator's own debug notes named the gap: a killed run comments nothing and resets
+ * nothing, so the board showed `doing`, zero comments, no run — "a state that is
+ * indistinguishable from *just started* without manually inspecting the worktree", and one task
+ * was orphaned that way three times. This arm is the board saying it out loud. The boundary,
+ * each edge a decision:
+ *
+ * * **Only `doing`.** An assigned `todo` task is simply not started — assignment auto-starts a
+ *   run, but a project with agents off, a full queue snapshot, or a plain hand-assignment are
+ *   all ordinary; `review` and `done` are past the point where a missing run means anything.
+ *   `doing` is the one status that *claims* work is under way, so it is the one status whose
+ *   claim can be false.
+ * * **A `queued` run suppresses it.** Queued is not working — the chip stays unlit — but the
+ *   system is on the task and will start it when a slot frees; stalled would say "nobody is
+ *   coming" about a run that is literally next.
+ * * **An `idle` run suppresses it.** The child is alive at its prompt, one retry or follow-up
+ *   from moving, and the turn-end nudge has already routed that fact to the orchestrator; a
+ *   stalled flag would double-report a state that has a live handle.
+ * * **An `interrupted` run does NOT suppress it.** Its child died with a cide restart and
+ *   nothing moves until a human presses Resume — which is precisely what the attention tone
+ *   asks for. The Agents panel shows the same fact on the run's own row; this is the *task's*
+ *   side of it, because the board is what the orchestrator and the user actually read.
+ *   `finished`, `failed` and any phase this build has never heard of are the same answer for
+ *   the same reason: no engaged run, claim false, say so.
+ *
  * The list row and the detail strip both call this, so they cannot disagree about which of the
- * three a task is in.
+ * four a task is in.
  *
  * Among several live runs on one task, an `awaitingPermission` one wins. That is the only run
  * state that is a call to action, and hiding it behind a sibling that merely happens to be
@@ -445,6 +502,21 @@ export function agentChip(
 
   const assigned = roleLabel(roles, task.agent)
   if (assigned === null) return null
+
+  /*
+   * The stalled arm — see the doc's boundary. Working phases cannot reach this line (the live
+   * branch above claimed them), so "engaged" here is only the two quiet-but-alive shapes:
+   * queued (the system is on it) and idle (a live child, one prompt from moving). The literal
+   * `'doing'` is deliberate rather than `groupOf`: a rogue status is *drawn* under Todo, and a
+   * stall claim about a status this build cannot read would be an attention flag on a guess.
+   */
+  const engaged = runs.some(
+    (run) => run.task === task.id && (run.phase === 'queued' || run.phase === 'idle'),
+  )
+  if (task.status === 'doing' && !engaged) {
+    return { label: assigned, lit: false, tone: 'attention', phase: null, run: null, session: null }
+  }
+
   return { label: assigned, lit: false, tone: 'assigned', phase: null, run: null, session: null }
 }
 
@@ -497,42 +569,112 @@ export function matchesFilter(task: TaskView, filter: StatusFilter): boolean {
   return groupOf(task) === filter
 }
 
+/* ------------------------------------------------------------------------------ the search */
+
+/*
+ * The one definition of "this text contains that query", shared by [`matchesQuery`] and
+ * [`queryAfterCreate`] so the two cannot disagree about what a hit is — the same one-answer
+ * discipline `groupOf` exists for, one feature over.
+ */
+function hitsQuery(q: string, texts: readonly string[]): boolean {
+  return texts.some((text) => text.toLowerCase().includes(q))
+}
+
 /**
- * Why the list has nothing in it — **and the two answers are different sentences**.
+ * Does this task survive the search box?
+ *
+ * **`''` is the absence of a search**, the way `null` is the absence of a [`StatusFilter`] —
+ * but spelled as the empty string rather than as `null`, because the query *is* a text box's
+ * value and a text box has no null: the state the control rests in has to be the state that
+ * matches everything, or clearing the box would need a second gesture. Whitespace counts as
+ * absent too, so a stray space cannot blank the board with nothing visibly typed.
+ *
+ * **Case-insensitive substring, and deliberately not the pickers' fuzzy scoring.** A scored
+ * match wants to *rank*, and the list's order is already spoken for — recency, the same with or
+ * without a query (see [`groups`]) — so a relevance order would make rows jump as the query
+ * grew. A subsequence matcher bolted onto a list that must keep an order of its own would also
+ * surface rows for queries that visibly contain none of the typed text, with no score on screen
+ * to explain them; a substring either is in the row or is not, which is the only kind of match
+ * a user can verify at a glance.
+ *
+ * **Over the id, the title and the body — and not the comments.** The id because it is on the
+ * row and agents quote it in prompts, so "t-14" must find t-14. The body because it is the
+ * statement of the work, which is what a user half-remembering a task actually recalls. The
+ * comments are excluded on purpose: a hit there would draw a row whose visible line contains
+ * nothing the user typed — a match with an invisible reason — and the log is the noisiest,
+ * most model-authored text in the tracker, so it is also where a short query matches most and
+ * means least. Searching the conversation is a different feature from finding a task.
+ *
+ * Total, and never throws: every field read is a `string` by construction, and a rogue status
+ * plays no part in it, so a task this build cannot place is still findable.
+ */
+export function matchesQuery(task: TaskView, query: string): boolean {
+  const q = query.trim().toLowerCase()
+  if (q === '') return true
+  return hitsQuery(q, [task.id, task.title, task.body])
+}
+
+/**
+ * Why the list has nothing in it — **and the three answers are different sentences**.
  *
  * `'tracker'` is *this project has no tasks*, which is the screen that already existed and the
  * one that offers New task. `'filter'` is *this project has tasks and you are looking at a
  * slice with none in it*, which is a completely different thing to tell a user: a filtered
  * board that silently drew nothing is how somebody concludes their tasks are gone, and this
- * project has a standing rule against a confident empty list.
+ * project has a standing rule against a confident empty list. `'search'` is that same fact
+ * arrived at through the text box, and it is a third sentence rather than a reuse of the
+ * second because the way out differs: the filter's screen names a status and offers Show all,
+ * the search's has to name what was *typed* and offer to clear it.
+ *
+ * When both narrowings are on and nothing survives, **the search takes the blame**. Not
+ * because it is likelier — because it is the answer the screen can be honest about: the
+ * search sentence names the query *and* the filter it ran inside, where blaming the filter
+ * would print a sentence claiming a status hid tasks that a different control is hiding.
  *
  * `null` for every board arm that is not `ready` — those three have their own designed screens
- * and none of them is a list — and `null` when the filtered list is not empty at all.
+ * and none of them is a list — and `null` when the narrowed list is not empty at all.
  */
-export type EmptyList = 'tracker' | 'filter'
+export type EmptyList = 'tracker' | 'filter' | 'search'
 
-export function listEmpty(board: Board, filter: StatusFilter): EmptyList | null {
+export function listEmpty(board: Board, filter: StatusFilter, query = ''): EmptyList | null {
   if (board.kind !== 'ready') return null
   if (board.tasks.length === 0) return 'tracker'
-  return board.tasks.some((task) => matchesFilter(task, filter)) ? null : 'filter'
+  if (board.tasks.some((task) => matchesFilter(task, filter) && matchesQuery(task, query))) {
+    return null
+  }
+  return query.trim() === '' ? 'filter' : 'search'
 }
 
 /**
  * The panel's body, grouped by status in [`GROUP_ORDER`].
  *
- * **Order within a group is the array's own order, untouched.** `TaskFile::tasks` is documented
- * as a list rather than a map precisely because the array *is* the priority and there is
- * deliberately no `order` field; re-sorting here would be the panel inventing a second ordering
- * that the file on disk contradicts, and the one the eye follows would be the wrong one.
+ * **Order within a group is recency: last touched first.** `updatedMs` descending, then
+ * `createdMs` descending, then — the sort being stable — the file's own order for full ties.
+ * "Touched" already means what a user expects it to, because Rust stamps `updated_unix_ms` on
+ * **every** `TaskEdit` in one place (`TasksStore::edit`, after the match): a status change, a
+ * new comment, an assignment, a retitle, an edited body all count. The panel answers *what is
+ * happening*, and within a status the task something just happened to is the one being asked
+ * after.
+ *
+ * The paragraph that used to be here argued the opposite — that `TaskFile::tasks` is a list
+ * precisely so the array can *be* the priority, and that re-sorting would invent a second
+ * ordering the file contradicts. It lost on use: appends land at the end of the array, so the
+ * file's order is oldest-first for ever and the rows agents were actively working sat below a
+ * backlog nobody was reading. What survives of it is real, though — the array is still the
+ * order a pull request reads, still the tie-break here, and the file is not rewritten to match
+ * the screen: this is a *reading* order derived from stamps the file already carries, never a
+ * stored second one, which is why `TaskFile`'s argument against an `order` field stands.
  *
  * **Empty groups are omitted.** A `Done` heading over nothing is noise on a 320px panel, and
  * the states that genuinely need prose are the board's own three non-`ready` arms, which return
  * `[]` here so the panel draws its designed screen instead of four empty headings.
  *
- * **The filter narrows the tasks, never the headings.** A group with nothing in it is omitted
- * exactly as before, so filtering to Doing draws the Doing heading and no others rather than
- * four headings with one populated — and the caller still gets `[]` when nothing matched, which
- * is [`listEmpty`]'s job to explain rather than this one's.
+ * **The filter and the query narrow the tasks, never the headings.** A group with nothing in
+ * it is omitted exactly as before, so filtering to Doing draws the Doing heading and no others
+ * rather than four headings with one populated — and the caller still gets `[]` when nothing
+ * matched, which is [`listEmpty`]'s job to explain rather than this one's. The two narrowings
+ * compose as the intersection, because each is its own claim about the row and a row on screen
+ * must satisfy both of the controls that say it should be there.
  *
  * A task whose status is none of the four is **not dropped**. Grouping strictly by value would
  * match no heading and the task would simply vanish from a tracker somebody is relying on —
@@ -541,21 +683,43 @@ export function listEmpty(board: Board, filter: StatusFilter): EmptyList | null 
  * the group that claims the least. Not `doing`, which would be the panel asserting that work is
  * under way on the strength of a value it could not read.
  */
-export function groups(board: Board, filter: StatusFilter = null): TaskGroup[] {
+export function groups(board: Board, filter: StatusFilter = null, query = ''): TaskGroup[] {
   if (board.kind !== 'ready') return []
   const buckets = new Map<TaskStatus, TaskView[]>()
   for (const status of GROUP_ORDER) buckets.set(status, [])
   for (const task of board.tasks) {
-    if (!matchesFilter(task, filter)) continue
+    if (!matchesFilter(task, filter) || !matchesQuery(task, query)) continue
     buckets.get(groupOf(task))?.push(task)
   }
   const out: TaskGroup[] = []
   for (const status of GROUP_ORDER) {
     const tasks = buckets.get(status)
     if (tasks === undefined || tasks.length === 0) continue
-    out.push({ status, label: statusLabel(status), tasks })
+    out.push({ status, label: statusLabel(status), tasks: recencyOrder(tasks) })
   }
   return out
+}
+
+/*
+ * A timestamp that can be compared. `adapt.ts`'s `Number(…)` cannot make a non-finite value out
+ * of the wire's u64, but this file is hand-editable JSON two layers down and `newerBoard`
+ * already refuses to order by a stamp it cannot trust. Non-finite compares as the epoch, so a
+ * mangled stamp sinks to the bottom of its group — a comparator that returns `NaN` is not an
+ * ordering at all, and hands `Array.sort` licence to leave the array in any arrangement it
+ * likes.
+ */
+function stamp(ms: number): number {
+  return Number.isFinite(ms) ? ms : 0
+}
+
+/**
+ * [`groups`]'s within-group order — last touched first; its doc carries the argument. Sorts in
+ * place, because the one caller hands it a bucket it just built and nothing else holds it.
+ */
+function recencyOrder(tasks: TaskView[]): TaskView[] {
+  return tasks.sort(
+    (a, b) => stamp(b.updatedMs) - stamp(a.updatedMs) || stamp(b.createdMs) - stamp(a.createdMs),
+  )
 }
 
 /**
@@ -745,6 +909,50 @@ export function commentOrder(task: TaskView): readonly CommentView[] {
   }
   if (ordered) return comments
   return [...comments].sort((a, b) => a.atMs - b.atMs)
+}
+
+/**
+ * A task's status transitions, oldest first — [`commentOrder`]'s defence for the other log. (M27)
+ *
+ * The same three properties, for the same reasons: stable, identity when already ordered, and a
+ * defence rather than a transformation — this file is committed, and a merge can interleave two
+ * sides' rows.
+ */
+export function historyOrder(task: TaskView): readonly StatusChangeView[] {
+  const history = task.history
+  let ordered = true
+  for (let i = 1; i < history.length; i += 1) {
+    const previous = history[i - 1]
+    const current = history[i]
+    if (previous === undefined || current === undefined) continue
+    if (current.atMs < previous.atMs) {
+      ordered = false
+      break
+    }
+  }
+  if (ordered) return history
+  return [...history].sort((a, b) => a.atMs - b.atMs)
+}
+
+/**
+ * A timestamp as the wall clock read it: `14:32:07`, local time, 24-hour, always eight
+ * characters. (M27)
+ *
+ * The card prints this **beside** the relative age, not instead of it — `14:32:07 (4m ago)` —
+ * because the two answer different questions: "which of these two lines came first" needs the
+ * absolute stamp (two `4m ago`s are indistinguishable), and "is this still current" needs the
+ * age (a bare clock time is ambiguous across days, and the age in the brackets is what
+ * disambiguates it without a date vocabulary this panel does not have).
+ *
+ * Local time on purpose — it is read next to the reader's own wall clock. Total: a value that
+ * is not a finite number of milliseconds renders as a visibly-broken placeholder rather than
+ * `NaN:NaN:NaN`.
+ */
+export function clock(atMs: number): string {
+  if (!Number.isFinite(atMs)) return '--:--:--'
+  const date = new Date(atMs)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 /* ------------------------------------------------------- the card's read/edit posture */
@@ -1151,6 +1359,38 @@ export function assignableRoles(
 }
 
 /**
+ * Why the assignee list is short, as a sentence — or `null` when there is nothing to say.
+ *
+ * Rendered under the assignee `<select>`, whose options come from [`assignableRoles`]: with a
+ * roster that is not `ready` that list is empty, and an empty dropdown with no sentence looks
+ * exactly like the bug it used to be (the host passed `{}` for years of one milestone). Two
+ * arms say something and two deliberately do not:
+ *
+ * - `'disabled'` restates `AgentsPanel/model.ts`'s `OFF_FOR_THIS_PROJECT` word for word — a
+ *   deliberate second copy, `WORKING_PHASES`'s trade (this module is import-free so the check
+ *   can compile it alone), pinned `===` against the original by `check:agents` — plus the
+ *   clause naming where the switch is.
+ * - `'empty'` names the file that would add a role, because that is the only action there is.
+ * - `'ready'` has real options, and `'unknown'` means nobody has looked yet — the roster's own
+ *   convention (see `AgentsPanel/model.ts`'s `Roster`) is that drawing nothing is the only
+ *   honest rendering of not having looked, and a hint would claim knowledge this window does
+ *   not have.
+ *
+ * The kind is an opaque `string` for [`RunRef.phase`]'s reason; an unrecognised one answers
+ * `null`, the arm that claims nothing.
+ */
+export function assigneeHint(rosterKind: string): string | null {
+  switch (rosterKind) {
+    case 'disabled':
+      return 'Subagents are off for this project. Turn them on in the Agents panel to assign tasks to roles.'
+    case 'empty':
+      return 'This project defines no roles yet — add one under .cide/agents/ or in the Agents panel.'
+    default:
+      return null
+  }
+}
+
+/**
  * A draft from the assignee editor, back into `Assign`'s `agent`.
  *
  * The other half of [`fieldValue`]'s `agent ?? ''`, and here rather than in the component
@@ -1289,4 +1529,24 @@ export function closeCompose(draft: TaskDraft, cause: CloseCause | 'cancel'): bo
  */
 export function filterAfterCreate(filter: StatusFilter, status: TaskStatus): StatusFilter {
   return filter === null || filter === status ? filter : null
+}
+
+/**
+ * The query to be in the box once a task has been created from `draft` — [`filterAfterCreate`]
+ * for the search, and for its reason: a create the user cannot see reads as a create that did
+ * not happen, and a query the new row does not match is the same trapdoor as a filter it is
+ * not in.
+ *
+ * Matched against the draft's **title and body only**, though [`matchesQuery`] also reads the
+ * id: the id is minted in Rust after the write, so this function cannot know it, and the
+ * conservative direction is to clear — a query kept on a guess would hide the row when the
+ * guess was wrong, where a query cleared needlessly merely shows the user more than they asked
+ * for, with the row they just created among it. A query the draft *does* match is kept, so a
+ * user working through a themed backlog ("retry", create another retry task) is not stripped
+ * of their narrowing every time they add to it.
+ */
+export function queryAfterCreate(query: string, draft: TaskDraft): string {
+  const q = query.trim().toLowerCase()
+  if (q === '') return query
+  return hitsQuery(q, [draft.title, draft.body]) ? query : ''
 }

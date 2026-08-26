@@ -265,6 +265,7 @@ export function PaneBody({
         project={project}
         tab={editor.tab}
         onScreen={onScreen}
+        pane={pane.id}
       />
     )
   }
@@ -318,6 +319,7 @@ export function PaneBody({
         rev={revision.rev}
         from={revision.from}
         onScreen={onScreen}
+        pane={pane.id}
       />
     )
   }

@@ -632,6 +632,39 @@ impl Index {
         added
     }
 
+    /// Re-read every known directory under `root` — `root` included — and reconcile the
+    /// whole subtree against the disk.
+    ///
+    /// The manual truth-teller for the corner the watcher deliberately leaves dark: an
+    /// ignored directory is never watched ([`Index::watch_dirs`]; `watch.rs`'s module header
+    /// carries the argument), so with *show ignored files* on, rows under `target/` are the
+    /// walk's snapshot and drift as the build writes. The file tree's *Refresh* menu item
+    /// lands here.
+    ///
+    /// [`Self::rescan_dir`] does all the per-directory work — dropping children that left
+    /// the disk, grafting subtrees that appeared, detaching a directory that is itself gone
+    /// — so this is only the traversal. The list of known directories is snapshotted up
+    /// front, and one that an earlier rescan removed simply misses its `by_path` lookup and
+    /// contributes nothing; a directory grafted *during* the sweep needs no rescan, because
+    /// a graft descends in full.
+    ///
+    /// Returns the entries that appeared, for the picker, exactly as [`Self::apply`] does —
+    /// and, like `apply`, does not report deletions to it (see `apply`'s note on `nucleo`).
+    pub fn refresh_subtree(&mut self, root: &Path, filter: &Filter) -> Vec<WalkItem> {
+        // `Path::starts_with` compares whole components, so `target-old/` is not swept up
+        // by a refresh of `target/`.
+        let dirs: Vec<PathBuf> = self
+            .dir_paths()
+            .into_iter()
+            .filter(|dir| dir.starts_with(root))
+            .collect();
+        let mut added = Vec::new();
+        for dir in &dirs {
+            added.extend(self.rescan_dir(dir, filter));
+        }
+        added
+    }
+
     /// Re-read one directory and reconcile its children.
     fn rescan_dir(&mut self, dir: &Path, filter: &Filter) -> Vec<WalkItem> {
         let Some(&node) = self.by_path.get(dir) else {
@@ -1289,6 +1322,70 @@ mod tests {
         assert!(watched.contains(&dir.join("src")));
         assert!(watched.contains(&dir.join("src/deep")));
         assert_eq!(index.visibility(), visibility);
+    }
+
+    /// The manual refresh sees what the watcher never will: churn inside an ignored folder.
+    ///
+    /// `the_watch_list_excludes_the_ignored_directories_the_tree_now_draws` above pins that a
+    /// shown `target/` costs no inotify descriptors — which means a file deleted in there
+    /// outlives itself in the tree until *something* re-reads the disk. `refresh_subtree` is
+    /// that something, and this drives it through the full round: a deletion, a new file, and
+    /// a whole new subtree, all under the ignored root, reconciled in one call.
+    #[test]
+    fn refresh_subtree_reconciles_an_ignored_folder_the_watcher_never_sees() {
+        let dir = scratch("index-refresh-subtree");
+        tree(&dir);
+        let visibility = Visibility {
+            hidden: true,
+            ignored: true,
+        };
+        let mut index = Index::build(
+            vec![Root::new(dir.path())],
+            BuildOptions {
+                visibility,
+                ..BuildOptions::default()
+            },
+            &|_: &[WalkItem]| {},
+        );
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            index.dir_paths().iter().map(|p| p.as_path()),
+            visibility,
+        );
+        let names = |index: &Index| -> Vec<String> {
+            index
+                .rows(0, index.count())
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        // Everything under the fixture is one expand away from visible; open it all so the
+        // assertions read the drawn rows rather than reasoning about fold state.
+        for d in index.dir_paths() {
+            index.expand(&d);
+        }
+        assert!(names(&index).contains(&"binary".to_string()));
+
+        // The churn the watcher is deliberately blind to.
+        std::fs::remove_file(dir.join("target/debug/binary")).unwrap();
+        std::fs::write(dir.join("target/debug/fresh"), "").unwrap();
+        std::fs::create_dir_all(dir.join("target/release")).unwrap();
+        std::fs::write(dir.join("target/release/nested"), "").unwrap();
+
+        let added = index.refresh_subtree(&dir.join("target"), &filter);
+        index.expand(&dir.join("target/release"));
+
+        let drawn = names(&index);
+        assert!(!drawn.contains(&"binary".to_string()), "{drawn:?}");
+        assert!(drawn.contains(&"fresh".to_string()), "{drawn:?}");
+        assert!(drawn.contains(&"release".to_string()), "{drawn:?}");
+        assert!(drawn.contains(&"nested".to_string()), "{drawn:?}");
+        // The graft reported what appeared, for the picker — files only need apply here, but
+        // the new directory rides along exactly as `apply`'s grafts do.
+        assert!(added.iter().any(|i| i.path.ends_with("debug/fresh")));
+        assert!(added.iter().any(|i| i.path.ends_with("release/nested")));
+        // And a subtree refresh is scoped: `src` was untouched and stays intact.
+        assert!(drawn.contains(&"main.rs".to_string()), "{drawn:?}");
     }
 
     /// Speed search's walk, against the walk that draws the rows.

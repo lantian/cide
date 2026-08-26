@@ -145,19 +145,31 @@
 //!
 //! Measured in the shipped binary: `run` answers a permission request by **rejecting it** and
 //! printing one line, unless `--auto` was passed. So there is no `AwaitingPermission` for this
-//! harness and no wedged turn either — the failure mode is a refused tool, in the run's own
-//! transcript, rather than a process waiting for a human who is not there. **`--auto` is
-//! deliberately not passed**: its own `--help` calls it dangerous, and opencode's default rules
-//! already allow ordinary edits and commands, so the flag would buy a run nothing except the
-//! ability to say yes to the questions that were worth asking.
+//! harness and no wedged turn either.
 //!
-//! # Opening a run into a pane shows the event stream
+//! `--auto` was deliberately not passed at first — its own `--help` calls it dangerous, and the
+//! theory was that opencode's default rules allow ordinary edits and commands, so the flag would
+//! buy nothing except the ability to say yes to questions worth asking. **Live runs disproved
+//! the theory's second half**: the first command that strayed past the project directory
+//! (`cat ~/.cargo/config.toml`, on the way to a `cargo check`) was auto-rejected and the turn
+//! **ended at the rejection** — two real runs died mid-investigation, exit 0, task never
+//! reported, which reads on the board as an agent that did nothing. A refusal that ends the
+//! turn is not a safety property in a headless child; it is the autonomy failing silently. So
+//! `--auto` now rides [`RunPlan::skip_permissions`] — the project-level
+//! `agents.skipPermissions`, on by default, off in one config line — and the containment for an
+//! unattended child is what it always actually was: worktree isolation.
 //!
-//! `--format json` is what makes the run legible to cide, and it is what makes the pane show raw
-//! ndjson to a person. That is a real cost and it is taken knowingly: the alternative is a
-//! human-readable stream cide cannot follow, which trades every row in the panel for one pane
-//! nobody is looking at most of the time. The named upgrade path is `opencode serve` plus
-//! `opencode attach`, which is a slice of its own.
+//! # Opening a run into a pane shows the events **rendered**, and the raw line is still the channel
+//!
+//! `--format json` is what makes the run legible to cide, and it used to be what made the pane
+//! show raw ndjson to a person — a cost this header once accepted, and the first live run
+//! reported as unreadable. [`render_event`] is the reconciliation, and *where* it runs is the
+//! design: `cide_pty::LineRender` rewrites the stream once, upstream of the mirror and every
+//! sink, while the app's observer reads each **raw** line inside the same hook before the
+//! rendering is returned. One rendered stream downstream (a rehydrated pane, a choked sink's
+//! catch-up and a live pane cannot disagree), one raw channel upstream for `capture` and
+//! [`Harness::observe`]. `opencode serve` plus `attach` remains the named upgrade path to a
+//! *live* TUI in the pane; this makes the transcript readable without it.
 
 use cide_ipc::RunState;
 use cide_pty::{Geometry as PtyGeometry, SpawnSpec};
@@ -178,9 +190,6 @@ const SERVER: &str = "cide";
 
 /// The document's own contract, so a person reading a dumped configuration can look it up.
 const SCHEMA: &str = "https://opencode.ai/config.json";
-
-/// The one `reason` on a `step_finish` that does **not** end the turn. See [`OpencodeHarness::observe`].
-const MORE_STEPS: &str = "tool-calls";
 
 /// The opencode CLI as a harness. A unit struct: it holds nothing, and must not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -214,30 +223,44 @@ impl Harness for OpencodeHarness {
     /// | observation | answer | why |
     /// | --- | --- | --- |
     /// | `Exit(code)` | `Finished { code }` | the only ground truth about the child, so it answers from any state |
-    /// | `Line` — `step_start` | `Running` | a model step began |
-    /// | `Line` — `text`, `tool_use`, `reasoning` | `Running` | the turn is producing something |
-    /// | `Line` — `step_finish`, `reason: "tool-calls"` | `Running` | **a step ended, not the turn** |
-    /// | `Line` — `step_finish`, any other reason | `Idle` | the turn was handed back, and the child is alive |
+    /// | `Line` — `step_start`, `step_finish`, `text`, `tool_use`, `reasoning` | `Running` | the turn is producing something |
     /// | `Line` — anything else, or not JSON at all | `None` | says nothing about the run |
     /// | `Hook` | `None` | nothing installs a hook into opencode |
     ///
-    /// # `step_finish` is not one event, and reading it as one is a real bug
+    /// # No line ends the turn — the exit does, and run 06202dd6 is why
     ///
-    /// A step is one model round trip. A turn that calls tools is **several** of them, and the
-    /// intermediate ones finish with `reason: "tool-calls"` (the value is the AI SDK's, mapped
-    /// from the provider's own — `tool_use` for Anthropic, `tool_calls` for OpenAI — and all
-    /// three spellings are in the shipped binary). Answering [`RunState::Idle`] to one of those
-    /// would tell the registry the turn had been handed back **in the middle of it**: the run's
-    /// concurrency slot is released on exactly that edge, and under worktree isolation the next
-    /// queued run of the same role would then start a second process in the same checkout. That
-    /// is the hazard the whole slot rule exists to prevent, reached through a JSON field.
+    /// This mapping used to read `step_finish` in two halves: `reason: "tool-calls"` was an
+    /// intermediate step (`Running` — a turn that calls tools is several model round trips, and
+    /// the intermediate ones finish with that value, the AI SDK's own), any other reason was the
+    /// turn handed back (`Idle`). The half-truth in it: a turn's *final* step really does finish
+    /// with a non-`tool-calls` reason. What it missed is that a final-looking reason is not
+    /// proof the *turn* is over — the stream carries `step_finish` events from **nested
+    /// sessions** too (a role that reaches for opencode's own sub-agents sees their final steps
+    /// on the same stdout, under their own `sessionID`s), and the SDK has finish reasons
+    /// (`length`, `error`, `unknown`) that end a step with the child nowhere near done.
     ///
-    /// The asymmetry is what makes the conservative reading cheap. Being *late* to call the turn
-    /// over costs almost nothing here, because `opencode run` exits within milliseconds of its
-    /// last step and `Observation::Exit` follows with the truth. Being *early* costs two agents
-    /// in one worktree.
+    /// Believing one was not a display bug. `Idle` releases the run's concurrency slot, and
+    /// under worktree isolation the next queued run of the same role is then admitted — whose
+    /// `bring_up` **winds down the idle child to reclaim the checkout**. Run 06202dd6 (a `qa`
+    /// role, sixteen minutes into a live smoke test) died exactly this way: a queued dispatch
+    /// for the same role had been waiting thirteen minutes, a mid-turn `step_finish` read as
+    /// `Idle`, and the wind-down killed a working child — logged by the orchestrator as
+    /// "dispatch-to-busy-role appears to preempt the active run", which is precisely what the
+    /// queue exists never to do. (The observed exit was 143: the CLI traps the wind-down's
+    /// signal, shuts its own process tree down — the cleanup was noted as flawless — and dies
+    /// as if TERMed. Good manners, wrong death.)
     ///
-    /// # Why every other event answers `Running` rather than `None`
+    /// So no line answers `Idle` any more, and the asymmetry that already stood in this comment
+    /// is the whole justification: being *late* to call the turn over costs almost nothing,
+    /// because `run` is one turn per process and the child exits within milliseconds of its
+    /// last step — `Observation::Exit` follows with the truth, releases the slot then, and the
+    /// queued run starts into a checkout whose previous occupant is genuinely gone. Being
+    /// *early* costs a working agent its life. An opencode run therefore never holds
+    /// [`RunState::Idle`]: its turn ends as `Finished { code }`, which nudges the orchestrator
+    /// like every other ending, and the idle wind-down is in practice a claude-only event —
+    /// a parked interactive `claude` being the one idle child that never leaves by itself.
+    ///
+    /// # Why every event answers `Running` rather than `None`
     ///
     /// Because for this harness they are the only evidence that the child is doing anything at
     /// all. A run stays [`RunState::Starting`] from the fork until something says otherwise, and
@@ -271,9 +294,9 @@ impl Harness for OpencodeHarness {
                 }
                 let event = Event::parse(line)?;
                 let next = match event.kind.as_str() {
-                    "step_finish" if event.turn_continues() => RunState::Running,
-                    "step_finish" => RunState::Idle,
-                    "step_start" | "text" | "tool_use" | "reasoning" => RunState::Running,
+                    "step_start" | "step_finish" | "text" | "tool_use" | "reasoning" => {
+                        RunState::Running
+                    }
                     _ => return None,
                 };
                 (next != current).then_some(next)
@@ -290,8 +313,11 @@ impl Harness for OpencodeHarness {
 ///   after its exit has been reaped, so without this a finished run goes back to `Running` and
 ///   stays there for ever.
 ///
-/// `Idle` is emphatically not one of them: an idle run's child may be gone but the *run* is alive
-/// and resumable, and a line from a respawned child has to be able to move it back to `Running`.
+/// `Idle` is emphatically not one of them — a rule that now outlives its only producer: since
+/// the 06202dd6 fix no line maps to `Idle`, so this harness's runs never hold it. It stays
+/// un-absorbed anyway, because the rule is about recovery, not production: if a run ever *is*
+/// `Idle` (a hand-set state in a test, a variant a future slice produces), a line from its child
+/// must still be able to move it back to `Running` rather than freeze it there.
 fn absorbs(current: &RunState) -> bool {
     matches!(
         current,
@@ -303,7 +329,11 @@ fn absorbs(current: &RunState) -> bool {
 ///
 /// Measured shape, from the shipped binary's own emitter:
 /// `{"type":<name>,"timestamp":<ms>,"sessionID":<id>, ...}` — the id is spread onto **every**
-/// line, including the first, which is the whole of [`capture`].
+/// line, including the first, which is the whole of [`capture`]. A `step_finish`'s finish
+/// `reason` is deliberately **not** here any more: it used to route the event to
+/// [`RunState::Idle`], which is the misreading that killed run 06202dd6 — see
+/// [`OpencodeHarness::observe`]. [`render_event`] still shows the reason to a person, from the
+/// raw JSON it reads for display.
 #[derive(Debug, Deserialize)]
 struct Event {
     /// `step_start`, `step_finish`, `text`, `tool_use`, `reasoning`, `error`.
@@ -312,15 +342,6 @@ struct Event {
     /// opencode's own session id, `ses_…`. Not cide's [`cide_ipc::SessionId`].
     #[serde(rename = "sessionID")]
     session: Option<String>,
-    /// Present on the part-carrying events; absent on `error`.
-    part: Option<Part>,
-}
-
-/// The one field of a part this file reads.
-#[derive(Debug, Deserialize)]
-struct Part {
-    /// A `step_finish`'s finish reason. See [`MORE_STEPS`].
-    reason: Option<String>,
 }
 
 impl Event {
@@ -339,14 +360,6 @@ impl Event {
         }
         serde_json::from_str(line).ok()
     }
-
-    /// Whether this `step_finish` is an intermediate one with another step behind it.
-    fn turn_continues(&self) -> bool {
-        self.part
-            .as_ref()
-            .and_then(|part| part.reason.as_deref())
-            .is_some_and(|reason| reason == MORE_STEPS)
-    }
 }
 
 /// The session id this line names, for [`SessionBinding::Harness`].
@@ -359,6 +372,177 @@ impl Event {
 /// neither is worth an error, and either would be worth one if this returned a `Result`.
 fn capture(line: &str) -> Option<String> {
     Event::parse(line)?.session.filter(|id| !id.is_empty())
+}
+
+// ==========================================================================================
+// Rendering the event stream for a person.
+// ==========================================================================================
+
+/// How much of a tool's output the pane shows before eliding. Characters, then lines.
+const OUTPUT_CHAR_BUDGET: usize = 700;
+const OUTPUT_LINE_BUDGET: usize = 6;
+
+/// How much of a reasoning fragment survives — it is texture, not record.
+const REASONING_BUDGET: usize = 240;
+
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const CYAN: &str = "\x1b[36m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+/// One event line, as a person should read it — [`SessionBinding::Harness`]'s `render`.
+///
+/// The stream this rewrites is `--format json`, which is the *channel* (see the module header)
+/// and which used to reach the pane raw: opening a working run showed ndjson, one event per
+/// line, with a whole file read arriving as a single JSON document. Reported, verbatim:
+/// *"it opens strange console with json output that isn't understandable"*. The events carry
+/// everything a readable transcript needs — tool, input, output, the model's words, tokens —
+/// so this renders them and drops nothing a person acts on:
+///
+/// * a tool call is `● name title`, its output clipped to a budget (the full text is one
+///   `cide_task_get`/transcript away; the pane is a progress view, not an archive);
+/// * a rejected or failed call is red, with the error verbatim — that line *is* the answer to
+///   "why did this run die";
+/// * the model's own text passes whole, reasoning passes dimmed and clipped;
+/// * `step_start` draws nothing, `step_finish` is one dim token count;
+/// * an event type this build has never heard of becomes a dim one-word marker rather than a
+///   screenful of JSON, and **a line that is not JSON passes verbatim** — that is the CLI's own
+///   prose (a warning, a rejected permission) and hiding it would hide the failure.
+///
+/// Styling is bare SGR (dim/bold/cyan/red), which every theme already maps; no colour is load-
+/// bearing.
+pub fn render_event(line: &str) -> Option<String> {
+    let Ok(Value::Object(event)) = serde_json::from_str::<Value>(line) else {
+        return Some(line.to_string());
+    };
+    let Some(kind) = event.get("type").and_then(Value::as_str) else {
+        return Some(line.to_string());
+    };
+    let part = event.get("part").unwrap_or(&Value::Null);
+
+    match kind {
+        "step_start" => None,
+        "step_finish" => {
+            let reason = part.get("reason").and_then(Value::as_str).unwrap_or("done");
+            let total = part
+                .pointer("/tokens/total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(format!("{DIM}· {reason} · {} tok{RESET}", thousands(total)))
+        }
+        "text" => {
+            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = text.trim_end();
+            if text.is_empty() {
+                return None;
+            }
+            Some(format!("{BOLD}{text}{RESET}"))
+        }
+        "reasoning" => {
+            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = one_line_of(text);
+            if text.is_empty() {
+                return None;
+            }
+            Some(format!("{DIM}∴ {}{RESET}", clip(&text, REASONING_BUDGET)))
+        }
+        "tool_use" => Some(render_tool(part)),
+        "error" => Some(format!("{RED}✗ {}{RESET}", one_line_of(&part.to_string()))),
+        other => Some(format!("{DIM}· {other}{RESET}")),
+    }
+}
+
+/// A tool call: what ran, on what, and a clipped view of what came back.
+fn render_tool(part: &Value) -> String {
+    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let state = part.get("state").unwrap_or(&Value::Null);
+    let status = state.get("status").and_then(Value::as_str).unwrap_or("");
+
+    // The CLI's own `title` when it wrote one (for `bash` it is the command), else the input
+    // document, compact — never the output, which gets its own budgeted block below.
+    let title = match state.get("title").and_then(Value::as_str) {
+        Some(title) if !title.trim().is_empty() => title.to_string(),
+        _ => state.get("input").map(compact_input).unwrap_or_default(),
+    };
+    let title = clip(&one_line_of(&title), 160);
+
+    if status == "error" {
+        let error = state
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("failed");
+        return format!(
+            "{RED}✗ {tool}{RESET} {title}\n{RED}  {}{RESET}",
+            one_line_of(error)
+        );
+    }
+
+    let mut out = format!("{CYAN}● {tool}{RESET} {title}");
+    if let Some(output) = state.get("output").and_then(Value::as_str) {
+        let preview = clip_block(output);
+        if !preview.is_empty() {
+            out.push_str(&format!("\n{DIM}{preview}{RESET}"));
+        }
+    }
+    out
+}
+
+/// The input document with its top-level values flattened — `{"command":"ls"}` reads `ls`.
+fn compact_input(input: &Value) -> String {
+    match input {
+        Value::Object(map) => map
+            .values()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => other.to_string(),
+    }
+}
+
+/// At most [`OUTPUT_LINE_BUDGET`] lines and [`OUTPUT_CHAR_BUDGET`] characters, indented, with
+/// an elision that says how much it hid.
+fn clip_block(text: &str) -> String {
+    let text = text.trim_end();
+    if text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut spent = 0;
+    for (n, line) in lines.iter().enumerate() {
+        if n >= OUTPUT_LINE_BUDGET || spent >= OUTPUT_CHAR_BUDGET {
+            out.push(format!("  … (+{} more lines)", lines.len() - n));
+            break;
+        }
+        let clipped = clip(line, OUTPUT_CHAR_BUDGET - spent);
+        spent += clipped.chars().count();
+        out.push(format!("  {clipped}"));
+    }
+    out.join("\n")
+}
+
+/// `chars`, not bytes: a byte slice of UTF-8 panics on a boundary, and this crate is linked
+/// into a process built with `panic = "abort"`.
+fn clip(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(budget).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// Whitespace runs collapsed to one space — a reasoning fragment arrives with its own layout.
+fn one_line_of(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `10454` reads `10.5k`; small counts stay exact.
+fn thousands(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    format!("{:.1}k", n as f64 / 1_000.0)
 }
 
 /// The child, fresh (`resume: None`) or continuing a conversation the harness already minted.
@@ -406,6 +590,14 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
     if let Some(effort) = &plan.agent.effort {
         args.push("--variant".into());
         args.push(effort.clone());
+    }
+
+    // The project's default for unattended children (`agents.skipPermissions`, on unless
+    // switched off). For this harness the alternative is not a prompt — `run` auto-rejects and,
+    // measured, the **turn ends at the rejection** — so the module header's old argument for
+    // never passing `--auto` is rewritten there, beside the measurement that lost it.
+    if plan.skip_permissions {
+        args.push("--auto".into());
     }
 
     // Not a display preference. This is the channel — see the module header.
@@ -465,7 +657,10 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
         spec,
         // The prompt went in the argv, so there is nothing to type. See `HarnessSpawn::opening`.
         opening: None,
-        binding: SessionBinding::Harness { capture },
+        binding: SessionBinding::Harness {
+            capture,
+            render: render_event,
+        },
     })
 }
 
@@ -602,6 +797,7 @@ mod tests {
                 model: None,
                 unavailable: None,
                 max_concurrent: 1,
+                worktree: true,
             },
             origin: PathBuf::from("/repo/.cide/agents/developer.md"),
             shadows: None,
@@ -628,6 +824,9 @@ mod tests {
             proxy: cide_core::proxy::ProxyEnv::default(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
+            // Off in the fixture, so every argv assertion below is about what the role
+            // and the plan actually said; the skip default has tests of its own.
+            skip_permissions: false,
         }
     }
 
@@ -657,6 +856,97 @@ mod tests {
     fn config_of(spec: &SpawnSpec) -> Value {
         serde_json::from_str(env_value(spec, "OPENCODE_CONFIG_CONTENT").expect("a config"))
             .expect("the config is json")
+    }
+
+    /// The pane's rendering of the event stream, over the shapes a real run printed — including
+    /// the two that motivated it: a whole-file `read` arriving as one JSON line, and a rejected
+    /// permission, which is the line that answers "why did this run die".
+    #[test]
+    fn the_rendering_reads_as_a_transcript_and_hides_no_failure() {
+        // The channel's own noise draws nothing or one dim marker.
+        assert_eq!(render_event(STEP_START), None);
+        let finish = render_event(STEP_FINISH).expect("rendered");
+        assert!(
+            finish.contains("stop") && finish.contains("5.7k tok"),
+            "{finish}"
+        );
+
+        // A tool call: name, the CLI's own title, and a clipped output block.
+        let big_output = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8";
+        let tool = format!(
+            r#"{{"type":"tool_use","sessionID":"s","part":{{"type":"tool","tool":"bash","state":{{"status":"completed","input":{{"command":"ls -la"}},"output":{},"title":"ls -la"}}}}}}"#,
+            serde_json::to_string(big_output).unwrap()
+        );
+        let rendered = render_event(&tool).expect("rendered");
+        assert!(
+            rendered.contains("● bash") && rendered.contains("ls -la"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("line6"), "{rendered}");
+        assert!(
+            !rendered.contains("line7") && rendered.contains("+2 more lines"),
+            "the clip must say what it hid: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#""status""#),
+            "JSON structure leaked into the display: {rendered}"
+        );
+
+        // The rejected permission — the failure that used to be findable only in opencode's own
+        // database — is red and verbatim.
+        let rejected = r#"{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"bash","state":{"status":"error","input":{"command":"cat ~/.cargo/config.toml"},"error":"The user rejected permission to use this specific tool call."}}}"#;
+        let rendered = render_event(rejected).expect("rendered");
+        assert!(
+            rendered.contains("✗ bash") && rendered.contains("rejected permission"),
+            "{rendered}"
+        );
+
+        // The model's words pass whole; reasoning passes dimmed and clipped.
+        let text = r#"{"type":"text","sessionID":"s","part":{"type":"text","text":"The task is already in doing.\n\nChecking the build."}}"#;
+        let rendered = render_event(text).expect("rendered");
+        assert!(rendered.contains("Checking the build."), "{rendered}");
+        let reasoning = format!(
+            r#"{{"type":"reasoning","sessionID":"s","part":{{"type":"reasoning","text":{}}}}}"#,
+            serde_json::to_string(&"x".repeat(500)).unwrap()
+        );
+        let rendered = render_event(&reasoning).expect("rendered");
+        assert!(rendered.contains('…') && rendered.len() < 400, "{rendered}");
+
+        // A CLI prose line — a warning, a rejection notice — passes verbatim: hiding it would
+        // hide the failure. An event type this build has never met becomes a dim marker, not a
+        // screenful of JSON.
+        assert_eq!(
+            render_event("! permission requested: bash (*)"),
+            Some("! permission requested: bash (*)".to_string())
+        );
+        let unknown = render_event(r#"{"type":"session_share","sessionID":"s"}"#).expect("marker");
+        assert!(
+            unknown.contains("session_share") && !unknown.contains("sessionID"),
+            "{unknown}"
+        );
+    }
+
+    /// `--auto` rides the project default (`agents.skipPermissions`) — and the message stays the
+    /// last token either way, because a flag written after the positional would be read as
+    /// another word of the message. The module header carries the measurement that reversed the
+    /// old never-pass-`--auto` stance: a headless auto-reject does not refuse one tool, it ends
+    /// the turn.
+    #[test]
+    fn the_skip_default_passes_auto_and_the_message_stays_last() {
+        let agent = role();
+        let mut plan = plan_for(&agent);
+        plan.skip_permissions = true;
+        let args = spawn(&plan).spec.args;
+        assert!(args.iter().any(|a| a == "--auto"), "{args:?}");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(plan.prompt.as_str()),
+            "a token after the positional message is another word of the message: {args:?}"
+        );
+
+        // Off means off — the way back to auto-rejects is one config line, and it must work.
+        let args = spawn(&plan_for(&agent)).spec.args;
+        assert!(!args.iter().any(|a| a == "--auto"), "{args:?}");
     }
 
     /// The document is valid JSON and the role's prompt survives it **byte for byte**, which is
@@ -862,20 +1152,29 @@ mod tests {
         );
     }
 
-    /// A harness whose `deliver` is `Stdin` has nothing truthful to answer here, and says so.
+    /// The claude side of a respawn, asserted from here because this file owns the trait's
+    /// respawn vocabulary. It used to refuse (`deliver` is `Stdin`, so a *follow-up* never
+    /// respawns) — what changed is the snapshot: a run restored after a cide restart has no
+    /// child to type into, and its continuation is `--resume` into the same conversation. The
+    /// argv is the claim: resume the run's own session, mint nothing.
     #[test]
-    fn a_harness_that_takes_a_follow_up_refuses_to_respawn() {
+    fn a_claude_respawn_resumes_the_runs_own_session() {
         let mut agent = role();
         agent.def.harness = cide_ipc::Harness::Claude;
         let plan = plan_for(&agent);
-        assert_eq!(
-            crate::harness::ClaudeHarness
-                .respawn_spec(&plan, SESSION)
-                .unwrap_err(),
-            HarnessError::NoRespawn {
-                harness: cide_ipc::Harness::Claude
-            },
-            "the default refuses, and names the harness that was asked"
+        let spawn = crate::harness::ClaudeHarness
+            .respawn_spec(&plan, &plan.session.to_string())
+            .expect("a continuing claude child");
+
+        let args = &spawn.spec.args;
+        assert_eq!(value_of(args, "--resume"), plan.session.to_string());
+        assert!(
+            !args.iter().any(|a| a == "--session-id"),
+            "a resume that also minted an id would be the 2.1.227 shape the CLI rejects: {args:?}"
+        );
+        assert!(
+            spawn.opening.is_some(),
+            "the continuation prompt is still typed into the restored TUI"
         );
     }
 
@@ -945,14 +1244,21 @@ mod tests {
         // …and a transition to the state it already holds is not a transition.
         assert_eq!(line(RunState::Running, TEXT), None);
 
-        // The turn ended: the child is alive and its slot is free. **Not** `Finished { code: 0 }`,
-        // which would be an exit status for a process that has not exited.
-        let ended = line(RunState::Running, STEP_FINISH);
-        assert_eq!(ended, Some(RunState::Idle));
-        assert_ne!(ended, Some(RunState::Finished { code: 0 }));
-
-        // The one that costs two agents in one worktree if it is read as the turn ending.
+        // Both halves of `step_finish` answer the same thing now. The final-looking one
+        // (`reason: "stop"`) used to answer `Idle` — the misreading that released the slot,
+        // admitted the queued run and got the working child of run 06202dd6 wound down
+        // mid-task; see `observe`'s doc. No line ends the turn; the exit does.
+        assert_eq!(
+            line(RunState::Running, STEP_FINISH),
+            None,
+            "a step finishing is a run that is working — never a turn handed back"
+        );
         assert_eq!(line(RunState::Running, STEP_FINISH_TOOLS), None);
+        assert_eq!(
+            line(RunState::Starting, STEP_FINISH),
+            Some(RunState::Running),
+            "…and from `Starting` it is evidence of life, exactly like any other event"
+        );
         assert_eq!(
             line(RunState::Starting, STEP_FINISH_TOOLS),
             Some(RunState::Running),

@@ -36,12 +36,12 @@
  *
  * The card reads **no store, calls no IPC and never reads the clock**: every fact and every
  * gesture arrives as a prop, which is what keeps it inside the render gate. In particular the
- * *field* draft lives in `TasksPanelHost`'s state and arrives as `editing`, so the check can
+ * *field* draft lives in `TaskDetailHost`'s state and arrives as `editing`, so the check can
  * draw "the title field, in edit, with these three characters typed" as a story — a draft held
  * in a `useState` here would be reachable from no fixture. The `useRef` is a focus handle, not
  * state; the log's own `useState` belongs to the comment-editing slice and is local to it.
  *
- * # Comments are text, never markup
+ * # Comments are not fields
  *
  * A comment is **not a field**, and the read/edit posture above deliberately does not reach it.
  * The four fields are values a task *has*, so drawing one as text with a pencil on it is the
@@ -51,9 +51,16 @@
  * the comment-editing slice's, with their own marks and their own argument — sit inside the log
  * rather than in the field list.
  *
- * The text is rendered into a `pre-wrap` block and **never as HTML or markdown**: it is
- * model-authored, and rendering model-authored markup inside the IDE's own chrome is an
- * injection surface bought for nothing.
+ * # Comments and the body render as markdown now — through the AST, never through HTML (M27)
+ *
+ * This header used to refuse markup here outright, on injection grounds, and the half of that
+ * argument that was about *mechanism* still stands: model-authored text must never reach
+ * `dangerouslySetInnerHTML`, with or without a sanitizer in front of it. What changed is that
+ * this project now owns a parser with no HTML node in its grammar (`editor/markdown/types.ts`
+ * carries the argument; `<b>` in a comment is four characters of text), so `TaskMarkdown.tsx`
+ * renders the tree as React elements and every string still goes through React's escaping.
+ * Agents write `**bold**`, fences and lists into this log all day; drawing the syntax raw was
+ * the panel refusing to read what its main authors write.
  */
 import { useRef, useState, type JSX } from 'react'
 import { canOpen, canPause, elapsed, phaseGlyph, type RunPhase, type RunView } from '@/sidebar/AgentsPanel/model'
@@ -67,9 +74,11 @@ import {
   authorLabel,
   beginEdit,
   cancelEdit,
+  clock,
   closeCard,
   commentOrder,
   commitEdit,
+  historyOrder,
   fieldLabel,
   isFieldEmpty,
   restText,
@@ -85,7 +94,9 @@ import {
   type TaskView,
   type Tone,
 } from './model'
-import { Icon } from '@/icons/Icon'
+import { Icon, asIcon } from '@/icons/Icon'
+import { MentionTextarea } from './MentionTextarea'
+import { TaskMarkdown } from './TaskMarkdown'
 
 import styles from './TasksPanel.module.css'
 
@@ -121,12 +132,18 @@ export function cx(...parts: Array<string | undefined | false>): string {
  * expressed in markup.
  *
  * Both `lit` and `tone` are consulted, because `agentChip` carries both on purpose: two
- * independent discriminators mean a view has to go out of its way to collapse the two
- * renderings into one. `check-agents-render.mjs` asserts the class sets differ between a story
- * with a live run and the same list without one.
+ * independent discriminators mean a view has to go out of its way to collapse the four
+ * renderings into fewer. `check-agents-render.mjs` asserts the class sets differ between a
+ * story with a live run and the same list without one — and that the **stalled** unlit chip (a
+ * `doing` task whose role has no run engaged; `agentChip`'s fourth arm carries the boundary)
+ * differs from the plain assigned one, because "nobody is coming" rendered identically to
+ * "assigned, quietly" is the orphaned-task invisibility the orchestrator's debug notes
+ * reported.
  */
 export function chipClass(chip: Chip): string {
-  if (!chip.lit) return cx(styles.chip, styles.chipAssigned)
+  if (!chip.lit) {
+    return cx(styles.chip, chip.tone === 'attention' ? styles.chipStalled : styles.chipAssigned)
+  }
   return cx(styles.chip, chip.tone === 'attention' ? styles.chipAttention : styles.chipLive)
 }
 
@@ -260,7 +277,7 @@ export function DeleteControl({
   /*
    * Armed with no `onDelete`, or neither handler. Nothing is drawn — not a disabled *Confirm
    * delete*, which would be a control that has already taken the user's decision and then cannot
-   * act on it. `IntegrateControl` says the same thing; `TasksPanelHost` passes the pair together.
+   * act on it. `IntegrateControl` says the same thing; `TaskDetailHost` passes the pair together.
    */
   return null
 }
@@ -301,12 +318,18 @@ export interface TaskDetailProps {
   runs: readonly RunRef[]
   /** Agent id → label, for the assignee list and the chip's fallback ladder. */
   roles: Readonly<Record<string, string>>
+  /**
+   * Why the assignee list is short — `model.ts::assigneeHint`'s sentence, or `null`/absent when
+   * the list speaks for itself. Drawn in the assignee editor only: at rest the row already reads
+   * honestly (*Unassigned*, or the raw id).
+   */
+  assigneeHint?: string | null | undefined
   /** The clock, as a prop, so the comment log's ages are deterministic under SSR. */
   nowMs: number
   /**
    * The one field in edit and what has been typed into it, or `null` for a fully read-only card.
    *
-   * `TasksPanelHost` owns it and `model.ts::activeEdit` has already refused an edit whose task
+   * `TaskDetailHost` owns it and `model.ts::activeEdit` has already refused an edit whose task
    * left the board, so this component draws what it is given rather than re-deciding.
    */
   editing?: FieldEdit | null | undefined
@@ -367,8 +390,10 @@ function runIntent(props: TaskDetailProps, intent: EditIntent): void {
 }
 
 /**
- * The card, in its dialog. **This is what the app mounts**; `TasksPanelHost` renders it beside
- * the list rather than in place of it, so the board stays on screen behind the scrim.
+ * The card, in its dialog. **This is what the app mounts**; `TaskDetailHost` renders it from
+ * `App.tsx`, beside the list rather than in place of it — and outside the sidebar branches, so
+ * a task opened from the Agents panel appears without switching panels. The board stays on
+ * screen behind the scrim whenever the Tasks panel is the view.
  *
  * One line of its own because [`OverlayCard`] portals: see the file header for why that boundary
  * is exactly the line between what a server render can see and what it cannot.
@@ -462,7 +487,9 @@ export function TaskDetail(props: TaskDetailProps) {
           data-audit="tasksDetailGlyph"
           aria-hidden="true"
         >
-          {statusGlyph(task.status)}
+          {/* Through `Icon`/`asIcon`, exactly as the list row draws it — the raw table value is
+              a *name* (`circle-dot`), and rendering it as text prints the name. */}
+          <Icon name={asIcon(statusGlyph(task.status))} size={1} />
         </span>
         <span className={styles.detailId} data-audit="tasksDetailId">
           {task.id}
@@ -552,6 +579,45 @@ export function TaskDetail(props: TaskDetailProps) {
               </button>
             ))}
           </div>
+          {/*
+            * The status log: who moved this task, when, from where to where. (M27)
+            *
+            * A native `<details>`, **collapsed by default** — it is the record you need rarely
+            * and must be able to trust absolutely when you do, so it costs one quiet line under
+            * the segment until it is asked for. Uncontrolled on purpose: whether a disclosure
+            * is open is exactly the transient gesture state the webview is allowed to own, and
+            * a `useState` here would be reachable from no fixture while buying nothing.
+            *
+            * Drawn only when there is history to show. An empty disclosure would be a control
+            * that opens onto nothing, and a task that never moved has nothing to audit — the
+            * segment above already says where it is, and the head says who created it.
+            */}
+          {task.history.length > 0 && (
+            <details className={styles.history} data-audit="tasksHistory">
+              <summary className={styles.historySummary} data-audit="tasksHistorySummary">
+                Status history ({task.history.length})
+              </summary>
+              <div className={styles.historyRows}>
+                {historyOrder(task).map((change, index) => (
+                  <div
+                    className={styles.historyRow}
+                    data-audit="tasksHistoryRow"
+                    key={`${change.atMs}:${index}`}
+                  >
+                    <span className={styles.historyTime}>
+                      {clock(change.atMs)} ({elapsed(nowMs, change.atMs)} ago)
+                    </span>
+                    {/* Through `statusLabel`, never raw: a status a future cide wrote renders
+                        as `Unknown` rather than as an unreadable token or a throw. */}
+                    <span className={styles.historyMove}>
+                      {statusLabel(change.from)} → {statusLabel(change.to)}
+                    </span>
+                    <span className={styles.historyBy}>{authorLabel(change.by)}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
         </div>
 
         <FieldRow field="assignee" task={task} roles={roles} editing={editing} run={run} props={props} />
@@ -567,7 +633,9 @@ export function TaskDetail(props: TaskDetailProps) {
           <div className={styles.runStrip} data-audit="tasksRunStrip">
             <span className={chipClass(chip)} data-audit="tasksStripChip" data-lit="true">
               <span className={styles.chipDot} aria-hidden="true">
-                {phaseGlyph((chip.phase ?? '') as RunPhase)}
+                {/* `phaseGlyph` returns an icon *name* (`loader-circle`), not a drawable
+                    character — same as the list row's chip, it must go through `Icon`. */}
+                <Icon name={asIcon(phaseGlyph((chip.phase ?? '') as RunPhase))} size={0} />
               </span>
               <span className={styles.chipLabel}>{chip.label}</span>
             </span>
@@ -643,7 +711,12 @@ export function TaskDetail(props: TaskDetailProps) {
                     >
                       {authorLabel(comment.author)}
                     </span>
-                    <span className={styles.logTime}>{elapsed(nowMs, comment.atMs)} ago</span>
+                    {/* The wall clock first, the age in brackets — `clock`'s doc carries why
+                        both are on the line. One span, so the head still reads as one
+                        right-aligned fact. */}
+                    <span className={styles.logTime}>
+                      {clock(comment.atMs)} ({elapsed(nowMs, comment.atMs)} ago)
+                    </span>
                     {comment.editedMs !== null && (
                       <span className={styles.logEdited} data-audit="tasksCommentEdited">
                         edited
@@ -667,13 +740,18 @@ export function TaskDetail(props: TaskDetailProps) {
                         onEditComment(task.id, comment.id, next)
                       }}
                     >
-                      <textarea
+                      <MentionTextarea
                         className={styles.composerText}
+                        roles={roles}
+                        listboxId={`comment-edit-mentions-${comment.id}`}
+                        tools
                         name="text"
                         defaultValue={comment.text}
                         rows={3}
                         autoFocus
                         onKeyDown={(event) => {
+                          // Only for keys the mention popup declined — its own Escape closes
+                          // the popup, not this editor.
                           if (event.key === 'Escape') {
                             event.stopPropagation()
                             setEditingComment(null)
@@ -695,9 +773,13 @@ export function TaskDetail(props: TaskDetailProps) {
                     </form>
                   ) : (
                     <>
-                      {/* Text, in a `pre-wrap` block. Never `dangerouslySetInnerHTML`, never a
-                          markdown renderer — see the file header. */}
-                      <p className={styles.logText}>{comment.text}</p>
+                      {/* Rendered as markdown — through the AST and React's own escaping, never
+                          `dangerouslySetInnerHTML`; the file header carries what changed. A
+                          `<div>` now, because the rendering is blocks and a `<p>` cannot hold
+                          them. */}
+                      <div className={styles.logText} data-audit="tasksCommentText">
+                        <TaskMarkdown text={comment.text} />
+                      </div>
                       {/*
                         * The two controls, on their own row under the comment rather than
                         * crammed into the head beside the timestamp. (M21)
@@ -773,12 +855,17 @@ export function TaskDetail(props: TaskDetailProps) {
               * Uncontrolled, and the only uncontrolled control left on the card. It is not a
               * field: nothing on the board can contradict it, there is no value to be dirty
               * against, and `form.reset()` after a successful append is the whole of its state.
+              * `MentionTextarea` keeps it that way — an accepted mention is written into
+              * `el.value` directly, which is exactly what the form's FormData reads.
               */}
-            <textarea
+            <MentionTextarea
               id={`task-comment-${task.id}`}
               className={styles.textarea}
               data-audit="tasksCommentField"
               data-write="true"
+              roles={roles}
+              listboxId={`task-comment-mentions-${task.id}`}
+              tools
               name="text"
               defaultValue=""
             />
@@ -877,45 +964,56 @@ function FieldRow({
       />
     ),
     assignee: () => (
-      <select
-        id={id}
-        className={styles.select}
-        data-audit="taskEditor"
-        data-field={field}
-        data-write="true"
-        autoFocus
-        aria-label={label}
-        value={editing?.draft ?? ''}
-        /*
-         * Choosing **is** the commit, so there is no Save beside this one. A `<select>` already
-         * costs a click to open and a click to choose; a third press to confirm the choice the
-         * user just made would be a button with nothing left to do. The draft is built here
-         * rather than stored first because the change carries the whole value.
-         */
-        onChange={(event) => run(commitEdit(task, { field, draft: event.target.value }))}
-      >
-        <option value="">{UNASSIGNED}</option>
-        {assignableRoles(task.agent, roles).map((agent) => (
-          <option key={agent} value={agent}>
-            {roles[agent] ?? agent}
-          </option>
-        ))}
-      </select>
+      <>
+        <select
+          id={id}
+          className={styles.select}
+          data-audit="taskEditor"
+          data-field={field}
+          data-write="true"
+          autoFocus
+          aria-label={label}
+          value={editing?.draft ?? ''}
+          /*
+           * Choosing **is** the commit, so there is no Save beside this one. A `<select>` already
+           * costs a click to open and a click to choose; a third press to confirm the choice the
+           * user just made would be a button with nothing left to do. The draft is built here
+           * rather than stored first because the change carries the whole value.
+           */
+          onChange={(event) => run(commitEdit(task, { field, draft: event.target.value }))}
+        >
+          <option value="">{UNASSIGNED}</option>
+          {assignableRoles(task.agent, roles).map((agent) => (
+            <option key={agent} value={agent}>
+              {roles[agent] ?? agent}
+            </option>
+          ))}
+        </select>
+        {(props.assigneeHint ?? null) !== null && (
+          <p className={styles.assigneeHint} data-audit="tasksAssigneeHint">
+            {props.assigneeHint}
+          </p>
+        )}
+      </>
     ),
     body: () => (
-      <textarea
+      <MentionTextarea
         id={id}
         className={styles.textarea}
         data-audit="taskEditor"
         data-field={field}
         data-write="true"
+        roles={roles}
+        listboxId={`task-body-mentions-${task.id}`}
+        tools
         autoFocus
         aria-label={label}
         value={editing?.draft ?? ''}
-        onChange={(event) => props.onEditing?.({ field, draft: event.target.value })}
+        onValueChange={(draft) => props.onEditing?.({ field, draft })}
         onKeyDown={(event) => {
           // Enter is a newline in a body, so the shortcut is the modified one. Save is on
-          // screen as well — a shortcut nobody can see is not a way out of a field.
+          // screen as well — a shortcut nobody can see is not a way out of a field. Plain
+          // Enter with the mention popup open never reaches here — the popup claims it.
           if (event.key !== 'Enter' || !(event.ctrlKey || event.metaKey)) return
           event.preventDefault()
           run(commitEdit(task, editing))
@@ -994,6 +1092,19 @@ function FieldRow({
             </div>
           )}
         </>
+      ) : field === 'body' && !isFieldEmpty(task, field) ? (
+        /*
+         * The body at rest renders as markdown — the statement of the work is the one field
+         * agents author in it. A `<div>` because the rendering is block elements, which a `<p>`
+         * cannot legally hold; same hook and classes, so every digest keeps reading it.
+         */
+        <div
+          className={cx(styles.fieldValue, styles.fieldValueBody)}
+          data-audit="taskFieldValue"
+          data-field={field}
+        >
+          <TaskMarkdown text={task.body} />
+        </div>
       ) : (
         /*
          * At rest. **Text, never a disabled control** — a greyed-out `<input>` is still an input:
@@ -1004,7 +1115,6 @@ function FieldRow({
         <p
           className={cx(
             styles.fieldValue,
-            field === 'body' ? styles.fieldValueBody : undefined,
             isFieldEmpty(task, field) ? styles.fieldValueEmpty : undefined,
           )}
           data-audit="taskFieldValue"

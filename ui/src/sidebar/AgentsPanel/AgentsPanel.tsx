@@ -943,6 +943,14 @@ function RoleLine({
  * the host reports as one. This is not a predictive button and must not be described as one; it
  * is a question the user is allowed to ask, whose answer sometimes is "nothing to do".
  *
+ * **What it merges narrowed when worktrees went per-task**: this button names no task, so it
+ * targets the role's *base* branch `cide/<role>` — the one its taskless dispatches commit to.
+ * A task's work lives on `cide/<role>-<task>` now, and the road to it is the orchestrator's
+ * `cide_agent_integrate` with the task named; a merge control on the task's own card is the
+ * named follow-up for doing it by hand. The backend's "no branch yet" refusal spells the exact
+ * branch it looked for, so pressing this over per-task work reads as an explanation rather
+ * than a silent no-op.
+ *
  * Two consequences worth stating because each looks like an oversight:
  *
  *  * **A role that cannot be dispatched still gets it.** `unavailable` is a fact about the

@@ -526,6 +526,7 @@ fn open_diff_tab(app: &AppHandle, project: ProjectId, broker: &DiffBroker, reque
         role: PaneRole::Auxiliary,
         session: None,
         conversation: None,
+        conversation_since: None,
         title,
     };
 

@@ -7,13 +7,22 @@
 //! turn. A worktree gives each its own working directory and its own `HEAD` while sharing the
 //! object database, so the isolation costs one checkout rather than one clone.
 //!
-//! # One worktree per *agent*, not per run
+//! # One worktree per *task*, not per run — and the name is the caller's composite
 //!
-//! The unit is the role — a developer, a qa — because that is how the user thinks about the
-//! team, and because it makes an agent's queue **serial**: one checkout is one place to stand,
-//! so an agent runs at most one task at a time. Per-run worktrees would multiply checkouts of
-//! a large repository without matching anyone's mental model, and would leave the question of
-//! which of five stale checkouts holds the work nobody merged.
+//! This header used to argue "one worktree per agent, not per run": the role was the unit, its
+//! queue was serial, and per-run worktrees "would leave the question of which of five stale
+//! checkouts holds the work nobody merged". Half of that argument survives — per-**run**
+//! checkouts really would orphan work — but the serial queue it bought was the cost a real
+//! workstream refused to pay: a role with `max-concurrent: 2` ran one task at a time and the
+//! user watched the second queue for no reason they could see. The unit that keeps both
+//! halves is the **task**: `cide_agents::checkout_name` composes `<role>-<task>` (or the bare
+//! role for a taskless dispatch), so a role's tasks parallelise in their own checkouts, the
+//! merge unit is a task's branch — which answers exactly "which checkout holds the work" —
+//! and a re-dispatch of the same task lands where its earlier commits already are.
+//!
+//! Nothing in *this* module changed for that: every function here takes a **name** and builds
+//! `.cide/worktrees/<name>` on `cide/<name>` from it. The composition lives with the registry,
+//! which is the one place that knows both halves of the pair.
 //!
 //! A consequence worth writing down: `claude` files its transcript under the directory it
 //! started in, so a run's cwd *is* its worktree and resume follows it, and paths an agent
@@ -385,9 +394,9 @@ fn branch_name(agent: &str) -> String {
     format!("{BRANCH_PREFIX}/{agent}")
 }
 
-/// Reject anything that is not `[a-z0-9][a-z0-9-]{0,31}`.
+/// Reject anything that is not `[a-z0-9][a-z0-9-]{0,63}`.
 ///
-/// **Agent names are not paths.** An agent id comes from a config file in the user's project
+/// **Worktree names are not paths.** The name comes from a config file in the user's project
 /// and from whatever wrote it — including a model — and it is about to be `Path::join`ed and
 /// turned into a ref name. `../../etc` joined onto `.cide/worktrees/` puts a checkout wherever
 /// it likes, and `..` in a ref name is a revision range. This is the same class of refusal
@@ -397,12 +406,17 @@ fn branch_name(agent: &str) -> String {
 /// name that only differs from another by case (one path on macOS, two here — the thing
 /// `check:casing` exists for), and whatever the next filesystem calls special.
 ///
-/// The refusal reuses [`GitError::InvalidBranchName`] because the agent id *is* the second
-/// segment of `cide/<agent>`, so the sentence the UI already shows is true; a worktree-shaped
+/// The length is 64 where an agent id alone is capped at 32, because a name here may be
+/// `cide_agents::checkout_name`'s composite — a 32-char role plus a task slug — and that
+/// composer keeps itself under this cap by construction. The charset is exactly the agent-id
+/// grammar, which is what lets one whitelist serve both shapes.
+///
+/// The refusal reuses [`GitError::InvalidBranchName`] because the name *is* the second
+/// segment of `cide/<name>`, so the sentence the UI already shows is true; a worktree-shaped
 /// variant would be a wire-contract change for a message that reads the same.
 fn validate_agent(agent: &str) -> Result<()> {
     let mut chars = agent.chars();
-    let ok = (1..=32).contains(&agent.len())
+    let ok = (1..=64).contains(&agent.len())
         && chars
             .next()
             .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
@@ -572,7 +586,8 @@ mod tests {
             "",
             "-dev",
             "dev\0",
-            &"x".repeat(33),
+            // 64 is the cap, not 32: a name may be `checkout_name`'s role-plus-task composite.
+            &"x".repeat(65),
         ] {
             assert_eq!(
                 ensure(&root, name),
@@ -589,7 +604,15 @@ mod tests {
             "a refused name creates nothing at all"
         );
 
-        for name in ["dev", "qa2", "a", "code-reviewer", &"x".repeat(32)] {
+        for name in [
+            "dev",
+            "qa2",
+            "a",
+            "code-reviewer",
+            // A per-task composite and the cap itself, which composites may reach.
+            "developer-t-62",
+            &"x".repeat(64),
+        ] {
             assert!(validate_agent(name).is_ok(), "{name:?} is a fine agent id");
         }
 

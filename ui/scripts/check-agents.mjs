@@ -126,6 +126,8 @@ try {
       'node_modules/typescript/bin/tsc',
       'src/sidebar/AgentsPanel/model.ts',
       'src/sidebar/TasksPanel/model.ts',
+      'src/sidebar/TasksPanel/mentionModel.ts',
+      'src/sidebar/TasksPanel/markdownTools.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -139,6 +141,8 @@ try {
 
   const agents = await import(`file://${join(out, 'AgentsPanel', 'model.js')}`)
   const tasks = await import(`file://${join(out, 'TasksPanel', 'model.js')}`)
+  const mentions = await import(`file://${join(out, 'TasksPanel', 'mentionModel.js')}`)
+  const mdTools = await import(`file://${join(out, 'TasksPanel', 'markdownTools.js')}`)
 
   const {
     HARNESSES,
@@ -147,6 +151,8 @@ try {
     ACTIVE_PHASES,
     TONES: RUN_TONES,
     ROSTER_UNKNOWN,
+    OFF_FOR_THIS_PROJECT,
+    rosterRoles,
     RECENT_CAP,
     RESTING_GLYPH,
     RESTING_LABEL,
@@ -154,6 +160,7 @@ try {
     isActivePhase,
     isRunPhase,
     phaseGlyph,
+    phaseHint,
     phaseLabel,
     phaseTone,
     canDispatch,
@@ -182,6 +189,7 @@ try {
     groupOf,
     groups,
     matchesFilter,
+    matchesQuery,
     listEmpty,
     armedDelete,
     openCount,
@@ -195,6 +203,7 @@ try {
     draftDirty,
     closeCompose,
     filterAfterCreate,
+    queryAfterCreate,
     TASK_FIELDS,
     EDITABLE_FIELDS,
     UNASSIGNED,
@@ -209,6 +218,7 @@ try {
     assigneeLabel,
     assigneeFromDraft,
     assignableRoles,
+    assigneeHint,
     startEdit,
     isDirty,
     beginEdit,
@@ -229,7 +239,7 @@ try {
   const rustHarnesses = variants(agentsRs, 'pub enum Harness {', 'Harness')
 
   ok(rustStatuses.length === 4, `read ${rustStatuses.length} TaskStatus variants — the scan still matches`)
-  ok(rustPhases.length === 8, `read ${rustPhases.length} RunState variants — the scan still matches`)
+  ok(rustPhases.length === 9, `read ${rustPhases.length} RunState variants — the scan still matches`)
   ok(rustHarnesses.length === 2, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
 
   eq(
@@ -315,6 +325,26 @@ try {
     nonEmptyString(phaseLabel(phase), `phaseLabel(${phase}) is a non-empty string`)
     nonEmptyString(phaseTone(phase), `phaseTone(${phase}) is a non-empty string`)
     ok(RUN_TONES.includes(phaseTone(phase)), `phaseTone(${phase}) is a declared tone`)
+  }
+
+  /*
+   * The paused hint. "Paused" alone read as a lie to a user watching their local model keep
+   * inferring after the freeze — the child is stopped, but a model call already in flight
+   * finishes on the provider's side and is read on resume. The row's title must carry that
+   * truth, and only there: every other phase's one-word label is the whole truth and gets no
+   * hint, so a view falling back to the label stays correct.
+   */
+  {
+    const hint = phaseHint('paused')
+    nonEmptyString(hint, `phaseHint('paused') carries the in-flight truth`)
+    ok(
+      hint.includes('in flight') && hint.includes('resumed'),
+      `the paused hint names the in-flight model call and when its answer lands`
+    )
+    for (const phase of RUN_PHASES) {
+      if (phase === 'paused') continue
+      eq(phaseHint(phase), null, `phaseHint(${phase}) === null — the label is the whole truth`)
+    }
   }
 
   /*
@@ -583,9 +613,13 @@ try {
     chips += 1
     if (result !== null) {
       nonEmptyString(result.label, `agentChip label is a non-empty string: ${what}`)
+      // The four legal (lit, tone) pairs and nothing else: lit is live/attention, unlit is
+      // assigned/attention — the unlit-attention pair being the stalled reading. The two
+      // combinations outside the square are each a lie: a lit-assigned chip claims work with
+      // no working run behind the tone, and an unlit-live one claims the reverse.
       ok(
-        result.lit === (result.tone !== 'assigned'),
-        `agentChip's two discriminators agree: ${what}`,
+        !(result.lit && result.tone === 'assigned') && !(!result.lit && result.tone === 'live'),
+        `agentChip's two discriminators stay inside the legal square: ${what}`,
       )
     }
     return result
@@ -596,13 +630,63 @@ try {
     ok(live !== null && live.lit === true, 'a live run wins and is lit')
     ok(live !== null && live.tone === 'live', 'and carries the live tone')
 
-    const dim = chip(task({}), [], ROLE_LABELS, 'no runs at all')
+    // The fixture's default is `doing` + assigned, so no runs at all is the STALLED exemplar —
+    // the orchestrator's orphaned-t-62 state, previously indistinguishable from just-started.
+    const stalled = chip(task({}), [], ROLE_LABELS, 'doing + assigned + no runs = stalled')
+    ok(stalled !== null && stalled.lit === false, 'stalled is unlit — no run is working')
+    ok(
+      stalled !== null && stalled.tone === 'attention',
+      'and carries attention — the task claims work is under way and nobody is coming',
+    )
+
+    const dim = chip(task({ status: 'todo' }), [], ROLE_LABELS, 'todo + assigned + no runs')
     ok(dim !== null && dim.lit === false, 'the assigned role alone is dim')
-    ok(dim !== null && dim.tone === 'assigned', 'and carries the assigned tone')
+    ok(
+      dim !== null && dim.tone === 'assigned',
+      'a todo task is not started, not stalled — assignment claims nothing about progress',
+    )
     ok(
       live !== null && dim !== null && live.tone !== dim.tone && live.lit !== dim.lit,
-      'the two renderings differ on both discriminators — a chip that looked the same either ' +
-        'way would claim an exited agent is still working',
+      'the live and assigned renderings differ on both discriminators — a chip that looked the ' +
+        'same either way would claim an exited agent is still working',
+    )
+    ok(
+      stalled !== null && dim !== null && stalled.tone !== dim.tone,
+      'and stalled differs from plain assigned — "nobody is coming" rendered identically to ' +
+        '"assigned, quietly" is the invisibility the debug notes reported',
+    )
+
+    // The suppression boundary, edge by edge — each why is in `agentChip`'s doc.
+    const queued = chip(
+      task({}),
+      [ref({ phase: 'queued', session: null })],
+      ROLE_LABELS,
+      'doing + a queued run',
+    )
+    ok(
+      queued !== null && queued.tone === 'assigned',
+      'a queued run suppresses stalled — the system is on the task and the run is literally next',
+    )
+    const idle = chip(task({}), [ref({ phase: 'idle' })], ROLE_LABELS, 'doing + an idle run')
+    ok(
+      idle !== null && idle.tone === 'assigned',
+      'an idle run suppresses stalled — a live child one follow-up from moving, already nudged',
+    )
+    const interrupted = chip(
+      task({}),
+      [ref({ phase: 'interrupted' })],
+      ROLE_LABELS,
+      'doing + an interrupted run',
+    )
+    ok(
+      interrupted !== null && interrupted.lit === false && interrupted.tone === 'attention',
+      'an interrupted run does NOT suppress stalled — its child died with a cide restart and ' +
+        'nothing moves until a human presses Resume, which is exactly what attention asks for',
+    )
+    const reviewed = chip(task({ status: 'review' }), [], ROLE_LABELS, 'review + assigned')
+    ok(
+      reviewed !== null && reviewed.tone === 'assigned',
+      'review is past the point where a missing run means anything',
     )
 
     eq(chip(task({ agent: null }), [], ROLE_LABELS, 'neither'), null, 'neither fact yields no chip')
@@ -978,6 +1062,12 @@ try {
   eq(canOpen(run({ phase: 'queued', session: null })), false, 'a queued run has nothing to open')
   eq(canOpen(run({ phase: 'queued', session: 's1' })), false, 'nor one whose session is premature')
   eq(canOpen(run({ phase: 'finished', session: 's1' })), true, 'a finished run still has its screen')
+  eq(
+    canOpen(run({ phase: 'interrupted', session: 's1' })),
+    false,
+    'an interrupted run carries a session id with no process behind it — an Open would attach ' +
+      'to nothing and draw a resume splash over a row whose real affordance is Resume',
+  )
   eq(canPause(run({ phase: 'running' })), true, 'a running child can be frozen')
   eq(canPause(run({ phase: 'paused' })), false, 'an already-frozen one draws Resume instead')
   eq(canPause(run({ phase: 'queued' })), false, 'and a queued one has no child to freeze')
@@ -988,7 +1078,7 @@ try {
     const board = ready(4, [
       task({ id: 't-1', status: 'todo' }),
       task({ id: 't-2', status: 'doing' }),
-      task({ id: 't-3', status: 'todo' }),
+      task({ id: 't-3', status: 'todo', updatedMs: 1_700_000_600_000 }),
       task({ id: 't-4', status: 'review' }),
     ])
     const list = groups(board)
@@ -999,8 +1089,9 @@ try {
     )
     eq(
       list.find((g) => g.status === 'todo').tasks.map((t) => t.id),
-      ['t-1', 't-3'],
-      'order within a group is the file’s own order — the array *is* the priority',
+      ['t-3', 't-1'],
+      'order within a group is recency — t-3 was touched later and comes first however the ' +
+        'file interleaves them; the dedicated block below carries the tie-breaks',
     )
     eq(groups(UNREADABLE), [], 'a non-ready board groups nothing')
 
@@ -1012,6 +1103,67 @@ try {
         'a tracker somebody is relying on',
     )
     eq(rogue[0].status, 'todo', 'and it lands in the group that claims the least')
+  }
+
+  /* == the recency order ==================================================================== */
+
+  {
+    const order = (list) => list.flatMap((g) => g.tasks.map((t) => t.id))
+
+    eq(
+      order(
+        groups(
+          ready(1, [
+            task({ id: 't-1', status: 'todo', updatedMs: 100, createdMs: 100 }),
+            task({ id: 't-2', status: 'todo', updatedMs: 300, createdMs: 50 }),
+            task({ id: 't-3', status: 'todo', updatedMs: 200, createdMs: 200 }),
+          ]),
+        ),
+      ),
+      ['t-2', 't-3', 't-1'],
+      'last touched first, off `updatedMs` alone — which Rust stamps on EVERY TaskEdit in one ' +
+        'place, so a status change, a new comment, an assignment and a retitle all count as ' +
+        'touching. t-2 wins on its update stamp despite being the oldest task on the board',
+    )
+    eq(
+      order(
+        groups(
+          ready(1, [
+            task({ id: 't-1', status: 'todo', updatedMs: 100, createdMs: 10 }),
+            task({ id: 't-2', status: 'todo', updatedMs: 100, createdMs: 20 }),
+          ]),
+        ),
+      ),
+      ['t-2', 't-1'],
+      'equal update stamps fall back to creation, newest first',
+    )
+    eq(
+      order(
+        groups(
+          ready(1, [
+            task({ id: 't-1', status: 'todo', updatedMs: 100, createdMs: 10 }),
+            task({ id: 't-2', status: 'todo', updatedMs: 100, createdMs: 10 }),
+          ]),
+        ),
+      ),
+      ['t-1', 't-2'],
+      'and full ties keep the file’s own order — the sort is stable, so two tasks stamped in ' +
+        'the same millisecond cannot swap places between two paints of the same board',
+    )
+    eq(
+      order(
+        groups(
+          ready(1, [
+            task({ id: 't-1', status: 'todo', updatedMs: 100, createdMs: 100 }),
+            task({ id: 't-2', status: 'todo', updatedMs: Number.NaN, createdMs: 100 }),
+          ]),
+        ),
+      ),
+      ['t-1', 't-2'],
+      'a non-finite stamp compares as the epoch and sinks, rather than floating on NaN ' +
+        'comparisons — which are not an ordering at all, and hand Array.sort licence to leave ' +
+        'the rows in any arrangement it likes. This file is hand-editable JSON two layers down',
+    )
   }
 
   {
@@ -1150,6 +1302,122 @@ try {
       'filter',
       'and the rogue task counts as a task for that purpose, so a board holding only one is ' +
         'never reported as an empty tracker',
+    )
+  }
+
+  /* == the search =========================================================================== */
+
+  {
+    const board = ready(4, [
+      task({ id: 't-1', status: 'todo', title: 'Add the retry bar', body: '' }),
+      task({ id: 't-2', status: 'doing', title: 'Sweep the phase table', body: 'The retry path is the hard half.' }),
+      task({ id: 't-3', status: 'review', title: 'Write the check', body: '' }),
+    ])
+    const ids = (list) => list.flatMap((g) => g.tasks.map((t) => t.id))
+
+    ok(
+      matchesQuery(task({ title: 'Anything at all' }), ''),
+      'an empty query matches everything — "no search" is the empty string, the one value a ' +
+        'text box cannot avoid resting in',
+    )
+    ok(
+      matchesQuery(task({ title: 'Anything at all' }), '   '),
+      'and so does whitespace: a stray space must not blank the board with nothing visibly typed',
+    )
+    ok(matchesQuery(task({ title: 'Add the RETRY bar' }), 'retry'), 'matching is case-insensitive')
+    ok(
+      matchesQuery(task({ title: 'x', body: 'offer a Retry instead' }), 'RETRY'),
+      '…in both directions, and the body counts — it is the statement of the work, which is ' +
+        'what a user half-remembering a task actually recalls',
+    )
+    ok(
+      matchesQuery(task({ id: 't-14', title: 'x', body: '' }), 't-14'),
+      'the id counts too — it is on the row, and agents quote it in prompts and comments',
+    )
+    eq(matchesQuery(task({ title: 'Sweep the table', body: '' }), 'retry'), false, 'and a miss is a miss')
+    eq(
+      matchesQuery(
+        task({
+          title: 'x',
+          body: '',
+          comments: [{ id: 'c-1', author: { kind: 'user' }, text: 'the retry path', atMs: 1, editedMs: null }],
+        }),
+        'retry',
+      ),
+      false,
+      'comments are NOT searched: a hit there draws a row whose visible line contains nothing ' +
+        'the user typed — a match with an invisible reason — and the log is the tracker’s ' +
+        'noisiest, most model-authored text, so it is where a short query matches most and ' +
+        'means least',
+    )
+
+    eq(
+      ids(groups(board, null, 'retry')),
+      ['t-2', 't-1'],
+      'a query narrows the list — still in GROUP_ORDER, still recency inside a group, because ' +
+        'a search FILTERS and never re-ranks: the order is the same one the unnarrowed list ' +
+        'draws, so a row keeps its place as the query grows and shrinks',
+    )
+    eq(
+      ids(groups(board, 'todo', 'retry')),
+      ['t-1'],
+      'and it composes with the status filter as the intersection — each control is its own ' +
+        'claim about the row',
+    )
+    eq(
+      ids(groups(board, null)),
+      ids(groups(board, null, '')),
+      'the argument defaults to no query, so every caller that predates it is unchanged',
+    )
+
+    eq(listEmpty(board, null, 'retry'), null, 'a query with matches is not empty')
+    eq(
+      listEmpty(board, null, 'quaternion'),
+      'search',
+      'one with none is its OWN state, a third sentence rather than a reuse of the filter’s: ' +
+        'the way out of this one is clearing what was typed, so the screen has to name the query',
+    )
+    eq(
+      listEmpty(ready(1, []), null, 'retry'),
+      'tracker',
+      'an empty tracker stays the tracker screen under a query — there was nothing to have hidden',
+    )
+    eq(
+      listEmpty(board, 'review', 'retry'),
+      'search',
+      'when both narrowings are on and nothing survives, the search takes the blame — the ' +
+        'sentence can name the query AND the status it ran inside, where blaming the filter ' +
+        'would claim a status hid tasks that a different control is hiding',
+    )
+    eq(
+      listEmpty(board, 'done', ''),
+      'filter',
+      'and with no query at all the filter keeps its own screen exactly as before',
+    )
+
+    /*
+     * `queryAfterCreate` — `filterAfterCreate`'s rule applied to the box: a create the user
+     * cannot see reads as a create that did not happen.
+     */
+    const draft = (over) => ({ ...EMPTY_DRAFT, ...over })
+    eq(queryAfterCreate('', draft({ title: 'New' })), '', 'no query, nothing to protect')
+    eq(
+      queryAfterCreate('retry', draft({ title: 'Fix the retry bar' })),
+      'retry',
+      'a query the new task matches survives — the row will appear under it, and a user ' +
+        'working through a themed backlog keeps their narrowing',
+    )
+    eq(
+      queryAfterCreate('Retry', draft({ title: 'x', body: 'the retry path' })),
+      'Retry',
+      'matched case-insensitively against the body too — the same hit rule as matchesQuery, ' +
+        'shared so the two cannot disagree about what will be visible',
+    )
+    eq(
+      queryAfterCreate('retry', draft({ title: 'Something else' })),
+      '',
+      'one it does not match is cleared: the dialog closes, and the row must be on the screen ' +
+        'behind it rather than hidden by a box the user stopped thinking about',
     )
   }
 
@@ -1618,6 +1886,243 @@ try {
     }
 
     ok(intents >= 13, `${intents} intents driven — the block above still runs`)
+  }
+
+  /* == the roles join, the hint under the dropdown, and the mention model ==================== */
+  //
+  // The assignee dropdown shipped empty for the whole life of one milestone because the host
+  // passed `{}` where the roster's map belonged — a wiring bug at the one seam neither check
+  // mounts. `rosterRoles` is now the join in model form, `assigneeHint` is the sentence that
+  // keeps a legitimately-short list from reading as that bug, and the mention model is the
+  // pure half of the @-popup. All three live here so the empty-forever state has a gate.
+
+  {
+    const join = (agents) => rosterRoles({ kind: 'ready', agents, runs: [], dispatching: true })
+
+    for (const [name, roster] of [
+      ['disabled', DISABLED],
+      ['empty', EMPTY],
+      ['unknown', ROSTER_UNKNOWN],
+    ]) {
+      eq(
+        Object.keys(rosterRoles(roster)).length,
+        0,
+        `rosterRoles(${name}) offers nothing — a roster that is not ready has no ids to sell`,
+      )
+    }
+
+    const roles = join([
+      def({ id: 'constructor', label: 'Ctor' }),
+      def({ id: '  ', label: 'Ghost' }),
+      def({ id: 'qa', label: '' }),
+      def({ id: 'developer', label: 'Developer' }),
+    ])
+    ok(
+      Object.hasOwn(roles, 'constructor') && roles['constructor'] === 'Ctor',
+      'an id off Object.prototype is an own entry, not an inherited function',
+    )
+    eq(roles['qa'], 'qa', 'a blank label falls back to the id, so the option still has a face')
+    ok(
+      !Object.keys(roles).some((id) => id.trim() === ''),
+      'a blank id is dropped — its empty value would collide with the Unassigned option',
+    )
+    eq(
+      assignableRoles(null, join(ROLES)),
+      ['artist', 'blank', 'developer', 'qa', 'writer'],
+      'the join round-trips into the dropdown sorted, whole roster in',
+    )
+
+    /* -- the hint --------------------------------------------------------------------------- */
+
+    ok(
+      assigneeHint('disabled').startsWith(OFF_FOR_THIS_PROJECT),
+      'the disabled hint opens with the Agents panel’s own sentence, word for word — a ' +
+        'deliberate second copy (this module is import-free so this script can compile it ' +
+        'alone), and this line is what pins the two together',
+    )
+    ok(
+      assigneeHint('empty').includes('.cide/agents/'),
+      'the empty hint names the file that would add a role — the only action there is',
+    )
+    eq(assigneeHint('ready'), null, 'a ready roster needs no excuse')
+    eq(
+      assigneeHint('unknown'),
+      null,
+      'nobody-has-looked draws nothing — the roster convention; a hint here would claim ' +
+        'knowledge this window does not have',
+    )
+    eq(assigneeHint('bogus'), null, 'an unrecognised kind claims nothing')
+  }
+
+  {
+    const { mentionQuery, mentionOptions, applyMention } = mentions
+    let mentionRows = 0
+    const q = (text, caret, expected, why) => {
+      mentionRows += 1
+      eq(mentionQuery(text, caret), expected, why)
+    }
+
+    // Opens exactly where the Rust parser (`cide-agents/src/mentions.rs`) would act — a popup
+    // that opens where the parser will not, or stays shut where it will, teaches a grammar the
+    // system does not have.
+    q('hi @dev', 7, { start: 3, end: 7, query: 'dev' }, 'a token under the caret opens')
+    q('@', 1, { start: 0, end: 1, query: '' }, 'a bare @ at the start opens with everything')
+    q('(@dev', 5, { start: 1, end: 5, query: 'dev' }, 'punctuation before the @ opens — parser parity')
+    q('@dev', 2, { start: 0, end: 2, query: 'd' }, 'the caret mid-token queries what is behind it')
+    q('a@b', 3, null, 'an alphanumeric before the @ closes it — user@example.com is prose')
+    q('mail user@example', 14, null, 'the email case, spelled out')
+    q('@dev x', 6, null, 'a space ends the token; the popup does not reopen from later prose')
+    q('@dev', 0, null, 'no caret, no token')
+    q(`@${'a'.repeat(45)}`, 46, null, 'a token past any legal id closes rather than scans on')
+
+    const roles = {
+      developer: 'Developer',
+      qa: 'QA',
+      'code-reviewer': 'Code Reviewer',
+      '': 'Ghost',
+    }
+    const ids = (query) => mentionOptions(roles, query).map((option) => option.id)
+    eq(
+      ids(''),
+      ['code-reviewer', 'developer', 'qa'],
+      'the empty query offers the whole roster, id-sorted, blank ids dropped',
+    )
+    eq(ids('dev'), ['developer'], 'an id prefix wins')
+    eq(
+      ids('rev'),
+      ['code-reviewer'],
+      'a label word-prefix matches — the author’s own words are searchable',
+    )
+    eq(ids('zz'), [], 'no match, no rows — the component closes an empty popup')
+    eq(
+      mentionOptions({ constructor: 'Ctor' }, 'c').map((option) => option.label),
+      ['Ctor'],
+      'a prototype-key id ranks like any other',
+    )
+
+    const applied = applyMention('hi @dev x', { start: 3, end: 7, query: 'dev' }, 'developer')
+    eq(applied.text, 'hi @developer  x', 'the splice replaces the token with `@<id> `')
+    eq(applied.caret, 14, 'the caret lands after the inserted space, ready for prose')
+    eq(
+      mentionQuery(applied.text, applied.caret),
+      null,
+      'the insert closes the popup — the trailing space is what does it',
+    )
+
+    ok(mentionRows >= 9, `${mentionRows} mentionQuery rows driven — the table above still runs`)
+  }
+
+  /* == the formatting tools (M27) ============================================================ */
+  //
+  // `markdownTools.ts` is the toolbar's pure half — what pressing Bold does to the three
+  // characters you selected — and the only alternative home for these rules is a DOM event
+  // handler nothing in this repository can run. The properties that matter: every inline tool
+  // is a *toggle* (press-press is identity, or the button is a one-way ratchet whose undo is
+  // hand-deleting syntax it wrote), every transform is *total* (a `data-tool` nobody can name
+  // must not eat a draft), and the selection lands where the next press or keystroke expects it.
+  {
+    const { MARKDOWN_TOOLS, applyTool, isMarkdownTool } = mdTools
+
+    ok(MARKDOWN_TOOLS.length === 8, 'eight tools — the set the toolbar draws, no more')
+    eq(
+      MARKDOWN_TOOLS.length,
+      new Set(MARKDOWN_TOOLS.map((spec) => spec.tool)).size,
+      'no tool named twice',
+    )
+    ok(
+      MARKDOWN_TOOLS.every((spec) => spec.icon.trim() !== '' && spec.label.trim() !== ''),
+      'every tool carries an icon name and a spoken label — `check-ui-icons.mjs` pins the ' +
+        'names against the vendored set',
+    )
+    ok(MARKDOWN_TOOLS.every((spec) => isMarkdownTool(spec.tool)), 'and the guard admits each')
+    ok(!isMarkdownTool('constructor'), 'while a prototype key is not a tool')
+
+    // The inline toggles. The selection in the result is over the content, which is exactly
+    // what makes the second press find the markers outside it and take them off.
+    const bold = applyTool('press word here', 6, 10, 'bold')
+    eq(bold.text, 'press **word** here', 'Bold wraps the selection')
+    eq([bold.selStart, bold.selEnd], [8, 12], 'and keeps it over the word')
+    eq(
+      applyTool(bold.text, bold.selStart, bold.selEnd, 'bold').text,
+      'press word here',
+      'pressing Bold again is the undo — a toggle, not a ratchet',
+    )
+    eq(
+      applyTool('press **word** here', 6, 14, 'bold').text,
+      'press word here',
+      'selecting the markers along with the word unwraps too',
+    )
+    eq(
+      applyTool('**word**', 2, 6, 'italic').text,
+      '***word***',
+      'Italic inside a bold pair nests rather than eating one of bold’s stars',
+    )
+    const empty = applyTool('', 0, 0, 'code')
+    eq(empty.text, '`code`', 'an empty selection gets a placeholder')
+    eq([empty.selStart, empty.selEnd], [1, 5], 'selected, so the next keystroke replaces it')
+
+    // The line tools: whole lines, toggles, families that replace one another.
+    eq(applyTool('title', 2, 2, 'heading').text, '## title', 'Heading works from a bare caret')
+    eq(applyTool('## title', 0, 0, 'heading').text, 'title', 'and toggles off')
+    eq(applyTool('a\nb', 0, 3, 'quote').text, '> a\n> b', 'Quote prefixes every selected line')
+    eq(
+      applyTool('1. a\n2. b', 0, 9, 'bullet').text,
+      '- a\n- b',
+      'switching families replaces the marker instead of stacking `- 1. `',
+    )
+    eq(
+      applyTool('a\n\nb', 0, 4, 'ordered').text,
+      '1. a\n\n2. b',
+      'Numbered list counts items, not lines — a blank separator is neither prefixed nor numbered',
+    )
+    eq(applyTool('x\nx', 0, 3, 'ordered').text, '1. x\n2. x', 'duplicate lines still number apart')
+
+    // The link, three shapes: the selection is the half the user supplied, and the selection
+    // in the result is the half they still owe.
+    const url = applyTool('see https://x.invalid/a', 4, 23, 'link')
+    eq(url.text, 'see [text](https://x.invalid/a)', 'a selected URL becomes the destination')
+    eq(url.text.slice(url.selStart, url.selEnd), 'text', 'with the label placeholder selected')
+    const prose = applyTool('the docs', 4, 8, 'link')
+    eq(prose.text, 'the [docs](url)', 'selected prose becomes the label')
+    eq(prose.text.slice(prose.selStart, prose.selEnd), 'url', 'with the destination owed')
+
+    // Total, for hostile and out-of-range input alike.
+    eq(
+      applyTool('draft', 0, 5, 'constructor'),
+      { text: 'draft', selStart: 0, selEnd: 5 },
+      'a tool this build cannot name changes nothing — the draft survives',
+    )
+    eq(applyTool('ab', 9, -3, 'bold').text, '**ab**', 'a selection outside the text clamps')
+  }
+
+  /* == the clock stamp, and the status log's order (M27) ===================================== */
+  //
+  // `clock` is asserted by shape rather than by value — the clock half is local time, and this
+  // check runs in whatever timezone the machine has. `historyOrder` gets `commentOrder`'s three
+  // assertions because it makes `commentOrder`'s three promises.
+  {
+    const { clock, historyOrder } = tasks
+    ok(
+      /^\d{2}:\d{2}:\d{2}$/.test(clock(1_700_000_000_000)),
+      'a millisecond stamp renders as HH:MM:SS, 24-hour, always eight characters',
+    )
+    eq(clock(Number.NaN), '--:--:--', 'a value that is not a time is visibly broken, never NaN:NaN:NaN')
+    eq(clock(Number.POSITIVE_INFINITY), '--:--:--', 'in either direction')
+
+    const hop = (from, to, atMs) => ({ from, to, by: { kind: 'user' }, atMs })
+    const scrambled = {
+      history: [hop('doing', 'review', 3), hop('todo', 'doing', 1), hop('review', 'doing', 2)],
+    }
+    eq(
+      historyOrder(scrambled).map((h) => h.atMs),
+      [1, 2, 3],
+      'the status log is oldest first whatever order the file holds — a merge can interleave',
+    )
+    const ordered = { history: [hop('todo', 'doing', 1), hop('doing', 'review', 2)] }
+    ok(
+      historyOrder(ordered) === ordered.history,
+      'already-ordered history comes back as the identical array, so a memoising reader does not rebuild',
+    )
   }
 
   // --- 7. the wire loop nothing else closes -------------------------------------------------

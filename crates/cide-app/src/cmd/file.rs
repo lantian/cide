@@ -97,6 +97,7 @@ pub(crate) fn open_file_tab(
                 role: PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title,
             },
         )
@@ -657,6 +658,7 @@ fn diff_pane(title: String) -> Pane {
         // No process, ever. A diff is a document.
         session: None,
         conversation: None,
+        conversation_since: None,
         title,
     }
 }
@@ -1067,6 +1069,7 @@ fn revision_pane(title: String) -> Pane {
         // No process, ever. A commit's bytes are a document.
         session: None,
         conversation: None,
+        conversation_since: None,
         title,
     }
 }
@@ -1974,6 +1977,19 @@ pub fn claude_send_lines(
 /// menu. So the frontend asks when it is about to need the answer; see
 /// `ui/src/editor/claudeNames.ts`, which owns the refresh policy and says what it costs.
 ///
+/// # Why a name is dated before it is answered
+///
+/// The CLI's name belongs to the **process**, not to the conversation: `/rename` sets it on a
+/// per-process singleton, and `/clear` starts a fresh conversation inside that same `claude`
+/// and rewrites its record with the new `sessionId` and the old `name` still attached. Passing
+/// the roster straight through therefore handed the name the user gave one conversation to the
+/// one that replaced it, which is the reported *"`/clear` doesn't reset the session fully"*.
+///
+/// So each name arrives with the `nameSince` it was given at, `claude_name_cutoffs` says when
+/// each pane arrived on the conversation it is on, and anything not later than its cutoff is
+/// dropped here. The wire type stays `id -> name`, because the timestamp is evidence for this
+/// decision and nothing the frontend has any use for.
+///
 /// # Not `spawn_blocking`
 ///
 /// It reads a directory of small files — eight of them on the machine this was written on, one
@@ -1982,8 +1998,15 @@ pub fn claude_send_lines(
 /// call is made from a context menu opening, so a hop onto the pool would cost more in
 /// scheduling than the read costs in total.
 #[tauri::command(rename_all = "camelCase")]
-pub fn claude_session_names() -> std::collections::HashMap<String, String> {
+pub fn claude_session_names(
+    state: State<'_, WorkspaceState>,
+) -> std::collections::HashMap<String, String> {
+    let cutoffs = state.with(cide_core::workspace::claude_name_cutoffs);
     cide_claude::roster::names()
+        .into_iter()
+        .filter(|(id, named)| cutoffs.get(id).is_none_or(|cutoff| named.since > *cutoff))
+        .map(|(id, named)| (id, named.name))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2826,6 +2849,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: Some(cide_ipc::SessionId::new()),
             conversation: None,
+            conversation_since: None,
             title: title.into(),
         }
     }
@@ -2837,6 +2861,7 @@ mod tests {
             role: PaneRole::Auxiliary,
             session: Some(cide_ipc::SessionId::new()),
             conversation: None,
+            conversation_since: None,
             title: title.into(),
         }
     }
@@ -3056,6 +3081,7 @@ mod tests {
                 role: PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "main.rs".into(),
             },
         )

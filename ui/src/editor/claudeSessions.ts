@@ -53,9 +53,15 @@ export interface PaneLike {
    * The conversation the CLI is actually on, when `/clear` or a resume has moved it.
    *
    * Consulted **first**, because the CLI files its session record under the conversation it is
-   * running — so after a `/clear` the name the user gave lives under this id and not under
+   * running — so a rename made after a `/clear` or a resume lives under this id and not under
    * [`session`]. Looking only at `session` would silently lose the name for exactly the panes
    * that have been used the longest.
+   *
+   * It does **not** follow that a name found under this id belongs to the conversation the
+   * pane is on now: the CLI holds its name on the *process*, so `/clear` rewrites the record
+   * with a new `sessionId` and the old name still attached. That one is dropped before it
+   * reaches this module — `cide_core::workspace::claude_name_cutoffs` dates each name against
+   * when the pane arrived on its conversation — which is why the lookup here is a plain one.
    */
   readonly conversation?: string | null | undefined
   /** cide's own label, e.g. `cide : claude`. The fallback when there is no name. */

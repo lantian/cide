@@ -78,7 +78,7 @@ import { ExtensionTab } from '@/ext/ExtensionTab'
    compile it standalone. `ProblemsPanel/model` is imported the same way two lines up. */
 import { liveCount } from '@/sidebar/AgentsPanel/model'
 import { useAgents } from '@/sidebar/agentsStore'
-import { TasksPanel } from '@/sidebar/TasksPanel'
+import { TasksPanel, TaskDetailHost } from '@/sidebar/TasksPanel'
 import { openCount } from '@/sidebar/TasksPanel/model'
 import { useTasks } from '@/sidebar/tasksStore'
 import { OverlayHost } from '@/overlays/OverlayHost'
@@ -767,6 +767,15 @@ export function App() {
   const taskBoard = useTasks((s) => s.board)
   const attachTasks = useTasks((s) => s.attach)
   const adoptTasks = useTasks((s) => s.adopt)
+  /*
+   * Which task's card is open — the gate on `TaskDetailHost`'s mount below. Subscribed here,
+   * where `overlay` is, because the mount has to be conditional for its `PanelBoundary`'s sake:
+   * the boundary never resets itself, so its Close must *unmount* it, and clearing the
+   * selection is what collapses this branch. Selection changes are user gestures at overlay
+   * open/close frequency, so the re-render this costs App is the one `useOverlayOpen` already
+   * pays.
+   */
+  const taskSelected = useTasks((s) => s.selected)
 
   useEffect(() => {
     void attachTasks(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
@@ -1096,8 +1105,6 @@ export function App() {
     },
     [activeProjectId],
   )
-  const onShowTasks = useCallback(() => setSidebar((s) => showPanel(s, 'tasks')), [])
-
   /*
    * Entry point 2 of the key gate: the window listener.
    *
@@ -1577,14 +1584,14 @@ export function App() {
               * detached-pane window has no project, and the panel says so instead of appearing
               * blank — which is what this branch's absence used to produce for the whole view.
               *
-              * `onShowTasks` is the second half of the agent→task link. The panel selects the
-              * task in `tasksStore` and asks for this, and it goes through the same `showPanel`
-              * the Tasks branch and `dispatch.ts` use — one mechanism, so a reveal from a run row
-              * and a reveal from the palette cannot land in different places.
+              * The agent→task link needs nothing from here any more: the panel selects the
+              * task in `tasksStore`, and the card is `TaskDetailHost`'s — mounted below,
+              * outside these branches — so it opens over this panel instead of switching the
+              * sidebar to Tasks.
               */}
             {sidebar.view === 'agents' && (
               <PanelBoundary name="Agents" onClose={() => setSidebar((st) => selectView(st, 'agents'))}>
-                <AgentsPanel project={activeProjectId} onShowTasks={onShowTasks} />
+                <AgentsPanel project={activeProjectId} />
               </PanelBoundary>
             )}
             {sidebar.view === 'extensions' && (
@@ -1866,6 +1873,21 @@ export function App() {
         <OutsideOpenGate />
         <PullStrategyGate />
         <ConflictsDialog />
+
+        {/*
+          * The open task's card, over whichever panel selected it. Outside every `sidebar.view`
+          * branch on purpose: the Agents panel's task links select a task and nothing else, so
+          * the card must not need the Tasks panel to be the view — see `TaskDetailHost`'s
+          * header. The host renders `null` until the selection resolves against a ready board,
+          * and the boundary is the sidebar panels' rule applied to a portal: a throw in the card
+          * must not empty the window, and Close clears the selection, which unmounts this
+          * branch and thereby resets the boundary for the next open.
+          */}
+        {taskSelected !== null && (
+          <PanelBoundary name="Task" onClose={() => useTasks.getState().select(null)}>
+            <TaskDetailHost />
+          </PanelBoundary>
+        )}
 
         {/*
           * The switcher popup — one component for Ctrl+Tab (tabs) and Ctrl+` (projects). No

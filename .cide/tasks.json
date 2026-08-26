@@ -9,6 +9,7 @@
       "status": "todo",
       "agent": null,
       "comments": [],
+      "history": [],
       "createdBy": {
         "kind": "user"
       },
@@ -22,6 +23,7 @@
       "status": "todo",
       "agent": null,
       "comments": [],
+      "history": [],
       "createdBy": {
         "kind": "user"
       },
@@ -46,6 +48,7 @@
           "deleted": true
         }
       ],
+      "history": [],
       "createdBy": {
         "kind": "user"
       },

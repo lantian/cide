@@ -13,6 +13,9 @@
  * The stateful half is `TasksPanelHost`, exported here as **`TasksPanel`** — the name a host
  * imports, the way `GitPanel` comes from `GitPanelHost`. It reads `sidebar/tasksStore.ts` and
  * hands the view everything as props, `nowMs` included, so the property above stays true.
+ * `TaskDetailHost` is the open task's card and is mounted separately, by `App.tsx` outside the
+ * sidebar branches, so a task opened from the Agents panel appears without switching panels —
+ * its header carries the argument.
  * `adapt.ts` is the seam allowed to import the generated wire types and is not re-exported: it
  * has one caller, the store, and a barrel entry would only offer a second way to reach it.
  *
@@ -37,5 +40,6 @@
  * `'@/sidebar/TasksPanel/model'` directly.
  */
 export { TasksPanel, type TasksPanelProps } from './TasksPanelHost'
+export { TaskDetailHost } from './TaskDetailHost'
 export { TasksPanelView, type TasksPanelViewProps } from './TasksPanel'
 export { TaskDetail, type TaskDetailProps } from './TaskDetail'

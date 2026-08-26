@@ -112,8 +112,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cide_agents::{Delivery, Isolation, Observation, RunPlan, SessionBinding};
@@ -123,7 +123,7 @@ use cide_ipc::{
     AgentId, AgentRun, ClaudeSettings, Geometry, Harness, PaneRole, ProjectId, ProxySettings,
     RunId, RunState, SessionId, SessionState, TaskId, Theme,
 };
-use cide_pty::{PtySession, SinkId};
+use cide_pty::PtySession;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Manager};
 
@@ -210,6 +210,9 @@ struct LiveRun {
     agent_limit: u16,
     /// The project-wide ceiling, recorded for the same reason.
     project_limit: u16,
+    /// The worktree this run stands in, recorded at dispatch for the same reason as the limits.
+    /// See [`DispatchSpec::checkout`]; [`admit_a_pass`]'s checkout gate is what reads it.
+    checkout: Option<String>,
     /// Dispatch order. The panel's groups are ordered within themselves by this, and admission
     /// walks it so a queue is first-in-first-out across agents as well as within one.
     seq: u64,
@@ -242,6 +245,33 @@ struct LiveRun {
     /// not a fact a row can draw, and widening the DTO for it would put a harness's private
     /// vocabulary into the panel's.
     harness_session: Option<String>,
+    /// Set when a resumed [`RunState::Interrupted`] run goes back through the queue, and read
+    /// once at admission: it is what tells [`admit_a_pass`] to build a [`ResumePoint`] and a
+    /// continuation prompt instead of replaying the original dispatch. Never persisted — a
+    /// restored run is `Interrupted`, and this flag exists only on the short walk from Resume
+    /// to admission.
+    continuing: bool,
+    /// Whether this run's abnormal end has already been written to its task as a comment
+    /// (P2 of the debug-report plan: a task stuck in `doing` after its run died was invisible
+    /// until someone opened the Agents panel). A latch, not persisted: a restored row starts
+    /// `false`, and [`AgentRegistry::death_facts`] refuses restored rows by other means — the
+    /// snapshot only carries ended runs as history, and history rows are never re-noted
+    /// because the end edge that calls this fired in the process that watched them die.
+    death_noted: bool,
+}
+
+/// What an abnormal end leaves for its task's comment. See [`AgentRegistry::death_facts`],
+/// which is the only producer and holds the rules; the consumer in `agent_rpc` only formats.
+#[derive(Debug, Clone)]
+pub struct DeathFacts {
+    pub task: TaskId,
+    /// The dispatch-time label, [`LiveRun::agent_label`]'s reason: the sentence must still
+    /// read correctly after the role is renamed or deleted.
+    pub agent_label: String,
+    /// `Some(code)` for a child that exited nonzero, `None` for a run that failed before or
+    /// beside its child — the two produce different sentences because "exit 129" is a lead
+    /// worth printing and a spawn failure has no number to offer.
+    pub code: Option<i32>,
 }
 
 /// What a freeze remembers. See [`LiveRun::frozen`].
@@ -294,6 +324,12 @@ pub struct DispatchSpec {
     pub prompt: String,
     pub agent_limit: u16,
     pub project_limit: u16,
+    /// The worktree this run will stand in — `cide_agents::checkout_name` of (role, task) —
+    /// or `None` under shared isolation, where every run stands in the project root and
+    /// N-in-one-directory is what the setting says on its face. Stamped at dispatch for the
+    /// same reason the limits are: the queue must enforce the fact the project had when the
+    /// run was dispatched, without a disk read under the lock.
+    pub checkout: Option<String>,
 }
 
 /// One run the queue has decided to start. Produced under the lock, acted on outside it.
@@ -305,6 +341,24 @@ struct Admission {
     task: Option<TaskId>,
     task_title: Option<String>,
     prompt: String,
+    /// `Some` for a resumed [`RunState::Interrupted`] run: the conversation the new child
+    /// continues. `None` is an ordinary first start.
+    resume: Option<ResumePoint>,
+}
+
+/// How a resumed run's new child finds the old conversation. Built by [`admit_a_pass`] from
+/// what the snapshot preserved; which field carries the identity is the harness split
+/// [`cide_agents::SessionBinding`] names.
+#[derive(Debug, Clone)]
+struct ResumePoint {
+    /// For a `claude` run: reuse the old [`SessionId`] — it *is* the conversation id
+    /// (`--resume <id>` keeps it), so hook routing, the row's session and a pane opened onto
+    /// the run all stay continuous. `None` for `opencode`, whose child gets a fresh cide
+    /// session while `--session` names the conversation.
+    rebind: Option<SessionId>,
+    /// What the harness's `respawn_spec` is handed: the claude session id, or opencode's
+    /// `ses_…`.
+    conversation: String,
 }
 
 /// One run about to be continued by a second child. See [`AgentRegistry::plan_respawn`].
@@ -369,6 +423,14 @@ struct FrozenSession {
 pub struct AgentRegistry {
     inner: Mutex<Inner>,
     emit: Coalescer,
+    /// Set by [`Self::final_snapshot`], read by every later [`Self::save_snapshot`]: once the
+    /// teardown has written what the user actually arranged, no flush may write again. The
+    /// hazard is concrete and was reported before it was reasoned about — the shutdown ladder
+    /// kills every child, the reaper marks each run `Finished`, and the coalescer's next flush
+    /// (120 ms, comfortably inside the ladder's 2.5 s of graces) overwrote the snapshot with
+    /// those kills recorded as outcomes. Two paused runs restored as *history*, and Resume had
+    /// nothing to resume.
+    snapshot_sealed: std::sync::atomic::AtomicBool,
 }
 
 impl AgentRegistry {
@@ -401,17 +463,18 @@ impl AgentRegistry {
                 started_unix_ms: now_unix_ms(),
                 prompt: spec.prompt,
                 note: (ahead > 0).then(|| {
-                    format!(
-                        "{ahead} ahead of it in this role's queue; a role runs one task at a time"
-                    )
+                    format!("{ahead} ahead of it in this role's queue; runs start as slots free")
                 }),
                 slot: false,
                 agent_limit: spec.agent_limit.max(1),
                 project_limit: spec.project_limit.max(1),
+                checkout: spec.checkout,
                 seq,
                 frozen: None,
                 stale_turn: false,
                 harness_session: None,
+                continuing: false,
+                death_noted: false,
             },
         );
         inner.queues.entry(key).or_default().push_back(run);
@@ -465,6 +528,7 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             };
             let (project, agent_limit, project_limit) =
                 (live.project, live.agent_limit, live.project_limit);
+            let checkout = live.checkout.clone();
             // The queue half of a pause. A paused project keeps its queue — nothing is cancelled
             // and the order is preserved — it simply stops being drained, so a resume starts
             // exactly what was waiting, in the order it was waiting in.
@@ -474,6 +538,32 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             let agent_held = inner.agent_slots.get(&key).copied().unwrap_or(0);
             let project_held = inner.project_slots.get(&project).copied().unwrap_or(0);
             if agent_held >= agent_limit || project_held >= project_limit {
+                continue;
+            }
+            // The checkout gate — the per-task successor to the worktree clamp that used to
+            // pin `agent_limit` at 1. Two children in one checkout is the failure worktree
+            // isolation exists to prevent, and with a worktree per task it is no longer a
+            // per-role *number* but a per-directory fact: this run stays queued while any run
+            // whose child may still be standing in the same checkout is on it. `Idle` does not
+            // block — its parked child is wound down by `bring_up` at the moment the checkout
+            // is claimed — and `Interrupted` and the terminal states hold no process at all.
+            // `None` (shared isolation) collides with nothing: N runs in one directory is what
+            // that setting says on its face.
+            let occupied = checkout.as_deref().is_some_and(|name| {
+                inner.runs.values().any(|other| {
+                    other.run != run
+                        && other.project == project
+                        && other.checkout.as_deref() == Some(name)
+                        && matches!(
+                            other.state,
+                            RunState::Starting
+                                | RunState::Running
+                                | RunState::AwaitingPermission
+                                | RunState::Paused { .. }
+                        )
+                })
+            });
+            if occupied {
                 continue;
             }
 
@@ -486,15 +576,69 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             live.state = RunState::Starting;
             live.slot = true;
             live.note = None;
+            // A resumed interrupted run continues its old conversation; one that never had a
+            // conversation to continue (it was still queued when cide quit) starts fresh with
+            // its original prompt, which is the honest reading of "nothing happened yet".
+            let resume = match live.continuing {
+                true => resume_point(live),
+                false => None,
+            };
+            live.continuing = false;
+            let prompt = match resume.is_some() {
+                true => continuation_prompt(live.task.as_ref(), live.task_title.as_deref()),
+                false => live.prompt.clone(),
+            };
             admitted.push(Admission {
                 run,
                 project,
                 agent: key.1,
                 task: live.task.clone(),
                 task_title: live.task_title.clone(),
-                prompt: live.prompt.clone(),
+                prompt,
+                resume,
             });
         }
+    }
+}
+
+/// See [`ResumePoint`]. `None` when the run never reported a conversation — the caller starts
+/// it fresh instead, which is a restart of the work rather than a lie about continuing it.
+fn resume_point(live: &LiveRun) -> Option<ResumePoint> {
+    match live.harness {
+        Harness::Claude => live.session.map(|session| ResumePoint {
+            rebind: Some(session),
+            conversation: session.to_string(),
+        }),
+        Harness::Opencode => live
+            .harness_session
+            .clone()
+            .map(|conversation| ResumePoint {
+                rebind: None,
+                conversation,
+            }),
+    }
+}
+
+/// The first line a resumed run is told. One line, for the same `\r` rule as every prompt.
+///
+/// It does not restate the task body — the conversation being continued already holds it — but
+/// it does name the id, because a restart is exactly the moment the tracker may have moved
+/// under the run and `cide_task_get` is how it finds out.
+fn continuation_prompt(task: Option<&TaskId>, title: Option<&str>) -> String {
+    let title = title
+        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|title| !title.is_empty())
+        .map(|title| format!(" ({title})"))
+        .unwrap_or_default();
+    match task {
+        Some(id) => format!(
+            "cide restarted while you were working. Re-read task {id}{title} with \
+             mcp__cide__cide_task_get, check your worktree with git status, and continue from \
+             where the conversation left off."
+        ),
+        None => "cide restarted while you were working. Check your worktree with git status \
+                 and continue from where the conversation left off."
+            .to_string(),
     }
 }
 
@@ -524,25 +668,27 @@ impl AgentRegistry {
     /// transition out of `Running`/`AwaitingPermission` into `Idle` counts as "the turn was
     /// handed back". `Starting → Idle` is the `SessionStart` window and releases nothing.
     ///
-    /// # That same edge is the product-owner loop's only trigger
+    /// # These edges are the product-owner loop's only triggers
     ///
     /// A run reports back through `.cide/tasks.json` and nothing watches that file on the
-    /// orchestrator's behalf, so the moment a turn is handed back is the moment the project's
-    /// primary session has something new to read. [`crate::agent_rpc::note_run_idle`] is called
-    /// from **here** and from nowhere else, precisely because this is the only place in the
-    /// process that can see a *transition* rather than a state: an idle run is observed over and
-    /// over — every statusline frame is an observation — and a nudge per observation would be a
-    /// typed prompt per observation. The edge happens once per turn.
+    /// orchestrator's behalf, so the moment a turn is handed back — or a run finishes or fails —
+    /// is the moment the project's primary session has something new to read.
+    /// [`crate::agent_rpc::note_run_over`] is called from **here** (and from the one wrapper
+    /// below), precisely because this is the only place in the process that can see a
+    /// *transition* rather than a state: an idle run is observed over and over — every
+    /// statusline frame is an observation — and a nudge per observation would be a typed prompt
+    /// per observation. Each edge happens once.
     ///
     /// # `app: Option<&AppHandle>`, and what the `None` arm costs
     ///
     /// `None` means *this caller cannot nudge*, and there is exactly one such caller:
     /// [`Self::watch_exit_with`], which is deliberately app-free so that a real child's exit can
     /// be driven by a test — `tauri`'s mock app is behind a feature this build does not enable.
-    /// It costs nothing, and that is a fact about the state machine rather than a hope:
-    /// [`Observation::Exit`] is the sole producer of `RunState::Finished` and produces nothing
-    /// else, so an exit can never *be* the handed-back edge. Every path that can reach the edge —
-    /// a hook frame through [`note_hook`] — carries an app.
+    /// It still costs nothing, because the exit's nudge is delivered one layer up instead: the
+    /// production wrapper [`Self::watch_exit`] holds the app and calls `note_run_over` after the
+    /// transition, so the app-free arm stays drivable by
+    /// `a_real_childs_exit_finishes_its_run` and a reaped child's ending is still announced.
+    /// Every *hook*-reached edge — through [`note_hook`] — carries an app of its own.
     fn set_state(&self, app: Option<&AppHandle>, run: RunId, next: RunState) -> bool {
         let mut inner = self.inner.lock();
         let Some(live) = inner.runs.get_mut(&run) else {
@@ -584,9 +730,10 @@ impl AgentRegistry {
             let project = live.project;
             let held = live.slot;
             live.slot = false;
-            if handed_back {
-                nudge = Some(project);
-            }
+            // Both edge kinds nudge — `note_run_over` reads the run's state back and renders
+            // "handed back" / "finished (exit n)" / "failed" accordingly. An `over` reached
+            // app-less (the reaper) computes this and drops it; `watch_exit` re-delivers it.
+            nudge = Some(project);
             if held {
                 release(&mut inner, &key, project);
             }
@@ -594,7 +741,7 @@ impl AgentRegistry {
         drop(inner);
         self.forget_old();
         if let (Some(app), Some(project)) = (app, nudge) {
-            crate::agent_rpc::note_run_idle(app, project, run);
+            crate::agent_rpc::note_run_over(app, project, run);
         }
         true
     }
@@ -654,6 +801,112 @@ impl AgentRegistry {
         !self.inner.lock().paused_projects.contains(&project)
     }
 
+    /// Whether any run of `agent` on `task` is still open — queued, starting, live, idle or
+    /// paused. Only `Finished` and `Failed` close a run for this question.
+    ///
+    /// The auto-dispatch dedupe (see [`crate::task_triggers`]): a repeated assignment or a
+    /// second mention of a role while its run lives must not stack a second queue entry for the
+    /// same pair. `Idle` counts as open on purpose — an idle run still holds a live child in the
+    /// role's only worktree, and the way to re-engage it is a retry or a prompt, not a duplicate
+    /// run queued behind it.
+    pub fn has_open_run(&self, project: ProjectId, agent: &AgentId, task: &TaskId) -> bool {
+        self.inner.lock().runs.values().any(|run| {
+            run.project == project
+                && &run.agent == agent
+                && run.task.as_ref() == Some(task)
+                && !matches!(
+                    run.state,
+                    RunState::Finished { .. } | RunState::Failed { .. }
+                )
+        })
+    }
+
+    /// Whether `session` belongs to a run that has not ended — the guard `session_kill` asks.
+    ///
+    /// This is the domain-side answer to the debug report's single-pane deaths (e83a75fe:
+    /// exit 129 after nine minutes while its sibling lived). A mirror pane's spawn plan lives
+    /// in the *clicking* window's JS realm, so in a multi-window layout the pane can render in
+    /// a window that never heard of the plan, adopt the run's session without the `mirrored`
+    /// flag — and `closePane`'s kill then SIGHUPed the agent mid-turn, silently. Rather than
+    /// widening `Pane` with a second ownership signal (the no-`agent_open_pane` note says why
+    /// that road is closed), the kill *command* refuses sessions the registry owns: a pane can
+    /// close its view of a run, and only a run's owners — Stop, the idle wind-down, a respawn,
+    /// the shutdown ladder — end its child, all of which call `pty.kill()` directly and never
+    /// pass through `session_kill`.
+    ///
+    /// `Interrupted` answers true too, harmlessly: there is no process behind it for a refused
+    /// kill to spare, and the row's own Stop is still the way to discard it.
+    pub fn owns_session(&self, session: SessionId) -> bool {
+        self.inner.lock().runs.values().any(|run| {
+            run.session == Some(session)
+                && !matches!(
+                    run.state,
+                    RunState::Finished { .. } | RunState::Failed { .. }
+                )
+        })
+    }
+
+    /// The facts an abnormal end leaves for its task, or `None` when there is nothing to say.
+    ///
+    /// P2 of the debug-report plan: a run that died mid-task left the task sitting in `doing`
+    /// with no trace on the board — the report's terrastrike runs were only diagnosable from
+    /// the Agents panel, which the orchestrator never reads. The answer is one comment on the
+    /// task, and this method is the decision half: it says *whether* to comment and hands back
+    /// what the sentence needs, in one lock pass, so the caller
+    /// ([`crate::agent_rpc::note_run_over`]'s death arm) does no registry reasoning of its own.
+    ///
+    /// `Some` requires all of: the run ended abnormally (`Failed`, or `Finished` with a nonzero
+    /// code — exit 0 is a run that believes it finished, and second-guessing it belongs to the
+    /// orchestrator's own review, not to an automatic epitaph); it carried a task; its
+    /// `death_noted` latch was clear; and **no other open run** of the same role holds the same
+    /// task — a respawn's predecessor stays quiet because the successor picks the work up and
+    /// its own end will speak if it also dies.
+    ///
+    /// The latch is set on *every* abnormal-end pass, including the ones a surviving sibling
+    /// silences: the question it records is "has this run's end been dealt with", and it has.
+    /// It is not persisted — a restored row starts `false`, which is safe because a snapshot
+    /// only restores ended runs as history and interrupted ones as resumable, and the end edge
+    /// that reaches this method fired (or will fire) in the process that watches the child.
+    pub fn death_facts(&self, run: RunId) -> Option<DeathFacts> {
+        let mut inner = self.inner.lock();
+        let live = inner.runs.get(&run)?;
+        if live.death_noted {
+            return None;
+        }
+        let code = match live.state {
+            RunState::Failed { .. } => None,
+            RunState::Finished { code } if code != 0 => Some(code),
+            _ => return None,
+        };
+        let task = live.task.clone()?;
+        let project = live.project;
+        let agent = live.agent.clone();
+        let agent_label = live.agent_label.clone();
+        let survived = inner.runs.values().any(|other| {
+            other.run != run
+                && other.project == project
+                && other.agent == agent
+                && other.task.as_ref() == Some(&task)
+                && !matches!(
+                    other.state,
+                    RunState::Finished { .. } | RunState::Failed { .. }
+                )
+        });
+        inner
+            .runs
+            .get_mut(&run)
+            .expect("present four lines up, and the lock never left this frame")
+            .death_noted = true;
+        if survived {
+            return None;
+        }
+        Some(DeathFacts {
+            task,
+            agent_label,
+            code,
+        })
+    }
+
     /// The live session behind a run, for a caller that wants to attach to it.
     pub fn session_of(&self, project: ProjectId, run: RunId) -> Result<SessionId> {
         let inner = self.inner.lock();
@@ -672,18 +925,24 @@ impl AgentRegistry {
         })
     }
 
-    /// Sessions of this agent's runs that are idle with a child still alive.
+    /// Sessions of runs that are idle with a child still alive **in this checkout**.
     ///
     /// The queue's answer to a real hazard: an `Idle` run has released its slot but its `claude`
-    /// is still sitting in the role's only worktree, so starting the next run there would put two
+    /// is still sitting in its worktree, so starting the next run there would put two
     /// processes in one checkout — exactly what the isolation exists to prevent.
     /// [`cide_ipc::RunState::Idle`]'s doc names the two ways out ("delivers the next turn into it
     /// or winds it down first"); this is the wind-down, taken only at the moment the checkout is
     /// actually needed, so an idle run that nothing is queued behind stays open to be read.
-    fn idle_children_of(
+    ///
+    /// Scoped by checkout **name**, not by role, since worktrees went per-task: an idle claude
+    /// of the same role parked in a *different* task's checkout is in nobody's way, and killing
+    /// it would repeat run 06202dd6's death with a different murder weapon. The name compared
+    /// is the stamped [`LiveRun::checkout`], which is the directory that run's child actually
+    /// stands in — computed by the same `checkout_name` at its own dispatch.
+    fn idle_children_in(
         &self,
         project: ProjectId,
-        agent: &AgentId,
+        checkout: &str,
         except: RunId,
     ) -> Vec<SessionId> {
         let inner = self.inner.lock();
@@ -692,7 +951,7 @@ impl AgentRegistry {
             .values()
             .filter(|run| {
                 run.project == project
-                    && &run.agent == agent
+                    && run.checkout.as_deref() == Some(checkout)
                     && run.run != except
                     && run.state == RunState::Idle
             })
@@ -964,6 +1223,13 @@ impl AgentRegistry {
 
         let watch = self.finish_thaws(project, run.is_none(), &thaws, now_unix_ms());
 
+        // The other thing Resume can mean since the snapshot landed: runs whose children died
+        // with a cide restart go back through the queue, continuing their conversations. Before
+        // the pump, so this press is what starts them; through the queue, because an
+        // interrupted run holds no slot and its role's worktree may meanwhile belong to a
+        // newer run — admission is the arbiter, exactly as for a dispatch.
+        self.requeue_interrupted(project, run);
+
         // The queue is open again, so whatever was waiting may start.
         self.pump(app);
 
@@ -1055,6 +1321,35 @@ impl AgentRegistry {
             }
         }
         watch
+    }
+
+    /// Put [`RunState::Interrupted`] runs back on their roles' queues, marked continuing.
+    ///
+    /// `run: None` is the project scope — every interrupted run the project has — matching
+    /// [`Self::resume`]'s own contract. A run id that names a non-interrupted run is a no-op
+    /// rather than an error: Resume's other half (the thaw) may own it.
+    fn requeue_interrupted(&self, project: ProjectId, run: Option<RunId>) {
+        let mut inner = self.inner.lock();
+        let matching: Vec<RunId> = inner
+            .runs
+            .values()
+            .filter(|live| live.project == project && live.state == RunState::Interrupted)
+            .filter(|live| run.is_none_or(|one| one == live.run))
+            .map(|live| live.run)
+            .collect();
+        for run in matching {
+            let Some(live) = inner.runs.get_mut(&run) else {
+                continue;
+            };
+            live.state = RunState::Queued;
+            live.continuing = true;
+            live.note = Some(
+                "resuming after a cide restart; a new child continues the same conversation"
+                    .to_string(),
+            );
+            let key = live.key();
+            inner.queues.entry(key).or_default().push_back(run);
+        }
     }
 
     /// Watch one thawed run for [`THAW_WATCH`], and raise `stale_turn` if nothing stirs.
@@ -1235,7 +1530,7 @@ impl AgentRegistry {
                     .try_state::<SessionRegistry>()
                     .and_then(|sessions| sessions.get(session))
                     .ok_or_else(|| CoreError::Io("this run's child is no longer running".into()))?;
-                pty.write(bytes);
+                type_submitted_line(app, session, &pty, bytes);
                 Ok(())
             }
             // A real answer rather than a failure — see `cide_agents::Delivery`.
@@ -1279,6 +1574,10 @@ impl AgentRegistry {
                 task: live.task.clone(),
                 task_title: live.task_title.clone(),
                 prompt: prompt.to_string(),
+                // A retry's continuation travels as `bring_up`'s explicit argument, not here:
+                // this admission never goes through the queue, so there is no later point at
+                // which a `ResumePoint` would be read.
+                resume: None,
             },
             previous: live.session,
             harness_session,
@@ -1384,9 +1683,13 @@ impl AgentRegistry {
     /// SIGKILL it, which is exactly the half-written transcript `lifecycle.rs`'s header says the
     /// ladder exists to prevent. One signal per paused session buys back both rungs.
     ///
-    /// This is also why **pause does not survive a restart**, which is stated rather than
-    /// attempted: the ladder ends the process either way, and a stopped-then-killed child is just
-    /// a killed child. Nothing about a freeze is written to disk.
+    /// The *freeze* still does not survive a restart — the ladder ends the process either way,
+    /// and a stopped-then-killed child is just a killed child. What survives since the snapshot
+    /// landed is the *arrangement*: `lifecycle` calls [`Self::save_snapshot`] before this, so
+    /// the paused queues come back paused and the runs come back as
+    /// [`RunState::Interrupted`] rows a Resume can continue. (This paragraph used to say
+    /// "nothing about a freeze is written to disk", and it was the recorded reason pause did
+    /// not survive a restart; the snapshot is what changed.)
     ///
     /// Takes the [`SessionRegistry`] rather than an `AppHandle` so it is callable from a test,
     /// and clears the records as it goes: a second call during a teardown that runs twice must
@@ -1476,6 +1779,423 @@ fn release(inner: &mut Inner, key: &AgentKey, project: ProjectId) {
     }
 }
 
+// ==========================================================================================
+// The snapshot: runs that outlive the process.
+// ==========================================================================================
+
+/// The disk shape of [`AgentRegistry::save_snapshot`]. Machine-local state, not project state:
+/// worktree paths, session ids and prompts belong to this machine's checkout, so the file lives
+/// in `$XDG_STATE_HOME` beside `workspace.json` — never in `.cide/`, which is committed.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunsFile {
+    version: u32,
+    /// Projects whose dispatch queue was shut when the process ended, so a halted workstream
+    /// comes back halted rather than silently reopened.
+    paused: Vec<ProjectId>,
+    runs: Vec<SavedRun>,
+}
+
+/// One run's durable facts — everything a `Resume` after restart needs and nothing it does not.
+/// The state is deliberately absent: whatever a run was doing, its child is gone, and every
+/// restored run is [`RunState::Interrupted`].
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedRun {
+    run: RunId,
+    project: ProjectId,
+    agent: AgentId,
+    agent_label: String,
+    harness: Harness,
+    /// The claude conversation id — the shutdown ladder's graces exist so the child could
+    /// finish writing the transcript this resumes from.
+    session: Option<SessionId>,
+    /// The opencode conversation id, whose store is that CLI's own.
+    harness_session: Option<String>,
+    task: Option<TaskId>,
+    task_title: Option<String>,
+    prompt: String,
+    started_unix_ms: u64,
+    /// Recorded limits, kept for [`admit_a_pass`]'s stated reason: admission must not read
+    /// disk under the lock, and a config edited across the restart must not release a slot
+    /// that was never taken.
+    agent_limit: u16,
+    project_limit: u16,
+    /// The stamped worktree name, kept for the checkout gate's stated reason — the same as the
+    /// limits'. `None` reads as "shared isolation" for a file from before this field; the cost
+    /// is that such a resumed run skips the gate once, which degrades to the pre-feature
+    /// status quo of sharing a checkout, not to anything worse.
+    #[serde(default)]
+    checkout: Option<String>,
+    /// The state at quit, kept **only** for its terminal arms: a `Finished` or `Failed` run
+    /// restores verbatim, because history is history — the user asked for the panel's tail to
+    /// be a durable record of runs, not a per-process scratchpad. Every other state restores
+    /// as [`RunState::Interrupted`], whatever it was: the child is gone either way, and the
+    /// old state would be a claim about a process that no longer exists. `None` (a file from
+    /// before this field) reads as non-terminal.
+    #[serde(default)]
+    state: Option<RunState>,
+}
+
+const RUNS_SNAPSHOT_VERSION: u32 = 1;
+
+fn snapshot_path() -> std::path::PathBuf {
+    cide_core::persist::state_dir().join("agent-runs.json")
+}
+
+/// Where [`AgentRegistry::save_screens_for_snapshot`] keeps each run's last screen.
+fn screens_dir() -> std::path::PathBuf {
+    cide_core::persist::state_dir().join("run-screens")
+}
+
+/// The saved screen a resumed run's mirror is seeded from, if the last teardown wrote one.
+fn saved_screen(run: RunId) -> Option<Vec<u8>> {
+    std::fs::read(screens_dir().join(format!("{run}.screen"))).ok()
+}
+
+/// Where each harness-bound run's raw output is teed, line by line, for a post-mortem.
+///
+/// The debug report's first ask, in its own words: *"e83a75fe ran 9 minutes and left literally
+/// zero evidence of what it was doing"* — no log, no captured tail, nothing to read after a
+/// death. This is that trail. Only the harness-bound stream is teed, deliberately: a `claude`
+/// run's durable transcript already exists under `~/.claude/projects` (the shutdown ladder's
+/// graces exist so it finishes writing), so a second copy here would be two records of one
+/// conversation.
+fn run_logs_dir() -> std::path::PathBuf {
+    cide_core::persist::state_dir().join("run-logs")
+}
+
+/// How much one run may log before the tee stops. A cap, not a rotation: the log answers "what
+/// was this run doing when it died", which the first five megabytes answer as well as fifty —
+/// and an unbounded file per run is a disk the user never agreed to spend.
+const RUN_LOG_CAP: u64 = 5 * 1024 * 1024;
+
+/// The one line a capped log ends with, so a reader knows it was cut rather than quiet.
+const RUN_LOG_CAPPED: &str = "\u{2014} log capped; the rest of this run is not recorded \u{2014}";
+
+/// One run's append-only log. Held behind a `Mutex` in the stream hook's closure.
+///
+/// Every failure path latches `dead` and never retries: the hook runs on the coalescer thread
+/// — the thread every byte of every session flows through — and a tee that blocks, errors
+/// loudly, or retries per line would put disk trouble in front of every terminal in the
+/// process. Losing the log is the cheap half; one warn says it happened.
+struct RunLog {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+    cap: u64,
+    dead: bool,
+}
+
+impl RunLog {
+    fn at(path: std::path::PathBuf, cap: u64) -> Self {
+        Self {
+            path,
+            file: None,
+            written: 0,
+            cap,
+            dead: false,
+        }
+    }
+
+    /// Append one raw line. Opens lazily on the first — a run that prints nothing owns no file.
+    fn append(&mut self, line: &str) {
+        use std::io::Write as _;
+        if self.dead {
+            return;
+        }
+        if self.file.is_none() {
+            let opened = self
+                .path
+                .parent()
+                .map(std::fs::create_dir_all)
+                .transpose()
+                .and_then(|_| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&self.path)
+                });
+            match opened {
+                Ok(file) => {
+                    // Seeded from what is already there: a respawned child appends to its
+                    // run's one log, and the cap covers the run's whole life rather than
+                    // resetting per child.
+                    self.written = file.metadata().map(|m| m.len()).unwrap_or(0);
+                    self.file = Some(file);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %self.path.display(), %error, "no run log; this run leaves no post-mortem trail");
+                    self.dead = true;
+                    return;
+                }
+            }
+        }
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if self.written + line.len() as u64 > self.cap {
+            let _ = writeln!(file, "{RUN_LOG_CAPPED}");
+            self.dead = true;
+            self.file = None;
+            return;
+        }
+        match writeln!(file, "{line}") {
+            Ok(()) => self.written += line.len() as u64 + 1,
+            Err(error) => {
+                tracing::warn!(path = %self.path.display(), %error, "run log write failed; the trail stops here");
+                self.dead = true;
+                self.file = None;
+            }
+        }
+    }
+}
+
+impl AgentRegistry {
+    /// Write the durable half of the registry to disk. Called from the coalescer's flush — so
+    /// it is at most one small write per emit burst, and a crash loses at worst the last
+    /// coalescing window — and once more from `lifecycle`'s teardown, where the paused set's
+    /// final state is decided.
+    pub fn save_snapshot(&self) {
+        self.write_snapshot_to(&snapshot_path());
+    }
+
+    /// The teardown's authoritative write: seal first, then record — idempotent, so a teardown
+    /// that runs twice cannot write the post-ladder wreckage over its own first answer. The
+    /// screens ride along because this is the one moment the children still exist to render.
+    pub fn final_snapshot(&self, sessions: &SessionRegistry) {
+        if self
+            .snapshot_sealed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.write_snapshot_now(&snapshot_path());
+        self.save_screens_for_snapshot(sessions);
+    }
+
+    /// The write, with the path as an argument so a test never touches the real state dir.
+    ///
+    /// Refuses after the seal — see [`Self::snapshot_sealed`] for the shutdown race this is
+    /// the answer to.
+    fn write_snapshot_to(&self, path: &std::path::Path) {
+        if self
+            .snapshot_sealed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.write_snapshot_now(path);
+    }
+
+    /// The unconditional half, which only the two callers above may reach.
+    fn write_snapshot_now(&self, path: &std::path::Path) {
+        let file = {
+            let inner = self.inner.lock();
+            let mut paused: Vec<ProjectId> = inner.paused_projects.iter().copied().collect();
+            paused.sort();
+            // Terminal runs ride along — the panel's tail is a history, and a history that
+            // ends at every restart is a scratchpad. [`Self::forget_old`] has already capped
+            // them at [`RECENT_KEPT`] per project, so this is bounded by construction.
+            let mut runs: Vec<&LiveRun> = inner.runs.values().collect();
+            runs.sort_by_key(|live| live.seq);
+            RunsFile {
+                version: RUNS_SNAPSHOT_VERSION,
+                paused,
+                runs: runs
+                    .into_iter()
+                    .map(|live| SavedRun {
+                        run: live.run,
+                        project: live.project,
+                        agent: live.agent.clone(),
+                        agent_label: live.agent_label.clone(),
+                        harness: live.harness,
+                        session: live.session,
+                        harness_session: live.harness_session.clone(),
+                        task: live.task.clone(),
+                        task_title: live.task_title.clone(),
+                        prompt: live.prompt.clone(),
+                        started_unix_ms: live.started_unix_ms,
+                        agent_limit: live.agent_limit,
+                        project_limit: live.project_limit,
+                        checkout: live.checkout.clone(),
+                        state: Some(live.state.clone()),
+                    })
+                    .collect(),
+            }
+        };
+        let json = match serde_json::to_vec_pretty(&file) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::error!(%error, "could not encode the run snapshot");
+                return;
+            }
+        };
+        if let Err(error) = cide_core::persist::write_atomic(path, &json) {
+            tracing::warn!(%error, "could not write the run snapshot; runs will not survive a restart");
+        }
+    }
+
+    /// Bring the snapshot's runs back as [`RunState::Interrupted`] rows, and its paused set
+    /// back as closed queues. Called once, at startup, after the workspace has loaded.
+    ///
+    /// `keep` filters by project — a run for a project the restored workspace no longer holds
+    /// is a row no panel could ever show. Reads never fail the launch: a missing file is a
+    /// first run, an unparseable one is logged and ignored, because
+    /// "a broken layout must not become a launch loop" applies one state file over.
+    pub fn restore_snapshot(&self, keep: impl Fn(ProjectId) -> bool) {
+        self.restore_snapshot_from(&snapshot_path(), keep);
+    }
+
+    /// The read, path-parameterised for the same reason as the write's.
+    fn restore_snapshot_from(&self, path: &std::path::Path, keep: impl Fn(ProjectId) -> bool) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not read the run snapshot");
+                return;
+            }
+        };
+        let file: RunsFile = match serde_json::from_slice(&bytes) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "the run snapshot did not parse; starting without it");
+                return;
+            }
+        };
+
+        let mut inner = self.inner.lock();
+        for project in file.paused {
+            if keep(project) {
+                inner.paused_projects.insert(project);
+            }
+        }
+        let mut restored: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for saved in file.runs {
+            if !keep(saved.project) || inner.runs.contains_key(&saved.run) {
+                continue;
+            }
+            inner.seq += 1;
+            let seq = inner.seq;
+            // History restores as history; everything that still had a child restores as
+            // `Interrupted` — see `SavedRun::state`. A terminal row's session is dropped
+            // rather than carried: the process behind it died with the old cide, so an Open
+            // control aimed at it would attach to nothing and draw a resume splash over a run
+            // that is not resumable. No session, no Open — the withheld-not-disabled rule.
+            let (state, session, note) = match saved.state {
+                Some(state @ (RunState::Finished { .. } | RunState::Failed { .. })) => {
+                    (state, None, None)
+                }
+                _ => (
+                    RunState::Interrupted,
+                    saved.session,
+                    Some(
+                        "its child ended with a cide restart; Resume continues the conversation"
+                            .to_string(),
+                    ),
+                ),
+            };
+            inner.runs.insert(
+                saved.run,
+                LiveRun {
+                    run: saved.run,
+                    agent: saved.agent,
+                    agent_label: saved.agent_label,
+                    harness: saved.harness,
+                    project: saved.project,
+                    session,
+                    task: saved.task,
+                    task_title: saved.task_title,
+                    state,
+                    started_unix_ms: saved.started_unix_ms,
+                    prompt: saved.prompt,
+                    note,
+                    slot: false,
+                    agent_limit: saved.agent_limit.max(1),
+                    project_limit: saved.project_limit.max(1),
+                    checkout: saved.checkout,
+                    seq,
+                    frozen: None,
+                    stale_turn: false,
+                    harness_session: saved.harness_session,
+                    continuing: false,
+                    death_noted: false,
+                },
+            );
+            restored.insert(format!("{}.log", saved.run));
+        }
+        drop(inner);
+
+        // The log prune, `save_screens_for_snapshot`'s pattern one directory over: a run the
+        // snapshot no longer names is a run whose post-mortem nobody can reach from any row,
+        // and its log would otherwise sit on disk for ever. Restored runs — history included —
+        // keep theirs; that file is the trail the debug report asked for.
+        if let Ok(entries) = std::fs::read_dir(run_logs_dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !restored.contains(&name) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    /// Write the screen of every run that still has a live child, for [`ResumePoint`]'s
+    /// preload — so a resumed run's pane starts with what the old child last showed, above the
+    /// continuation, instead of starting blank.
+    ///
+    /// Teardown-only, deliberately: a screen per flush would be a `vt100` render per run per
+    /// second for a file nothing reads until the next restart. A crash therefore loses the
+    /// screens and keeps the runs, which is the right half to keep. The directory is pruned to
+    /// the runs written, so it cannot grow past [`RECENT_KEPT`]-ish per project ever.
+    fn save_screens_for_snapshot(&self, sessions: &SessionRegistry) {
+        let dir = screens_dir();
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(%error, "no run-screens directory; resumed panes will start blank");
+            return;
+        }
+        let live: Vec<(RunId, SessionId)> = {
+            let inner = self.inner.lock();
+            inner
+                .runs
+                .values()
+                .filter(|live| {
+                    !matches!(
+                        live.state,
+                        RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+                    )
+                })
+                .filter_map(|live| live.session.map(|session| (live.run, session)))
+                .collect()
+        };
+        let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (run, session) in live {
+            let Some(pty) = sessions.get(session) else {
+                continue;
+            };
+            let name = format!("{run}.screen");
+            // `full_state`, not `screen_state`: the file preloads the resumed child's fresh
+            // mirror, and a one-screen picture cost a resumed run everything above its final
+            // two dozen lines — the same amputation History's Open had, fixed the same day.
+            // The whole transcript replays into the new mirror's scrollback, so a pane on the
+            // continued run can scroll back past the restart.
+            if std::fs::write(dir.join(&name), pty.full_state()).is_ok() {
+                kept.insert(name);
+            }
+        }
+        // The prune: whatever an earlier process left for runs this one no longer holds.
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !kept.contains(&name) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
 /// Which of the panel's groups a state belongs to. See `AgentRoster::Ready::runs`.
 fn group_rank(state: &RunState) -> u8 {
     match state {
@@ -1483,7 +2203,10 @@ fn group_rank(state: &RunState) -> u8 {
         RunState::Starting => 1,
         RunState::Paused { .. } => 2,
         RunState::Idle => 3,
-        RunState::Queued => 4,
+        // Beside `Queued`, because that is what it is about to become: an interrupted run is
+        // actionable, and sorting it into the finished tail would bury the one row that still
+        // has a Resume on it.
+        RunState::Queued | RunState::Interrupted => 4,
         RunState::Finished { .. } | RunState::Failed { .. } => 5,
     }
 }
@@ -1570,16 +2293,6 @@ struct Started {
     cwd: PathBuf,
 }
 
-/// How many bytes of a single unterminated output line [`AgentRegistry::watch_stream`] will hold.
-///
-/// Generous rather than tight, because one legitimate event line is not small: a `tool_use` event
-/// carries the tool's own state, and a file read is inside it. The cap is not a size limit on
-/// what a run may print — it is the answer to a child that prints a megabyte with **no newline in
-/// it at all**, which would otherwise grow this buffer for the life of the run. Over the cap the
-/// buffer is dropped and the scanner resynchronises at the next newline, losing the one line it
-/// was in the middle of.
-const LINE_CAP: usize = 1024 * 1024;
-
 impl AgentRegistry {
     /// Start every run the queue will admit. Returns at once; each start runs on its own task.
     pub fn pump(self: &Arc<Self>, app: &AppHandle) {
@@ -1595,9 +2308,18 @@ impl AgentRegistry {
         // Minted *before* the fork and recorded *before* the fork, so the child's first
         // `SessionStart` — applied on the hook thread the instant it arrives — finds a run this
         // registry can already name. See `bind_session`.
-        let session_id = SessionId::new();
+        let (session_id, resume) = match admission.resume.clone() {
+            // A resumed claude run keeps its old id — `--resume <id>` keeps the conversation's
+            // identity, so reusing it keeps hook routing and the row continuous. An opencode
+            // child is a new cide session either way; `--session` names the conversation.
+            Some(point) => (
+                point.rebind.unwrap_or_else(SessionId::new),
+                Some(point.conversation),
+            ),
+            None => (SessionId::new(), None),
+        };
         self.bind_session(admission.run, session_id);
-        self.bring_up(app, admission, session_id, None).await;
+        self.bring_up(app, admission, session_id, resume).await;
     }
 
     /// Fork one child for a run and wire it up, fresh or continuing.
@@ -1616,6 +2338,9 @@ impl AgentRegistry {
     ) {
         let run = admission.run;
         let project = admission.project;
+        // Cloned out before `admission` moves into the fork's closure; wanted again only if the
+        // child comes up.
+        let task = admission.task.clone();
 
         let facts = match facts(&app, project) {
             Ok(facts) => facts,
@@ -1660,12 +2385,22 @@ impl AgentRegistry {
         // And only now the opening prompt. `None` for a harness that took the prompt in its argv
         // instead; for `claude` it is written into the terminal, because a bare prompt does not
         // begin with `-` and `--mcp-config <configs...>` would swallow it — see
-        // `HarnessSpawn::opening`.
+        // `HarnessSpawn::opening`. Through `type_submitted_line`, not a plain write: the TUI
+        // does not exist yet, and a chunk this long read whole off the boot buffer is bundled
+        // as a paste with its Enter eaten — a run that starts, idles at a full composer, and
+        // holds its slot and worktree while reporting nothing. See the helper's measurements.
         if let Some(opening) = started.opening {
-            started.session.write(opening);
+            type_submitted_line(&app, session_id, &started.session, opening);
         }
 
         self.note_cwd(run, &started.cwd);
+        // The board reflects that somebody is on it now: `Todo → Doing`, and only that hop —
+        // `note_run_started`'s own doc has the reviewer-on-a-review-task case and the respawn
+        // idempotence argument. After the child is live rather than at enqueue, so a run the
+        // queue held for minutes does not claim a task nobody has started.
+        if let Some(task) = task.as_ref() {
+            crate::task_triggers::note_run_started(&app, project, task);
+        }
         tracing::info!(%run, session = %session_id, cwd = %started.cwd.display(), "subagent run started");
         self.mark_changed(&app, project);
     }
@@ -1693,7 +2428,20 @@ impl AgentRegistry {
     fn watch_exit(self: &Arc<Self>, app: &AppHandle, session: SessionId, pty: &Arc<PtySession>) {
         let app = app.clone();
         self.watch_exit_with(session, pty, move |registry, run| {
-            after_transition(&app, registry, run)
+            after_transition(&app, registry, run);
+            // The exit's nudge, delivered by the wrapper that holds the app — the observation
+            // itself travels app-free so a test can drive it (see `set_state`'s `None` arm).
+            // For a claude run this is a child that died; for an opencode run it is the *normal*
+            // end of every turn, which is why finished runs could not stay silent.
+            let project = registry
+                .inner
+                .lock()
+                .runs
+                .get(&run)
+                .map(|live| live.project);
+            if let Some(project) = project {
+                crate::agent_rpc::note_run_over(&app, project, run);
+            }
         });
     }
 
@@ -1724,142 +2472,83 @@ impl AgentRegistry {
         });
     }
 
-    /// Read one run's output as the harness-bound channel it is: the id, then the state.
+    /// The hook a [`SessionBinding::Harness`] run's session is spawned with: the raw channel
+    /// and the display rendering, one closure, in that order.
     ///
     /// # Why this exists at all, and only for some runs
     ///
     /// A `claude` run reports through the hook socket: `cide-hook` echoes `CIDE_SESSION` back on
     /// ten hook points, `note_hook` applies them, and nothing has to read a byte of the child's
     /// output. `opencode` has no hooks and no `--settings`, so **its `--format json` stream is
-    /// the only channel it has**: without this sink an opencode run's row sits at `Starting`
+    /// the only channel it has**: without this hook an opencode run's row sits at `Starting`
     /// until the process dies, and a follow-up has no conversation id to name.
     ///
-    /// So this is attached exactly when the harness said its identity arrives that way
-    /// ([`SessionBinding::Harness`]), and a claude run pays nothing for it — no sink, no parse,
-    /// no allocation.
+    /// # A `LineRender`, where a sink used to be — and what the move deleted
     ///
-    /// # What it owes the session it attaches to
+    /// This was a `cide_pty::Sink` once, and its doc spent paragraphs on the three hazards that
+    /// came with being one: the ack-credit debt (a sink that never pays is choked and starts
+    /// receiving rendered screens — fatal to a scanner), the re-entrant sink-list lock (the
+    /// first version parked the coalescer for the whole process), and the Weak-vs-Arc cycle
+    /// through the session's own sink list. The render hook has none of them by construction:
+    /// it is called by the coalescer *outside* the sink-list lock, owes no acknowledgement
+    /// because it is not credited, and is owned by the coalescer thread rather than by the
+    /// session. `cide_pty::render_lines` owns the line splitting now and hands this closure
+    /// complete lines — the `Scan` buffer, its cap and its resync all moved there.
     ///
-    /// **Every byte is acknowledged, and never from this thread.** `cide-pty` gives each sink a
-    /// credit budget, and a sink that never pays it back is choked at 256 KiB — after which it
-    /// stops receiving *output* and starts receiving rendered screens, which is right for a pane
-    /// catching up and fatal for a scanner. There is no backpressure to apply here anyway; the
-    /// work is one pass over a byte slice. But the acknowledgement cannot be made here either,
-    /// and [`ack_credit`] carries that whole argument: it is a re-entrant lock that parks the
-    /// coalescer for the entire process.
-    ///
-    /// It holds a [`std::sync::Weak`] to the session rather than an `Arc`, because an `Arc` here
-    /// would be a cycle — the session owns the sink list, the sink would own the session — and
-    /// the run's child would never be dropped.
+    /// What forced the move is the display half: sinks now carry the **rendered** stream (the
+    /// harness's `render`, so a pane opened onto the run reads prose rather than ndjson), and a
+    /// scanner attached as a sink would have been parsing its own output format's rendering.
+    /// Observation therefore reads each raw line here, before the rendering is returned.
     ///
     /// # `app: Option<&AppHandle>`
     ///
     /// [`Self::set_state`]'s convention, with [`Self::watch_exit_with`]'s motive: `None` means
     /// *this caller cannot nudge or admit*, and the only such caller is a test — `tauri`'s mock
-    /// app is behind a feature this build does not enable, so a sink that required one could be
+    /// app is behind a feature this build does not enable, so a hook that required one could be
     /// exercised only by running the application.
     ///
-    /// Production passes `Some`, and that is not a detail either: the `Running → Idle` edge this
-    /// sink produces **is** the product-owner nudge for a harness with no hooks, so a `None` here
-    /// in earnest would be an opencode run that finishes its turn with nothing typed into the
+    /// Production passes `Some`, and that is not a detail: the `Running → Idle` edge this hook
+    /// produces **is** the product-owner nudge for a harness with no hooks, so a `None` here in
+    /// earnest would be an opencode run that finishes its turn with nothing typed into the
     /// orchestrator's console and nothing started off its queue.
-    fn watch_stream(
+    fn stream_hook(
         self: &Arc<Self>,
         app: Option<&AppHandle>,
         run: RunId,
         session: SessionId,
-        pty: &Arc<PtySession>,
         capture: fn(&str) -> Option<String>,
-    ) {
-        /// The partial line one sink is carrying between deliveries.
-        ///
-        /// **Only the buffer is behind the mutex.** Whether the id has been captured is an
-        /// [`AtomicBool`] beside it rather than a third field here, and that is a bug fix rather
-        /// than a preference: reading it inside an `if` whose body then writes it takes this
-        /// lock twice, and a `parking_lot::Mutex` is not reentrant — the second acquisition
-        /// deadlocks **`cide-pty`'s coalescer thread**, which is the thread every byte of every
-        /// session in the process flows through. Nothing anywhere reports that; every terminal
-        /// in the application simply stops painting.
-        #[derive(Default)]
-        struct Scan {
-            /// Bytes of a line that has not ended yet.
-            buffer: Vec<u8>,
-            /// Dropping the remains of a line that went past [`LINE_CAP`], until a newline.
-            resyncing: bool,
-        }
-
+        render: fn(&str) -> Option<String>,
+    ) -> cide_pty::LineRender {
         let registry = Arc::clone(self);
         let app = app.cloned();
-        // See the doc: an `Arc` would be a cycle through the session's own sink list.
-        let weak = Arc::downgrade(pty);
-        // The id is minted by `attach`, which cannot be called until the sink exists, so the
-        // first delivery may land before this is set. That costs one unacknowledged chunk out of
-        // a 256 KiB budget.
-        let id: Arc<std::sync::OnceLock<cide_pty::SinkId>> = Arc::new(std::sync::OnceLock::new());
-        let for_sink = Arc::clone(&id);
-        let scan = Mutex::new(Scan::default());
-        // A one-way latch, so the scan stops parsing for an id once it has one.
+        // A one-way latch: a respawn continues the same conversation and prints the same id,
+        // so this is one write per run rather than one parse per line for its whole life.
         let captured = AtomicBool::new(false);
-
-        let attached = pty.attach(Arc::new(move |bytes: &[u8]| -> bool {
-            // **Never `pty.ack(..)` from here.** See `ack_credit`: this callback runs with
-            // `cide-pty`'s sink list locked, and re-entering that lock parks the coalescer.
-            if let Some(id) = for_sink.get().copied() {
-                ack_credit(&weak, id, bytes.len());
-            }
-
-            // The split happens under the lock; everything that can block — a registry lock, an
-            // emit, a nudge that writes into another PTY — happens after it is dropped. This runs
-            // on `cide-pty`'s coalescer thread, which is the thread every byte of every session
-            // in the process flows through.
-            let mut lines: Vec<String> = Vec::new();
+        // The post-mortem tee — see `run_logs_dir`. Raw lines, before rendering: a death is
+        // debugged from what the child said, not from what the pane showed of it.
+        let log = Mutex::new(RunLog::at(
+            run_logs_dir().join(format!("{run}.log")),
+            RUN_LOG_CAP,
+        ));
+        cide_pty::LineRender(Arc::new(move |line: &str| {
+            log.lock().append(line);
+            if !captured.load(Ordering::Acquire)
+                && let Some(harness_session) = capture(line)
             {
-                let mut scan = scan.lock();
-                let mut rest = bytes;
-                if scan.resyncing {
-                    match rest.iter().position(|b| *b == b'\n') {
-                        Some(end) => {
-                            scan.resyncing = false;
-                            rest = &rest[end + 1..];
-                        }
-                        None => return true,
-                    }
-                }
-                scan.buffer.extend_from_slice(rest);
-
-                let mut start = 0;
-                for end in 0..scan.buffer.len() {
-                    if scan.buffer[end] == b'\n' {
-                        lines.push(String::from_utf8_lossy(&scan.buffer[start..end]).into_owned());
-                        start = end + 1;
-                    }
-                }
-                scan.buffer.drain(..start);
-                if scan.buffer.len() > LINE_CAP {
-                    scan.buffer.clear();
-                    scan.resyncing = true;
-                }
+                registry.note_harness_session(run, harness_session);
+                captured.store(true, Ordering::Release);
             }
-
-            for line in lines {
-                // Until it answers, and never again: a respawn continues the same conversation
-                // and prints the same id, so this is one write per run rather than one per line.
-                if !captured.load(Ordering::Acquire)
-                    && let Some(harness_session) = capture(&line)
-                {
-                    registry.note_harness_session(run, harness_session);
-                    captured.store(true, Ordering::Release);
-                }
-                if let Some((moved, _)) =
-                    registry.observe(app.as_ref(), session, Observation::Line(&line))
-                    && let Some(app) = app.as_ref()
-                {
-                    after_transition(app, &registry, moved);
-                }
+            // Runs on the coalescer thread — the thread every byte of every session flows
+            // through — which is where the sink version ran too: the registry lock, the emit
+            // coalescer and the nudge are all costs that thread already carries.
+            if let Some((moved, _)) =
+                registry.observe(app.as_ref(), session, Observation::Line(line))
+                && let Some(app) = app.as_ref()
+            {
+                after_transition(app, &registry, moved);
             }
-            true
-        }));
-        let _ = id.set(attached);
+            render(line)
+        }))
     }
 
     /// Write down the conversation id a harness minted for a run. Answers whether it was new.
@@ -1913,6 +2602,13 @@ impl AgentRegistry {
                 self.fail(Some(app), run, "stopped before it started");
             }
             RunState::Finished { .. } | RunState::Failed { .. } => {}
+            // No child to kill and no reaper to report one, so the fall-through below would
+            // move nothing and the row would be unstoppable, silently. Stopping an interrupted
+            // run means "do not resume this": the row closes into Recent, the conversation
+            // stays on disk, and a fresh dispatch remains available.
+            RunState::Interrupted => {
+                self.fail(Some(app), run, "discarded without resuming");
+            }
             _ => {
                 // The child, through the one registry that owns it. The run's own state moves
                 // when the reaper reports, not here: a state written on the way *into* a kill
@@ -1965,6 +2661,9 @@ impl AgentRegistry {
                     crate::emit::agents_changed(&app, project, &roster);
                 }
             }
+            // The durable half rides the same coalescing: every burst that changed a roster
+            // may have changed which runs a restart must bring back.
+            self.save_snapshot();
             return;
         }
     }
@@ -1972,55 +2671,6 @@ impl AgentRegistry {
 
 /// Prepare the worktree, build the argv and fork. **On the blocking pool** — every line of it
 /// touches a disk or a process.
-/// Acknowledge a sink's credit from a thread that is **not** the one that delivered it.
-///
-/// # Why this is not `pty.ack(id, n)` at the delivery site
-///
-/// `cide-pty`'s `broadcast` calls `Sink::deliver` **with the sink list locked** — it is a
-/// `retain` over that list, which is what lets a sink that answers `false` be dropped in place.
-/// So a sink calling [`PtySession::ack`] inside its own delivery takes that same
-/// `parking_lot::Mutex` a second time on the same thread, and parks the **coalescer**: every
-/// terminal in the process stops painting, every screen mirror stops advancing, and nothing
-/// anywhere reports it. That is not a theory — it is what the first version of
-/// [`AgentRegistry::watch_stream`] did, and the only symptom was a run whose row never moved.
-///
-/// # And why a scanner that simply never acks is not the answer either
-///
-/// At 256 KiB of unacknowledged output `cide-pty` chokes a sink, and a choked sink stops
-/// receiving the *stream* and starts receiving rendered screens. For a pane that is a catch-up;
-/// for a line scanner it is the channel quietly turning into terminal noise, a quarter of a
-/// megabyte into a run that will print far more than that.
-///
-/// # One thread for the process
-///
-/// Created on the first harness-bound run and never joined, like `child_env::on_spawn_thread`'s.
-/// It holds nothing while it waits, and each message carries a [`Weak`] so a queued
-/// acknowledgement cannot keep a dead run's session alive. A send that finds the thread gone is
-/// dropped: the cost of a lost acknowledgement is credit, and the watchdog forgives that anyway.
-fn ack_credit(pty: &Weak<PtySession>, sink: SinkId, bytes: usize) {
-    type Credit = (Weak<PtySession>, SinkId, usize);
-    static ACKS: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Credit>>> =
-        std::sync::OnceLock::new();
-
-    let sender = ACKS.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Credit>();
-        let spawned = std::thread::Builder::new()
-            .name("cide-agents-credit".into())
-            .spawn(move || {
-                for (pty, sink, bytes) in rx {
-                    if let Some(pty) = pty.upgrade() {
-                        pty.ack(sink, bytes);
-                    }
-                }
-            });
-        if let Err(error) = spawned {
-            tracing::warn!(%error, "no thread to acknowledge agent output; runs may be throttled");
-        }
-        Mutex::new(tx)
-    });
-    let _ = sender.lock().send((pty.clone(), sink, bytes));
-}
-
 fn start_child(
     app: &AppHandle,
     registry: &Arc<AgentRegistry>,
@@ -2045,25 +2695,36 @@ fn start_child(
     }
 
     let cwd = match project.config.agents.isolation {
-        Isolation::Worktree => {
-            // Idempotent, and called before every dispatch rather than once per agent: a user can
-            // delete `.cide/worktrees/<agent>` between two runs, and `ensure` repairs a
-            // registration whose directory has gone.
-            //
-            // The run's cwd *is* its resume identity — `claude` files its transcript under the
-            // directory it started in — so this is not merely where the work happens.
-            let tree = cide_git::worktree::ensure(&facts.root, &admission.agent.0)
+        // The role's own `worktree: false` opts it out of the checkout — its runs stand in
+        // the project root, exactly as under shared isolation, which is the arm below. Read
+        // off the same fresh `project.get` as the refusal, so a flag edited mid-queue is
+        // honoured at the fork — and the stamped `checkout` the admission gate used was
+        // `None` for such a role, so nothing was serialised on a directory it never takes.
+        Isolation::Worktree if agent.def.worktree => {
+            // One worktree per (role, task): `checkout_name` composes the name and the
+            // determinism is load-bearing — a resumed run recomputes this and must land in
+            // the directory its transcript lives under. Recomputed here from the fresh
+            // config rather than read off the run, exactly as the refusal above re-reads the
+            // role: `bring_up` acts on facts as they stand at the fork.
+            let name = cide_agents::checkout_name(&admission.agent, admission.task.as_ref());
+            // Idempotent, and called before every dispatch rather than once per checkout: a
+            // user can delete `.cide/worktrees/<name>` between two runs, and `ensure` repairs
+            // a registration whose directory has gone.
+            let tree = cide_git::worktree::ensure(&facts.root, &name)
                 .map_err(|error| CoreError::Io(error.to_string()))?;
 
-            // One checkout, one process. An `Idle` run of this role has released its slot but its
-            // child is still sitting in that directory, so it is wound down at the one moment the
-            // checkout is actually needed. See `idle_children_of`.
+            // One checkout, one process. An `Idle` run whose child is still sitting in *this*
+            // directory is wound down at the one moment the checkout is actually needed. See
+            // `idle_children_in` — scoped to the name, never the role, since worktrees went
+            // per-task. In practice only a `claude` is ever found here: opencode's observer
+            // stopped answering `Idle` after run 06202dd6, where a misread mid-turn
+            // `step_finish` released the slot and this very kill took a working child —
+            // `cide_agents::harness::opencode`'s `observe` doc carries the incident, and an
+            // opencode turn now ends only at its process's exit.
             if let Some(sessions) = app.try_state::<SessionRegistry>() {
-                for idle in
-                    registry.idle_children_of(admission.project, &admission.agent, admission.run)
-                {
+                for idle in registry.idle_children_in(admission.project, &name, admission.run) {
                     if let Some(pty) = sessions.get(idle) {
-                        tracing::info!(session = %idle, agent = %admission.agent, "winding down an idle run to reclaim its worktree");
+                        tracing::info!(session = %idle, checkout = %name, "winding down an idle run to reclaim its worktree");
                         pty.kill();
                     }
                 }
@@ -2072,7 +2733,7 @@ fn start_child(
         }
         // Nothing separates two runs here, which is what the setting says on its face and what
         // `agents_config_set` refuses to arrange by accident.
-        Isolation::Shared => facts.root.clone(),
+        Isolation::Worktree | Isolation::Shared => facts.root.clone(),
     };
 
     let plan = RunPlan {
@@ -2097,6 +2758,10 @@ fn start_child(
         // later opened into a pane is resized then, through the path a re-docked pane uses.
         geometry: Geometry::default(),
         claude: facts.claude.clone(),
+        // From the same fresh `load_project` the refusal above used, so the flag a child runs
+        // with is the file as it stood at this fork — a `git checkout` flipping
+        // `agents.skipPermissions` is honoured from the next dispatch, never cached past it.
+        skip_permissions: project.config.agents.skip_permissions,
     };
 
     let harness = cide_agents::for_kind(agent.def.harness).ok_or_else(|| {
@@ -2114,19 +2779,43 @@ fn start_child(
     }
     .map_err(|error| CoreError::Io(error.to_string()))?;
 
-    let binding = spawn.binding;
-    let pty = PtySession::spawn(spawn.spec).map_err(|error| CoreError::Io(error.to_string()))?;
-
-    // Attached here rather than after this function returns, and the difference is real: the
-    // caller resumes on another thread after an `await`, and a run whose whole liveness channel
-    // is its own output cannot afford to have the first lines of it delivered to nobody.
-    if let SessionBinding::Harness { capture } = binding {
-        registry.watch_stream(Some(app), admission.run, session, &pty, capture);
-    }
+    let cide_agents::HarnessSpawn {
+        spec,
+        opening,
+        binding,
+    } = spawn;
+    // Installed **in the spec**, not attached after the fork, and the difference is real twice
+    // over: a run whose whole liveness channel is its own output cannot afford to have its
+    // first lines delivered to nobody, and the hook is also the display renderer — a line that
+    // reached the mirror before it was installed would sit on screen as raw ndjson for ever.
+    let spec = match binding {
+        SessionBinding::Harness { capture, render } => {
+            spec.render(registry.stream_hook(Some(app), admission.run, session, capture, render))
+        }
+        SessionBinding::Caller => spec,
+    };
+    // A resumed run's pane opens onto what the old child last showed, above the continuation —
+    // the same mechanism a restored shell pane uses (`SpawnSpec::preload`: mirror only, never
+    // the child), fed from the screen the last teardown saved. Absent file, absent preload:
+    // a crash keeps the runs and loses the screens, and blank-above-continuation is honest.
+    let spec = match admission
+        .resume
+        .as_ref()
+        .and_then(|_| saved_screen(admission.run))
+    {
+        Some(mut screen) => {
+            screen.extend_from_slice(
+                b"\r\n\x1b[2m\xe2\x80\x94 resumed after a cide restart \xe2\x80\x94\x1b[0m\r\n",
+            );
+            spec.preload(screen)
+        }
+        None => spec,
+    };
+    let pty = PtySession::spawn(spec).map_err(|error| CoreError::Io(error.to_string()))?;
 
     Ok(Started {
         session: pty,
-        opening: spawn.opening,
+        opening,
         cwd,
     })
 }
@@ -2200,6 +2889,99 @@ fn after_transition(app: &AppHandle, registry: &Arc<AgentRegistry>, run: RunId) 
 }
 
 // ==========================================================================================
+// Typing a submitted line into a claude TUI.
+// ==========================================================================================
+
+/// The paste-detection gap: how long after its text the lone Enter is written.
+///
+/// 150 ms was measured to fall outside the TUI's paste coalescing (see
+/// [`type_submitted_line`]); 250 leaves margin without being felt by anybody watching.
+const ENTER_GAP: Duration = Duration::from_millis(250);
+
+/// How long the Enter thread waits for a spawning TUI to come up before submitting anyway.
+///
+/// Generous, because the cost of expiring early is the whole failure this helper exists to
+/// prevent, and the cost of waiting is one parked thread. It expires at all only for a session
+/// whose hooks never report in — a build whose hook socket failed to bind answers `Spawning`
+/// for ever — and a late submit there still beats a lost one.
+const ENTER_BOOT_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Type one submitted line into a `claude` TUI: the text now, the Enter alone once the TUI is
+/// up and a beat has passed.
+///
+/// # Why the Enter travels separately — measured against claude 2.1.245
+///
+/// The TUI reads raw and detects pastes **by length**: a short chunk submits, but a chunk the
+/// size of a real nudge or opening prompt, arriving with its `\r` in the same `read`, is
+/// bundled as a paste — the CR becomes a newline in the composer, and the line sits there
+/// unsubmitted while later lines stack below it. That was the reported shape, twice over: two
+/// nudges piled up in the product owner's input box, and an opening prompt a freshly dispatched
+/// run would never have acted on. Probed three ways against the shipped binary: a long
+/// one-chunk write never submits, a short one does (which is why the `/bin/sh` `read` test in
+/// `agent_rpc` cannot see this — a shell has no paste detection), and text-then-lone-CR submits
+/// both into a live TUI and over a composer filled from the pre-boot buffer.
+///
+/// # Why it waits on the hook state first
+///
+/// An opening prompt is written before the child's TUI exists, so a fixed delay alone is not a
+/// separation — both writes would sit in the kernel buffer and come back in one `read`. The
+/// session leaving [`SessionState::Spawning`] is the CLI's own "I am up" (its `SessionStart`
+/// hook, applied by `crate::hooks`), and only after it does the gap mean anything. Live-TUI
+/// callers — the nudge, a retry — pass the check on the first poll and pay only the gap.
+///
+/// Bytes not ending in `\r` are not a submitted line and are written verbatim: this helper must
+/// not invent an Enter the harness did not produce.
+pub(crate) fn type_submitted_line(
+    app: &AppHandle,
+    session: SessionId,
+    pty: &Arc<PtySession>,
+    bytes: Vec<u8>,
+) {
+    let (text, enter) = strip_enter(bytes);
+    pty.write(text);
+    if !enter {
+        return;
+    }
+
+    let app = app.clone();
+    let for_thread = Arc::clone(pty);
+    let spawned = std::thread::Builder::new()
+        .name("cide-type-enter".into())
+        .spawn(move || {
+            let deadline = Instant::now() + ENTER_BOOT_DEADLINE;
+            while Instant::now() < deadline {
+                let state = app
+                    .try_state::<crate::hooks::HookServer>()
+                    .map(|hooks| hooks.state(session));
+                if state != Some(SessionState::Spawning) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::thread::sleep(ENTER_GAP);
+            for_thread.write(b"\r".to_vec());
+        });
+    if let Err(error) = spawned {
+        // No thread means no gap: write the Enter now and say so. A maybe-eaten submit beats a
+        // caller blocked for the gap, and beats a line that never gets its Enter at all.
+        tracing::warn!(%error, "no thread for the split Enter; submitting inline");
+        pty.write(b"\r".to_vec());
+    }
+}
+
+/// The split, as a pure decision: the bytes to write now, and whether an Enter is owed.
+///
+/// Exactly one trailing `\r` is peeled — the harness `submit` produces exactly one, and a
+/// second would be a second Enter, which is finding 8's whole subject.
+fn strip_enter(mut bytes: Vec<u8>) -> (Vec<u8>, bool) {
+    let enter = bytes.last() == Some(&b'\r');
+    if enter {
+        bytes.pop();
+    }
+    (bytes, enter)
+}
+
+// ==========================================================================================
 // The emit coalescer.
 // ==========================================================================================
 
@@ -2264,6 +3046,10 @@ mod tests {
     use cide_pty::SpawnSpec;
 
     /// A dispatch as `cmd::agents::plan_dispatch` would have produced it.
+    ///
+    /// `checkout: None` — shared isolation's stamp — so the numeric limits stay the whole
+    /// story in every test that is not *about* the checkout gate; the gate's own tests stamp
+    /// names explicitly.
     fn spec(project: ProjectId, agent: &str, agent_limit: u16, project_limit: u16) -> DispatchSpec {
         DispatchSpec {
             project,
@@ -2275,6 +3061,7 @@ mod tests {
             prompt: "do the thing".into(),
             agent_limit,
             project_limit,
+            checkout: None,
         }
     }
 
@@ -2289,6 +3076,18 @@ mod tests {
             .clone()
     }
 
+    /// The split `type_submitted_line` makes, pinned pure: exactly one trailing Enter is
+    /// peeled and owed separately, and bytes that are not a submitted line pass through whole.
+    #[test]
+    fn the_enter_is_peeled_exactly_once() {
+        assert_eq!(strip_enter(b"hi\r".to_vec()), (b"hi".to_vec(), true));
+        assert_eq!(strip_enter(b"hi".to_vec()), (b"hi".to_vec(), false));
+        // Only the final one — the harness's own — is peeled; anything deeper is the caller's
+        // second Enter, which finding 8 already forbids upstream.
+        assert_eq!(strip_enter(b"hi\r\r".to_vec()), (b"hi\r".to_vec(), true));
+        assert_eq!(strip_enter(Vec::new()), (Vec::new(), false));
+    }
+
     /// **One worktree per agent means one run at a time.**
     ///
     /// The property the whole queue exists for: three dispatches against one role admit exactly
@@ -2297,14 +3096,13 @@ mod tests {
     fn an_agent_admits_one_run_and_queues_the_rest() {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
-        // 1 is what `effective_max_concurrent` answers under worktree isolation, whatever the
-        // role's own `max-concurrent` says.
+        // A role whose `max-concurrent` is 1 — the numeric ceiling, enforced as stamped.
         let runs: Vec<RunId> = (0..3)
             .map(|_| registry.enqueue(spec(project, "developer", 1, 4)))
             .collect();
 
         let admitted = registry.take_admissions();
-        assert_eq!(admitted.len(), 1, "a second run would share a worktree");
+        assert_eq!(admitted.len(), 1, "the role's ceiling is one");
         assert_eq!(admitted[0].run, runs[0], "the queue is first in, first out");
         assert_eq!(state_of(&registry, runs[0]), RunState::Starting);
         assert_eq!(state_of(&registry, runs[1]), RunState::Queued);
@@ -2313,6 +3111,440 @@ mod tests {
         // And asking again while it is still starting admits nothing: the slot is held from
         // admission, not derived from the phase.
         assert!(registry.take_admissions().is_empty());
+    }
+
+    /// **Two tasks of one role run in parallel; one checkout never holds two children.**
+    ///
+    /// The per-task successor to the worktree clamp, driven end to end through admission. The
+    /// user's report that motivated it: a role with `max-concurrent: 2` and two assigned tasks
+    /// ran one and queued the other, because the role had one checkout and the limit was
+    /// clamped to protect it. Now the checkout is per task and the limit means what it says —
+    /// but the *gate* has to hold everything that would still collide: a second dispatch into
+    /// the same checkout, and any dispatch with no task at all, which shares the role's base
+    /// worktree.
+    #[test]
+    fn two_tasks_parallelise_and_one_checkout_serialises() {
+        let with_checkout = |project, name: Option<&str>| DispatchSpec {
+            checkout: name.map(str::to_string),
+            ..spec(project, "developer", 2, 8)
+        };
+
+        // Different tasks, different checkouts: the declared 2 is real.
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let first = registry.enqueue(with_checkout(project, Some("developer-t-1")));
+        let second = registry.enqueue(with_checkout(project, Some("developer-t-2")));
+        let admitted = registry.take_admissions();
+        assert_eq!(
+            admitted.len(),
+            2,
+            "two tasks are two checkouts and both slots are free"
+        );
+        assert_eq!(state_of(&registry, first), RunState::Starting);
+        assert_eq!(state_of(&registry, second), RunState::Starting);
+
+        // The same checkout, twice: the second waits for the first to *end*, not merely to
+        // start — a `Starting`/`Running` child may be standing in that directory.
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let first = registry.enqueue(with_checkout(project, Some("developer")));
+        let second = registry.enqueue(with_checkout(project, Some("developer")));
+        assert_eq!(registry.take_admissions().len(), 1);
+        assert_eq!(
+            state_of(&registry, second),
+            RunState::Queued,
+            "two taskless dispatches share the base worktree and must serialise"
+        );
+        registry.set_state(None, first, RunState::Running);
+        assert!(
+            registry.take_admissions().is_empty(),
+            "a running child in the checkout still blocks it"
+        );
+        registry.set_state(None, first, RunState::Finished { code: 0 });
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].run, second, "the checkout freed with the exit");
+
+        // `Idle` deliberately does not block: the parked child is `bring_up`'s to wind down at
+        // the moment the checkout is claimed, and holding the queue on it would leave an idle
+        // claude pinning its task's checkout for ever.
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let first = registry.enqueue(with_checkout(project, Some("developer")));
+        let second = registry.enqueue(with_checkout(project, Some("developer")));
+        registry.take_admissions();
+        registry.set_state(None, first, RunState::Idle);
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1, "idle releases the checkout to the queue");
+        assert_eq!(admitted[0].run, second);
+
+        // `None` — shared isolation's stamp — collides with nothing: N runs in one directory
+        // is what that setting says on its face.
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        registry.enqueue(with_checkout(project, None));
+        registry.enqueue(with_checkout(project, None));
+        assert_eq!(registry.take_admissions().len(), 2);
+    }
+
+    /// **The teardown's snapshot is the last word.** The first live restart found the race:
+    /// teardown wrote the truth, the ladder killed the children, the reaper marked the runs
+    /// `Finished`, and the coalescer's next flush — 120 ms, well inside the ladder's graces —
+    /// overwrote the file with the shutdown's own kills recorded as outcomes. Two paused runs
+    /// restored as history, and Resume had nothing to resume. The seal is the fix, and this
+    /// drives the exact sequence.
+    #[test]
+    fn a_sealed_snapshot_ignores_the_shutdowns_own_kills() {
+        let dir = std::env::temp_dir().join(format!("cide-run-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        registry.bind_session(run, SessionId::new());
+        registry.inner.lock().paused_projects.insert(project);
+
+        // The teardown: seal, then write. (`final_snapshot` is exactly this plus the screens,
+        // aimed at the real path; the seal and the write are what the race is about.)
+        assert!(
+            !registry
+                .snapshot_sealed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        );
+        registry.write_snapshot_now(&path);
+        let sealed = std::fs::read(&path).expect("the teardown wrote");
+
+        // The ladder kills the child, the reaper reports, the coalescer flushes once more.
+        registry.set_state(None, run, RunState::Finished { code: 143 });
+        registry.write_snapshot_to(&path);
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            sealed,
+            "a post-seal flush rewrote the snapshot with the shutdown's kills as outcomes"
+        );
+
+        // And the restart reads the sealed truth: resumable, not history.
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true);
+        assert_eq!(state_of(&after, run), RunState::Interrupted);
+        assert!(!after.dispatching(project), "the halt survived too");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A run outlives the process, and Resume continues it — through the queue.**
+    ///
+    /// The whole restart story in one test: a working opencode run is snapshotted, restored
+    /// into a fresh registry as `Interrupted`, requeued by Resume, and admitted carrying its
+    /// conversation and a continuation prompt — while a run that was still *queued* at quit
+    /// comes back with no conversation and its original prompt, because nothing had happened
+    /// yet and claiming otherwise would bill a fresh start as a continuation.
+    #[test]
+    fn an_interrupted_run_resumes_through_the_queue_continuing_its_conversation() {
+        let dir = std::env::temp_dir().join(format!("cide-run-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let before = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let worked = before.enqueue(opencode_spec(project, "developer"));
+        let waiting = before.enqueue(opencode_spec(project, "qa"));
+        let admitted = before.take_admissions();
+        assert_eq!(admitted.len(), 2, "two roles, two slots");
+        let session = SessionId::new();
+        before.bind_session(worked, session);
+        assert!(before.note_harness_session(worked, "ses_fe6da2c1effe8Yz".into()));
+        // `waiting` was admitted too; push it back to Queued to model a run the quit caught
+        // before its child existed. (Its slot bookkeeping dies with the process either way.)
+        before
+            .inner
+            .lock()
+            .runs
+            .get_mut(&waiting)
+            .expect("row")
+            .state = RunState::Queued;
+        // The workstream was halted before the quit, and that must come back too.
+        before.inner.lock().paused_projects.insert(project);
+
+        before.write_snapshot_to(&path);
+
+        // A run that ENDED before the quit is history, and history restores as history —
+        // with its session dropped, so no Open can aim at a process the old cide took with it.
+        let ended = before.enqueue(opencode_spec(project, "artist"));
+        {
+            let mut inner = before.inner.lock();
+            let live = inner.runs.get_mut(&ended).expect("row");
+            live.state = RunState::Finished { code: 0 };
+            live.session = Some(SessionId::new());
+        }
+        before.write_snapshot_to(&path);
+
+        // The restart: a fresh registry, the workspace still holding the project.
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true);
+        assert_eq!(state_of(&after, worked), RunState::Interrupted);
+        assert_eq!(state_of(&after, waiting), RunState::Interrupted);
+        assert_eq!(state_of(&after, ended), RunState::Finished { code: 0 });
+        assert_eq!(
+            after.inner.lock().runs[&ended].session,
+            None,
+            "a restored history row must not carry a session nothing holds"
+        );
+        assert!(
+            !after.dispatching(project),
+            "a halted workstream restarted itself"
+        );
+
+        // Resume's two halves, exercised app-free: reopen the queue, requeue the interrupted.
+        after.inner.lock().paused_projects.remove(&project);
+        after.requeue_interrupted(project, None);
+        let mut admissions = after.take_admissions();
+        admissions.sort_by_key(|admission| admission.run != worked);
+        assert_eq!(admissions.len(), 2);
+
+        let continued = &admissions[0];
+        let point = continued
+            .resume
+            .as_ref()
+            .expect("a conversation to continue");
+        assert_eq!(point.conversation, "ses_fe6da2c1effe8Yz");
+        assert_eq!(
+            point.rebind, None,
+            "opencode's new child is a new cide session"
+        );
+        assert!(
+            continued.prompt.contains("cide restarted"),
+            "{}",
+            continued.prompt
+        );
+
+        let fresh = &admissions[1];
+        assert!(
+            fresh.resume.is_none(),
+            "nothing had happened; nothing to continue"
+        );
+        assert_eq!(
+            fresh.prompt, "do the thing",
+            "the original dispatch, replayed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The claude flavour of the same continuation: the run's own [`SessionId`] is both the
+    /// rebind and the conversation, which is what keeps hook routing and the row continuous.
+    #[test]
+    fn a_claude_runs_continuation_rebinds_its_own_session() {
+        let dir = std::env::temp_dir().join(format!("cide-run-snapclaude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let before = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = before.enqueue(spec(project, "developer", 1, 4));
+        before.take_admissions();
+        let session = SessionId::new();
+        before.bind_session(run, session);
+        before.write_snapshot_to(&path);
+
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true);
+        after.requeue_interrupted(project, Some(run));
+        let admissions = after.take_admissions();
+        assert_eq!(admissions.len(), 1);
+        let point = admissions[0].resume.as_ref().expect("resumable");
+        assert_eq!(point.rebind, Some(session));
+        assert_eq!(point.conversation, session.to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The auto-dispatch dedupe: a `(agent, task)` pair with a run in any not-yet-closed state
+    /// answers open, so a repeated assignment or mention stacks nothing — and only `Finished`/
+    /// `Failed` reopen it.
+    #[test]
+    fn an_open_run_is_any_run_that_has_not_ended() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let task = TaskId("t-7".into());
+        let mut with_task = spec(project, "developer", 1, 4);
+        with_task.task = Some(task.clone());
+        let run = registry.enqueue(with_task);
+        let agent = AgentId("developer".into());
+
+        // Queued counts: the whole point is not stacking a second entry behind it.
+        assert!(registry.has_open_run(project, &agent, &task));
+        // A different task, and a different role, do not.
+        assert!(!registry.has_open_run(project, &agent, &TaskId("t-8".into())));
+        assert!(!registry.has_open_run(project, &AgentId("qa".into()), &task));
+
+        // Idle still counts — the child lives and holds the role's worktree.
+        let _ = registry.take_admissions();
+        registry.set_state(None, run, RunState::Idle);
+        assert!(registry.has_open_run(project, &agent, &task));
+
+        // Failed closes it: the pair may be dispatched again.
+        registry.fail(None, run, "spawn failed");
+        assert!(!registry.has_open_run(project, &agent, &task));
+    }
+
+    /// **P0's truth table**: the registry owns a session for as long as its run has not ended.
+    ///
+    /// `session_kill` consults this before killing anything, because the debug report's
+    /// single-pane deaths (exit 129, one sibling dead while the other lived) were pane closes
+    /// reaching a run's PTY. Interrupted must count as owned — that is precisely the state a
+    /// run resumes from, and a kill there destroys the transcript the resume needs.
+    #[test]
+    fn the_registry_owns_a_session_until_its_run_ends() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        let session = SessionId::new();
+
+        // Enqueued but unbound: no session, nothing owned.
+        assert!(!registry.owns_session(session));
+
+        registry.bind_session(run, session);
+        assert!(registry.owns_session(session));
+        // A session the registry never bound is not owned, whatever else is running.
+        assert!(!registry.owns_session(SessionId::new()));
+
+        let _ = registry.take_admissions();
+        for state in [RunState::Running, RunState::Idle, RunState::Interrupted] {
+            registry.set_state(None, run, state);
+            assert!(
+                registry.owns_session(session),
+                "a not-ended run owns its session"
+            );
+        }
+
+        // Finished releases it — the child is gone, the pane close may reap the PTY.
+        registry.set_state(None, run, RunState::Finished { code: 0 });
+        assert!(!registry.owns_session(session));
+
+        // Failed likewise.
+        let other = registry.enqueue(spec(project, "qa", 1, 4));
+        let other_session = SessionId::new();
+        registry.bind_session(other, other_session);
+        registry.fail(None, other, "spawn failed");
+        assert!(!registry.owns_session(other_session));
+    }
+
+    /// **P2's decision table**: an abnormal end with a task and no successor speaks, once.
+    ///
+    /// The consumer (`agent_rpc::note_death`) only formats what this hands back, so the whole
+    /// rule is testable here with no store and no app: exit 0 is silent, an exit code is
+    /// carried, `Failed` carries none, a surviving sibling on the pair silences the death for
+    /// good, and the latch makes every answer single-shot.
+    #[test]
+    fn a_death_speaks_once_and_only_with_no_successor() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let task = TaskId("t-9".into());
+        let with_task = |agent: &str| {
+            let mut spec = spec(project, agent, 2, 8);
+            spec.task = Some(task.clone());
+            spec
+        };
+
+        // Exit 0 is a run that believes it finished; second-guessing it is the orchestrator's
+        // review, not an automatic epitaph.
+        let clean = registry.enqueue(with_task("developer"));
+        let _ = registry.take_admissions();
+        registry.set_state(None, clean, RunState::Finished { code: 0 });
+        assert!(registry.death_facts(clean).is_none());
+
+        // Two runs of one role on one task: the first to die is silenced by the survivor,
+        // and stays silent after the survivor is gone — the survivor's own end speaks.
+        let first = registry.enqueue(with_task("developer"));
+        let second = registry.enqueue(with_task("developer"));
+        let _ = registry.take_admissions();
+        registry.set_state(None, first, RunState::Finished { code: 129 });
+        assert!(
+            registry.death_facts(first).is_none(),
+            "the successor owns the story now"
+        );
+        registry.fail(None, second, "spawn failed");
+        assert!(
+            registry.death_facts(first).is_none(),
+            "the latch outlives the successor"
+        );
+        let facts = registry
+            .death_facts(second)
+            .expect("the last run on the task speaks");
+        assert_eq!(facts.task, task);
+        assert_eq!(facts.agent_label, "developer");
+        assert_eq!(facts.code, None, "Failed has no exit code to print");
+        assert!(registry.death_facts(second).is_none(), "once");
+
+        // A nonzero exit carries its number — the report's 129 is the sentence's whole point.
+        let crashed = registry.enqueue(with_task("qa"));
+        let _ = registry.take_admissions();
+        registry.set_state(None, crashed, RunState::Finished { code: 129 });
+        let facts = registry
+            .death_facts(crashed)
+            .expect("no successor, so it speaks");
+        assert_eq!(facts.code, Some(129));
+
+        // No task, nothing to write on.
+        let bare = registry.enqueue(spec(project, "qa", 2, 8));
+        let _ = registry.take_admissions();
+        registry.fail(None, bare, "spawn failed");
+        assert!(registry.death_facts(bare).is_none());
+    }
+
+    /// **P1's cap**: a run log stops at its cap with one notice, and never grows past it.
+    ///
+    /// The cap exists because the log tees every raw line of a run that may loop for hours;
+    /// the notice exists because a silently truncated log reads as "the run stopped here",
+    /// which is the exact confusion the log was added to end.
+    #[test]
+    fn a_run_log_caps_with_one_notice_and_goes_quiet() {
+        let dir = std::env::temp_dir().join(format!("cide-run-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("r-test.log");
+        let mut log = RunLog::at(path.clone(), 64);
+
+        log.append("first line");
+        log.append("second line");
+        let mid = std::fs::read_to_string(&path).expect("the log was created lazily");
+        assert_eq!(mid, "first line\nsecond line\n");
+
+        // Push past the cap: the breaching line is dropped, the notice takes its place,
+        // and everything after it is silence.
+        log.append("a line long enough to cross the sixty-four byte cap set above");
+        log.append("this line must not be recorded");
+        log.append("nor this one");
+        let full = std::fs::read_to_string(&path).expect("the log survives the cap");
+        assert!(
+            full.ends_with(&format!("{RUN_LOG_CAPPED}\n")),
+            "one notice, at the end: {full:?}"
+        );
+        assert_eq!(
+            full.matches(RUN_LOG_CAPPED).count(),
+            1,
+            "the notice appears once"
+        );
+        assert!(!full.contains("must not be recorded"));
+
+        // A fresh RunLog at the same path (a respawn) seeds `written` from the file and
+        // stays quiet too — the cap covers the run's whole life, not one child's.
+        let mut again = RunLog::at(path.clone(), 64);
+        again.append("a respawned child's line");
+        let after = std::fs::read_to_string(&path).expect("still there");
+        assert_eq!(
+            after.matches(RUN_LOG_CAPPED).count(),
+            2,
+            "the respawn breaches once more at most"
+        );
+        assert!(!after.contains("respawned child"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A role allowed several slots gets them in one pass, not one per unrelated event.
@@ -3071,6 +4303,12 @@ mod tests {
     /// The real one is private to that module and tested there; what is under test *here* is the
     /// wiring around it — that a sink splits the child's bytes into lines, hands each to the
     /// harness, and writes the answer down once.
+    /// A pass-through display for [`AgentRegistry::stream_hook`] in tests: what is under test
+    /// is the raw channel, and the real renderer has tests of its own in `cide-agents`.
+    fn test_render(line: &str) -> Option<String> {
+        Some(line.to_string())
+    }
+
     fn test_capture(line: &str) -> Option<String> {
         let event: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
         Some(event.get("sessionID")?.as_str()?.to_string())
@@ -3083,18 +4321,24 @@ mod tests {
         }
     }
 
-    /// **A run with no hooks moves on its own output, and the queue moves with it.**
+    /// **A run with no hooks moves on its own output, and the queue moves on its exit.**
     ///
     /// The whole liveness story for the second harness, against a real child and the real state
-    /// mapping: the id the CLI minted is read off the first line, the run leaves `Starting`, and
-    /// the turn ending hands the role's slot back — which is what lets the next queued run start.
-    /// Nothing here is a hook, because there is no hook to be had.
+    /// mapping: the id the CLI minted is read off the first line, the run leaves `Starting` on
+    /// output, and the role's slot comes back on the **exit** and never on a line. That last
+    /// clause used to read the other way — the final `step_finish` answered `Idle` and this test
+    /// asserted the queue moved on it — until run 06202dd6, where a mid-turn `step_finish`
+    /// released the slot and the admitted sibling's wind-down killed the still-working child;
+    /// `cide_agents::harness::opencode::observe` carries the incident. What the queued sibling
+    /// here now pins is the repaired order: it is admitted only once the child is genuinely
+    /// gone. Nothing here is a hook, because there is no hook to be had.
     ///
     /// `/bin/sh` rather than `opencode`, for `a_real_childs_exit_finishes_its_run`'s reason: what
     /// is under test is the wiring between a child's stdout and a run, and the child's identity is
-    /// irrelevant to it. The `sleep` is not a hedge against slowness — it closes a real race in
-    /// the *test*: the sink is attached after the spawn, and a child that had already printed and
-    /// been flushed would have written to nobody.
+    /// irrelevant to it. The hook rides the spec into the spawn — production's shape since the
+    /// renderer moved it there — so there is no attach-after-print race left to sleep away; the
+    /// `sleep` stays only so the two lines arrive as their own late chunk rather than inside the
+    /// spawn's first read.
     #[test]
     fn a_harness_bound_run_moves_on_its_own_output() {
         let registry = Arc::new(AgentRegistry::default());
@@ -3113,26 +4357,36 @@ mod tests {
                 // Two lines in one write, so the split is exercised rather than assumed.
                 .arg(format!(
                     "sleep 0.2; printf '%s\n%s\n' '{STEP_START}' '{STEP_FINISH}'"
-                )),
+                ))
+                .render(registry.stream_hook(None, run, session, test_capture, test_render)),
         )
         .expect("spawn sh");
-        registry.watch_stream(None, run, session, &pty, test_capture);
+        // The reaper's app-free half, exactly as `a_real_childs_exit_finishes_its_run` uses it:
+        // the child prints its two lines and exits, and that exit is what ends the turn.
+        registry.watch_exit_with(session, &pty, |_, _| {});
 
+        // Two facts, two threads: the exit arrives on the reaper's watch, the capture on the
+        // coalescer's, and nothing orders them — so the wait is on both, or the capture assert
+        // races the drain of the child's last chunk.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while state_of(&registry, run) != RunState::Idle && Instant::now() < deadline {
+        let settled = |registry: &Arc<AgentRegistry>| {
+            state_of(registry, run) == (RunState::Finished { code: 0 })
+                && registry.inner.lock().runs[&run].harness_session.is_some()
+        };
+        while !settled(&registry) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        // The turn was handed back — and **not** `Finished { code: 0 }`, which would be an exit
-        // status for a process that has not exited.
-        assert_eq!(state_of(&registry, run), RunState::Idle);
+        // The exit ended the run — no line did.
+        assert_eq!(state_of(&registry, run), RunState::Finished { code: 0 });
         assert_eq!(
             registry.inner.lock().runs[&run].harness_session.as_deref(),
             Some("ses_fe6da2c1effe8Yz"),
             "the id the CLI minted is what a follow-up names"
         );
 
-        // And the slot came back with the turn, so the queue moves.
+        // And the slot came back with the exit, so the queue moves — with the previous occupant
+        // of the role's checkout genuinely gone, not merely presumed done by a JSON field.
         let admitted = registry.take_admissions();
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].run, queued);

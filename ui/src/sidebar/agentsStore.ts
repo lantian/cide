@@ -356,6 +356,15 @@ export const useAgents = create<AgentsStore>((set, get) => ({
     // A broadcast for a project this window is not showing. Every window hears every emit.
     if (get().project !== project) return
     /*
+     * The generation is claimed here as well as in `refresh`, and this is the line that makes
+     * the guard actually cover the hazard its comment describes: a `refresh` in flight when this
+     * broadcast lands would otherwise pass `mine !== generation` and overwrite the *newer*
+     * adopted roster with its older answer. Refresh-vs-refresh was covered; broadcast-vs-refresh
+     * was not, and fs-driven emits (an agent writing a role file) make that race an everyday one
+     * rather than a curiosity.
+     */
+    generation += 1
+    /*
      * Set unconditionally, with no drop rule, and the header says why at length: one in-process
      * writer means the last emit is the newest by construction, so there is nothing to compare
      * a counter against. The store does not fabricate object identity either — a fresh `Roster`

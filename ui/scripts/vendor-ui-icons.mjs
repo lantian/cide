@@ -140,6 +140,10 @@ const ICONS = [
   'file-diff', 'message-square', 'arrow-up-right', 'arrow-right', 'arrow-left-right',
   // Git log and the markdown view switcher.
   'list-tree', 'file-code', 'book-open-text',
+  // The task composer's formatting toolbar — `sidebar/TasksPanel/markdownTools.ts`. `text-quote`
+  // rather than `quote`: upstream's `quote` is a filled speech mark, and filled icons are
+  // refused below by design.
+  'bold', 'italic', 'code', 'link', 'heading', 'text-quote', 'list', 'list-ordered',
 ]
 
 /**

@@ -95,6 +95,43 @@ pub fn defaults() -> Vec<Binding> {
         // `commands::nothing_binds_a_key_to_an_unavailable_command` keeps it gone.
         ("ctrl+shift+d", "pane.detachToWindow"),
         ("ctrl+shift+`", "terminal.splitBelow"),
+        /*
+         * The four spawn chords, asked for by name: "CTRL+( - new claude panel, CTRL+) - new
+         * claude row, CTRL+{ - new bash panel, CTRL+} - new bash row". A "panel" is a tile
+         * beside the focused pane — the pane title bar's `⊞` — and a "row" is the header's
+         * full-width `⊞ bash row` / `⊞ claude row`, so these are the keyboard spellings of the
+         * four existing mouse gestures.
+         *
+         * # Spelling
+         *
+         * The *physical* keys, not the shifted faces. `strokeFromEvent` reads
+         * `KeyboardEvent.code` first, so no keystroke ever produces the token `(` — on a US
+         * layout Ctrl+( arrives as `ctrl+shift+9` — and a binding written with the literal
+         * would be inert, the trap the `~` note in `chords.ts`'s `ALIASES` documents. That
+         * table folds `(`, `)`, `{` and `}` onto `9`, `0`, `bracketleft` and `bracketright`
+         * now, so the ask's own spellings still mean these chords in a `keymap.json`.
+         *
+         * # What they cost, checked in every layer rather than assumed
+         *
+         * * **In this table**: nothing bound any ctrl+shift+digit or ctrl+shift+bracket, in
+         *   any scope.
+         * * **In a terminal**: nothing. xterm encodes a control byte only for
+         *   `ctrl && !shift && !alt && !meta` (`Keyboard.ts`) — the same fact that leaves
+         *   ⌃⇧C inert — so no pty loses a byte. The unshifted keys are another story
+         *   entirely: Ctrl+[ **is** ESC and Ctrl+] is telnet's escape, which is why the ⌘[
+         *   note in `platform_layer` refuses them; Shift is what makes these four free.
+         * * **In CodeMirror**: `Ctrl-Shift-[` / `Ctrl-Shift-]` are `foldKeymap`'s chords
+         *   upstream, and `editor/folding.ts` deliberately does not install it — folding
+         *   lives on the `ctrl+minus` family below. Nothing binds a `Mod-Shift-` digit.
+         * * **On macOS**: the blanket rewrite makes ⇧⌘9 / ⇧⌘0 / ⇧⌘[ / ⇧⌘], none of which
+         *   AppKit's default menu claims (`MACOS_MENU_CHORDS`). ⇧⌘[ and ⇧⌘] are every Cocoa
+         *   tab bar's previous/next-tab reflex; cide draws no native tabs, so the chords
+         *   land — a divergence recorded here like ⌘T's, not worked around.
+         */
+        ("ctrl+shift+9", "claude.split.right"),
+        ("ctrl+shift+0", "claude.addRow"),
+        ("ctrl+shift+bracketleft", "terminal.splitRight"),
+        ("ctrl+shift+bracketright", "terminal.addRow"),
         ("ctrl+p", "picker.files"),
         ("ctrl+shift+p", "palette.commands"),
         // Find in files. The search panel was built, wired to its Rust engine, and reachable
@@ -198,6 +235,40 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+alt+l", "pane.navigate.right"),
         ("ctrl+alt+k", "pane.navigate.up"),
         ("ctrl+alt+j", "pane.navigate.down"),
+        /*
+         * Alt+Left / Alt+Right — the same two horizontal moves, on the arrows. Asked for by
+         * name: "ALT+UP/DOWN/LEFT/RIGHT should allow to move focus between panels". The vim
+         * spellings above stay — a moved chord breaks the muscle memory this table shipped
+         * first, and two keys for one command is a state `conflicts` has no opinion about
+         * (it groups commands per key, never keys per command).
+         *
+         * The vertical pair is **not** here: `alt+up`/`alt+down` are the member walk inside
+         * a buffer, so those two live in the `when`-carrying block below as the complement
+         * `!editorFocused`, beside the rows they complement. These two are unconditional on
+         * purpose — an editor pane needs *some* alt+arrow that still leaves it, or the
+         * keyboard is stranded inside a buffer and the feature answers only half its ask.
+         *
+         * # What it costs, checked in every layer rather than assumed
+         *
+         * * **In `defaults()`**: nothing bound any bare Alt+Arrow. Free.
+         * * **In a terminal**: xterm encodes Alt+Left as `ESC [ 1 ; 3 D` (`… C` for Right) —
+         *   word-motion in zsh's default line editor and in many a distro's inputrc — and
+         *   the gate is a window **capture** listener, so every pane in every window loses
+         *   those bytes, unconditionally. The `mouseback` note below refused exactly this
+         *   trade for `navigate.back`, a command nobody had asked to put there; here the
+         *   chord was asked for by name, which is the `ctrl+t` trade again, and the same
+         *   escape hatch pays for it: `{"key":"alt+left","command":"-pane.navigate.left"}`.
+         * * **In CodeMirror**: `defaultKeymap` binds `Alt-ArrowLeft`/`Alt-ArrowRight` to
+         *   `cursorSyntaxLeft`/`Right`, and the gate resolves first, so syntax-step motion
+         *   goes. Taken deliberately: it is the least-known motion in the default set, and
+         *   losing it is what buys the way *out* of a buffer. `Shift-Alt-Arrow` is a
+         *   different stroke, so select-syntax and move-line survive untouched.
+         * * **On macOS**: no `ctrl`, so `platform_layer` passes both through — where ⌥←/⌥→
+         *   is word-motion in every Cocoa text view and in CodeMirror's mac spellings. A
+         *   real divergence, recorded rather than worked around, like F4's Fn tax.
+         */
+        ("alt+left", "pane.navigate.left"),
+        ("alt+right", "pane.navigate.right"),
         ("ctrl+comma", "settings.open"),
         // M12. `ctrl+f12` is IDEA's own File Structure chord; `ctrl+alt+shift+n` is free in every
         // layer (`ctrl+shift+n` is `claude.split.newSession`, and the two normalise to different
@@ -241,8 +312,10 @@ pub fn defaults() -> Vec<Binding> {
         // IDEA's Ctrl+Alt+Left/Right is not free here: `ctrl+alt+right` is already
         // `pane.split.right` above, and on KDE both are commonly the compositor's
         // virtual-desktop shortcuts and never reach the app. `alt+left`/`alt+right` are
-        // word-motion in readline and would be taken from every terminal in every window by the
-        // window capture listener. `ctrl+alt+shift+left`/`right` are free in every layer and are
+        // word-motion in readline — a cost this table refused to pay for a navigation nobody
+        // had asked to put there, and later *did* pay for `pane.navigate.left`/`right` above,
+        // where the chord was asked for by name; either way the pair is spent.
+        // `ctrl+alt+shift+left`/`right` are free in every layer and are
         // what a user should add if they want them — `README.md` prints the two lines. Shipping
         // an unbound pair rather than guessing is the same trade `file.saveAll` already makes.
         ("mouseback", "navigate.back"),
@@ -252,14 +325,17 @@ pub fn defaults() -> Vec<Binding> {
     .map(|(key, command)| Binding::new(key, command))
     // Bindings that carry a `when`, and the only ones in this table that do.
     //
-    // Two different reasons live in this block and mixing them up would be easy, so they are
+    // Three different reasons live in this block and mixing them up would be easy, so they are
     // named once here. `editorFocused` (the M12 group) is about *taking a key away from a
     // terminal*: the gate is a window capture listener, so an unscoped chord is swallowed in
     // every pane in every window, and `ctrl+b` is tmux's prefix and `ctrl+g` is readline's
     // abort. `shellWindow` (the M14 group) is about *a window that has nowhere to put the
     // gesture*: a detached pane or tab window has no rail, no sidebar and no project strip, and
     // `App.tsx` installs the gate before it branches on the role — so without the clause those
-    // chords are swallowed there in exchange for a diagnostic log line.
+    // chords are swallowed there in exchange for a diagnostic log line. And `!editorFocused`
+    // (the pane-gesture trio) is the first reason's mirror image: *giving a key to everything
+    // except the buffer*, because inside one the same chord is already a feature somebody asked
+    // for — its own comment below walks through it.
     //
     // # Why alt+up / alt+down need a clause when nothing above does
     //
@@ -291,6 +367,55 @@ pub fn defaults() -> Vec<Binding> {
         [
             ("alt+down", "navigate.nextMember", "editorFocused"),
             ("alt+up", "navigate.prevMember", "editorFocused"),
+            /*
+             * Alt+Up / Alt+Down as pane moves and Alt+Enter as maximize — the complement of
+             * the member walk directly above. Asked for by name: "hotkey ALT+ENTER that will
+             * do the current panel (claude or bash) to fullscreen or back to normal", and
+             * "ALT+UP/DOWN/LEFT/RIGHT should allow to move focus between panels".
+             *
+             * # Why `!editorFocused`, the first negated clause in this table
+             *
+             * All three chords already mean something inside a buffer, and each meaning was
+             * itself asked for by name in its own round: `alt+up`/`alt+down` are the member
+             * walk two rows up, and `Alt-Enter` is *send lines to Claude*
+             * (`EditorSurface`'s own keymap; the gate is a window **capture** listener, so an
+             * unscoped row here would not shadow that feature, it would kill it in every
+             * buffer in every window). `!editorFocused` is the two requests coexisting: a
+             * buffer keeps its three chords, and every other pane — the claude and shell
+             * panes the request names, and the diff and merge surfaces too, which are
+             * `kind == "editor"` and so stay out — gets the moves and the toggle. The
+             * horizontal arrows in the main table are the deliberate exception, and their
+             * comment names the reason: an editor pane needs some alt+arrow that still
+             * leaves it.
+             *
+             * `conflicts` reports nothing for `alt+up`/`alt+down` carrying two commands
+             * each: `editorFocused` and `!editorFocused` are two scoped groups, and the fold
+             * that makes an *unscoped* row contest every scoped one does not apply. That
+             * silence is honest only because the clauses are genuinely disjoint — one flag,
+             * negated — not two spellings that overlap in some state nobody tried.
+             *
+             * # What it costs a terminal, precisely — because there the chords now *fire*
+             *
+             * Alt+Up/Down are `ESC [ 1 ; 3 A/B`, which stock readline and zsh leave unbound;
+             * near-free. Alt+Enter is `ESC` `CR`, which the Claude CLI reads as *insert
+             * newline* in its composer — a real loss in exactly the pane this request is
+             * about, taken with eyes open: `\` + Enter still inserts one (and Shift+Enter
+             * after `/terminal-setup`), and one line of `keymap.json` gives the chord back —
+             * `{"key":"alt+enter","command":"-pane.maximize","when":"!editorFocused"}`, the
+             * clause repeated, or the removal matches nothing.
+             *
+             * On macOS `platform_layer` rewrites only chords containing `ctrl`, so all three
+             * pass through untouched, and none of them is in `MACOS_MENU_CHORDS`.
+             *
+             * `pane.maximize` is a *toggle* — `keys/dispatch.ts` un-maximizes when the
+             * focused pane already is the maximized one — so one chord is the whole gesture.
+             * And the arrows compose with it rather than stranding anyone: focusing any
+             * other pane un-maximizes (`layout::focus_pane`), so Alt+Arrow out of a
+             * full-screen pane lands on a visible tile, never behind one.
+             */
+            ("alt+up", "pane.navigate.up", "!editorFocused"),
+            ("alt+down", "pane.navigate.down", "!editorFocused"),
+            ("alt+enter", "pane.maximize", "!editorFocused"),
             // IDEA's own Go to Declaration chord, and free in both layers: no binding in
             // `defaults()` uses `b`, and CodeMirror's `Ctrl-b` lives only in `emacsStyleKeymap`,
             // which `standardKeymap` re-exposes under a **mac-only** `mac:` property — so on
@@ -482,7 +607,8 @@ pub fn defaults() -> Vec<Binding> {
              * # What it costs, checked in every layer rather than assumed
              *
              * * **In `defaults()`**: no binding uses Alt with a letter except `alt+shift+s`, and
-             *   the only other Alt entries are `alt+up`, `alt+down` and `alt+f7`. Free.
+             *   the other Alt entries are the arrows (the member walk and the pane moves),
+             *   `alt+enter` and `alt+f7`. Free.
              * * **Against typing**: strokes come from `KeyboardEvent.code`, so this is
              *   layout-independent, and the gate resolves before the focused input is offered
              *   the event — the picker's field never sees a character.
@@ -1838,6 +1964,12 @@ mod tests {
             // The binding comes back with the domain operation.
             "pane.detachToWindow",
             "terminal.splitBelow",
+            // The spawn-chord family — Ctrl+(/)/{/} in the ask's spelling, bound as the
+            // physical keys Shift makes those faces of.
+            "claude.split.right",
+            "claude.addRow",
+            "terminal.splitRight",
+            "terminal.addRow",
             "picker.files",
             "palette.commands",
             "tab.close",
@@ -1854,6 +1986,9 @@ mod tests {
             "pane.navigate.right",
             "pane.navigate.up",
             "pane.navigate.down",
+            // Alt+Enter, scoped `!editorFocused` — inside a buffer the chord is CodeMirror's
+            // *send lines to Claude* and must stay so.
+            "pane.maximize",
             "settings.open",
             "project.switcher.next",
             // M14. `project.switcher.prev` was in this list and is deliberately gone: its
@@ -1963,6 +2098,42 @@ mod tests {
     #[test]
     fn the_default_keymap_has_no_conflicts() {
         assert_eq!(conflicts(&resolve(&[])), Vec::new());
+    }
+
+    #[test]
+    fn the_alt_arrow_pane_moves_complement_the_member_walk() {
+        let resolved = resolve(&[]);
+        // The horizontal pair is unconditional; the vertical pair and Alt+Enter ship as the
+        // `!editorFocused` complement of chords a buffer already owns. Both rows on a shared
+        // key must survive resolution — a "tidied" merge that collapsed a key to one command
+        // would take either the member walk or the pane move, silently.
+        assert_eq!(command_for(&resolved, "alt+left"), ["pane.navigate.left"]);
+        assert_eq!(command_for(&resolved, "alt+right"), ["pane.navigate.right"]);
+        assert_eq!(
+            command_for(&resolved, "alt+up"),
+            ["navigate.prevMember", "pane.navigate.up"]
+        );
+        assert_eq!(
+            command_for(&resolved, "alt+down"),
+            ["navigate.nextMember", "pane.navigate.down"]
+        );
+        assert_eq!(command_for(&resolved, "alt+enter"), ["pane.maximize"]);
+        // Disjoint by construction — one flag, negated — which is what keeps the shared keys
+        // out of `conflicts` honestly rather than by mere string inequality.
+        for binding in resolved
+            .iter()
+            .filter(|r| normalize_key(&r.key) == "alt+up")
+        {
+            match binding.command.as_str() {
+                "navigate.prevMember" => {
+                    assert_eq!(binding.when.as_deref(), Some("editorFocused"));
+                }
+                "pane.navigate.up" => {
+                    assert_eq!(binding.when.as_deref(), Some("!editorFocused"));
+                }
+                other => panic!("unexpected command on alt+up: {other}"),
+            }
+        }
     }
 
     #[test]
@@ -2613,14 +2784,26 @@ mod tests {
                 "{key} must be unbound off macOS"
             );
         }
+        // *Unshifted*, precisely. This assertion used to forbid every bracket chord, and its
+        // stated reason was always the narrower rule: the byte theft is `ctrl+[`'s, and xterm
+        // encodes a control byte only for `ctrl && !shift && !alt && !meta` — the same fact
+        // that leaves ⌃⇧C inert. The spawn chords (`ctrl+shift+bracketleft`/`right`, asked
+        // for as CTRL+{ / CTRL+}) stand on exactly that distinction, so the guard now states
+        // the rule it was protecting rather than a superset of it.
         for binding in defaults() {
-            let key = normalize_key(&binding.key);
-            assert!(
-                !key.contains('[') && !key.contains(']') && !key.contains("bracket"),
-                "{key} is bound to {} — a bracket chord in `defaults()` reaches Linux, where \
-                 ctrl+[ is the ESC character every terminal application reads",
-                binding.command
-            );
+            for chord in parse_chord(&binding.key).expect("every default parses") {
+                let bracket = matches!(
+                    chord.key.as_str(),
+                    "[" | "]" | "bracketleft" | "bracketright"
+                );
+                assert!(
+                    !bracket || chord.shift,
+                    "{} is bound to {} — an unshifted bracket chord in `defaults()` reaches \
+                     Linux, where ctrl+[ is the ESC character every terminal application reads",
+                    binding.key,
+                    binding.command
+                );
+            }
         }
 
         // Rebindable and unbindable like any other key, which is the whole reason these live in
@@ -3029,16 +3212,38 @@ mod tests {
             );
 
             let resolved = resolve(&user);
+            // Scoped to the (command, `when`) row the edit named, which is the identity every
+            // `KeymapEdit` carries: since the Alt+Arrow round, `pane.navigate.up`/`.down` each
+            // stand on two rows with *different* clauses (`ctrl+alt+k` unscoped, `alt+up` as
+            // the `!editorFocused` complement of the member walk), and moving one row must not
+            // drag the other with it.
             let keys: Vec<&str> = resolved
                 .iter()
-                .filter(|r| r.command == binding.command)
+                .filter(|r| r.command == binding.command && r.when == binding.when)
                 .map(|r| r.key.as_str())
                 .collect();
             assert_eq!(
                 keys,
                 [normalize_key(target)],
-                "{} should answer to one chord after a rebind",
-                binding.command
+                "{} ({:?}) should answer to one chord after a rebind",
+                binding.command,
+                binding.when
+            );
+            // …and the sibling row, where the command has one, is exactly where it shipped.
+            let siblings: Vec<String> = resolved
+                .iter()
+                .filter(|r| r.command == binding.command && r.when != binding.when)
+                .map(|r| r.key.clone())
+                .collect();
+            let shipped: Vec<String> = defaults()
+                .iter()
+                .filter(|o| o.command == binding.command && o.when != binding.when)
+                .map(|o| normalize_key(&o.key))
+                .collect();
+            assert_eq!(
+                siblings, shipped,
+                "rebinding {} ({:?}) touched the command's other scope",
+                binding.command, binding.when
             );
             assert_eq!(
                 conflicts(&resolved),
@@ -3069,10 +3274,10 @@ mod tests {
     /// Every default can be unbound, and unbinding is the only thing it does.
     ///
     /// Pinned to the PC layer, and the assertion at the foot is *why*: an unbind must write one
-    /// removal line **per chord the command actually stands on**, and not one more. Fewer would
-    /// leave the command live on a chord the user thought they had taken away — the precise
-    /// failure `suppress` exists to prevent, and the one the macOS test below states for the
-    /// layer that adds a second chord.
+    /// removal line **per chord the (command, `when`) row actually stands on**, and not one
+    /// more. Fewer would leave the row live on a chord the user thought they had taken away —
+    /// the precise failure `suppress` exists to prevent, and the one the macOS test below
+    /// states for the layer that adds a second chord.
     ///
     /// It read `assert_eq!(user.len(), 1)` until M19, with a comment calling one-chord-per-command
     /// a property of `defaults()`. That was true and incidental rather than intended, and folding
@@ -3093,10 +3298,18 @@ mod tests {
                 },
             );
             let resolved = resolve_pc(&user);
+            // The row is the (command, `when`) pair — the identity every `KeymapEdit` carries —
+            // and not the bare command: `pane.navigate.up`/`.down` stand on two rows with
+            // different clauses since the Alt+Arrow round, and unbinding the unscoped chord
+            // must leave the `!editorFocused` one standing, exactly as the editor's screen
+            // shows them as two lines.
             assert!(
-                !resolved.iter().any(|r| r.command == binding.command),
-                "{} is still bound after an unbind",
-                binding.command
+                !resolved
+                    .iter()
+                    .any(|r| r.command == binding.command && r.when == binding.when),
+                "{} ({:?}) is still bound after an unbind",
+                binding.command,
+                binding.when
             );
             let (_, diags) = resolve_with_diagnostics_pc(&user);
             assert!(

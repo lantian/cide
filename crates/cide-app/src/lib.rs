@@ -19,6 +19,7 @@ pub mod cmd;
 /// Platform-neutral model, `cfg`-gated AppKit glue, and a no-op on Linux — its header says why
 /// the dock is the *only* surface that can name projects the desktop cannot see.
 pub mod dock;
+pub mod dotcide;
 pub mod edit_wait;
 pub mod emit;
 /// The `cide-ext://` scheme: an installed extension's own files, path-jailed and read-only.
@@ -47,6 +48,7 @@ pub mod scratches;
 pub mod srcgrep;
 pub mod state;
 pub mod symbols;
+pub mod task_triggers;
 // M18: one `.cide/tasks.json` store per open project, and the thread that ticks them.
 pub mod tasks_state;
 pub mod windows;
@@ -504,6 +506,7 @@ pub fn run() {
             cmd::fs::fs_tree_match,
             cmd::fs::tree_match_labels,
             cmd::fs::fs_expand,
+            cmd::fs::fs_refresh,
             cmd::fs::fs_collapse,
             cmd::fs::fs_reveal,
             cmd::fs::fs_show_in_manager,
@@ -821,6 +824,13 @@ pub fn run() {
                         stores.ensure(project, root);
                     }
                 }
+
+                // The runs the last process could not take with it, back as `Interrupted` rows
+                // — and paused queues back as paused. Filtered to the projects the restored
+                // workspace actually holds; before any window exists, so the first roster a
+                // panel reads already carries them and no emit is owed.
+                let agents = app.state::<std::sync::Arc<agents::AgentRegistry>>();
+                agents.restore_snapshot(|project| ws.projects.contains_key(&project));
             }
 
             restore_windows(app.handle())?;

@@ -68,8 +68,23 @@ unavailable: string | null,
  * How many runs of this role may be live at once.
  *
  * Per role rather than only globally, because roles differ: a `qa` that reads and reports
- * parallelises, a `developer` holding a git worktree does not. Worktree isolation pins this
- * to 1 and `cide-agents` refuses a higher value with a sentence rather than silently
- * letting two runs share one checkout.
+ * parallelises more safely than a `developer` rewriting files. The declared number is the
+ * enforced number under both isolations — worktrees are per (role, task), so parallel
+ * tasks are parallel checkouts and the old clamp-to-1 is gone with its premise; what
+ * cannot run twice is two children in *one* checkout, which the registry's admission gate
+ * holds in the queue.
  */
-maxConcurrent: number, };
+maxConcurrent: number, 
+/**
+ * `worktree:` — whether this role's runs take a worktree under the project's worktree
+ * isolation, default `true`.
+ *
+ * `false` opts the role out: its runs stand in the **project root**, on the user's own
+ * checked-out branch, beside the user's own uncommitted changes. That is the right shape
+ * for a role that only reads — a reviewer, a reporter — and the wrong one for anything
+ * that edits, which is why it is per role and opt-*out*: the safe posture stays the
+ * default and the file has to say otherwise. An opted-out role has no `cide/<role>`
+ * branches and nothing to integrate — its work, if any, lands directly where the user is.
+ * Under `isolation: shared` the flag is meaningless and ignored.
+ */
+worktree: boolean, };

@@ -1229,14 +1229,32 @@ than sitting raw in the prompt position where a task written by another agent wo
 user's own instruction. `the_opening_prompt_never_contains_a_newline` is the test, and the rule
 generalises — the nudge and the retry are both PTY writes and both inherit it.
 
-### One worktree per agent, and an integration that refuses before it touches anything
+### One worktree per task, and an integration that refuses before it touches anything
 
-`crates/cide-git/src/worktree.rs` puts each role in `.cide/worktrees/<agent>` on branch
-`cide/<agent>`. The unit is the **role and not the run**, because that is how a person thinks about
-a team and because one checkout is one place to stand: an agent therefore runs at most one task at a
-time, and `cide_agents::effective_max_concurrent` clamps a role's own `max-concurrent` to 1 while
-worktree isolation is on rather than letting a definition file quietly ask for two processes in one
-directory. `ensure` is idempotent and called before **every** dispatch, not once, because the
+`crates/cide-git/src/worktree.rs` builds `.cide/worktrees/<name>` on branch `cide/<name>` from
+whatever **name** it is handed. The unit was the *role* until a user asked, reasonably, why their
+`max-concurrent: 2` role queued its second task: one checkout per role made the queue serial and
+`effective_max_concurrent` clamped the declared number to 1 to protect it. The unit is the
+**task** now — `cide_agents::checkout_name` composes `<role>-<task>` (the bare role for a
+taskless dispatch; the task id sanitised through the worktree grammar, since `.cide/tasks.json`
+is hand-editable and this string becomes a directory and a ref) — so a role's tasks parallelise
+in their own checkouts up to the number its file actually declares, the merge unit is a task's
+branch, and a re-dispatch of the same task lands on its earlier commits. What still cannot run
+twice is two children in one directory, and that moved from a per-role number to a per-checkout
+fact: admission's **checkout gate** holds a queued run while any run whose child may be standing
+in the same checkout is on it (`Idle` deliberately excepted — its parked claude is wound down at
+the moment the checkout is claimed, by a wind-down now scoped to that checkout and not the
+role). The gate reads a `checkout` stamped on the run at dispatch, like the limits, and stamped
+`None` under shared isolation, whose N-runs-one-directory meaning is unchanged. A role may also
+opt itself out: **`worktree: false`** in its frontmatter puts that role's runs in the project
+root, on the user's own branch — right for a role that only reads (a reviewer, a reporter),
+wrong for anything that edits, which is why the safe posture is the default and the file has to
+say otherwise (a mangled value greys the role rather than guessing — this switch decides
+whether an unattended child edits the user's checkout, which is `permission-mode`'s class of
+stakes). The flag rides `AgentDraft` as well as the definition, because `defs::render` writes
+only the fields the draft models and a switch the draft did not carry would be silently deleted
+from a hand-written file by the next panel save. `ensure` is
+idempotent and called before **every** dispatch, not once, because the
 half-made states are all reachable: a valid registration is returned, a registration whose directory
 was deleted is pruned and rebuilt (`rm -rf` is one keystroke), a registration pointing somewhere
 else is refused, a non-empty directory with no registration is refused because cide deletes nothing
@@ -1246,7 +1264,11 @@ only the reflog remembers. An agent name that is a path is refused **before anyt
 because a role file's stem is a string out of somebody's repository and `.cide/worktrees/../..` is
 one `git worktree add` outside the project.
 
-`integrate` merges `cide/<agent>` into whatever the project root has checked out, and computes the
+`integrate` merges one of the role's branches into whatever the project root has checked out —
+`cide/<role>-<task>` when the task is named (the ordinary case now; `cide_agent_integrate` and
+`agents_integrate` both take the task, and the Agents panel's role-level button, which names
+none, targets the taskless base branch — a merge control on the task's own card is the named
+follow-up) — and computes the
 whole merge **in memory** first: `merge_commits` produces an index nothing on disk has seen, and
 `Index::has_conflicts` is asked before a single file is written. A conflict returns
 `Integration::Conflicts { paths }` **having changed nothing** — auto-merging when a task turns
@@ -1697,7 +1719,302 @@ the user's reach any more. What is *not* symmetric, deliberately: a **subagent r
 `--mcp-config` unconditionally, because a run reports back only through the tracker and one without
 it is a run nobody can see.
 
-## Scrolling a Claude session (M16), and what is not done
+## The loop closed: assignment starts the agent, @mentions, and a roster that follows the disk (M27), and what is not verified
+
+M18 built the machinery and left the loop open at four joints; M27 closes them.
+
+**`.cide/` changes reach the panels without a restart.** `cide_fs` always watched `<root>/.cide`,
+and nothing in Rust consumed the events — so a role file an orchestrator wrote with its ordinary
+Write tool (the documented road: there is deliberately no `cide_agent_create` MCP tool) was
+invisible until relaunch, and a `git pull` moving `.cide/tasks.json` sat unmerged until this
+process happened to write. `cide_app::dotcide` is the router: `.cide/agents/**` and
+`.cide/config.json` mark the run registry's coalescer (whose flush already rebuilds the roster
+from disk), `.cide/tasks.json` goes to the new `TaskStore::refresh_from_disk` — `reconcile`'s
+stamp compare, so the store's own debounced writes are not events — and **the first line is the
+worktrees filter**: `.cide/worktrees/<agent>` is under the watched prefix and each worktree is a
+whole checkout with its own `.cide/tasks.json`, so a subagent's `cargo build` would otherwise
+storm the router and its checkout's tracker would be mistaken for the project's. The global agents
+directory is outside every project watcher and deliberately stays uncovered — every read path
+re-reads it, and `agents_save` (the in-app editor for it) already emits.
+
+**Assigning a task starts the role.** `Task::agent` was pure bookkeeping; now
+`cide_agents::autodispatch::trigger` (pure, table-tested) decides and `cide_app::task_triggers`
+acts: an assignment edge — `cide_task_assign`, `cide_task_update`, the panel's `<select>`, a
+creation with an assignee — or an `@role` mention in fresh text dispatches through the same
+`agents_dispatch` the button uses, so the refusal table and the one-line opening prompt are never
+re-derived. The rules that earned their place: **only the user and the orchestrator trigger** (the
+tools are served to runs too, and an ungated trigger would let a subagent spawn a subagent through
+the side door the two-vocabulary split keeps shut); only `todo`/`doing` tasks start work; a
+mention always starts the role but adopts only an unassigned task; mentions are scanned only in
+the text the mutation introduced and filtered against the loaded catalog, so a typo'd `@develoepr`
+can neither spawn nor rewrite the assignee field; re-assigns dedupe against open runs
+(`has_open_run` — `Queued` and `Idle` count, only `Finished`/`Failed` reopen the pair); and
+unassigning stops nothing — `agents_stop` stays the only kill. A started run moves its task
+`Todo → Doing`, and only that hop, which is what keeps a respawn idempotent and a reviewer
+dispatched onto a `review` task from yanking it backwards. `agents.autoDispatch` in
+`.cide/config.json` (disk-only, default on, read fresh per burst) is the way out.
+
+**The orchestrator now hears every ending, and a busy one hears it late instead of never.** The
+nudge fired only on the handed-back edge and was dropped if the product owner was mid-turn — false
+comfort ("the next run will nudge again") for the *last* run of a burst, and an `opencode` run,
+whose normal end is process exit, never nudged at all. Now `Finished`/`Failed` nudge too (the exit
+path delivers through `watch_exit`'s production wrapper, so the observation stays app-free and
+test-drivable), the line says *how* it ended — "finished (exit 0)", "failed", "handed its turn
+back" — and a nudge composed against a busy session is **held** in the coalescer and re-armed on
+that session's next `Idle`/`AwaitingInput` edge, re-checked at delivery, capped at 64 turns
+dropping oldest. The done-workflow convention rides every prompt: a run that finishes sets its
+task to `review` and comments what it did; `done` belongs to the reviewer.
+
+**The UI joins the two stores.** `TasksPanelHost` finally subscribes the agents roster — the
+assignee dropdown had been hardcoded empty since the store landed, a wiring bug at the one seam
+neither check mounts, and `check:agents-render` now source-greps the subscription so un-wiring it
+fails. The dropdown carries a sentence (`assigneeHint`) when the roster is legitimately short, the
+card's live-run strip got its three handlers, and `@` in any task textarea opens a mention popup —
+`mentionModel.ts` (import-free, compiled standalone by `check:agents`, its opening rule
+deliberately the Rust parser's) under a `MentionTextarea` that keeps the comment composer
+uncontrolled and renders its open list in normal flow, where the render check can see it. The
+orchestrator's system-prompt paragraph became an operating manual: role-file format and the fact
+that writing one takes effect live, assignment/mention semantics, the queue-not-refuse concurrency
+model (`cide_agents_list` prints each role's cap and where its runs stand — since worktrees went
+per-task the declared `max-concurrent` is the true number under both isolations, and the list's
+header says which checkout a task's work and its integrate branch live in), the review
+convention, keep-the-plan-on-the-board, and end-your-turn-
+with-a-question to summon the user through the existing awaiting badges.
+
+**Verified the hard way, once.** The first live workstream (an opencode-harness role in a real
+project) found what no gate here could: **claude ≥ 2.1.245 detects pastes by length**, so a
+nudge- or opening-prompt-sized chunk written to the PTY with its `\r` in one write lands in the
+composer as a paste with the Enter eaten — two nudges stacked unsubmitted in the product owner's
+input box, and (probed, not just argued) an opening prompt a claude-harness run would have idled
+on for ever, holding its slot and worktree. The fix is `agents::type_submitted_line`: the text
+now, the lone Enter after the session leaves `Spawning` plus a 250 ms beat, used by all three
+live-typing paths (nudge, retry-turn, opening prompt) — measured against the shipped binary
+three ways, long-chunk/short-chunk/split. The `/bin/sh` `read` test keeps the byte shape honest
+and *cannot* see this class; only typing at the real TUI can.
+
+**And the permission answer for unattended children, which that same run decided.** The opencode
+road died on the CLI's headless permission auto-reject — not refusing one tool but **ending the
+turn** at it, exit 0, task never reported — and a claude run hitting a prompt parks in
+`AwaitingPermission` holding its slot and its role's only worktree until somebody opens its pane.
+So `agents.skipPermissions` (in `.cide/config.json`, disk-only like its three neighbours, **on by
+default**, live-editable through the fs router) sends every child out promptless: `--permission-mode
+bypassPermissions` for a claude run whose role names no mode of its own — the author's word always
+wins, restrictive modes included — and `--auto` for an opencode run, whose module header now
+records the measurement that reversed its never-pass-`--auto` stance. While it is on, the
+`allowDangerousPermissions` two-acts gate stands down (refusing a role for writing down the
+project's own default would be a refusal about nothing) and bites again the moment a project sets
+`"skipPermissions": false`. The blast-radius containment for an unattended child is what it always
+actually was: worktree isolation.
+
+**And an opencode run's pane reads as a transcript now, not as ndjson.** The same live run
+reported the raw `--format json` stream as unreadable — which it was, and the harness header had
+accepted that cost knowingly. The reconciliation is `cide_pty::LineRender`: an optional per-line
+hook applied once, at the top of the coalescer's output arm, so the vt100 mirror, every sink, the
+frame splitter and the choked-sink catch-up all agree on one rendered stream — and the app's
+stream observer moved *into* the hook, reading each raw line before returning the rendering,
+which deleted wholesale the three hazards the old sink's doc agonised over (the ack-credit debt,
+the re-entrant sink-list lock, the Weak-vs-Arc cycle). `opencode.rs::render_event` does the
+prose: `● bash ls -la` with a budgeted output block, the model's words whole, reasoning dimmed, a
+rejected permission **red and verbatim** — that line is the answer to "why did this run die", and
+it used to be findable only in opencode's own database. CLI prose passes untouched; unknown event
+types become a dim marker instead of a screenful of JSON. `opencode serve` + `attach` stays the
+named upgrade path to a *live* TUI.
+
+**The tracker reads and writes markdown now.** Agents write `**bold**`, fences and lists into
+task bodies and comments all day, and the card drew the syntax raw — reported with screenshots,
+alongside two icon regressions the same screenshots caught (the card head printed the literal
+name `circle-dot`, the live-run strip printed `loader-circle`: both were `model.ts` glyph-table
+strings rendered as text instead of through `Icon`/`asIcon`, which is exactly the drift those
+tables' "narrow at the render site" comments warned about). Rendering reuses the **parser** the
+markdown pane already owns (`editor/markdown/blocks.ts` — import-free, no HTML node in its
+grammar, so model-authored text still cannot reach the DOM as markup) under a new small renderer
+(`TaskMarkdown.tsx`): headings capped at card scale, uncoloured fences, tables that scroll in
+place, task-item boxes drawn as icons rather than `<input>`s (the read-only-at-rest count is a
+render-check assertion), and **links inert by decision** — accented, destination in the `title`,
+following nothing, because the card calls no IPC and a model-authored link that navigated the
+IDE is the surface the old no-markup rule was guarding. The "styling tools when creating" half
+is a GitHub-style toolbar on every markdown-bearing textarea (`MentionTextarea`'s `tools`, so
+the compose body, the card's body editor, the comment composer and the comment editor all carry
+it): eight buttons whose transforms live in `markdownTools.ts` — import-free, compiled
+standalone and driven by `check:agents`, every inline tool a toggle, every transform total. The
+render check pins that the markdown story produces real `<strong>`/heading/list elements with no
+marker surviving into the prose, and counts eight tools per textarea. This batch also taught
+`AgentsPanel/model.ts` the **`interrupted`** phase the Rust side had already grown (tone and
+placement argued in the tables; `WORKING_PHASES` deliberately unchanged — an interrupted run
+holds no slot), which un-broke the vocabulary pin in `check:agents`.
+
+**And runs survive a restart now, as `Interrupted` rows a Resume continues.** The registry was
+memory-only, so quitting cide erased the run list and a halted workstream restarted itself as
+nothing — `thaw_for_shutdown`'s doc even recorded "pause does not survive a restart, stated
+rather than attempted"; the snapshot is the attempt. The registry's durable half (run, role,
+task, prompt, the claude session id, opencode's `ses_…`, the recorded limits, the paused set)
+is written to `$XDG_STATE_HOME/cide/agent-runs.json` on every coalesced flush, and the teardown
+writes it once more and **seals it** — machine-local state, never `.cide/`, which is committed.
+The seal is not tidiness; the first live restart found the race it closes: the shutdown ladder's
+kills reached the reaper, the runs went `Finished`, and the coalescer's next flush (120 ms,
+comfortably inside the ladder's 2.5 s of graces) overwrote the teardown's snapshot with the
+shutdown's own kills recorded as outcomes — two paused runs restored as *history*, and Resume
+had nothing to resume. At launch the rows come back
+as **`RunState::Interrupted`** (a new wire variant: not `Failed`, whose conversation is spent,
+and not `Paused`, which claims a frozen live child) and paused queues come back paused. Resume —
+the row's, or the project header's — requeues them **through ordinary admission**, because an
+interrupted run holds no slot and its role's worktree may meanwhile belong to a newer run; on
+admission the continuation is built per harness: a claude run rebinds its *own* previous
+`SessionId` and respawns with `--resume` (the shutdown ladder's graces exist precisely so that
+transcript got written; `ClaudeHarness` grew the `respawn_spec` it used to refuse), an opencode
+run passes `--session ses_…`, and a run that was still queued at quit starts fresh with its
+original prompt — nothing happened, and billing a fresh start as a continuation would be a lie.
+Each resumed child's first line names its task and says cide restarted, and Stop on an
+interrupted row means "do not resume this" — it closes into Recent with the conversation still
+on disk.
+
+Opening a **finished** run's transcript had a multi-window hole, found live: a mirror pane's
+spawn plan lives in the *clicking* window's JS realm, so a pane rendered by a different window
+falls through to `TerminalPane`'s domain-session gate — which adopted a **running** session (Open
+on a live run worked, by accident of that very fallback) and refused a **finished** one, so the
+pane spawned a fresh `claude` over the transcript the user clicked Open to read. The gate now
+asks `sessionIsHeld` — running, *or exited with the screen `report_exit` retained* — and adopts
+both; the missing `mirrored` flag costs nothing on the exited arm, because closing the pane
+`kill`s a process that is already gone. (`reaping` and `unknown` still refuse: one is a
+mid-reap corpse the plan-carrying window never races, the other is the restore path's business.)
+
+The first live restart sharpened the same slice twice more. **The panel's tail is a history,
+not a per-process scratchpad**: the snapshot's original filter dropped `Finished`/`Failed`
+rows, so a workstream that *completed* before the quit restored as nothing — now terminal runs
+ride the snapshot with their states and restore verbatim (the section reads **History**;
+`forget_old`'s 50-per-project cap bounds the file by construction), with their dead `session`
+dropped so no Open can aim at a process the old cide took with it — the same reasoning made
+`canOpen` withhold Open from `Interrupted` rows, whose session id is real but whose process is
+not, and whose Open used to land on a pane-resume splash instead of anything readable. And
+**a resumed run keeps its screen**: teardown writes each live run's `vt100` screen to
+`$XDG_STATE_HOME/cide/run-screens/` (teardown-only — a crash keeps the runs and loses the
+pictures, the right half to keep; the directory is pruned to the snapshot's runs), and the
+resumed child's mirror is seeded from it through the same `SpawnSpec::preload` a restored shell
+pane uses, under a dim "— resumed after a cide restart —" rule, so opening the continued run
+shows what the old child last showed instead of starting blank.
+
+**The card answers when, and who moved what.** Three reports from reading the card daily, each
+now a pinned behaviour. Comment text and the body went up a rung (`--fs-ui-12` and `-13`; the
+provenance heads stay at 11 — metadata under content). Every timestamp on the card reads
+`14:32:07 (4m ago)` — the wall clock first, the age in brackets — because two `4m ago`s are
+indistinguishable and a bare clock time is ambiguous across days; `model.ts::clock` is the pure
+half, asserted by shape since the render check runs in arbitrary timezones. And **status changes
+are recorded now**: `TaskEdit::SetStatus` appends `{from, to, by, at}` to a new
+`Task::history` vector (`#[serde(default)]`, so every existing tasks.json parses; a no-op set
+records nothing), with `by` stamped from the connection's identity exactly as a comment's author
+is — so the autodispatch `Todo → Doing` hop reads as the Orchestrator's, and an agent cannot
+record a move as the user. The merge unions both sides' rows structurally (immutable rows need
+no id — the two hazards that broke the comments' structural union cannot arise), and the card
+draws the log as a native `<details>` under the segment, **collapsed by default** — the record
+you need rarely and must trust absolutely when you do. The render check pins collapsed-by-default
+(a stray `open` would ship every card unfolded), scrambled-fixture ordering, and the
+no-disclosure-when-empty rule.
+
+**The first workstream filed its own debug report, and its five findings are behaviour now.**
+The orchestrator left `CIDE_AGENTS_DEBUG.md` behind in its project — a subagent's-eye account of
+what the loop felt like from inside — and each finding earned code. **Closing a pane no longer
+kills the run it showed**, the report's one fatal: the multi-window adoption fix above lets a
+plan-less window adopt a *running* session, necessarily without the `mirrored` flag (the plan
+carrying it lives in another window's JS realm), so closing that pane `kill`ed the child
+mid-turn — exit 129 from a SIGHUP, the precise signature the report logged. `session_kill` now
+asks the registry first and refuses any session belonging to a run that has not ended
+(`Interrupted` included: that is the state Resume depends on); registry-owned children die only
+through their owners — Stop, the idle wind-down, a respawn, the shutdown ladder — which call the
+session's `kill` directly and never pass through the command. **Every run writes a transcript to
+disk as it goes**: the stream hook tees each raw line to `$XDG_STATE_HOME/cide/run-logs/<run>.log`
+before the display rendering, 5 MiB per run *lifetime* (a respawned child appends under the same
+cap), one truncation notice, dead-latched on any write failure so a full disk cannot stall the
+coalescer thread, and pruned by the snapshot's own retention — so "what did this run actually
+do" no longer dies with the screen. **A run that dies without finishing says so on its task**:
+an abnormal end — `Failed`, or `Finished` with a non-zero code — appends one
+Orchestrator-authored comment naming the run and its exit code, latched so it speaks exactly
+once and stays silent when a sibling run of the same role is still open on the task; and the
+Tasks panel draws the orphan a dead run leaves — a `doing` task with an assignee and no run
+engaged renders a **stalled** chip, unlit with attention ink (`queued` and `idle` suppress it,
+the system is mid-stride there; `interrupted` deliberately does not, because nothing moves until
+a human presses Resume), where before it was indistinguishable from "assigned, quietly", which
+is the invisibility the report named. **Re-assigning revives**: picking the same assignee again
+— the dropdown, `cide_task_assign` — is an assignment *gesture* now, decided at the collection
+site where the edit's shape is still in hand, so it dispatches even though the field did not
+change; a status flip or comment that merely carries the assignee along still fires nothing, and
+`has_open_run` still refuses to stack a second run on a live pair. **And the prompts teach
+checkpoint discipline**: both injected halves now tell a run to comment its plan before starting
+and to commit each coherent step — the plan comment plus the branch's commits are the only
+record if the run dies mid-turn, which the report's lost work demonstrated — and
+`cide_agent_dispatch`'s description states that `instructions` is one line *by design* (it is
+typed into a terminal); anything longer belongs in the task body, which the run reads in full.
+
+The report's second visit added a sixth finding, and it was the sharpest: **a dispatch to a
+busy role appeared to preempt the role's active run** — run 06202dd6, sixteen minutes into a
+live smoke test, died at the exact moment the dispatch that had queued behind it for thirteen
+minutes flipped to `starting`, which is precisely what queue-not-refuse promises never happens.
+The chain: opencode's observer read a mid-turn `step_finish` whose finish reason was not
+`tool-calls` as `Idle` (the stream carries nested sessions' final steps, and the SDK has
+`length`/`error`/`unknown` reasons that end a step mid-work), `Idle` released the slot, the
+queued run was admitted, and admission's idle wind-down killed the "idle" child to reclaim the
+role's worktree — the CLI trapped the signal, cleaned up its process tree (the report noted the
+cleanup was flawless) and died as if TERMed, exit 143. The fix deletes the misreading at its
+root: **no opencode line answers `Idle` any more** — `run` is one turn per process and exits
+within milliseconds of its true last step, so the exit *is* the turn end, releases the slot
+then, and the queued run starts into a checkout whose previous occupant is genuinely gone.
+Being late costs those milliseconds; being early cost a working agent its life. The idle
+wind-down is now in practice a claude-only event, which is the case it was designed for — a
+parked interactive `claude` is the one idle child that never leaves by itself.
+
+Two more findings came from the user watching the panels rather than from the report. **Pause
+told a half-truth**: the run said *Paused* while the user's local model visibly kept inferring —
+because a SIGSTOPped child cannot cancel the model call it already had in flight, the provider
+finishes it server-side, and the bytes wait in the kernel's socket buffer to be read on resume.
+cide cannot stop that call (only the child could abort its own request, and the child cannot run
+an instruction; killing the connection is Stop's semantics, not Pause's), so the fix is the
+sentence: `phaseHint` rides a paused row's `title` with exactly that mechanics, pinned in
+`check:agents` as the one phase whose one-word label is not the whole truth. And **a role set to
+`max-concurrent: 2` queued its second task**, which is what dissolved the one-worktree-per-role
+design — the per-task worktree section above carries the whole argument, and the loop-closed
+operating manual, `cide_agents_list` and the integrate surfaces all moved with it.
+
+The next pair of notes closed two more gaps. **History showed "about 10 lines" of a
+twenty-minute run**, and the amputation was mechanical: every snapshot path emitted `vt100`'s
+`contents_formatted` — the viewport — while the mirror sat on 5,000 lines of scrollback nothing
+ever read, and a headless run's mirror ran at the default 80×24 until a pane attached. A dead
+session's snapshot is now `PtySession::full_state`: every retained scrollback row and then the
+final screen's rows, emitted as flowing `\r\n` lines rather than a screen dump (whose leading
+clear-screen would erase the just-replayed tail — the eviction-replay path survives its own
+clear only because what it erases is exactly what it repaints, and here it would not be). The
+same composition now feeds the teardown's `run-screens/` files, so a run resumed across a
+restart scrolls back past the restart instead of starting from its last two dozen lines. Live
+sessions deliberately keep the one-screen snapshot — their scrollback story belongs to the
+eviction-replay machinery, and a full replay there would prepend a second copy of history to a
+terminal that already holds one. And **`worktree: false` exists now** — the per-role opt-out
+described in the worktree section above — because not every role needs a checkout, and the
+user asked for the choice.
+
+**Still not verified end to end**: no assignment in this tree has yet auto-dispatched a **real**
+`claude` and run to `review`; the fs router's hookup runs only
+in the app (`classify` is table-tested, but nothing headless drives a real watcher event through
+`try_state` to a broadcast); the mention popup's DOM behaviour — caret tracking, key
+claiming, the uncontrolled write — is story-rendered and source-grepped, not driven; the
+rendered run pane has been driven only by `/bin/sh` printing captured event lines, not yet by a
+live opencode child; and the restart round-trip is proven registry-to-registry (snapshot →
+restore → requeue → admission with the right continuation, both harnesses) but has not yet been
+watched across a real quit with a real child resuming. The debug-report batch is in the same
+state: the kill-guard, the death comment and the revive gesture are truth-table-tested
+(`the_registry_owns_a_session_until_its_run_ends`, `a_death_speaks_once_and_only_with_no_successor`,
+`an_assign_gesture_dispatches_and_a_carried_assignee_does_not`) but no real pane close over a
+real live run, and no real abnormal child death, has yet been watched through them; the run log
+is exercised at a tiny injected cap, not by a full 5 MiB stream; and the stalled chip is
+SSR-pinned in both checks, not yet eyeballed on a live board. Per-task worktrees are proven at
+the registry (`two_tasks_parallelise_and_one_checkout_serialises` drives the checkout gate's
+whole table, and `checkout_name`'s sanitiser has its own) but no real role has yet run two tasks
+in two checkouts side by side, and no orchestrator has yet integrated with the task named; the
+worktrees a finished task leaves behind also accumulate until someone removes them — a prune
+gesture for integrated tasks is a named follow-up. The full-transcript snapshot is driven by a
+real 200-line child in `an_exited_sessions_snapshot_carries_its_whole_scrollback` but has not
+yet been eyeballed on a real opencode History row, and `worktree: false` is parse- and
+gate-tested with no live opted-out run watched yet. The markdown surfaces are in the same state: markup-verified under SSR,
+not yet eyeballed in the running card — the toolbar's selection round-trip (apply, selection
+lands, second press toggles) is driven as a pure model but its DOM half
+(`setSelectionRange` after React's commit) only runs live.
 
 **The scrolling belongs to Claude Code, not to cide.** A Claude pane runs on the alternate
 screen (`ESC[?1049h`, confirmed live from the spawned CLI's first 60 bytes), and the alternate
@@ -3339,8 +3656,10 @@ in every layer if you want them:
 ```
 
 IDEA's own `Ctrl+Alt+Left/Right` is not free here — `ctrl+alt+right` is `pane.split.right`, and on
-KDE both are usually the compositor's virtual-desktop shortcuts — and `alt+left`/`alt+right` are
-readline word-motion the window capture listener would take from every terminal.
+KDE both are usually the compositor's virtual-desktop shortcuts — and `alt+left`/`alt+right` have
+since been spent anyway, on `pane.navigate.left`/`right`: the readline word-motion cost this
+paragraph once refused to pay for a navigation nobody had asked to put there was later paid for a
+pane move asked for by name, and the trade is recorded at length on the binding in `keymap.rs`.
 
 **Only an explicit navigation is recorded — and, since M16, a far pointer click.** The list of what
 deliberately is *not* is in `ui/src/editor/navHistory.ts`: typing and arrow keys, scrolling,

@@ -32,6 +32,12 @@
 //! this loop turns that `Some` into a `cide://tasks-changed`. Without the emit, a teammate's
 //! three new tasks would sit in memory, correct and invisible, until something unrelated made
 //! the panel re-ask.
+//!
+//! The *prompt* channel for those external moves is [`crate::dotcide`], which turns the
+//! `.cide/tasks.json` watch event into `TaskStore::refresh_from_disk` within a debounce or two
+//! of the write. This loop is the belt to that suspender — `write_now` reconciles before
+//! *every* flush, so a change the watcher missed (degraded watcher, coalesced event) is still
+//! folded in on the back of the next local mutation, exactly as before the router existed.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

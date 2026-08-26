@@ -288,6 +288,86 @@
   background: transparent;
 }
 
+/* --- The search box. ------------------------------------------------------------------ */
+
+/*
+ * One text box over the whole board, drawn above the status toggles it composes with.
+ *
+ * The container is the visible control — border, ground, radius — and the `<input>` inside it
+ * is bare, so the magnifier and the clear button sit *inside* the box rather than beside it.
+ * That is why focus is `:focus-within` on the container: the input has no edge of its own to
+ * carry a ring, and a ring on the inner element inside a bordered parent draws the double
+ * outline every native search field manages to avoid.
+ */
+.search {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 8px;
+  padding: 0 4px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+}
+
+.search:focus-within {
+  box-shadow: var(--focus-inset);
+}
+
+.searchGlyph {
+  flex: none;
+  display: flex;
+  align-items: center;
+  color: var(--faint);
+}
+
+.searchInput {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+}
+
+.searchInput:focus-visible {
+  outline: none;
+}
+
+.searchInput::placeholder {
+  color: var(--faint);
+}
+
+/*
+ * The clear control, only while there is something to clear. In the DOM and reachable by
+ * keyboard for `.rowDelete`'s reason — a control revealed only on hover is one a keyboard user
+ * never meets — but here "revealed" keys off the box's *content* rather than the pointer, so it
+ * is present exactly when it has work to do.
+ */
+.searchClear {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 1px;
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.searchClear:hover {
+  color: var(--text);
+  background: var(--chrome-hi);
+}
+
+.searchClear:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
 /* --- The list. ----------------------------------------------------------------------- */
 
 /* The list sits below the New task row and the filter row, both of which are above it on every
@@ -533,6 +613,15 @@
   color: var(--yellow);
 }
 
+/* Stalled: a `doing` task whose role has no run engaged on it — `agentChip`'s fourth arm, and
+   the orphaned-task state the orchestrator's debug notes could not see on the board. The
+   attention ink without the ground: the ground is the lit/unlit axis (a ground says a run is
+   behind the chip, and here none is), while the yellow says this row needs a person — the same
+   two-discriminator split the `Chip` type carries as `lit` and `tone`. */
+.chipStalled {
+  color: var(--yellow);
+}
+
 /* --- The task card. ------------------------------------------------------------------- */
 
 /*
@@ -695,10 +784,13 @@
   overflow-wrap: anywhere;
 }
 
-/* The body is the one field whose own line breaks are usually its only structure — the same
-   reason `.logText` preserves them. Still text, still never markup. */
+/* The body at rest is the other markdown container — `.logText`'s twin at field scale. The
+   `pre-wrap` it used to carry is gone for the reason stated there. A rung above `.fieldValue`'s
+   12 for `.logText`'s reason: the body is the statement of the work, read at length, and it was
+   reported as too small — the other rest rows are one-line values and stay at 12. */
 .fieldValueBody {
-  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-ui-13);
 }
 
 /* `restText`'s placeholder for an empty field. Dim and italic, so "no description" cannot be
@@ -741,6 +833,54 @@
 .textarea {
   min-height: calc(72px * var(--ui-scale));
   resize: vertical;
+}
+
+/* Why the assignee list is short — `model.ts::assigneeHint`, drawn under the `<select>` so an
+   empty dropdown never again reads as the unwired-store bug it once was. */
+.assigneeHint {
+  margin: var(--sp-1) 0 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--faint);
+}
+
+/* The @mention popup — `MentionTextarea.tsx`. In normal flow directly under its textarea, never
+   absolutely positioned: that file's header carries the argument (nothing to clip, nothing to
+   z-index, and the open state is renderable by the check). No elevation, so no --shadow-*; no
+   transitions, per check:motion — a list that blinks open is a list, not an animation. */
+.mentionPopup {
+  max-height: calc(160px * var(--ui-scale));
+  overflow-y: auto;
+  margin-top: var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+}
+
+.mentionOption {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: 3px 8px;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.mentionOption[aria-selected='true'] {
+  background: var(--chrome-hi);
+}
+
+.mentionId {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.mentionLabel {
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .input:focus-visible,
@@ -790,6 +930,68 @@
 .segmentButton:focus-visible {
   outline: none;
   box-shadow: var(--focus-inset);
+}
+
+/*
+ * The status log, under the segment. (M27)
+ *
+ * A native `<details>`, one dim summary line at rest — the record you need rarely. No custom
+ * twisty: the platform marker is the one disclosure affordance every user already knows, and a
+ * hand-drawn one would be a second answer to what "collapsed" looks like.
+ */
+.history {
+  margin-top: 4px;
+}
+
+.historySummary {
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  cursor: pointer;
+  /* Both spellings — WebKitGTK only implements the prefixed one; check:css-prefix pins the pair. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.historySummary:hover {
+  color: var(--dim);
+}
+
+.historyRows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 3px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-soft);
+}
+
+.historyRow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--fs-ui-11);
+}
+
+.historyTime {
+  flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.historyMove {
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* Right-aligned, the way `.logTime` ends a comment's head: the row reads change-then-author. */
+.historyBy {
+  margin-left: auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--dim);
 }
 
 /* The live-run strip: what is actually running against this task, right now. */
@@ -860,25 +1062,172 @@
 }
 
 /*
- * Comment text.
+ * Comment text — a markdown container now (M27; `TaskMarkdown.tsx`).
  *
- * `pre-wrap`, and **never rendered as markup**. The text is model-authored, and rendering
- * model-authored markup inside the IDE's own chrome is an injection surface bought for nothing
- * at a 320px panel width. Whitespace is preserved because an agent's line breaks are usually
- * the only structure it has.
+ * No `pre-wrap` any more: the structure an agent's line breaks carried is the parser's job —
+ * a blank line is a paragraph, a fence is a `<pre>` that preserves its own whitespace — and
+ * preserving source newlines *around* rendered blocks would double every margin. The injection
+ * argument that used to live here moved to `TaskMarkdown.tsx`'s header: rendering goes through
+ * the AST and React's escaping, never through an HTML string.
  */
 .logText {
   margin: 0;
   font-family: inherit;
-  font-size: var(--fs-ui-11);
+  /* One rung up from the 11 it launched at — reported as too small to read a conversation in.
+     The head above it stays at 11: provenance is metadata, the words are the content. */
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--text);
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* The containers stay tight: a lone paragraph must sit exactly where the plain text used to. */
+.logText > :first-child,
+.fieldValueBody > :first-child {
+  margin-top: 0;
+}
+
+.logText > :last-child,
+.fieldValueBody > :last-child {
+  margin-bottom: 0;
 }
 
 .composer {
   margin-top: 10px;
+}
+
+/* ------------------------------------------------------- markdown, drawn and written (M27) */
+
+/*
+ * The formatting toolbar, above every markdown-bearing textarea (`MentionTextarea`'s `tools`).
+ * Sized off `.fieldEdit`'s 20px control height so the row reads as chrome, not content.
+ */
+.mdToolbar {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 3px;
+}
+
+.mdTool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(22px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.mdTool:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.mdTool:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+/*
+ * Rendered markdown — `TaskMarkdown.tsx`, inside `.logText` and `.fieldValueBody`.
+ *
+ * Everything inherits the container's size; the two exceptions are stated. Headings take one
+ * rung, not the document scale: an `#` in a comment is a section of that comment, and a
+ * 20px title inside a 620px card would out-shout the card's own head.
+ */
+.mdP {
+  margin: 0 0 6px;
+}
+
+.mdHeading {
+  margin: 8px 0 4px;
+  /* One rung above the largest container base (`.fieldValueBody`'s 13), so a heading still
+     reads as one in both containers. */
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-hi);
+}
+
+.mdPre {
+  margin: 4px 0 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  /* Wide content scrolls inside its own box — the app-wide rule; the card must not widen. */
+  overflow-x: auto;
+}
+
+.mdCode {
+  padding: 0 3px;
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  font-family: var(--font-mono);
+}
+
+.mdQuote {
+  margin: 4px 0 6px;
+  padding: 1px 0 1px 8px;
+  border-left: 2px solid var(--border);
+  color: var(--dim);
+}
+
+.mdList {
+  margin: 2px 0 6px;
+  padding-left: 18px;
+}
+
+/* A task item hides its bullet; the drawn box is the marker. Never an `<input>` — the render
+   gate counts those to prove the card is read-only, and `TaskMarkdown.tsx` says the rest. */
+.mdTask {
+  list-style: none;
+  margin-left: -14px;
+}
+
+.mdCheck {
+  display: inline-block;
+  margin-right: 4px;
+  vertical-align: -2px;
+  color: var(--dim);
+}
+
+.mdRule {
+  margin: 8px 0;
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.mdTable {
+  display: block;
+  margin: 4px 0 6px;
+  border-collapse: collapse;
+  overflow-x: auto;
+}
+
+.mdTable th,
+.mdTable td {
+  padding: 2px 6px;
+  border: 1px solid var(--border-soft);
+}
+
+.mdTable th {
+  color: var(--text-hi);
+}
+
+/* A link is shown, not followed — `TaskMarkdown.tsx`'s header carries the decision. Accented
+   and underlined so it still reads as a destination; the href is in its `title`. */
+.mdLink {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .composerActions {

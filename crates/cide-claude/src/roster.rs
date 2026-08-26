@@ -65,10 +65,42 @@ struct Record {
     pid: Option<u32>,
     /// What `/rename` set. Absent for a conversation nobody has named.
     name: Option<String>,
+    /// Milliseconds since the epoch, written when the *name* was set — not when the record
+    /// was last touched.
+    ///
+    /// The only field here that says anything about *which conversation a name was given to*,
+    /// and the whole reason the caller can tell a live name from one the CLI carried across a
+    /// `/clear`. See [`Named::since`].
+    #[serde(default)]
+    name_since: u64,
     /// Milliseconds since the epoch, written on every status change. The tiebreak between two
     /// live processes naming one conversation.
     #[serde(default)]
     updated_at: u64,
+}
+
+/// A name, and when it was given.
+///
+/// The pair rather than the string, because a name alone cannot answer the question the
+/// caller actually has. The CLI holds its name on the **process**, not on the conversation:
+/// `/rename` sets `registeredName` on a per-process singleton, and `/clear` starts a new
+/// conversation inside that same process, so the record is rewritten with a new `sessionId`
+/// and the *old* name still attached. Read as a bare map, that makes a name the user gave one
+/// conversation label the one that replaced it — which is what "`/clear` did not reset the
+/// session" looked like from the outside.
+///
+/// `cide_core::workspace::fresh_claude_names` is where the comparison lives; this module's job
+/// ends at reporting both halves honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    /// What the user typed, trimmed of nothing — it is their string.
+    pub name: String,
+    /// `nameSince`: milliseconds since the epoch, or `0` from a CLI that does not write it.
+    ///
+    /// Zero is deliberately the *oldest possible* value rather than "unknown": a name with no
+    /// timestamp loses to any conversation change cide has recorded, so an older CLI degrades
+    /// to dropping the name on a cleared pane rather than to showing a stale one.
+    pub since: u64,
 }
 
 /// `~/.claude/sessions`, or `None` when there is no home to look under.
@@ -95,7 +127,7 @@ pub fn sessions_dir() -> Option<PathBuf> {
 /// could be, and a cwd comparison would additionally have to answer for symlinks, a project
 /// with several roots, and a session started in a subdirectory. Matching an id that cide
 /// itself minted cannot be wrong in any of those ways.
-pub fn names() -> HashMap<String, String> {
+pub fn names() -> HashMap<String, Named> {
     match sessions_dir() {
         Some(dir) => names_in(&dir),
         None => HashMap::new(),
@@ -103,7 +135,7 @@ pub fn names() -> HashMap<String, String> {
 }
 
 /// [`names`], against a directory named explicitly. The half a test can drive.
-pub fn names_in(dir: &std::path::Path) -> HashMap<String, String> {
+pub fn names_in(dir: &std::path::Path) -> HashMap<String, Named> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         // No directory at all is the ordinary state on a machine where `claude` has never
         // run, and it is not worth a log line at any level a user would see.
@@ -112,7 +144,7 @@ pub fn names_in(dir: &std::path::Path) -> HashMap<String, String> {
 
     // Keyed by conversation, holding the `updatedAt` that won it, so the newest live record
     // for each conversation is what survives the walk.
-    let mut best: HashMap<String, (u64, String)> = HashMap::new();
+    let mut best: HashMap<String, (u64, Named)> = HashMap::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -141,12 +173,18 @@ pub fn names_in(dir: &std::path::Path) -> HashMap<String, String> {
         match best.get(&record.session_id) {
             Some((seen, _)) if *seen >= record.updated_at => {}
             _ => {
-                best.insert(record.session_id, (record.updated_at, name));
+                let named = Named {
+                    name,
+                    since: record.name_since,
+                };
+                best.insert(record.session_id, (record.updated_at, named));
             }
         }
     }
 
-    best.into_iter().map(|(id, (_, name))| (id, name)).collect()
+    best.into_iter()
+        .map(|(id, (_, named))| (id, named))
+        .collect()
 }
 
 #[cfg(test)]
@@ -212,7 +250,7 @@ mod tests {
         );
 
         let names = names_in(&dir);
-        assert_eq!(names.get("alive").map(String::as_str), Some("agents"));
+        assert_eq!(names.get("alive").map(|n| n.name.as_str()), Some("agents"));
         assert_eq!(names.len(), 1, "{names:?}");
     }
 
@@ -237,7 +275,43 @@ mod tests {
             "11.json",
             &format!(r#"{{"pid":{pid},"sessionId":"s","name":"new","updatedAt":200}}"#),
         );
-        assert_eq!(names_in(&dir).get("s").map(String::as_str), Some("new"));
+        assert_eq!(
+            names_in(&dir).get("s").map(|n| n.name.as_str()),
+            Some("new")
+        );
+    }
+
+    /// `nameSince` is carried through, and its absence reads as the oldest possible name.
+    ///
+    /// The field is what lets a caller tell a name given to *this* conversation from one the
+    /// CLI carried across a `/clear`, so a record that has it must not be flattened to a bare
+    /// string on the way out — and one that does not must not come back as "just now", which
+    /// would make the stale name win every comparison it should lose.
+    #[test]
+    fn a_name_carries_when_it_was_given() {
+        let dir = tempdir();
+        let pid = me();
+        write(
+            &dir,
+            "20.json",
+            &format!(
+                r#"{{"pid":{pid},"sessionId":"stamped","name":"proto","nameSince":1700,"updatedAt":1800}}"#
+            ),
+        );
+        write(
+            &dir,
+            "21.json",
+            &format!(r#"{{"pid":{pid},"sessionId":"unstamped","name":"legacy","updatedAt":1800}}"#),
+        );
+        let names = names_in(&dir);
+        assert_eq!(
+            names.get("stamped"),
+            Some(&Named {
+                name: "proto".into(),
+                since: 1700
+            })
+        );
+        assert_eq!(names.get("unstamped").map(|n| n.since), Some(0));
     }
 
     /// A directory that is not there answers empty rather than failing.

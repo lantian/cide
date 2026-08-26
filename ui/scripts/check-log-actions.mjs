@@ -930,13 +930,30 @@ try {
   const rawDialog = readFileSync(join(UI, 'src', 'chrome', 'ConfirmDestructive.tsx'), 'utf8')
   const dialog = stripComments(rawDialog)
 
-  // Rule 3, both halves. The focus, and the colour.
+  // Rule 3, both halves — the focus, and the colour — plus its one declared exception: the
+  // default is Cancel's unless the caller set `defaultButton: 'confirm'`, which only the file
+  // tree's trash move (reversible by construction) may do. Focus and accent must travel
+  // together whichever way the default points.
   ok(
-    /cancel\.current\?\.focus\(\)/.test(dialog),
-    'Cancel still takes the initial focus — the keystroke already in flight when the dialog ' +
-      'appeared has to back out, not go ahead',
+    /\(confirmDefault \? confirmBtn : cancel\)\.current\?\.focus\(\)/.test(dialog),
+    'the initial focus follows the declared default — Cancel unless the caller flipped it, so ' +
+      'the keystroke already in flight when a *destructive* dialog appeared backs out',
   )
-  ok(/useEffect\(/.test(dialog) && /ref=\{cancel\}/.test(dialog), 'and the ref is on a real button')
+  ok(
+    /const confirmDefault = state\.defaultButton === 'confirm'/.test(dialog),
+    'and a caller that says nothing gets Cancel as the default',
+  )
+  ok(
+    !stripComments(readFileSync(join(UI, 'src', 'chrome', 'logActions.ts'), 'utf8')).includes(
+      'defaultButton',
+    ),
+    'and no log action flips it — reset, checkout and a moved tag have no undo, so for all of ' +
+      'them the reflexive Enter must back out, not go ahead',
+  )
+  ok(
+    /useEffect\(/.test(dialog) && /ref=\{cancel\}/.test(dialog) && /ref=\{confirmBtn\}/.test(dialog),
+    'and both refs are on real buttons',
+  )
   ok(
     /ev\.key === 'Escape'/.test(dialog) && /onCancel\(\)/.test(dialog),
     'Escape still cancels',
@@ -950,13 +967,17 @@ try {
   const cancelButton = before('data-audit="confirmDestructiveCancel"', 260)
   ok(runButton !== '', 'the destructive button is still identifiable')
   ok(
-    !runButton.includes('buttonPrimary'),
-    'and it is NOT the accent-filled one. This single className is rule 3 in the DOM: the ' +
-      'prominent button has to be Cancel, or a reflexive Enter performs the destruction',
+    runButton.includes('confirmDefault ? styles.buttonPrimary : danger ? styles.buttonDanger'),
+    'the accent reaches the confirm button ONLY behind `confirmDefault`. This one className is ' +
+      'rule 3 in the DOM: for every destructive caller the prominent button has to be Cancel, ' +
+      'or a reflexive Enter performs the destruction — and where a caller did declare the act ' +
+      'reversible, the accent displaces the red, because an act safe enough to confirm by ' +
+      'reflex has no claim on the colour that means "this destroys work"',
   )
   ok(
-    cancelButton.includes('buttonPrimary'),
-    'Cancel is the accent-filled one',
+    cancelButton.includes("confirmDefault ? '' : styles.buttonPrimary"),
+    'Cancel is the accent-filled one exactly when it is the default — the accent and the focus ' +
+      'travel together, or the dialog looks like Enter will do one thing and it does the other',
   )
   ok(
     runButton.includes('buttonDanger'),

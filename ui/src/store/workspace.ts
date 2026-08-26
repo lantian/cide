@@ -19,6 +19,7 @@ import { destroyHost, noteLivePanes, peekHost, releaseHost } from '@/layout/pane
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import type { CloseScope } from '@/chrome/closeConfirmModel'
 import { planFileIndex, type IndexTarget } from './fileIndex'
+import { useSessionStatus } from './sessionStatus'
 import {
   app as appApi,
   events,
@@ -310,6 +311,56 @@ function syncHostBudget(workspace: Workspace): void {
     }
   }
   noteLivePanes(ids)
+}
+
+/**
+ * The conversation each Claude pane was last seen on, so a `/clear` can be noticed.
+ *
+ * Module-level and not in the store: it is evidence about the previous snapshot, read once
+ * and never rendered, and putting it in the store would re-render every subscriber for a
+ * value nothing draws.
+ */
+const paneConversations = new Map<string, string | null>()
+
+/**
+ * Forget what belonged to a conversation the pane has left.
+ *
+ * `/clear` does not restart the child, so nothing in the session lifecycle fires: the pane
+ * keeps its `SessionId`, the pty keeps its pid, and the only signal that the conversation
+ * underneath has been replaced is `Pane.conversation` moving — which Rust learns from a hook
+ * frame and puts on the very snapshot this runs from.
+ *
+ * What that leaves behind is the statusline readout. Frames are keyed by the *pane's* session,
+ * so the status bar went on showing the cleared conversation's token, context and cost figures
+ * until the next turn overwrote them — and for ever on a pane nobody prompts again, which is
+ * the ordinary fate of a pane somebody has just cleared. `useSessionStatus.clear` existed for
+ * this from the start and had no caller; this is it.
+ *
+ * Deliberately not a pane-title or scrollback reset: the terminal's buffer is the record of
+ * what the user did, `/clear` scrolls it rather than erasing it, and cide must not be more
+ * destructive than the command it is reacting to.
+ */
+function syncConversations(workspace: Workspace): void {
+  const seen = new Set<string>()
+  const panes = Object.values(workspace.projects).flatMap((project) => [
+    ...project.tabs.flatMap((tab) => Object.values(tab.tree.panes)),
+    ...Object.values(project.detached),
+  ])
+  for (const pane of panes) {
+    if (pane.kind !== 'claude') continue
+    seen.add(pane.id)
+    const now = pane.conversation ?? null
+    const before = paneConversations.get(pane.id)
+    paneConversations.set(pane.id, now)
+    // `before === undefined` is the first snapshot that carried this pane — a launch, a
+    // window opening, a project coming back. Whatever it is on then, it has not *moved*, and
+    // clearing there would throw away the readout of a session that is running perfectly well.
+    if (before === undefined || before === now) continue
+    if (pane.session) useSessionStatus.getState().clear(pane.session)
+  }
+  for (const id of [...paneConversations.keys()]) {
+    if (!seen.has(id)) paneConversations.delete(id)
+  }
 }
 
 function syncFileIndex(workspace: Workspace): void {
@@ -635,12 +686,13 @@ interface WorkspaceStore {
   setRatio: (project: ProjectId, tab: TabId, split: SplitId, ratio: number) => Promise<void>
   /** Every member of the pane's chain to an equal share of it. `'row'` is its tiles. */
   distributePanes: (project: ProjectId, tab: TabId, pane: PaneId, axis: Axis) => Promise<void>
+  /** Answers the pane focus landed on, or `null` at an edge — the caller moves the caret. */
   navigatePane: (
     project: ProjectId,
     tab: TabId,
     pane: PaneId,
     direction: Direction,
-  ) => Promise<void>
+  ) => Promise<PaneId | null>
   bindSession: (
     project: ProjectId,
     tab: TabId,
@@ -1040,9 +1092,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // first is a pure query on the tree, and at the edge it answers null rather than
     // wrapping around, which is what stops Alt+Left cycling forever in a two-pane tab.
     const target = await paneApi.navigate(project, tab, pane, direction)
-    if (target === null) return
+    if (target === null) return null
     const { rev } = await paneApi.focus(project, tab, target)
     await synced(rev)
+    // Handed back rather than acted on: moving the DOM's focus is the dispatcher's half
+    // (`panes/paneFocus.ts`), and this mutator is also driven by the audit, which has no
+    // keyboard to move.
+    return target
   },
   bindSession: async (project, tab, pane, session) => {
     const { rev } = await paneApi.bindSession(project, tab, pane, session)
@@ -1129,6 +1185,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // to call `hydrate`.
     syncFileIndex(workspace)
     syncHostBudget(workspace)
+    syncConversations(workspace)
     flushSynced(Number(workspace.rev))
   },
 

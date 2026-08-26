@@ -48,7 +48,11 @@
  *    containing both sides of everything.
  *  - **`list-with-live-run`'s chip classes differ from `list`'s.** Same board, one run. A chip
  *    that looked the same either way would claim an agent that exited an hour ago is still
- *    working. This is the most important assertion in the file.
+ *    working. This is the most important assertion in the file. Since the stalled reading it is
+ *    three-way: within `list`, T14 (doing, no run — stalled) must also differ from T15
+ *    (assigned), because a `doing` task nobody is on rendered identically to a plain
+ *    assignment is the orchestrator's orphaned-task report — three orphanings, nothing on the
+ *    board — restated as CSS.
  *  - **The stale-turn bar has exactly two buttons**, `Retry turn` and `Leave it`. cide cannot
  *    see the model request, only a process it stopped and continued, so it may neither
  *    re-dispatch on its own (double-billing a turn that survived) nor stay silent.
@@ -784,6 +788,38 @@ try {
       'and the labels are identical, so the difference above is the *rendering* rather than the ' +
         'text — which is the whole claim',
     )
+
+    /*
+     * The stalled reading, in the same pair of stories. T14 is `doing` and assigned, and in
+     * `list` no run exists at all — the orphaned state the orchestrator hit three times with
+     * nothing visible on the board. Its chip must carry attention while T15's (assigned, not
+     * started on anything the tracker claims is moving) stays plain — and the two class sets
+     * must actually differ, because tone is only real if a stylesheet spends it.
+     */
+    eq(
+      idle.chipTone,
+      ['attention', 'assigned', 'assigned'],
+      'with no runs, the doing task’s chip is the STALLED one — the task claims work is under ' +
+        'way and no run is on it — and the merely-assigned chips stay plain',
+    )
+    eq(
+      live.chipTone,
+      ['live', 'assigned', 'assigned'],
+      'one working run flips the same chip to live: stalled and working are the same board one ' +
+        'run apart, exactly like assigned and working',
+    )
+    const classSet = (attr) => JSON.stringify([...new Set((attr ?? '').split(/\s+/))].sort())
+    ok(
+      classSet(idle.chipClasses?.[0]) !== classSet(idle.chipClasses?.[1]),
+      'the stalled chip’s classes differ from the assigned chip’s IN THE SAME STORY — "nobody ' +
+        'is coming" painted like "assigned, quietly" is the invisibility that let a task be ' +
+        'orphaned three times unnoticed',
+    )
+    ok(
+      classSet(idle.chipClasses?.[0]) !== classSet(live.chipClasses?.[0]),
+      'and from the lit chip’s — stalled must not read as working, which is the original ' +
+        'most-important assertion extended to the third rendering',
+    )
     eq(idle.rows?.length, 4, 'every task reaches the DOM')
     eq(
       idle.groups,
@@ -998,6 +1034,92 @@ try {
     const live = t('card-with-live-run')
     eq(live.runStrip, true, 'a live run against this task gets its strip')
     ok(live.buttons?.includes('Open'), 'and the strip can attach a pane to it')
+
+    /*
+     * ----- Markdown, drawn and written. (M27) --------------------------------------------
+     *
+     * Reported as: comments and the body need markdown rendering, and styling tools when
+     * writing. Two halves, and each has a failure only markup can show. Rendering: the parser
+     * and the renderer both existed and compiled long before anything called them — "built and
+     * reachable from nothing" is this repository's oldest failure class. Tools: the toolbar
+     * rides `MentionTextarea`'s `tools` prop, which every call site must *pass*, and a site
+     * that forgot it renders a working textarea with no tools and nothing else wrong.
+     */
+    const md = t('card-markdown')
+    ok(
+      (md.md?.strong ?? 0) >= 1 && (md.md?.em ?? 0) >= 1,
+      'a fixture that wrote **strong** and *emphasis* produced real <strong> and <em> elements',
+    )
+    ok((md.md?.headings ?? 0) >= 1, 'and `## Scope` is a heading element, not a line of hashes')
+    ok((md.md?.code ?? 0) >= 2, 'code spans render in the body and in the comment alike')
+    ok((md.md?.fences ?? 0) >= 1, 'a fenced block is a <pre>, uncoloured on purpose')
+    ok((md.md?.items ?? 0) >= 4, 'both lists render as list items — the body’s two and the comment’s two')
+    ok((md.md?.links ?? 0) >= 1, 'a link renders marked — inert by decision, but visibly a destination')
+    ok(
+      !md.text?.includes('**') && !md.text?.includes('```') && !md.text?.includes('## '),
+      'and the syntax was consumed: no marker survives into the prose the user reads',
+    )
+    ok(
+      !JSON.stringify(md).includes('dangerouslySetInnerHTML'),
+      'rendered through the AST as React elements — never an HTML string handed to the DOM',
+    )
+    /*
+     * The plain stories still flatten to the same prose they always did — a markdown renderer
+     * over text with no markdown in it must be invisible. `fieldValues` and `comments` above
+     * are the pin; this line states why they did not have to change.
+     */
+    eq(
+      rest.comments?.length,
+      3,
+      'the plain card still digests all three comments through the markdown road',
+    )
+
+    /*
+     * The styling tools. Eight per markdown-bearing textarea — the composer’s row is always on
+     * the card, and a field editor brings its own. Counted, not looked for: "some textareas
+     * have tools" is the drift the count exists to make visible.
+     */
+    eq(rest.mdTools, 8, 'at rest the comment composer carries the eight formatting tools')
+    eq(
+      body.mdTools,
+      16,
+      'with the body in edit its editor carries eight more — the tools follow the textarea, ' +
+        'so a field editor cannot lose them while the composer keeps its own',
+    )
+    eq(t('list').mdTools, 0, 'the list has no textarea and therefore no toolbar')
+
+    /*
+     * ----- The status log. (M27) ----------------------------------------------------------
+     *
+     * Asked for in as many words: *a log of status change (by whom and when and in what
+     * status), collapsed by default*. The collapsed assertion is the load-bearing one — a
+     * stray `open` on the `<details>` would ship every card with its audit trail unfolded,
+     * and nothing but markup can see that.
+     */
+    eq(rest.historyDrawn, true, 'a task that has moved draws its status log')
+    eq(
+      rest.historyOpen,
+      false,
+      'COLLAPSED by default — one quiet summary line until it is asked for',
+    )
+    eq(
+      rest.history,
+      ['Todo → Doing|Orchestrator', 'Doing → Review|You', 'Review → Doing|You'],
+      'oldest first from a fixture that arrives scrambled, each row naming who moved it — ' +
+        'the automatic dispatch hop reads as the Orchestrator’s, which is who dispatched',
+    )
+    eq(
+      bare.historyDrawn,
+      false,
+      'a task that never moved draws no disclosure — a control that opens onto nothing',
+    )
+    ok(
+      (rest.times?.length ?? 0) >= 6 &&
+        rest.times.every((stamp) => /^\d{2}:\d{2}:\d{2} \(.+ ago\)$/.test(stamp)),
+      'every timestamp on the card — three comments, three history rows — is the wall clock ' +
+        'plus the age: `HH:MM:SS (… ago)`, because two `4m ago`s are indistinguishable and a ' +
+        'bare clock time is ambiguous across days',
+    )
   }
 
   /*
@@ -1073,6 +1195,13 @@ try {
     eq(busy.composeCreate, 'off', 'with Create inert, so a second press cannot write twice')
     eq(busy.composeCancel, true, 'and a way out that still works')
 
+    eq(
+      empty.mdTools,
+      8,
+      'the body box carries the eight formatting tools — "styling tools when creating" is the ' +
+        'half of the markdown report that names this dialog',
+    )
+
     for (const [name, d] of [['compose-empty', empty], ['compose-filled', filled], ['compose-busy', busy]]) {
       eq(d.unclassed, 0, `${name}: names only classes its stylesheet defines`)
     }
@@ -1084,6 +1213,76 @@ try {
      */
     eq(t('card').compose, false, 'the card is not the compose dialog')
     eq(t('card').composeControls, 0, 'and draws none of its controls')
+  }
+
+  /*
+   * ===== The assignee options, the hint, and the @mention popup. ==========================
+   *
+   * The dropdown shipped empty for the whole life of one milestone because the host passed `{}`
+   * where the roster's map belonged, and no gate saw it: `check:agents` proved `assignableRoles`
+   * correct over a populated map, and these stories rendered the populated path while the app
+   * ran the empty one. The host wiring is source-grepped below with the other seams; what THIS
+   * block pins is the two on-screen halves — a populated roster becomes options, and an empty
+   * one comes with the sentence saying why, so the legitimate state and the bug cannot look
+   * alike again.
+   */
+  {
+    eq(
+      t('card-editing-assignee').assigneeOptions,
+      ['Unassigned', 'Developer', 'QA'],
+      'a populated roster is on offer, labels in sorted-id order behind the Unassigned row',
+    )
+    eq(
+      t('card-editing-assignee').assigneeHint,
+      '',
+      'and a ready roster needs no excuse under it',
+    )
+
+    const noRoles = t('card-assignee-no-roles')
+    eq(
+      noRoles.assigneeOptions,
+      ['Unassigned', 'developer'],
+      'an empty roster still folds the current assignee in — `assignableRoles`’ honesty rule, ' +
+        'now visible: without it the select would silently show Unassigned and reassign the ' +
+        'task to nobody the moment it was touched',
+    )
+    ok(
+      noRoles.assigneeHint.startsWith('Subagents are off for this project.'),
+      `the sentence saying why the list is short is on screen: ${noRoles.assigneeHint}`,
+    )
+
+    const compose = t('compose-no-roles')
+    eq(compose.assigneeOptions, ['Unassigned'], 'the dialog over an empty roster offers only Unassigned')
+    ok(
+      compose.assigneeHint.startsWith('Subagents are off for this project.'),
+      'with the same sentence under it',
+    )
+    eq(t('compose-filled').assigneeHint, '', 'and none when the roster is real')
+
+    /*
+     * The popup, in its open state — which only these stories can render: the component mounts
+     * it from DOM events a server render cannot fire. The options came through the real
+     * `mentionOptions`, so the order on screen IS the scored order.
+     */
+    const open = t('mention-open')
+    eq(
+      open.mentionRows,
+      ['@code-reviewer Code Reviewer|false', '@developer Developer|true', '@qa QA|false'],
+      'the open popup lists the roster id-first with the label beside it, in scored order',
+    )
+    eq(
+      open.mentionRows.filter((row) => row.endsWith('|true')).length,
+      1,
+      'exactly one row is aria-selected — the highlight the arrows move',
+    )
+    eq(
+      t('mention-filtered').mentionRows,
+      ['@developer Developer|true'],
+      'a narrowing query narrows the rows',
+    )
+    for (const name of ['mention-open', 'mention-filtered']) {
+      eq(t(name).unclassed, 0, `${name}: names only classes its stylesheet defines`)
+    }
   }
 
   /*
@@ -1295,8 +1494,89 @@ try {
     eq(
       selected.detail,
       false,
-      'and the card itself is NOT in this view’s markup: it is mounted by `TasksPanelHost` ' +
+      'and the card itself is NOT in this view’s markup: it is mounted by `TaskDetailHost` ' +
         'beside it, which is what keeps the portal out of this render',
+    )
+  }
+
+  /*
+   * ===== The search box. ===================================================================
+   */
+  {
+    const all = t('list')
+    eq(all.search, true, 'a ready board with tasks in it draws the search box')
+    eq(all.searchValue, '', 'empty until the user types')
+    eq(all.searchClear, false, 'and with nothing to clear, no clear control')
+
+    const hit = t('list-searched')
+    eq(hit.rows?.length, 1, 'a query narrows the list')
+    ok(
+      hit.rows?.[0]?.includes('t-14'),
+      'to the tasks whose text contains it — and the story types `Retry` over a lowercase ' +
+        'title, so the case-insensitivity is pinned in markup as well as in the model',
+    )
+    for (const id of ['t-15', 't-16', 't-17']) {
+      ok(
+        !hit.text?.includes(id),
+        `${id} is ABSENT from the markup rather than merely dimmed — the filter’s rule, ` +
+          'because a search that left the rows on screen would be a highlight, which is a ' +
+          'different feature',
+      )
+    }
+    eq(
+      hit.meta,
+      all.meta,
+      'the header figure does not follow the search, for the filter’s reason: it names the ' +
+        'tracker, not the slice being read',
+    )
+    eq(hit.filters?.length, 5, 'the filter row is still drawn — the two narrowings compose')
+    eq(hit.searchValue, 'Retry', 'the box holds what was typed')
+    eq(hit.searchClear, true, 'and with text in it, the clear control exists')
+
+    const none = t('list-search-no-match')
+    eq(none.rows, [], 'a query can match nothing at all')
+    eq(none.noMatch, true, 'and that is its own screen rather than a blank body')
+    ok(
+      /quaternion/.test(none.claim ?? ''),
+      'whose sentence names the QUERY that is hiding them — the filter’s empty screen names a ' +
+        'status, and the way out of this one is clearing what was typed instead',
+    )
+    ok(none.text?.includes('3 tasks'), 'and counts the tasks that do exist, so the number argues')
+    ok(none.buttons?.includes('Clear search'), 'with the way out in the sentence’s own row')
+    ok(
+      !none.buttons?.includes('Show all tasks'),
+      'and no Show all beside it: with no filter on there is nothing that button would undo, ' +
+        'and a control that changes nothing teaches the user to ignore the one beside it',
+    )
+    eq(
+      none.search,
+      true,
+      'the box itself is still drawn — a search that hid its own control when it matched ' +
+        'nothing would leave the user no way to clear what they typed',
+    )
+
+    eq(t('empty').search, false, 'an empty tracker draws no search box: there is nothing to find')
+    eq(t('absent').search, false, 'nor does a project with no tracker file')
+    eq(t('unreadable').search, false, 'nor an unreadable one, which offers only Reveal and Retry')
+  }
+
+  /*
+   * ===== The recency order. ================================================================
+   */
+  {
+    const d = t('list-recent-first')
+    eq(
+      d.rows?.map((r) => r.split('|')[2]),
+      ['t-33', 't-32', 't-31'],
+      'rows come last-touched-first. The fixture writes them to the file oldest-first — the ' +
+        'order an append-only tracker accretes — so this passing is the sort and not the ' +
+        'fixture: a panel drawing the array as written would print the exact reverse',
+    )
+    eq(
+      d.groups,
+      ['Todo|3'],
+      'all three in one group, so the order above is within-group order rather than ' +
+        'GROUP_ORDER doing the work',
     )
   }
 
@@ -1334,6 +1614,8 @@ try {
     const detail = src('../src/sidebar/TasksPanel/TaskDetail.tsx')
     const panel = src('../src/sidebar/TasksPanel/TasksPanel.tsx')
     const host = src('../src/sidebar/TasksPanel/TasksPanelHost.tsx')
+    const card = src('../src/sidebar/TasksPanel/TaskDetailHost.tsx')
+    const app = src('../src/App.tsx')
     const shell = src('../src/overlays/ModalShell.tsx')
 
     ok(
@@ -1370,15 +1652,97 @@ try {
     )
 
     ok(
-      /<TasksPanelView\b/.test(host) && /<TaskDetailModal\b/.test(host),
-      'the host mounts the list AND the card, which is what puts the board behind the scrim ' +
-        'rather than replacing it',
+      /<TasksPanelView\b/.test(host) && !/<TaskDetailModal\b/.test(host),
+      'the panel host mounts the list and no longer the card — the card left with the ' +
+        'Agents-panel task links, which open it without switching the sidebar to Tasks',
+    )
+    ok(
+      /<TaskDetailModal\b/.test(card),
+      'the card is mounted by `TaskDetailHost` instead, which holds the wiring the panel host ' +
+        'used to: the field-in-edit draft, the card’s armed delete, and the 30 s comment clock',
+    )
+    ok(
+      /\{taskSelected !== null &&[\s\S]{0,400}<TaskDetailHost\b/.test(app),
+      'and `App.tsx` mounts that host OUTSIDE every `sidebar.view` branch, gated on the ' +
+        'selection — which is the whole feature: a task opened from the Agents panel appears ' +
+        'over that panel rather than yanking the sidebar to Tasks first',
+    )
+    ok(
+      /<PanelBoundary name="Task"[\s\S]{0,400}<TaskDetailHost\b/.test(app),
+      '...wrapped in a `PanelBoundary` whose Close clears the selection, so a throw in the ' +
+        'card cannot empty the window and the unmount is what re-arms the boundary',
+    )
+    ok(
+      !/onShowTasks/.test(src('../src/sidebar/AgentsPanel/AgentsPanelHost.tsx')),
+      'and the Agents panel no longer takes an `onShowTasks` — a task link selects the task ' +
+        'and nothing else, because switching panels was the gesture the user asked to remove',
     )
     ok(
       !/<TaskDetail\b/.test(panel),
       'and the view no longer renders the card in place. If it did, the portal inside it would ' +
         'take every board state, every group and both empty screens out of this file’s reach ' +
         'along with it — the stories above would not render at all',
+    )
+
+    /*
+     * The join with the agents store — the seam the empty-dropdown bug lived in, and the one
+     * neither render above can reach: the host reads stores and calls IPC, so it is source only
+     * here. The stories rendered the populated path for a whole milestone while the app ran the
+     * empty one; these lines are what make un-wiring it a failure instead of a regression.
+     */
+    for (const [name, source] of [['panel host', host], ['card host', card]]) {
+      ok(
+        /import \{[^}]*\buseAgents\b[^}]*\} from '@\/sidebar\/agentsStore'/.test(source),
+        `the ${name} imports the agents store — the roster is where \`roles\` and \`runs\` ` +
+          'come from now',
+      )
+      ok(
+        /useAgents\(\(s\) => s\.roster\)/.test(source),
+        `and the ${name} subscribes its roster`,
+      )
+      ok(
+        /rosterRoles\(roster\)/.test(source),
+        `the ${name} derives the roles map through \`rosterRoles\` — the join in model form, ` +
+          'which `check:agents` tests over every roster arm',
+      )
+      ok(
+        !source.includes('NO_ROLES'),
+        `no hardcoded empty roles constant in the ${name}. It was the bug: the header promised ` +
+          '"two lines change when the store lands", the store landed, and nothing changed',
+      )
+    }
+    eq(
+      [...host.matchAll(/roles=\{roles\}/g)].length,
+      2,
+      'the derived roles reach both of the panel host’s mounts — the list and the compose dialog',
+    )
+    eq(
+      [...card.matchAll(/roles=\{roles\}/g)].length,
+      1,
+      '...and the card host’s one — the card, whose assignee dropdown is where the ' +
+        'empty-forever bug lived',
+    )
+    ok(
+      [...host.matchAll(/runs=\{runs\}/g)].length >= 1 &&
+        [...card.matchAll(/runs=\{runs\}/g)].length >= 1,
+      'and the derived runs reach the list and the card',
+    )
+
+    /*
+     * The @mention popup, at its call sites. Counted as source because which textareas offer
+     * mentions is a decision, not a rendering: a "cleanup" that swapped one back to a plain
+     * `<textarea>` would still render, still pass every digest, and silently drop the feature
+     * from that field.
+     */
+    const compose = src('../src/sidebar/TasksPanel/TaskCompose.tsx')
+    ok(
+      [...detail.matchAll(/<MentionTextarea\b/g)].length >= 2,
+      'the card offers mentions in the body editor and the comment composer at least',
+    )
+    eq(
+      [...compose.matchAll(/<MentionTextarea\b/g)].length,
+      1,
+      'and the compose dialog in its body — one each, the title is one line and mentions nobody',
     )
   }
 

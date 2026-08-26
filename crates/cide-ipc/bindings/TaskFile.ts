@@ -32,8 +32,13 @@ rev: bigint,
  * places — the key and the value's `id` — and the first hand edit that disagreed with
  * itself would be a task with two identities.
  *
- * There is deliberately **no `order` field**. The array *is* the order. A stored rank is a
- * second source of truth that a hand-edited or merged file can contradict, and then
- * something has to decide which of the two orderings the panel obeys.
+ * There is deliberately **no `order` field**: a stored rank is a second source of truth
+ * that a hand-edited or merged file can contradict, and then something has to decide which
+ * of the two orderings wins. The array is the *file's* order — what a pull request reads
+ * top to bottom, where appends land. The Tasks panel does not draw it verbatim any more:
+ * each status group is drawn by `updated_unix_ms`, newest first, with the array as the
+ * tie-break (`groups` in `ui/src/sidebar/TasksPanel/model.ts` carries the argument). That
+ * is a reading order derived from stamps this struct already carries, not a second stored
+ * one, which is why it does not reopen the argument above.
  */
 tasks: Array<Task>, };

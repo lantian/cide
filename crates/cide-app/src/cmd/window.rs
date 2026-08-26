@@ -1008,6 +1008,7 @@ mod tests {
                 role: cide_ipc::PaneRole::Auxiliary,
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "Cargo.toml".into(),
             },
         )
@@ -1051,6 +1052,7 @@ mod tests {
             role: cide_ipc::PaneRole::Auxiliary,
             session: Some(session),
             conversation: None,
+            conversation_since: None,
             title: "atlas : claude — mirror".into(),
         };
         let mirror_id = mirror.id;
@@ -1108,6 +1110,7 @@ mod tests {
             role: cide_ipc::PaneRole::Auxiliary,
             session: Some(leaves),
             conversation: None,
+            conversation_since: None,
             title: "atlas : claude".into(),
         };
         let second_id = second.id;
@@ -1156,6 +1159,7 @@ mod tests {
             role: cide_ipc::PaneRole::Auxiliary,
             session: Some(cide_ipc::SessionId::new()),
             conversation: None,
+            conversation_since: None,
             title: "atlas : claude".into(),
         };
         let second_id = second.id;

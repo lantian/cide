@@ -105,6 +105,16 @@ permissionMode?: string,
  */
 maxConcurrent?: number, 
 /**
+ * `worktree:`. `None` means the file does not say, which the loader reads as `true`.
+ *
+ * An `Option` for `max_concurrent`'s exact reason one field up: the form carries what the
+ * file says, and `Some` is written back only when the file (or the user) actually said
+ * it. This field existing on the draft at all is load-bearing — `defs::render` writes
+ * only the fields the draft models, so a switch the draft did not carry would be
+ * silently *deleted* from a hand-written definition by the next panel save.
+ */
+worktree?: boolean, 
+/**
  * The body of the file: the role's system prompt, verbatim.
  *
  * The one field here that is a document rather than a switch, and the reason the format is

@@ -57,17 +57,25 @@ pub fn settings_set(
 ) -> Result<Settings, CoreError> {
     // Read before the patch, so the comparisons below are against what the windows are
     // actually wearing rather than against the value we just wrote.
-    let (was_theme, was_explorer, was_binaries, was_working_set, was_memory_limit, was_cli) = state
-        .with(|ws| {
-            (
-                ws.settings.theme,
-                ws.settings.explorer,
-                ws.settings.inspections.server_binaries.clone(),
-                ws.settings.inspections.server_index_working_set_pct,
-                ws.settings.inspections.server_memory_limit_mb,
-                ws.settings.claude.cli.binary.clone(),
-            )
-        });
+    let (
+        was_theme,
+        was_explorer,
+        was_binaries,
+        was_working_set,
+        was_memory_limit,
+        was_cli,
+        was_job_notify,
+    ) = state.with(|ws| {
+        (
+            ws.settings.theme,
+            ws.settings.explorer,
+            ws.settings.inspections.server_binaries.clone(),
+            ws.settings.inspections.server_index_working_set_pct,
+            ws.settings.inspections.server_memory_limit_mb,
+            ws.settings.claude.cli.binary.clone(),
+            ws.settings.terminal.job_notify_after_secs,
+        )
+    });
     state.update(|ws| {
         apply_patch(&mut ws.settings, patch);
         // Settings are not part of any structural invariant, but they are part of the tree,
@@ -125,6 +133,22 @@ pub fn settings_set(
         && let Some(registry) = app.try_state::<crate::lsp::DiagnosticsRegistry>()
     {
         registry.restart_everywhere(&app, cide_ipc::DiagnosticSourceId::for_server("gopls"));
+    }
+    // The job threshold reaches sessions that are already running, and it has to: a session
+    // outlives every pane, tab and window — most shells are spawned once per app run — so a
+    // value baked in at spawn would leave the settings row doing nothing visible until the
+    // next relaunch. Cheap enough not to gate on anything beyond the comparison: one channel
+    // send per session, serviced on a coalescer thread that is already awake, and a no-op on
+    // every session that watches no jobs (every Claude pane — its state comes from hooks).
+    if was_job_notify != settings.terminal.job_notify_after_secs
+        && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
+    {
+        let after = crate::lifecycle::job_notify_after(&settings);
+        for id in registry.ids() {
+            if let Some(session) = registry.get(id) {
+                session.set_job_announce_after(after);
+            }
+        }
     }
     // A new Claude binary means a new version string in every window's header. The probe is
     // a fork of a Node process, so it runs on a blocking worker rather than making the
@@ -360,6 +384,7 @@ pub fn tab_open_settings(
                 // the settings screen simply renders over it.
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "settings".into(),
             },
         )?;

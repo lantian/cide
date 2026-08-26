@@ -99,10 +99,29 @@ pub struct AgentDef {
     /// How many runs of this role may be live at once.
     ///
     /// Per role rather than only globally, because roles differ: a `qa` that reads and reports
-    /// parallelises, a `developer` holding a git worktree does not. Worktree isolation pins this
-    /// to 1 and `cide-agents` refuses a higher value with a sentence rather than silently
-    /// letting two runs share one checkout.
+    /// parallelises more safely than a `developer` rewriting files. The declared number is the
+    /// enforced number under both isolations — worktrees are per (role, task), so parallel
+    /// tasks are parallel checkouts and the old clamp-to-1 is gone with its premise; what
+    /// cannot run twice is two children in *one* checkout, which the registry's admission gate
+    /// holds in the queue.
     pub max_concurrent: u16,
+    /// `worktree:` — whether this role's runs take a worktree under the project's worktree
+    /// isolation, default `true`.
+    ///
+    /// `false` opts the role out: its runs stand in the **project root**, on the user's own
+    /// checked-out branch, beside the user's own uncommitted changes. That is the right shape
+    /// for a role that only reads — a reviewer, a reporter — and the wrong one for anything
+    /// that edits, which is why it is per role and opt-*out*: the safe posture stays the
+    /// default and the file has to say otherwise. An opted-out role has no `cide/<role>`
+    /// branches and nothing to integrate — its work, if any, lands directly where the user is.
+    /// Under `isolation: shared` the flag is meaningless and ignored.
+    #[serde(default = "default_worktree")]
+    pub worktree: bool,
+}
+
+/// `AgentDef::worktree`'s default, for files and wire payloads from before the field existed.
+fn default_worktree() -> bool {
+    true
 }
 
 /// Where one run is.
@@ -205,6 +224,23 @@ pub enum RunState {
     /// SIGSTOPped. `since_unix_ms` is what the elapsed figure counts from, and what decides
     /// whether the thaw is long enough to suspect a timed-out turn.
     Paused { since_unix_ms: u64 },
+    /// The run outlived its process: cide restarted (or quit) while this run was open, the
+    /// shutdown ladder ended the child, and the registry's snapshot brought the row back.
+    ///
+    /// # Not `Failed`, and not `Paused`, and both distinctions are load-bearing
+    ///
+    /// `Failed` closes a run — it may be dispatched again but never continued — and this run's
+    /// conversation is intact: a `claude` child was given the ladder's grace precisely so it
+    /// could finish writing the transcript `--resume` depends on, and an `opencode` conversation
+    /// lives in that CLI's own store. `Paused` claims a frozen **live** child (`SIGCONT` is its
+    /// resume), and there is no process here at all. What resuming this state means is a *new
+    /// child continuing the old conversation*, through the same admission gate as any start —
+    /// an interrupted run holds no slot, and its role's worktree may have been given to a newer
+    /// run in the meantime, so it queues like anything else.
+    ///
+    /// The child is gone, so there is no session to open, nothing to pause, and no exit code —
+    /// the ladder's kill is cide's own act, not a fact about the work.
+    Interrupted,
     /// The child exited. `code` is the real status, kept for the reason
     /// [`crate::SessionExit`]'s doc gives: a bare "exited" with no number is the one thing a
     /// finished row cannot be read from.
@@ -572,6 +608,15 @@ pub struct AgentDraft {
     /// freeze a default that a later cide may want to change.
     #[ts(optional)]
     pub max_concurrent: Option<u16>,
+    /// `worktree:`. `None` means the file does not say, which the loader reads as `true`.
+    ///
+    /// An `Option` for `max_concurrent`'s exact reason one field up: the form carries what the
+    /// file says, and `Some` is written back only when the file (or the user) actually said
+    /// it. This field existing on the draft at all is load-bearing — `defs::render` writes
+    /// only the fields the draft models, so a switch the draft did not carry would be
+    /// silently *deleted* from a hand-written definition by the next panel save.
+    #[ts(optional)]
+    pub worktree: Option<bool>,
     /// The body of the file: the role's system prompt, verbatim.
     ///
     /// The one field here that is a document rather than a switch, and the reason the format is

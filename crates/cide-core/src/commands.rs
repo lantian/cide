@@ -598,6 +598,26 @@ fn build() -> Vec<Command> {
             CLAUDE,
         )
         .when("paneFocused"),
+        /*
+         * The chord spellings of the two mouse gestures beside it, asked for by name: "CTRL+(
+         * - new claude panel, CTRL+) - new claude row" (and the bash pair under Terminal
+         * below). `claude.split.right` is the pane title bar's `⊞ claude pane` — a tile beside
+         * the focused pane, `PaneTitleBar.tsx`'s exact call — and `claude.addRow` is the
+         * header's `⊞ claude row`, the full-width row `RowControls.tsx` adds. Both create the
+         * session they split to, so they carry `claude.split.newSession`'s clause and not
+         * `claudePaneFocused`, for the reason its comment above walks through. "panel" is the
+         * user's own word for a tile, so it is a keyword rather than lost.
+         */
+        Command::new(
+            "claude.split.right",
+            "Split right: new Claude session",
+            CLAUDE,
+        )
+        .when("paneFocused")
+        .keywords(&["panel", "tile", "beside"]),
+        Command::new("claude.addRow", "Add row: new Claude session", CLAUDE)
+            .when("paneFocused")
+            .keywords(&["panel", "full-width"]),
         Command::new("claude.fork", "Fork session into new pane", CLAUDE).when("claudePaneFocused"),
         Command::new("claude.mirror", "Mirror session into new pane", CLAUDE)
             .when("claudePaneFocused"),
@@ -684,6 +704,15 @@ fn build() -> Vec<Command> {
         // Terminal. Splitting one below is offered from any pane — it creates the terminal
         // it splits to — whereas clearing needs a terminal already focused.
         Command::new("terminal.splitBelow", "Split terminal below", TERMINAL).when("paneFocused"),
+        // The bash half of the spawn-chord family — see `claude.split.right` above for the
+        // shape. A tile beside the focused pane, and the header's `⊞ bash row`. "bash" and
+        // "panel" are the words the ask used, so both are keywords.
+        Command::new("terminal.splitRight", "Split terminal right", TERMINAL)
+            .when("paneFocused")
+            .keywords(&["bash", "panel", "tile", "beside"]),
+        Command::new("terminal.addRow", "Add row: new shell", TERMINAL)
+            .when("paneFocused")
+            .keywords(&["bash", "panel", "full-width"]),
         Command::new("terminal.clear", "Clear terminal", TERMINAL).when("terminalFocused"),
         Command::new("terminal.paste", "Paste into terminal", TERMINAL).when("terminalFocused"),
         /*
@@ -1649,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_commands_require_a_claude_pane_except_the_two_that_do_not_act_on_a_session() {
+    fn claude_commands_require_a_claude_pane_except_the_ones_that_do_not_act_on_a_session() {
         for command in registry().iter().filter(|c| c.id.starts_with("claude.")) {
             let expected = match command.id.as_str() {
                 // "Mention the file I am looking at", which means an editor has focus and so
@@ -1657,9 +1686,9 @@ mod tests {
                 // could only ever be offered in the one state where it has no file to
                 // mention.
                 "claude.mention.file" => "editorFocused && claudeTarget",
-                // Creates the session it splits to, so it needs a pane to split and not a
-                // conversation to act on — the same clause `terminal.splitBelow` carries.
-                "claude.split.newSession" => "paneFocused",
+                // Each creates the session it splits to, so it needs a pane to split and not
+                // a conversation to act on — the same clause `terminal.splitBelow` carries.
+                "claude.split.newSession" | "claude.split.right" | "claude.addRow" => "paneFocused",
                 _ => "claudePaneFocused",
             };
             assert_eq!(command.when.as_deref(), Some(expected), "{}", command.id);
@@ -1784,12 +1813,14 @@ mod tests {
         let found = search("split");
         assert_eq!(ids(&found)[0], "pane.split.right");
         assert_eq!(
-            &ids(&found)[..4],
+            &ids(&found)[..6],
             &[
                 "pane.split.right",
                 "pane.split.down",
                 "claude.split.newSession",
+                "claude.split.right",
                 "terminal.splitBelow",
+                "terminal.splitRight",
             ]
         );
     }

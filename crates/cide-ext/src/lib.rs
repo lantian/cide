@@ -536,9 +536,18 @@ fn scan(config: &ExtConfig) -> Scan {
                     description: read.description,
                     capabilities: read.capabilities,
                     installed: installed.map(|i| i.version.clone()),
-                    update_available: installed.is_some_and(|i| {
-                        i.version != read.version || i.commit != head.clone().unwrap_or_default()
-                    }),
+                    // The *declared* version, and nothing else. This used to also compare the
+                    // installed extension's pinned commit against the clone's HEAD, as a net
+                    // under authors who ship code without bumping `version` — but HEAD moves for
+                    // the whole repository, so the first time a marketplace gained an extension,
+                    // every other extension installed from it offered a byte-identical "update".
+                    // A button that cries wolf teaches people to stop reading it. The version is
+                    // the author's own claim that something shipped, it is what the marketplace
+                    // README already demands be bumped with every code change, and inequality
+                    // (not ordering) keeps a rollback offerable too. The per-directory tree hash
+                    // was considered and lost: one `git` fork per row per refresh to catch only
+                    // authors ignoring their own versioning discipline.
+                    update_available: installed.is_some_and(|i| i.version != read.version),
                     unavailable: read.unavailable,
                 }),
                 Err(problem) => {

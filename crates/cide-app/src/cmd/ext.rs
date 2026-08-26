@@ -322,6 +322,7 @@ pub async fn tab_open_extension(
                 // simply renders over it, exactly as the Settings tab does.
                 session: None,
                 conversation: None,
+                conversation_since: None,
                 title: "extension".into(),
             },
         )

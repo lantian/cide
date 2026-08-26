@@ -228,6 +228,47 @@ impl Default for Geometry {
     }
 }
 
+/// Rewrites a session's output, one line at a time, before anything downstream sees it.
+///
+/// # What this is for, and the shape of the stream it exists for
+///
+/// A headless harness child (`opencode run --format json`) emits machine events — ndjson, one
+/// event per line — and that stream is simultaneously the *channel* something in the app parses
+/// for run state and the *picture* a pane shows when a person opens the run. Raw, the picture is
+/// unreadable. This hook is the reconciliation: it runs at the **top of the coalescer's output
+/// arm**, so the vt100 mirror, every sink, the frame splitter and the choked-sink catch-up all
+/// operate on one rendered stream and cannot disagree — a catch-up frame is rendered from the
+/// mirror, and a mirror holding different text than the sinks is precisely the corruption the
+/// coalescer exists to prevent. The caller that needs the *raw* line reads it inside this hook,
+/// before returning the rendering; there is deliberately no second, raw sink class.
+///
+/// # The contract
+///
+/// Called once per complete line, on the coalescer thread, with the terminator (and a trailing
+/// `\r`) stripped. `Some(text)` replaces the line — it may span several lines, and the plumbing
+/// converts its `\n`s to the `\r\n` a terminal needs, since these bytes bypass the pty's own
+/// output post-processing. `None` drops the line from the display entirely. A line that is not
+/// the hook's format should be returned verbatim, not dropped: this stream is also where a
+/// child's own error text arrives.
+///
+/// It runs on the thread every byte of every session flows through, so the same law as
+/// [`Sink::deliver`] applies: never block, never call back into this session. Unlike a sink it
+/// runs *outside* the sink-list lock and owes no acknowledgement — which is much of why the
+/// app's stream observer moved into it.
+#[derive(Clone)]
+pub struct LineRender(pub LineRenderFn);
+
+/// The closure inside [`LineRender`], named so the tuple field stays legible to clippy and
+/// callers alike.
+pub type LineRenderFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+impl std::fmt::Debug for LineRender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The pointee is an opaque closure; naming the type is everything there is to print.
+        f.write_str("LineRender(..)")
+    }
+}
+
 /// What to run, where, and with which environment.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -283,6 +324,11 @@ pub struct SpawnSpec {
     /// running has finished. See [`crate::jobs`] for what is watched and why there is a
     /// threshold at all.
     pub watch_jobs: Option<Duration>,
+    /// Rewrite this session's output line-by-line before the mirror or any sink sees it.
+    ///
+    /// `None` — every pane, every claude child — is the zero-cost path: bytes flow untouched.
+    /// See [`LineRender`] for the contract and the reason there is no raw sink class beside it.
+    pub render: Option<LineRender>,
 }
 
 impl SpawnSpec {
@@ -297,6 +343,7 @@ impl SpawnSpec {
             credit: CreditPolicy::default(),
             preload: Vec::new(),
             watch_jobs: None,
+            render: None,
         }
     }
 
@@ -356,6 +403,12 @@ impl SpawnSpec {
     /// Seed the screen mirror with bytes from a previous run. See [`SpawnSpec::preload`].
     pub fn preload(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.preload = bytes.into();
+        self
+    }
+
+    /// Render this session's output for display. See [`LineRender`].
+    pub fn render(mut self, render: LineRender) -> Self {
+        self.render = Some(render);
         self
     }
 
@@ -432,6 +485,11 @@ enum Control {
         /// The screen as of the cut point. The caller sends this to the sink itself.
         reply: Sender<Vec<u8>>,
     },
+    /// Retune [`JobWatch::set_announce_after`] on the coalescer's probe, if it has one.
+    ///
+    /// A control message rather than a shared atomic so the watch keeps exactly one writer —
+    /// see [`PtySession::set_job_announce_after`].
+    JobThreshold(Duration),
 }
 
 /// What the coalescer sends to sinks.
@@ -577,6 +635,7 @@ impl PtySession {
             Arc::clone(&exited),
             spec.credit,
             probe,
+            spec.render.clone(),
         );
         spawn_writer(writer, writer_rx);
 
@@ -675,6 +734,24 @@ impl PtySession {
         self.job_listeners.lock().push(Box::new(f));
     }
 
+    /// Change the job announce threshold on a running session — see
+    /// [`SpawnSpec::watch_jobs`], which set it at spawn.
+    ///
+    /// This exists because the threshold is a user setting now and a session outlives every
+    /// pane, tab and window: a threshold fixed at spawn would leave every shell the user
+    /// already has open on yesterday's number for the rest of the app's run, which is a
+    /// settings row that appears to do nothing. Harmless on a session that watches no jobs —
+    /// every Claude pane — where there is no probe for the message to reach.
+    ///
+    /// Through the control channel rather than a shared atomic, because the coalescer thread
+    /// owns the [`JobWatch`] outright and that is worth keeping: the rule's state machine has
+    /// exactly one writer, so nothing can interleave with an observation.
+    pub fn set_job_announce_after(&self, announce_after: Duration) {
+        // A send to a coalescer that has already exited is a session on its way down; there
+        // is nobody left to notify about anything, so the error carries no information.
+        let _ = self.control_tx.send(Control::JobThreshold(announce_after));
+    }
+
     pub fn geometry(&self) -> Geometry {
         *self.geometry.lock()
     }
@@ -752,6 +829,16 @@ impl PtySession {
         }
 
         self.sinks.lock().push(registered(id, sink));
+        // A dead session answers with the whole transcript, not the final screen —
+        // [`Self::full_state`]'s doc carries the History argument (a run's twenty minutes
+        // shown as its last two dozen lines). Only the *exited* arm: a live child reaching
+        // this fallback (a coalescer busy past ATTACH_TIMEOUT) keeps the one-screen
+        // `reattach_state`, because a live hydration's scrollback story belongs to the
+        // eviction-replay machinery upstream and a full replay here would prepend a second
+        // copy of history to a terminal that already holds one.
+        if self.exited.load(Ordering::Acquire) {
+            return (id, self.full_state());
+        }
         // `reattach_state`, not `screen_state`: this is still a sink adopting a child's
         // current screen, and the fallback path differing from the coalescer path in *which
         // buffer the receiver ends up on* would make the alt-screen desync depend on whether
@@ -841,6 +928,65 @@ impl PtySession {
     /// application repaints from its own state.
     pub fn screen_state(&self) -> Vec<u8> {
         self.vt.lock().screen().state_formatted()
+    }
+
+    /// The whole retained transcript, as flowing lines: every scrollback row the mirror still
+    /// holds (oldest first), then the final screen's rows, trailing blanks trimmed.
+    ///
+    /// [`Self::screen_state`] and [`Self::reattach_state`] both emit **one screen** — `vt100`'s
+    /// `contents_formatted` stops at the viewport — and for a live child that is the right
+    /// shape: the application owns everything above the fold and repaints on demand. A *dead*
+    /// session is the opposite case. Its transcript is the whole reason a pane attaches to it
+    /// (the Agents panel's History), the child can repaint nothing, and the one-screen snapshot
+    /// showed a twenty-minute run as its last two dozen rendered lines — reported by the first
+    /// user to open one as "about 10 lines, why not full session?". The mirror had the answer
+    /// all along ([`SCROLLBACK`] lines of it); nothing ever emitted it.
+    ///
+    /// So this walks the scrollback by stepping `set_scrollback` one row at a time and taking
+    /// the top visible row of each window, and emits every row as `<row>\x1b[m\r\n` — the SGR
+    /// reset so one row's trailing colour cannot bleed into the next, the hard break costing a
+    /// wrapped line its wrap flag and nothing visible. The final screen is emitted the same
+    /// way rather than as a `contents_formatted` dump, because that dump leads with a
+    /// clear-screen which would erase the just-replayed tail out of the receiving viewport —
+    /// the eviction-replay path upstream survives its own such clear only because what it
+    /// erases there is exactly what the dump repaints, and here it would not be.
+    ///
+    /// The lead-in matches [`reattach_bytes`]: ST first, to abort any string sequence the
+    /// receiver may be sitting in, then the *normal* buffer selected — scrollback lives there,
+    /// and a receiver left on the alternate screen would paint the history into a grid that
+    /// never scrolls.
+    pub fn full_state(&self) -> Vec<u8> {
+        let mut vt = self.vt.lock();
+        let (_, cols) = vt.screen().size();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x1b\\\x1b[?1049l");
+        // Clamped by the crate to what the scrollback actually holds, which is how the real
+        // depth is learned without a second API.
+        vt.screen_mut().set_scrollback(usize::MAX);
+        let depth = vt.screen().scrollback();
+        for offset in (1..=depth).rev() {
+            vt.screen_mut().set_scrollback(offset);
+            if let Some(row) = vt.screen().rows_formatted(0, cols).next() {
+                out.extend_from_slice(&row);
+            }
+            out.extend_from_slice(b"\x1b[m\r\n");
+        }
+        vt.screen_mut().set_scrollback(0);
+        // A dead screen's tail is mostly empty rows; replaying them would put a page of blank
+        // lines under the transcript. `rows` (plain) decides emptiness, `rows_formatted`
+        // supplies what is actually written, and the two iterate the same grid.
+        let keep = vt
+            .screen()
+            .rows(0, cols)
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|row| !row.trim().is_empty())
+            .map_or(0, |last| last + 1);
+        for row in vt.screen().rows_formatted(0, cols).take(keep) {
+            out.extend_from_slice(&row);
+            out.extend_from_slice(b"\x1b[m\r\n");
+        }
+        out
     }
 
     /// [`Self::screen_state`] made self-sufficient: the buffer identity first, then the
@@ -1032,6 +1178,7 @@ fn serve_control(
     policy: &CreditPolicy,
     pending: &mut Vec<u8>,
     first_byte_at: &mut Option<Instant>,
+    probe: &mut Option<JobProbe>,
 ) {
     match request {
         Control::Attach { id, sink, reply } => {
@@ -1044,6 +1191,13 @@ fn serve_control(
             // end. The sink stays attached regardless — it is registered and will receive
             // output; only the atomicity of its first frame was lost.
             let _ = reply.send(reattach_bytes(vt));
+        }
+        Control::JobThreshold(after) => {
+            // Absent for every session that watches no jobs — a Claude pane — where the
+            // retune has nothing to reach and correctly changes nothing.
+            if let Some(probe) = probe.as_mut() {
+                probe.watch.set_announce_after(after);
+            }
         }
     }
 }
@@ -1116,6 +1270,62 @@ fn foreground_pgid(_master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) -> Option<i3
     None
 }
 
+/// How many bytes of one unterminated line [`render_lines`] will hold before giving up on it.
+///
+/// Generous, because a harness event line legitimately carries a whole file read in one JSON
+/// document; what this bounds is a child that simply never writes a newline, whose buffer would
+/// otherwise grow without limit. Past it the held bytes are flushed through **raw** — ugly
+/// beats lost — and the rest of that line passes unrendered until its terminator arrives.
+const RENDER_LINE_CAP: usize = 1 << 20;
+
+/// The partial line the renderer is carrying between chunks.
+#[derive(Default)]
+struct RenderState {
+    buffer: Vec<u8>,
+    /// The tail of a line whose head was flushed raw at [`RENDER_LINE_CAP`] — rendering the
+    /// tail alone would hand the hook half a document and call it a line.
+    resyncing: bool,
+}
+
+/// Apply the hook to every complete line in `chunk`, holding the remainder.
+///
+/// The output substitutes for the raw chunk in the coalescer's stream, so its line endings are
+/// written as `\r\n` explicitly: these bytes never pass the pty's own output post-processing
+/// (the child's did, which is why the split below strips a trailing `\r` before the hook sees
+/// the line).
+fn render_lines(state: &mut RenderState, render: &LineRender, chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    state.buffer.extend_from_slice(chunk);
+
+    let mut start = 0;
+    while let Some(offset) = state.buffer[start..].iter().position(|b| *b == b'\n') {
+        let end = start + offset;
+        let line = &state.buffer[start..end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if state.resyncing {
+            // The head of this line already went out raw; send the tail the same way, with
+            // the terminator, and resume rendering from the next line.
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+            state.resyncing = false;
+        } else if let Some(rendered) = (render.0)(&String::from_utf8_lossy(line)) {
+            // The hook's text is display content; its own newlines need the full terminator
+            // too, for the reason in the function doc.
+            out.extend_from_slice(rendered.replace('\n', "\r\n").as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        start = end + 1;
+    }
+    state.buffer.drain(..start);
+
+    if state.buffer.len() > RENDER_LINE_CAP {
+        out.append(&mut state.buffer);
+        state.resyncing = true;
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)] // one private call site; a params struct would name nothing
 fn spawn_coalescer(
     rx: Receiver<Vec<u8>>,
     control_rx: Receiver<Control>,
@@ -1124,12 +1334,14 @@ fn spawn_coalescer(
     exited: Arc<AtomicBool>,
     policy: CreditPolicy,
     mut probe: Option<JobProbe>,
+    render: Option<LineRender>,
 ) {
     thread::Builder::new()
         .name("cide-pty-coalesce".into())
         .spawn(move || {
             let mut pending: Vec<u8> = Vec::with_capacity(FLUSH_BYTES * 2);
             let mut first_byte_at: Option<Instant> = None;
+            let mut render_state = RenderState::default();
 
             loop {
                 // Wait indefinitely when idle; once bytes are pending, only wait out the
@@ -1168,9 +1380,22 @@ fn spawn_coalescer(
                             &policy,
                             &mut pending,
                             &mut first_byte_at,
+                            &mut probe,
                         );
                     }
                     Event::Output(chunk) => {
+                        // The render hook, if any, rewrites the stream **here** — before the
+                        // mirror, before `pending`, before the frame splitter — so everything
+                        // downstream, the choked-sink catch-up included, agrees on one text.
+                        // See [`LineRender`]. A chunk that ended mid-line renders to nothing
+                        // and is held; skipping the rest keeps `first_byte_at` honest.
+                        let chunk = match render.as_ref() {
+                            Some(render) => render_lines(&mut render_state, render, &chunk),
+                            None => chunk,
+                        };
+                        if chunk.is_empty() {
+                            continue;
+                        }
                         // The mirror is fed unconditionally, attached or not — that is what
                         // makes a reattaching pane able to paint the current screen.
                         vt.lock().process(&chunk);
@@ -1224,6 +1449,14 @@ fn spawn_coalescer(
                         }
                     }
                     Event::Eof => {
+                        // A final line the child never terminated still belongs on screen —
+                        // rendered stream or not, EOF is the one point after which nothing
+                        // else will ever complete it.
+                        if !render_state.buffer.is_empty() {
+                            vt.lock().process(&render_state.buffer);
+                            pending.extend_from_slice(&render_state.buffer);
+                            render_state.buffer.clear();
+                        }
                         if !pending.is_empty() {
                             broadcast(
                                 &sinks,
@@ -1498,8 +1731,8 @@ mod tests {
         let spec = SpawnSpec::new("/bin/bash", std::env::temp_dir())
             .arg("--norc")
             .arg("-i")
-            // Far below the ten seconds the app ships, for the ordinary reason: a test that
-            // waits out a production threshold is a test nobody runs.
+            // Far below the two minutes the app defaults to, for the ordinary reason: a test
+            // that waits out a production threshold is a test nobody runs.
             .watch_jobs(Duration::from_millis(100));
         let session = PtySession::spawn(spec).expect("spawn bash");
 
@@ -1656,6 +1889,134 @@ mod tests {
             screen.contains("printed-before-anyone-was-listening"),
             "the mirror lost output produced with no sink attached: {screen:?}"
         );
+    }
+
+    /// The line splitter under the render hook: chunks land mid-line, terminators vary, the
+    /// hook may drop or multiply lines, and the cap flushes raw rather than losing bytes.
+    #[test]
+    fn render_lines_holds_partials_and_flushes_the_oversized_raw() {
+        let render = LineRender(Arc::new(|line: &str| {
+            if line == "drop" {
+                return None;
+            }
+            Some(format!("<{line}>"))
+        }));
+        let mut state = RenderState::default();
+
+        // A line split across two chunks renders once, when it completes; `\r\n` arrives as
+        // the pty wrote it and the hook sees neither half of the terminator.
+        assert_eq!(render_lines(&mut state, &render, b"hel"), b"");
+        assert_eq!(
+            render_lines(&mut state, &render, b"lo\r\nwo"),
+            b"<hello>\r\n"
+        );
+        assert_eq!(render_lines(&mut state, &render, b"rld\n"), b"<world>\r\n");
+
+        // `None` drops the line from the display; a multi-line rendering gets real terminators.
+        assert_eq!(render_lines(&mut state, &render, b"drop\n"), b"");
+        let two = LineRender(Arc::new(|_: &str| Some("a\nb".into())));
+        assert_eq!(render_lines(&mut state, &two, b"x\n"), b"a\r\nb\r\n");
+
+        // Past the cap the held head goes out raw — ugly beats lost — and the tail of that
+        // line follows raw at its terminator, with rendering resuming on the next line.
+        let mut state = RenderState::default();
+        let huge = vec![b'x'; RENDER_LINE_CAP + 1];
+        assert_eq!(render_lines(&mut state, &render, &huge), huge);
+        assert!(state.resyncing);
+        assert_eq!(
+            render_lines(&mut state, &render, b"tail\nok\n"),
+            b"tail\r\n<ok>\r\n"
+        );
+    }
+
+    /// The hook, end to end: one rendered stream is what the mirror holds and what a sink is
+    /// delivered — there is no raw copy anywhere downstream for the two to disagree over.
+    #[test]
+    fn a_rendered_session_shows_the_rendering_in_mirror_and_sink_alike() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            // The `sleep` is what makes the sink assertion below race-free: the sink is
+            // attached after the spawn, a fresh sink gets no replay from the pty (hydration is
+            // the pane layer's job), and under a saturated box the reader thread once
+            // delivered the whole output before `attach` ran — the sink then held `""` and
+            // this test failed with the coalescer blameless. The same beat, for the same
+            // reason, as the harness-bound-run test over in `cide-app`.
+            .arg("sleep 0.2; printf 'alpha\\nbeta\\n'")
+            .render(LineRender(Arc::new(|line: &str| Some(format!("[{line}]")))));
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_copy = Arc::clone(&received);
+        session.attach(Arc::new(move |bytes: &[u8]| -> bool {
+            sink_copy.lock().extend_from_slice(bytes);
+            true
+        }));
+
+        let deadline = Instant::now() + DEADLINE;
+        let mut screen = String::new();
+        while Instant::now() < deadline {
+            screen = String::from_utf8_lossy(&session.screen_state()).into_owned();
+            if screen.contains("[beta]") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            screen.contains("[alpha]") && screen.contains("[beta]"),
+            "the mirror holds the raw stream, so a rehydrated pane would too: {screen:?}"
+        );
+        assert!(
+            !screen.contains("alpha\nbeta"),
+            "the raw lines leaked past the hook: {screen:?}"
+        );
+
+        let delivered = String::from_utf8_lossy(&received.lock().clone()).into_owned();
+        assert!(
+            delivered.contains("[alpha]"),
+            "a sink was delivered something the mirror does not hold: {delivered:?}"
+        );
+    }
+
+    /// **A dead session's snapshot is the whole transcript, not the final screen.**
+    ///
+    /// The regression this pins: a run's pane opened from the Agents panel's History showed
+    /// "about 10 lines" of a twenty-minute session, because every snapshot path emitted
+    /// `contents_formatted` — the viewport — while the mirror sat on 5,000 lines of
+    /// scrollback nothing ever read. A 24-row screen over 200 numbered lines makes the loss
+    /// mechanical: line 1 exists only in scrollback, so this assertion fails on any
+    /// one-screen snapshot.
+    #[test]
+    fn an_exited_sessions_snapshot_carries_its_whole_scrollback() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("i=1; while [ $i -le 200 ]; do echo \"transcript line $i\"; i=$((i+1)); done");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let deadline = Instant::now() + DEADLINE;
+        while !session.has_exited() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.has_exited(), "child exit was never observed");
+        // The exit is reaped before the last output is necessarily processed; the mirror is
+        // fed on the coalescer thread, so wait for the tail line to land in it.
+        let deadline = Instant::now() + DEADLINE;
+        while !String::from_utf8_lossy(&session.screen_state()).contains("transcript line 200")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let (_, snapshot) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true));
+        let text = String::from_utf8_lossy(&snapshot);
+        assert!(
+            text.contains("transcript line 1\u{1b}") || text.contains("transcript line 1\r"),
+            "the first line lives only in scrollback and must be in the snapshot"
+        );
+        assert!(text.contains("transcript line 200"), "{}", text.len());
+        // And the ordering is the transcript's: line 1 before line 200.
+        let first = text.find("transcript line 1").expect("asserted above");
+        let last = text.find("transcript line 200").expect("asserted above");
+        assert!(first < last, "scrollback precedes the screen");
     }
 
     #[test]
@@ -1976,9 +2337,17 @@ mod tests {
     fn small_writes_are_coalesced_into_few_frames() {
         // 2000 one-byte writes with no delay must not become 2000 IPC frames; if they do,
         // every frame is under Tauri's 1024-byte raw threshold and takes the eval path.
+        //
+        // The `sleep` is what makes counting from a sink race-free: the sink is attached
+        // after the spawn and gets no replay from the pty, and under a saturated box the
+        // reader thread once delivered the entire burst before `attach` ran — this test then
+        // failed with "0 bytes across 0 frames" after the full deadline, the coalescer
+        // blameless. Three load flakes were misread as a slow burst before the attach race
+        // was recognised; the rendered-session test above carries the same beat for the same
+        // reason.
         let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
             .arg("-c")
-            .arg("for i in $(seq 1 2000); do printf x; done");
+            .arg("sleep 0.2; for i in $(seq 1 2000); do printf x; done");
         let session = PtySession::spawn(spec).expect("spawn sh");
 
         let (tx, rx) = mpsc::channel::<usize>();
@@ -1986,17 +2355,26 @@ mod tests {
         let sink: Arc<dyn Sink> = Arc::new(move |b: &[u8]| tx.lock().send(b.len()).is_ok());
         session.attach(sink);
 
-        let deadline = Instant::now() + DEADLINE;
+        // Three deadlines, not one: under a full `--workspace` run this box is saturated and
+        // the child's own 2000-iteration loop can take longer than the shared DEADLINE — the
+        // coalescer blameless both times this test has flaked on load. The property under test
+        // is the frames-to-bytes ratio, which waiting longer cannot fake.
+        let deadline = Instant::now() + DEADLINE * 3;
         let mut frames = 0usize;
         let mut total = 0usize;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match rx.recv_timeout(remaining.min(Duration::from_millis(400))) {
-                Ok(n) => {
-                    frames += 1;
-                    total += n;
-                }
-                Err(_) if total > 0 => break,
-                Err(_) => break,
+            // A timeout keeps waiting until the byte count is in or the deadline is. This
+            // used to break on any 400 ms silence, which read "the burst is over" — and
+            // under a full `--workspace` run the shell's own loop stalls longer than that
+            // mid-burst, so the test failed on machine load with the coalescer blameless.
+            // The comment under the next test names this exact class.
+            let Ok(n) = rx.recv_timeout(remaining.min(Duration::from_millis(400))) else {
+                continue;
+            };
+            frames += 1;
+            total += n;
+            if total >= 2000 {
+                break;
             }
         }
         assert!(

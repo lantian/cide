@@ -156,6 +156,16 @@ export interface PaneHost {
    */
   lastParsedAt?: number | undefined
   lastRenderedAt?: number | undefined
+  /**
+   * `performance.now()` when this terminal was last fitted to a *different* cell geometry.
+   *
+   * The second debt, beside `lastParsedAt`. A resize owes a frame exactly as parsed bytes do —
+   * every row the user is looking at has moved — and it is the only one an idle pane can
+   * incur, which is why maximising a quiet pane could leave it blank with nothing in the
+   * system able to notice. Stamped from `syncSize`'s changed-geometry path only, so a drag
+   * that reports the same cell size a hundred times arms nothing.
+   */
+  lastResizedAt?: number | undefined
   /** When this host was last unstuck, so a repair that did not work cannot become a loop. */
   lastRepairAt?: number | undefined
   /** The armed stall check, so at most one is outstanding per host. */
@@ -499,6 +509,45 @@ export function noteParsed(paneId: string): void {
 }
 
 /**
+ * Report that this pane's terminal has been fitted to a new cell geometry.
+ *
+ * Called from `panes/sessionSink.ts`'s `syncSize`, on the path where the fit actually changed
+ * `cols`/`rows` — the same path that decides to spend a `session_resize`, and for the same
+ * reason: a `ResizeObserver` callback that reports the geometry the terminal already had is
+ * not a resize, and stamping one would arm a timer per frame of a drag for a terminal that
+ * owes nothing.
+ *
+ * Separate from [`noteParsed`] rather than folded into it because the two debts are guarded
+ * differently — a scrolled-back viewport excuses unpainted bytes and does not excuse an
+ * unpainted resize. `terminal/renderStall.ts` carries that argument.
+ */
+export function noteResized(paneId: string): void {
+  const host = hosts.get(paneId)
+  if (!host) return
+  host.lastResizedAt = now()
+  /*
+   * Ask for the frame, then arm the watchdog in case the ask goes unanswered — the same pair
+   * `mountHost` uses on the way back in from parking, and for the same reason. A reflow
+   * *should* produce a frame on its own: `RenderService.resize` calls `_fullRefresh`, and if
+   * the renderer is paused that sets xterm's `_needsFullRefresh` for the intersection callback
+   * to spend. Both halves of that sentence have a way of not happening — the callback may not
+   * come, and a pane maximised while idle has no later output to force the issue — and the
+   * cost of asking anyway is one full repaint of one terminal per actual size change, which
+   * is what a resize is.
+   *
+   * In a `requestAnimationFrame` because the caller is inside a `ResizeObserver` callback,
+   * which runs after layout and before paint: a refresh queued from there belongs to the
+   * frame that has not been painted yet, and the terminal has just been told its new size on
+   * the line above. Safe in either order, exactly as at `mountHost`.
+   */
+  requestAnimationFrame(() => {
+    const term = hosts.get(paneId)?.terminal?.term
+    if (term !== undefined) term.refresh(0, term.rows - 1)
+  })
+  armStallCheck(host)
+}
+
+/**
  * Arm one stall check for this host.
  *
  * A timer per burst of output rather than a polling interval: output is bursty, and a session
@@ -537,15 +586,35 @@ function stallInput(host: PaneHost, atBottom: boolean): RenderStallInput {
     mounted: host.mounted,
     onScreen: onScreen(host),
     atBottom,
+    lastResizedAt: host.lastResizedAt ?? null,
   }
 }
 
-/** Bytes were parsed into this terminal and no frame has answered them yet. */
-function owesFrame(host: PaneHost): boolean {
-  return (
-    host.lastParsedAt !== undefined &&
-    (host.lastRenderedAt === undefined || host.lastRenderedAt < host.lastParsedAt)
+/**
+ * The unanswered events this terminal is carrying, or `undefined` if it owes nothing.
+ *
+ * The scheduling half of the rule in `terminal/renderStall.ts`, which is deliberately not
+ * exported from there: this one is about whether to keep a timer alive, and it therefore
+ * ignores the guards — a pane that is parked, off screen or scrolled back still *owes* the
+ * frame, it just must not be nudged for it.
+ *
+ * Both ends, because the two re-arm branches below ask different questions of the same debt.
+ * *How long has a frame been owed* is asked of `first`, so a trickle of output cannot keep
+ * pushing the deadline out in front of a renderer that died a minute ago. *Has the last
+ * repair answered this* is asked of `last`, so bytes that arrived after a repair are a fresh
+ * debt and not one that has already had its nudge.
+ */
+function frameDebt(host: PaneHost): { first: number; last: number } | undefined {
+  const painted = host.lastRenderedAt
+  const owed = [host.lastParsedAt, host.lastResizedAt].filter(
+    (at): at is number => at !== undefined && (painted === undefined || painted < at),
   )
+  return owed.length === 0 ? undefined : { first: Math.min(...owed), last: Math.max(...owed) }
+}
+
+/** Bytes were parsed or the terminal was resized, and no frame has answered yet. */
+function owesFrame(host: PaneHost): boolean {
+  return frameDebt(host) !== undefined
 }
 
 function checkStall(host: PaneHost): void {
@@ -553,6 +622,7 @@ function checkStall(host: PaneHost): void {
   if (!term || !host.opened) return
   const buffer = term.buffer.active
   const input = stallInput(host, buffer.viewportY === buffer.baseY)
+  const debt = frameDebt(host)
   if (!isRenderStalled(input)) {
     /*
      * Not stalled — but "not stalled" and "healthy" are different claims, and returning
@@ -565,7 +635,7 @@ function checkStall(host: PaneHost): void {
      * not buy a per-STALL_MS heartbeat (and `stallInput`'s forced layout) for as long as
      * it sits in that state.
      */
-    if (host.mounted && owesFrame(host) && input.now - (host.lastParsedAt ?? 0) < STALL_MS) {
+    if (host.mounted && debt !== undefined && input.now - debt.first < STALL_MS) {
       armStallCheck(host)
     }
     return
@@ -576,7 +646,8 @@ function checkStall(host: PaneHost): void {
     // then goes quiet, instead of nudging and logging every cooldown for ever.
     if (
       host.mounted &&
-      (host.lastRepairAt === undefined || host.lastRepairAt < (host.lastParsedAt ?? 0))
+      debt !== undefined &&
+      (host.lastRepairAt === undefined || host.lastRepairAt < debt.last)
     ) {
       armStallCheck(host)
     }
@@ -588,9 +659,20 @@ function checkStall(host: PaneHost): void {
   // reported as "it just stops outputting". A line here means a pane genuinely sat on a stale
   // frame; silence over a long session is the evidence that the renderer is keeping up on its
   // own, which is what this is supposed to become.
+  //
+  // Which debt, and where the viewport was sitting, because the two failures this answers are
+  // told apart by exactly those two facts: a paused renderer owes bytes, and a maximise that
+  // did not repaint owes a resize. A report of either should be diagnosable from the log
+  // alone rather than from a second round of questions.
+  const unanswered = (at: number | undefined): boolean =>
+    at !== undefined && (host.lastRenderedAt === undefined || host.lastRenderedAt < at)
+  const owes = [
+    unanswered(host.lastParsedAt) ? 'bytes' : '',
+    unanswered(host.lastResizedAt) ? 'a resize' : '',
+  ].filter(Boolean)
   void diag
     .log(
-      `pane ${host.paneId}: terminal parsed bytes but painted no frame for ${STALL_MS}ms while on screen; forcing the renderer back`,
+      `pane ${host.paneId}: terminal owes a frame for ${owes.join(' and ') || 'an event'} and painted none for ${STALL_MS}ms while on screen (${term.cols}x${term.rows}, viewport ${buffer.viewportY}/${buffer.baseY}); forcing the renderer back`,
     )
     .catch(() => {})
 }

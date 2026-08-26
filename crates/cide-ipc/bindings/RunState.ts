@@ -28,4 +28,4 @@
  * reach `SessionState`, because a paused *session* is a fact a pane must draw; what does not
  * reach it is the queue.)
  */
-export type RunState = { "state": "queued" } | { "state": "starting" } | { "state": "running" } | { "state": "idle" } | { "state": "awaitingPermission" } | { "state": "paused", sinceUnixMs: bigint, } | { "state": "finished", code: number, } | { "state": "failed", reason: string, };
+export type RunState = { "state": "queued" } | { "state": "starting" } | { "state": "running" } | { "state": "idle" } | { "state": "awaitingPermission" } | { "state": "paused", sinceUnixMs: bigint, } | { "state": "interrupted" } | { "state": "finished", code: number, } | { "state": "failed", reason: string, };

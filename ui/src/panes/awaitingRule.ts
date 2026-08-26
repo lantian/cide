@@ -2,25 +2,25 @@
  * When a session is *waiting for the user*, as opposed to merely not busy.
  *
  * The user's request was "notify me when it finished processing and is waiting for me". The
- * hard part is not the notification, it is the predicate: `SessionState` alone cannot answer
- * it. `Busy` is plainly not waiting and `AwaitingPermission` plainly is, but `Idle` is two
- * completely different situations wearing one name —
+ * hard part is not the notification, it is the predicate — and the predicate used to live
+ * here. `Idle` is two completely different situations wearing one name (a session at a fresh
+ * prompt that has never been asked anything, and a session that has just finished a turn),
+ * and the first version of this module told them apart with per-window *history*: one extra
+ * bit per session, "has it ever been `Busy`". That decision has since moved to Rust —
+ * `cide_claude::next_state` turns a `Stop` out of `Busy` into `AwaitingInput`, so a finished
+ * turn is said outright on the wire and every window hears the same answer whether or not it
+ * happened to witness the `Busy` (the long comment on the `Stop` arm there carries the why).
  *
- * * a session that started and has never been asked anything (`SessionStart` → `Idle`), which
- *   is *not* waiting on the user in any sense worth interrupting them for; and
- * * a session that has just finished a turn (`Stop` → `Idle`), which is exactly the moment
- *   the user asked to be told about.
- *
- * The two are indistinguishable in the state and completely distinguishable in the *history*:
- * the second one has been `Busy`. So this module tracks one extra bit per session — has it
- * ever run a turn — and that bit is the whole difference. Nothing on the Rust side had to
- * change for it, because `cide://session-state` is emitted per transition and a transition is
- * precisely a piece of history.
- *
- * The alternative that lost was teaching the hook server a fifth state (`Finished`). It is a
- * bigger change for the same information, it would have to be persisted for a session the
- * hooks lose track of, and it puts a UI notion — "the user has not looked yet" — into a state
- * machine that is otherwise a faithful model of what Claude Code is doing.
+ * The history bit outlived that move as a belt-and-braces on the `idle` arm — "an `Idle` on a
+ * session that has run a turn means finished" — and by then it had exactly one remaining
+ * trigger: **`/clear`**. Clearing makes the CLI open a fresh conversation, which fires
+ * `SessionStart`, which arrives here as `Idle` on a session whose history says it has run
+ * turns. The marker went up on the pane the user was at that moment typing into, which is the
+ * noise this module exists to prevent. So the rule today is the plain reading, with no
+ * history at all: `AwaitingInput`/`AwaitingPermission` mean waiting because they say so,
+ * `Busy` means not waiting, and `Idle` says *nothing* about waiting in either direction — it
+ * must not raise (that re-announces on every `/clear`), and it must not clear (a stray `Stop`
+ * landing on a session already waiting must not eat a marker nobody has acknowledged).
  *
  * DOM-free and import-free on purpose, in the same way and for the same reason as
  * `menus/model.ts` and `panes/exitMarker.ts`: `ui/scripts/check-awaiting.mjs` compiles this
@@ -48,8 +48,6 @@ export type SessionPhase =
 
 /** What is remembered about one session. */
 export interface Track {
-  /** Whether this session has ever been observed mid-turn. The bit `Idle` cannot supply. */
-  readonly ranATurn: boolean
   /** Whether it is waiting on the user *right now*, unacknowledged. */
   readonly awaiting: boolean
   /** Set once the child is gone, so the caller can drop the entry. */
@@ -57,72 +55,74 @@ export interface Track {
 }
 
 /** A session nothing has been heard about yet. */
-export const UNSEEN: Track = { ranATurn: false, awaiting: false, gone: false }
+export const UNSEEN: Track = { awaiting: false, gone: false }
 
 /**
  * Fold one `cide://session-state` transition into a session's track.
  *
- * `Idle` is the interesting arm and the only one that consults history. Everything else is
- * decided by the state alone:
+ * `Idle` is the interesting arm and the only one that preserves the answer. Everything else
+ * is decided by the state alone:
  *
- * * `AwaitingPermission` / `AwaitingInput` — the turn has stopped *on* the user. Waiting even
- *   if this is the first turn, which is why neither consults `ranATurn`.
- * * `Busy` — plainly not waiting, and it is also what arms the bit: from here, the next
- *   `Idle` means "finished".
+ * * `AwaitingPermission` / `AwaitingInput` — the turn has stopped *on* the user. A finished
+ *   turn arrives as `AwaitingInput` because `cide_claude::next_state` decides that on the
+ *   wire; this end never infers it.
+ * * `Busy` — plainly not waiting.
+ * * `Idle` — says nothing about waiting, see the module comment. It reaches a window as a
+ *   fresh prompt (`SessionStart` at launch, and `SessionStart` again on `/clear`, which lands
+ *   on a session that was `AwaitingInput` or `Busy` a keystroke ago) or as a `Stop` that
+ *   ended no work — never as a finished turn, which the wire spells `AwaitingInput`.
  * * `Spawning` / `Splash` — the session has not started; a splash is waiting for a click, but
  *   it is a control the user is already looking at rather than news to carry to the task bar.
  * * `Paused` — frozen by the user, mid-turn, with `SIGSTOP`. Deliberately **not** awaiting, on
  *   the same argument as `Splash`: the user is the one who froze it, so it is a state they are
  *   already looking at rather than news to carry to the task bar. Telling somebody "1 session is
  *   waiting for you" about the session they just paused is the noise this module exists to
- *   prevent. `ranATurn` survives the freeze — a paused turn is an unfinished turn, not an
- *   un-run one, so the `Idle` that follows a resume still means "finished".
+ *   prevent.
  * * `Exited` — nothing is waiting for anybody. Reported so the caller drops the entry rather
  *   than leaving a dead session counted for the life of the window.
  */
 export function onState(track: Track, phase: SessionPhase): Track {
   switch (phase) {
     case 'busy':
-      return { ranATurn: true, awaiting: false, gone: false }
+      return { awaiting: false, gone: false }
     case 'awaitingPermission':
     case 'awaitingInput':
-      return { ranATurn: true, awaiting: true, gone: false }
+      return { awaiting: true, gone: false }
     case 'idle':
-      // The whole point of the module. An `Idle` that has never been `Busy` is a session
-      // sitting at a fresh prompt, and telling the user "1 session is waiting for you" about
-      // it on every launch is how a notification becomes noise they stop reading.
-      return { ranATurn: track.ranATurn, awaiting: track.ranATurn, gone: false }
+      // Preserved, not derived and not cleared. Raising here on history — "this session has
+      // run a turn, so an `Idle` means finished" — is how typing `/clear` marked the pane the
+      // user was typing into: the fresh conversation's `SessionStart` arrives as `Idle`.
+      // Clearing here is the opposite bug: a stray `Stop` on a session already waiting
+      // (`AwaitingInput -> Idle` in the hook map) would eat an unacknowledged marker.
+      return { awaiting: track.awaiting, gone: false }
     case 'spawning':
     case 'splash':
     case 'paused':
-      return { ranATurn: track.ranATurn, awaiting: false, gone: false }
+      return { awaiting: false, gone: false }
     case 'exited':
-      return { ranATurn: track.ranATurn, awaiting: false, gone: true }
+      return { awaiting: false, gone: true }
   }
 }
 
 /**
  * The user has dealt with this session: clicked into its pane, or typed at it.
  *
- * `ranATurn` deliberately survives. Acknowledging is "I have seen this one", not "this
- * session has never run" — the next `Stop` has to raise the marker again, and clearing the
- * bit here would mean a session only ever announced itself once.
+ * Acknowledging is "I have seen this one", not "this session will never wait again" — the
+ * next turn's end arrives as `AwaitingInput` and raises the marker on its own.
  *
  * There is no timer and no "seen because it is on screen". A marker that cleared itself after
  * a few seconds would be gone by the time the user came back to the machine, which is the
  * case the whole feature exists for.
  */
 export function onAcknowledge(track: Track): Track {
-  return { ranATurn: track.ranATurn, awaiting: false, gone: track.gone }
+  return { awaiting: false, gone: track.gone }
 }
 
 /**
  * Fold a whole `cide://session-awaiting` broadcast into a local table.
  *
  * Rust holds the authoritative set — it is the only place that sees every window's reports —
- * and re-broadcasts it so a window that opened after the fact still paints the marker. This
- * merges that set in without losing `ranATurn`, which is per-window history the broadcast
- * cannot carry and which the *next* `Idle` in this window depends on.
+ * and re-broadcasts it so a window that opened after the fact still paints the marker.
  *
  * Sessions absent from the broadcast are cleared rather than left alone: the set is complete
  * by construction, so absence is the message "no longer waiting" — which is how one window
@@ -139,7 +139,7 @@ export function mergeAuthoritative(
     next.set(session, { ...track, awaiting: wanted.has(session) })
   }
   for (const session of wanted) {
-    if (!next.has(session)) next.set(session, { ranATurn: true, awaiting: true, gone: false })
+    if (!next.has(session)) next.set(session, { awaiting: true, gone: false })
   }
   return next
 }
@@ -167,9 +167,7 @@ export function adopt(
     const track = next.get(session)
     next.set(
       session,
-      track === undefined
-        ? { ranATurn: true, awaiting: true, gone: false }
-        : { ...track, awaiting: true },
+      track === undefined ? { awaiting: true, gone: false } : { ...track, awaiting: true },
     )
   }
   return next

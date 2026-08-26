@@ -555,6 +555,15 @@ export const fs = {
     invoke<number>('fs_collapse', { project: projectId, path }),
 
   /**
+   * Re-scan everything under one folder against the disk. The tree's *Refresh* menu item,
+   * and the manual answer to the corner the watcher deliberately leaves dark: an ignored
+   * directory is never watched, so external churn under `target/` is invisible until
+   * somebody asks. Returns the new row count, on `expand`'s argument.
+   */
+  refresh: (projectId: ProjectId, path: string) =>
+    invoke<number>('fs_refresh', { project: projectId, path }),
+
+  /**
    * Expand everything above a path and return the row it now sits on.
    *
    * `null` when the path has no row — gitignored, or deleted. Scroll to the number; show
@@ -3643,20 +3652,23 @@ export type AgentIntegration =
 
 export const agentWorktree = {
   /**
-   * Merge `cide/<agent>` into the branch this project's root has checked out.
+   * Merge one of the role's worktree branches into the branch this project's root has checked
+   * out: `cide/<agent>-<task>` when `task` names one — worktrees are per (role, task), so a
+   * task's work lives on its own branch — or `cide/<agent>`, the base branch a taskless
+   * dispatch commits to, when it does not.
    *
    * **Not through `pendingCommand`**, like every other user gesture in this feature and unlike
    * `agents.roster`: this is a click, and a click that silently does nothing is the failure this
    * project has paid for most often. Rust refuses with a sentence — the project is not a
-   * repository, `HEAD` is detached, a rebase is in progress, the role has never run and so has
-   * no branch — and the rejection is meant to reach `notifyFailure`.
+   * repository, `HEAD` is detached, a rebase is in progress, the branch has never been minted —
+   * and the rejection is meant to reach `notifyFailure`.
    *
    * It resolves only when the merge is **finished**, unlike `agentRuns.dispatch`: there is
    * nothing asynchronous behind it, the work happens on Rust's blocking pool, and the answer is
    * the whole point of the call.
    */
-  integrate: (project: ProjectId, agent: AgentId) =>
-    invoke<AgentIntegration>('agents_integrate', { project, agent }),
+  integrate: (project: ProjectId, agent: AgentId, task?: string) =>
+    invoke<AgentIntegration>('agents_integrate', { project, agent, task: task ?? null }),
 }
 
 /* ---------------------------------------------------------------------------------------

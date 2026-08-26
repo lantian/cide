@@ -102,7 +102,7 @@ use std::time::{Duration, Instant};
 use cide_agents::Delivery;
 use cide_agents::tools::{self, AgentSink, Integrated, TaskSink, ToolResult};
 use cide_ipc::{
-    AgentDef, AgentId, AgentRoster, AgentRun, DispatchRequest, Harness, ProjectId, RunId,
+    AgentDef, AgentId, AgentRoster, AgentRun, DispatchRequest, Harness, ProjectId, RunId, RunState,
     SessionId, SessionState, Task, TaskAuthor, TaskEdit, TaskId, TaskNew,
 };
 use cide_ipc::{Project, Workspace};
@@ -114,6 +114,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::agents::AgentRegistry;
 use crate::state::SessionRegistry;
+use crate::task_triggers::TaskMutation;
 use crate::tasks_state::TasksStores;
 use crate::workspace_state::WorkspaceState;
 
@@ -328,6 +329,7 @@ impl ToolAccess for ProjectTools {
             project: self.project,
             author: self.author.clone(),
             changed: AtomicBool::new(false),
+            mutations: Mutex::new(Vec::new()),
         };
         // The task family first, then — **only for the product owner** — the orchestration one.
         // The [`RegistrySink`] is built *inside* the arm, so a run's connection never constructs
@@ -356,6 +358,9 @@ impl ToolAccess for ProjectTools {
         if sink.changed.load(Ordering::Relaxed) {
             crate::tasks_state::broadcast(&self.app, self.project, &store);
         }
+        // And after the broadcast, the assignment-starts-work question — for every author, with
+        // the refusal in `autodispatch::trigger`'s author gate; see `StoreSink::mutations`.
+        crate::task_triggers::consider(&self.app, self.project, sink.mutations.into_inner());
         result
     }
 }
@@ -397,6 +402,13 @@ struct StoreSink {
     /// something moved. A `tasks-changed` per `cide_task_list` would be an event to every window
     /// for a read.
     changed: AtomicBool,
+    /// What the call mutated, as plain data for [`crate::task_triggers::consider`] — drained by
+    /// [`ProjectTools::call`] after the broadcast. Recorded for *every* author, run-authored
+    /// mutations included: the refusal that keeps a subagent from spawning a subagent is
+    /// `autodispatch::trigger`'s author gate, applied centrally where its test sees it, not a
+    /// filter here that somebody could later remove. Pure data, so this type stays
+    /// `AppHandle`-free and constructible in the sink test above.
+    mutations: Mutex<Vec<TaskMutation>>,
 }
 
 impl TaskSink for StoreSink {
@@ -426,15 +438,43 @@ impl TaskSink for StoreSink {
             .create(&req, self.author.clone())
             .map_err(|error| error.to_string())?;
         self.changed.store(true, Ordering::Relaxed);
+        self.mutations.lock().push(TaskMutation {
+            before: None,
+            after: task.clone(),
+            author: self.author.clone(),
+            // `cide_task_create` naming an assignee is the orchestrator's assignment gesture,
+            // exactly as the compose form's dropdown is the user's.
+            assign_gesture: agent.is_some(),
+            fresh_text: vec![body.to_string()],
+        });
         Ok(task)
     }
 
     fn edit(&self, id: &TaskId, edit: TaskEdit) -> Result<Task, String> {
+        // The prose this mutation introduces, read before `edit` is consumed; `before` read
+        // immediately ahead of the write — `cmd::tasks::task_edit` documents the race window and
+        // why it is accepted.
+        let fresh_text: Vec<String> = match &edit {
+            TaskEdit::SetBody { body } => vec![body.clone()],
+            TaskEdit::Comment { text } => vec![text.clone()],
+            _ => Vec::new(),
+        };
+        // `cide_task_assign` arriving as `Assign { Some }` is an assignment gesture (the
+        // orchestrator's revive), the same reading `cmd::tasks::task_edit` gives the dropdown.
+        let assign_gesture = matches!(&edit, TaskEdit::Assign { agent: Some(_) });
+        let before = self.store.get(id);
         let task = self
             .store
             .edit(id, edit, self.author.clone())
             .map_err(|error| error.to_string())?;
         self.changed.store(true, Ordering::Relaxed);
+        self.mutations.lock().push(TaskMutation {
+            before,
+            after: task.clone(),
+            author: self.author.clone(),
+            assign_gesture,
+            fresh_text,
+        });
         Ok(task)
     }
 }
@@ -549,7 +589,7 @@ impl AgentSink for RegistrySink {
         .map_err(|error| error.to_string())
     }
 
-    fn integrate(&self, agent: &AgentId) -> Result<Integrated, String> {
+    fn integrate(&self, agent: &AgentId, task: Option<&TaskId>) -> Result<Integrated, String> {
         let workspace = self
             .app
             .try_state::<WorkspaceState>()
@@ -559,8 +599,10 @@ impl AgentSink for RegistrySink {
         // Straight to `cide-git`, because there is no command in front of it to reuse: the merge
         // has no wire surface yet. It is real work on a real repository and it happens on this
         // connection's thread, which is the one thread in the process that is allowed to wait for
-        // it — the caller asked, and the accept loop is untouched.
-        cide_git::worktree::integrate(&root, agent.as_str())
+        // it — the caller asked, and the accept loop is untouched. The name is the same
+        // composite a dispatch's checkout gets, so the branch merged is by construction the one
+        // that run committed to.
+        cide_git::worktree::integrate(&root, &cide_agents::checkout_name(agent, task))
             .map(|outcome| match outcome {
                 cide_git::worktree::Integration::UpToDate => Integrated::UpToDate,
                 cide_git::worktree::Integration::Merged { commit, files } => {
@@ -578,6 +620,21 @@ impl AgentSink for RegistrySink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_millis() as u64)
             .unwrap_or_default()
+    }
+
+    fn isolated(&self) -> Result<bool, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        let root = crate::tasks_state::project_root(&workspace, self.project)
+            .map_err(|error| error.to_string())?;
+        // Read fresh, `nudge_allowed`'s discipline: the file is committed, and a checkout can
+        // flip isolation under a running app. One small-file read, on this connection's thread.
+        Ok(matches!(
+            cide_agents::config::load(&root).agents.isolation,
+            cide_agents::Isolation::Worktree
+        ))
     }
 }
 
@@ -1007,6 +1064,13 @@ const NUDGE_CEILING: Duration = Duration::from_secs(10);
 /// How often the flusher wakes while a burst settles. Short next to [`NUDGE_COALESCE`].
 const NUDGE_TICK: Duration = Duration::from_millis(100);
 
+/// How many held turns the coalescer keeps while an orchestrator stays busy.
+///
+/// A cap because a session can stay mid-turn for minutes while a busy project's runs keep
+/// ending, and the buffer summarises to one line however big it grows — 64 is far above any
+/// real burst, and dropping the *oldest* keeps the "most recently" the line names true.
+const NUDGE_HOLD_CAP: usize = 64;
+
 /// How much of a task title the line may carry, in characters.
 ///
 /// A title is written by whoever created the task — a person, or another model — so it has no
@@ -1018,7 +1082,8 @@ const TITLE_BUDGET: usize = 72;
 /// Turns that have ended and not yet been announced. One per process; see [`NudgeCoalescer`].
 static NUDGES: NudgeCoalescer = NudgeCoalescer::new();
 
-/// A subagent handed its turn back. Tell the project's product owner, once per burst.
+/// A subagent's turn ended — handed back, finished, or failed. Tell the project's product
+/// owner, once per burst.
 ///
 /// # Why this is a PTY write at all
 ///
@@ -1036,17 +1101,27 @@ static NUDGES: NudgeCoalescer = NudgeCoalescer::new();
 ///    written into a session mid-turn land in whatever it is composing.
 /// 2. **One line, terminated with `\r`** ([`submit`]). A PTY write is keystrokes, so an embedded
 ///    newline is another Enter — finding 8, and the rule every prompt path in this codebase
-///    inherits.
+///    inherits. The bytes are then *delivered* as text-then-lone-Enter through
+///    `crate::agents::type_submitted_line`, never one chunk: the TUI's paste detection eats a
+///    trailing CR off a long chunk, and the nudge sat unsubmitted in the composer until that
+///    was measured — see the helper's header.
 /// 3. **Coalesced** ([`NudgeCoalescer`]), or six agents finishing together type six prompts and
 ///    are answered six times.
 /// 4. **The setting is read from disk at the moment of the nudge** ([`deliver_nudge`]), never
 ///    cached: `.cide/config.json` is committed, and a `git checkout` can switch it off under a
 ///    running app.
 ///
-/// Called from `crate::agents::AgentRegistry::set_state` and from nowhere else, on the
-/// `Running | AwaitingPermission → Idle` edge — see that method's doc for why the edge and not
-/// the state.
-pub fn note_run_idle(app: &AppHandle, project: ProjectId, run: RunId) {
+/// Called from two producers and nowhere else: `crate::agents::AgentRegistry::set_state`, on
+/// the `Running | AwaitingPermission → Idle` edge and on an app-carrying transition into
+/// `Finished`/`Failed` — see that method's doc for why the edge and not the state — and
+/// `AgentRegistry::watch_exit`'s production closure, which is where a reaped child's exit picks
+/// its app back up (the observation itself travels app-free so a test can drive it).
+pub fn note_run_over(app: &AppHandle, project: ProjectId, run: RunId) {
+    // The death comment first, before the nudge machinery gets any chance to return early: the
+    // nudge dedupes per *turn* and can be refused (a busy orchestrator, a repeated edge), and
+    // the comment must not inherit either refusal — the board is the durable record, the nudge
+    // is a courtesy knock. Its own dedupe is the registry's `death_noted` latch.
+    note_death(app, project, run);
     // The facts are read *now*, while they are still true, rather than at flush time: a run can
     // be stopped, finished or forgotten in the two seconds the burst is settling, and a line
     // composed from what the registry says afterwards would describe the wrong thing or nothing.
@@ -1071,6 +1146,90 @@ pub fn note_run_idle(app: &AppHandle, project: ProjectId, run: RunId) {
     }
 }
 
+/// A run that died with a task and no successor writes one comment onto that task.
+///
+/// P2 of the debug-report plan: the terrastrike runs that died with exit 129 left their tasks
+/// in `doing` for ever, and the only evidence was in the Agents panel — which the orchestrator,
+/// being a `claude` reading `.cide/tasks.json` over MCP, cannot see. One comment on the task
+/// puts the fact where every reader of the board already looks, signed
+/// [`TaskAuthor::Orchestrator`] because that is the one author cide itself may write as (the
+/// author is never a parameter — `TaskEdit::Comment`'s doc says why).
+///
+/// Exactly one call site, at the top of [`note_run_over`] — the funnel both producers
+/// (`set_state`'s over edge, `watch_exit`'s reap) already end at — so a run reaped twice
+/// still comments once: the whole decision, dedupe latch included, is
+/// [`AgentRegistry::death_facts`]'s.
+fn note_death(app: &AppHandle, project: ProjectId, run: RunId) {
+    let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+        return;
+    };
+    let Some(facts) = registry.death_facts(run) else {
+        return;
+    };
+    // `get`, never `ensure`: a project whose tracker is not open has no board on screen and no
+    // orchestrator attached to read it, and opening and parsing the file just to write an
+    // epitaph into it would be disk work on behalf of nobody. The run's own row still says how
+    // it ended.
+    let Some(stores) = app.try_state::<Arc<TasksStores>>() else {
+        return;
+    };
+    let Some(store) = stores.get(project) else {
+        return;
+    };
+    let text = match facts.code {
+        Some(code) => format!(
+            "run {run} ({}) ended with exit {code} before finishing this task",
+            facts.agent_label
+        ),
+        None => format!(
+            "run {run} ({}) failed before finishing this task",
+            facts.agent_label
+        ),
+    };
+    match store.edit(
+        &facts.task,
+        TaskEdit::Comment { text },
+        TaskAuthor::Orchestrator,
+    ) {
+        Ok(_) => crate::tasks_state::broadcast(app, project, &store),
+        // A task deleted between the death and this write is a fine reason to say nothing.
+        Err(error) => {
+            tracing::debug!(%run, %error, "no death comment; the task is gone or unwritable");
+        }
+    }
+}
+
+/// A session's turn ended — if nudges were held for a busy orchestrator, try again.
+///
+/// Called from the hook applier's `Effect::State` arm for **every** session transition in the
+/// process, which is why the shape is two cheap refusals and a latch: the state filter costs
+/// nothing, and [`NudgeCoalescer::rearm`] is one lock and an `is_empty` in the overwhelmingly
+/// common no-holds case — the applier thread's ordering is a correctness requirement and
+/// nothing here may make it wait. It does not know (and must not look up — that is a workspace
+/// lock) whether `state`'s session is even the right project's product owner; the flusher
+/// re-resolves and re-checks everything at delivery, and a wrong-session re-arm merely holds
+/// again. The retry rate is bounded by real turn-end edges plus the coalescer's own debounce,
+/// so nothing spins.
+pub fn note_session_ready(app: &AppHandle, state: SessionState) {
+    if !may_be_typed_into(state) {
+        return;
+    }
+    if !NUDGES.rearm() {
+        return;
+    }
+    let app = app.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("cide-agent-nudge".into())
+        .spawn(move || flush_nudges(&app))
+    {
+        tracing::warn!(%error, "no thread to redeliver held nudges; they wait for the next edge");
+        // Unlatch `flushing` only — unlike `note_run_over`'s give_up, the held turns are kept:
+        // the next ready edge or the next `mark` re-arms, and the facts are not lost to one
+        // failed spawn.
+        NUDGES.state.lock().flushing = false;
+    }
+}
+
 /// Wait the burst out, then write at most one line per project.
 fn flush_nudges(app: &AppHandle) {
     loop {
@@ -1079,7 +1238,7 @@ fn flush_nudges(app: &AppHandle) {
             continue;
         };
         for (project, turns) in by_project(due) {
-            deliver_nudge(app, project, &turns);
+            deliver_nudge(app, project, turns);
         }
         return;
     }
@@ -1092,7 +1251,7 @@ fn flush_nudges(app: &AppHandle) {
 /// would be a useful sentence. The orchestrator is never left without the information — asking
 /// `mcp__cide__cide_agent_runs` answers the same question, and answers it as of the moment it is
 /// called.
-fn deliver_nudge(app: &AppHandle, project: ProjectId, turns: &[Turn]) {
+fn deliver_nudge(app: &AppHandle, project: ProjectId, turns: Vec<Turn>) {
     let Some(workspace) = app.try_state::<WorkspaceState>() else {
         return;
     };
@@ -1120,9 +1279,18 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, turns: &[Turn]) {
     };
     let state = hooks.state(session);
     if !may_be_typed_into(state) {
-        // Dropped, never queued. A nudge that arrived five minutes after the fact would describe
-        // a state of the world that has moved on, and the next run to finish will nudge again.
-        tracing::debug!(%project, ?state, "the product owner is busy; dropping the nudge");
+        // **Held, not dropped.** This used to drop, on the theory that the next run to finish
+        // would nudge again — which is false for the *last* run of a burst: an orchestrator
+        // mid-turn while its final subagent handed back simply never heard, and the loop ended
+        // with the work done and nobody told. So the turns go back into the coalescer and
+        // [`note_session_ready`] re-arms a flusher on this session's next `Idle`/`AwaitingInput`
+        // edge; delivery re-checks everything then, so a held nudge is never staler than the
+        // moment it is finally typed — and the line points at `cide_agent_runs`, which answers
+        // as of *now*, whatever it says. Every other decline above still drops: a project that
+        // said no must not be typed at later, and a project with no session has nowhere to hold
+        // for.
+        tracing::debug!(%project, ?state, "the product owner is busy; holding the nudge");
+        NUDGES.hold(turns);
         return;
     }
 
@@ -1130,7 +1298,7 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, turns: &[Turn]) {
         .last()
         .and_then(|turn| turn.task.as_ref())
         .and_then(|task| task_title(app, project, task));
-    let Some(bytes) = submit(&nudge_line(turns, title.as_deref())) else {
+    let Some(bytes) = submit(&nudge_line(&turns, title.as_deref())) else {
         return;
     };
 
@@ -1141,7 +1309,11 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, turns: &[Turn]) {
         return;
     };
     tracing::info!(%project, turns = turns.len(), "nudging the product owner");
-    pty.write(bytes);
+    // The text now, the Enter alone after a beat — never one chunk. The TUI's paste detection
+    // is length-triggered, and a line this long written whole lands in the composer with its
+    // CR eaten: the measured shape was two nudges stacked in the product owner's input box,
+    // submitted by nobody. `type_submitted_line`'s header carries the measurements.
+    crate::agents::type_submitted_line(app, session, &pty, bytes);
 }
 
 /// Rule 4: does this project still want to be typed at?
@@ -1157,7 +1329,7 @@ fn nudge_allowed(root: &Path) -> bool {
     cide_agents::config::load(root).agents.nudge_orchestrator
 }
 
-/// One handed-back turn, as the edge recorded it.
+/// One ended turn, as the edge recorded it.
 ///
 /// The facts are copied rather than referenced back to the registry for `AgentRun::agent_label`'s
 /// reason, one step further along: a line that said what the run *is* by the time it is typed
@@ -1168,9 +1340,31 @@ struct Turn {
     project: ProjectId,
     agent_label: String,
     task: Option<TaskId>,
+    outcome: TurnOutcome,
 }
 
-/// What the registry can still say about the run that just went idle.
+/// How the turn ended — the difference between "read what it wrote and answer it" and "that
+/// role's child is gone".
+///
+/// For a `claude` run every ordinary turn is [`Self::HandedBack`] (the child stays at its prompt
+/// between turns and exits only when stopped); for an `opencode` run one turn is one process, so
+/// [`Self::Finished`] is its *normal* end — which is why the nudge could not stay
+/// handed-back-only without one whole harness's runs ending silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnOutcome {
+    /// The child is alive at its prompt, waiting to be answered or retried.
+    HandedBack,
+    /// The child exited; the code is the reaper's, never invented.
+    Finished { code: i32 },
+    /// The run failed before or instead of finishing — a spawn that never came up, a stop.
+    Failed,
+}
+
+/// What the registry can still say about the run whose turn just ended.
+///
+/// The outcome is read from the run's state *now*, immediately after the transition that
+/// triggered this — `Finished`/`Failed` runs are retained by the registry precisely so a late
+/// reader still finds them.
 fn turn_of(app: &AppHandle, project: ProjectId, run: RunId) -> Option<Turn> {
     let registry = app.try_state::<Arc<AgentRegistry>>()?;
     registry
@@ -1181,6 +1375,14 @@ fn turn_of(app: &AppHandle, project: ProjectId, run: RunId) -> Option<Turn> {
             project,
             agent_label: live.agent_label,
             task: live.task,
+            outcome: match live.state {
+                RunState::Finished { code } => TurnOutcome::Finished { code },
+                RunState::Failed { .. } => TurnOutcome::Failed,
+                // The handed-back edge left the run `Idle`; any other state means it has already
+                // moved on (a retry re-entered `Running` inside the burst window), and the honest
+                // summary of the edge that fired is still "a turn ended".
+                _ => TurnOutcome::HandedBack,
+            },
         })
 }
 
@@ -1247,6 +1449,15 @@ fn nudge_line(turns: &[Turn], title: Option<&str>) -> String {
         .filter(|label| !label.is_empty())
         .map_or_else(|| "a subagent".to_string(), |label| format!("`{label}`"));
 
+    // The outcome is the difference between "answer it" and "its child is gone": a claude run
+    // hands every ordinary turn back and exits only when stopped, an opencode run *finishes* as
+    // its normal end — the orchestrator's next move differs, so the line says which.
+    let ended = match last.map(|turn| &turn.outcome) {
+        None | Some(TurnOutcome::HandedBack) => "handed its turn back".to_string(),
+        Some(TurnOutcome::Finished { code }) => format!("finished (exit {code})"),
+        Some(TurnOutcome::Failed) => "failed".to_string(),
+    };
+
     let task = last.and_then(|turn| turn.task.as_ref());
     let on = match (task, title.map(one_line).filter(|title| !title.is_empty())) {
         (Some(id), Some(title)) => format!(" on task {id} ({})", clip(&title)),
@@ -1256,15 +1467,15 @@ fn nudge_line(turns: &[Turn], title: Option<&str>) -> String {
 
     let line = match (turns.len(), task.is_some()) {
         (0 | 1, true) => format!(
-            "A subagent turn just ended: {who}{on}. Read that task's comments and check \
+            "A subagent turn just ended: {who} {ended}{on}. Read that task's comments and check \
              mcp__cide__cide_agent_runs before deciding what to do next."
         ),
         (0 | 1, false) => format!(
-            "A subagent turn just ended: {who}{on}, dispatched with no task. Check \
+            "A subagent turn just ended: {who} {ended}{on}, dispatched with no task. Check \
              mcp__cide__cide_agent_runs."
         ),
         (many, _) => format!(
-            "{many} subagent turns just ended, most recently {who}{on}. Check \
+            "{many} subagent turns just ended, most recently {who} ({ended}){on}. Check \
              mcp__cide__cide_agent_runs and the tasks they commented on."
         ),
     };
@@ -1377,13 +1588,53 @@ impl NudgeCoalescer {
         Some(std::mem::take(&mut state.pending))
     }
 
-    /// Unlatch after a flusher that could not be started. See [`note_run_idle`].
+    /// Unlatch after a flusher that could not be started. See [`note_run_over`].
     fn give_up(&self) {
         let mut state = self.state.lock();
         state.pending.clear();
         state.first = None;
         state.last = None;
         state.flushing = false;
+    }
+
+    /// Put a busy project's turns back, to be flushed when its session next hands its own turn
+    /// back. See the busy arm of [`deliver_nudge`] for why holding beat dropping.
+    ///
+    /// The held turns go to the *front*, ahead of anything that ended while delivery was being
+    /// decided, so the line's "most recently" stays honest; the clock is reset so the ceiling
+    /// cannot fire the moment a flusher is re-armed; and the buffer is capped — past
+    /// [`NUDGE_HOLD_CAP`] the oldest are dropped, because the line only ever summarises a count
+    /// and points at `cide_agent_runs`, which answers as of the moment it is called.
+    fn hold(&self, turns: Vec<Turn>) {
+        let mut state = self.state.lock();
+        let mut pending = turns;
+        pending.extend(std::mem::take(&mut state.pending));
+        if pending.len() > NUDGE_HOLD_CAP {
+            pending.drain(..pending.len() - NUDGE_HOLD_CAP);
+        }
+        state.pending = pending;
+        let now = Instant::now();
+        state.first = Some(now);
+        state.last = Some(now);
+        state.flushing = false;
+    }
+
+    /// Re-arm a flusher for held turns. `true` means *you must start the flusher thread* —
+    /// [`Self::mark`]'s latch, for the redelivery path.
+    ///
+    /// The empty case is the overwhelming one (every session state change in the process asks),
+    /// and it costs exactly one lock and one `is_empty` — which is what lets
+    /// [`note_session_ready`] sit on the ordered hook-applier thread.
+    fn rearm(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.pending.is_empty() || state.flushing {
+            return false;
+        }
+        let now = Instant::now();
+        state.first.get_or_insert(now);
+        state.last.get_or_insert(now);
+        state.flushing = true;
+        true
     }
 }
 
@@ -1986,12 +2237,17 @@ mod tests {
             project: ProjectId::new(),
             author: TaskAuthor::Orchestrator,
             changed: AtomicBool::new(false),
+            mutations: Mutex::new(Vec::new()),
         };
 
         assert!(sink.list().expect("list").is_empty());
         assert!(
             !sink.changed.load(Ordering::Relaxed),
             "a read is not a change"
+        );
+        assert!(
+            sink.mutations.lock().is_empty(),
+            "a read left a mutation for the trigger to act on"
         );
 
         let made = sink
@@ -2024,6 +2280,25 @@ mod tests {
             made.id
         );
 
+        // The mutation ledger the trigger reads: one entry per write, the creation carrying its
+        // body as fresh text and the comment carrying its line — signed with the connection's
+        // author, which is what the trigger's gate refuses run-authored entries by.
+        let mutations = sink.mutations.lock();
+        assert_eq!(mutations.len(), 2);
+        assert!(mutations[0].before.is_none());
+        assert_eq!(mutations[0].fresh_text, ["why"]);
+        assert_eq!(
+            mutations[1].before.as_ref().map(|task| task.id.clone()),
+            Some(made.id.clone())
+        );
+        assert_eq!(mutations[1].fresh_text, ["done"]);
+        assert!(
+            mutations
+                .iter()
+                .all(|m| m.author == TaskAuthor::Orchestrator)
+        );
+        drop(mutations);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2032,10 +2307,20 @@ mod tests {
     // ======================================================================================
 
     fn turn(project: ProjectId, agent: &str, task: Option<&str>) -> Turn {
+        ended_turn(project, agent, task, TurnOutcome::HandedBack)
+    }
+
+    fn ended_turn(
+        project: ProjectId,
+        agent: &str,
+        task: Option<&str>,
+        outcome: TurnOutcome,
+    ) -> Turn {
         Turn {
             project,
             agent_label: agent.to_string(),
             task: task.map(|id| TaskId(id.to_string())),
+            outcome,
         }
     }
 
@@ -2116,6 +2401,110 @@ mod tests {
         );
         assert!(long.chars().count() < 400, "an unbounded title: {long}");
         assert!(long.contains('…'), "{long}");
+    }
+
+    /// The line says *how* the turn ended, because the orchestrator's next move differs: a
+    /// handed-back run is answered or retried, a finished or failed one has no child behind it.
+    /// An opencode run finishes as its normal end, which is why outcomes could not stay silent.
+    #[test]
+    fn the_nudge_says_how_the_turn_ended() {
+        let project = ProjectId::new();
+
+        let handed = nudge_line(&[turn(project, "developer", Some("t-17"))], None);
+        assert!(handed.contains("handed its turn back"), "{handed}");
+
+        let finished = nudge_line(
+            &[ended_turn(
+                project,
+                "developer",
+                Some("t-17"),
+                TurnOutcome::Finished { code: 0 },
+            )],
+            None,
+        );
+        assert!(finished.contains("finished (exit 0)"), "{finished}");
+
+        let failed = nudge_line(
+            &[ended_turn(project, "developer", None, TurnOutcome::Failed)],
+            None,
+        );
+        assert!(failed.contains("failed"), "{failed}");
+
+        // A burst renders the last turn's outcome, and a non-zero code is carried verbatim.
+        let many = nudge_line(
+            &[
+                turn(project, "developer", Some("t-1")),
+                ended_turn(
+                    project,
+                    "qa",
+                    Some("t-2"),
+                    TurnOutcome::Finished { code: 101 },
+                ),
+            ],
+            None,
+        );
+        assert!(many.contains("(finished (exit 101))"), "{many}");
+    }
+
+    /// **A busy orchestrator's nudge is held and redelivered, not lost.**
+    ///
+    /// The drop this replaces was justified by "the next run to finish will nudge again" — false
+    /// for the last run of a burst, whose ending the orchestrator then simply never heard about.
+    /// The state table: a hold puts the turns back and unlatches; `rearm` latches exactly one
+    /// flusher and answers `false` when there is nothing held (the every-session-event fast
+    /// path) or when one is already waiting; the held turns flush once due; and a hold past the
+    /// cap drops the *oldest*, keeping the "most recently" the line names true.
+    #[test]
+    fn a_held_nudge_is_redelivered_when_the_session_frees() {
+        let coalescer = NudgeCoalescer::new();
+        let project = ProjectId::new();
+
+        assert!(
+            !coalescer.rearm(),
+            "nothing held, and a flusher was latched"
+        );
+
+        // A burst settles, the flusher takes it — and delivery finds the orchestrator busy.
+        assert!(coalescer.mark(turn(project, "developer", Some("t-1"))));
+        {
+            let mut state = coalescer.state.lock();
+            state.last = Some(Instant::now() - NUDGE_COALESCE - Duration::from_millis(10));
+        }
+        let due = coalescer.take_due().expect("settled");
+        coalescer.hold(due);
+
+        assert!(
+            coalescer.take_due().is_none(),
+            "held turns flushed with no flusher armed"
+        );
+        assert!(coalescer.rearm(), "the ready edge must start a flusher");
+        assert!(!coalescer.rearm(), "and exactly one");
+
+        {
+            let mut state = coalescer.state.lock();
+            state.last = Some(Instant::now() - NUDGE_COALESCE - Duration::from_millis(10));
+        }
+        let redelivered = coalescer.take_due().expect("due again after the re-arm");
+        assert_eq!(redelivered.len(), 1);
+        assert_eq!(redelivered[0].task, Some(TaskId("t-1".into())));
+
+        // The cap drops the oldest: hold more than fits and the newest survive.
+        let many: Vec<Turn> = (0..NUDGE_HOLD_CAP + 5)
+            .map(|n| turn(project, "developer", Some(&format!("t-{n}"))))
+            .collect();
+        coalescer.hold(many);
+        assert!(coalescer.rearm());
+        {
+            let mut state = coalescer.state.lock();
+            state.last = Some(Instant::now() - NUDGE_COALESCE - Duration::from_millis(10));
+        }
+        let capped = coalescer.take_due().expect("due");
+        assert_eq!(capped.len(), NUDGE_HOLD_CAP);
+        assert_eq!(
+            capped.last().and_then(|turn| turn.task.clone()),
+            Some(TaskId(format!("t-{}", NUDGE_HOLD_CAP + 4))),
+            "the cap must drop the oldest, never the most recent"
+        );
     }
 
     /// **Six agents finishing together are one prompt.**
@@ -2209,12 +2598,14 @@ mod tests {
         assert_eq!(grouped[1].1.len(), 1);
     }
 
-    /// **A busy orchestrator is not typed into, and the nudge is dropped rather than queued.**
+    /// **A busy orchestrator is not typed into.**
     ///
-    /// Bytes written into a session mid-turn land in whatever the CLI is composing. The unknown
-    /// case matters as much as the known ones: `HookServer::state` answers `Spawning` for a
-    /// session it has never seen — which is every session in a build whose hook socket failed to
-    /// bind — and losing the nudge is the right way to be wrong about that.
+    /// Bytes written into a session mid-turn land in whatever the CLI is composing. `Busy` and
+    /// `AwaitingPermission` now *hold* the nudge for redelivery (the test above); every other
+    /// refused state still loses it, and the unknown case matters as much as the known ones:
+    /// `HookServer::state` answers `Spawning` for a session it has never seen — which is every
+    /// session in a build whose hook socket failed to bind — and losing the nudge is the right
+    /// way to be wrong about that.
     #[test]
     fn only_an_idle_or_awaiting_orchestrator_may_be_typed_into() {
         for state in [SessionState::Idle, SessionState::AwaitingInput] {
@@ -2275,6 +2666,11 @@ mod tests {
     /// returning at all is the assertion that matters: a line arrives only because the `\r` was
     /// translated to a newline by the terminal discipline, which is precisely the claim finding 8
     /// makes about why a prompt is submitted this way and why it may not contain another one.
+    ///
+    /// What a shell's `read` **cannot** see is a raw-mode TUI's paste detection — claude 2.1.245
+    /// eats the trailing CR off exactly these bytes when they arrive as one chunk, which is why
+    /// delivery goes through `crate::agents::type_submitted_line` and this test stays a test of
+    /// the byte shape, not of the delivery.
     #[test]
     fn the_nudge_reaches_a_real_child_as_one_submitted_line() {
         let bytes = submit(&nudge_line(

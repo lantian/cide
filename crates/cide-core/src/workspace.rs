@@ -127,6 +127,7 @@ pub fn open_project(
             role: PaneRole::Primary,
             session: Some(primary_session),
             conversation: None,
+            conversation_since: None,
             title: format!("{name} : claude"),
         }),
     };
@@ -1435,7 +1436,12 @@ pub fn console_tab(ws: &Workspace, project: ProjectId) -> Result<TabId> {
 /// `workspace.json` write behind it. That matters more here than elsewhere: a busy turn
 /// sends hook frames continuously and all but the first carry a conversation id the pane has
 /// already recorded.
-pub fn note_conversation(ws: &mut Workspace, session: SessionId, conversation: SessionId) -> bool {
+pub fn note_conversation(
+    ws: &mut Workspace,
+    session: SessionId,
+    conversation: SessionId,
+    now_ms: u64,
+) -> bool {
     for project in ws.projects.values_mut() {
         let panes = project
             .tabs
@@ -1455,10 +1461,65 @@ pub fn note_conversation(ws: &mut Workspace, session: SessionId, conversation: S
                 return false;
             }
             pane.conversation = next;
+            // In lockstep, never independently: the stamp means "when the pane arrived on
+            // *this* conversation", so a stamp left behind by the previous one would be worse
+            // than none at all — it would date a cleared-away name to the clear that replaced
+            // it and let it win the comparison it exists to lose. Cleared with the id when the
+            // CLI comes back to cide's own, for the same reason.
+            pane.conversation_since = next.map(|_| now_ms);
             return true;
         }
     }
     false
+}
+
+/// The instant each open conversation became the one its pane is on, keyed by conversation id.
+///
+/// The half of the `/rename`-across-`/clear` rule that can live here. The other half is
+/// `cide_claude::roster`, which reads the CLI's `~/.claude/sessions/<pid>.json` and reports a
+/// name **with the `nameSince` it was given at**; this crate cannot see that module (the
+/// dependency runs the other way, `cide-claude` → `cide-core`), so the comparison is split:
+/// this side answers *what would make a name stale*, and the caller — `cmd::file`'s
+/// `claude_session_names` — drops every name not later than the cutoff for its id.
+///
+/// # Why a name has to be dated at all
+///
+/// The CLI's name belongs to the **process**, not to the conversation. `/rename` sets it on a
+/// per-process singleton; `/clear` starts a fresh conversation inside that same `claude` and
+/// rewrites the record with the new `sessionId` and the old `name` still on it. A bare
+/// id → name map therefore hands the name the user gave one conversation to the one that
+/// replaced it, which is what *"`/clear` doesn't reset the session fully"* looked like from
+/// the menu.
+///
+/// The obvious one-liner — stop consulting `Pane::conversation` and look names up under
+/// `Pane::session` — is wrong in the other direction, and quietly: the CLI files its record
+/// under the conversation it is *running*, so a rename made after a `/clear` (or after any
+/// resume) would then be invisible for the rest of the pane's life. Only a timestamp separates
+/// the two cases.
+///
+/// Panes that have never diverged are absent from the map, not present with a zero: they have
+/// no cutoff, and a name found under their id is theirs whenever it was given.
+pub fn claude_name_cutoffs(ws: &Workspace) -> std::collections::HashMap<String, u64> {
+    let mut cutoffs = std::collections::HashMap::new();
+    for project in ws.projects.values() {
+        let panes = project
+            .tabs
+            .iter()
+            .flat_map(|t| t.tree.panes.values())
+            .chain(project.detached.values());
+        for pane in panes {
+            if let (Some(conversation), Some(since)) = (pane.conversation, pane.conversation_since)
+            {
+                // `max` rather than `insert`, because two panes can legitimately name one
+                // conversation id — a resume hands the same id to a second pane — and the
+                // honest cutoff is the latest move onto it. Taking either arbitrarily would
+                // make the answer depend on iteration order.
+                let at = cutoffs.entry(conversation.to_string()).or_insert(since);
+                *at = (*at).max(since);
+            }
+        }
+    }
+    cutoffs
 }
 
 pub fn bind_session(
@@ -2105,6 +2166,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         role: PaneRole::Auxiliary,
         session: attached.then(SessionId::new),
         conversation: None,
+        conversation_since: None,
         title: title.to_string(),
     }
 }
@@ -2246,16 +2308,26 @@ mod tests {
 
         let cleared = SessionId::new();
         assert!(
-            note_conversation(&mut ws, session, cleared),
+            note_conversation(&mut ws, session, cleared, 1_700),
             "the first frame after a `/clear` has something to say"
         );
         assert_eq!(
             project(&ws, id).expect("exists").tabs[0].tree.panes[&pane].conversation,
             Some(cleared)
         );
+        assert_eq!(
+            project(&ws, id).expect("exists").tabs[0].tree.panes[&pane].conversation_since,
+            Some(1_700),
+            "the stamp moves with the id, because a name is dated against it"
+        );
         assert!(
-            !note_conversation(&mut ws, session, cleared),
+            !note_conversation(&mut ws, session, cleared, 9_999),
             "every later frame of the same turn repeats it and must cost nothing"
+        );
+        assert_eq!(
+            project(&ws, id).expect("exists").tabs[0].tree.panes[&pane].conversation_since,
+            Some(1_700),
+            "and a repeat must not re-date the conversation the pane is already on"
         );
 
         // A pane whose CLI is simply using our id stays `None`, so `workspace.json` does not
@@ -2264,9 +2336,13 @@ mod tests {
         let id = open(&mut plain, "/home/dev/work/cide");
         let session = project(&plain, id).expect("exists").primary_session;
         let pane = project(&plain, id).expect("exists").tabs[0].tree.focused;
-        assert!(!note_conversation(&mut plain, session, session));
+        assert!(!note_conversation(&mut plain, session, session, 1_700));
         assert_eq!(
             project(&plain, id).expect("exists").tabs[0].tree.panes[&pane].conversation,
+            None
+        );
+        assert_eq!(
+            project(&plain, id).expect("exists").tabs[0].tree.panes[&pane].conversation_since,
             None
         );
 
@@ -2274,9 +2350,54 @@ mod tests {
         assert!(!note_conversation(
             &mut plain,
             SessionId::new(),
-            SessionId::new()
+            SessionId::new(),
+            1_700
         ));
         validate(&plain).expect("still valid");
+    }
+
+    /// A cleared pane dates its conversation, so a name given before the `/clear` is stale.
+    ///
+    /// The rule is a comparison and not a lookup, and the two directions of it are what this
+    /// pins: a name whose `nameSince` predates the move is the one the CLI carried across the
+    /// `/clear` and must be dropped, and one stamped after it is a rename the user made on the
+    /// conversation they are actually on and must survive. A pane that has never diverged has
+    /// no cutoff at all, so its name is never questioned.
+    #[test]
+    fn a_cleared_pane_dates_the_conversation_it_moved_onto() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let session = project(&ws, id).expect("exists").primary_session;
+
+        assert!(
+            claude_name_cutoffs(&ws).is_empty(),
+            "a pane still on the id it was spawned under questions nothing"
+        );
+
+        let cleared = SessionId::new();
+        note_conversation(&mut ws, session, cleared, 1_700);
+        let cutoffs = claude_name_cutoffs(&ws);
+        assert_eq!(cutoffs.get(&cleared.to_string()), Some(&1_700));
+        assert_eq!(cutoffs.len(), 1, "{cutoffs:?}");
+
+        // What the caller does with it, spelled out here because the comparison is the rule
+        // and the boundary is the half that is easy to get backwards. `nameSince == cutoff`
+        // is the CLI writing both in the same millisecond as it starts the new conversation,
+        // which is the carried-over name, not a rename.
+        let cutoff = cutoffs[&cleared.to_string()];
+        assert!(1_699 <= cutoff, "a name from before the /clear is stale");
+        assert!(1_700 <= cutoff, "and one from the same instant is too");
+        assert!(1_701 > cutoff, "a rename after the /clear survives");
+
+        // A second `/clear` re-dates it; the first cutoff must not linger.
+        let again = SessionId::new();
+        note_conversation(&mut ws, session, again, 2_400);
+        let cutoffs = claude_name_cutoffs(&ws);
+        assert_eq!(cutoffs.get(&again.to_string()), Some(&2_400));
+        assert!(
+            !cutoffs.contains_key(&cleared.to_string()),
+            "the conversation the pane has left is nobody's cutoff"
+        );
     }
 
     /// And every other pane binds only itself.

@@ -113,7 +113,7 @@ export interface RunRowProps {
   onResume?: ((run: string) => void) | undefined
   /** End the run. Not offered once it has already ended. */
   onStop?: ((run: string) => void) | undefined
-  /** Reveal the task this run is against, in the Tasks panel. */
+  /** Open the task this run is against — its card, over this panel; no view is switched. */
   onRevealTask?: ((task: string) => void) | undefined
   /** Re-send the turn the freeze may have killed. */
   onRetryTurn?: ((run: string) => void) | undefined
@@ -160,8 +160,10 @@ export function ActivityRow({
         <TaskLink row={row} onRevealTask={onRevealTask} />
         {/* `title` carries the phase in words, because the dot at the head of the line is the
             only other place this run's state is written and a dot is not readable by a screen
-            reader or by somebody who has not learned the glyphs. */}
-        <span className={styles.elapsed} data-audit="agentsElapsed" title={row.label}>
+            reader or by somebody who has not learned the glyphs. `hint` outranks the word for
+            the one phase whose word is not the whole truth — a paused child with a model call
+            still finishing server-side; see `phaseHint`. */}
+        <span className={styles.elapsed} data-audit="agentsElapsed" title={row.hint ?? row.label}>
           {elapsed(nowMs, run.startedMs)}
         </span>
         <RunControls
@@ -218,14 +220,18 @@ export function RunRow({
             empties when a role is deleted, and a row that renames itself lies about what
             happened. That is what makes this row survivable for a role that no longer exists,
             which in Recent is an ordinary state rather than an edge case. */}
-        <span className={styles.agentLabel} data-audit="agentsRunLabel" title={row.label}>
+        <span
+          className={styles.agentLabel}
+          data-audit="agentsRunLabel"
+          title={row.hint ?? row.label}
+        >
           {run.agentLabel}
         </span>
         <span className={styles.sep} aria-hidden="true">
           ·
         </span>
         <span className={styles.harness}>{harnessLabel(run.harness)}</span>
-        <span className={styles.elapsed} data-audit="agentsElapsed" title={row.label}>
+        <span className={styles.elapsed} data-audit="agentsElapsed" title={row.hint ?? row.label}>
           {elapsed(nowMs, run.startedMs)}
         </span>
       </div>
@@ -289,7 +295,7 @@ function TaskLink({
       data-audit="agentsTaskLink"
       data-task={task}
       onClick={() => onRevealTask(task)}
-      title={`Show ${task} in the Tasks panel`}
+      title={`Open ${task}`}
     >
       <span className={styles.taskId}>{task}</span>
       <span className={styles.taskTitle}>{row.taskTitle ?? 'Untitled task'}</span>
@@ -319,7 +325,10 @@ function RunControls({
   onStop?: ((run: string) => void) | undefined
 }) {
   const { run } = row
-  const canResume = run.phase === 'paused'
+  // `interrupted` resumes too, and it is the row's *only* affordance: the child died with a
+  // cide restart, so there is nothing to open, pause or type at — Resume requeues the run and
+  // a new child continues the same conversation.
+  const canResume = run.phase === 'paused' || run.phase === 'interrupted'
   const canStop = !isDonePhase(run.phase)
 
   return (

@@ -27,6 +27,22 @@ session: SessionId | null,
  */
 conversation: SessionId | null, 
 /**
+ * When the CLI moved onto [`Self::conversation`], in milliseconds since the epoch.
+ *
+ * The stamp beside the id, and it exists for one question: *was this name given to the
+ * conversation the pane is on now, or to the one before it?* The CLI holds a `/rename`
+ * name on the **process** — `/clear` mints a new conversation inside the same `claude`
+ * and rewrites `~/.claude/sessions/<pid>.json` with the new `sessionId` and the old
+ * `name` still attached — so a name read back under this id may predate it. Anything not
+ * later than this instant belongs to a conversation the user has already cleared away.
+ *
+ * Wall clock rather than monotonic, because the only thing it is ever compared against is
+ * the CLI's own `nameSince`, which is `Date.now()`. Persisted for the same reason
+ * [`Self::conversation`] is: a restart must not resurrect the stale name.
+ * `cide_core::workspace::claude_name_cutoffs` is the one reader.
+ */
+conversationSince: bigint | null, 
+/**
  * e.g. `cide : claude`, `cide : bash`, `cide : claude — diff`.
  */
 title: string, };

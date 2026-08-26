@@ -603,10 +603,13 @@ pub fn tasks_changed(
 /// few kilobytes, the emitter has it in hand, and a window that answered by re-reading would be
 /// reading files that may have changed again in between.
 ///
-/// Not coalesced yet, and it does not need to be: in this slice the only emitter is
-/// `cmd::agents::agents_config_set`, which is a user pressing a switch. The 120 ms coalescing
-/// with a 1 s ceiling that `crate::lsp` uses belongs with the run registry, which is what
-/// produces the once-a-second-per-run churn worth damping.
+/// The markers have multiplied since that paragraph was first written — the Settings commands
+/// (`agents_config_set`/`agents_save`/`agents_delete`), the run registry's activity, and
+/// `crate::dotcide` translating a `.cide/agents` or `.cide/config.json` change on disk — but the
+/// *emit* still has one funnel: everything except the three Settings commands routes through
+/// `AgentRegistry::mark_changed`, whose coalescer (120 ms, 1 s ceiling) rebuilds the roster from
+/// disk at flush. "Built immediately after the change, from the state that change produced"
+/// therefore survives the fs-driven marker, which is what keeps the no-`rev` argument sound.
 pub const AGENTS_CHANGED: &str = "cide://agents-changed";
 
 #[derive(Clone, Serialize)]

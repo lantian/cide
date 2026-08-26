@@ -50,6 +50,7 @@ import {
   type TaskDraft,
 } from './model'
 import { cx } from './TaskDetail'
+import { MentionTextarea } from './MentionTextarea'
 import { Icon } from '@/icons/Icon'
 
 import styles from './TasksPanel.module.css'
@@ -59,6 +60,12 @@ export interface TaskComposeProps {
   draft: TaskDraft
   /** Agent id → label, for the assignee list. The same map the card is handed. */
   roles: Readonly<Record<string, string>>
+  /**
+   * Why the assignee list is short — `model.ts::assigneeHint`'s sentence, or `null`/absent when
+   * the list speaks for itself. Without it, a disabled-roster dropdown holding only *Unassigned*
+   * is indistinguishable from the wiring bug it used to be.
+   */
+  assigneeHint?: string | null | undefined
   /** A keystroke, a choice, a status. The draft is replaced whole. */
   onDraft: (draft: TaskDraft) => void
   /** Create. Only ever called with a draft `draftReady` admits. */
@@ -110,6 +117,7 @@ export function TaskComposeModal(props: TaskComposeProps) {
 export function TaskCompose({
   draft,
   roles,
+  assigneeHint = null,
   onDraft,
   onCreate,
   onCancel,
@@ -257,21 +265,30 @@ export function TaskCompose({
             </select>
           )}
         </Field>
+        {assigneeHint !== null && (
+          <p className={styles.assigneeHint} data-audit="tasksAssigneeHint">
+            {assigneeHint}
+          </p>
+        )}
 
         <Field field="body">
           {(id) => (
-            <textarea
+            <MentionTextarea
               id={id}
               className={styles.textarea}
               data-audit="taskComposeField"
               data-field="body"
               data-write="true"
+              roles={roles}
+              listboxId="compose-body-mentions"
+              tools
               value={draft.body}
-              onChange={(event) => onDraft({ ...draft, body: event.target.value })}
+              onValueChange={(body) => onDraft({ ...draft, body })}
               onKeyDown={(event) => {
                 // Enter is a newline in a body, so the submit shortcut is the modified one —
                 // the card's body editor makes the same distinction. Create is on screen too: a
-                // shortcut nobody can see is not a way out of a field.
+                // shortcut nobody can see is not a way out of a field. Plain Enter with the
+                // mention popup open never reaches here — the popup claims it.
                 if (event.key !== 'Enter' || !(event.ctrlKey || event.metaKey)) return
                 event.preventDefault()
                 submit()

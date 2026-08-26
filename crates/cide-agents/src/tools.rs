@@ -375,8 +375,11 @@ pub trait AgentSink: Send + Sync {
     /// durable record, and [`tool::AGENT_STOP`]'s description says so and names the tool that is.
     fn stop(&self, run: RunId, reason: Option<&str>) -> Result<(), String>;
 
-    /// Merge `cide/<agent>` into the branch the project root has checked out.
-    fn integrate(&self, agent: &AgentId) -> Result<Integrated, String>;
+    /// Merge one of the role's worktree branches into the branch the project root has checked
+    /// out: `cide/<agent>-<task>` when a task is named, `cide/<agent>` — the branch its
+    /// taskless dispatches commit to — when not. Worktrees are per (role, task), so the task
+    /// is what picks the branch holding the work being taken.
+    fn integrate(&self, agent: &AgentId, task: Option<&TaskId>) -> Result<Integrated, String>;
 
     /// Now, in epoch milliseconds.
     ///
@@ -393,6 +396,17 @@ pub trait AgentSink: Send + Sync {
     /// function of its arguments and a test asserts on a sentence rather than on whatever the
     /// machine's clock said while it ran.
     fn now_unix_ms(&self) -> u64;
+
+    /// Whether this project isolates runs in worktrees.
+    ///
+    /// This used to be the fact that let `cide_agents_list` clamp the printed concurrency to 1
+    /// — one worktree per role meant one run at a time whatever `max-concurrent` declared. The
+    /// clamp is gone (worktrees are per **task** now, so the declared number is the true one),
+    /// and what the flag feeds instead is the list's *ground* sentence: where a run stands —
+    /// its own `.cide/worktrees/<role>-<task>` checkout, or the shared project root — which is
+    /// what an orchestrator needs for integrate branch names and for knowing that a taskless
+    /// dispatch of a busy role serialises on the base checkout.
+    fn isolated(&self) -> Result<bool, String>;
 }
 
 // --- what `tools/list` says --------------------------------------------------------------------
@@ -441,9 +455,14 @@ pub fn description(name: &str) -> &'static str {
              title a person can act on, and put the statement of the work in the body."
         }
         tool::TASK_UPDATE => {
+            // Third person deliberately, here and in TASK_ASSIGN: `tool::ALL` serves these to
+            // dispatched runs as well as to the product owner, and a run's own assign records
+            // intent only (the author gate in `crate::autodispatch`) — a first-person "this
+            // starts the agent" would be a lie to half this description's readers.
             "Change a task's title, body, status or assigned role. Only the fields you send are \
              changed. To record *why* something changed, add a comment as well — the tracker is \
-             read by the user and by the other agents."
+             read by the user and by the other agents. When subagents are enabled, an assignment \
+             made by the user or the product owner also starts that role on the task."
         }
         tool::TASK_COMMENT => {
             "Append one line to a task's log: what you did, what you found, or why you are \
@@ -452,21 +471,29 @@ pub fn description(name: &str) -> &'static str {
         }
         tool::TASK_ASSIGN => {
             "Set the role a task is for, or pass agent: null to unassign it. This is the same as \
-             the `assignee` field of cide_task_update and exists because it is the common call."
+             the `assignee` field of cide_task_update and exists because it is the common call. \
+             When subagents are enabled, an assignment made by the user or the product owner \
+             also starts that role on the task; unassigning never stops a run."
         }
         tool::AGENTS_LIST => {
             "The subagent roles this project defines and can hand work to: what each one is for, \
-             whether it can be dispatched right now, and how many of its runs are live. Call \
-             this before dispatching anything — the roles come from files in the repository, so \
-             a teammate's commit can add or remove one while you are working."
+             whether it can be dispatched right now, how many of its runs are live and how many \
+             it may run at once. Call this before dispatching anything — the roles come from \
+             files in the repository (`.cide/agents/<name>.md`), so a teammate's commit can add \
+             or remove one while you are working, and a role file you write yourself takes \
+             effect immediately."
         }
         tool::AGENT_DISPATCH => {
             "Hand one of this project's roles a task to work on. Create the task first with \
              cide_task_create and put the statement of the work in its body: the run is pointed \
              at the task and reads it itself. This returns a run id **immediately** and does not \
              wait for the run — carry on, and use cide_agent_runs to see how it is getting on. A \
-             role works on one task at a time, so a dispatch to a busy role is queued rather \
-             than refused."
+             dispatch past a role's concurrency is queued rather than refused. Not needed after \
+             an assignment — assigning a task already starts the role — so reach for this to \
+             re-run a role or to add a one-line extra instruction. `instructions` is a single \
+             line by design (it is typed into a terminal): anything longer — context, \
+             constraints, acceptance criteria — belongs in the task's body, which the run reads \
+             in full."
         }
         tool::AGENT_RUNS => {
             "What this project's subagents are doing: one row per run, with the task it is on, \
@@ -481,9 +508,11 @@ pub fn description(name: &str) -> &'static str {
         }
         tool::AGENT_INTEGRATE => {
             "Take a role's finished work back into the branch this project has checked out, by \
-             merging its worktree branch `cide/<agent>`. Do this once you have read what the run \
-             did. On a conflict **nothing is changed** and the conflicting paths come back, so \
-             you can hand them to a role as a new task."
+             merging its worktree branch — `cide/<agent>-<task>` when you name the task (each \
+             task works in its own worktree, so name it whenever the work was on one), \
+             `cide/<agent>` for a run dispatched without a task. Do this once you have read \
+             what the run did. On a conflict **nothing is changed** and the conflicting paths \
+             come back, so you can hand them to a role as a new task."
         }
         // Unreachable while `descriptors` walks `ALL`, and empty rather than a placeholder: a
         // tool advertised with a made-up sentence is worse than the test failure below.
@@ -654,7 +683,15 @@ pub fn input_schema(name: &str) -> Value {
                 "agent": {
                     "type": "string",
                     "description":
-                        "The role whose branch `cide/<agent>` is to be merged, e.g. `developer`.",
+                        "The role whose work is to be merged, e.g. `developer`.",
+                },
+                "task": {
+                    "type": "string",
+                    "description":
+                        "The task whose branch to merge, e.g. `t-14` — a task's work lives on \
+                         `cide/<agent>-<task>` in its own worktree, so name the task whenever \
+                         the run was on one. Omit only for a run dispatched without a task, \
+                         whose work is on `cide/<agent>`.",
                 },
             },
             "required": ["agent"],
@@ -1001,15 +1038,34 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         // Not an error: subagents are on for this project and it simply has no roles yet. The
         // sentence names the file that would add one, because that is the only action available
         // and a model told "no roles" with no path is a model that gives up and does the work
-        // itself without saying why.
+        // itself without saying why. This used to end "the user adds one; you cannot" — true
+        // until the fs router (`cide_app::dotcide`) made a written role file take effect live,
+        // and a model still told it cannot would never use the one action it has.
         return ToolResult::text(
             "This project defines no subagent roles, so there is nobody to hand work to. A role \
-             is a markdown file at .cide/agents/<name>.md — the user adds one; you cannot.",
+             is a markdown file at .cide/agents/<name>.md; one you write takes effect \
+             immediately.",
         );
     }
+    let isolated = match sink.isolated() {
+        Ok(isolated) => isolated,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENTS_LIST)),
+    };
 
     let live = runs.iter().filter(|run| is_live(&run.state)).count();
-    let header = format!("{} role(s) defined, {live} run(s) live.", agents.len());
+    // Where a run stands is planning information: an orchestrator fanning a role out across
+    // tasks needs to know each task gets its own checkout (and which branch to integrate),
+    // and that a task*less* dispatch of a busy role serialises on the base worktree.
+    let ground = if isolated {
+        " Each task runs in its own worktree (branch cide/<role>-<task>); dispatches without \
+         a task share the role's base worktree one at a time."
+    } else {
+        " Runs share the project root (isolation: shared)."
+    };
+    let header = format!(
+        "{} role(s) defined, {live} run(s) live.{ground}",
+        agents.len()
+    );
 
     let mut body = String::new();
     for def in &agents {
@@ -1017,11 +1073,28 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
             .iter()
             .filter(|run| run.agent == def.id && is_live(&run.state))
             .count();
+        // The declared number is the true one now under both isolations: worktrees went
+        // per-task, so a role genuinely runs `max-concurrent` tasks at once — each in its own
+        // checkout when the project isolates, all in the project root when it does not. The
+        // clamp-to-1 this used to restate is gone with its premise; what `isolated` still
+        // decides is the sentence below, which tells the orchestrator where the parallelism
+        // lands and what a taskless dispatch costs.
+        let at_once = def.max_concurrent.max(1);
+        // A role that opted out of the checkout is the exception to the header's ground
+        // sentence, and it changes what the orchestrator does next: no worktree, no
+        // `cide/<role>-<task>` branch, nothing to integrate — the run's edits land directly
+        // on the project's own checked-out branch.
+        let ground = if isolated && !def.worktree {
+            ", in the project root (worktree: false — its edits land on your branch, nothing \
+             to integrate)"
+        } else {
+            ""
+        };
         // The refusal sentence is passed through verbatim — it is `dispatch_refusal`'s, the same
         // one the Agents panel draws, and it names its own fix. Inventing a second wording here
         // would leave a user reading two different explanations of one state.
         body.push_str(&format!(
-            "{} ({}) | {} | {} | {mine} live run(s)\n",
+            "{} ({}) | {} | {} | {mine} live run(s), runs up to {at_once} at once{ground}\n",
             one_line(def.id.as_str()),
             one_line(&def.label),
             harness_wire(def.harness),
@@ -1166,14 +1239,24 @@ fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(agent) => agent,
         Err(result) => return result,
     };
+    // Optional, because a taskless dispatch's work lives on the role's base branch — but with
+    // per-task worktrees the task is almost always the right thing to name, and the schema
+    // says so.
+    let task = match optional_string(arguments, "task") {
+        Ok(task) => task.filter(|task| !task.trim().is_empty()).map(TaskId),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_INTEGRATE)),
+    };
+    // The branch the sink will resolve, named in every sentence below so the model reports
+    // the ref that actually moved (or refused).
+    let branch = crate::checkout_name(&agent, task.as_ref());
 
-    match sink.integrate(&agent) {
+    match sink.integrate(&agent, task.as_ref()) {
         Ok(Integrated::UpToDate) => ToolResult::text(format!(
-            "`cide/{agent}` has nothing this branch does not already have, so nothing was \
+            "`cide/{branch}` has nothing this branch does not already have, so nothing was \
              merged."
         )),
         Ok(Integrated::Merged { commit, files }) => ToolResult::text(format!(
-            "Merged `cide/{agent}` into this project's branch: commit {}, {files} file(s) \
+            "Merged `cide/{branch}` into this project's branch: commit {}, {files} file(s) \
              changed.",
             short(&commit)
         )),
@@ -1182,7 +1265,7 @@ fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         // asks about conflicts before a byte is written — and saying so is what stops a model
         // "cleaning up" a working tree that was never touched.
         Ok(Integrated::Conflicts { paths }) => ToolResult::error(format!(
-            "`cide/{agent}` conflicts with this branch, so **nothing was changed** — your \
+            "`cide/{branch}` conflicts with this branch, so **nothing was changed** — your \
              checkout is exactly as it was. The conflicting path(s):\n{}\nHand these back to a \
              role as a new task, or resolve them yourself.",
             paths
@@ -1253,6 +1336,7 @@ fn run_state_wire(state: &RunState) -> &'static str {
         RunState::AwaitingPermission => "awaitingPermission",
         RunState::Paused { .. } => "paused",
         RunState::Idle => "idle",
+        RunState::Interrupted => "interrupted",
         RunState::Finished { .. } => "finished",
         RunState::Failed { .. } => "failed",
     }
@@ -1274,6 +1358,11 @@ fn run_state_detail(state: &RunState) -> Option<String> {
         RunState::Idle => {
             Some("its turn ended; read the task's comments for what it did".to_string())
         }
+        RunState::Interrupted => Some(
+            "its child ended with a cide restart; the user can resume it, which continues the \
+             same conversation in a new child"
+                .to_string(),
+        ),
         RunState::Finished { code } => Some(format!("exit {code}")),
         RunState::Failed { reason } => Some(one_line(reason)),
         RunState::Queued | RunState::Starting | RunState::Running => None,
@@ -1689,6 +1778,7 @@ mod tests {
                 status: TaskStatus::Todo,
                 agent: agent.cloned(),
                 comments: Vec::new(),
+                history: Vec::new(),
                 // The real store stamps this from the identity the RPC connection carried; every
                 // call that reaches a `TaskSink` is one of those, so the fake answers as the side
                 // of the wire it stands in for.
@@ -1748,6 +1838,7 @@ mod tests {
             status,
             agent: agent.map(|a| AgentId(a.to_string())),
             comments: Vec::new(),
+            history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 1,
@@ -2273,6 +2364,7 @@ mod tests {
         /// is the one that matters, and it must not read as an empty roster.
         broken: Option<String>,
         now: u64,
+        isolated: bool,
     }
 
     const NOW: u64 = 1_700_000_000_000;
@@ -2326,7 +2418,11 @@ mod tests {
             Ok(())
         }
 
-        fn integrate(&self, _agent: &AgentId) -> Result<Integrated, String> {
+        fn integrate(
+            &self,
+            _agent: &AgentId,
+            _task: Option<&TaskId>,
+        ) -> Result<Integrated, String> {
             match &self.broken {
                 Some(why) => Err(why.clone()),
                 None => Ok(self.integration.clone()),
@@ -2335,6 +2431,13 @@ mod tests {
 
         fn now_unix_ms(&self) -> u64 {
             self.now
+        }
+
+        fn isolated(&self) -> Result<bool, String> {
+            match &self.broken {
+                Some(why) => Err(why.clone()),
+                None => Ok(self.isolated),
+            }
         }
     }
 
@@ -2348,6 +2451,7 @@ mod tests {
             model: None,
             unavailable: unavailable.map(str::to_string),
             max_concurrent: 1,
+            worktree: true,
         }
     }
 
@@ -2393,6 +2497,8 @@ mod tests {
             integration: Integrated::UpToDate,
             broken: None,
             now: NOW,
+            // The default project shape; `the_list_prints_the_effective_concurrency` flips it.
+            isolated: true,
         }
     }
 
@@ -2415,7 +2521,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("developer (Developer) | claude | ready | 2 live run(s)"),
+            text.contains(
+                "developer (Developer) | claude | ready | 2 live run(s), runs up to 1 at once"
+            ),
             "{text}"
         );
         // The refusal is `dispatch_refusal`'s own sentence, verbatim.
@@ -2435,6 +2543,33 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(".cide/agents/*.md"), "{text}");
+    }
+
+    /// The number the list prints is the number the queue enforces — which, since worktrees
+    /// went per-task, is the author's own `max-concurrent` under both isolations. What changes
+    /// with isolation is the *ground* sentence in the header: an orchestrator fanning a role
+    /// out needs to know each task takes its own worktree (and which branch to integrate),
+    /// and that a taskless dispatch of a busy role serialises on the base checkout. The old
+    /// clamp this test pinned ("runs up to 1 at once" under isolation) is gone with its
+    /// premise.
+    #[test]
+    fn the_list_prints_the_declared_concurrency_and_says_where_runs_stand() {
+        let mut shared = roster();
+        shared.isolated = false;
+        shared.defs[0].max_concurrent = 3;
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &shared));
+        assert!(text.contains("runs up to 3 at once"), "{text}");
+        assert!(text.contains("share the project root"), "{text}");
+
+        let mut isolated = roster();
+        isolated.defs[0].max_concurrent = 3;
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &isolated));
+        assert!(
+            text.contains("runs up to 3 at once"),
+            "the declared number is the true one now: {text}"
+        );
+        assert!(text.contains("its own worktree"), "{text}");
+        assert!(text.contains("cide/<role>-<task>"), "{text}");
     }
 
     #[test]

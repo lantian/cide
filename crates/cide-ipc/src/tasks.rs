@@ -221,6 +221,33 @@ impl TaskComment {
     }
 }
 
+/// One status transition, recorded where the mutation is applied. (M27)
+///
+/// # Why a structured record rather than a seeded comment
+///
+/// The alternative was `TasksStore::edit` appending "moved to Review" lines to the log, which
+/// costs nothing on the wire — and it is the design [`Task::created_by`] already tried and
+/// reversed, for reasons that all apply here: the panel would have to *parse prose* to draw the
+/// transitions apart from conversation, the user can delete comments (so the history would be
+/// editable in exactly the way provenance must not be), and every agent reading the task would
+/// wade through bookkeeping lines to find the words. A separate vector is invisible to the log,
+/// undeletable by design (no [`TaskEdit`] variant touches it), and renders collapsed.
+///
+/// `by` is stamped from the connection's identity exactly as a comment's author is — see
+/// [`TaskEdit::Comment`] — so an agent cannot record a move as the user. `from` is read off the
+/// task at the moment of the change, not supplied: a caller-supplied `from` is one an agent can
+/// get wrong, and the pair is what makes each row legible on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskStatusChange {
+    pub from: TaskStatus,
+    pub to: TaskStatus,
+    pub by: TaskAuthor,
+    /// Stamped by Rust when the change lands, for [`TaskComment::at_unix_ms`]'s reason.
+    pub at_unix_ms: u64,
+}
+
 /// One task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -249,6 +276,15 @@ pub struct Task {
     pub agent: Option<AgentId>,
     /// Oldest first, which is the order the panel renders and the order an agent reads.
     pub comments: Vec<TaskComment>,
+    /// Every status transition, oldest first. (M27)
+    ///
+    /// `#[serde(default)]` so every task file that already exists parses — the same posture
+    /// [`Self::created_by`] took when it landed: `.cide/tasks.json` is the user's committed
+    /// data, and a build that refused last week's file over a field it added would be the
+    /// tracker locking the team out of its own repository. Recorded only on an actual change:
+    /// a `SetStatus` naming the status the task already has writes no row.
+    #[serde(default)]
+    pub history: Vec<TaskStatusChange>,
     /// Who asked for this task: the person at the keyboard, the orchestrator, or a subagent.
     /// (M21)
     ///
@@ -309,9 +345,14 @@ pub struct TaskFile {
     /// places — the key and the value's `id` — and the first hand edit that disagreed with
     /// itself would be a task with two identities.
     ///
-    /// There is deliberately **no `order` field**. The array *is* the order. A stored rank is a
-    /// second source of truth that a hand-edited or merged file can contradict, and then
-    /// something has to decide which of the two orderings the panel obeys.
+    /// There is deliberately **no `order` field**: a stored rank is a second source of truth
+    /// that a hand-edited or merged file can contradict, and then something has to decide which
+    /// of the two orderings wins. The array is the *file's* order — what a pull request reads
+    /// top to bottom, where appends land. The Tasks panel does not draw it verbatim any more:
+    /// each status group is drawn by `updated_unix_ms`, newest first, with the array as the
+    /// tie-break (`groups` in `ui/src/sidebar/TasksPanel/model.ts` carries the argument). That
+    /// is a reading order derived from stamps this struct already carries, not a second stored
+    /// one, which is why it does not reopen the argument above.
     pub tasks: Vec<Task>,
 }
 
@@ -512,6 +553,12 @@ mod tests {
                 at_unix_ms: 1_700_000_000_000,
                 edited_at_unix_ms: None,
                 deleted: false,
+            }],
+            history: vec![TaskStatusChange {
+                from: TaskStatus::Todo,
+                to: TaskStatus::Doing,
+                by: TaskAuthor::User,
+                at_unix_ms: 1_700_000_000_000,
             }],
             created_by: TaskAuthor::Orchestrator,
             created_unix_ms: 1_699_999_999_000,

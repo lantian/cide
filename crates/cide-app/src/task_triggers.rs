@@ -1,0 +1,230 @@
+//! Turns "this task was assigned or a role was @mentioned" into a dispatch.
+//!
+//! The policy — who may trigger, which statuses start work, what a mention does to the assignee
+//! field — is [`cide_agents::autodispatch`], pure and table-tested. This module is the app half:
+//! it collects [`TaskMutation`]s from the two places tasks are mutated (the panel's commands in
+//! `cmd::tasks`, and the agent-RPC socket's `StoreSink`), reads `.cide/config.json` fresh at the
+//! moment of each burst (the `nudge_orchestrator` discipline: a committed file can be switched
+//! off under a running app, and a cached copy would keep spawning), asks the registry which
+//! dispatches would duplicate a live run, and hands the survivors to
+//! [`crate::cmd::agents::agents_dispatch`] — the same function the panel's button and the
+//! orchestrator's MCP tool call, because that is where the refusal table, the task lookup and
+//! the one-line opening prompt live, and a second path would eventually get the
+//! `bypassPermissions` arm wrong.
+//!
+//! # Both mutation roads end here, and the author gate is applied *after* the funnel
+//!
+//! Run-authored mutations are deliberately collected and passed through like every other — the
+//! refusal is `autodispatch::trigger`'s author gate, in the pure function, where the test sees
+//! it. Filtering at the collection sites instead would be two copies of the security boundary
+//! that keeps a subagent from spawning a subagent.
+//!
+//! # Everything declines by doing nothing
+//!
+//! `deliver_nudge`'s argument, inherited: a project with agents off, a role the catalog does not
+//! know, a task deleted mid-flight, a dispatch refusal — each is a log line, never an error the
+//! panel shows. The gesture that got us here (a comment, a `<select>` change) already succeeded
+//! and already answered; a durable "could not auto-start" would need a comment from a system
+//! author `TaskAuthor` has no variant for, and is a named possible follow-up rather than a thing
+//! this module fakes with the user's own identity.
+//!
+//! # `spawn`, never `block_on`
+//!
+//! `consider` is reachable from async command handlers, and
+//! `tauri::async_runtime::block_on` is legal only on the agent-RPC connection threads (the rule
+//! `agent_rpc`'s `RegistrySink` documents). So the disk read happens on `spawn_blocking` and
+//! each dispatch on its own spawned task, exactly like [`crate::agents::AgentRegistry::pump`]'s
+//! admissions.
+
+use std::sync::Arc;
+
+use cide_agents::autodispatch;
+use cide_ipc::{
+    AgentId, DispatchRequest, ProjectId, Task, TaskAuthor, TaskEdit, TaskId, TaskStatus,
+};
+use tauri::{AppHandle, Manager as _};
+
+use crate::agents::AgentRegistry;
+use crate::tasks_state::TasksStores;
+use crate::workspace_state::WorkspaceState;
+
+/// One task mutation, as the trigger policy wants to see it.
+///
+/// `fresh_text` is the prose *this mutation introduced* — a creation body, a rewritten body, a
+/// new comment — and never the stored task, so a mention cannot re-fire on every later status
+/// flip. Collected as plain data at the mutation site; nothing here holds a lock or a handle.
+pub struct TaskMutation {
+    /// The task as it was, `None` for a creation.
+    pub before: Option<Task>,
+    /// The task as the mutation left it.
+    pub after: Task,
+    /// Who mutated — from the command layer (`User`) or the RPC connection's header, never from
+    /// a payload.
+    pub author: TaskAuthor,
+    /// Whether this mutation *was* an assignment gesture — the dropdown, `cide_task_assign`, a
+    /// creation naming an assignee — as opposed to a save that carries the field along. Decided
+    /// at the collection site, where the edit's shape is still in hand; the policy uses it to
+    /// dispatch a re-pick of the same assignee (the debug report's revive gesture) without
+    /// letting a status flip or comment re-fire the standing assignment.
+    pub assign_gesture: bool,
+    pub fresh_text: Vec<String>,
+}
+
+/// Ask the policy about a burst of mutations and act on what it answers. Returns immediately;
+/// the work happens on the blocking pool.
+pub fn consider(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMutation>) {
+    if mutations.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || consider_blocking(&app, project, mutations));
+}
+
+fn consider_blocking(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMutation>) {
+    let root = {
+        let Some(workspace) = app.try_state::<WorkspaceState>() else {
+            return;
+        };
+        match crate::tasks_state::project_root(&workspace, project) {
+            Ok(root) => root,
+            Err(_) => return,
+        }
+    };
+
+    // Fresh, per burst — see the module header. The catalog doubles as the mention filter: a
+    // typo'd `@develoepr` must act on nothing, above all not on the assignee field.
+    let loaded = cide_agents::load_project(&root);
+    if !loaded.config.agents.enabled || !loaded.config.agents.auto_dispatch {
+        return;
+    }
+    let roles: Vec<AgentId> = loaded
+        .catalog
+        .agents
+        .iter()
+        .map(|agent| agent.def.id.clone())
+        .collect();
+
+    let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+        return;
+    };
+
+    for mutation in mutations {
+        let fresh: Vec<&str> = mutation.fresh_text.iter().map(String::as_str).collect();
+        let Some(trigger) = autodispatch::trigger(
+            mutation.before.as_ref(),
+            &mutation.after,
+            &mutation.author,
+            mutation.assign_gesture,
+            &fresh,
+            &roles,
+        ) else {
+            continue;
+        };
+
+        let task = mutation.after.id.clone();
+        // The adoption write (a mention on an unassigned task becomes the assignee) is applied
+        // here, inline, and is structurally incapable of re-triggering: only the two collection
+        // sites build `TaskMutation`s, and this write goes through neither.
+        if let Some(agent) = trigger.assign {
+            adopt(app, project, &task, agent, &mutation.author);
+        }
+
+        for agent in trigger.dispatch {
+            if registry.has_open_run(project, &agent, &task) {
+                tracing::debug!(
+                    %project, agent = %agent, task = %task,
+                    "assignment/mention repeated while a run is open; not stacking a second"
+                );
+                continue;
+            }
+            dispatch(app, project, agent, task.clone());
+        }
+    }
+}
+
+/// Write the mention's adoption into the task, and tell the windows.
+fn adopt(app: &AppHandle, project: ProjectId, task: &TaskId, agent: AgentId, author: &TaskAuthor) {
+    let Some(stores) = app.try_state::<Arc<TasksStores>>() else {
+        return;
+    };
+    let Some(store) = stores.get(project) else {
+        return;
+    };
+    let edit = TaskEdit::Assign {
+        agent: Some(agent.clone()),
+    };
+    match store.edit(task, edit, author.clone()) {
+        Ok(_) => {
+            tracing::info!(%project, %task, agent = %agent, "a mention assigned the task");
+            crate::tasks_state::broadcast(app, project, &store);
+        }
+        // Deleted between the comment landing and this write — an ordinary race, not a failure.
+        Err(error) => tracing::debug!(%task, %error, "a mention's assignment found no task"),
+    }
+}
+
+/// One auto-dispatch, on its own task so nothing here waits on the queue.
+fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let (Some(workspace), Some(agents), Some(tasks)) = (
+            app.try_state::<WorkspaceState>(),
+            app.try_state::<Arc<AgentRegistry>>(),
+            app.try_state::<Arc<TasksStores>>(),
+        ) else {
+            return;
+        };
+        let request = DispatchRequest {
+            project,
+            agent: agent.clone(),
+            task: Some(task.clone()),
+            // The run is pointed at the task and reads it with `cide_task_get`; assignment adds
+            // no extra line. Anything more is `cide_agent_dispatch`'s `instructions`.
+            prompt: None,
+        };
+        match crate::cmd::agents::agents_dispatch(app.clone(), workspace, agents, tasks, request)
+            .await
+        {
+            Ok(run) => {
+                tracing::info!(%run, agent = %agent, %task, "an assignment started a subagent run");
+            }
+            // `plan_dispatch` owns every refusal (role gone, project disabled mid-flight,
+            // `bypassPermissions` never authorised); here each one declines by doing nothing
+            // louder than a line.
+            Err(error) => {
+                tracing::warn!(agent = %agent, %task, %error, "an assignment could not start the role");
+            }
+        }
+    });
+}
+
+/// A run admitted onto a task moves that task `Todo → Doing` — and only that hop.
+///
+/// Called from the registry's `bring_up` once the child is live. `Doing`, `Review` and `Done`
+/// are left alone: a reviewer role dispatched onto a `review` task must not yank it backwards,
+/// and the same rule is what makes a respawn (which re-enters `bring_up`) idempotent here.
+/// Authored as [`TaskAuthor::Orchestrator`] — the honest nearest fit, and since `SetStatus`
+/// records its author into `Task::history` (M27) that is now a visible claim: the card's status
+/// log shows the automatic `Todo → Doing` hop as the orchestrator's, which is who dispatched.
+pub fn note_run_started(app: &AppHandle, project: ProjectId, task: &TaskId) {
+    let Some(stores) = app.try_state::<Arc<TasksStores>>() else {
+        return;
+    };
+    // `get`, not `ensure`: the dispatch that admitted this run already ensured the store.
+    let Some(store) = stores.get(project) else {
+        return;
+    };
+    if store.get(task).map(|task| task.status) != Some(TaskStatus::Todo) {
+        return;
+    }
+    let edit = TaskEdit::SetStatus {
+        status: TaskStatus::Doing,
+    };
+    match store.edit(task, edit, TaskAuthor::Orchestrator) {
+        Ok(_) => {
+            tracing::info!(%project, %task, "the run's task moved to doing");
+            crate::tasks_state::broadcast(app, project, &store);
+        }
+        Err(error) => tracing::debug!(%task, %error, "could not move the run's task to doing"),
+    }
+}

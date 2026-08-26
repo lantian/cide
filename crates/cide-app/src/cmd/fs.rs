@@ -489,6 +489,50 @@ pub async fn fs_collapse(
     .await?
 }
 
+/// Re-scan everything under one folder against the disk, and answer the new row count.
+/// The file tree's *Refresh* menu item.
+///
+/// Exists for the corner the watcher deliberately leaves dark: an ignored directory is never
+/// watched (`Index::watch_dirs` — a shown `target/` must cost no inotify descriptors), so
+/// *external* churn under one is invisible until the next full index. cide's own mutations
+/// fold themselves in (`create_entry`, `delete_entries`, `rename_entry`, `paste_into`); this
+/// is the escape hatch for everything else — a `cargo build`, an agent's `rm` in a terminal.
+///
+/// `Index::refresh_subtree` does the work; anything that appeared reaches the picker the way
+/// `create_entry`'s fold does, and every window hears `cide://fs-changed`, because the whole
+/// premise of the gesture is that no watcher will say it for us. Refused outside the
+/// project's roots rather than the writable set — a refresh is a read, and the scratch
+/// drawer is already re-listed by every mutation that touches it.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_refresh(
+    app: tauri::AppHandle,
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    path: PathBuf,
+) -> Result<u32, FsError> {
+    let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
+    blocking("fs_refresh", move || {
+        ops::check_within(&fs.root_paths(), &path)?;
+        let filter = fs.filter();
+        let added = fs.with_index_mut(|index| index.refresh_subtree(&path, &filter));
+        for item in added.iter().filter(|i| !i.is_dir) {
+            fs.matcher().push(cide_search::Candidate::new(
+                item.rel.clone(),
+                item.path.to_string_lossy().into_owned(),
+            ));
+        }
+        let change = cide_ipc::FsChange {
+            paths: vec![path],
+            truncated: false,
+            git: false,
+        };
+        events.changed(project, &change);
+        Ok(tree_count(&fs) as u32)
+    })
+    .await?
+}
+
 /// Expand everything above a path and return the row it sits on.
 ///
 /// `None` rather than an error when the path is not in the tree: revealing a file that is
@@ -1059,6 +1103,15 @@ pub async fn fs_rename(
         if rename_entry(&fs, &from, &to)? {
             events.status(project, &fs.status());
         }
+        // After the `?`, so a refused rename stays silent — and for `fs_delete`'s reason:
+        // inside an ignored directory this event is the only road the move has into any
+        // other window's tree.
+        let change = cide_ipc::FsChange {
+            paths: vec![from, to],
+            truncated: false,
+            git: false,
+        };
+        events.changed(project, &change);
         Ok(())
     })
     .await??;
@@ -1115,6 +1168,25 @@ pub(crate) fn rename_entry(
     ops::check_within(&writable, to)?;
     ops::check_not_root(&writable, from)?;
     ops::rename(from, to)?;
+    // The fold [`delete_entries`] carries, for its reason: inside an ignored directory this
+    // is the only mechanism that will ever move the row, and even outside one it is what
+    // makes the new name appear before the watcher's debounce. Both ends in one change, the
+    // shape `paste_into` uses for a cut — the old row has to go in the same write that adds
+    // the new one. The new file also reaches the picker, exactly as `create_entry` pushes
+    // its creation.
+    let filter = fs.filter();
+    let change = cide_ipc::FsChange {
+        paths: vec![from.to_path_buf(), to.to_path_buf()],
+        truncated: false,
+        git: false,
+    };
+    let added = fs.with_index_mut(|index| index.apply(&change, &filter));
+    for item in added.iter().filter(|i| !i.is_dir) {
+        fs.matcher().push(cide_search::Candidate::new(
+            item.rel.clone(),
+            item.path.to_string_lossy().into_owned(),
+        ));
+    }
     Ok(relist_if_scratch(
         fs,
         &[from.to_path_buf(), to.to_path_buf()],
@@ -1141,7 +1213,21 @@ pub async fn fs_delete(
     let fs = project_fs(&registry, project)?;
     let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_delete", move || {
-        let (trashed, moved) = delete_entries(&fs, &paths)?;
+        let outcome = delete_entries(&fs, &paths);
+        // A second window has no watcher to hear this from when the paths are ignored, and
+        // `delete_entries` has already folded the truth into the shared index — so tell the
+        // webviews whenever rows could have moved: on success, and on a partial delete,
+        // which has still removed the rows it managed. A containment refusal moved nothing
+        // and stays silent.
+        if matches!(&outcome, Ok(_) | Err(FsError::PartialDelete { .. })) {
+            let change = cide_ipc::FsChange {
+                paths: paths.clone(),
+                truncated: false,
+                git: false,
+            };
+            events.changed(project, &change);
+        }
+        let (trashed, moved) = outcome?;
         if moved {
             events.status(project, &fs.status());
         }
@@ -1162,6 +1248,7 @@ pub(crate) fn delete_entries(
         ops::check_not_root(&writable, path)?;
     }
     let mut trashed = Vec::with_capacity(paths.len());
+    let mut failure: Option<FsError> = None;
     for path in paths {
         match ops::delete(path) {
             Ok(dest) => trashed.push(dest),
@@ -1171,17 +1258,35 @@ pub(crate) fn delete_entries(
                     already_trashed = trashed.len(),
                     "a multi-path delete stopped part way through"
                 );
-                return Err(FsError::PartialDelete {
+                failure = Some(FsError::PartialDelete {
                     trashed: trashed.iter().map(|p| p.display().to_string()).collect(),
                     error: err.to_string(),
                 });
+                break;
             }
         }
     }
+    // The same fold [`create_entry`] and [`paste_into`] run, and here it is not merely a
+    // latency courtesy: a path inside an *ignored* directory has no watcher behind it at
+    // all (`Index::watch_dirs` — a shown `target/` deliberately costs no descriptors), so
+    // this fold is the only thing that will ever take the row out of the tree. Skipping it
+    // left a deleted file under `target/` drawn for ever. `apply` rescans each path's
+    // parent, so on a partial delete the entries still on disk are simply re-confirmed —
+    // which is why this runs on the failure path too, before the error goes out.
+    let filter = fs.filter();
+    let change = cide_ipc::FsChange {
+        paths: paths.to_vec(),
+        truncated: false,
+        git: false,
+    };
+    let _ = fs.with_index_mut(|index| index.apply(&change, &filter));
     // After the moves, not before: a delete that failed part way through has still removed the
     // rows it managed, and re-listing here is what stops the group showing files that are
     // already in the trash.
     let moved = relist_if_scratch(fs, paths);
+    if let Some(err) = failure {
+        return Err(err);
+    }
     Ok((trashed, moved))
 }
 
@@ -2412,6 +2517,82 @@ mod tests {
             fs.with_index(|index| index.count()),
             rows,
             "a refused create still moved the tree"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    /// A delete or rename inside an *ignored* folder still moves the tree — with no watcher.
+    ///
+    /// The watcher deliberately takes no descriptor under an ignored directory
+    /// (`Index::watch_dirs`; a shown `target/` must cost no inotify descriptors), so for a
+    /// path in there the fold these two handlers run is the **only** mechanism that will
+    /// ever reconcile the rows. Before the fold existed, a file deleted through the tree
+    /// inside `target/` stayed drawn for ever: cide performed the delete, knew the path,
+    /// and told its own index nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_and_a_rename_inside_an_ignored_folder_move_the_tree_without_a_watcher() {
+        let dir = scratch("cmd-mutate-ignored");
+        std::fs::create_dir_all(dir.path().join("target/debug")).expect("dirs");
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").expect("ignore file");
+        std::fs::write(dir.path().join("target/debug/binary"), []).expect("doomed file");
+        std::fs::write(dir.path().join("target/debug/kept"), []).expect("renamed file");
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        index_project(
+            events,
+            &registry,
+            project,
+            vec![dir.path().to_path_buf()],
+            Visibility {
+                hidden: true,
+                ignored: true,
+            },
+        )
+        .await
+        .expect("the walk");
+        let fs = registry.get(project).expect("an indexed project");
+
+        let names = |fs: &crate::files::ProjectFs| -> Vec<String> {
+            fs.with_index(|index| {
+                index
+                    .rows(0, index.count())
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect()
+            })
+        };
+        // Unfold everything so the assertions read drawn rows, not fold state.
+        fs.with_index_mut(|index| {
+            for d in index.dir_paths() {
+                index.expand(&d);
+            }
+        });
+        assert!(names(&fs).contains(&"binary".to_string()));
+        assert!(names(&fs).contains(&"kept".to_string()));
+
+        delete_entries(&fs, &[dir.path().join("target/debug/binary")]).expect("trashed");
+        rename_entry(
+            &fs,
+            &dir.path().join("target/debug/kept"),
+            &dir.path().join("target/debug/renamed"),
+        )
+        .expect("renamed");
+
+        let drawn = names(&fs);
+        assert!(
+            !drawn.contains(&"binary".to_string()),
+            "the deleted row outlived its file: {drawn:?}"
+        );
+        assert!(
+            !drawn.contains(&"kept".to_string()),
+            "the old name outlived the rename: {drawn:?}"
+        );
+        assert!(
+            drawn.contains(&"renamed".to_string()),
+            "the new name never arrived: {drawn:?}"
         );
 
         drop(registry.remove(project));

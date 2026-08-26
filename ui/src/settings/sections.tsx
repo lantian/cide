@@ -516,7 +516,7 @@ function Files({ settings, patch }: SectionProps) {
       />
       <ToggleRow
         label="Show ignored files"
-        hint="Everything .gitignore covers — target/, node_modules/, dist/ — drawn in a muted olive, the way IDEA draws them. On by default, the way IDEA shows them. It is the expensive setting: on a Rust project it is hundreds of thousands of extra rows to walk, hold and offer to Ctrl+P, so turn it off if indexing a large project feels slow. One ignore decision serves every surface, so this widens Find in Files and the symbol index with the tree — a find-in-files over a built project will read your object files. They are shown but not watched, so changes inside an ignored directory appear when the project is indexed again rather than as they happen."
+        hint="Everything .gitignore covers — target/, node_modules/, dist/ — drawn in a muted olive, the way IDEA draws them. On by default, the way IDEA shows them. It is the expensive setting: on a Rust project it is hundreds of thousands of extra rows to walk, hold and offer to Ctrl+P, so turn it off if indexing a large project feels slow. One ignore decision serves every surface, so this widens Find in Files and the symbol index with the tree — a find-in-files over a built project will read your object files. They are shown but not watched, so changes inside an ignored directory appear when the project is indexed again rather than as they happen — or on demand, with Refresh in the folder's context menu."
         checked={explorer.showIgnoredFiles}
         onChange={(v) => set({ showIgnoredFiles: v })}
       />
@@ -632,6 +632,24 @@ function Terminal({ settings, patch }: SectionProps) {
               value={terminal.renderer}
               options={RENDERERS}
               onChange={(renderer) => set({ renderer })}
+            />
+          }
+        />
+      </Group>
+
+      <Group title="Notifications">
+        <Row
+          label="Announce a job after (seconds)"
+          hint="How long a command must run before its pane reports it — and so lights the pane dot, the tab and project badges and the window title when it finishes. Shorter jobs come and go silently: the threshold is the answer to “did I walk away from this?”, so set it around where you stop watching and switch to something else. Applies to running shells immediately, jobs already under way included."
+          control={
+            <NumberField
+              label="Job announce threshold, seconds"
+              value={terminal.jobNotifyAfterSecs}
+              min={0}
+              max={3600}
+              // Rounded because the wire type is an integer: a typed 90.5 would not be
+              // clamped by the input, and the rejected patch would silently snap back.
+              onChange={(secs) => set({ jobNotifyAfterSecs: Math.round(secs) })}
             />
           }
         />
