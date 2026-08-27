@@ -16,4 +16,4 @@
 # fork, whose manifest patches salsa to the sibling packaging/salsa.lock pins; the two move
 # together or the build resolves a salsa nobody chose.
 CIDE_RA_URL=https://github.com/lantian/rust-analyzer
-CIDE_RA_REV=cide-2026-08-28
+CIDE_RA_REV=cide-2026-08-28.1

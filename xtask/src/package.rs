@@ -536,11 +536,6 @@ pub struct AppInfo {
     /// `bundle.externalBin` from `TAURI_CONF`. Must stay empty: `tauri-build` acts on it on
     /// every cargo invocation, so anything here breaks `cargo build --workspace`.
     pub base_external_bin: Vec<String>,
-    /// `bundle.linux.appimage.files` from `TAURI_BUNDLE_CONF`, as AppDir path -> source path.
-    ///
-    /// AppImage-only on purpose. A `.deb` depends on the distribution's own `webkit2gtk`
-    /// package and must not carry a second copy of its helper processes.
-    pub appimage_files: Vec<(String, String)>,
     /// `bundle.targets` from `TAURI_MACOS_CONF`, the macOS platform overlay.
     ///
     /// Separate from `bundle_targets` because the overlay *replaces* the base array rather than
@@ -983,7 +978,11 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
         steps.extend(sidecar_steps(triple));
         // The fork, for the same reason: it is not a workspace member, so no step below would
         // ever produce it, and the bundler needs its `-<triple>` copy to resolve externalBin.
-        steps.extend(fork_steps(Some(triple), ra_rev(root).as_deref()));
+        steps.extend(fork_steps(
+            Some(triple),
+            ra_rev(root).as_deref(),
+            fork_toolchain_channel(root).as_deref(),
+        ));
         steps.extend(gopls_steps(Some(triple), gopls_rev(root).as_deref()));
 
         let mut env = Vec::new();
@@ -1019,16 +1018,31 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
         // not a separate step here — adding one would build it twice.
         steps.push(Step {
             program: "cargo".into(),
-            args: vec![
-                "tauri".into(),
-                "build".into(),
-                // The sidecar lives here and not in tauri.conf.json; see the module docs.
-                // Without this flag the bundle comes out with no `cide-hook` and no error.
-                "--config".into(),
-                bundle_conf_arg(),
-                "--bundles".into(),
-                bundles,
-            ],
+            args: {
+                let mut args = vec![
+                    "tauri".into(),
+                    "build".into(),
+                    // The sidecar lives here and not in tauri.conf.json; see the module docs.
+                    // Without this flag the bundle comes out with no `cide-hook` and no error.
+                    "--config".into(),
+                    bundle_conf_arg(),
+                ];
+                // The host's WebKit helper mapping, as a second `--config`. `cargo tauri`
+                // takes JSON strings as well as paths and merges them left to right, so this
+                // is a file's worth of host-specific configuration with no file: writing one
+                // would mean either a generated artefact in the source tree or a config in a
+                // different directory, and every relative path in the base config (the three
+                // `../../target/release/*` sidecars) is resolved against that directory.
+                //
+                // Nothing is appended on a host that needs no mapping, so the printed plan
+                // says which kind of host this is.
+                if let Some((_, files)) = webkit_helper_plan() {
+                    args.push("--config".into());
+                    args.push(appimage_files_config(&files));
+                }
+                args.extend(["--bundles".into(), bundles]);
+                args
+            },
             cwd: APP_CRATE.into(),
             env,
             optional: false,
@@ -1048,7 +1062,11 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
             steps.extend(frontend_build_step(info));
             steps.push(release_binaries_step());
             // No triple copy: that name exists for the bundler, and this plan has none.
-            steps.extend(fork_steps(None, ra_rev(root).as_deref()));
+            steps.extend(fork_steps(
+                None,
+                ra_rev(root).as_deref(),
+                fork_toolchain_channel(root).as_deref(),
+            ));
             steps.extend(gopls_steps(None, gopls_rev(root).as_deref()));
         }
         steps.extend(tarball_steps(info, triple));
@@ -1196,7 +1214,7 @@ fn sidecar_path(triple: &str) -> String {
 /// `version.rs` reads it with `option_env!`, so `<rev>+cide` in `--version` output costs zero
 /// diff in the fork. It is only ever for logs and bug reports — provenance in `cide-lsp` is
 /// decided by *where the binary came from*, never by parsing this string.
-fn fork_steps(triple: Option<&str>, rev: Option<&str>) -> Vec<Step> {
+fn fork_steps(triple: Option<&str>, rev: Option<&str>, msrv: Option<&str>) -> Vec<Step> {
     let mut build_env = vec![
         ("CARGO_PROFILE_RELEASE_LTO".into(), "thin".into()),
         ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS".into(), "1".into()),
@@ -1204,7 +1222,49 @@ fn fork_steps(triple: Option<&str>, rev: Option<&str>) -> Vec<Step> {
     if let Some(rev) = rev {
         build_env.push(("CFG_RELEASE".into(), cide_version_stamp(rev)));
     }
-    let mut steps = vec![
+    let mut steps = Vec::new();
+
+    // The toolchain, named by the fork and not by this repository.
+    //
+    // `Step::execute` removes the inherited `RUSTUP_TOOLCHAIN` so the fork resolves its own
+    // compiler from its own directory — and the fork ships no `rust-toolchain.toml`, so what
+    // it resolves is rustup's *default*. On a developer machine that is some recent stable and
+    // everything works; in CI `setup-rust` runs `rustup default` with cide's pin, and the fork
+    // build then dies with "rustc 1.92.0 is not supported by the following packages" across
+    // three dozen crates. Nothing in the workspace changed between those two runs — only which
+    // toolchain was default — which is exactly the class of failure a pin exists to remove.
+    //
+    // So the requirement is read from the fork and stated to the build, the same lane gopls
+    // uses (`GOTOOLCHAIN=auto` against its checkout's `go.mod`). It is a floor rather than a
+    // preference — building with exactly the declared minimum is the more reproducible of the
+    // two answers, and it is the one that does not drift when a runner image updates.
+    if let Some(msrv) = msrv {
+        steps.push(Step {
+            program: "rustup".into(),
+            args: vec![
+                "toolchain".into(),
+                "install".into(),
+                msrv.into(),
+                // No clippy, no rustfmt, no docs: this toolchain compiles one binary and is
+                // never developed against.
+                "--profile".into(),
+                "minimal".into(),
+                // A rustup that decides to update itself mid-release is a variable nobody
+                // asked for, and on some installations it cannot (a distribution package).
+                "--no-self-update".into(),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+            // Skipped where there is no rustup at all — a distribution-packaged Rust, where
+            // the single system compiler is the only answer available and this step would
+            // fail rather than help. `RUSTUP_TOOLCHAIN` below is inert there for the same
+            // reason: no shim reads it.
+            optional: true,
+        });
+        build_env.push(("RUSTUP_TOOLCHAIN".into(), msrv.to_string()));
+    }
+
+    steps.extend([
         Step {
             program: "cargo".into(),
             args: vec![
@@ -1229,7 +1289,7 @@ fn fork_steps(triple: Option<&str>, rev: Option<&str>) -> Vec<Step> {
             env: Vec::new(),
             optional: false,
         },
-    ];
+    ]);
     if let Some(triple) = triple {
         steps.push(Step {
             program: "install".into(),
@@ -1258,6 +1318,36 @@ fn ra_sidecar_path(triple: &str) -> String {
 /// and a plan that merely lacks the stamp is still an honest plan.
 fn ra_rev(root: &Path) -> Option<String> {
     read_ra_lock(root).ok().map(|lock| lock.rev)
+}
+
+/// The toolchain channel the fork's own `rust-toolchain.toml` names.
+///
+/// Read from the checkout rather than restated here, for the same reason the gopls sidecar
+/// takes its Go version from the checkout's own `go.mod`: the requirement belongs to the
+/// thing being built, and a copy of it in this repository goes stale at the next rebase —
+/// silently, because the symptom appears only on a host whose default toolchain differs.
+///
+/// **Not `[workspace.package] rust-version`**, which was tried first and is not true of the
+/// code: it says 1.95, and upstream's own token-tree storage rewrite uses `std::assert_matches`
+/// and `hint::cold_path`, unstable there. A pin taken from it fails the build it was added to
+/// fix. `rust-toolchain.toml` is a cide patch in the fork for exactly this reason, and its
+/// CLAUDE.md carries it in the list of things a rebase must not drop.
+fn fork_toolchain_channel(root: &Path) -> Option<String> {
+    let file = fs::read_to_string(root.join(RA_FORK_DIR).join("rust-toolchain.toml")).ok()?;
+    parse_toolchain_channel(&file)
+}
+
+/// `channel = "1.97.1"` out of a `rust-toolchain.toml`. Pure, so the format has a test.
+fn parse_toolchain_channel(file: &str) -> Option<String> {
+    file.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        let value = line.strip_prefix("channel")?.trim_start();
+        let value = value.strip_prefix('=')?.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 /// The fork's preflight: the pin, the sibling checkout, and whether the two agree.
@@ -1318,8 +1408,35 @@ fn fork_verdicts(root: &Path) -> Vec<Verdict> {
             lock.rev, lock.rev,
         )),
     }];
+    out.push(fork_toolchain_verdict(
+        fork_toolchain_channel(root).as_deref(),
+    ));
     out.extend(salsa);
     out
+}
+
+/// Which compiler the fork will be built with — pure over the fact, so both sentences are
+/// testable on a machine in either state.
+///
+/// A verdict at all because the alternative is discovering it at the end of a plan: the
+/// failure is `rustc 1.92.0 is not supported by the following packages`, once per crate, three
+/// dozen times, from a build that has already spent minutes on cide's own binaries.
+fn fork_toolchain_verdict(channel: Option<&str>) -> Verdict {
+    match channel {
+        Some(channel) => Verdict::Ok(format!(
+            "{RA_FORK_DIR} pins its toolchain to {channel}, and the build states it rather \
+             than inheriting whichever toolchain is default"
+        )),
+        // Not a failure: the build still runs, on rustup's default, which is what every local
+        // build did before this existed. It is a warning because that default is the one
+        // variable that differed between a developer machine where the fork built and a
+        // release runner where the same commit did not.
+        None => Verdict::Warn(format!(
+            "{RA_FORK_DIR} has no rust-toolchain.toml, so the fork will be built with whatever \
+             toolchain is default here — a rebase that dropped it is the likely cause, and its \
+             CLAUDE.md lists the file among the patches that must survive one"
+        )),
+    }
 }
 
 /// The salsa fork's preflight, which only exists when the rust-analyzer fork asks for it.
@@ -2092,7 +2209,7 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
     }
 
     if targets.appimage {
-        out.push(webkit_helper_check(info));
+        out.push(webkit_helper_check());
         out.push(if info.has_updater {
             Verdict::Ok("the updater plugin is configured".into())
         } else {
@@ -2271,6 +2388,86 @@ const WEBKIT_SEARCH_DIRS: [&str; 4] = [
 /// The two out-of-process helpers a WebKitGTK web view cannot render without.
 const WEBKIT_HELPERS: [&str; 2] = ["WebKitWebProcess", "WebKitNetworkProcess"];
 
+/// Everything worth carrying out of the helper directory, required and optional together.
+/// `WebKitGPUProcess` is not in [`WEBKIT_HELPERS`] because a web view renders without it;
+/// it is copied when present because a web view that has one and cannot spawn it stutters.
+const WEBKIT_HELPER_FILES: [&str; 3] = [
+    "WebKitWebProcess",
+    "WebKitNetworkProcess",
+    "WebKitGPUProcess",
+];
+
+/// Whether `tauri-bundler` will find this directory by itself.
+///
+/// Its search is each of [`WEBKIT_SEARCH_DIRS`] joined with `webkit2gtk-4.1`, and when it
+/// finds them it copies them to where that host's `libwebkit2gtk` resolves its relative
+/// helper path inside the AppDir. On a host laid out that way there is nothing for cide to
+/// do, and mapping the files in anyway would duplicate the bundler's own copy at a *second*
+/// path — which is not where the library looks, so it would be dead weight that reads like a
+/// fix.
+fn bundler_finds_helpers(dir: &str) -> bool {
+    WEBKIT_SEARCH_DIRS
+        .iter()
+        .any(|search| dir == format!("{search}/webkit2gtk-4.1"))
+}
+
+/// What `bundle.linux.appimage.files` has to say on **this** host, or nothing if the host
+/// needs no help.
+///
+/// This is derived rather than checked in, and that is the whole point of the function. The
+/// mapping was a literal in `tauri.bundle.conf.json` until 2026-08-28, naming
+/// `/usr/libexec/libwebkit2gtk-4_1-0/…` — openSUSE's layout, and the layout of the machine
+/// cide is developed on. The first release run on a Debian-family runner failed preflight on
+/// it: the sources do not exist there, WebKit's helpers being in
+/// `/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/` where the bundler already looks. One file
+/// cannot hold both answers, because the right answer is a fact about the build host.
+///
+/// The target path mirrors the host's absolute one (`/usr/libexec/x` -> `usr/libexec/x`),
+/// because the reason the mapping is needed at all is that this host's `libwebkit2gtk`
+/// resolves a *relative* path against its own directory — see [`webkit_helper_check`] — so
+/// reproducing the host layout inside the AppDir is exactly what makes that path land.
+fn webkit_helper_files(dir: &str) -> Vec<(String, String)> {
+    WEBKIT_HELPER_FILES
+        .into_iter()
+        .filter(|name| Path::new(dir).join(name).exists())
+        .map(|name| {
+            (
+                format!("{}/{name}", dir.trim_start_matches('/')),
+                format!("{dir}/{name}"),
+            )
+        })
+        .collect()
+}
+
+/// One `--config` argument's worth of JSON: `bundle.linux.appimage.files`, and nothing else.
+///
+/// Hand-built rather than `serde_json::to_string`: the pairs are paths this process just read
+/// off the filesystem, the shape is four nested keys that will not grow, and a dependency on
+/// serde_json in the argument-building path would be paid by every plan that prints and
+/// builds nothing. Paths are escaped for JSON all the same — a directory name is not this
+/// module's to trust.
+fn appimage_files_config(files: &[(String, String)]) -> String {
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let entries: Vec<String> = files
+        .iter()
+        .map(|(target, source)| format!("\"{}\":\"{}\"", escape(target), escape(source)))
+        .collect();
+    format!(
+        "{{\"bundle\":{{\"linux\":{{\"appimage\":{{\"files\":{{{}}}}}}}}}}}",
+        entries.join(",")
+    )
+}
+
+/// The host's helper mapping: the directory, and the files to map out of it — `None` when the
+/// bundler needs no help, which is the common case on Debian-family hosts.
+fn webkit_helper_plan() -> Option<(String, Vec<(String, String)>)> {
+    let dir = find_webkit_helpers_elsewhere()?;
+    if bundler_finds_helpers(&dir) {
+        return None;
+    }
+    Some((dir.clone(), webkit_helper_files(&dir)))
+}
+
 /// Whether the AppImage will carry WebKit's helper processes.
 ///
 /// **This is the check that catches the quietest failure in this whole file**, and its first
@@ -2305,50 +2502,33 @@ const WEBKIT_HELPERS: [&str; 2] = ["WebKitWebProcess", "WebKitNetworkProcess"];
 /// The fix is therefore to place the helpers where the relative path lands, which is what
 /// `bundle.linux.appimage.files` does. Verified by copying them into an extracted AppDir and
 /// running `AppRun`: the window opened and the IPC probe reported the fast path.
-fn webkit_helper_check(info: &AppInfo) -> Verdict {
-    let Some(dir) = find_webkit_helpers_elsewhere() else {
-        // Nothing to copy from. The bundler's own search may still find them, in which case
-        // this is fine and the mapping below would be pointing at nothing.
+fn webkit_helper_check() -> Verdict {
+    let Some((dir, files)) = webkit_helper_plan() else {
+        // Either nothing to copy from, or a host whose helpers sit where `tauri-bundler`
+        // already looks. Both are fine, and both are the same verdict: nothing for cide to do.
         return Verdict::Ok("WebKit's helper processes are where the bundler looks".into());
     };
 
+    // Derived from this directory a moment ago, so an absent source means the directory
+    // changed under us or holds only some of the helpers — either way the bundler copies
+    // nothing and says nothing, which is the silence this check exists for.
     let missing: Vec<&str> = WEBKIT_HELPERS
         .into_iter()
-        .filter(|helper| {
-            !info
-                .appimage_files
-                .iter()
-                .any(|(target, _)| target.ends_with(&format!("/{helper}")))
-        })
+        .filter(|helper| !files.iter().any(|(_, source)| source.ends_with(helper)))
         .collect();
-    if missing.is_empty() {
-        // And the sources have to be real, or the bundler copies nothing and says nothing —
-        // the same silence this check exists for, one layer up.
-        let absent: Vec<&str> = info
-            .appimage_files
-            .iter()
-            .filter(|(_, source)| !Path::new(source).exists())
-            .map(|(_, source)| source.as_str())
-            .collect();
-        if absent.is_empty() {
-            return Verdict::Ok(format!(
-                "the AppImage maps WebKit's helper processes from {dir} into usr/libexec/"
-            ));
-        }
+    if !missing.is_empty() {
         return Verdict::Fail(format!(
-            "bundle.linux.appimage.files names {} which does not exist, so the bundler will \
-             copy nothing and the AppImage will abort on launch",
-            absent.join(", ")
+            "the AppImage will not contain {}, and will abort before its first frame: the \
+             bundled libwebkit2gtk resolves `././/libexec/libwebkit2gtk-4_1-0` against its own \
+             directory, so inside the package that is <AppDir>/usr/libexec/, which nothing \
+             populates. This machine keeps helpers in {dir}, but not those",
+            missing.join(" and "),
         ));
     }
-
-    Verdict::Fail(format!(
-        "the AppImage will not contain {}, and will abort before its first frame: the bundled \
-         libwebkit2gtk resolves `././/libexec/libwebkit2gtk-4_1-0` against its own directory, \
-         so inside the package that is <AppDir>/usr/libexec/, which nothing populates. This \
-         machine keeps them in {dir} — map them in with bundle.linux.appimage.files in {}",
-        missing.join(" and "),
-        TAURI_BUNDLE_CONF,
+    Verdict::Ok(format!(
+        "the AppImage maps {} of WebKit's helper processes from {dir}, which the bundler does \
+         not search",
+        files.len()
     ))
 }
 
@@ -3307,15 +3487,6 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         icons: list(conf.pointer("/bundle/icon")),
         has_updater: conf.pointer("/plugins/updater").is_some(),
         external_bin: list(overlay.pointer("/bundle/externalBin")),
-        appimage_files: overlay
-            .pointer("/bundle/linux/appimage/files")
-            .and_then(|v| v.as_object())
-            .map(|map| {
-                map.iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
-                    .collect()
-            })
-            .unwrap_or_default(),
         base_external_bin: list(conf.pointer("/bundle/externalBin")),
         macos_bundle_targets: list(macos.pointer("/bundle/targets")),
         macos_icons: list(macos.pointer("/bundle/icon")),
@@ -3421,7 +3592,6 @@ mod tests {
             version: "0.1.0".into(),
             product_name: "cide".into(),
             bundle_targets: vec!["appimage".into(), "deb".into()],
-            appimage_files: Vec::new(),
             icons: vec!["icons/32x32.png".into()],
             has_updater: false,
             external_bin: vec!["../../target/release/cide-hook".into()],
@@ -4034,54 +4204,178 @@ mod tests {
     }
 
     #[test]
-    fn the_webkit_helper_check_fails_when_nothing_maps_the_helpers() {
-        // This test used to assert `never a hard failure`, and that assertion was the bug it
-        // should have caught: an AppImage without these helpers does not degrade on an unusual
-        // host, it aborts before its first frame on every host including the one that built it.
-        // A warning let a package ship that could not start.
-        //
-        // Not a fixture for the machine half — the point of the check is to describe the
-        // machine it runs on, and a mocked filesystem would only assert the mock was read.
-        let Some(_) = find_webkit_helpers_elsewhere() else {
-            // The bundler's own search will find them; nothing to map and nothing to assert.
+    fn the_fork_is_built_with_the_toolchain_it_declares() {
+        assert_eq!(
+            parse_toolchain_channel("[toolchain]\nchannel = \"1.97.1\"\n").as_deref(),
+            Some("1.97.1")
+        );
+        // A commented-out channel is not one — and the comment above the real channel in the
+        // fork's own file says the word, so a naive line scan reads the comment first.
+        assert_eq!(
+            parse_toolchain_channel("# channel = \"1.95\"\n[toolchain]\nchannel = \"1.97.1\"\n")
+                .as_deref(),
+            Some("1.97.1")
+        );
+        assert_eq!(
+            parse_toolchain_channel("[toolchain]\nprofile = \"minimal\"\n"),
+            None
+        );
+
+        // The declared version reaches the build as an env pin, and a toolchain install step
+        // comes with it — cide's CI pins a *default* toolchain, so an uninstalled one is the
+        // normal state there rather than the exception.
+        let steps = fork_steps(None, None, Some("1.97.1"));
+        let build = steps
+            .iter()
+            .find(|s| s.program == "cargo")
+            .expect("a step that builds the fork");
+        assert_eq!(
+            build
+                .env
+                .iter()
+                .find(|(k, _)| k == "RUSTUP_TOOLCHAIN")
+                .map(|(_, v)| v.as_str()),
+            Some("1.97.1"),
+            "{:?}",
+            build.env
+        );
+        let install = steps
+            .iter()
+            .find(|s| s.program == "rustup")
+            .expect("a step that installs it");
+        assert!(
+            install.args.contains(&"1.97.1".to_string()),
+            "{:?}",
+            install
+        );
+        assert!(
+            install.optional,
+            "a distribution-packaged Rust has no rustup, and one system compiler"
+        );
+        assert!(
+            steps.iter().position(|s| s.program == "rustup")
+                < steps.iter().position(|s| s.program == "cargo")
+        );
+
+        // And nothing at all when the fork declares nothing, rather than a guessed version.
+        let bare = fork_steps(None, None, None);
+        assert!(bare.iter().all(|s| s.program != "rustup"), "{bare:?}");
+        assert!(
+            bare.iter()
+                .all(|s| s.env.iter().all(|(k, _)| k != "RUSTUP_TOOLCHAIN")),
+            "{bare:?}"
+        );
+        assert!(matches!(fork_toolchain_verdict(None), Verdict::Warn(_)));
+        assert!(matches!(
+            fork_toolchain_verdict(Some("1.97.1")),
+            Verdict::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn a_host_the_bundler_does_not_cover_gets_a_mapping_and_one_it_does_gets_none() {
+        // The rule the checked-in literal could not express. `tauri-bundler` searches each of
+        // WEBKIT_SEARCH_DIRS joined with `webkit2gtk-4.1`; a host whose helpers are there
+        // needs nothing from cide, and a host that keeps them anywhere else needs every one of
+        // them mapped or the AppImage aborts before its first frame.
+        assert!(bundler_finds_helpers(
+            "/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
+        ));
+        assert!(bundler_finds_helpers("/usr/lib64/webkit2gtk-4.1"));
+        assert!(!bundler_finds_helpers("/usr/libexec/libwebkit2gtk-4_1-0"));
+        // Not a suffix match: a directory that merely ends in the name is a different path.
+        assert!(!bundler_finds_helpers("/opt/x/usr/lib64/webkit2gtk-4.1"));
+
+        // The machine half, asserted against the machine — a fixture here would only prove
+        // the fixture was read.
+        let Some(dir) = find_webkit_helpers_elsewhere() else {
             return;
         };
-
-        let bare = info();
-        assert!(bare.appimage_files.is_empty(), "fixture starts unmapped");
-        let verdict = webkit_helper_check(&bare);
-        assert!(
-            matches!(verdict, Verdict::Fail(_)),
-            "an unmapped bundle must fail, not warn: {verdict:?}"
-        );
-        // Both helpers named, not just one: the bundler's loop is per-file, so a machine
-        // holding one of the two must still be told which is missing.
-        if let Verdict::Fail(detail) = &verdict {
-            assert!(detail.contains("WebKitWebProcess"), "{detail}");
-            assert!(detail.contains("WebKitNetworkProcess"), "{detail}");
+        match webkit_helper_plan() {
+            None => assert!(
+                bundler_finds_helpers(&dir),
+                "{dir} is not on the bundler's search list, so it needs a mapping"
+            ),
+            Some((planned, files)) => {
+                assert_eq!(planned, dir);
+                for helper in WEBKIT_HELPERS {
+                    let (target, source) = files
+                        .iter()
+                        .find(|(_, source)| source.ends_with(helper))
+                        .unwrap_or_else(|| panic!("{helper} unmapped from {dir}: {files:?}"));
+                    // The target mirrors the host's absolute path with the leading slash
+                    // dropped, because this host's libwebkit2gtk resolves a relative path
+                    // against its own directory inside the AppDir.
+                    assert_eq!(*target, source.trim_start_matches('/'));
+                    assert!(Path::new(source).exists(), "{source}");
+                }
+            }
         }
     }
 
     #[test]
-    fn the_shipped_config_maps_them() {
-        // The real file, because that is the artefact that decides whether a package runs.
-        // `workspace_root` lives in main.rs and is not visible here; the manifest dir of this
-        // crate is its child, which is the same answer by a route a test can take.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask has a parent")
-            .to_path_buf();
-        let Ok(real) = read_app_info(&root) else {
-            return;
-        };
-        if find_webkit_helpers_elsewhere().is_none() {
-            return;
+    fn the_helper_mapping_reaches_the_bundler_as_a_second_config() {
+        // The mapping is worth nothing if it does not reach `cargo tauri build`. Two
+        // `--config` flags, base file first: the CLI merges them left to right, so the derived
+        // one wins on the key it names and touches nothing else.
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            Targets::LINUX,
+            "x86_64-unknown-linux-gnu",
+        );
+        let tauri = steps
+            .iter()
+            .find(|s| s.args.first().map(String::as_str) == Some("tauri"))
+            .expect("an appimage plan builds through cargo tauri");
+        let configs: Vec<&String> = tauri
+            .args
+            .iter()
+            .skip_while(|a| *a != "--config")
+            .filter(|a| *a != "--config")
+            .take(2)
+            .collect();
+        match webkit_helper_plan() {
+            None => assert_eq!(configs.len(), 1, "no mapping needed: {:?}", tauri.args),
+            Some(_) => {
+                assert_eq!(configs.len(), 2, "{:?}", tauri.args);
+                assert!(configs[1].contains("WebKitWebProcess"), "{}", configs[1]);
+                assert!(
+                    configs[1].contains("WebKitNetworkProcess"),
+                    "{}",
+                    configs[1]
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_files_config_is_json_a_path_cannot_break_out_of() {
+        let json = appimage_files_config(&[(
+            "usr/libexec/w/WebKitWebProcess".into(),
+            "/usr/libexec/w/WebKitWebProcess".into(),
+        )]);
+        assert_eq!(
+            json,
+            r#"{"bundle":{"linux":{"appimage":{"files":{"usr/libexec/w/WebKitWebProcess":"/usr/libexec/w/WebKitWebProcess"}}}}}"#
+        );
+        // A directory name is not this module's to trust: cargo-tauri parses this string as
+        // JSON, and a quote in a path would otherwise end the value and change the shape.
+        let odd = appimage_files_config(&[("a\"b".into(), "c\\d".into())]);
+        assert!(odd.contains(r#""a\"b":"c\\d""#), "{odd}");
+    }
+
+    #[test]
+    fn this_host_can_build_a_startable_appimage() {
+        // The preflight's own answer on the machine running the test, which is the only host
+        // its verdict is about. It took an `AppInfo` and read the mapping out of the shipped
+        // config until 2026-08-29; the config no longer carries one, because a literal there
+        // is a claim about one distro's layout that a runner on another distro failed on. So
+        // there is nothing from the repository to read here — only the machine.
         assert!(
-            matches!(webkit_helper_check(&real), Verdict::Ok(_)),
-            "the checked-in bundle config must map WebKit's helpers, or the AppImage cannot \
-             start: {:?}",
-            webkit_helper_check(&real)
+            matches!(webkit_helper_check(), Verdict::Ok(_)),
+            "this host cannot produce an AppImage that starts: {:?}",
+            webkit_helper_check()
         );
     }
 

@@ -4,15 +4,6 @@
       "../../target/release/cide-hook",
       "../../target/release/cide-rust-analyzer",
       "../../target/release/cide-gopls"
-    ],
-    "linux": {
-      "appimage": {
-        "files": {
-          "usr/libexec/libwebkit2gtk-4_1-0/WebKitNetworkProcess": "/usr/libexec/libwebkit2gtk-4_1-0/WebKitNetworkProcess",
-          "usr/libexec/libwebkit2gtk-4_1-0/WebKitWebProcess": "/usr/libexec/libwebkit2gtk-4_1-0/WebKitWebProcess",
-          "usr/libexec/libwebkit2gtk-4_1-0/WebKitGPUProcess": "/usr/libexec/libwebkit2gtk-4_1-0/WebKitGPUProcess"
-        }
-      }
-    }
+    ]
   }
 }

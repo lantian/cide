@@ -53,6 +53,19 @@ runs:
         git init "${{ inputs.dest }}"
         git -C "${{ inputs.dest }}" fetch --depth 1 "$url" "$rev"
         git -C "${{ inputs.dest }}" checkout --detach FETCH_HEAD
+        # Give the pin a local name. `fetch <url> <rev>` writes FETCH_HEAD and no ref, so a
+        # tag pin resolves to nothing in the checkout — and `cargo xtask package` compares
+        # HEAD against `<rev>^{commit}` *in the sibling*, which then cannot be resolved and
+        # warns "could not compare ... is <rev> fetched there?" on every release run, for all
+        # three forks. A warning that always fires is one nobody reads, including on the day
+        # it means something.
+        #
+        # Skipped when the rev already resolves, which is the 40-hex case: the object is
+        # present after the fetch, so it needs no name. `|| true` on the tag itself because a
+        # re-run over a restored cache may already have it.
+        if ! git -C "${{ inputs.dest }}" rev-parse -q --verify "$rev^{commit}" >/dev/null; then
+          git -C "${{ inputs.dest }}" tag "$rev" FETCH_HEAD || true
+        fi
       env:
         URL_VAR: ${{ inputs.url-var }}
         REV_VAR: ${{ inputs.rev-var }}
