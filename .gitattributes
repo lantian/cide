@@ -1,0 +1,22 @@
+# Line endings, for the two corpora whose whole point is that bytes survive.
+#
+# `cide-spec`'s corpora are fixtures a test compares byte for byte: `tests/corpus.rs` asserts
+# that splicing a requirement back as itself leaves the file identical, and `tests/config.rs`
+# asserts that a CRLF file edited by cide is still a CRLF file. A fixture whose line endings
+# git rewrites on the way in or out is not a fixture — it is a copy of a different file that
+# the test then proves things about.
+#
+# This is not hypothetical and it is not about Windows. `core.autocrlf = input` is a common
+# setting on Linux, it converts CRLF to LF **on commit**, and the author's working tree keeps
+# the CRs — so the test passes on the machine that added the fixture and fails on every fresh
+# checkout, including CI's:
+#
+#     panicked at crates/cide-spec/tests/config.rs:422:5:
+#     the fixture lost its CRLF on disk
+#
+# `-text` disables end-of-line conversion in both directions while leaving the files diffable
+# (that is what separates it from `binary`, which is `-text -diff`). Applied to the whole
+# directories rather than to the two CRLF files, because the next byte-exact fixture should
+# not have to rediscover this.
+crates/cide-spec/tests/corpus/** -text
+crates/cide-spec/tests/config-corpus/** -text
