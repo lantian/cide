@@ -570,11 +570,47 @@ jobs:
       # The same numbers `xtask` printed per artefact as it built them, in a file somebody can
       # download beside the artefacts. Computed over the assets as uploaded rather than copied
       # out of the build logs, so it describes the bytes on the release page.
+      # `upload-artifact` roots an artefact at the least common ancestor of the paths it was
+      # given, and both jobs' paths are globs under `target/release/bundle/`. The macOS job
+      # uploads one glob, so its ancestor is `bundle/dmg` and the `.dmg` arrives flat; the
+      # Linux job uploads three, so its ancestor is `bundle/` and its files arrive inside
+      # `appimage/`, `tarball/` and `src/`. Everything below — the checksums, the downloads
+      # table, `gh release create` — takes a flat directory, and the first release run said so:
+      #
+      #     sha256sum: appimage: Is a directory
+      #
+      # Flattened here rather than by rewriting the upload paths, because the nesting is a
+      # function of *how many globs a job happens to pass*, which is not a fact any of these
+      # steps should have to know.
+      - name: Flatten the downloaded artefacts
+        run: |
+          set -euo pipefail
+          cd dist
+          # A collision would otherwise be a silent overwrite and a release missing a file.
+          # Every artefact name carries the version and the platform, so this should never
+          # fire; if it does, the names are wrong and the release must not go out.
+          find . -mindepth 2 -type f -print0 | while IFS= read -r -d "" f; do
+            name=$(basename "$f")
+            if [ -e "./$name" ]; then
+              echo "::error::two artefacts are both called $name" >&2
+              exit 1
+            fi
+            mv "$f" "./$name"
+          done
+          find . -mindepth 1 -type d -empty -delete
+          ls -la
+
       - name: Checksums
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum -- * > SHA256SUMS
+          # Regular files only and in a fixed order: `sha256sum -- *` reads whatever the glob
+          # returns, which is how a directory ended up as an argument, and it is also how
+          # SHA256SUMS ends up listing itself — the redirection creates the file before the
+          # glob is expanded in some shells and not others.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf "%f\\0" \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
           cat SHA256SUMS
 
       # The download table, from the files that are about to be attached. Each row is matched
