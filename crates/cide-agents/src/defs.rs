@@ -53,7 +53,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cide_ipc::agents::{AgentDraft, AgentDraftProblem, AgentField, AgentLocation, AgentScope};
+use cide_ipc::agents::{
+    AgentDraft, AgentDraftProblem, AgentExtra, AgentField, AgentLocation, AgentScope,
+};
 use cide_ipc::{AgentDef, AgentId, Harness};
 
 // ==========================================================================================
@@ -174,9 +176,15 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "Write",
 ];
 
-/// The keys the front matter may carry.
+/// The keys **cide's own** front matter may carry.
 ///
-/// Exactly the nine the panel, the parser and the spawn between them consume. Listed so an
+/// Exactly the ten the panel, the parser and the spawn between them consume. (It said "nine"
+/// through two milestones after `worktree` was added, which is the sort of drift a list a reader
+/// trusts cannot afford.)
+///
+/// Not the vocabulary of a `.claude/agents/` file, which is Claude Code's and is not enumerable
+/// here — see [`canonical_key`] for the handful of keys the two formats share and
+/// `cide_ipc::AgentExtra` for what happens to the rest. Listed so an
 /// unknown key can be *named* in its warning together with what was expected, which is the
 /// difference between "unknown key `permission_mode`" and a user staring at an underscore.
 pub const KNOWN_KEYS: &[&str] = &[
@@ -223,13 +231,47 @@ pub const KNOWN_KEYS: &[&str] = &[
 /// `description: fixes issue #42` is far likelier than a trailing comment, and a whole-line
 /// comment is available for the other case.
 pub mod frontmatter {
-    /// One `key: value` line.
+    /// Whose format is being read. (M30)
+    ///
+    /// # Why this is a mode on one parser and not a second parser
+    ///
+    /// The fence, the BOM strip, the comment rule, the quoting rule, the duplicate-key rule and
+    /// the body-is-verbatim rule are identical in both dialects, and they are the rules that took
+    /// the arguing. A second reader would start as a copy and drift the first time one of them was
+    /// fixed — and the drift would be silent, because each dialect is only ever exercised by files
+    /// of its own kind.
+    ///
+    /// What actually differs is three narrow things, each named at the point it is decided below:
+    /// whether a nested line is a refusal or a continuation, whether a key may carry capitals, and
+    /// whether an unquoted value that opens a YAML construct is refused.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Grammar {
+        /// `.cide/agents/*.md` — cide's own format. Refuses what it does not read, by name and
+        /// with a line number, on the module header's argument.
+        Cide,
+        /// `.claude/agents/*.md` — a Claude Code subagent. **cide does not own this format**, so
+        /// it reads the handful of keys it can act on and carries the rest through untouched.
+        /// Refusing a construct here would mean refusing a file that works perfectly well in the
+        /// tool that defined it.
+        Claude,
+    }
+
+    /// One `key: value` line — or, under [`Grammar::Claude`], one key and the block beneath it.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Field {
         pub key: String,
         pub value: String,
         /// 1-based, so it can be handed to an editor without arithmetic.
         pub line: u32,
+        /// The source lines this field occupied, joined with `\n`, trailing whitespace trimmed.
+        ///
+        /// **The only thing that makes a lossless save possible**, and the reason it is stored
+        /// rather than reconstructed: `value` has been unquoted and trimmed, so rendering from it
+        /// would rewrite `tools: [Read, Edit]` as `tools: Read, Edit` and a nested block as
+        /// nothing at all. Under [`Grammar::Cide`] this is always exactly one line, which is why
+        /// the round-trip invariant that half of the module rests on is unaffected by its
+        /// existence.
+        pub raw: String,
     }
 
     /// A parsed definition file, before anything has been validated.
@@ -269,6 +311,11 @@ pub mod frontmatter {
     /// Never panics and never loops: one pass over the lines, no lookahead, no state beyond
     /// "before the fence / inside / after".
     pub fn parse(text: &str) -> Result<Document, FrontMatterError> {
+        parse_with(text, Grammar::Cide)
+    }
+
+    /// [`parse`] in a named dialect. See [`Grammar`] for what the two differ on.
+    pub fn parse_with(text: &str, grammar: Grammar) -> Result<Document, FrontMatterError> {
         // A byte-order mark is what a Windows editor leaves in front of the first `-`, and
         // without this the file fails with "does not begin with ---" while looking, in every
         // editor the user has, exactly as though it does.
@@ -299,14 +346,36 @@ pub mod frontmatter {
                 let body = lines[index + 1..].join("\n").trim().to_string();
                 return Ok(Document { fields, body });
             }
-            if line.starts_with(' ') || line.starts_with('\t') {
-                return Err(FrontMatterError::at(
-                    number,
-                    "indented lines are not supported: cide's front matter is a flat list of \
-                     `key: value` lines with no nesting. Write a list as `tools: Read, Edit`.",
-                ));
-            }
-            if line == "-" || line.starts_with("- ") {
+            let continuation = line.starts_with(' ')
+                || line.starts_with('\t')
+                || line == "-"
+                || line.starts_with("- ");
+            if continuation {
+                // **The one structural difference between the dialects.** cide's own format is
+                // flat and says so; a subagent's is real YAML and `hooks:`, `mcpServers:` and
+                // `skills:` are routinely blocks. Refusing them here — which is what happened
+                // before M30 — did not degrade such a file, it *dropped* it: `read_definition`
+                // turns a `FrontMatterError` into a problem and returns `None`, so a user's
+                // whole subagent vanished from the roster because it used a feature of its own
+                // format.
+                //
+                // Appending to the previous field's `raw` and to nothing else is deliberate. The
+                // block is not parsed, not interpreted, and never becomes a `value` cide acts
+                // on; it is held so that `render` can put it back exactly as it was found.
+                if grammar == Grammar::Claude
+                    && let Some(previous) = fields.last_mut()
+                {
+                    previous.raw.push('\n');
+                    previous.raw.push_str(line);
+                    continue;
+                }
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    return Err(FrontMatterError::at(
+                        number,
+                        "indented lines are not supported: cide's front matter is a flat list of \
+                         `key: value` lines with no nesting. Write a list as `tools: Read, Edit`.",
+                    ));
+                }
                 return Err(FrontMatterError::at(
                     number,
                     "`- item` lists are not supported. Write a list on one line, as \
@@ -330,7 +399,15 @@ pub mod frontmatter {
                 ));
             };
             let key = key.trim();
-            if key.is_empty() || !is_key(key) {
+            // Claude spells its keys in camelCase (`permissionMode`, `disallowedTools`,
+            // `mcpServers`), so the lowercase rule — which is right for cide's own vocabulary,
+            // where there is nothing to be liberal about — would refuse most real subagents on
+            // their second line.
+            let key_ok = match grammar {
+                Grammar::Cide => is_key(key),
+                Grammar::Claude => is_claude_key(key),
+            };
+            if key.is_empty() || !key_ok {
                 return Err(FrontMatterError::at(
                     number,
                     format!(
@@ -353,13 +430,24 @@ pub mod frontmatter {
             let (value, quoted) = unquote(rest.trim());
             // Only unquoted values are inspected: quoting is the escape hatch, and a user who
             // wrote `description: "*emphasis*"` meant the asterisks.
-            if !quoted && let Some(message) = unsupported_scalar(value) {
+            //
+            // And only under cide's own dialect. Every one of these refusals says "cide will not
+            // read this", which is a true and useful thing to say about a file cide's format
+            // owns and a false one about a subagent: an anchor or a flow mapping in
+            // `.claude/agents/` is read perfectly well by the tool the file is for. `raw` is what
+            // survives instead — the construct is carried, uninterpreted, and only a key cide
+            // actually acts on ever has its `value` looked at.
+            if grammar == Grammar::Cide
+                && !quoted
+                && let Some(message) = unsupported_scalar(value)
+            {
                 return Err(FrontMatterError::at(number, message));
             }
             fields.push(Field {
                 key: key.to_string(),
                 value: value.to_string(),
                 line: number,
+                raw: line.to_string(),
             });
         }
 
@@ -370,6 +458,18 @@ pub mod frontmatter {
             "the front matter is never closed: add a line containing only `---` between the \
              last key and the system prompt",
         ))
+    }
+
+    /// `[a-zA-Z][a-zA-Z0-9_-]*` — [`is_key`] with capitals, for [`Grammar::Claude`].
+    ///
+    /// Wider in exactly one respect and no other. Claude's own keys are camelCase, so the case
+    /// rule has to go; everything else about the shape is kept, because a "key" containing a
+    /// space or a slash is far likelier to be a prose line after a front matter somebody forgot
+    /// to close, and that diagnosis is worth more than admitting one more character.
+    fn is_claude_key(key: &str) -> bool {
+        let mut chars = key.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }
 
     /// `[a-z][a-z0-9_-]*`. Deliberately narrower than the value grammar: a key is cide's
@@ -491,6 +591,13 @@ pub struct LoadedAgent {
     /// differs per harness and per release, exactly like [`KNOWN_TOOLS`], and cide has no list to
     /// check it against that would not be wrong within a month.
     pub effort: Option<String>,
+    /// Every front-matter key cide does not model, in file order. See `cide_ipc::AgentExtra`.
+    ///
+    /// Ordinarily empty for a `.cide/agents/` definition and ordinarily *not* for a subagent,
+    /// where `hooks`, `skills`, `mcpServers` and `maxTurns` all land here. Nothing in a dispatch
+    /// reads it — under `--agent` the CLI reads those keys out of the file itself — and its only
+    /// consumer is the form, which must be able to show and re-emit what it did not understand.
+    pub extras: Vec<AgentExtra>,
 }
 
 impl LoadedAgent {
@@ -564,6 +671,32 @@ pub fn valid_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// [`valid_name`] with Claude Code's rule instead of cide's, for a `.claude/agents/` file. (M30)
+///
+/// # What is relaxed, and the one thing that is not
+///
+/// The **32-character cap goes** and the requirement that the file stem agree goes with it: both
+/// are cide's, Claude states neither, and enforcing them would grey subagents that work. A long
+/// name costs nothing downstream — [`crate::checkout_name`] already truncates the composed
+/// `<role>-<task>` to fit a ref.
+///
+/// The **path-safety whitelist stays**, whole, and [`valid_name`]'s doc is the argument for it
+/// unchanged: this string is about to be joined onto `.cide/worktrees/` and to become the second
+/// segment of `cide/<name>`, so it is checked for shape before anything resolves it, as a
+/// whitelist rather than a blacklist. `cide_git::worktree::validate_agent` remains the second,
+/// independent refusal at the moment the join happens; neither is allowed to be the only one.
+///
+/// `:` is refused by name rather than merely by omission because it means something: it is
+/// Claude's plugin scoping separator (`my-plugin:reviewer`), so a name containing one is a real
+/// subagent from a source cide does not read, and it can never be a path component.
+pub fn valid_claude_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// `code-reviewer` becomes `Code Reviewer`.
 ///
 /// So that a roster is readable before anybody has thought about presentation, which is what
@@ -603,6 +736,71 @@ struct Parsed {
     permission_mode: Option<String>,
     max_concurrent: Option<u16>,
     worktree: Option<bool>,
+    /// Every key this file carried that cide does not model, in the order it carried them.
+    extras: Vec<AgentExtra>,
+}
+
+/// Claude Code's `permissionMode` vocabulary, which is **not** cide's [`PERMISSION_MODES`].
+///
+/// Two members differ: Claude has `default` where cide has nothing, and cide has `manual` where
+/// Claude has nothing. Checking a subagent against cide's list would report a perfectly ordinary
+/// `permissionMode: default` as a mistake.
+///
+/// Like its neighbour, this is somebody else's vocabulary and will go stale — but the cost of
+/// staleness is far lower here, because under `--agent` **cide does not pass this value**: the CLI
+/// reads the key out of the file itself. So an unrecognised mode is a warning and never greys the
+/// role. There is nothing cide could be doing wrong with a value it never touches.
+pub const CLAUDE_PERMISSION_MODES: &[&str] = &[
+    "default",
+    "acceptEdits",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+    "plan",
+];
+
+/// The cide key a front-matter key means, or `None` when cide does not model it.
+///
+/// # Why the two dialects share one table instead of one `match` each
+///
+/// Three keys are cide's own and are honoured in **both** — `label`, `max-concurrent` and
+/// `worktree`. That is not an oversight to tidy up: they are additive, Claude ignores keys it does
+/// not know, and without them a subagent could never say "run two of me" or "stay out of a
+/// worktree". A user who wants either writes cide's spelling into their subagent and both tools
+/// stay happy.
+///
+/// What is *not* shared is `harness`, deliberately: a Claude Code subagent runs under Claude Code
+/// by construction, so the key is meaningless there and is carried as an extra with a warning
+/// rather than obeyed.
+fn canonical_key(key: &str, scope: AgentScope) -> Option<&'static str> {
+    let claude = scope.is_claude_code();
+    match key {
+        "name" => Some("name"),
+        "description" => Some("description"),
+        "model" => Some("model"),
+        "effort" => Some("effort"),
+        "tools" => Some("tools"),
+        // cide's three additive keys, in both dialects.
+        "label" => Some("label"),
+        "max-concurrent" => Some("max-concurrent"),
+        "worktree" => Some("worktree"),
+        // The one key each dialect spells for itself.
+        "permission-mode" if !claude => Some("permission-mode"),
+        "permissionMode" if claude => Some("permission-mode"),
+        "harness" if !claude => Some("harness"),
+        _ => None,
+    }
+}
+
+/// Split one field's raw source into the value text `render` has to put back.
+///
+/// Everything after the key's colon, with **one** leading space removed. One, not all: the space
+/// after a colon is the format's own separator and `render` re-emits it, while a second space is
+/// something the author typed and is theirs. A field that opened a block has an empty first line
+/// here and the block beneath it, indentation untouched.
+fn extra_value(raw: &str) -> String {
+    let after = raw.split_once(':').map(|(_, rest)| rest).unwrap_or("");
+    after.strip_prefix(' ').unwrap_or(after).to_string()
 }
 
 /// A definition that made it far enough to have an identity, and the file it came from.
@@ -639,10 +837,17 @@ struct Candidate {
 fn read_definition(
     path: &Path,
     text: &str,
+    scope: AgentScope,
     default_harness: Harness,
     problems: &mut Vec<AgentProblem>,
 ) -> Option<Candidate> {
-    let doc = match frontmatter::parse(text) {
+    let claude = scope.is_claude_code();
+    let grammar = if claude {
+        frontmatter::Grammar::Claude
+    } else {
+        frontmatter::Grammar::Cide
+    };
+    let doc = match frontmatter::parse_with(text, grammar) {
         Ok(doc) => doc,
         Err(err) => {
             problems.push(AgentProblem::error(path, Some(err.line), err.message));
@@ -666,7 +871,83 @@ fn read_definition(
     for field in &doc.fields {
         let line = Some(field.line);
         let value = field.value.trim();
-        match field.key.as_str() {
+        // Matched on the *canonical* key rather than the written one, so `permissionMode` and
+        // `permission-mode` reach one arm and the validation behind it is written once.
+        let Some(canonical) = canonical_key(&field.key, scope) else {
+            // Not a key cide models. It is kept either way — see `AgentDraft::extras` — and what
+            // differs is whether cide has any standing to complain about it.
+            parsed.extras.push(AgentExtra {
+                key: field.key.clone(),
+                value: extra_value(&field.raw),
+            });
+            if claude {
+                // Claude's vocabulary in Claude's directory. Two keys are worth a word anyway,
+                // because each looks like something cide would act on and does not.
+                if field.key == "harness" {
+                    problems.push(AgentProblem::warning(
+                        path,
+                        line,
+                        "`harness:` has no meaning in a Claude Code subagent — it runs under \
+                         Claude Code by definition. The key is kept in the file and ignored.",
+                    ));
+                } else if field.key == "isolation" {
+                    problems.push(AgentProblem::warning(
+                        path,
+                        line,
+                        "`isolation:` is Claude Code's own worktree switch and is **not** cide's \
+                         `worktree:`. Claude branches from the default branch and cleans up \
+                         after itself; cide gives a run a checkout on `cide/<role>-<task>` that \
+                         it later integrates from. Set `worktree:` if you meant cide's.",
+                    ));
+                }
+                continue;
+            }
+            // cide's own directory, cide's own format: an unknown key here is a defect, and the
+            // two answers below are unchanged from before extras existed. What changed is that
+            // the key is now *reported and kept* rather than reported and deleted by the next
+            // save — see `AgentDraft`'s header.
+            let other = field.key.as_str();
+            let canonical_spelling = other.replace('_', "-");
+            match KNOWN_KEYS
+                .iter()
+                .find(|known| ***known == *canonical_spelling)
+            {
+                // A key that is a *near-miss* of one cide reads — `permission_mode` for
+                // `permission-mode` — is a typo, and the switch it meant to set is silently not
+                // in effect; since that switch may be the one deciding whether an unattended
+                // process asks before editing, the role is greyed rather than run under a
+                // setting its author did not choose.
+                Some(known) => {
+                    problems.push(AgentProblem::error(
+                        path,
+                        line,
+                        format!(
+                            "`{other}` is not a key cide reads; it spells this one \
+                             `{known}`. As written, the setting has no effect."
+                        ),
+                    ));
+                    note_first(
+                        &mut unavailable,
+                        format!(
+                            "`{other}` is not a key cide reads — the spelling is `{known}` — \
+                             so that setting is not in effect."
+                        ),
+                    );
+                }
+                // A key that resembles nothing only warns, because a definition written for a
+                // newer cide arriving in a `git pull` must not empty somebody's roster.
+                None => problems.push(AgentProblem::warning(
+                    path,
+                    line,
+                    format!(
+                        "`{other}` is not a key cide reads. Known keys are {}.",
+                        KNOWN_KEYS.join(", ")
+                    ),
+                )),
+            }
+            continue;
+        };
+        match canonical {
             "name" => parsed.name = Some((value.to_string(), field.line)),
             "label" => parsed.label = non_empty(value),
             "description" => parsed.description = value.to_string(),
@@ -690,6 +971,26 @@ fn read_definition(
                         ),
                     ));
                 }
+            }
+            "permission-mode" if claude => {
+                // Validated against Claude's list, and only ever a warning. Under `--agent` cide
+                // does not pass this value at all — the CLI reads the key from the file — so an
+                // unrecognised one cannot be the reason a run misbehaves, and greying the role
+                // over it would refuse to start an agent that works.
+                if !CLAUDE_PERMISSION_MODES.contains(&value) {
+                    problems.push(AgentProblem::warning(
+                        path,
+                        line,
+                        format!(
+                            "`{value}` is not a permission mode this build of cide knows about. \
+                             Claude Code's are {}. That list is the CLI's and changes between \
+                             releases, so this is only a warning — cide passes the key straight \
+                             through.",
+                            CLAUDE_PERMISSION_MODES.join(", ")
+                        ),
+                    ));
+                }
+                parsed.permission_mode = Some(value.to_string());
             }
             "permission-mode" => {
                 if PERMISSION_MODES.contains(&value) {
@@ -766,43 +1067,10 @@ fn read_definition(
                     );
                 }
             },
-            other => {
-                // Two unknown keys, two different answers. A key that is a *near-miss* of one
-                // cide reads — `permission_mode` for `permission-mode` — is a typo, and the
-                // switch it meant to set is silently not in effect; since that switch may be the
-                // one deciding whether an unattended process asks before editing, the role is
-                // greyed rather than run under a setting its author did not choose. A key that
-                // resembles nothing only warns, because a definition written for a newer cide
-                // arriving in a `git pull` must not empty somebody's roster.
-                let canonical = other.replace('_', "-");
-                match KNOWN_KEYS.iter().find(|known| ***known == *canonical) {
-                    Some(known) => {
-                        problems.push(AgentProblem::error(
-                            path,
-                            line,
-                            format!(
-                                "`{other}` is not a key cide reads; it spells this one \
-                                 `{known}`. As written, the setting has no effect."
-                            ),
-                        ));
-                        note_first(
-                            &mut unavailable,
-                            format!(
-                                "`{other}` is not a key cide reads — the spelling is `{known}` — \
-                                 so that setting is not in effect."
-                            ),
-                        );
-                    }
-                    None => problems.push(AgentProblem::warning(
-                        path,
-                        line,
-                        format!(
-                            "`{other}` is not a key cide reads. Known keys are {}.",
-                            KNOWN_KEYS.join(", ")
-                        ),
-                    )),
-                }
-            }
+            // `canonical_key` returns only the names spelled above, and the compiler cannot
+            // know that. A `debug_assert` rather than a silent `{}` so a key added to that table
+            // and forgotten here fails a test run instead of being read as absent.
+            other => debug_assert!(false, "`{other}` has no arm in read_definition"),
         }
     }
 
@@ -814,27 +1082,53 @@ fn read_definition(
             problems.push(AgentProblem::error(
                 path,
                 None,
-                format!(
-                    "no `name:` in the front matter. It must be `{stem}`, matching the file name."
-                ),
+                if claude {
+                    "no `name:` in the front matter. Claude Code skips a subagent file without \
+                     one, treating it as documentation, and so does cide."
+                        .to_string()
+                } else {
+                    format!(
+                        "no `name:` in the front matter. It must be `{stem}`, matching the file \
+                         name."
+                    )
+                },
             ));
             return None;
         }
     };
-    if !valid_name(&name) {
+    let name_ok = if claude {
+        valid_claude_name(&name)
+    } else {
+        valid_name(&name)
+    };
+    if !name_ok {
         problems.push(AgentProblem::error(
             path,
             Some(name_line),
-            format!(
-                "`{name}` is not a usable agent name. A name is 1–32 characters of a–z, 0–9 and \
-                 `-`, starting with a letter or digit — because it becomes a directory under \
-                 `.cide/worktrees/` and a git branch, so a name containing `/` or `..` would put \
-                 a checkout outside the project."
-            ),
+            if claude {
+                format!(
+                    "`{name}` is not a name cide can key a run on. Claude Code allows lowercase \
+                     letters and `-`; cide additionally needs the name to be safe as a directory \
+                     under `.cide/worktrees/` and as the second half of the git ref \
+                     `cide/<name>`, so `/`, `..`, a leading `-` and the plugin separator `:` are \
+                     all refused."
+                )
+            } else {
+                format!(
+                    "`{name}` is not a usable agent name. A name is 1–32 characters of a–z, 0–9 \
+                     and `-`, starting with a letter or digit — because it becomes a directory \
+                     under `.cide/worktrees/` and a git branch, so a name containing `/` or `..` \
+                     would put a checkout outside the project."
+                )
+            },
         ));
         return None;
     }
-    if name != stem {
+    // **Not asked of a subagent.** Claude Code keys by the `name:` value and documents that the
+    // filename need not agree, so a `.claude/agents/reviewer-v2.md` declaring `name: reviewer` is
+    // an ordinary, working file there. Reporting it would be cide inventing a rule for a
+    // directory it does not own — and greying the role would take away an agent that runs.
+    if !claude && name != stem {
         problems.push(AgentProblem::error(
             path,
             Some(name_line),
@@ -879,13 +1173,26 @@ fn read_definition(
     let id = AgentId(name.clone());
     let label = parsed.label.unwrap_or_else(|| label_from_id(&name));
     Some(Candidate {
-        stem_matches: name == stem,
+        // A subagent is keyed by its `name:` and its stem is not consulted, so it can never be
+        // the tie-break's "the file whose own name agrees with its contents". `false` rather
+        // than `true` is the honest answer and the conservative one: two subagents declaring one
+        // name grey the survivor and name both paths, which is the outcome for two files nothing
+        // distinguishes.
+        stem_matches: !claude && name == stem,
         name,
         agent: LoadedAgent {
             def: AgentDef {
                 id,
                 label,
-                harness: parsed.harness.unwrap_or(default_harness),
+                scope,
+                // Forced, never read from the file. A Claude Code subagent runs under Claude
+                // Code; there is no second answer, which is why the roster offers no harness
+                // choice for one and the `harness:` key above is carried as an extra.
+                harness: if claude {
+                    Harness::Claude
+                } else {
+                    parsed.harness.unwrap_or(default_harness)
+                },
                 description: parsed.description,
                 system_prompt: doc.body,
                 model: parsed.model,
@@ -903,6 +1210,7 @@ fn read_definition(
             tools: parsed.tools,
             permission_mode: parsed.permission_mode,
             effort: parsed.effort,
+            extras: parsed.extras,
         },
     })
 }
@@ -1067,6 +1375,58 @@ pub fn global_dir() -> PathBuf {
     cide_core::persist::config_dir().join("agents")
 }
 
+/// Where a project keeps its **Claude Code** subagents. (M30)
+///
+/// `<root>/.claude/agents`, per <https://code.claude.com/docs/en/sub-agents>. Not a directory cide
+/// created or owns: it is committed with the project and read by the `claude` CLI whether or not
+/// cide is running.
+pub fn claude_project_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".claude").join("agents")
+}
+
+/// Where the user keeps their own **Claude Code** subagents, across every project. (M30)
+///
+/// `~/.claude/agents`, relocated wholesale by `CLAUDE_CONFIG_DIR` — [`cide_claude::claude_dir`] is
+/// the one place that rule lives, so this cannot drift from the half of cide that reads session
+/// names out of the same directory.
+///
+/// `None` when there is no home to look under, which contributes no scope and **no problem**: it
+/// is the same non-event as a directory that is not there, and a machine with no `HOME` has not
+/// misconfigured anything cide should be telling it about.
+pub fn claude_global_dir() -> Option<PathBuf> {
+    Some(cide_claude::claude_dir()?.join("agents"))
+}
+
+/// The four directories a project's roster is merged from, **lowest precedence first**.
+///
+/// ```text
+/// ~/.claude/agents  →  <root>/.claude/agents  →  ~/.config/cide/agents  →  <root>/.cide/agents
+/// ```
+///
+/// # Why this order and not another
+///
+/// Two rules, composed. *Project beats user* is the rule both formats already state for
+/// themselves, and it is unchanged within each family. *cide's own directory beats Claude's* is
+/// the rule this milestone had to invent, and it goes this way because `.cide/agents/` is the only
+/// one of the four that can express what cide needs to run a role unattended — `max-concurrent`,
+/// `worktree`, and a `harness` that is not Claude. A definition written there is a statement about
+/// how cide should run this role, and it wins over one written for a different tool.
+///
+/// The shadowing is never silent either way: `LoadedAgent::shadows` records the file that was
+/// replaced, and a *cross-family* shadow additionally raises a warning naming both paths, because
+/// "I edited my subagent and nothing happened" is the afternoon this whole mechanism costs when it
+/// is not said out loud.
+pub fn scopes(project_root: &Path) -> Vec<(AgentScope, PathBuf)> {
+    let mut scopes = Vec::with_capacity(4);
+    if let Some(dir) = claude_global_dir() {
+        scopes.push((AgentScope::ClaudeGlobal, dir));
+    }
+    scopes.push((AgentScope::ClaudeProject, claude_project_dir(project_root)));
+    scopes.push((AgentScope::Global, global_dir()));
+    scopes.push((AgentScope::Project, project_dir(project_root)));
+    scopes
+}
+
 /// Read every `*.md` in one directory.
 ///
 /// A missing directory is **not** a problem and produces nothing: no `.cide/agents/` is the
@@ -1079,6 +1439,7 @@ pub fn global_dir() -> PathBuf {
 /// and is not stable between two checkouts of the same repository.
 fn load_scope(
     dir: &Path,
+    scope: AgentScope,
     default_harness: Harness,
     problems: &mut Vec<AgentProblem>,
 ) -> BTreeMap<String, Candidate> {
@@ -1119,7 +1480,8 @@ fn load_scope(
                 continue;
             }
         };
-        let Some(candidate) = read_definition(&path, &text, default_harness, problems) else {
+        let Some(candidate) = read_definition(&path, &text, scope, default_harness, problems)
+        else {
             continue;
         };
 
@@ -1185,21 +1547,39 @@ fn load_scope(
 /// It is only ever consulted for a harness this build can actually run — see [`implemented`] and
 /// the loop below.
 pub fn load_from(
-    global: &Path,
-    project: &Path,
+    scopes: &[(AgentScope, PathBuf)],
     default_harness: Harness,
     probe: impl Fn(Harness) -> Option<String>,
 ) -> Catalog {
     let mut problems = Vec::new();
-    let globals = load_scope(global, default_harness, &mut problems);
-    let projects = load_scope(project, default_harness, &mut problems);
-
-    let mut merged = globals;
-    for (name, mut candidate) in projects {
-        if let Some(shadowed) = merged.get(&name) {
-            candidate.agent.shadows = Some(shadowed.agent.origin.clone());
+    let mut merged: BTreeMap<String, Candidate> = BTreeMap::new();
+    for (scope, dir) in scopes {
+        let found = load_scope(dir, *scope, default_harness, &mut problems);
+        for (name, mut candidate) in found {
+            if let Some(shadowed) = merged.get(&name) {
+                let from = shadowed.agent.def.scope;
+                candidate.agent.shadows = Some(shadowed.agent.origin.clone());
+                // Within a family this is the documented, wanted behaviour and says nothing.
+                // Across one it is worth a sentence on the file, because the two directories look
+                // nothing alike in a user's head: somebody who has just edited a subagent has no
+                // reason to suspect a `.cide/agents/` file of the same name is winning, and
+                // `shadows` alone is only visible to whoever thinks to look.
+                if from.is_claude_code() != scope.is_claude_code() {
+                    problems.push(AgentProblem::warning(
+                        &candidate.agent.origin,
+                        None,
+                        format!(
+                            "this definition replaces `{}`, which declares the same name. cide's \
+                             own `.cide/agents/` wins over a Claude Code subagent, because it is \
+                             the only one of the two that can say how cide should run the role. \
+                             Rename one of them if that is not what you meant.",
+                            shadowed.agent.origin.display()
+                        ),
+                    ));
+                }
+            }
+            merged.insert(name, candidate);
         }
-        merged.insert(name, candidate);
     }
 
     // One probe per distinct harness, not one per role. `which` walks every `PATH` entry with a
@@ -1251,12 +1631,7 @@ pub fn load_from(
 /// `default_harness` comes from `.cide/config.json`; see `crate::config::AgentsConfig::harness`
 /// for why a project gets to choose it and a definition gets to override it.
 pub fn load(project_root: &Path, default_harness: Harness) -> Catalog {
-    load_from(
-        &global_dir(),
-        &project_dir(project_root),
-        default_harness,
-        installed,
-    )
+    load_from(&scopes(project_root), default_harness, installed)
 }
 
 // ==========================================================================================
@@ -1384,11 +1759,38 @@ impl std::error::Error for WriteError {}
 /// scope is *not* per project, and a signature that took the root only for the project arm would
 /// make two functions out of one concept and let a caller reach the global directory without
 /// having thought about which scope it wanted.
-pub fn scope_dir(project_root: &Path, scope: AgentScope) -> PathBuf {
+pub fn scope_dir(project_root: &Path, scope: AgentScope) -> Option<PathBuf> {
     match scope {
-        AgentScope::Project => project_dir(project_root),
-        AgentScope::Global => global_dir(),
+        AgentScope::Project => Some(project_dir(project_root)),
+        AgentScope::Global => Some(global_dir()),
+        AgentScope::ClaudeProject => Some(claude_project_dir(project_root)),
+        // The one arm that can answer `None`: `~/.claude` needs a home, and a machine without one
+        // has no user scope rather than an empty one.
+        AgentScope::ClaudeGlobal => claude_global_dir(),
     }
+}
+
+/// The file a role of this name occupies **in this scope**, found rather than composed.
+///
+/// # Why a Claude scope cannot use [`definition_path`]
+///
+/// cide's own format requires the file stem to equal the `name:` key, so `<dir>/<name>.md` is not
+/// a guess — it is the rule, enforced at load. Claude Code states the opposite: the filename need
+/// not agree, and `reviewer-v2.md` declaring `name: reviewer` is an ordinary file. Composing a
+/// path there would create `reviewer.md` beside the file the user actually opened, leaving two
+/// definitions claiming one name — which is the state [`load_scope`] greys a role for.
+///
+/// So the file is **found**, by reading the directory and asking each candidate what it declares.
+/// It costs a `read_dir` on a save; the alternative costs somebody their subagent.
+fn find_claude_file(dir: &Path, name: &str, default_harness: Harness) -> Option<PathBuf> {
+    let mut discarded = Vec::new();
+    let found = load_scope(
+        dir,
+        AgentScope::ClaudeProject,
+        default_harness,
+        &mut discarded,
+    );
+    found.get(name).map(|c| c.agent.origin.clone())
 }
 
 /// The file one role occupies, or `None` when the name may not become a path component.
@@ -1399,7 +1801,16 @@ pub fn scope_dir(project_root: &Path, scope: AgentScope) -> PathBuf {
 /// answers `None` rather than trusting that somebody upstream asked. [`save`], [`delete`] and
 /// [`read_draft`] all go through it, so there is one join to audit rather than three.
 pub fn definition_path(project_root: &Path, scope: AgentScope, name: &str) -> Option<PathBuf> {
-    valid_name(name).then(|| scope_dir(project_root, scope).join(format!("{name}.md")))
+    let dir = scope_dir(project_root, scope)?;
+    if scope.is_claude_code() {
+        // Found, not composed — see `find_claude_file`. `None` here means "this scope has no role
+        // by that name", which the callers turn into `WriteError::NotFound` rather than into a
+        // create, because cide does not author files into a directory it does not own.
+        return valid_claude_name(name)
+            .then(|| find_claude_file(&dir, name, Harness::Claude))
+            .flatten();
+    }
+    valid_name(name).then(|| dir.join(format!("{name}.md")))
 }
 
 /// A one-line value, as the grammar can hold it: no line breaks, no surrounding whitespace.
@@ -1460,7 +1871,49 @@ pub fn normalize(draft: &AgentDraft) -> AgentDraft {
         max_concurrent: draft.max_concurrent,
         worktree: draft.worktree,
         system_prompt: body(&draft.system_prompt),
+        extras: draft
+            .extras
+            .iter()
+            .map(|extra| AgentExtra {
+                key: scalar(&extra.key),
+                value: extra_scalar(&extra.value),
+            })
+            .filter(|extra| !extra.key.is_empty())
+            .collect(),
     }
+}
+
+/// An extra's value, in the only shape the front matter can hold it.
+///
+/// # The one thing this has to stop, and why it is not `scalar`
+///
+/// `scalar` folds **every** line break to a space, which is exactly right for a modelled value and
+/// exactly wrong here: it would flatten a `hooks:` block into one unreadable line and destroy the
+/// thing extras exist to preserve. So line breaks survive — and that reopens the hazard the
+/// section header calls the format's only real one, which is a value that puts a line at column
+/// zero *inside* the front-matter region, where `---` is the fence and `key:` is a key.
+///
+/// The rule is therefore narrow rather than blunt: CRLF is folded to LF, trailing whitespace goes,
+/// and any continuation line that is not indented is **indented by two spaces**. A block's own
+/// lines already are, so this is a no-op for every value that came out of a real file; it only
+/// bites a value a form handed back with the indentation stripped, which is precisely the case
+/// that could otherwise close the fence early.
+fn extra_scalar(value: &str) -> String {
+    let unified = value.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = unified.split('\n');
+    let mut out = String::new();
+    if let Some(first) = lines.next() {
+        out.push_str(first.trim_end());
+    }
+    for line in lines {
+        out.push('\n');
+        let line = line.trim_end();
+        if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            out.push_str("  ");
+        }
+        out.push_str(line);
+    }
+    out.trim_end().to_string()
 }
 
 /// A draft as the whole text of its `.md` file.
@@ -1505,7 +1958,11 @@ pub fn render(draft: &AgentDraft) -> String {
         field(&mut out, "tools", &draft.tools.join(", "));
     }
     if let Some(mode) = &draft.permission_mode {
-        field(&mut out, "permission-mode", mode);
+        // The one modelled key the two dialects spell differently. Written back in the spelling
+        // the file's own owner uses, because a subagent re-emitted with cide's hyphenated name
+        // would be a key Claude Code does not read: the mode would silently stop applying, in a
+        // file cide had just told the user it was only editing the description of.
+        field(&mut out, permission_mode_key(draft.scope), mode);
     }
     if let Some(max) = draft.max_concurrent {
         field(&mut out, "max-concurrent", &max.to_string());
@@ -1520,6 +1977,20 @@ pub fn render(draft: &AgentDraft) -> String {
             if worktree { "true" } else { "false" },
         );
     }
+    // Last, and verbatim. Everything above is a key cide models and can therefore re-spell —
+    // quoting it, joining a list with `, `, normalising `True` to `true`. These are keys cide does
+    // **not** model, so re-spelling one would be a guess about a format it does not own, and the
+    // only honest thing to do with them is put them back the way they were found. See
+    // `AgentExtra`.
+    //
+    // Last rather than in their original position because the position is not recoverable: the
+    // draft carries an ordered list of extras and an unordered set of modelled fields, so
+    // interleaving them would need an index cide would then have to keep true through a rename, a
+    // scope move and a field being cleared. A stable "known keys, then the rest" is what the
+    // corpus round-trip is asserted against.
+    for extra in &draft.extras {
+        raw_field(&mut out, &extra.key, &extra.value);
+    }
     out.push_str("---\n\n");
 
     // The blank line above and the newline below are cosmetic — `parse` trims the body at both
@@ -1528,6 +1999,37 @@ pub fn render(draft: &AgentDraft) -> String {
     out.push_str(&draft.system_prompt);
     out.push('\n');
     out
+}
+
+/// How this scope's format spells `--permission-mode`.
+///
+/// The inverse of the one asymmetric row in [`canonical_key`], and a function rather than an
+/// inline `if` so that the two directions of the mapping sit next to each other in a grep.
+fn permission_mode_key(scope: AgentScope) -> &'static str {
+    if scope.is_claude_code() {
+        "permissionMode"
+    } else {
+        "permission-mode"
+    }
+}
+
+/// One extra, written back exactly as it came in.
+///
+/// No quoting, no escaping, no trimming — the value has already survived a parse that took it
+/// literally, so anything done to it here is damage. The one shape worth naming is a key that
+/// opened a block: its value's first line is empty and the block follows, so `hooks:` is written
+/// with no trailing space and its indented lines land underneath, byte for byte.
+///
+/// `normalize` is what stops this reopening the fence — it refuses an extra whose value could
+/// introduce a bare `---` or a line that reads as a new key at column zero.
+fn raw_field(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push(':');
+    if !value.starts_with('\n') && !value.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(value);
+    out.push('\n');
 }
 
 fn field(out: &mut String, key: &str, value: &str) {
@@ -1588,23 +2090,33 @@ fn needs_quotes(value: &str) -> bool {
 ///
 /// # What this drops
 ///
-/// Front-matter comments, unknown keys, and any value cide's own vocabulary cannot hold — a
-/// `harness: bogus` or a `max-concurrent: lots` reads as absent, and saving the draft therefore
-/// deletes the line. `AgentDraft`'s doc argues why that is the design rather than a defect: the
-/// alternative is a draft carrying text the form cannot show and is nonetheless responsible for
-/// preserving. Every one of those cases is already an error or a warning on the roster, against
-/// its own line, before anybody opens the form.
+/// Front-matter comments, and any value cide's own vocabulary cannot hold — a `harness: bogus` or
+/// a `max-concurrent: lots` reads as absent, and saving the draft therefore deletes the line.
+/// `AgentDraft`'s doc argues why that is the design rather than a defect: a value cide could not
+/// read is one it cannot vouch for. Every one of those cases is already an error or a warning on
+/// the roster, against its own line, before anybody opens the form.
+///
+/// An **unknown key** used to be on that list and is not any more. It rides `AgentDraft::extras`,
+/// verbatim, and is written back by [`render`] — see `cide_ipc::AgentExtra` for the argument.
 pub fn parse_draft(
     text: &str,
     scope: AgentScope,
 ) -> Result<AgentDraft, frontmatter::FrontMatterError> {
-    let doc = frontmatter::parse(text)?;
-    let value = |key: &str| {
+    let claude = scope.is_claude_code();
+    let grammar = if claude {
+        frontmatter::Grammar::Claude
+    } else {
+        frontmatter::Grammar::Cide
+    };
+    let doc = frontmatter::parse_with(text, grammar)?;
+    // Looked up by the *canonical* name, so one lookup serves `permissionMode` and
+    // `permission-mode` and the form has one field either way.
+    let field = |canonical: &str| {
         doc.fields
             .iter()
-            .find(|field| field.key == key)
-            .map(|field| field.value.trim())
+            .find(|field| canonical_key(&field.key, scope) == Some(canonical))
     };
+    let value = |key: &str| field(key).map(|field| field.value.trim());
     let optional = |key: &str| {
         value(key)
             .filter(|value| !value.is_empty())
@@ -1616,7 +2128,14 @@ pub fn parse_draft(
         name: AgentId(value("name").unwrap_or_default().to_string()),
         original: None,
         label: optional("label"),
-        harness: value("harness").and_then(harness_from_str),
+        // Never read from a subagent: it runs under Claude Code by construction, so a `harness:`
+        // line there is an extra like any other and obeying it would be cide acting on a key it
+        // has just told the user is meaningless.
+        harness: if claude {
+            None
+        } else {
+            value("harness").and_then(harness_from_str)
+        },
         description: value("description").unwrap_or_default().to_string(),
         model: optional("model"),
         effort: optional("effort"),
@@ -1625,6 +2144,15 @@ pub fn parse_draft(
         max_concurrent: value("max-concurrent").and_then(|value| value.parse::<u16>().ok()),
         worktree: value("worktree").and_then(|value| value.parse::<bool>().ok()),
         system_prompt: doc.body,
+        extras: doc
+            .fields
+            .iter()
+            .filter(|field| canonical_key(&field.key, scope).is_none())
+            .map(|field| AgentExtra {
+                key: field.key.clone(),
+                value: extra_value(&field.raw),
+            })
+            .collect(),
     })
 }
 
@@ -1664,18 +2192,113 @@ pub fn validate(draft: &AgentDraft) -> Vec<AgentDraftProblem> {
     let draft = normalize(draft);
     let mut problems = Vec::new();
 
+    let claude = draft.scope.is_claude_code();
+    // Which grammar the name is judged by follows the scope, because the two directories have two
+    // owners — see `valid_claude_name`. The refusal *sentence* differs with it, since "1–32
+    // characters" is not a rule Claude Code has and quoting it at somebody editing a subagent
+    // would send them to fix something that is not broken.
+    let name_ok = |name: &str| {
+        if claude {
+            valid_claude_name(name)
+        } else {
+            valid_name(name)
+        }
+    };
+
     if draft.name.as_str().is_empty() {
         problems.push(problem(
             AgentField::Name,
-            "a role needs a name. It becomes the file name — `<name>.md` — and the word the \
-             orchestrator uses to ask for this role by.",
+            if claude {
+                "a subagent needs a name. Claude Code keys by this value — the file it lives in \
+                 may be called anything — and it is the word cide asks for the role by."
+            } else {
+                "a role needs a name. It becomes the file name — `<name>.md` — and the word the \
+                 orchestrator uses to ask for this role by."
+            },
         ));
-    } else if !valid_name(draft.name.as_str()) {
-        problems.push(problem(AgentField::Name, invalid_name(draft.name.as_str())));
+    } else if !name_ok(draft.name.as_str()) {
+        problems.push(problem(
+            AgentField::Name,
+            invalid_name_for(draft.scope, draft.name.as_str()),
+        ));
+    }
+
+    // **Creation is refused into a directory cide does not own.** `original: None` means create;
+    // the roster lists subagents and the form edits them, but authoring one is Claude Code's
+    // gesture (`/agents`) and cide inventing files in `.claude/agents/` would be cide taking over
+    // a format it does not define. Fielded on `Scope`, because that is the control the user would
+    // change to make the save go through.
+    if claude && draft.original.is_none() {
+        problems.push(problem(
+            AgentField::Scope,
+            "cide does not create Claude Code subagents — it lists and edits the ones already in \
+             `.claude/agents/`. Use Claude Code's own `/agents` to add one, or choose a cide \
+             scope to define this role in `.cide/agents/`.",
+        ));
+    }
+
+    // A move between the two families is not a move. The field sets differ — one carries
+    // `harness` and `max-concurrent`, the other carries `hooks` and `skills` — so the file that
+    // arrived would be a translation cide performed and nobody reviewed. Within a family it is
+    // the ordinary project↔user move and stays allowed.
+    if let Some(location) = &draft.original
+        && location.scope.is_claude_code() != claude
+    {
+        problems.push(problem(
+            AgentField::Scope,
+            "a definition cannot be moved between cide's `.cide/agents/` and Claude Code's \
+             `.claude/agents/`: the two formats carry different keys, so the file that arrived \
+             would be a translation nobody wrote. Create the role in the other place and delete \
+             this one when you are happy with it.",
+        ));
+    }
+
+    for (index, extra) in draft.extras.iter().enumerate() {
+        // The extras are cide's to *carry*, not to interpret — but they are still going into a
+        // front matter, and the two ways a key/value pair can break out of one are checked here
+        // because nothing downstream will. `render` writes them verbatim by design.
+        if !extra
+            .key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            || !extra
+                .key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            problems.push(problem(
+                AgentField::Extras,
+                format!(
+                    "`{}` is not a key: a front-matter key is a word of letters, digits, `-` and \
+                     `_`, starting with a letter.",
+                    extra.key
+                ),
+            ));
+        }
+        if draft.extras[..index].iter().any(|e| e.key == extra.key) {
+            problems.push(problem(
+                AgentField::Extras,
+                format!(
+                    "`{}` is set twice. Which one wins is not something cide should be guessing.",
+                    extra.key
+                ),
+            ));
+        }
+        if extra.value.lines().any(|line| line.trim() == "---") {
+            problems.push(problem(
+                AgentField::Extras,
+                format!(
+                    "the value of `{}` contains a line that is just `---`, which would close the \
+                     front matter early and turn the rest of the file into the system prompt.",
+                    extra.key
+                ),
+            ));
+        }
     }
 
     if let Some(location) = &draft.original
-        && !valid_name(location.name.as_str())
+        && !name_ok(location.name.as_str())
     {
         // Not reachable from a form that was populated by `read_draft` — the roster cannot list
         // a role whose name `read_definition` refused. Checked anyway because this is the value
@@ -1687,7 +2310,7 @@ pub fn validate(draft: &AgentDraft) -> Vec<AgentDraftProblem> {
                 "this form says it is editing a role called `{}`, which is not a usable name. \
                  {}",
                 location.name,
-                invalid_name(location.name.as_str())
+                invalid_name_for(location.scope, location.name.as_str())
             ),
         ));
     }
@@ -1706,6 +2329,7 @@ pub fn validate(draft: &AgentDraft) -> Vec<AgentDraftProblem> {
     }
 
     if let Some(mode) = &draft.permission_mode
+        && !claude
         && !PERMISSION_MODES.contains(&mode.as_str())
     {
         problems.push(problem(
@@ -1756,6 +2380,29 @@ fn invalid_name(name: &str) -> String {
     )
 }
 
+/// [`invalid_name`] for a subagent, which is judged by [`valid_claude_name`] instead.
+///
+/// A separate sentence rather than a shared one because the shared one names a rule Claude Code
+/// does not have: quoting "1–32 characters" at somebody editing a `.claude/agents/` file sends
+/// them to shorten a name that was never too long.
+fn invalid_claude_name(name: &str) -> String {
+    format!(
+        "`{name}` is not a name cide can key a run on. Claude Code allows lowercase letters and \
+         `-`; cide additionally needs the name to be safe as a directory under \
+         `.cide/worktrees/` and as the second half of the git ref `cide/<name>`, so `/`, `..`, a \
+         leading `-` and the plugin separator `:` are all refused."
+    )
+}
+
+/// Whichever of the two sentences above this scope's name rule earns.
+fn invalid_name_for(scope: AgentScope, name: &str) -> String {
+    if scope.is_claude_code() {
+        invalid_claude_name(name)
+    } else {
+        invalid_name(name)
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // The three acts: read one into a form, write one back, remove one.
 // ------------------------------------------------------------------------------------------
@@ -1777,8 +2424,16 @@ pub fn read_draft(
     scope: AgentScope,
     name: &str,
 ) -> Result<AgentDraft, WriteError> {
-    let path = definition_path(project_root, scope, name)
-        .ok_or_else(|| WriteError::Rejected(vec![problem(AgentField::Name, invalid_name(name))]))?;
+    // For a Claude scope this *finds* the file rather than composing its path — the stem need not
+    // equal the name there — so a `None` covers two cases: a name that could never be one, and a
+    // name no file in that directory declares. Both are answered on the name box, which is the
+    // only field a user could act on either way.
+    let path = definition_path(project_root, scope, name).ok_or_else(|| {
+        WriteError::Rejected(vec![problem(
+            AgentField::Name,
+            invalid_name_for(scope, name),
+        )])
+    })?;
 
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -1861,28 +2516,45 @@ pub fn save(project_root: &Path, draft: &AgentDraft) -> Result<PathBuf, WriteErr
         return Err(WriteError::Rejected(problems));
     }
 
-    // `validate` has already refused a name that cannot be a path component, so neither of these
-    // can be `None`. Asked again rather than unwrapped because this is where the join happens,
-    // and a guard that lives at the join is a guard a later refactor cannot separate from it.
-    let target =
-        definition_path(project_root, draft.scope, draft.name.as_str()).ok_or_else(|| {
-            WriteError::Rejected(vec![problem(
-                AgentField::Name,
-                invalid_name(draft.name.as_str()),
-            )])
-        })?;
     let previous = match &draft.original {
         Some(location) => Some(
             definition_path(project_root, location.scope, location.name.as_str()).ok_or_else(
                 || {
                     WriteError::Rejected(vec![problem(
                         AgentField::Name,
-                        invalid_name(location.name.as_str()),
+                        invalid_name_for(location.scope, location.name.as_str()),
                     )])
                 },
             )?,
         ),
         None => None,
+    };
+
+    // **A subagent is rewritten where it lies.** Claude Code keys by the `name:` value and the
+    // filename need not agree, so renaming one is an edit *inside* a file rather than a move
+    // between two. Composing `<dir>/<name>.md` for the new name — which is what cide's own scopes
+    // do, correctly, because there the stem is the rule — would write a second file beside the
+    // one the user opened, leaving two definitions claiming one name: the very state `load_scope`
+    // greys a role for.
+    //
+    // `original` is always `Some` here: `validate` refuses a create into a Claude scope, and this
+    // is the arm that says why in a sentence rather than by unwrapping.
+    let target = if draft.scope.is_claude_code() {
+        previous.clone().ok_or_else(|| {
+            WriteError::NotFound(
+                scope_dir(project_root, draft.scope).unwrap_or_else(|| PathBuf::from("~/.claude")),
+            )
+        })?
+    } else {
+        // `validate` has already refused a name that cannot be a path component, so this cannot
+        // be `None`. Asked again rather than unwrapped because this is where the join happens,
+        // and a guard that lives at the join is a guard a later refactor cannot separate from it.
+        definition_path(project_root, draft.scope, draft.name.as_str()).ok_or_else(|| {
+            WriteError::Rejected(vec![problem(
+                AgentField::Name,
+                invalid_name(draft.name.as_str()),
+            )])
+        })?
     };
 
     let moving = previous.as_deref() != Some(target.as_path());
@@ -1962,8 +2634,15 @@ fn taken(draft: &AgentDraft, target: &Path) -> AgentDraftProblem {
 /// [`definition_path`], because an unchecked join is as dangerous for an `unlink` as it is for a
 /// write, and more so.
 pub fn delete(project_root: &Path, name: &str, scope: AgentScope) -> Result<PathBuf, WriteError> {
-    let path = definition_path(project_root, scope, name)
-        .ok_or_else(|| WriteError::Rejected(vec![problem(AgentField::Name, invalid_name(name))]))?;
+    // Scope-aware for the same reason `read_draft` is: a Claude scope resolves the file by asking
+    // the directory what it declares, so a `None` here is "no such role in that directory" as
+    // often as it is "that could never be a name". Neither licenses a delete.
+    let path = definition_path(project_root, scope, name).ok_or_else(|| {
+        WriteError::Rejected(vec![problem(
+            AgentField::Name,
+            invalid_name_for(scope, name),
+        )])
+    })?;
 
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(path),
@@ -1979,6 +2658,18 @@ pub fn delete(project_root: &Path, name: &str, scope: AgentScope) -> Result<Path
 
 #[cfg(test)]
 mod tests {
+
+    /// The two cide scopes as a scope list, for tests written before the Claude ones existed.
+    ///
+    /// Their subject is the merge, not the number of directories in it, so they say the same
+    /// thing through this shim as they did through the old two-argument signature — and a test
+    /// that keeps its wording is a test whose failure still means what it used to.
+    fn two(global: &Path, project: &Path) -> Vec<(AgentScope, PathBuf)> {
+        vec![
+            (AgentScope::Global, global.to_path_buf()),
+            (AgentScope::Project, project.to_path_buf()),
+        ]
+    }
     use super::*;
 
     /// A scratch directory, built the way `cide-core`'s tests build theirs.
@@ -2052,8 +2743,7 @@ Work one task at a time.
         write(&dir.join("project"), "developer.md", DEVELOPER);
 
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2118,8 +2808,7 @@ Work one task at a time.
         let dir = temp("unclosed");
         write(&dir.join("project"), "qa.md", text);
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2143,8 +2832,7 @@ Work one task at a time.
             "---\nname: developer\ndescription: d\n---\nPrompt.\n",
         );
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2191,8 +2879,7 @@ Work one task at a time.
             "---\nname: ../../etc\ndescription: d\n---\nPrompt.\n",
         );
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2217,8 +2904,7 @@ Work one task at a time.
             "---\nname: qa\ndescription: Checks things.\n---\n\n   \n",
         );
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2255,8 +2941,7 @@ Work one task at a time.
         );
 
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2302,7 +2987,11 @@ Work one task at a time.
             "---\nname: qa\ndescription: q\n---\nTwo.\n",
         );
 
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
         assert_eq!(ids(&catalog), ["developer", "qa"]);
         assert_eq!(catalog.errors().count(), 1, "{}", messages(&catalog));
         assert_eq!(catalog.problems[0].path, project.join("broken.md"));
@@ -2327,7 +3016,11 @@ Work one task at a time.
             "---\nname: developer\ndescription: copy\n---\nCopy.\n",
         );
 
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
         assert_eq!(ids(&catalog), ["developer"]);
         let text = messages(&catalog);
         assert!(text.contains("developer.md"), "{text}");
@@ -2358,7 +3051,11 @@ Work one task at a time.
             "---\nname: developer\ndescription: b\n---\nB.\n",
         );
 
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
         let loaded = agent(&catalog, "developer");
         let reason = loaded.def.unavailable.as_deref().expect("greyed");
         assert!(
@@ -2380,8 +3077,7 @@ Work one task at a time.
             "---\nname: developer\ndescription: d\n---\nPrompt.\n",
         );
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             missing,
         );
@@ -2406,8 +3102,7 @@ Work one task at a time.
             "---\nname: developer\nharness: gemini\ndescription: d\n---\nPrompt.\n",
         );
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2450,7 +3145,11 @@ Work one task at a time.
         // The ordinary machine: `opencode` installed, the build has the harness, so the panel
         // draws a Dispatch button that works. Before the harness landed this same role loaded
         // greyed, with a sentence saying this build could not start it.
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
         let loaded = agent(&catalog, "developer");
         assert_eq!(loaded.def.harness, Harness::Opencode);
         assert_eq!(
@@ -2462,7 +3161,11 @@ Work one task at a time.
         // And the half that did not change: the binary probe still greys the role, with the
         // sentence that *is* an instruction. Listed, never hidden — "we could not tell" and "it
         // is not there" have to stay distinguishable, and a vanished role is neither.
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, missing);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            missing,
+        );
         let loaded = agent(&catalog, "developer");
         assert!(!loaded.def.system_prompt.is_empty(), "still fully loaded");
         let reason = loaded.def.unavailable.as_deref().expect("greyed");
@@ -2527,14 +3230,22 @@ Work one task at a time.
             "---\nname: developer\nharness: claude\ndescription: d\n---\nPrompt.\n",
         );
 
-        let present_catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let present_catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
         assert_eq!(
             agent(&present_catalog, "developer").def.unavailable,
             None,
             "a sound claude role on a machine that has the binary is dispatchable"
         );
 
-        let missing_catalog = load_from(&dir.join("global"), &project, Harness::Claude, missing);
+        let missing_catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            missing,
+        );
         let reason = agent(&missing_catalog, "developer")
             .def
             .unavailable
@@ -2560,8 +3271,7 @@ Work one task at a time.
              permission-mode: yolo\n---\nPrompt.\n",
         );
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2607,7 +3317,11 @@ Work one task at a time.
             "qa.md",
             "---\nname: qa\ndescription: d\nfuture-thing: 3\n---\nP.\n",
         );
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
 
         let developer = agent(&catalog, "developer");
         let reason = developer.def.unavailable.as_deref().expect("greyed");
@@ -2701,8 +3415,7 @@ Work one task at a time.
             "---\nname: qa\nlabel: QA\ndescription: d\n---\nPrompt.\n",
         );
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2717,8 +3430,7 @@ Work one task at a time.
     fn a_missing_directory_is_silent() {
         let dir = temp("absent");
         let catalog = load_from(
-            &dir.join("global"),
-            &dir.join("project"),
+            &two(&dir.join("global"), &dir.join("project")),
             Harness::Claude,
             present,
         );
@@ -2739,7 +3451,11 @@ Work one task at a time.
             "b.md",
             "---\nname: b\nharness: claude\ndescription: d\n---\nP.\n",
         );
-        let catalog = load_from(&dir.join("global"), &project, Harness::Opencode, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Opencode,
+            present,
+        );
         assert_eq!(agent(&catalog, "a").def.harness, Harness::Opencode);
         assert_eq!(agent(&catalog, "b").def.harness, Harness::Claude);
 
@@ -2761,7 +3477,11 @@ Work one task at a time.
             "b.md",
             "---\nname: b\ndescription: d\nmax-concurrent: lots\n---\nP.\n",
         );
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
         assert_eq!(agent(&catalog, "a").def.max_concurrent, 1);
         assert_eq!(agent(&catalog, "b").def.max_concurrent, 1);
         assert_eq!(catalog.errors().count(), 2, "{}", messages(&catalog));
@@ -2788,7 +3508,11 @@ Work one task at a time.
             "c.md",
             "---\nname: c\ndescription: d\nworktree: nope\n---\nP.\n",
         );
-        let catalog = load_from(&dir.join("global"), &project, Harness::Claude, present);
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
         assert!(!agent(&catalog, "a").def.worktree);
         assert!(
             agent(&catalog, "b").def.worktree,
@@ -2832,6 +3556,7 @@ Work one task at a time.
     /// A draft with the two fields every valid one must have and nothing else.
     fn draft(name: &str, prompt: &str) -> AgentDraft {
         AgentDraft {
+            extras: Vec::new(),
             scope: AgentScope::Project,
             name: AgentId(name.to_string()),
             original: None,
@@ -3067,8 +3792,7 @@ Work one task at a time.
             write(&project, &format!("{}.md", normal.name), &render(&original));
 
             let catalog = load_from(
-                &dir.join(index.to_string()).join("global"),
-                &project,
+                &two(&dir.join(index.to_string()).join("global"), &project),
                 Harness::Opencode,
                 present,
             );
@@ -3171,21 +3895,39 @@ Work one task at a time.
         assert_eq!(doc.body, "Prompt.");
     }
 
-    /// Comments and keys cide does not read are dropped by a save, which is a decision rather
-    /// than an oversight — see [`parse_draft`]'s doc — and is pinned so it cannot become one.
+    /// What a save still drops, and what it stopped dropping in M30.
+    ///
+    /// The two halves are different decisions and the test says so, because they used to be one.
+    /// A **value** cide could not read still goes — `harness: bogus` is a switch nothing will act
+    /// on, and re-emitting it would be the file claiming a setting that is not in effect. A
+    /// front-matter **comment** still goes, for want of anywhere in the draft to put it. An
+    /// unknown **key** no longer goes: it rides `extras`, is shown in the form as an editable
+    /// row, and comes back out of `render` byte for byte. `AgentDraft`'s header carries the
+    /// argument; this pins it in both directions so neither half can quietly swap places.
     #[test]
-    fn a_save_rewrites_the_file_to_what_cide_reads_and_no_more() {
+    fn a_save_keeps_the_keys_it_cannot_read_and_drops_the_values_it_cannot() {
         let text = "---\n# who wrote this\nname: qa\ndescription: Checks.\nfuture-key: value\n\
                     harness: bogus\nmax-concurrent: lots\n---\nPrompt.\n";
         let back = parse_draft(text, AgentScope::Project).expect("parses");
         assert_eq!(back.description, "Checks.");
         assert_eq!(back.harness, None, "an unreadable value reads as absent");
         assert_eq!(back.max_concurrent, None);
+        // `harness` and `max-concurrent` are keys cide *models*, so an unreadable value there is
+        // an absent value and never an extra — otherwise a save would write the line back and
+        // the roster would go on reporting it for ever.
+        assert_eq!(
+            back.extras
+                .iter()
+                .map(|extra| extra.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["future-key"]
+        );
 
         let rendered = render(&back);
-        assert!(!rendered.contains("future-key"), "{rendered}");
+        assert!(rendered.contains("future-key: value"), "{rendered}");
         assert!(!rendered.contains("who wrote this"), "{rendered}");
         assert!(!rendered.contains("bogus"), "{rendered}");
+        assert!(!rendered.contains("lots"), "{rendered}");
     }
 
     /// Every refusal reaches the box that carries it. The whole reason a rejection is a list of
@@ -3269,8 +4011,7 @@ Work one task at a time.
         assert_eq!(path, root.join(".cide/agents/qa.md"));
 
         let catalog = load_from(
-            &dir.join("global"),
-            &project_dir(&root),
+            &two(&dir.join("global"), &project_dir(&root)),
             Harness::Claude,
             present,
         );
@@ -3317,8 +4058,7 @@ Work one task at a time.
         // The `name:` key moved with the file, which is the invariant `read_definition` enforces
         // and the reason a rename cannot be an in-place write.
         let catalog = load_from(
-            &dir.join("global"),
-            &project_dir(&root),
+            &two(&dir.join("global"), &project_dir(&root)),
             Harness::Claude,
             present,
         );
@@ -3341,12 +4081,12 @@ Work one task at a time.
         let root = std::env::temp_dir().join("cide-agents-scope");
         assert_eq!(
             scope_dir(&root, AgentScope::Global),
-            global_dir(),
+            Some(global_dir()),
             "the global scope ignores the project root, by design"
         );
         assert_eq!(
             scope_dir(&root, AgentScope::Project),
-            root.join(".cide/agents")
+            Some(root.join(".cide/agents"))
         );
         assert_ne!(
             definition_path(&root, AgentScope::Global, "qa"),
@@ -3391,8 +4131,7 @@ Work one task at a time.
 
         // And nothing moved: both files are still there, with their own prompts.
         let catalog = load_from(
-            &dir.join("global"),
-            &project_dir(&root),
+            &two(&dir.join("global"), &project_dir(&root)),
             Harness::Claude,
             present,
         );
@@ -3489,5 +4228,224 @@ Work one task at a time.
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ==========================================================================================
+// The Claude Code corpus: the assertion that cide does not damage a file it does not own.
+// ==========================================================================================
+//
+// Modelled on `cide-spec`'s `tests/corpus.rs`, and here for the same reason: the promise this
+// milestone makes to a user is *byte-level*, and a promise about bytes is only ever worth what
+// a differential test says it is. Every case below is a shape a real `.claude/agents/*.md`
+// takes — the block mapping, the block sequence, the flow sequence, the CRLF, the BOM, the
+// `---` inside a prompt — and the assertion is always the same one: read it, write it back
+// unchanged, and the front matter that comes out is the front matter that went in.
+//
+// It is deliberately *not* an assertion that the whole file is byte-identical. `render` owns
+// the file's shape — key order, the blank line after the fence, the trailing newline — and
+// always has; what it must not own is the *content* of a key it cannot read.
+#[cfg(test)]
+mod claude_corpus {
+    use super::*;
+
+    /// One subagent, as somebody would actually have written it.
+    const FULL: &str = "---\nname: code-reviewer\ndescription: Reviews a diff for correctness.\n\
+                        model: sonnet\ntools: Read, Grep, Glob, Bash\npermissionMode: acceptEdits\n\
+                        maxTurns: 40\ncolor: cyan\ndisallowedTools: Write\n\
+                        skills:\n  - security-review\n  - style\n\
+                        hooks:\n  PreToolUse:\n    - matcher: Bash\n      command: ./audit.sh\n\
+                        mcpServers:\n  - name: docs\n    command: docs-server\n\
+                        ---\nYou review code.\n\nBe specific.\n";
+
+    /// Every front-matter key with the raw source text it occupied, in file order.
+    ///
+    /// The **raw** text and not the parsed value, which is the whole point: a `hooks:` block that
+    /// came back flattened to one line has an identical `value` and a completely different `raw`,
+    /// so a comparison on values would pass while the file was being destroyed.
+    type Keyed = Vec<(String, String)>;
+
+    /// Read the front matter, render it back, and read it again.
+    fn round_trip(text: &str) -> (Keyed, Keyed) {
+        let before =
+            frontmatter::parse_with(text, frontmatter::Grammar::Claude).expect("the corpus parses");
+        let draft = parse_draft(text, AgentScope::ClaudeProject).expect("the corpus drafts");
+        let rendered = render(&draft);
+        let after = frontmatter::parse_with(&rendered, frontmatter::Grammar::Claude)
+            .unwrap_or_else(|err| panic!("re-reading what render wrote: {err:?}\n{rendered}"));
+        let raw = |doc: frontmatter::Document| {
+            doc.fields
+                .into_iter()
+                .map(|field| (field.key, field.raw))
+                .collect::<Vec<_>>()
+        };
+        (raw(before), raw(after))
+    }
+
+    /// **The load-bearing one.** Every key survives, and the multi-line ones survive with their
+    /// indentation, because a `hooks:` block that came back as `hooks:` and nothing else would be
+    /// a silent deletion in a committed file.
+    #[test]
+    fn every_key_survives_a_save_with_its_block_intact() {
+        let (before, after) = round_trip(FULL);
+        for (key, raw) in &before {
+            let found = after
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("`{key}` did not survive the round trip"));
+            assert_eq!(&found.1, raw, "`{key}` came back changed");
+        }
+        assert_eq!(before.len(), after.len(), "a key appeared from nowhere");
+    }
+
+    /// The blocks reach the draft as extras, not as anything cide thinks it understands, and the
+    /// keys cide *does* model do not.
+    #[test]
+    fn the_split_between_modelled_and_carried_is_where_it_should_be() {
+        let draft = parse_draft(FULL, AgentScope::ClaudeProject).expect("drafts");
+        assert_eq!(draft.name.as_str(), "code-reviewer");
+        assert_eq!(draft.model.as_deref(), Some("sonnet"));
+        assert_eq!(draft.tools, vec!["Read", "Grep", "Glob", "Bash"]);
+        // Claude spells it `permissionMode`; the draft has one field either way.
+        assert_eq!(draft.permission_mode.as_deref(), Some("acceptEdits"));
+        // Forced, never read from the file — a subagent has no other harness.
+        assert_eq!(draft.harness, None);
+
+        let carried: Vec<&str> = draft.extras.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            carried,
+            vec![
+                "maxTurns",
+                "color",
+                "disallowedTools",
+                "skills",
+                "hooks",
+                "mcpServers"
+            ],
+            "in file order, and nothing cide models among them"
+        );
+        let hooks = draft
+            .extras
+            .iter()
+            .find(|e| e.key == "hooks")
+            .expect("hooks is carried");
+        assert_eq!(
+            hooks.value, "\n  PreToolUse:\n    - matcher: Bash\n      command: ./audit.sh",
+            "a block's own indentation is the block, and must not be touched"
+        );
+    }
+
+    /// A BOM, CRLF line endings and a `---` inside the prompt: the three shapes that break a
+    /// front-matter reader, all of which cide's own parser already survives and which must go on
+    /// being survived in the dialect that admits blocks.
+    #[test]
+    fn the_three_shapes_that_break_a_front_matter_reader() {
+        let text = "\u{feff}---\r\nname: qa\r\ndescription: Checks.\r\n\
+                    hooks:\r\n  Stop:\r\n    - command: ./done.sh\r\n---\r\n\
+                    A prompt.\r\n\r\n---\r\n\r\nStill the prompt.\r\n";
+        let draft = parse_draft(text, AgentScope::ClaudeProject).expect("drafts");
+        assert_eq!(draft.name.as_str(), "qa");
+        assert_eq!(
+            draft
+                .extras
+                .iter()
+                .map(|e| e.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hooks"]
+        );
+        assert!(
+            draft.system_prompt.contains("---"),
+            "a fence inside the body is body: {:?}",
+            draft.system_prompt
+        );
+        // And CRLF is folded, so the value the form shows is not one no file can hold.
+        assert!(!draft.extras[0].value.contains('\r'));
+        let (before, after) = round_trip(text);
+        assert_eq!(before, after);
+    }
+
+    /// The dialect is a *mode*, not a second reader: the same block that is carried under
+    /// `Claude` is still refused by name, with a line number, under `Cide`.
+    #[test]
+    fn cides_own_format_still_refuses_what_it_always_refused() {
+        let text = "---\nname: qa\ndescription: Checks.\nhooks:\n  Stop: x\n---\nP.\n";
+        let err = frontmatter::parse_with(text, frontmatter::Grammar::Cide)
+            .expect_err("cide's own format has no nesting");
+        assert_eq!(err.line, 5);
+        assert!(err.message.contains("indented"), "{}", err.message);
+        frontmatter::parse_with(text, frontmatter::Grammar::Claude).expect("Claude's does");
+    }
+
+    /// **The promise, made against a real file.** Read a subagent through `read_draft`, save it
+    /// back through `save` with nothing changed, and every key it had is still there with its
+    /// block intact.
+    ///
+    /// The in-memory round trip above is the same claim one layer down; this one is here because
+    /// the layer between them is where it could still be lost. `save` resolves its own target
+    /// path, and for a Claude scope that resolution is *find the file that declares this name*
+    /// rather than *compose `<dir>/<name>.md`* — so a regression there would write a second file
+    /// beside the user's, leave the original untouched, and pass every test that never looked at
+    /// the disk.
+    #[test]
+    fn a_real_subagent_survives_a_real_save() {
+        let dir = std::env::temp_dir().join(format!("cide-subagent-{}", std::process::id()));
+        let agents = dir.join(".claude/agents");
+        std::fs::create_dir_all(&agents).expect("temp dirs");
+        // Deliberately named for neither its `name:` nor cide's convention, which is legal in
+        // Claude Code and is the case a composed path gets wrong.
+        let file = agents.join("reviewer-v2.md");
+        std::fs::write(&file, FULL).expect("writes the fixture");
+
+        let draft = read_draft(&dir, AgentScope::ClaudeProject, "code-reviewer")
+            .expect("the form opens on a subagent");
+        assert_eq!(
+            draft.original,
+            Some(AgentLocation {
+                scope: AgentScope::ClaudeProject,
+                name: AgentId("code-reviewer".into()),
+            })
+        );
+
+        let wrote = save(&dir, &draft).expect("an unchanged draft saves");
+        assert_eq!(
+            wrote, file,
+            "rewritten where it lay, not composed as code-reviewer.md"
+        );
+        assert_eq!(
+            std::fs::read_dir(&agents).expect("reads").count(),
+            1,
+            "and no second file appeared beside it"
+        );
+
+        let after = std::fs::read_to_string(&file).expect("reads back");
+        for needle in [
+            "maxTurns: 40",
+            "color: cyan",
+            "disallowedTools: Write",
+            "  - security-review",
+            "  PreToolUse:",
+            "    - matcher: Bash",
+            "      command: ./audit.sh",
+            "  - name: docs",
+            "permissionMode: acceptEdits",
+        ] {
+            assert!(after.contains(needle), "`{needle}` was lost:\n{after}");
+        }
+        assert!(
+            !after.contains("permission-mode:"),
+            "and it is written back in Claude's spelling, not cide's:\n{after}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A continuation line with no key above it is still a refusal in both dialects — there is
+    /// nothing to attach it to, and reading it as a key would invent one.
+    #[test]
+    fn a_block_with_nothing_above_it_is_refused_in_both_dialects() {
+        let text = "---\n  orphaned: true\nname: qa\n---\nP.\n";
+        for grammar in [frontmatter::Grammar::Cide, frontmatter::Grammar::Claude] {
+            let err = frontmatter::parse_with(text, grammar).expect_err("no key to attach to");
+            assert_eq!(err.line, 2);
+        }
     }
 }

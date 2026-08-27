@@ -908,6 +908,8 @@ pub enum FormatAnswer {
         /// never the resolved path: a user's Rust is formatted by "rust-analyzer" whether the
         /// file on disk was `cide-rust-analyzer` or their own build, and which one ran is
         /// already in `server::supervise`'s `resolved` log line where a bug report finds it.
+        /// One exception: `"cide"` (`cide_core::format::BUILTIN_FORMATTER_NAME`), when the
+        /// builtin road did the work — no binary ran, so there is no binary to name.
         by: String,
     },
     /// The formatter ran and had nothing to change. See the type's docs.

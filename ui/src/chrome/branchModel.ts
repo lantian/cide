@@ -609,6 +609,26 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
     case 'ambiguousRev':
       return `${name('spec')} matches more than one object in this repository — type a few more characters of the oid.`
 
+    // --- staging ------------------------------------------------------------------------------
+    //
+    // Reached from the Git panel, which drops files on a changelist by adding them to git first.
+    // Its own failure line used to be `String(e)`, so all three of these read `[object Object]`.
+    case 'pathIgnored':
+      // Not "it has no changes" — which is what Rust used to answer and is true of every ignored
+      // path, and says nothing about the file the user can see sitting on screen with content in
+      // it. The rule is in a file they can open, and forcing it is a real answer, so both are
+      // named. cide has no un-ignore gesture, which is why the second half says terminal.
+      return `${name('path')} is ignored by a rule in .gitignore, so git will not add it. Change the rule, or add it anyway from a terminal with git add -f.`
+    case 'nestedRepository':
+      // The agent-worktree case, and the vendored-clone case. Naming submodules matters: it is
+      // the one thing that makes the directory work as part of this repository, and it is not
+      // discoverable from a refusal that only says no.
+      return `${name('path')} is a git repository of its own, so its files belong to it and not to this one. Commit them inside it, or add it here as a submodule from a terminal.`
+    case 'noSuchChange':
+      return `${name('path')} has nothing left to apply — it changed again while that was in flight. Refresh and try once more.`
+    case 'staleSelection':
+      return `${name('path')} changed while that was in flight, so the lines that were ticked are no longer the lines it has. Refresh and pick again.`
+
     // --- file history and blame ------------------------------------------------------------------
     case 'notTracked':
       return `${name('path')} is not tracked by git, so it has no history yet — commit it first.`

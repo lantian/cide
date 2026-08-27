@@ -438,6 +438,28 @@
   font-size: var(--fs-ui-11);
 }
 
+/*
+ * The `running` mark, turning. See `model.ts::SPINNING_GLYPH` for why this keys off the glyph
+ * rather than off the phase, and for how long it sat still.
+ *
+ * A loop, so reduced motion is answered through `--motion-loop` — an infinite animation at the
+ * zeroed `--dur-1` strobes, which is the opposite of the request. Paused renders the 0% frame:
+ * the arc at rest, which is a legible static "working" mark and is what this drew before.
+ */
+.glyphSpin {
+  animation: agents-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes agents-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .agentLabel {
   min-width: 0;
   overflow: hidden;
@@ -717,6 +739,35 @@
   text-overflow: ellipsis;
   font-size: var(--fs-ui-12);
   color: var(--text-hi);
+}
+
+/*
+ * The source chip on a Claude Code subagent's row.
+ *
+ * `flex-shrink: 0` because the name beside it is the thing that ellipsises: a badge that shrank
+ * would read as a different word, and "Claude Cod…" is worse than a shorter role name.
+ *
+ * A rung of the `--fs-ui-*` ladder, never a bare pixel size — this is a box drawn around text and
+ * `check:ui-scale` is what stops it silently stopping following the UI font size. `--fs-ui-11` is
+ * the lowest rung there is.
+ *
+ * **`--accent`, which is Claude's own orange**, and that is the reason rather than a coincidence:
+ * the chip names Claude Code, and the palette's accent family is built from `#d97757` — see the
+ * note above `--accent` in `tokens.css`. It is declared in **both** palette blocks, so the chip
+ * follows the theme; ink and border share the token rather than pairing `--accent` text with an
+ * `--accent-dim` fill, because that pair lands at 2.2:1 in dark mode where it is 4.4:1 in light,
+ * and a chip that is legible in one theme only is the failure `check:scheme` exists to argue
+ * about one surface over.
+ */
+.roleBadge {
+  flex-shrink: 0;
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-1);
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  color: var(--accent);
+  white-space: nowrap;
 }
 
 /*

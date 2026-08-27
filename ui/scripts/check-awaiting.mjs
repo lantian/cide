@@ -71,6 +71,8 @@ try {
     isAwaiting,
     awaitingBadge,
     awaitingHint,
+    acknowledgesKey,
+    acknowledgesButton,
   } = await import(`file://${join(out, 'awaitingRule.js')}`)
 
   /** Replay a sequence of transitions from nothing. */
@@ -145,6 +147,34 @@ try {
     onState(onState(seen, 'busy'), 'awaitingInput').awaiting,
     true,
     'the ordinary loop — reply, wait, finish — raises the marker every time round',
+  )
+
+  // --- which gestures are a person -----------------------------------------------------
+  //
+  // Driven rather than grepped, because the DOM half of this was grepped and that is exactly
+  // how the keyboard acknowledger shipped dead: the assertion below used to read
+  // `includes("addEventListener('keydown', onKeyDown)")`, which the broken bubble-phase
+  // registration satisfied word for word.
+  eq(acknowledgesKey('a'), true, 'an ordinary keystroke in a pane is a person reading it')
+  eq(acknowledgesKey('Enter'), true, 'and so is Enter — UP then Enter is the reported gesture')
+  eq(acknowledgesKey('ArrowUp'), true, 'and an arrow: recalling the last command is an act')
+  eq(
+    [acknowledgesKey('Shift'), acknowledgesKey('Control'), acknowledgesKey('Alt'), acknowledgesKey('Meta')],
+    [false, false, false, false],
+    'bare modifiers are not: a chord is half-typed, or on some layouts a modifier is pressed ' +
+      'on the way somewhere else entirely',
+  )
+  eq(acknowledgesButton(0), true, 'a left click into the pane has always counted')
+  eq(
+    acknowledgesButton(1),
+    true,
+    'and the middle one now does: a primary-selection paste puts text into THIS pane',
+  )
+  eq(
+    acknowledgesButton(2),
+    false,
+    'the right button opens the pane menu, which is where `Minimize window` is chosen from — ' +
+      'clearing on the way there destroys the one thing that brings the user back',
   )
 
   // --- the loop, driven for real ------------------------------------------------------------
@@ -676,10 +706,51 @@ try {
     'the keystroke handler is the sink s alone — a second one per mount would send every ' +
       'keystroke twice',
   )
+
+  //    ...and it acknowledges in the **capture** phase, which is the assertion this file did
+  //    not have and needed. The previous form asked only that a `keydown` listener existed,
+  //    and the listener that existed was registered on the bubble — where it is silently DEAD:
+  //    xterm's handlers sit on `term.textarea`, a descendant of the element `term.open()` was
+  //    given, and its `_keyDown` ends every key it consumes with `cancel(ev, true)`, which is
+  //    `preventDefault()` and `stopPropagation()`. So the listener fired for the keys xterm
+  //    ignores and never for a printable character, `Enter` or an arrow — the whole of the
+  //    report that the marker could only be cleared by clicking a pane the user was already
+  //    typing in. Nothing else in the chain can catch this: the rule was right, the surfaces
+  //    were wired, and the one dead link passed a check that spelled it out by name.
   has(
     'src/panes/TerminalPane.tsx',
-    "addEventListener('keydown', onKeyDown)",
-    'a real keystroke in the pane is what acknowledges instead',
+    "addEventListener('keydown', onKeyDown, true)",
+    'a real keystroke in the pane acknowledges, and in the CAPTURE phase — on the bubble the ' +
+      'listener never sees a printable key, Enter or an arrow, because xterm stops the event ' +
+      'at the textarea',
+  )
+  has(
+    'src/panes/TerminalPane.tsx',
+    "removeEventListener('keydown', onKeyDown, true)",
+    'and comes off with the same flag: removal matches on it, and the host outlives the ' +
+      'mount, so a bare removal leaks one acknowledger per mount onto a live terminal',
+  )
+  //    Scrolling the scrollback is reading it, and it is the only such act with no keyboard in
+  //    it at all — which is how a finished `make` is usually read.
+  has(
+    'src/panes/TerminalPane.tsx',
+    "addEventListener('wheel', onWheel, { capture: true, passive: true })",
+    'scrolling a waiting pane acknowledges it too — capture for the reason above, passive ' +
+      'because a non-passive wheel listener makes the browser wait on it before scrolling',
+  )
+  has(
+    'src/panes/TerminalPane.tsx',
+    "removeEventListener('wheel', onWheel, true)",
+    'and comes off with the capture flag, for the same reason as the keystroke one',
+  )
+  //    The pointer screen is the rule module's, not a literal. Written out at the listener it
+  //    was `button === 0`, which is a statement about a number rather than about people, and
+  //    the middle button — a primary-selection paste straight into the pane — fell through it.
+  has(
+    'src/layout/PaneTitleBar.tsx',
+    'acknowledgesButton(event.button)',
+    'the pane frame asks the rule module which buttons are a person, so the answer cannot ' +
+      'drift from the one this file drives above',
   )
 
   // 4. The task bar. The title was already being set correctly and the report was still "no

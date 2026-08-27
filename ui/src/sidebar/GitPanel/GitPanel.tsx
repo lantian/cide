@@ -192,7 +192,18 @@ export function GitPanelView({
         </p>
       )}
       {git.unavailable !== null && (
-        <p className={`${styles.note} ${styles.noteWarn}`} data-audit="gitUnavailable">
+        /*
+         * `title` because `.note` is one ellipsized line and these sentences are long: a git
+         * refusal names the path, says what refused, and says what to do instead, and in a
+         * narrow sidebar the third part is exactly what falls off the end. The tooltip is the
+         * only way to read the rest — the note cannot wrap without pushing the tree down on
+         * every transient failure.
+         */
+        <p
+          className={`${styles.note} ${styles.noteWarn}`}
+          data-audit="gitUnavailable"
+          title={git.unavailable}
+        >
           {git.unavailable}
         </p>
       )}

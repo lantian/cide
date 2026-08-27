@@ -72,12 +72,29 @@ pub struct TaskMutation {
 
 /// Ask the policy about a burst of mutations and act on what it answers. Returns immediately;
 /// the work happens on the blocking pool.
+///
+/// # This is the funnel, and a second reaction rides it
+///
+/// Both roads a task can be mutated by — `cmd::tasks` and the agent-RPC socket's `StoreSink` —
+/// end here, which makes this the one place that sees every mutation exactly once. Since M31
+/// [`crate::spec_reveal`] reads the same burst for a different question (*did a proposal just
+/// finish?*), rather than the two collection sites growing a second call each and drifting apart
+/// the way a duplicated funnel does.
+///
+/// It runs **before** [`consider_blocking`] and outside all of that function's gates, which is
+/// the load-bearing half of the ordering: dispatch declines when subagents are off for the
+/// project or auto-dispatch is disabled, and *neither has anything to do with proposing* — a
+/// proposal is typed into a conversation, not spawned. Revealing behind those gates would have
+/// made the feature silently absent on every project that has not turned subagents on.
 pub fn consider(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMutation>) {
     if mutations.is_empty() {
         return;
     }
     let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || consider_blocking(&app, project, mutations));
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::spec_reveal::consider(&app, project, &mutations);
+        consider_blocking(&app, project, mutations);
+    });
 }
 
 fn consider_blocking(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMutation>) {
@@ -108,11 +125,24 @@ fn consider_blocking(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMut
         return;
     };
 
+    // One read per burst, for the blocking gate: `mutation.after` carries the task's own
+    // `blockedBy` edges, but a blocker's *status* lives on the other task, so the policy is
+    // handed `blocker_statuses` over the whole board. The read races later mutations only in
+    // the direction that is safe — a blocker finished after this snapshot delays a dispatch
+    // until the next gesture, it never starts one early. (M30)
+    let board: Vec<Task> = app
+        .try_state::<Arc<TasksStores>>()
+        .and_then(|stores| stores.get(project))
+        .map(|store| store.list())
+        .unwrap_or_default();
+
     for mutation in mutations {
         let fresh: Vec<&str> = mutation.fresh_text.iter().map(String::as_str).collect();
+        let blockers = autodispatch::blocker_statuses(&mutation.after, &board);
         let Some(trigger) = autodispatch::trigger(
             mutation.before.as_ref(),
             &mutation.after,
+            &blockers,
             &mutation.author,
             mutation.assign_gesture,
             &fresh,

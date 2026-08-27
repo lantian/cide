@@ -59,6 +59,22 @@ export type Inline =
   /** A hard break — two trailing spaces, or a trailing backslash. */
   | { readonly kind: 'break' }
 
+/**
+ * How a parse should treat a lone newline inside a paragraph. (M31)
+ *
+ * CommonMark's answer is `'space'`: a paragraph is one flow however its source was wrapped, and
+ * that is right for a `.md` file, where the author wraps at 100 columns and means nothing by it.
+ * It is wrong for a message. `'break'` is the convention every comment box uses — a newline is a
+ * line — and it is what `TaskMarkdown.tsx` asks for, because a task comment is written the way a
+ * chat message is and read at 620px. The default stays CommonMark; only the caller that knows it
+ * is rendering a message opts out.
+ *
+ * A *hard* break (two trailing spaces, or a trailing backslash) is unaffected either way.
+ */
+export interface MarkdownOptions {
+  readonly softBreak?: 'space' | 'break'
+}
+
 /* --- blocks ------------------------------------------------------------------------------- */
 
 /** Column alignment from a GFM delimiter row. `null` is "not stated". */

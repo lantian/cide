@@ -41,10 +41,14 @@ import type { ProjectId } from '@/ipc/client'
 import {
   EMPTY_DRAFT,
   assigneeHint,
+  linkTargetOptions,
+  linkableTargets,
+  taskLinks,
   type ArmedDelete,
   type Board,
   type CommentView,
   type FieldEdit,
+  type LinkTargetOption,
   type RunRef,
   type TaskDraft,
   type TaskStatus,
@@ -109,6 +113,15 @@ function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskVie
   return {
     body: '',
     status: 'todo',
+    // No change, which is most tasks — and the value that keeps every existing story's digest
+    // byte-identical to what it was before M28. `check:agents-render` compares them.
+    change: null,
+    // And no conversation, the same claim: the work of a task that went to a role, or nowhere
+    // yet, is not with a Claude session and the card draws no session row.
+    session: null,
+    // No links either, the same claim for M30: a card handed no `links` prop draws no Links
+    // section at all, so every pre-M30 story's digest stands.
+    links: [],
     agent: null,
     comments: [],
     history: [],
@@ -316,7 +329,66 @@ const CARD_HANDLERS = {
   onOpenRun: () => {},
   onPauseRun: () => {},
   onResumeRun: () => {},
+  /*
+   * On every card story, so "no session row" is never true merely because nobody passed a
+   * handler. The row is gated on `spec.session`, and its Open control on the pane still being
+   * there — both of which are facts about the story, which is where the assertions want them.
+   */
+  onOpenSession: () => {},
 } as const
+
+/* ------------------------------------------------------------------- typed links (M30) */
+
+/**
+ * The linked card's task: three kinds outgoing, one of them dangling.
+ *
+ * `t-99` is on nobody's board — deleted, or living on a branch not pulled yet — and the chip
+ * must draw *marked* rather than vanish: a reference that silently disappeared is the
+ * task-leaves-the-tracker failure, one edge over.
+ */
+const LINKED = task({
+  id: 't-40',
+  title: 'Ship the panel',
+  links: [
+    { kind: 'blockedBy', target: 't-14' },
+    { kind: 'subtaskOf', target: 't-16' },
+    { kind: 'related', target: 't-17' },
+    { kind: 'blockedBy', target: 't-99' },
+  ],
+})
+
+/**
+ * The other end: a task whose own stored edge names `t-40`. Its chip on `t-40`'s card —
+ * "Blocks t-41" — is **derived**, which is the claim the story exists for: each edge is stored
+ * once, on its canonical side, and the other reading is computed from the board.
+ */
+const BLOCKED_BY_LINKED = task({
+  id: 't-41',
+  title: 'Write the release note',
+  links: [{ kind: 'blockedBy', target: 't-40' }],
+})
+
+const LINK_BOARD: readonly TaskView[] = [T14, T16, T17, LINKED, BLOCKED_BY_LINKED]
+
+/**
+ * The link handlers, separate from `CARD_HANDLERS` on purpose: a card handed no `links` prop
+ * draws no Links section at all — that absence is the pre-M30 digest claim — so only the link
+ * stories carry these.
+ */
+const LINK_HANDLERS = {
+  onLinkAdd: () => {},
+  onLink: () => {},
+  onUnlink: () => {},
+  onOpenTask: () => {},
+} as const
+
+/** Through the real derivations, so the stories exercise `taskLinks`' actual answers. */
+const LINK_CHIPS = taskLinks(LINKED, LINK_BOARD)
+const LINK_TARGETS = linkableTargets('t-40', LINK_BOARD).map((candidate) => ({
+  id: candidate.id,
+  title: candidate.title,
+  status: candidate.status,
+}))
 
 function story(over: Partial<TasksPanelViewProps>): TasksPanelViewProps {
   return { project: PROJECT, roles: ROLES, ...HANDLERS, ...over }
@@ -336,6 +408,107 @@ function compose(draft: TaskDraft, over: Partial<TaskComposeProps> = {}): TaskCo
     ...over,
   }
 }
+
+/**
+ * A task that implements an OpenSpec change.
+ *
+ * Its whole job is `change`, and its pair is every other card story, where `change` is `null` and
+ * the prop is absent — which is the optionality claim: with no change the card's markup is what
+ * it was before M28.
+ */
+/**
+ * A change as the card has it once the read lands — 3 of 9 steps, valid, one requirement.
+ *
+ * `action` is what `OpenSpecPanel/model.ts::primaryAction` answers for that state, restated here
+ * rather than computed: this fixture belongs to the *card*, and a story that called into the
+ * panel's model would be testing two modules at once and would go green the day either changed.
+ */
+const SPEC_CARD = {
+  change: 'add-dark-mode',
+  done: 3,
+  total: 9,
+  valid: true,
+  issues: 0,
+  tasks: [
+    { done: true, description: 'Add the theme tokens' },
+    { done: false, description: 'Wire the palette switch' },
+  ],
+  deltas: [
+    {
+      spec: 'dark-mode',
+      op: 'added',
+      requirements: [
+        {
+          target: 'd0.r0',
+          issues: [],
+          name: 'Theme switching',
+          text: 'The app SHALL switch themes.',
+          scenarios: [{ title: 'Picks dark', body: '- **WHEN** a\n- **THEN** b' }],
+          block: '### Requirement: Theme switching',
+        },
+      ],
+    },
+  ],
+  artifacts: [{ id: 'tasks', path: '/repo/openspec/changes/add-dark-mode/tasks.md' }],
+  action: {
+    id: 'approve' as const,
+    label: 'Approve & dispatch',
+    hint: 'Choose where the work happens.',
+    enabled: true,
+    reason: '',
+  },
+  /** Nothing has been dispatched anywhere: no session row, and the approve button stands. */
+  session: null,
+  /** In flight. `card-spec-archived` is the same change once `openspec archive` has moved it. */
+  archived: null,
+}
+
+/**
+ * The same change, handed to a conversation. (M28)
+ *
+ * `action.id` is `none` because `primaryAction` refuses the approve road once a session is set —
+ * so this story is also the assertion that the two move together. A card that kept the button
+ * *and* drew this row would be offering to dispatch work that is already being done, which is
+ * exactly what shipped: choosing *New Claude session* started the session, typed the task in, and
+ * left **Approve & dispatch** sitting over it.
+ */
+const SPEC_CARD_SESSION = {
+  ...SPEC_CARD,
+  action: {
+    id: 'none' as const,
+    label: '',
+    hint: 'This change’s work is with a conversation. Open it to see where it has got to.',
+    enabled: false,
+    reason:
+      'Its work is with a Claude conversation — open this change’s task to see where it has got to.',
+  },
+  session: {
+    id: '11111111-2222-4333-8444-555555555555',
+    label: 'Conversation 1',
+    open: true,
+    awaiting: false,
+  },
+}
+
+/** The three kinds of place a run can happen. See `specCard.ts::DispatchTarget`. */
+const TARGETS = [
+  { kind: 'role' as const, id: 'developer', label: 'Developer', detail: 'Runs unattended.' },
+  {
+    kind: 'session' as const,
+    id: '11111111-2222-4333-8444-555555555555',
+    label: 'Conversation 1',
+    detail: 'Already open — the task is typed into it.',
+  },
+  { kind: 'fresh' as const, id: '', label: 'New Claude session', detail: 'Adds a pane.' },
+]
+
+const SPEC_TASK = task({
+  id: 't-21',
+  title: 'Add the dark theme',
+  status: 'doing',
+  agent: 'developer',
+  change: 'add-dark-mode',
+})
 
 /**
  * A task with nothing in any of the three editable fields, and the reason it is a story.
@@ -537,6 +710,18 @@ export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
  */
 export type CardStoryName =
   | 'card'
+  | 'card-spec-reading'
+  | 'card-spec-failed'
+  | 'card-spec-session'
+  | 'card-spec-session-awaiting'
+  | 'card-spec-session-closed'
+  | 'card-spec-ready'
+  | 'card-spec-picking'
+  | 'card-spec-accepting'
+  | 'card-spec-archive-only'
+  | 'card-spec-archived'
+  | 'card-spec-archived-session'
+  | 'card-propose'
   | 'card-bare'
   | 'card-with-live-run'
   | 'card-editing-title'
@@ -545,6 +730,8 @@ export type CardStoryName =
   | 'card-editing-body'
   | 'card-delete-armed'
   | 'card-markdown'
+  | 'card-linked'
+  | 'card-link-adding'
 
 export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
   /*
@@ -552,6 +739,227 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
    * the same scrambled `COMMENTS` the panel has always been asked to print straight.
    */
   card: card({ task: T14 }),
+
+  /*
+   * ------------------------------------------------------------- the change, before it is read
+   *
+   * A task linked to an OpenSpec change, with the read still in flight.
+   *
+   * This is a *state*, and it was drawn as an absence. Reading a change is four `openspec`
+   * invocations and every one is a node process — six tenths of a second now that they run at
+   * once, two and a half before — and for all of it the card drew nothing where the block would
+   * be. A task with a change therefore opened looking exactly like a task without one, with
+   * nothing on screen saying OpenSpec was being read, and then grew a whole section.
+   *
+   * `card-spec-failed` is its pair, and the pair is the point: `spec === null` on its own means
+   * *still reading*, and the same value with a problem means *the read finished and there is
+   * nothing*. Collapsing them is a spinner that never stops.
+   */
+  'card-spec-reading': card({ task: SPEC_TASK, spec: null }),
+
+  'card-spec-failed': card({
+    task: SPEC_TASK,
+    spec: null,
+    specProblem: 'add-dark-mode could not be read. It may have been archived.',
+  }),
+
+  /*
+   * The read finished and there is a change. (M28)
+   *
+   * The story the two above were missing, and its absence is why a regression shipped: with no
+   * fixture that ever carried a *loaded* spec, nothing in the suite had rendered the dispatch
+   * bar at all, so a card that drew everything except its most consequential control passed
+   * every check.
+   */
+  'card-spec-ready': card({
+    task: SPEC_TASK,
+    spec: SPEC_CARD,
+    dispatchTargets: TARGETS,
+    dispatchOpen: false,
+  }),
+
+  /*
+   * ------------------------------------------------- handed to a conversation, three states
+   *
+   * `Task::session` is a **record of where the work went** and survives the pane closing, so
+   * whether a conversation is still open is a fact about the workspace tree looked up at render.
+   * Three states and not two, `validityLabel`'s rule: *closed* is not a quieter shade of *not
+   * waiting* — it is work with nowhere to continue, and it is the only one of the three that
+   * names a next step.
+   */
+  'card-spec-session': card({
+    task: { ...SPEC_TASK, session: '11111111-2222-4333-8444-555555555555' },
+    spec: SPEC_CARD_SESSION,
+    dispatchTargets: TARGETS,
+    dispatchOpen: false,
+  }),
+
+  'card-spec-session-awaiting': card({
+    task: { ...SPEC_TASK, session: '11111111-2222-4333-8444-555555555555' },
+    spec: { ...SPEC_CARD_SESSION, session: { ...SPEC_CARD_SESSION.session, awaiting: true } },
+    dispatchTargets: TARGETS,
+    dispatchOpen: false,
+  }),
+
+  'card-spec-session-closed': card({
+    task: { ...SPEC_TASK, session: '11111111-2222-4333-8444-555555555555' },
+    spec: { ...SPEC_CARD_SESSION, session: { ...SPEC_CARD_SESSION.session, open: false } },
+    dispatchTargets: TARGETS,
+    dispatchOpen: false,
+  }),
+
+  /* The picker open, which is what Approve does rather than assigning on the spot. */
+  'card-spec-picking': card({
+    task: SPEC_TASK,
+    spec: SPEC_CARD,
+    dispatchTargets: TARGETS,
+    dispatchOpen: true,
+  }),
+
+  /*
+   * The accept, mid-flight. (M28)
+   *
+   * `Integrate & Archive` merges the agent's branch, runs `openspec archive`, re-validates and
+   * closes the task — and it shipped drawing **nothing** while all of that ran, so a card that
+   * had taken the press was indistinguishable from one that had not. This story is the spinner
+   * and the present participle, and the button inert so a second press cannot start a second
+   * merge.
+   */
+  'card-spec-accepting': card({
+    task: SPEC_TASK,
+    spec: {
+      ...SPEC_CARD,
+      done: 9,
+      action: {
+        id: 'accept' as const,
+        label: 'Integrate & Archive',
+        hint: "Merges the agent's branch, then merges these requirement edits into openspec/specs/ and closes the task.",
+        enabled: true,
+        reason: '',
+      },
+    },
+    specBusy: true,
+  }),
+
+  /*
+   * The accept over work that is already on the user's own branch. (M31)
+   *
+   * The pair with `card-spec-accepting`, and the whole of what this story asserts is the two
+   * words the button does **not** say. A task handed to a Claude conversation carries no role —
+   * `TaskEdit::SetSession` clears `Task::agent` — so `plan_accept` finds no `cide/<role>-<task>`
+   * and `spec_accept` merges nothing: the press is a plain archive. The card nonetheless read
+   * *Integrate & Archive*, over a conversation that had spent the afternoon committing every
+   * batch of its work onto the branch the user was standing on. It named a step it would not
+   * take, and the reader's conclusion was the correct one: there is nothing to integrate.
+   *
+   * The session row rather than `SPEC_CARD`'s null one, because that is the shape this arises
+   * in — and it is what makes the story legible as *the work is over there, and it is already
+   * yours* rather than as an arbitrary relabelling.
+   */
+  'card-spec-archive-only': card({
+    task: { ...SPEC_TASK, agent: null, session: '11111111-2222-4333-8444-555555555555' },
+    spec: {
+      ...SPEC_CARD_SESSION,
+      done: 9,
+      action: {
+        id: 'accept' as const,
+        label: 'Archive',
+        hint: 'Merges these requirement edits into openspec/specs/ and closes the task. This work was done in your own checkout, so there is no branch to merge.',
+        enabled: true,
+        reason: '',
+      },
+    },
+  }),
+
+  /*
+   * The change after it was accepted. (M28)
+   *
+   * The card said *"add-dark-mode could not be read. It may have been archived."* here, from the
+   * moment the work landed onwards — because `openspec archive` moves the directory and no CLI
+   * command reads the result, so the task that did the work lost its record at exactly the point
+   * the record was worth keeping.
+   *
+   * cide reads the directory itself now, and the story is as much about what is **not** drawn as
+   * what is: the three fields an archive cannot answer come back `0/0` and vacuously valid, which
+   * rendered naively is an empty progress bar and a green *Valid* over finished, merged work. So
+   * there is no bar, the badge reads `Archived`, and the summary line names the directory.
+   */
+  'card-spec-archived': card({
+    task: { ...SPEC_TASK, status: 'done' },
+    spec: {
+      ...SPEC_CARD,
+      done: 0,
+      total: 0,
+      tasks: [],
+      valid: true,
+      issues: 0,
+      archived: '2026-08-27-add-dark-mode',
+      action: {
+        id: 'none' as const,
+        label: '',
+        hint: 'Archived as openspec/changes/archive/2026-08-27-add-dark-mode/. Its requirements are in openspec/specs/ now.',
+        enabled: false,
+        reason: 'this change has been archived',
+      },
+    },
+  }),
+
+  /*
+   * An archived change whose work went to a conversation. (M31)
+   *
+   * The story the archive arm was missing, and its absence is exactly why a regression shipped:
+   * `card-spec-archived` is built on `SPEC_CARD`, whose `session` is `null`, so nothing in the
+   * suite had ever drawn the session row and the archive line together. What the user saw was
+   * both at once —
+   *
+   *     Archived
+   *     archived as 2026-08-27-add-todo-list
+   *     Working                       Conversation a7d4fd80   Resume  Open  Hand it elsewhere
+   *     It is working. The checklist above ticks as it goes.
+   *
+   * — a live-work claim under the card's own *Archived* line, a sentence about a checklist this
+   * arm deliberately draws no bar for, and two controls that dispatch against a change directory
+   * `openspec archive` has moved. `primaryAction` had refused this arm since M28; the row was
+   * the second door onto the same gesture and had none of that reasoning.
+   *
+   * The pair with `card-spec-session` is the claim, and it has to be a pair: the *same* open,
+   * not-awaiting conversation reads `Working` there and `Did this work` here, so the assertion
+   * is about the archive and cannot pass by the row having gone quiet for some other reason.
+   */
+  'card-spec-archived-session': card({
+    task: { ...SPEC_TASK, status: 'done', session: '11111111-2222-4333-8444-555555555555' },
+    spec: {
+      ...SPEC_CARD_SESSION,
+      done: 0,
+      total: 0,
+      tasks: [],
+      valid: true,
+      issues: 0,
+      archived: '2026-08-27-add-dark-mode',
+      action: {
+        id: 'none' as const,
+        label: '',
+        hint: 'Archived as openspec/changes/archive/2026-08-27-add-dark-mode/. Its requirements are in openspec/specs/ now.',
+        enabled: false,
+        reason: 'this change has been archived',
+      },
+    },
+    dispatchTargets: TARGETS,
+  }),
+
+  /*
+   * A task with no change, on a project that *could* have one. (M28)
+   *
+   * The replacement for the compose dialog's *New change from this task*, which called
+   * `spec_propose` and scaffolded a stub — no deltas, no checklist — so the task was born linked
+   * to a change `openspec validate` refuses. Writing a proposal needs the codebase, so it is a
+   * conversation's job; this button starts one on it.
+   *
+   * The pair that matters is this story against `card`, which passes no handler and must draw no
+   * such button: a project with no `openspec/`, or with no propose command installed, sees the
+   * card exactly as it was before M28.
+   */
+  'card-propose': card({ task: T14, onProposeChange: () => {} }),
 
   /* No title, no body, nobody assigned. Three placeholders, three rows, nothing collapsed. */
   'card-bare': card({ task: BARE }),
@@ -600,6 +1008,29 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
    * sequence anywhere it is meant to survive as prose.
    */
   'card-markdown': card({ task: RICH }),
+
+  /*
+   * The Links section, at rest. (M30) Five chips: three outgoing (one of them dangling and
+   * marked), and two derived incoming readings — `Blocks t-41` from the other task's own
+   * stored edge, plus nothing for `related` because `t-17` stores no edge back. The removes:
+   * the outgoing chips and the related pair carry an ✕; the derived directed chip does not,
+   * because that edge belongs to the other task and the chip is the road there.
+   */
+  'card-linked': card({
+    task: LINKED,
+    links: LINK_CHIPS,
+    linkTargets: LINK_TARGETS,
+    ...LINK_HANDLERS,
+  }),
+
+  /* The same card with the add picker open: kind and target selects, and the gated Add. */
+  'card-link-adding': card({
+    task: LINKED,
+    links: LINK_CHIPS,
+    linkTargets: LINK_TARGETS,
+    linkAdd: { kind: 'blockedBy' },
+    ...LINK_HANDLERS,
+  }),
 }
 
 /**
@@ -627,6 +1058,7 @@ export type ComposeStoryName =
   | 'compose-filled'
   | 'compose-busy'
   | 'compose-no-roles'
+  | 'compose-linking'
 
 /** A draft with something in every field, including a status that is not the default. */
 const FILLED_DRAFT: TaskDraft = {
@@ -634,6 +1066,8 @@ const FILLED_DRAFT: TaskDraft = {
   status: 'doing',
   assignee: 'qa',
   body: 'The filter rejects dot-prefixed components before any gitignore matcher runs.',
+  change: '',
+  links: [],
 }
 
 export const COMPOSE_STORIES: Record<ComposeStoryName, TaskComposeProps> = {
@@ -651,6 +1085,22 @@ export const COMPOSE_STORIES: Record<ComposeStoryName, TaskComposeProps> = {
     roles: {},
     assigneeHint: assigneeHint('disabled'),
   }),
+
+  /*
+   * The links row, drawn and holding one picked edge. (M30) The row exists only because the
+   * `tasks` prop is present — `compose-empty` and `compose-filled` pass none, which is the
+   * pre-M30 digest claim, the `changes` row's own arrangement — and the picked link renders as
+   * a chip with its remove beside it, above the two selects ready for the next pick.
+   */
+  'compose-linking': compose(
+    { ...FILLED_DRAFT, links: [{ kind: 'blockedBy', target: 't-14' }] },
+    {
+      tasks: [
+        { id: 't-14', title: 'Add the retry bar', status: 'doing' },
+        { id: 't-16', title: 'Write check-agents', status: 'todo' },
+      ],
+    },
+  ),
 }
 
 /**
@@ -681,5 +1131,31 @@ export const MENTION_STORIES: Record<
     options: mentionOptions(MENTION_ROLES, 'dev'),
     selected: 0,
     listboxId: 'mention-story-filtered',
+  },
+}
+
+/**
+ * The link-target popup's named states — `LinkTargetList`, which is the half `LinkTargetInput`
+ * only ever opens from DOM events a server render cannot fire. (M30) `MENTION_STORIES`'
+ * arrangement, and the options come through the real `linkTargetOptions`, so the tier order on
+ * screen is the tier order the model produces.
+ */
+export type LinkTargetStoryName = 'link-target-open' | 'link-target-filtered'
+
+export const LINK_TARGET_STORIES: Record<
+  LinkTargetStoryName,
+  { options: readonly LinkTargetOption[]; selected: number; listboxId: string }
+> = {
+  /* The empty query: the whole board in panel order, second row highlighted. */
+  'link-target-open': {
+    options: linkTargetOptions('', LINK_TARGETS),
+    selected: 1,
+    listboxId: 'link-target-story-open',
+  },
+  /* A query that reaches by the summary — `retry` finds t-14 by its title. */
+  'link-target-filtered': {
+    options: linkTargetOptions('retry', LINK_TARGETS),
+    selected: 0,
+    listboxId: 'link-target-story-filtered',
   },
 }

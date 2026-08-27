@@ -932,6 +932,101 @@ tab strip's right-click menu: a menu item that cannot be honestly disabled — t
 webview — and that silently does nothing is the surface where silence is worst, so the two routes
 are the chord and the palette.
 
+## Moving a pane between rows and columns (M31), and what is not verified
+
+**A pane's position was decided once, when it was made, and could never be changed.**
+`pane_split` and `pane_add_row` put a *new* pane somewhere, `pane_close` took one away, and a
+divider drag changed how much room a pane had but never which row it was in. Splitting the wrong
+way round meant closing the pane and making another one — which ends the session it was holding.
+
+Two gestures now move one:
+
+| gesture | what it does |
+| --- | --- |
+| the **grab handle** in a terminal pane's corner cluster | press and drag; every other pane lights a band on the edge the drop would land on, release to move it there |
+| **Ctrl+Alt+Shift+H/L/K/J** | move the focused pane past its neighbour to the left / right / up / down |
+
+Both run one domain operation, `layout::move_pane`, and it is a real move rather than the swap
+that was already in the tree. `layout::swap` exchanges two leaves' positions; it cannot take a
+pane out of one row and put it in another, and it cannot collapse anything. It remains, and
+remains unused.
+
+**The row a pane leaves collapses, and gives its space back in proportion.** `move_pane`'s
+removal is `close`'s, not `take_pane`'s: `removal_plan` is read before the surgery and written
+after it, so four equal tiles minus one is three equal thirds rather than 50/25/25 with the
+shape of the binary tree — invisible to the user — deciding which neighbour got the lot. Take
+the last member out of a row and the row itself goes, its height spread over the rows that
+remain. At the destination the pane is a newcomer and gets `1 / (n + 1)`, which is what a split
+there would have given it.
+
+**The whole operation runs on a clone and commits only on success**, and that is not defensive
+tidiness. The destination's legality is only decidable *after* the removal — reordering a tile
+inside a full ten-tile row takes it to nine and back, so a pre-flight count against the tree as
+it stands would refuse the one gesture a full row most needs. Doing the removal first puts the
+pane in `lift`'s return value, off the tree, where a refusal from `add_tile` would drop it on
+the floor: a live session with no leaf and no `panes` entry pointing at it. Committing a clone
+makes every refusal leave the tree bit for bit as it was, which is what
+`a_refused_move_leaves_the_tree_bit_for_bit_untouched` asserts.
+
+**The console's primary pane can be moved, and still cannot be closed or detached.** This is the
+one invariant M31 relaxes, and the argument is narrow: `take_pane`'s refusal is about a pane
+*leaving the tree* — its own note names the failure, a console tab holding no `Primary` for as
+long as a detached window is open, permanently if the re-dock anchor goes stale. A move never
+takes the pane out, so the leaf set at the end is the leaf set at the start and
+`validate_console` holds throughout rather than being re-checked afterwards. `take_pane` is now
+a role check in front of a private `lift`, so there is still exactly one removal path and
+`close` is still `take_pane` rather than something kept in agreement with it.
+
+**`pane.move.*` is `terminalFocused`, not `paneFocused`**, because the handle is drawn on claude
+and shell panes only — one flag keeps the chord and the button describing the same gesture. An
+editor or diff pane keeps the four-button cluster and cannot be picked up; it is still a
+perfectly good *drop target*, so a terminal can be moved next to one.
+
+**All four directions join the neighbour's row**, including up and down. Minting a full-width
+row instead was the alternative and it loses on the case that matters: in a 2x2, moving the
+bottom-left pane up would give three rows and promote its former row-mate to a full-width row of
+its own, as a side effect of a keystroke aimed at another pane. Joining lands the pane at the
+horizontal position it already had, and it is the only reading that can *reduce* the row count.
+A new full-width row is still reachable — the drag's top and bottom bands, and
+`pane.split.down`. At the edge of the tree the move is a no-op: `layout::navigate` answers
+nothing there, and a move that wrapped would cycle a layout for ever with no fixed point.
+
+**`Ctrl+Alt+Shift+H/L/K/J` and not the arrows**, which read better and are both spent.
+`Shift+Alt+Arrow` is banked by the note on `alt+left` — *"a different stroke, so select-syntax
+and move-line survive untouched"* — and taking it here would make that sentence false.
+`Ctrl+Alt+Shift+Left/Right` are printed twice in this file as the binding a user should add for
+`navigate.back`/`forward`, so a default there would collide with advice already in the manual.
+The chords used are the `ctrl+alt+<hjkl>` focus block one modifier up.
+
+**The session survives, by construction on both sides.** `move_pane` never touches
+`Pane::session`; the pane is carried through `lift` into `add_tile` by value. In the webview the
+pane's DOM lives in a module-level map outside React and `PaneSlot` *parks* it on unmount rather
+than removing it, so the terminal, its scrollback and its child come back attached.
+
+**Not verified.** *Nothing in this repo can move a pointer*, so the drag gesture itself — the
+threshold, the capture, the band that follows the cursor, the drop — has never been executed by
+a test and has not been confirmed on screen. What is covered is everything either side of it:
+`check:pane-move` compiles `layout/paneMove.ts` alone and drives every decision it makes
+(the four bands by normalised distance, the edge-to-axis mapping, and the no-op drop that stops
+a tile being "moved" onto the edge it already borders), then greps the hook for the properties
+no test can execute — that it uses pointer events and never HTML5 drag-and-drop, that its
+hit test is rooted at the active tab's `[data-audit="paneTree"]`, and that every exit path
+detaches its listeners. That last one matters more than it looks: an Escaped drag never sees a
+`pointerup`, so a teardown hung off that event alone leaks the whole state machine.
+
+The **tab-scoping** of the hit test is the bug that was found by reasoning and not by a test, and
+it would have shipped silently: `TabContent` lays every tab out at full size and hides the
+inactive ones with `visibility: hidden` — never `display: none`, which zeroes the measurements
+xterm reads — so an unscoped `querySelectorAll('[data-pane-id]')` collects the panes of every
+open tab at real, overlapping coordinates, and a drop would land in a tab the user cannot see.
+
+Also unverified: that a moved pane's terminal comes back **painting**. A move re-parents the
+pane into a different chain grid, and a chain root's `SplitId` changes when `prune` collapses
+it, so React unmounts and remounts the slots of the affected rows — the park-and-re-adopt path a
+project switch already takes, and the path the frozen-pane class `check:render-stall` exists
+for. It should be a park rather than a release, and the watchdog in `layout/paneHosts.ts` should
+catch it if it is not, but neither claim has been watched happen.
+
 ## Closing a mirror pane no longer kills the conversation it was mirroring (M18)
 
 **It did, and it had since mirrors shipped.** `TerminalPane`'s mirror branch adopts the id of the
@@ -1517,9 +1612,14 @@ about whether a round trip finished, not something the backend can report. `newe
 rev-drop rule as a pure function and returns the **identical object** when it drops a snapshot, so a
 store reader does not re-render. `agentChip` has three renderings for three facts — a live run lit
 with its phase dot, an assigned role dim, nothing at all — because a chip that looked the same
-either way would say an exited agent is still working. Comments are never rendered as markup: they
-are model-authored, and rendering model-authored markup inside the IDE's own chrome is an injection
-surface bought for nothing at this width. The Agents panel's disabled state is designed rather than
+either way would say an exited agent is still working. A comment is **markdown** (M27), rendered by
+`TaskMarkdown.tsx` through the AST and React's escaping — never a `string -> HTML string` into
+`dangerouslySetInnerHTML`, which is the road the old blanket refusal was really about, and a link is
+drawn rather than followed. It parses with `softBreak: 'break'`, so a lone newline is a line: a
+comment is a message, and the markdown *preview* pane keeps CommonMark because a `.md` file is not.
+The sentence here said "never rendered as markup" for a milestone after that stopped being true, and
+so did the MCP input schema agents read — so runs were told their reports would not be formatted and
+wrote flat paragraphs. The Agents panel's disabled state is designed rather than
 defaulted, printing the full `.cide/config.json` path *before* the enable button, because a feature
 toggle that quietly adds a committed file is a surprise commit.
 
@@ -2054,6 +2154,318 @@ require cide to encode mouse reports itself, which ADR 0003 assigns to xterm. It
 VS Code `ScrollableElement` with no trackpad clamp, so raising it globally would speed up a bash
 pane's scrollback, which is not broken. `shift`+wheel is inert in a Claude pane and stays that
 way — xterm drops it in `consumeWheelEvent` before any protocol runs, confirmed at zero bytes.
+
+## Claude Code subagents as roles cide can run (M30), and what is not verified
+
+cide read role definitions from two directories — `<root>/.cide/agents/*.md` and
+`~/.config/cide/agents/*.md`. Claude Code has had its own convention for the same idea for
+longer and on far more machines:
+[`.claude/agents/`](https://code.claude.com/docs/en/sub-agents), project and user, YAML front
+matter over a markdown system prompt. A user who had already written subagents there saw none of
+them in cide's roster and could not hand one a task without copying the file and rewriting its
+front matter. M30 reads both, badges them, edits them without damaging them, and dispatches them
+by **naming** them rather than by re-deriving what they mean.
+
+**Four directories, one merge, one catalog.** `defs::scopes()` is the list, lowest precedence
+first — `~/.claude/agents` → `<root>/.claude/agents` → `~/.config/cide/agents` →
+`<root>/.cide/agents` — and `load_from` takes a slice of them instead of the two paths it used to
+take. Two rules composed: *project beats user*, which both formats already say about themselves,
+and *cide's own directory beats Claude Code's*, which this milestone had to invent and which goes
+that way because `.cide/agents/` is the only one of the four that can state how **cide** should
+run a role (`max-concurrent`, `worktree`, a harness that is not Claude). One keyed catalog rather
+than two lists, because a role's identity is its name and that name becomes a worktree directory,
+a `cide/<role>-<task>` ref, a `Task.agent` and an `@mention`; two lists keyed by name would be two
+answers to *who is `reviewer`*. Shadowing is never silent — `LoadedAgent::shadows` already
+recorded the replaced file, and a **cross-family** shadow now also raises a warning naming both
+paths, because "I edited my subagent and nothing happened" is the afternoon this costs when it is
+not said out loud.
+
+**The parser grew a dialect, not a twin.** A real subagent's front matter is real YAML: `hooks:`
+is a block mapping, `skills:` and `mcpServers:` are block sequences, and the keys are camelCase.
+cide's hand-written reader refuses nesting and block sequences *by name with a line number*, which
+is right for a format cide defined and fatal for one it did not — a subagent with a `hooks:` block
+was not degraded, it was **dropped**, because `read_definition` turns a `FrontMatterError` into a
+problem and returns `None`. So `frontmatter::parse_with` takes a `Grammar`, and exactly three
+things differ: a continuation line is appended to the previous key's raw span instead of refused,
+a key may carry capitals, and an unquoted value that opens a YAML construct is carried rather than
+rejected. Everything else — the fence, the BOM strip, the comment rule, the quoting rule, the
+duplicate-key refusal, body-is-verbatim — is one implementation, because those are the rules that
+took the arguing and a second copy would drift silently, each dialect being exercised only by
+files of its own kind.
+
+**`AgentDraft` stopped deleting what it could not read, and that reverses a paragraph this file
+used to argue at length.** The old rule was that a save re-renders from the keys cide models and
+drops the rest, on the grounds that re-emitting an unread key would be cide vouching for a line it
+does not understand. That holds for a directory cide *owns* and collapses for one it does not:
+deleting somebody's `hooks:` block because they fixed a typo in a description is not a defensible
+thing to do to a committed file in somebody else's format. Every unmodelled key now rides
+`AgentDraft::extras` — key plus **raw** value, which may be multi-line with its indentation intact
+— is written back verbatim by `render`, and is shown in the Settings dialog as an editable **Meta**
+row, because preserving text the form cannot show would make the form lie about what the file
+contains. What is still dropped is a front-matter *comment*, and a **value** cide's vocabulary
+cannot hold (`harness: bogus`, `max-concurrent: lots`): a value cide could not read is one it
+cannot vouch for. Reporting did not move with preservation — an unknown key in a `.cide/agents/`
+file is still an error or a warning against its line, now *reported and kept* rather than reported
+and deleted.
+
+**A subagent is dispatched by name.** `harness/claude.rs` asks one question — is this role's scope
+`is_claude_code()` — and four things follow. `--agent <name>` is pushed in step 4's position
+(non-variadic, so it disturbs nothing after it); the role's body is **not** folded into
+`--append-system-prompt`, because `--agent` makes it the child's system prompt outright and a
+second copy would say the brief twice; and `--model`, `--effort`, `--permission-mode` and
+`--allowedTools` all stand down, because the CLI reads them from the definition itself and a copy
+on the command line would *win* — a `permissionMode` its author wrote could be overridden by a
+value cide re-derived, and `--allowedTools` would silently drop the `disallowedTools` half cide has
+no flag for. The one survivor is the unattended-permission fallback: a subagent naming no
+`permissionMode` still gets `--permission-mode bypassPermissions` under `agents.skipPermissions`,
+for the reason it has always got it — a headless run cannot answer a prompt, and one that hits a
+prompt parks in `AwaitingPermission` holding its slot and its checkout until a human opens its pane.
+`skills`, `hooks`, `mcpServers` and `maxTurns` reach the child because the CLI applies them; cide
+has no vocabulary for any of the four and, deliberately, does not acquire one.
+
+**Discovery needs no materialising step, and that is luck worth pinning.** `--agent` resolves a
+project subagent by walking *up* from the child's working directory, and a run's cwd is
+`<root>/.cide/worktrees/<role>-<task>` — inside the project root — so the walk reaches
+`<root>/.claude/agents/` on its own. Move worktrees to a sibling or a temp directory and every
+project-scoped subagent stops resolving with **no error cide would ever see**: the run would simply
+come up as the default agent, doing plausible work under the wrong brief. `cide-git`'s
+`discovery_containment` is the test that stops that being quiet. (A *committed* `.claude/agents/`
+also appears inside the worktree at the revision the run's branch points at, and being closer it
+wins — same content, worth knowing when a stale one confuses somebody.)
+
+**Names are relaxed, creation is not, and a rename is an edit.** `valid_claude_name` drops cide's
+32-character cap and its stem-must-equal-`name:` rule, both of which are cide's alone; the
+path-safety whitelist stays whole, with `:` refused by name because it is Claude's plugin-scoping
+separator and can never be a path component. Because the stem need not agree, a Claude scope is
+addressed by declared name and the file behind it is **found** by reading the directory —
+`definition_path` composes for cide's scopes and searches for Claude's, and composing there would
+create `code-reviewer.md` beside the `reviewer-v2.md` the user opened, leaving two definitions
+claiming one name. So editing `name:` rewrites the key **in place**: no move, nothing to strand.
+Creating into `.claude/agents/` is refused with a sentence naming `/agents` and `.cide/agents/`,
+and moving a definition *between* the families is refused too — the field sets differ, so the file
+that arrived would be a translation nobody wrote.
+
+**What the panels say.** `AgentDef` gained `scope`, and a `is_claude_code()` row draws a **Claude
+Code** chip after its name. Only those two of the four are badged: a chip on every row would say
+nothing, and what a subagent's row needs to convey is a real difference in kind — no harness to
+choose, a definition applied by the CLI, a file `claude` reads outside cide entirely. Both Claude
+scopes draw the *same* mark, because which of the two matters when you go to edit it and not when
+you are reading a roster. In Settings the Harness control **disappears** for a subagent rather than
+greying — the others grey because the question is meaningful and the answer fixed; here the
+question does not exist — while Scope greys, so the row still says which file is open.
+`rowsFor`'s shadowing generalised from `scope === 'global'` to a rank table, which is the change
+that would otherwise have drawn a shadowed subagent as the one that runs.
+
+**Watching, and the two directories that are deliberately not watched.** `<root>/.claude/agents`
+joins `watched_paths` recursively — `openspec/`'s bargain, a bounded subtree of documents, and
+emphatically **not** `<root>/.claude`, which also holds transcripts and session state and would be
+a storm with no upper bound. `dotcide::classify` routes `.claude/agents/**` to `Route::Agents` and
+everything else under `.claude` to `Nothing` **by name** rather than by falling through, because a
+fall-through is one refactor away from rebuilding the roster once per assistant token. `admits`
+still says no, so nothing new appears in the file tree, in `Ctrl+Shift+F` or in the symbol walk.
+`~/.claude/agents` is not watched, exactly as `defs::global_dir()` is not: every read path re-reads
+it and `agents_save` emits.
+
+**What is not verified.** No dispatch of a Claude Code subagent has ever been run against a real
+`claude` from this tree — that needs a GUI and a person, as M18's own paragraph said of the loop it
+built. Two facts in particular are argued from the CLI's documentation and its `--help`, not
+observed. **That `--append-system-prompt` composes with `--agent`** rather than being ignored or
+replacing the agent's own prompt: cide folds its tracker paragraph in that way and a run that
+never hears about `mcp__cide__cide_task_*` is a run that reports to nobody, so this is the one
+finding that would send the design back to translating onto cide's own flags. And **that a
+project-scoped subagent resolves from a worktree cwd** — the containment is pinned by a test, the
+CLI's walk is not. One further consequence is written down rather than worked around: Claude's
+`initialPrompt:` is auto-submitted as the first turn under `--agent`, and cide types its own
+one-line opening prompt as well, so a subagent carrying one gets two turns.
+
+## Specs the agents work from: OpenSpec in cide (M28), and what is not verified
+
+M27 closed the loop and left cide running unattended agents against requirements that live only
+in a chat transcript. [OpenSpec](https://github.com/Fission-AI/OpenSpec) is the convention that
+fixes that — `openspec/specs/<capability>/spec.md` for the requirements as they stand,
+`openspec/changes/<name>/` for each piece of proposed work (a proposal, a `tasks.md` checklist,
+and delta files stating `## ADDED | MODIFIED | REMOVED | RENAMED Requirements`), and an *archive*
+step that merges a finished change's deltas into the specs. It is MIT, tool-agnostic, and read by
+thirty other editors. **cide is a frontend to it, not a fork of it**: the brand is shown, the real
+directories are named on screen, and everything a user learns here transfers to the CLI and to a
+teammate's editor.
+
+**The two systems join at one field, and nothing is mirrored.** `Task.change` names a change
+folder. OpenSpec owns content; the tracker owns orchestration — status, assignee, the dispatch
+trigger, the review conversation. `cide-ipc/src/tasks.rs`'s header rejects six proposed fields on
+the test *"a field an agent must be taught to fill and a column the panel must draw, and neither
+changes what anybody does next"*; this one changes what a dispatched run reads, what the panel
+draws, and what accepting the task does. A task without it renders exactly as it did before —
+which is asserted rather than claimed, because `check:agents-render`'s existing digests are
+unchanged.
+
+**Nothing in cide parses OpenSpec's markdown.** `cide-spec` shells out to the CLI's `--json`
+surface. ADR 0012 has the argument in full; the short version is that the grammar carries
+code-fence masking, case-folded name matching and a *schema-driven artifact set* — `config.yaml`
+picks a workflow schema whose artifacts are declared with globs, so even `tasks.md` is not a
+filename cide may assume. The one exception is the write path, which the CLI has no command for:
+`cide_spec::block` addresses a requirement as a **byte range** and the writer splices into it,
+copying every other byte, so a committed file keeps its front matter, its comments, its BOM and
+its CRLF. That is the corpus round-trip test, and it caught a real bug — a byte-order mark made
+every heading in a Windows-authored file invisible to the scanner.
+
+**cide supplies buttons; upstream supplies the prose.** `openspec init` installs its workflow
+into the project's own Claude session, so `init` runs `--tools claude` and never `--tools none`,
+and an empty board offers *Propose a change* and *Explore first* rather than a tour cide wrote —
+each typing the matching command into the pinned tab. **Which commands exist, and how they are
+invoked, is read from the project directory before anything is typed** (`cide_spec::claude`),
+because a table in cide was wrong twice. The first version offered `/opsx:onboard`, which is in
+the CLI's templates and is *not* installed by the profile `init` uses, so Claude answered
+`Unknown command` and nothing in cide could explain it. The second was the whole prefix: OpenSpec
+moved the same workflow from slash commands (`.claude/commands/opsx/`, typed `/opsx:propose`) to
+Claude Code skills (`.claude/skills/openspec-propose/`, typed `/openspec-propose`), and every
+button in the panel then refused on every correctly set up project — with a sentence recommending
+`openspec update`, which on such a project answers *"all tools up to date"* and writes nothing.
+Both surfaces are enumerated, newest first, so a project set up by an older CLI keeps working;
+the board carries the resolved line so the composer previews exactly what it sends; and the
+refusal names what is installed. The prefix was not the only thing that moved: four of the six
+commands were **renamed** with the surface (`apply` → `apply-change`, `archive` →
+`archive-change`, `sync` → `sync-specs`, `update` → `update-change`), so each row carries a
+rename table and cide's own handle is always the current name — a table that templated one handle
+into both rows answered *this project has no such command* on the older surface for exactly the
+commands a dispatch types.
+`SPEC_PREAMBLE` is six sentences of cide's own rules — tick as you go, correct an artifact when
+implementing proves it wrong, set `review` when done, **never archive** — and then names
+`openspec instructions apply --change <c> --json`, saying in as many words that its answer
+outranks the preamble. A project that installed OpenSpec's apply workflow gets one sentence more,
+naming `/openspec-apply-change` and saying it outranks that summary too; a dispatch into a *live
+conversation* types the command itself, with cide's task rules as its argument.
+
+**A conversation that was already running does not have a skill written after it started.** Claude
+Code reads a project's skills and slash commands once, at launch — so enabling OpenSpec from the
+panel wrote `.claude/skills/`, and the very next *Propose* typed `/openspec-propose` into the
+console pane that came up with the window and got `Unknown command`, with nothing anywhere saying
+why. `SessionRegistry::started` stamps every fork, `cide_spec::claude::installed_at` reads the
+command file's mtime, and `spec_run_command` refuses the send when the file is newer, naming the
+restart — which resumes the transcript, so the fix costs seconds. The same comparison is
+*advisory* on the dispatch road, which falls back to prose rather than failing.
+
+**An archived change is still readable, and the CLI cannot read it.** `openspec archive` *moves*
+the directory to `openspec/changes/archive/<YYYY-MM-DD>-<name>/`; `show` resolves
+`openspec/changes/<name>/proposal.md` and nothing else, so from the moment work was accepted the
+task that did it said *"this change could not be read; it may have been archived"* — a refusal at
+exactly the point the record is worth keeping. `cide_spec::archived_change` reads the directory:
+the deltas come back through the same byte-range scanner the write path uses, the documents come
+back as a directory listing, and `SpecOrigin::Archived` labels the answer. The **checklist and the
+verdict do not**, and that is the design: which file is the checklist is the schema's business and
+`openspec validate` cannot see a moved directory, so both are neutral and no surface draws them —
+an empty progress bar over finished, merged work, or a green *Valid* nobody ran, would each be a
+worse claim than the refusal this replaced. The date stamp is stripped **as a date** rather than
+as "anything before the last match", because `ends_with("-auth")` is true of `fix-auth` and a
+change called `auth` would otherwise be answered by somebody else's archive.
+
+**The same rule reaches the session row, which it did not at first.** *No surface draws a claim it
+cannot support* was applied to the bar and the badge and stopped there, so a task whose work had
+gone to a conversation drew, directly under its own *Archived* line, a **Working** chip, the
+sentence *"It is working. The checklist above ticks as it goes."* — beside a card that draws no
+checklist on this arm, by the paragraph above — and **Resume** and **Hand it elsewhere**, each of
+which dispatches against a change directory `openspec archive` has moved. `primaryAction` had
+refused the arm since M28; the row was the second door onto the same gesture and carried none of
+that reasoning. `sessionState` and `sessionHint` therefore ask `archived` **first** and override
+all three live states, because whether a pane still holds the conversation decides whether work can
+*continue* in it and there is none left to continue. **Open** stays, and is why the row stays at
+all: which conversation did the work is the record worth keeping, and reading it back writes
+nothing.
+
+**A task acquires a change by proposing one, never by being created with one.** The compose dialog
+offered *New change from this task*: it called `spec_propose`, which scaffolds a directory with a
+stub proposal, **no delta specs and no checklist** — a change `openspec validate` refuses and
+whose board row reads `0/0` for ever. Writing a proposal is work and needs the codebase, so the
+gesture moved to after the task exists: the card offers *Make a proposal*, `spec_propose_for_task`
+runs `/openspec-propose` in a conversation, and the line tells that conversation to link the
+change back with `cide_task_update` — cide cannot name the folder in advance, because the workflow
+chooses it. The picker now only ever links a change that is already there.
+
+**That link is also how the finished proposal gets on screen.** A conversation writing a proposal
+takes minutes, and the gesture used to end with the change existing and nothing saying so — the
+user had to notice the board row appear and open it. `spec_reveal` reads the same mutation burst
+`task_triggers` does and opens the change's tab on one transition: a task that *existed without a
+change* acquires one, written by somebody who is not the user. That is the propose road's shape
+exactly, and nothing else's — a creation naming a change is agent bookkeeping, the card's own
+control is a `User` edit made inside a modal the tab would open behind, and a task that already had
+a change reads `Some` in `before` and declines. It needs no ledger for the same reason
+`spec_triggers`' review hop needs none: unset-to-set happens once, and unlinking by hand is the only
+re-arm. Watching `openspec/changes/` for a new directory was the alternative and is wrong — it fires
+on a `git pull`, a branch switch and a checkout of somebody else's proposal.
+
+**The three CLI facts the code turns on**, each a silent bug the other way and each pinned by an
+`#[ignore]`d test against the real binary: a `--json` failure exits **0** and reports itself in a
+`status` array; root resolution **walks ancestors**, so an agent's worktree without its own
+`openspec/` would report the parent repository's progress as that run's; and a bare `init`
+**prompts**, which on a command worker is a hang rather than an error.
+
+**Finding the binary is its own problem.** `openspec` is installed by `npm -g`, into a directory a
+shell rc file puts on `PATH` and a desktop launcher never does — while `toolchain::extra_dirs`
+is `~/.cargo/bin` and `~/go/bin`, and its header forbids widening that list. So the Node rungs
+live inside `cide-spec`, and `child_env::run_filter_with` hands the chosen directory back to the
+child, because `openspec` is a `#!/usr/bin/env node` script and without it `execve` *succeeds*
+while the shebang dies with `env: node: No such file or directory`. There is no `npx` rung: it
+would download a package with nothing on screen saying so.
+
+**Split work: one change, a task tree, and a question before anything starts.** A change's page
+offered one gesture — *Start work*, which makes a single task carrying the change link. That is
+the single-agent shape, and it left the checklist a proposal already carries doing no work. The
+second button asks the project's Claude conversation to read that checklist with
+`openspec instructions apply --change <c> --json`, create a **main** task carrying the change and
+one `subtaskOf` child per coherent unit of it, look at the roster with `cide_agents_list`, say
+which role should take which piece — or, on a project with no roles, offer to write them rather
+than quietly doing the work itself — and then **stop and ask**. Nothing is dispatched by pressing
+it: the prompt says to leave every task unassigned, because `autodispatch` fires on the assignment
+edge and a helpful model filling that field in would start N subagents on a plan nobody has read.
+The line is cide's own prose and not an upstream command, since OpenSpec has no opinion about
+`.cide/tasks.json`, `subtaskOf`, or who may dispatch; the checklist is upstream's and is read as
+data. **Exactly one task may carry `change`**, and the prompt says so with its consequence
+attached, because `spec_triggers::consider_one` finds a change's task by that field and on more
+than one match moves *neither* — a split that put the change on every subtask would switch the
+finished-checklist hop off, silently, for the life of the change. cide refuses the same case at
+the command, naming the task that already tracks it. The target is unconditionally the **primary**
+session: `agent_rpc::ProjectTools::names()` serves the roster and the dispatch only to
+`Project::primary_session`, so a split typed anywhere else would reach the sentence about the
+roster and find no tool to look with.
+
+**The progress bar moves while an agent works**, which needed one hole cut in the worktree storm
+filter — `.cide/worktrees/<agent>/openspec/**` routes to the spec board and everything else in
+that checkout still routes to nothing. `dotcide::classify` takes the project root now and strips
+it first, since `openspec` is an ordinary word that can appear at `src/openspec/`; that anchoring
+also fixed a pre-existing miss where a vendored dependency's own `.cide/` fired the router.
+
+### What is not verified
+
+- **Nothing here has been driven in the real app.** Every claim above is held up by tests —
+  `cargo test -p cide-spec -- --ignored` runs eight of them against the installed CLI — and by
+  `cide-headless spec <root>`, which is the only way to see the discovery ladder answer on a
+  launch whose `PATH` is not a shell's. The panel, the card's spec block and the compose picker
+  have been type-checked, SSR-rendered and digest-asserted; they have not been clicked.
+- **The accept gesture has never run end to end.** `spec_accept` integrates and then archives, in
+  that order, and its refusal table is unit-tested — but no test drives a real merge followed by a
+  real archive, because that needs a worktree with a committed branch and a change whose deltas
+  are worth merging.
+- **Split work has never been driven in the real app.** The prompt is pinned by unit tests — one
+  line, every tool namespaced, the three rules present, a length budget — and the button by
+  `check:openspec` and `check:openspec-render`. What has not happened is somebody pressing it and
+  watching a conversation build the tree: whether the grouping it chooses is sensible, whether it
+  really leaves everything unassigned, and whether it stops to ask rather than dispatching are all
+  claims about a model's behaviour that no test here can make.
+- **The Review hop has not been observed firing.** `spec_triggers` is tested over path batches and
+  the status gate is tested in isolation; what has not happened is an agent ticking the last box
+  in a worktree and the card moving on its own.
+- **The requirement editor has not been typed into.** It exists — a pencil on each delta card
+  opens name, behaviour and per-scenario fields, with `+ Scenario` seeding the canonical shape and
+  WHEN/THEN/AND chips inserting a clause at the caret — and its model and markup are gated by
+  `check:openspec` and `check:openspec-render`. What has not happened is somebody editing a real
+  requirement in the running app and watching the file change.
+- **A scenario body is a textarea, deliberately, and that is a decision worth disagreeing with.**
+  Rigid WHEN/THEN fields would need a parser *and* a serialiser that round-trip every scenario
+  anybody ever hand-wrote; the first that did not would silently rewrite a committed file a
+  reviewer had approved. The chips teach the shape without owning it. If that trade turns out to
+  be wrong, the place to change it is `OpenSpecPanel/editModel.ts`.
+- **`--tools claude` assumes the harness.** A project whose roles all use `opencode` still gets
+  the Claude slash commands installed and nothing of its own.
 
 ## The tab strip: drag to reorder, Close to the left, and Back into a closed file (M16)
 
@@ -5668,6 +6080,196 @@ act, which is the whole reason focus moves at all.
   A CLI release that moves or renames that directory costs the submenu its labels and costs the
   feature nothing.
 
+## The `claude` behind a wrapper: attributing a connection to a pane (M29)
+
+*Send lines to Claude* refused, from a Mac, with one Claude pane open and a live conversation in
+it:
+
+> cide has no Claude bound to any pane in this project. One session is connected to the IDE
+> server, but nothing identifies which pane it belongs to — run /ide in the pane you meant to
+> send to.
+
+`/ide` did not help, and the same cide on Linux could not reproduce it. Neither fact is what it
+looks like.
+
+**The join was pid equality.** `pane_bind_session` records the pid of the process cide forked
+into the pty; the CLI announces itself over the IDE socket with `ide_connected {pid:
+process.pid}` — that is literally what it sends, `async function
+HUe(e){await e.notification({method:"ide_connected",params:{pid:process.pid}})}` — and
+`cide_ide_mcp`'s `pane_of_pid` matches the two. A *broadcast* (`selection_changed`) goes to every
+connection; an **addressed** notification (`at_mentioned`, which is what this gesture is) goes
+only to a connection the map claims. So the whole feature rests on the process cide forked being
+the process that opened the socket.
+
+On the reporting machine `claude` is a **wrapper** — `some/path/bbin agent claude` — that spawns
+the real CLI rather than `exec`ing it. cide holds the wrapper's pid, the CLI announces its own,
+and the join finds nothing. On the Linux box the same user's `~/.local/bin/claude` is a symlink
+straight to the executable: one `execve`, one process, pids equal, feature works. Nothing in this
+path is `cfg`-gated and the platform was never the variable — the *shape of the install* was.
+The same failure has been in the code for shell panes since it was written, and
+`cide_ide_mcp::server` says so in its own notes: a `claude` typed into a cide shell is a
+grandchild of `$SHELL` and received no addressed notification, ever.
+
+**The fix is an ancestry walk.** `cide_core::proc::owning_ancestor` climbs from the announced pid
+and stops at the first pid this project has a pane for; `ide::resolve_unbound_connections` asks
+the server which connections nothing claims (`unbound_pids`) and binds what it finds. Nearest
+owned ancestor wins, which is what makes a `claude` inside a shell pane belong to the shell pane
+and not to whatever pane is above it. A chain with **no** owned ancestor is left unattributed
+rather than guessed at, so somebody's `claude` in a Terminal window that found this project's
+lockfile is exactly as unaddressable as it was before.
+
+It runs twice, and the second time is not belt-and-braces: on `Connected`, and again in
+`claude_send_lines` before it concludes a send has nowhere to go. The pane binding is a workspace
+mutation the *frontend* makes after a spawn resolves, so a connection that beats it would find
+nothing to match against — a feature whose correctness depends on the order of two independent
+round trips is a feature that works on the machine it was written on.
+
+### What is verified, and what is not
+
+- **Every rule that can be got wrong is pure and runs on any host** (`cargo test -p cide-core
+  proc`): nearest owned ancestor wins, the hop cap, stopping at `init`, refusing a cycle, and an
+  unowned chain answering nothing. The walk takes its parent lookup as a closure precisely so
+  that those are testable without a process tree.
+- **The routing half is driven over a real socket** (`cargo test -p cide-ide-mcp`): a connection
+  announcing a pid nothing bound is reported by `unbound_pids`, is not addressable, and becomes
+  addressable when bound — which is the whole of the reported bug and its fix, from the server's
+  side.
+- **The Linux `parent_of_pid` is checked against `getppid(2)`**, and the derived-binding
+  bookkeeping — reaping the wrapper must forget the CLI it spawned, because `report_exit` has
+  never heard of that pid — has its own test in `cide-app`.
+- **The macOS arm has never run.** It is `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`, and the only
+  thing said about it from here is that it compiles, via the Darwin type-check in
+  *Type-checking for macOS from Linux* below. That check earned its place immediately: the first
+  version used `sysctl(KERN_PROC_PID)` and `libc` defines no `kinfo_proc` for Apple at all, so it
+  was a hard error on a platform no machine here can build.
+- **A `claude` in a shell pane is now *attributed*, and is still not a mention *target*.** The
+  ancestry walk answers "which pane is this process running in", which is what diff credit and
+  the routing table want. Which panes an `@`-mention may be *sent* to is a different decision,
+  `cmd::file::mention_candidates` makes it, and it offers Claude panes only — unchanged here on
+  purpose, because widening it is a feature and not a bug fix.
+- **Nothing has been observed end to end on the reporting machine.** What should be visible there
+  is a log line — *attributed a claude to a pane through its ancestry* — naming the pane, the
+  announced pid and the pid it was derived from; and where it still fails, the warning that
+  replaces it prints the chain it walked and the children the project has, which is the sentence
+  a report of this error was missing.
+
+## Typed links between tasks: related, blocked-by, subtask-of (M30), and what is not verified
+
+Tasks referenced each other only in prose — a `t-14` quoted in a comment, which is what short
+ids exist for and which nothing could act on. M30 makes the edge a field: `Task::links`, three
+kinds, each stored **once on its canonical side** (`blockedBy` on the blocked task, `subtaskOf`
+on the child, `related` on whichever end made the gesture) with the other reading derived from
+the board at render. `cide-ipc/src/tasks.rs`'s module header used to cut `blocked_by` and
+parent/child by name; the header now carries the reversal, and the argument is one sentence:
+**`blockedBy` is not advisory** — auto-dispatch skips a task whose blockers are not done
+(`autodispatch::trigger`'s new early return, table-tested), and an explicit dispatch of one is
+refused in `plan_dispatch`, the single funnel the panel's button, `cide_agent_dispatch` and
+auto-dispatch all pass through, with the blockers named in the sentence. `Done` alone
+satisfies; `Review` still blocks, because review work can bounce back to `Doing`.
+
+The pieces, each with its gate:
+
+- **The wire**: `LinkType`, `TaskLink` (tombstone + stamp), `TaskLinkSpec`, `TaskEdit::{Link,
+  Unlink}`, `TaskNew::links` — additive, `#[serde(default)]`, no schema bump; a pre-M30 file
+  parses byte-identically (`cargo test -p cide-ipc`).
+- **The store**: per-edge merge (`union_links` — newer stamp wins per `(link, target)` key, so
+  an unlink survives a merge whose *scalars* the stale side wins, and a re-link reverses an
+  unlink because the tombstone is a toggle, not the comments' one-way flag); self-links and
+  duplicates refused in `validate`; **dangling targets and cycles deliberately legal in the
+  file** and refused only as gestures — `validate`'s doc carries both arguments, and
+  `a_merged_or_hand_edited_cycle_does_not_freeze_the_tracker` is the invariant as a test.
+  `repair` re-points link targets through its re-mint map, which its old doc said was
+  impossible for references — true of prose, false of fields, and rewritten to say so.
+- **The MCP surface**: `cide_task_link`/`cide_task_unlink`, in `tool::ALL` — a run decomposing
+  work records edges; the author gate and the dispatch preflight are the boundary, not the
+  vocabulary split. `cide_task_list` carries the blocking pair both ways (`blocked by t-3` /
+  `blocks t-7`), `cide_task_get` a full `links:` block with targets resolved and dangling
+  marked `(deleted)`; a task without links renders byte-identically to M29
+  (`cargo test -p cide-agents`).
+- **The panel**: a Links *section* on the card — chips that navigate, ✕ on the edges the card
+  may write, and a picker whose target is a **search input**: id-prefix first, then title
+  word-prefix, then substrings (`model.ts::linkTargetOptions`, the mention popup's tier idea),
+  with picking a row as the commit — and the same search in the compose dialog's links row,
+  because a create
+  naming an assignee dispatches immediately and a `blockedBy` attached one call later is a gate
+  the trigger never saw. `TASK_FIELDS` stands at four with the argument written beside it;
+  `check:agents` pins `LINK_KINDS` to `pub enum LinkType` and drives the derivation;
+  `check:agents-render`'s new stories assert the chips, the derived direction, the gone mark,
+  and that every pre-M30 digest is unchanged.
+
+What is **not** verified:
+
+- **Nothing has been driven through the GUI.** The whole loop — link `blockedBy` on the card,
+  watch the assignment record intent instead of dispatching, see the refusal sentence from an
+  explicit dispatch, mark the blocker done, re-assign and watch the run start — has run only as
+  unit tests either side of the seam. `./run.sh` and two tasks reproduce it in a minute.
+- **Two writers toggling one edge inside clock skew** resolve by wall clock (`union_links`'s
+  stated cost); the merge tests pin the rule, not the skew.
+- The `#[ignore]`d spawn tests have not been re-run — links change no spawn path, but the
+  preamble a dispatched run reads now includes link lines nothing live has read yet.
+
+## The orchestrator can define a role: `cide_agent_create`/`cide_agent_update` (M33), and what is not verified
+
+The product owner could hand work to a role and could not make one. The paragraph
+`cmd::session` puts in its system prompt said to write `.cide/agents/<name>.md` with ordinary
+file tools, which is true and is how it was done — and it is a grammar nobody can see from
+outside: a definition that spells `max_concurrent` with an underscore, or names a
+`permission-mode` from another CLI's vocabulary, loads, is greyed by `read_definition`, and is
+never dispatched. The model finds out from a dispatch that refuses, or does not find out.
+
+Two tools, in `tool::ORCHESTRATION` — so the product owner's session has them and a dispatched
+run never sees them, which is the same structural split `agent_rpc` already draws for dispatch.
+Both go through `cide_agents::defs::validate` and `defs::save`, the writer the Agents panel's
+form uses, so `AgentDraftProblem`'s field lands in the sentence: *`systemPrompt`: a role needs a
+system prompt…*, and **nothing is written**.
+
+- **`cide_agent_create`** takes a name, a description and a system prompt, plus the eight
+  optional keys, and writes `.cide/agents/<name>.md`. `original: None` is what makes it a
+  create rather than a rename, so a name a file already holds is refused rather than
+  overwritten — the file it would replace is somebody's system prompt.
+- **`cide_agent_update`** is a **patch**: `AgentSink::definition` reads the draft, `Field<T>`
+  folds each argument onto it (absent keeps, `null` clears, a value replaces), and everything
+  the caller did not name — the prompt above all, and a subagent's unmodelled `hooks:` block —
+  comes through untouched. A serde struct of `Option<T>` would have collapsed *absent* and
+  *null* and silently cleared every field a caller did not mention.
+
+Four narrowings are decisions rather than gaps, each with the argument in `tools.rs`'s header or
+beside the refusal: **a create is always the project scope** (a global role is the user's *other*
+projects, changed by a model, in a directory no review looks at — `cide_agent_update` does take a
+scope, because editing what exists is bounded by what is there); **no rename** (the name is what
+every assignee, every `cide/<role>-<task>` branch and every worktree is keyed on, and `name` on
+an update is refused rather than ignored, because a dropped one is a rename the caller believes
+happened); **no `cide_agent_delete`**, for `cide_task_delete`'s reason one turn further; and
+**`harness` is refused on a Claude Code subagent**, the one modelled key that is not in that
+dialect (`defs::canonical_key`'s single `!claude` arm), because written there it is a line
+nothing reads, in a file cide does not own, preserved for ever as an extra.
+
+`cide_agents_list` now prints the **scope** beside every role rather than marking only the two
+Claude ones, because that word is `cide_agent_update`'s `scope` argument and a roster that named
+half of them would leave a model guessing at the other half. An update with no scope resolves to
+the definition *in effect* — the roster's row, so a project file shadowing a global one is the one
+that gets edited — and every answer names the path it wrote.
+
+What is **not** verified:
+
+- **No MCP client has called either of them.** Every refusal, every patch and the whole
+  create → load → update road run as unit tests, the last against a real directory
+  (`a_role_written_by_a_tool_is_a_role_the_loader_runs`, which asserts through
+  `defs::load` rather than through the writer). What has not run is the socket: a `claude`
+  calling `mcp__cide__cide_agent_create` and then dispatching what it just defined.
+- **`RegistrySink::write_definition` goes through `cmd::agents::agents_save`** — for the
+  emission, since `$XDG_CONFIG_HOME/cide/agents/` is watched by nothing and a global role would
+  otherwise never appear in an open window. It is `dispatch`'s and `stop`'s shape (`block_on`
+  into an async command that awaits `blocking`), which is proven in production, but this
+  particular call has not been run live.
+- **The system prompt is written blind.** No tool in the vocabulary shows a caller the prompt a
+  role currently has — `AgentDef` carries it and `cide_agents_list` deliberately does not print
+  it — so `systemPrompt` on an update replaces bytes the model may never have read. The
+  description says so, the answer echoes the line count and the opening line back, and the
+  honest fix is a read the vocabulary does not have.
+- Nothing has been driven through the **GUI**: a role written by the orchestrator appearing in
+  the Agents panel of a second window is the emission path above, unobserved.
+
 ## Opening a file a pane printed, including one outside the project
 
 Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the
@@ -6742,15 +7344,27 @@ nobody typed landing under a dirty buffer". So the user's only route was to leav
 run the formatter in a shell pane and click back — which is exactly the sequence those guards
 exist to survive.
 
-**Two roads behind one command id**, resolved in `cmd::format::run`:
+**Three roads behind one command id** (two in M26, the third in M32), resolved in
+`cmd::format::run`:
 
 - **The language server.** `textDocument/formatting`, which *is* rustfmt against rust-analyzer
   and *is* gofmt against gopls. Both are bundled since M25/M26, so **Rust and Go format out of
   the box with nothing installed**. It also comes free for any server an extension contributes.
-- **A user-configured filter**, for the nine builtin languages with no server — TypeScript,
-  JSON, YAML, TOML, Markdown, Python, shell, SQL, clike. Settings → Editor → Formatters, keyed
+- **A user-configured filter**, for the builtin languages with no server — TypeScript, YAML,
+  TOML, Markdown, Python, shell, SQL, clike. Settings → Editor → Formatters, keyed
   by language id, and a row **wins** over the server: it is the only lever over a formatter cide
   chose, short of switching the whole server to System, which is a far larger hammer.
+- **cide's own JSON reprinter** (M32, `cide_core::format::json`), the floor beneath both:
+  reached only when no row exists *and* no registered server claims the language — gated on
+  the claim, never on the server's answer, so a future JSON server extension takes over by
+  being installed and a server failure never silently swaps formatters. It is a token-level
+  reprinter, not a serde round-trip, under one invariant asserted over the whole test corpus:
+  `lex(output) == lex(input)` — only whitespace moves. That is what lets it format the files
+  the `json` id actually claims (`.jsonc` included): comments stay where they were said,
+  duplicate keys, `9007199254740993` and trailing commas survive byte for byte, and a
+  JSON-Lines file is refused rather than reflowed into one broken document. Broken JSON is
+  refused with a line/column sentence; indentation follows the editor's own
+  `tab_size`/`insert_spaces`.
 
 A formatter is a **`Vec<String>`, one box per argument, never a command line** — the rule
 `ClaudeCli::args` already states and for its reason: a single string needs a quoting parser cide
@@ -6761,7 +7375,7 @@ stdout — which is the only shape that can format an *unsaved* buffer, and a to
 in place and prints nothing (`cargo fmt` itself, the first thing anyone tries) is refused by
 name rather than allowed to empty the buffer.
 
-**Nothing is ever written to disk.** Both roads return text, the buffer takes a transaction, the
+**Nothing is ever written to disk.** Every road returns text, the buffer takes a transaction, the
 tab goes dirty like any other edit, and Ctrl+S is unchanged.
 
 **The four rules that make it not corrupt anything**, each silent if dropped:

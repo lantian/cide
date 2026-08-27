@@ -708,6 +708,21 @@ function viewFor(kind: TabKind): TabView {
         audit: undefined,
       }
 
+    case 'openSpec':
+      return {
+        // Settings' shape, for the reason the extension arm above gives: both are pages *about*
+        // something rather than documents in the project, and a fourth shape for one more
+        // non-document tab would be a shape nobody can name. The caption carries the difference.
+        shape: styles.shapeSettings,
+        // The bare id — `add-dark-mode` — because that is what the user typed, what the
+        // directory is called and what every other tool that reads this folder calls it.
+        body: <span>{kind.subject.kind === 'change' ? kind.subject.change : kind.subject.spec}</span>,
+        closable: true,
+        dirty: false,
+        hint: kind.subject.kind === 'change' ? 'OpenSpec change' : 'OpenSpec capability',
+        audit: undefined,
+      }
+
     default:
       return unhandled(kind)
   }

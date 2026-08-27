@@ -59,6 +59,28 @@ pub struct AgentDef {
     /// What the row says. Title-cased from the id unless the file gives one, so a roster is
     /// readable before anybody has thought about presentation.
     pub label: String,
+    /// Which of the four directories this definition was read from. (M30)
+    ///
+    /// # Why a roster row carries it when `origin`/`shadows` deliberately do not
+    ///
+    /// `LoadedAgent`'s doc has flagged for two milestones that the panel genuinely wants those
+    /// two paths and that adding them "would be a reasonable addition to `AgentDef` when someone
+    /// is next in there". This is the half that earned its way across, and a *path* is still not
+    /// what crosses: a scope is a closed enum the frontend can switch on, where a path is a
+    /// string it would have to parse to learn anything.
+    ///
+    /// What reads it is the roster's badge: a [`AgentScope::is_claude_code`] role is drawn
+    /// **Claude Code**, because a definition cide did not author, cannot fully model, and applies
+    /// through `--agent` rather than through its own flags is a fact the user has to be able to
+    /// see without opening anything.
+    ///
+    /// **It does not replace the Settings screen's per-scope probing**, and that is worth saying
+    /// because it looks as though it should. That screen issues one `agents_draft` per scope per
+    /// name, which is not a lookup of something this field already knows: a roster row is the
+    /// *merged* answer, one entry per name, so it names the scope that **won** and is silent
+    /// about the file it shadowed. Listing both is the whole point of that screen — a shadowed
+    /// definition must never be invisible — so the probe answers a question this field cannot.
+    pub scope: AgentScope,
     pub harness: Harness,
     /// One line, from the front matter's `description`. What the role is *for*, in the author's
     /// own words — the orchestrator is given this verbatim when it asks what agents it has, so
@@ -483,8 +505,8 @@ pub struct DispatchRequest {
 
 /// Which of the two directories a definition lives in.
 ///
-/// The two `cide_agents::defs::load_from` merges, named on the wire because **a form has to say
-/// which file it is about**. The panel draws one `developer` row where two files may declare it
+/// The four directories `cide_agents::defs::load_from` merges, named on the wire because **a
+/// form has to say which file it is about**. The panel draws one `developer` row where two files may declare it
 /// — a project definition shadowing a global one, which `LoadedAgent::shadows` exists to make
 /// visible — so a save that guessed would edit whichever the guess landed on, and the user would
 /// watch their change have no effect for the same reason shadowing costs an afternoon today.
@@ -493,6 +515,20 @@ pub struct DispatchRequest {
 /// `Global` is how it stops being this repository's and becomes theirs, on every project they
 /// open; there is no key in the file for that, because it *is* which directory the file is in.
 /// So scope is a field of the draft and changing it is a move — see `cide_agents::defs::save`.
+///
+/// # Two families, four directories
+///
+/// The first two are cide's own. The second two are **Claude Code's** (M30): a subagent is the
+/// same idea in somebody else's format, documented at <https://code.claude.com/docs/en/sub-agents>,
+/// and the directories are already populated on the machines of people who have never opened
+/// cide. Reading them is not a translation layer bolted on — they merge into the one catalog
+/// through the one merge, because a role's identity is its name and two lists keyed by name
+/// would be two answers to "who is `reviewer`".
+///
+/// What the families do *not* share is who owns the vocabulary. cide defines the keys in
+/// `.cide/agents/` and may refuse one it does not know; it defines none of the keys in
+/// `.claude/agents/` and must therefore preserve every one of them — see
+/// [`AgentDraft::extras`], which exists for exactly that reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -503,6 +539,28 @@ pub enum AgentScope {
     /// `$XDG_CONFIG_HOME/cide/agents/<name>.md` — beside `keymap.json`, the user's own, and
     /// applied to every project they open unless that project defines the same name.
     Global,
+    /// `<root>/.claude/agents/*.md` — a **Claude Code subagent** committed with the project.
+    ///
+    /// The file stem need not equal the `name:` key here, which is Claude's rule and not cide's,
+    /// so this scope is addressed by declared name and the file behind it is found by reading
+    /// the directory. See `cide_agents::defs::claude_project_dir`.
+    ClaudeProject,
+    /// `~/.claude/agents/*.md` — the user's own Claude Code subagents, on every project.
+    ///
+    /// `CLAUDE_CONFIG_DIR` relocates it; `cide_claude::claude_dir` is the one place that rule
+    /// lives.
+    ClaudeGlobal,
+}
+
+impl AgentScope {
+    /// Whether this scope is a directory **Claude Code** owns rather than one cide does.
+    ///
+    /// The question three separate decisions turn on, which is why it is a method and not three
+    /// `matches!` written out: the roster's badge, the harness's `--agent` road, and whether an
+    /// unknown front-matter key is a defect in cide's format or a key in somebody else's.
+    pub fn is_claude_code(self) -> bool {
+        matches!(self, Self::ClaudeProject | Self::ClaudeGlobal)
+    }
 }
 
 /// Which definition file a role occupies: a scope and a name, which is a directory and a stem.
@@ -517,6 +575,35 @@ pub enum AgentScope {
 pub struct AgentLocation {
     pub scope: AgentScope,
     pub name: AgentId,
+}
+
+/// One front-matter key cide does not model, carried through a save untouched. (M30)
+///
+/// # The whole point is that cide does not understand it
+///
+/// A Claude Code subagent's front matter is **Claude's vocabulary**: `hooks`, `mcpServers`,
+/// `skills`, `maxTurns`, `disallowedTools`, `color`, `background`, `initialPrompt`, `memory`, and
+/// whatever a release adds next month. cide has no model for any of them, will never have a model
+/// for all of them, and is nonetheless being asked to write the file back after a user edits the
+/// description. Re-rendering only the keys cide knows would **delete somebody's `hooks:` block**,
+/// silently, in a committed file, as a side effect of fixing a typo.
+///
+/// So an unmodelled key is neither dropped nor guessed at: it is kept, in the order the file had
+/// it, and written back verbatim. [`Self::value`] may therefore be **multi-line** — a nested
+/// block or a block sequence is carried as the raw source lines it occupied, because the one
+/// thing cide can honestly promise about YAML it does not parse is that it did not touch it.
+///
+/// The form renders these as editable key/value rows, which is the other half of the decision:
+/// preserving a key the user cannot see would make the form lie about what the file contains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct AgentExtra {
+    /// The key, without its colon.
+    pub key: String,
+    /// Everything after the colon, and — when the key opened a nested block or a block sequence —
+    /// the lines under it too, joined with `\n` and with their original indentation intact.
+    pub value: String,
 }
 
 /// One role as a form edits it: every key the definition file may carry, plus where it lives.
@@ -537,15 +624,26 @@ pub struct AgentLocation {
 ///
 /// # What a save through this loses, and why that is the design
 ///
-/// A save re-renders the whole file from these fields, so it keeps exactly what
-/// `cide_agents::defs::KNOWN_KEYS` names and nothing else: comments in the front matter go, an
-/// unknown key a newer cide would read goes, and a value cide's own vocabulary cannot hold —
-/// `harness: bogus`, `max-concurrent: lots` — comes back as "not set" and is written out as
-/// absent. That is lossy on purpose. The alternative is a draft that carries text it cannot
-/// show the user, which the form would then be silently responsible for preserving, and a save
-/// that re-emitted an unread key would be cide vouching for a line it does not understand. The
-/// roster already reports every one of those cases as a problem against the file's line before
-/// anybody opens the form.
+/// A save re-renders the whole file from these fields. What that costs, and what it no longer
+/// costs, changed in M30 and the distinction is worth stating precisely.
+///
+/// **Still lost:** comments in the front matter, and a value cide's own vocabulary cannot hold —
+/// `harness: bogus`, `max-concurrent: lots` — which comes back as "not set" and is written out as
+/// absent. Both are lossy on purpose. A value cide could not read is one it cannot vouch for, and
+/// re-emitting it would be the form claiming a switch is set when nothing will act on it.
+///
+/// **No longer lost: an unknown key.** It used to go, on the argument that "a save that
+/// re-emitted an unread key would be cide vouching for a line it does not understand". That
+/// argument holds for a directory cide *owns* and collapses for one it does not. Claude Code's
+/// `.claude/agents/` is now a scope ([`AgentScope::ClaudeProject`]), its whole vocabulary is
+/// outside `cide_agents::defs::KNOWN_KEYS`, and deleting a user's `hooks:` block because they
+/// edited a description is not a defensible thing to do to somebody else's file. So an unmodelled
+/// key rides [`Self::extras`], is shown in the form as an editable row — which is what keeps it
+/// from being text the user cannot see — and is written back verbatim.
+///
+/// The reporting did not move with it. A key outside `KNOWN_KEYS` in a `.cide/agents/` file is
+/// still a problem against that file's line, exactly as before; it is now *reported and kept*
+/// rather than reported and deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
@@ -626,6 +724,16 @@ pub struct AgentDraft {
     /// racing the user's editor is a bad idea in a surface nobody opened for editing. A form the
     /// user deliberately opened to change this file is the surface that was missing.
     pub system_prompt: String,
+    /// Every front-matter key cide does not model, in the order the file had them. (M30)
+    ///
+    /// See [`AgentExtra`] for why they are carried at all. Empty is the ordinary state of a
+    /// `.cide/agents/` definition — cide defines that format, so a key outside
+    /// `cide_agents::defs::KNOWN_KEYS` there is a *defect* and is reported as one against the
+    /// file's line. It is still preserved, which is the change M30 made to the paragraph above:
+    /// reporting a key and deleting it are different services, and cide now performs only the
+    /// first.
+    #[serde(default)]
+    pub extras: Vec<AgentExtra>,
 }
 
 /// Which box on the form a refusal belongs to.
@@ -653,6 +761,13 @@ pub enum AgentField {
     PermissionMode,
     MaxConcurrent,
     SystemPrompt,
+    /// The unmodelled front-matter keys, as a whole. (M30)
+    ///
+    /// One variant for the whole list rather than one per key, because the keys are not cide's to
+    /// enumerate — that is the entire premise of [`AgentExtra`]. What lands here is a refusal
+    /// about the list's *shape*: a key that is not a key, a duplicate, a value that would open a
+    /// line inside the front matter.
+    Extras,
 }
 
 /// One reason a draft was not written, against the field that caused it.

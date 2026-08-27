@@ -114,6 +114,34 @@ function task(from: WireTask): TaskView {
     // `model.ts` cannot name `AgentId`, and the distinction it would draw is not one the panel
     // makes — `agentChip` looks the id up in a plain map and falls back to printing it.
     agent: from.agent,
+    change: from.change ?? null,
+    /*
+     * `== null`, which catches **both** `null` and `undefined`, and the distinction cost a bug
+     * that broke every task on the board.
+     *
+     * `Task::session` is `Option<SessionId>` with `#[serde(default)]` and **no
+     * `skip_serializing_if`** — so a task with no session does not omit the key, it sends
+     * `"session": null`. A check for `undefined` alone therefore fell through to
+     * `String(null)`, which is the seven-character string `"null"`: a truthy session id on
+     * every task in the project. The card drew a session row reading *Conversation null*, and
+     * `primaryAction` — which now refuses the approve road once a session is set — took
+     * **Approve & dispatch off every OpenSpec task there was**.
+     *
+     * `undefined` is still possible and still has to be caught: ts-rs renders the field
+     * optional, and the model is compiled under `exactOptionalPropertyTypes` where the two are
+     * not the same value.
+     */
+    session: from.session == null ? null : String(from.session),
+    /*
+     * Link tombstones are dropped here, the comments' rule one field over. (M30) An unlinked
+     * edge stays in the file so the merge can resolve re-links against stale copies
+     * (`TaskLink::deleted` is a *toggle* — `cide_tasks::union_links` has the argument), and no
+     * renderer has any use for one. The stamp goes with it: what remains is exactly what
+     * `model.ts`'s `LinkView` restates.
+     */
+    links: from.links
+      .filter((l) => !l.deleted)
+      .map((l) => ({ kind: l.link, target: l.target })),
     /*
      * Tombstones are dropped here, so nothing above this line knows they exist. (M21)
      *

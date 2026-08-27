@@ -56,8 +56,8 @@ use std::path::{Path, PathBuf};
 use cide_core::persist::{self, Debouncer};
 use cide_core::{CoreError, Result, document};
 use cide_ipc::{
-    CommentId, FileStamp, Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskId,
-    TaskNew, TaskStatusChange,
+    ChangeName, CommentId, FileStamp, LinkType, Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit,
+    TaskFile, TaskId, TaskLink, TaskLinkSpec, TaskNew, TaskStatusChange,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -119,6 +119,29 @@ pub fn well_formed_id(id: &TaskId) -> bool {
 ///   does not own. [`read`] refuses a future schema before it ever reaches memory, so reaching
 ///   here means a bug in this crate rather than a file on disk; it is cheap to assert and the
 ///   failure it prevents (silently downgrading a teammate's file on the next flush) is total.
+/// * **Every link target well-formed, no self-links, one entry per `(link, target)`** — the
+///   first cross-task rules this function has ever had, and each is downstream-breaking in the
+///   established way: an unquotable target is a reference nothing can match back, a self-link
+///   would gate a task on itself, and two entries under one key would make [`union_links`]'
+///   per-key reconciliation ambiguous (the duplicate-task-id argument, one level down —
+///   tombstoned entries count, because they carry the key too).
+///
+/// Two link states are **deliberately legal** here, refused only as gestures in
+/// [`TaskStore::edit`]:
+///
+/// * **A dangling target.** [`TaskStore::delete`] scrubs nothing (a scrub could not survive
+///   [`merge`], which has no task tombstones and would re-adopt the stale side's edge), and ids
+///   are never reused, so a dangling edge can never come to mean new work. Renderers mark it;
+///   the dispatch gate treats a dangling blocker as satisfied, because a deleted task can never
+///   become done and an edge that gated for ever would make deletion corrupt every task that
+///   pointed at the deleted one.
+/// * **A `blockedBy`/`subtaskOf` cycle.** [`merge`] can lawfully union two acyclic sides into a
+///   cycle (each side added one arc), and [`TaskStore::reconcile`] swaps merge output in without
+///   re-validating — a rule here that a merge can break would freeze every subsequent mutation,
+///   which is the exact failure [`repair`]'s doc exists to prevent. Nothing traverses links
+///   transitively at read time (the dispatch gate is one hop), so a cyclic file wedges nothing:
+///   the tasks merely stand mutually undispatchable until a status edit — always allowed —
+///   breaks the standoff.
 pub fn validate(file: &TaskFile) -> Result<()> {
     if file.schema_version != TaskFile::CURRENT_SCHEMA {
         return Err(CoreError::Invariant(format!(
@@ -149,6 +172,31 @@ pub fn validate(file: &TaskFile) -> Result<()> {
             )));
         }
         seen.push(task.id.as_str());
+
+        for (i, entry) in task.links.iter().enumerate() {
+            if !well_formed_id(&entry.target) {
+                return Err(CoreError::Invariant(format!(
+                    "task {} links to {:?}, which is not usable as an identifier",
+                    task.id,
+                    entry.target.as_str()
+                )));
+            }
+            if entry.target == task.id {
+                return Err(CoreError::Invariant(format!(
+                    "task {} links to itself",
+                    task.id
+                )));
+            }
+            if task.links[..i]
+                .iter()
+                .any(|other| other.link == entry.link && other.target == entry.target)
+            {
+                return Err(CoreError::Invariant(format!(
+                    "task {} carries two {:?} links to {}",
+                    task.id, entry.link, entry.target
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -181,17 +229,31 @@ const LEGACY_CREATE_NOTE: &str = "created this task";
 ///   available: the later copy has no identity of its own to be given (renaming it would silently
 ///   re-point every comment and prompt that named the id), and keeping both is the state the
 ///   invariant exists to forbid. The dropped bytes are still in `git log -p`.
-/// * **A malformed id is re-minted.** Rewriting an id normally breaks every reference to it — but
-///   "malformed" here means precisely "cannot be quoted and matched back", so there were no usable
-///   references to break. Dropping the task instead would lose work over a typo.
+/// * **A malformed id is re-minted.** Rewriting an id normally breaks every reference to it. The
+///   *prose* references were never a cost — "malformed" means precisely "cannot be quoted and
+///   matched back", so no comment or prompt held a usable copy — and the structured references
+///   [`Task::links`] added (M30) are re-pointed rather than broken: the re-mint pass records every
+///   `was → now` and a second pass rewrites link targets through that map, which is a repair only
+///   possible *because* the reference is a field and not prose. Dropping the task instead would
+///   lose work over a typo.
 /// * **An empty title becomes `(untitled)`.** The option that lost was dropping the task, which
 ///   loses work; the other was leaving it, which freezes the tracker as described above. The
 ///   placeholder is visible in the panel and in the next diff, which is the point.
+/// * **A link that cannot be made valid is dropped.** After re-pointing: a target still
+///   malformed, a self-link, or a second entry under one `(link, target)` key (the newest stamp
+///   is the one kept — it is the copy [`union_links`] would have chosen). Dropped and warned, not
+///   refused, for the header's reason: these arrive by hand edit or merge, and each would
+///   otherwise freeze the tracker. A *dangling* target is not in this list — it is legal, see
+///   [`validate`].
 fn repair(file: &mut TaskFile) {
     // The high-water mark is read once, up front, and advanced by hand as ids are minted: a task
     // re-minted mid-pass must not be able to collide with one further down the list that has not
     // been visited yet.
     let mut high_water = high_water_mark(file);
+
+    // Every re-mint below, `was → now`, applied to link targets in a second pass: a reference
+    // that is a field can follow the rename that a reference in prose never could.
+    let mut reminted: Vec<(TaskId, TaskId)> = Vec::new();
 
     let mut kept: Vec<Task> = Vec::with_capacity(file.tasks.len());
     for mut task in std::mem::take(&mut file.tasks) {
@@ -203,6 +265,7 @@ fn repair(file: &mut TaskFile) {
                 now = %minted,
                 "task id was not usable as an identifier; re-minted it"
             );
+            reminted.push((task.id.clone(), minted.clone()));
             task.id = minted;
         }
         if kept.iter().any(|k| k.id == task.id) {
@@ -265,6 +328,49 @@ fn repair(file: &mut TaskFile) {
         }
         kept.push(task);
     }
+
+    // The link pass, after the id pass so the re-mint map is complete. Order inside matters:
+    // re-point first, then judge — a link whose target was just re-minted is a link the map
+    // saves, not one the malformed-target rule drops.
+    for task in &mut kept {
+        for entry in &mut task.links {
+            if let Some((_, now)) = reminted.iter().find(|(was, _)| *was == entry.target) {
+                tracing::warn!(
+                    id = %task.id,
+                    was = %entry.target,
+                    now = %now,
+                    "link target was re-minted; re-pointed the link"
+                );
+                entry.target = now.clone();
+            }
+        }
+        let id = task.id.clone();
+        let mut seen_keys: Vec<(LinkType, TaskId)> = Vec::new();
+        // Newest-stamp-first so the duplicate collapse below keeps the copy `union_links`
+        // would have chosen; the file's own order for links carries no meaning (renderers
+        // group by kind), so re-sorting here costs nothing a reader can see.
+        task.links
+            .sort_by_key(|entry| std::cmp::Reverse(entry.at_unix_ms));
+        task.links.retain(|entry| {
+            if !well_formed_id(&entry.target) {
+                tracing::warn!(id = %id, target = %entry.target, "link target is not usable as an identifier; dropped the link");
+                return false;
+            }
+            if entry.target == id {
+                tracing::warn!(id = %id, "task linked to itself; dropped the link");
+                return false;
+            }
+            let key = (entry.link, entry.target.clone());
+            if seen_keys.contains(&key) {
+                tracing::warn!(id = %id, target = %entry.target, "duplicate link; keeping the newest");
+                return false;
+            }
+            seen_keys.push(key);
+            true
+        });
+        task.links.sort_by_key(|entry| entry.at_unix_ms);
+    }
+
     file.tasks = kept;
 }
 
@@ -319,16 +425,82 @@ fn find_mut<'a>(file: &'a mut TaskFile, id: &TaskId) -> Option<&'a mut Task> {
     file.tasks.iter_mut().find(|task| &task.id == id)
 }
 
-/// `CoreError` has no `NoSuchTask` variant and this crate does not own `cide-core/src/error.rs`.
+/// The tagged refusal every "no such X" in the domain gets — `NoSuchTab` and `NoSuchPane`'s
+/// arrangement, for this file's ids.
 ///
-/// So the refusal travels as [`CoreError::Io`], which is the wrong tag: the frontend cannot branch
-/// on it, and every other "no such X" in the domain (`NoSuchTab`, `NoSuchPane`, `NoSuchSplit`) is a
-/// tagged variant precisely so that it can. Adding `NoSuchTask(TaskId)` beside them is the right
-/// end state and is a one-line change in a file this crate is not allowed to edit; it is flagged
-/// rather than worked around, because a bespoke error type here would be a *second* error vocabulary
-/// crossing the same IPC boundary.
+/// This used to be a [`CoreError::Io`] carrying the same sentence, with a doc explaining that the
+/// variant did not exist yet; it does now (`cmd/agents.rs`' dispatch preflight was what forced
+/// it), and the display string was written to match this function's byte for byte, so adopting
+/// the tag changed no message anything renders or matches.
 fn no_such_task(id: &TaskId) -> CoreError {
-    CoreError::Io(format!("no such task: {id}"))
+    CoreError::NoSuchTask(id.clone())
+}
+
+/// OpenSpec's own ceiling on a change name. (M28)
+///
+/// 200 characters, matching `dist/utils/change-utils.js` in `@fission-ai/openspec`. Restated here
+/// rather than inferred, because the value ends up as a directory name and a filesystem's own
+/// limit is per-component and platform-dependent — a rule cide can state is worth more than one
+/// it would discover by failing.
+const CHANGE_NAME_MAX: usize = 200;
+
+/// Check a change name against OpenSpec's grammar, or explain why it is not one. (M28)
+///
+/// `^[a-z0-9]+(?:-[a-z0-9]+)*$`, which is `dist/core/id.js`'s `KEBAB_ID_REGEX` in the installed
+/// CLI. Written as a scan rather than a regex because this crate has no regex dependency and the
+/// rule is four conditions; the comment naming the upstream file is what keeps the two together.
+///
+/// # Why this is refused here rather than sanitised
+///
+/// Because the value is joined onto a path. A name carrying `/` or `..` would let a task in a
+/// committed file address a directory outside `openspec/changes/`, and a *sanitising* answer —
+/// silently rewriting it to something legal — would produce a task whose link points at a
+/// directory that does not exist and never will, which is the failure that is hardest to see. The
+/// refusal names the value, so whoever typed it can fix it.
+///
+/// `None` is always fine: absent means "not spec-driven", which is most tasks.
+fn valid_change_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(CoreError::Io(
+            "a change name cannot be empty — leave it unset to unlink the task instead".into(),
+        ));
+    }
+    if name.len() > CHANGE_NAME_MAX {
+        return Err(CoreError::Io(format!(
+            "a change name is at most {CHANGE_NAME_MAX} characters, and this one is {}",
+            name.len()
+        )));
+    }
+    let legal = name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !legal || name.starts_with('-') || name.ends_with('-') || name.contains("--") {
+        return Err(CoreError::Io(format!(
+            "`{name}` is not an OpenSpec change name: lowercase letters, digits and single \
+             hyphens between them, like `add-dark-mode`. It names a directory under \
+             openspec/changes/, which is why it cannot be anything else"
+        )));
+    }
+    Ok(())
+}
+
+/// [`valid_change_name`] over the optional the wire actually carries.
+///
+/// Trims first, so a name pasted with a trailing space is accepted rather than refused for a
+/// character nobody can see — the same courtesy `create` extends to a title. A value that is
+/// *only* whitespace collapses to `None`: the panel's picker has an empty option, and a `<select>`
+/// has no null, so "" arriving here means unlinked and must not become an empty directory name in
+/// a committed file. That is the mirror of `assigneeFromDraft`'s rule one layer up.
+fn validated_change(change: Option<&ChangeName>) -> Result<Option<ChangeName>> {
+    let Some(change) = change else {
+        return Ok(None);
+    };
+    let trimmed = change.as_str().trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    valid_change_name(trimmed)?;
+    Ok(Some(ChangeName(trimmed.to_string())))
 }
 
 /// A comment that is not there, or is already tombstoned.
@@ -349,6 +521,247 @@ fn agents_may_not_rewrite() -> CoreError {
         "only the user can edit or delete a comment; an agent adds a correcting comment instead"
             .to_string(),
     )
+}
+
+/// The wire spelling of a link kind, for refusal sentences. (M30)
+///
+/// A refusal that says `BlockedBy` to a caller who typed `blockedBy` is a refusal that teaches
+/// the wrong vocabulary — the sentence is read by the model that will make the next call. A
+/// match rather than a `serde_json::to_value` round trip per message; the test
+/// `the_link_wire_spelling_is_serdes` is what keeps it from being a second copy that drifts.
+fn link_wire(link: LinkType) -> &'static str {
+    match link {
+        LinkType::Related => "related",
+        LinkType::BlockedBy => "blockedBy",
+        LinkType::SubtaskOf => "subtaskOf",
+    }
+}
+
+/// The chain of live `kind` edges leading from `from` back to `back_to`, if one exists: the
+/// intermediate task ids, exclusive of both ends. (M30)
+///
+/// [`apply_link`]'s cycle preflight. A depth-first walk with a visited set, and the set is not
+/// paranoia: the file itself may already hold a cycle — a merge can lawfully create one, see
+/// [`validate`] — and the walk must terminate inside it rather than follow it for ever.
+fn link_chain(
+    file: &TaskFile,
+    kind: LinkType,
+    from: &TaskId,
+    back_to: &TaskId,
+) -> Option<Vec<TaskId>> {
+    fn walk(
+        file: &TaskFile,
+        kind: LinkType,
+        at: &TaskId,
+        back_to: &TaskId,
+        visited: &mut Vec<TaskId>,
+        path: &mut Vec<TaskId>,
+    ) -> bool {
+        if visited.contains(at) {
+            return false;
+        }
+        visited.push(at.clone());
+        let Some(task) = find(file, at) else {
+            // Dangling mid-chain: the walk simply ends here, exactly as the dispatch gate's
+            // one-hop read would.
+            return false;
+        };
+        for edge in task.links.iter().filter(|l| l.link == kind && !l.deleted) {
+            if &edge.target == back_to {
+                return true;
+            }
+            path.push(edge.target.clone());
+            if walk(file, kind, &edge.target, back_to, visited, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+
+    let mut visited = Vec::new();
+    let mut path = Vec::new();
+    walk(file, kind, from, back_to, &mut visited, &mut path).then_some(path)
+}
+
+/// [`TaskEdit::Link`], applied. A free function over the whole file, because the rules it
+/// enforces live on *other* tasks: the target's existence, the cycle walk, and (for
+/// [`LinkType::Related`]) the inverse edge. (M30)
+///
+/// The refusals, each a sentence at the gesture — see [`validate`] for why the same states are
+/// legal in a file that merged or was hand-edited into them:
+///
+/// * the target must exist — a *gesture* never creates a dangling edge; only a later delete or
+///   an out-of-process merge can,
+/// * no self-link, no live duplicate (for `related`, in either direction — the pair is one
+///   fact, wherever it is stored),
+/// * no `blockedBy`/`subtaskOf` edge that would close a cycle, refused naming the chain.
+///
+/// A tombstoned edge under the same key is **revived** rather than duplicated — flipping
+/// `deleted` back and re-stamping is what keeps one key per fact, which [`union_links`]' whole
+/// resolution rests on.
+fn apply_link(
+    file: &mut TaskFile,
+    id: &TaskId,
+    link: LinkType,
+    target: &TaskId,
+    now: u64,
+) -> Result<Task> {
+    if find(file, id).is_none() {
+        return Err(no_such_task(id));
+    }
+    if target == id {
+        return Err(CoreError::Io(format!("{id} cannot be linked to itself")));
+    }
+    if find(file, target).is_none() {
+        return Err(no_such_task(target));
+    }
+
+    let wire = link_wire(link);
+    let live = |task: &Task, kind: LinkType, to: &TaskId| {
+        task.links
+            .iter()
+            .any(|l| l.link == kind && &l.target == to && !l.deleted)
+    };
+    let already = live(find(file, id).expect("checked above"), link, target)
+        || (link == LinkType::Related
+            && find(file, target).is_some_and(|t| live(t, LinkType::Related, id)));
+    if already {
+        return Err(CoreError::Io(format!(
+            "{id} is already linked: {wire} {target}"
+        )));
+    }
+
+    if link != LinkType::Related
+        && let Some(via) = link_chain(file, link, target, id)
+    {
+        let chain = if via.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (via {})",
+                via.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let cost = match link {
+            LinkType::BlockedBy => {
+                "a blocking cycle would leave every task in it waiting on the others"
+            }
+            _ => "a task cannot appear inside its own decomposition",
+        };
+        return Err(CoreError::Io(format!(
+            "cannot link {id} {wire} {target}: {target} is itself {wire} {id}{chain}, and {cost}"
+        )));
+    }
+
+    let task = find_mut(file, id).expect("checked above");
+    match task
+        .links
+        .iter_mut()
+        .find(|l| l.link == link && &l.target == target)
+    {
+        // The tombstoned key, revived. Only ever reached with `deleted: true` — a live copy
+        // was refused as a duplicate above.
+        Some(edge) => {
+            edge.deleted = false;
+            edge.at_unix_ms = now;
+        }
+        None => task.links.push(TaskLink {
+            link,
+            target: target.clone(),
+            deleted: false,
+            at_unix_ms: now,
+        }),
+    }
+    task.updated_unix_ms = now;
+    Ok(task.clone())
+}
+
+/// [`TaskEdit::Unlink`], applied: tombstone one live edge. (M30)
+///
+/// For [`LinkType::Related`] the edge is looked for on **both** ends — it lives on whichever
+/// task the linking gesture was made on, and "unlink these two" must not require the caller to
+/// remember which that was. The task returned is always the one the caller named, even when the
+/// edge turned out to be stored on the other one: the response is an answer about the gesture's
+/// subject, not about where the bookkeeping happened to live.
+///
+/// One message covers "never existed" and "already tombstoned" — [`no_such_comment`]'s posture,
+/// for its reason: both are one answer to the caller, and telling them apart would let a caller
+/// probe what used to be linked.
+fn apply_unlink(
+    file: &mut TaskFile,
+    id: &TaskId,
+    link: LinkType,
+    target: &TaskId,
+    now: u64,
+) -> Result<Task> {
+    if find(file, id).is_none() {
+        return Err(no_such_task(id));
+    }
+
+    let tombstone = |task: &mut Task, kind: LinkType, to: &TaskId| -> bool {
+        let Some(edge) = task
+            .links
+            .iter_mut()
+            .find(|l| l.link == kind && &l.target == to && !l.deleted)
+        else {
+            return false;
+        };
+        edge.deleted = true;
+        edge.at_unix_ms = now;
+        task.updated_unix_ms = now;
+        true
+    };
+
+    let named = find_mut(file, id).expect("checked above");
+    if tombstone(&mut *named, link, target) {
+        return Ok(named.clone());
+    }
+    if link == LinkType::Related
+        && let Some(other) = find_mut(file, target)
+        && tombstone(other, LinkType::Related, id)
+    {
+        return Ok(find(file, id).expect("checked above").clone());
+    }
+    Err(CoreError::Io(format!(
+        "no such link on {id}: {} {target}",
+        link_wire(link)
+    )))
+}
+
+/// The stored edges a creation's specs become, refused whole when any spec cannot stand. (M30)
+///
+/// Runs inside the create's `update` closure, against the file the new task is about to join.
+/// Two of [`apply_link`]'s refusals are structurally impossible here and deliberately not
+/// restated: a self-link would need the id this call has not minted yet, and a cycle would need
+/// an edge *into* a task that does not exist. What is left is existence and duplication.
+fn validated_links(specs: &[TaskLinkSpec], file: &TaskFile, now: u64) -> Result<Vec<TaskLink>> {
+    let mut out: Vec<TaskLink> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if find(file, &spec.target).is_none() {
+            return Err(no_such_task(&spec.target));
+        }
+        if out
+            .iter()
+            .any(|l| l.link == spec.link && l.target == spec.target)
+        {
+            return Err(CoreError::Io(format!(
+                "the new task names its {} link to {} twice",
+                link_wire(spec.link),
+                spec.target
+            )));
+        }
+        out.push(TaskLink {
+            link: spec.link,
+            target: spec.target.clone(),
+            deleted: false,
+            at_unix_ms: now,
+        });
+    }
+    Ok(out)
 }
 
 // --- layer 3: the merge ---------------------------------------------------------------------
@@ -380,21 +793,23 @@ fn agents_may_not_rewrite() -> CoreError {
 /// | on both sides | the higher `updated_unix_ms` wins the scalar fields |
 /// | only on disk | **adopted** — a `git pull` or a teammate added it |
 /// | only in memory | **kept** — this process created it since the last read |
-/// | comments | **unioned**, by `(author, at_unix_ms, text)` |
+/// | comments | **unioned**, by id — [`union_comments`], resolved per id by [`reconcile_comment`] |
+/// | history | **unioned**, structurally — [`union_history`]; rows are immutable, so `==` suffices |
+/// | links | **unioned**, by `(link, target)` — [`union_links`]; the newer stamp wins per key |
 /// | one side deleted what the other edited | the task **survives**, with the edit |
 ///
-/// ## Why comments union on `(author, at_unix_ms, text)`
+/// ## Why comments union by id
 ///
-/// [`TaskComment`] has no id — deliberately, because it is append-only and nothing ever addresses
-/// one — so identity has to come from the value, and those three fields *are* the value; there is
-/// no fourth. Two comments equal in all three are indistinguishable to every reader there is (the
-/// panel, the next agent, a reviewer reading the diff), so collapsing them cannot lose information
-/// that anything could have used. The false-collapse case — one author posting byte-identical text
-/// inside the same millisecond — would be invisible in the panel anyway.
+/// They unioned structurally on `(author, at_unix_ms, text)` until M21, when those three fields
+/// stopped being the whole value: editing changes `text`, so a stale copy's original survived
+/// *beside* the edit, and a delete removed a comment the stale copy still had, so the next merge
+/// put it back. [`TaskComment::id`] is the fix and [`reconcile_comment`] carries the resolution
+/// rules; the structural union survives unchanged for [`union_history`], whose rows really are
+/// immutable.
 ///
-/// The alternative, appending both sides unconditionally, is not merely untidy: this merge runs
-/// again on the next out-of-process write, so every surviving duplicate is re-duplicated, and a
-/// noisy afternoon of `git pull`s turns a five-line log into fifty.
+/// The alternative to collapsing at all, appending both sides unconditionally, is not merely
+/// untidy: this merge runs again on the next out-of-process write, so every surviving duplicate
+/// is re-duplicated, and a noisy afternoon of `git pull`s turns a five-line log into fifty.
 ///
 /// ## Why a delete does not survive a concurrent write
 ///
@@ -458,6 +873,7 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
 
     winner.comments = union_comments(&mine.comments, &theirs.comments);
     winner.history = union_history(&mine.history, &theirs.history);
+    winner.links = union_links(&mine.links, &theirs.links);
     // The creation stamp is the earlier of the two by definition: a task cannot have been created
     // twice, and if the two disagree one of them was hand-edited. The earlier is the safer read.
     winner.created_unix_ms = mine.created_unix_ms.min(theirs.created_unix_ms);
@@ -486,6 +902,11 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
         winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
     }
     if let Some(newest) = winner.history.iter().map(|c| c.at_unix_ms).max() {
+        winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
+    }
+    // A link edge adopted from the loser is an update by the same argument — and here it is
+    // load-bearing twice over, because an adopted edge's stamp is what wins it the *next* merge.
+    if let Some(newest) = winner.links.iter().map(|l| l.at_unix_ms).max() {
         winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
     }
     winner
@@ -530,6 +951,52 @@ fn union_history(mine: &[TaskStatusChange], theirs: &[TaskStatusChange]) -> Vec<
     // Stable, on the stamp, for `union_comments`' reason: rows sharing a millisecond keep
     // mine-before-theirs rather than an unstable pivot's choice.
     out.sort_by_key(|c| c.at_unix_ms);
+    out
+}
+
+/// Both sides' link edges, resolved per `(link, target)` key: **the newer stamp wins, ties go to
+/// mine.** (M30)
+///
+/// # Why not whole-vector last-writer-wins
+///
+/// Doing nothing would inherit [`merge_task`]'s rule — the loser's entire scalar set is
+/// discarded. Then: side A unlinks `blockedBy t-3` at 10:00, side B's stale copy takes an
+/// unrelated *comment* at 10:01, B wins the scalars, and the unlink is resurrected — silently,
+/// and a resurrected `blockedBy` silently re-gates dispatch. A subagent commenting is the single
+/// most common write in the file, so this is not a corner; it is the ordinary afternoon.
+/// [`reconcile_comment`] documents the identical hazard for comments, which is why edges carry a
+/// tombstone and a stamp at all.
+///
+/// # Why not the comments' rule (deleted wins absolutely)
+///
+/// [`TaskComment::deleted`] can be one-way because a deleted comment is *replaced* — a new
+/// comment gets a new id, so the tombstoned key is never written to again. A link's identity is
+/// its `(link, target)` pair: re-linking after an unlink recreates the **same** key, so
+/// "either side deleted ⇒ deleted" would make every unlink permanent after any merge with a
+/// stale file. The tombstone is therefore a *toggle*, resolved by the stamp — which is
+/// `reconcile_comment`'s rule 2 where its rule 1 cannot apply. The cost — both ends toggling one
+/// edge inside clock skew resolves by wall clock — is bounded by what links are: low-frequency,
+/// deliberate gestures, where the stamp order and the intent order agree in practice and a wrong
+/// resolution is one visible chip and one gesture to repeat.
+fn union_links(mine: &[TaskLink], theirs: &[TaskLink]) -> Vec<TaskLink> {
+    let mut out: Vec<TaskLink> = mine.to_vec();
+    for edge in theirs {
+        match out
+            .iter_mut()
+            .find(|l| l.link == edge.link && l.target == edge.target)
+        {
+            // Strictly newer, so a tie keeps mine — this function's side of `merge_task`'s
+            // stated stability convention.
+            Some(ours) => {
+                if edge.at_unix_ms > ours.at_unix_ms {
+                    *ours = edge.clone();
+                }
+            }
+            None => out.push(edge.clone()),
+        }
+    }
+    // Stable, on the stamp, for `union_comments`' reason.
+    out.sort_by_key(|l| l.at_unix_ms);
     out
 }
 
@@ -1113,7 +1580,17 @@ impl TaskStore {
     /// that now agrees with the log.
     pub fn create(&self, req: &TaskNew, author: TaskAuthor) -> Result<Task> {
         let now = persist::now_ms();
+        // Before the lock and before the write: a refusal must not be able to leave a
+        // half-created task behind, and the caller wants the sentence, not a poisoned file.
+        let change = validated_change(req.change.as_ref())?;
         self.update(move |file| {
+            // Inside the closure, unlike `change` above, because two of its refusals need the
+            // file (existence) — and a refusal from in here rolls the update back whole, so
+            // nothing half-creates either way. Landing the edges *in* the create matters beyond
+            // convenience: the auto-dispatch trigger reads the task this mutation leaves behind,
+            // and a create-then-link would hand it a task whose `blockedBy` did not exist yet —
+            // `TaskNew::links` carries the argument.
+            let links = validated_links(req.links.as_deref().unwrap_or(&[]), file, now)?;
             let task = Task {
                 id: next_id(file),
                 // Trimmed, because a title is one line drawn in a 320px panel and trailing space is
@@ -1125,6 +1602,16 @@ impl TaskStore {
                 // agent's.
                 status: req.status.unwrap_or(cide_ipc::TaskStatus::Todo),
                 agent: req.agent.clone(),
+                // Validated before it can reach the file, because this value names a directory:
+                // `cide-spec` joins it onto `openspec/changes/`, and a task carrying `../..`
+                // would be a path traversal written into the user's committed tracker.
+                change: change.clone(),
+                // A task is never born attached to a session: handing work to a live
+                // conversation is a gesture somebody makes, and `TaskNew` has no shape for it
+                // for `status`' reason — a creation road that could is a road an agent could
+                // take without anybody choosing.
+                session: None,
+                links,
                 comments: Vec::new(),
                 // Empty even when the caller named a starting status: the history records
                 // *changes*, and a task born in `Doing` did not move there — `created_by` and
@@ -1154,6 +1641,21 @@ impl TaskStore {
     pub fn edit(&self, id: &TaskId, edit: TaskEdit, author: TaskAuthor) -> Result<Task> {
         let now = persist::now_ms();
         self.update(move |file| {
+            // The two link arms route through free functions over the whole file before the
+            // single-task borrow below is taken: the rules they enforce — the target's
+            // existence, the cycle walk, `related`'s inverse edge — live on *other* tasks.
+            // No author gate, unlike the comment arms: an edge is recorded intent, not a
+            // rewrite of the record, and what keeps a run's `blockedBy` from dispatching
+            // anything is `autodispatch`'s author gate downstream, not ownership here.
+            let edit = match edit {
+                TaskEdit::Link { link, target } => {
+                    return apply_link(file, id, link, &target, now);
+                }
+                TaskEdit::Unlink { link, target } => {
+                    return apply_unlink(file, id, link, &target, now);
+                }
+                other => other,
+            };
             let task = find_mut(file, id).ok_or_else(|| no_such_task(id))?;
             match edit {
                 TaskEdit::SetTitle { title } => task.title = title.trim().to_string(),
@@ -1175,7 +1677,28 @@ impl TaskStore {
                         task.status = status;
                     }
                 }
-                TaskEdit::Assign { agent } => task.agent = agent,
+                /*
+                 * Assigning a role clears the session, and handing to a session clears the role.
+                 *
+                 * The invariant lives here because this is the only writer: "who is on this" is
+                 * one fact carried in two shapes, and a task claiming both would be a card that
+                 * cannot answer the question it exists to answer. Doing it in the store rather
+                 * than at each call site is what makes it true for the panel, the MCP tools and
+                 * any future caller alike.
+                 */
+                TaskEdit::Assign { agent } => {
+                    task.agent = agent;
+                    task.session = None;
+                }
+                TaskEdit::SetSession { session } => {
+                    task.session = session;
+                    task.agent = None;
+                }
+                // Validated here for `create`'s reason — this is the other door into the same
+                // field, and a check on only one of them is a check that is not there.
+                TaskEdit::SetChange { change } => {
+                    task.change = validated_change(change.as_ref())?;
+                }
                 // **Appends.** There is no edit and no delete, here or on the wire, and that single
                 // restriction is what makes the log a channel between agents rather than a
                 // scratchpad — see `TaskComment`.
@@ -1229,6 +1752,9 @@ impl TaskStore {
                     comment.text = String::new();
                     comment.edited_at_unix_ms = Some(now);
                 }
+                TaskEdit::Link { .. } | TaskEdit::Unlink { .. } => {
+                    unreachable!("returned through apply_link/apply_unlink above")
+                }
             }
             task.updated_unix_ms = now;
             Ok(task.clone())
@@ -1240,6 +1766,9 @@ impl TaskStore {
     /// The id is **not** returned to the pool — see `high_water_mark`. Deliberately not reachable
     /// from an MCP tool either: the file is the shared record of what happened, and deletion belongs
     /// to the user.
+    ///
+    /// Links pointing at the removed task are left **dangling, deliberately** — see [`validate`]
+    /// for why a scrub could not survive the merge and why a dangling edge is safe to keep.
     pub fn delete(&self, id: &TaskId) -> Result<()> {
         self.update(|file| {
             let before = file.tasks.len();
@@ -1518,6 +2047,9 @@ mod tests {
             status: TaskStatus::Todo,
             agent: None,
             comments: Vec::new(),
+            change: None,
+            links: Vec::new(),
+            session: None,
             history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1_000,
@@ -1699,6 +2231,8 @@ mod tests {
                     body: None,
                     agent: None,
                     status: None,
+                    change: None,
+                    links: None,
                 },
                 TaskAuthor::User,
             )
@@ -1970,6 +2504,90 @@ mod tests {
                     assert_eq!(out.tasks[0].created_by, TaskAuthor::Orchestrator);
                 },
             },
+            Case {
+                name: "an unlink survives a merge with a stale file, even when the stale side \
+                       wins the scalars",
+                why: "links merge per (link, target) key by stamp, never with the scalar fields: \
+                      side A unlinked at 50, side B merely commented at 60. Whole-vector \
+                      last-writer-wins would take B's links wholesale and resurrect the edge — \
+                      and a resurrected blockedBy silently re-gates dispatch. A subagent \
+                      commenting is the most common write in the file, so this is the ordinary \
+                      afternoon, not a corner",
+                mine: a_file(
+                    4,
+                    vec![with_links(
+                        "t-1",
+                        50,
+                        vec![an_edge(LinkType::BlockedBy, "t-2", true, 50)],
+                    )],
+                ),
+                theirs: a_file(
+                    4,
+                    vec![Task {
+                        comments: vec![a_comment("stale side comments", 60)],
+                        ..with_links(
+                            "t-1",
+                            60,
+                            vec![an_edge(LinkType::BlockedBy, "t-2", false, 10)],
+                        )
+                    }],
+                ),
+                check: |out| {
+                    let task = &out.tasks[0];
+                    assert_eq!(task.comments.len(), 1, "the stale side's comment is kept");
+                    assert!(
+                        task.links[0].deleted,
+                        "and the newer unlink still wins its own key"
+                    );
+                },
+            },
+            Case {
+                name: "…and a re-link beats the unlink it reversed, because the tombstone is a \
+                       toggle",
+                why: "a link's identity is its (link, target) key, so re-linking recreates the \
+                      same key. The comments' deleted-wins-for-ever rule here would make every \
+                      unlink permanent after any merge with a stale file",
+                mine: a_file(
+                    4,
+                    vec![with_links(
+                        "t-1",
+                        70,
+                        vec![an_edge(LinkType::Related, "t-2", false, 70)],
+                    )],
+                ),
+                theirs: a_file(
+                    4,
+                    vec![with_links(
+                        "t-1",
+                        50,
+                        vec![an_edge(LinkType::Related, "t-2", true, 50)],
+                    )],
+                ),
+                check: |out| assert!(!out.tasks[0].links[0].deleted),
+            },
+            Case {
+                name: "a link added on each side: both survive",
+                why: "the union half of the rule — two windows each recording one edge in the \
+                      same debounce window must lose neither, which is the comments' oldest \
+                      argument applied to edges",
+                mine: a_file(
+                    4,
+                    vec![with_links(
+                        "t-1",
+                        300,
+                        vec![an_edge(LinkType::Related, "t-2", false, 300)],
+                    )],
+                ),
+                theirs: a_file(
+                    4,
+                    vec![with_links(
+                        "t-1",
+                        200,
+                        vec![an_edge(LinkType::BlockedBy, "t-3", false, 200)],
+                    )],
+                ),
+                check: |out| assert_eq!(out.tasks[0].links.len(), 2),
+            },
         ];
 
         for case in cases {
@@ -2002,6 +2620,22 @@ mod tests {
         Task {
             comments,
             ..a_task(id, "a task", updated)
+        }
+    }
+
+    fn with_links(id: &str, updated: u64, links: Vec<TaskLink>) -> Task {
+        Task {
+            links,
+            ..a_task(id, "a task", updated)
+        }
+    }
+
+    fn an_edge(link: LinkType, target: &str, deleted: bool, at: u64) -> TaskLink {
+        TaskLink {
+            link,
+            target: TaskId(target.to_string()),
+            deleted,
+            at_unix_ms: at,
         }
     }
 
@@ -2165,6 +2799,468 @@ mod tests {
 
     // --- layer 1: the operations ---------------------------------------------------------------
 
+    #[test]
+    fn a_change_name_that_is_not_openspecs_kebab_is_refused() {
+        // The grammar is `dist/core/id.js`'s KEBAB_ID_REGEX in the installed CLI, restated.
+        for good in ["add-dark-mode", "auth", "m28", "a-b-c", "v2-cache"] {
+            assert!(valid_change_name(good).is_ok(), "{good} is a legal name");
+        }
+        // The four that matter, and the first two are the reason this is a refusal and not a
+        // sanitisation: the value is joined onto `openspec/changes/`.
+        for bad in [
+            "../../etc/passwd",
+            "changes/nested",
+            "Add-Dark-Mode",
+            "add--dark",
+            "-leading",
+            "trailing-",
+            "has space",
+            "",
+        ] {
+            assert!(valid_change_name(bad).is_err(), "{bad} must be refused");
+        }
+        assert!(valid_change_name(&"a".repeat(CHANGE_NAME_MAX)).is_ok());
+        assert!(valid_change_name(&"a".repeat(CHANGE_NAME_MAX + 1)).is_err());
+    }
+
+    #[test]
+    fn a_blank_change_collapses_to_unlinked_rather_than_to_an_empty_directory_name() {
+        // A `<select>` has no null, so its empty option arrives as "". Writing that through as
+        // `Some("")` would put an empty directory name in a committed file that no board could
+        // ever match — `assigneeFromDraft`'s rule, one layer down.
+        assert_eq!(
+            validated_change(Some(&ChangeName("".into()))).unwrap(),
+            None
+        );
+        assert_eq!(
+            validated_change(Some(&ChangeName("   ".into()))).unwrap(),
+            None
+        );
+        assert_eq!(validated_change(None).unwrap(), None);
+        assert_eq!(
+            validated_change(Some(&ChangeName("  add-dark-mode  ".into()))).unwrap(),
+            Some(ChangeName("add-dark-mode".into())),
+            "trimmed, so a name pasted with a trailing space is not refused for a character \
+             nobody can see"
+        );
+    }
+
+    #[test]
+    fn the_change_link_is_written_read_back_and_can_be_unlinked() {
+        let dir = TempDir::new("change-link");
+        let store = TaskStore::open(&dir.0);
+        let mut req = new_task("Add dark mode");
+        req.change = Some(ChangeName("add-dark-mode".into()));
+        let task = store.create(&req, TaskAuthor::User).expect("created");
+        assert_eq!(task.change, Some(ChangeName("add-dark-mode".into())));
+
+        let unlinked = store
+            .edit(
+                &task.id,
+                TaskEdit::SetChange { change: None },
+                TaskAuthor::User,
+            )
+            .expect("unlinked");
+        assert_eq!(
+            unlinked.change, None,
+            "null unlinks — a change that was proposed and abandoned must not need the task \
+             deleted and retyped"
+        );
+
+        // And a refusal is a refusal, not a silently rewritten value.
+        assert!(
+            store
+                .edit(
+                    &task.id,
+                    TaskEdit::SetChange {
+                        change: Some(ChangeName("../escape".into())),
+                    },
+                    TaskAuthor::User,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.get(&task.id).expect("still there").change,
+            None,
+            "and the refused write left the field where it was"
+        );
+    }
+
+    #[test]
+    fn a_task_file_written_before_the_change_link_still_parses() {
+        // `.cide/tasks.json` is committed. A build that refused last week's file over a field it
+        // added would be the tracker locking the team out of its own repository.
+        let json = r#"{"schemaVersion":1,"rev":3,"tasks":[{"id":"t-1","title":"old",
+            "body":"","status":"todo","agent":null,"comments":[],
+            "createdUnixMs":1,"updatedUnixMs":1}]}"#;
+        let file: TaskFile = serde_json::from_str(json).expect("an older file still parses");
+        assert_eq!(file.tasks[0].change, None);
+        assert!(
+            file.tasks[0].links.is_empty(),
+            "and no links, same posture (M30)"
+        );
+    }
+
+    // --- typed links (M30) ---------------------------------------------------------------------
+
+    #[test]
+    fn the_link_wire_spelling_is_serdes() {
+        // `link_wire` is a match, not a serde round trip, so it *could* drift; this is the pin.
+        // A refusal that spells a kind differently from the wire teaches the model that reads it
+        // the wrong vocabulary for its next call.
+        for kind in [LinkType::Related, LinkType::BlockedBy, LinkType::SubtaskOf] {
+            let wire = serde_json::to_value(kind).expect("serialize");
+            assert_eq!(wire.as_str().expect("a string"), link_wire(kind));
+        }
+    }
+
+    #[test]
+    fn a_link_is_written_read_back_unlinked_and_relinked() {
+        let dir = TempDir::new("links");
+        let store = TaskStore::open(&dir.0);
+        let blocker = store
+            .create(&new_task("the loader"), TaskAuthor::User)
+            .expect("create");
+        let blocked = store
+            .create(&new_task("the panel"), TaskAuthor::User)
+            .expect("create");
+
+        let linked = store
+            .edit(
+                &blocked.id,
+                TaskEdit::Link {
+                    link: LinkType::BlockedBy,
+                    target: blocker.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("linked");
+        assert_eq!(linked.links.len(), 1);
+        assert!(!linked.links[0].deleted);
+        assert_eq!(linked.links[0].target, blocker.id);
+
+        let unlinked = store
+            .edit(
+                &blocked.id,
+                TaskEdit::Unlink {
+                    link: LinkType::BlockedBy,
+                    target: blocker.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("unlinked");
+        assert_eq!(
+            unlinked.links.len(),
+            1,
+            "an unlink tombstones rather than removes — a removed edge is one the next merge \
+             with a stale file puts back"
+        );
+        assert!(unlinked.links[0].deleted);
+
+        let relinked = store
+            .edit(
+                &blocked.id,
+                TaskEdit::Link {
+                    link: LinkType::BlockedBy,
+                    target: blocker.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("relinked");
+        assert_eq!(
+            relinked.links.len(),
+            1,
+            "a re-link revives the tombstoned key rather than duplicating it — one entry per \
+             (link, target) is the invariant the merge's per-key resolution rests on"
+        );
+        assert!(!relinked.links[0].deleted);
+    }
+
+    #[test]
+    fn a_related_link_can_be_unlinked_from_either_end() {
+        let dir = TempDir::new("related-ends");
+        let store = TaskStore::open(&dir.0);
+        let a = store
+            .create(&new_task("a"), TaskAuthor::User)
+            .expect("create");
+        let b = store
+            .create(&new_task("b"), TaskAuthor::User)
+            .expect("create");
+
+        store
+            .edit(
+                &a.id,
+                TaskEdit::Link {
+                    link: LinkType::Related,
+                    target: b.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("linked");
+        // The gesture names the pair from the *other* end than the one that stored it.
+        store
+            .edit(
+                &b.id,
+                TaskEdit::Unlink {
+                    link: LinkType::Related,
+                    target: a.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("unlink from the end that does not hold the edge");
+        let holder = store.get(&a.id).expect("still there");
+        assert!(
+            holder.links[0].deleted,
+            "the edge was tombstoned where it lives, not where it was named"
+        );
+    }
+
+    #[test]
+    fn a_self_link_a_duplicate_and_a_missing_target_are_refused_at_the_gesture() {
+        let dir = TempDir::new("link-refusals");
+        let store = TaskStore::open(&dir.0);
+        let a = store
+            .create(&new_task("a"), TaskAuthor::User)
+            .expect("create");
+        let b = store
+            .create(&new_task("b"), TaskAuthor::User)
+            .expect("create");
+
+        let link = |from: &TaskId, kind: LinkType, to: &TaskId| {
+            store.edit(
+                from,
+                TaskEdit::Link {
+                    link: kind,
+                    target: to.clone(),
+                },
+                TaskAuthor::User,
+            )
+        };
+
+        assert!(link(&a.id, LinkType::Related, &a.id).is_err(), "self-link");
+        assert!(
+            link(&a.id, LinkType::BlockedBy, &TaskId("t-99".into())).is_err(),
+            "a gesture never creates a dangling edge; only a later delete or a merge can"
+        );
+
+        link(&a.id, LinkType::Related, &b.id).expect("first link");
+        assert!(
+            link(&a.id, LinkType::Related, &b.id).is_err(),
+            "a live duplicate is refused"
+        );
+        assert!(
+            link(&b.id, LinkType::Related, &a.id).is_err(),
+            "…and for related, in either direction: the pair is one fact, wherever it is stored"
+        );
+
+        // Unlinking what is not there is a sentence, and one sentence for never-existed and
+        // already-tombstoned alike — `no_such_comment`'s posture.
+        let err = store
+            .edit(
+                &a.id,
+                TaskEdit::Unlink {
+                    link: LinkType::SubtaskOf,
+                    target: b.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect_err("nothing to unlink");
+        assert!(
+            err.to_string().contains("subtaskOf"),
+            "the refusal spells the wire vocabulary: {err}"
+        );
+    }
+
+    #[test]
+    fn a_blocking_cycle_is_refused_at_the_edit_and_names_the_chain() {
+        let dir = TempDir::new("cycle");
+        let store = TaskStore::open(&dir.0);
+        let t1 = store
+            .create(&new_task("one"), TaskAuthor::User)
+            .expect("create");
+        let t2 = store
+            .create(&new_task("two"), TaskAuthor::User)
+            .expect("create");
+        let t3 = store
+            .create(&new_task("three"), TaskAuthor::User)
+            .expect("create");
+
+        let block = |from: &TaskId, on: &TaskId| {
+            store.edit(
+                from,
+                TaskEdit::Link {
+                    link: LinkType::BlockedBy,
+                    target: on.clone(),
+                },
+                TaskAuthor::User,
+            )
+        };
+        block(&t1.id, &t2.id).expect("t-1 waits on t-2");
+        block(&t2.id, &t3.id).expect("t-2 waits on t-3");
+
+        let err = block(&t3.id, &t1.id).expect_err("would close the cycle");
+        assert!(
+            err.to_string().contains(&format!("via {}", t2.id)),
+            "the refusal names the chain, because the caller cannot see it: {err}"
+        );
+
+        // Related never cycles — it gates nothing, so the same shape is legal.
+        store
+            .edit(
+                &t3.id,
+                TaskEdit::Link {
+                    link: LinkType::Related,
+                    target: t1.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("related is not a dependency");
+    }
+
+    #[test]
+    fn a_merged_or_hand_edited_cycle_does_not_freeze_the_tracker() {
+        // `validate` deliberately has no cycle rule: a merge can lawfully union two acyclic
+        // sides into a cycle, and `reconcile` swaps merge output in without re-validating — a
+        // rule a merge can break would make every later mutation roll back with nothing on
+        // screen saying why. This plants the cycle a merge would have produced and proves an
+        // unrelated edit still lands.
+        let dir = TempDir::new("cycle-tolerated");
+        dir.plant(
+            r#"{"schemaVersion":1,"rev":5,"tasks":[
+                {"id":"t-1","title":"one","body":"","status":"todo","agent":null,
+                 "links":[{"link":"blockedBy","target":"t-2","atUnixMs":10}],
+                 "comments":[],"createdUnixMs":1,"updatedUnixMs":1},
+                {"id":"t-2","title":"two","body":"","status":"todo","agent":null,
+                 "links":[{"link":"blockedBy","target":"t-1","atUnixMs":10}],
+                 "comments":[],"createdUnixMs":2,"updatedUnixMs":2}]}"#,
+        );
+        let store = TaskStore::open(dir.root());
+        store
+            .edit(
+                &TaskId("t-1".into()),
+                TaskEdit::SetTitle {
+                    title: "still editable".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("a cyclic file wedges nothing");
+    }
+
+    #[test]
+    fn repair_repoints_links_at_a_reminted_id_and_drops_what_it_cannot() {
+        let dir = TempDir::new("link-repair");
+        dir.plant(
+            r#"{"schemaVersion":1,"rev":5,"tasks":[
+                {"id":"t 5","title":"typed by hand","body":"","status":"todo","agent":null,
+                 "comments":[],"createdUnixMs":1,"updatedUnixMs":1},
+                {"id":"t-2","title":"linked","body":"","status":"todo","agent":null,
+                 "links":[
+                    {"link":"related","target":"t 5","atUnixMs":10},
+                    {"link":"related","target":"t-2","atUnixMs":11},
+                    {"link":"blockedBy","target":"t-9","atUnixMs":20},
+                    {"link":"blockedBy","target":"t-9","atUnixMs":30,"deleted":true}],
+                 "comments":[],"createdUnixMs":2,"updatedUnixMs":2}]}"#,
+        );
+
+        let file = TaskStore::open(dir.root()).snapshot();
+        let reminted = &file.tasks[0].id;
+        assert!(well_formed_id(reminted));
+        let links = &file.tasks[1].links;
+        assert!(
+            links.iter().any(|l| &l.target == reminted),
+            "the link followed the re-mint — a structured reference can be re-pointed where a \
+             prose one could only break: {links:?}"
+        );
+        assert!(
+            !links.iter().any(|l| l.target.as_str() == "t-2"),
+            "the self-link is gone"
+        );
+        assert_eq!(
+            links
+                .iter()
+                .filter(|l| l.target.as_str() == "t-9")
+                .collect::<Vec<_>>()
+                .len(),
+            1,
+            "duplicate keys collapse"
+        );
+        assert!(
+            links
+                .iter()
+                .find(|l| l.target.as_str() == "t-9")
+                .expect("kept")
+                .deleted,
+            "…keeping the newest stamp, which is the copy the merge would have chosen"
+        );
+        assert!(validate(&file).is_ok());
+    }
+
+    #[test]
+    fn deleting_a_task_leaves_links_to_it_dangling_and_the_file_valid() {
+        let dir = TempDir::new("dangling");
+        let store = TaskStore::open(&dir.0);
+        let blocker = store
+            .create(&new_task("the loader"), TaskAuthor::User)
+            .expect("create");
+        let blocked = store
+            .create(&new_task("the panel"), TaskAuthor::User)
+            .expect("create");
+        store
+            .edit(
+                &blocked.id,
+                TaskEdit::Link {
+                    link: LinkType::BlockedBy,
+                    target: blocker.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("linked");
+
+        store.delete(&blocker.id).expect("deleted");
+        let survivor = store.get(&blocked.id).expect("still there");
+        assert_eq!(
+            survivor.links.len(),
+            1,
+            "delete scrubs nothing — a scrub could not survive the merge, which has no task \
+             tombstones and would re-adopt the stale side's edge"
+        );
+        assert!(validate(&store.snapshot()).is_ok(), "and dangling is legal");
+    }
+
+    #[test]
+    fn create_lands_compose_time_links_before_the_task_is_visible() {
+        let dir = TempDir::new("create-links");
+        let store = TaskStore::open(&dir.0);
+        let blocker = store
+            .create(&new_task("first"), TaskAuthor::User)
+            .expect("create");
+
+        let mut req = new_task("second");
+        req.links = Some(vec![TaskLinkSpec {
+            link: LinkType::BlockedBy,
+            target: blocker.id.clone(),
+        }]);
+        let task = store
+            .create(&req, TaskAuthor::User)
+            .expect("created linked");
+        assert_eq!(
+            task.links.len(),
+            1,
+            "the edge is on the task the create returned"
+        );
+        assert!(!task.links[0].deleted);
+
+        // Refused whole: a bad spec must not leave a half-created task behind.
+        let before = store.list().len();
+        let mut bad = new_task("third");
+        bad.links = Some(vec![TaskLinkSpec {
+            link: LinkType::Related,
+            target: TaskId("t-99".into()),
+        }]);
+        assert!(store.create(&bad, TaskAuthor::User).is_err());
+        assert_eq!(store.list().len(), before, "nothing half-created");
+    }
+
     fn new_task(title: &str) -> TaskNew {
         TaskNew {
             project: cide_ipc::ProjectId::new(),
@@ -2172,6 +3268,8 @@ mod tests {
             body: None,
             agent: None,
             status: None,
+            change: None,
+            links: None,
         }
     }
 
@@ -2759,6 +3857,7 @@ mod tests {
             .create(
                 &TaskNew {
                     status: Some(TaskStatus::Doing),
+                    change: None,
                     ..new_task("already under way")
                 },
                 TaskAuthor::User,

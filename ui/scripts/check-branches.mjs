@@ -183,6 +183,37 @@ try {
     ),
     'GitError still carries checkoutWouldOverwrite {branch, paths} — the refusal the popup unpacks',
   )
+  // The two staging refusals the Git panel's drop-to-add raises. Without these the panel's
+  // `explain` arms are dead code and the gesture is back to printing whichever tag Rust
+  // happened to send — which is how it came to say `[object Object]`.
+  for (const tag of ['pathIgnored', 'nestedRepository']) {
+    ok(
+      new RegExp(`"kind": "${tag}", "detail": \{ path: string, \}`).test(generated),
+      `GitError still carries ${tag} {path} — the refusal the Git panel explains`,
+    )
+  }
+
+  /*
+   * And the surface. `explain` having an arm is half the fix; the panel calling it is the
+   * other half, and the half that was missing.
+   *
+   * `useGitPanel::trackPaths` is the drop-to-add gesture. Its failure line read
+   * `e instanceof Error ? e.message : String(e)`, and a `GitError` is neither an `Error` nor a
+   * string — so the message a user saw was `nothing was added to git — [object Object]`, for a
+   * refusal Rust had a perfectly good reason for. Grepped rather than executed because the hook
+   * is a React module this script cannot import.
+   */
+  // Comments stripped: the fixed line carries a comment that *quotes* `String(e)` as the thing
+  // it is not, and a raw grep would match the warning and call the bug present.
+  const panel = stripComments(
+    readFileSync(join(UI, 'src', 'sidebar', 'GitPanel', 'useGitPanel.ts'), 'utf8'),
+  )
+  const track = panel.slice(panel.indexOf('const trackPaths'))
+  ok(track.includes('const detail = explain(e)'), 'the drop-to-add failure goes through explain')
+  ok(
+    !/String\(e\)/.test(track.slice(0, track.indexOf('const dismissDialog'))),
+    'and nothing in that gesture stringifies a rejection by hand',
+  )
 
   // --- compile the model on its own -------------------------------------------------------
 
@@ -442,6 +473,37 @@ try {
       // This used to arrive as libgit2's own `Config: remote 'origin' does not exist`, via
       // the catch-all `git` variant. True, and useless to someone who has not added a remote.
       'a repository with no remote is told how to get one',
+    ],
+    [
+      { kind: 'pathIgnored', detail: { path: '.cide/worktrees/' } },
+      '.gitignore',
+      // Raised by the Git panel's drop-to-add. Rust answered `noSuchChange` for this until M30,
+      // which is *"…has no changes to apply"* about a directory full of files the user is
+      // looking at, and the panel then printed the whole tagged object as `[object Object]`.
+      // The sentence has to name the thing that is refusing — a rule, in a file they can open.
+      'an ignored path is told which mechanism refuses it',
+    ],
+    [
+      { kind: 'pathIgnored', detail: { path: '.cide/worktrees/' } },
+      'git add -f',
+      'and how to overrule it, since cide has no gesture that can',
+    ],
+    [
+      { kind: 'nestedRepository', detail: { path: '.cide/worktrees/agent-1/' } },
+      'submodule',
+      // An agent worktree, or a vendored clone. libgit2's own refusal is `invalid path:
+      // 'x/'` — a complaint about a trailing slash, which reads as a bug in cide.
+      'a nested repository is told the one arrangement that would make it work here',
+    ],
+    [
+      { kind: 'noSuchChange', detail: { path: 'src/a.rs' } },
+      'src/a.rs',
+      'noSuchChange names the path — it is a race, and the user needs to know which file lost it',
+    ],
+    [
+      { kind: 'staleSelection', detail: { path: 'src/a.rs' } },
+      'pick again',
+      'staleSelection says the ticks are what went stale, not the file',
     ],
   ]) {
     ok(said(error).includes(needle), `${what} — got ${JSON.stringify(said(error))}`)

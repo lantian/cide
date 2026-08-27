@@ -37,23 +37,46 @@
  * first character they type. A Create that materialised mid-word is harder to understand than one
  * that has been sitting there greyed out.
  */
-import { useRef, type JSX } from 'react'
+import { useRef, useState, type JSX } from 'react'
 import { OverlayCard } from '@/overlays/ModalShell'
 import {
+  LINK_KINDS,
   TASK_STATUSES,
   UNASSIGNED,
   assignableRoles,
   closeCompose,
   draftReady,
   fieldLabel,
+  isLinkKind,
+  linkLabel,
   statusLabel,
+  type LinkKind,
+  type LinkTargetOption,
   type TaskDraft,
 } from './model'
 import { cx } from './TaskDetail'
+import { LinkTargetInput } from './LinkTargetInput'
 import { MentionTextarea } from './MentionTextarea'
 import { Icon } from '@/icons/Icon'
 
 import styles from './TasksPanel.module.css'
+
+/**
+ * The sentence under the picker.
+ *
+ * One fact a user cannot get anywhere else, and it is about what pressing Create will *do*:
+ * assigning is what starts the agent, which is the single most surprising thing about this
+ * feature if nobody says it.
+ *
+ * It said one thing more — the directory a proposed change would take — until the option that
+ * proposed one was removed. See the picker below for why.
+ */
+function specNote(draft: TaskDraft): string {
+  const assigned = draft.assignee.trim() !== ''
+  return assigned
+    ? 'Creating this assigns the role and starts it on this change — approving a change is assigning it.'
+    : 'Links this task to that change, so a run started on it is pointed at the checklist.'
+}
 
 export interface TaskComposeProps {
   /** What has been typed so far. Controlled — the store holds it; see `tasksStore.compose`. */
@@ -66,6 +89,21 @@ export interface TaskComposeProps {
    * is indistinguishable from the wiring bug it used to be.
    */
   assigneeHint?: string | null | undefined
+  /**
+   * The changes this project has in flight, newest question first. (M28)
+   *
+   * **Absent means the row is not drawn at all** — a project with no `openspec/`, or one whose
+   * board has not been read, sees exactly the dialog it saw before M28. That is the optionality
+   * claim, made structurally rather than by a flag somebody could forget to check.
+   */
+  changes?: readonly string[] | undefined
+  /**
+   * The tasks a link may point at — the board's rows, in panel order. (M30)
+   *
+   * Absent means the links row is not drawn: `changes`' structural optionality, for its reason
+   * — and it is also simply true that a board that has not been read has nothing to link to.
+   */
+  tasks?: readonly LinkTargetOption[] | undefined
   /** A keystroke, a choice, a status. The draft is replaced whole. */
   onDraft: (draft: TaskDraft) => void
   /** Create. Only ever called with a draft `draftReady` admits. */
@@ -118,12 +156,22 @@ export function TaskCompose({
   draft,
   roles,
   assigneeHint = null,
+  changes,
+  tasks,
   onDraft,
   onCreate,
   onCancel,
   busy = false,
 }: TaskComposeProps) {
   const ready = draftReady(draft)
+  /*
+   * Which kind the next link takes. (M30) Local, unlike everything else the dialog holds,
+   * because it is not part of the draft: choosing a *target* is the add — the assignee
+   * `<select>`'s choosing-is-the-commit argument — and this only says what that add will mean.
+   * The markup is identical whatever it holds, so nothing the render check could story lives
+   * here.
+   */
+  const [linkKind, setLinkKind] = useState<LinkKind>('related')
   /*
    * The focus handle, for the same reason the card has one: Escape is handled on this element,
    * and React dispatches synthetic events through the React tree, so it hears Escape from every
@@ -245,30 +293,190 @@ export function TaskCompose({
 
         <Field field="assignee">
           {(id) => (
+            <>
+              <select
+                id={id}
+                className={styles.select}
+                data-audit="taskComposeField"
+                data-field="assignee"
+                data-write="true"
+                value={draft.assignee}
+                onChange={(event) => onDraft({ ...draft, assignee: event.target.value })}
+              >
+                {/* The empty option **is** unassigned — a `<select>` has no null. `assigneeFromDraft`
+                    is the other half of that convention and converts it back in the store. */}
+                <option value="">{UNASSIGNED}</option>
+                {assignableRoles(null, roles).map((agent) => (
+                  <option key={agent} value={agent}>
+                    {roles[agent] ?? agent}
+                  </option>
+                ))}
+              </select>
+              {/* Inside the row, not after it: the rows are bordered blocks now, and a sentence
+                  about the assignee list floating between two boxes belongs to neither. The card's
+                  editor already draws it inside the field for the same reason. */}
+              {assigneeHint !== null && (
+                <p className={styles.assigneeHint} data-audit="tasksAssigneeHint">
+                  {assigneeHint}
+                </p>
+              )}
+            </>
+          )}
+        </Field>
+
+        {/*
+          * The OpenSpec row. (M28)
+          *
+          * Its own row, hooked `taskComposeSpecRow` and **not** `taskComposeRow`, which is not
+          * cosmetic: `check-agents-render.mjs` asserts `composeControls === 3` with a paragraph
+          * arguing exactly three — the title box, the assignee select and the body box. Adding a
+          * fourth control to that hook would break a check whose comment explains a different
+          * number, and the honest fix is a hook of its own.
+          */}
+        {changes !== undefined && (
+          <div
+            className={styles.field}
+            data-audit="taskComposeSpecRow"
+            data-field="change"
+          >
+            <label className={styles.fieldLabel} htmlFor="compose-change">
+              OpenSpec change
+            </label>
             <select
-              id={id}
+              id="compose-change"
               className={styles.select}
-              data-audit="taskComposeField"
-              data-field="assignee"
+              data-audit="taskComposeSpecPicker"
               data-write="true"
-              value={draft.assignee}
-              onChange={(event) => onDraft({ ...draft, assignee: event.target.value })}
+              value={draft.change}
+              onChange={(event) => onDraft({ ...draft, change: event.target.value })}
             >
-              {/* The empty option **is** unassigned — a `<select>` has no null. `assigneeFromDraft`
-                  is the other half of that convention and converts it back in the store. */}
-              <option value="">{UNASSIGNED}</option>
-              {assignableRoles(null, roles).map((agent) => (
-                <option key={agent} value={agent}>
-                  {roles[agent] ?? agent}
+              <option value="">Not a spec change</option>
+              {/*
+                * **There is no "new change from this task" option, and there must not be.**
+                *
+                * There was. It called `spec_propose`, which scaffolds the directory and writes a
+                * stub proposal — no delta specs, no task checklist. So pressing Create produced
+                * a change that `openspec validate` refuses and whose board row reads `0/0` for
+                * ever: cide manufacturing a broken artefact out of a title, at the one moment
+                * the user has told it least about the work.
+                *
+                * Writing a proposal *is* work — it needs the codebase and the existing specs —
+                * so the gesture moved to after the task exists, where a conversation can do it:
+                * the card offers *Make a proposal*, which runs `/openspec-propose` and tells it
+                * to link the change back. This picker only ever links to a change that is
+                * already there.
+                */}
+              {changes.map((change) => (
+                <option key={change} value={change}>
+                  {change}
                 </option>
               ))}
             </select>
-          )}
-        </Field>
-        {assigneeHint !== null && (
-          <p className={styles.assigneeHint} data-audit="tasksAssigneeHint">
-            {assigneeHint}
-          </p>
+            {draft.change !== '' && (
+              <p className={styles.assigneeHint} data-audit="taskComposeSpecNote">
+                {specNote(draft)}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/*
+          * The links row. (M30)
+          *
+          * Its own hooks — `taskComposeLinkRow`, not `taskComposeRow` — for exactly the reason
+          * the spec row's comment gives: `check-agents-render.mjs` asserts `composeControls === 3`
+          * with a paragraph arguing exactly three, and a fourth control under that hook would
+          * break a check whose comment explains a different number.
+          *
+          * Choosing a target **is** the add — the assignee `<select>`'s argument: the choice
+          * carries the whole value, and a third press to confirm it would be a button with
+          * nothing left to do. The kind `<select>` beside it says what the add will mean. Links
+          * are here at all, rather than left to the card afterwards, because a create naming an
+          * assignee dispatches immediately — `TaskDraft::links` carries the interleaving.
+          */}
+        {tasks !== undefined && (
+          <div className={styles.field} data-audit="taskComposeLinkRow" data-field="links">
+            <label className={styles.fieldLabel} htmlFor="compose-link-target">
+              Links
+            </label>
+            {draft.links.length > 0 && (
+              <div className={styles.linkChips} data-audit="taskComposeLinkChips">
+                {draft.links.map((link) => (
+                  <span className={styles.linkPair} key={`${link.kind}:${link.target}`}>
+                    <span
+                      className={styles.linkChip}
+                      data-audit="taskComposeLinkChip"
+                      data-kind={link.kind}
+                      data-target={link.target}
+                    >
+                      {linkLabel(link.kind, 'out')} {link.target}
+                    </span>
+                    <button
+                      type="button"
+                      className={styles.linkRemove}
+                      data-audit="taskComposeLinkRemove"
+                      title="Remove this link from the draft"
+                      aria-label={`Do not link ${link.target}`}
+                      onClick={() =>
+                        onDraft({
+                          ...draft,
+                          links: draft.links.filter(
+                            (kept) => kept.kind !== link.kind || kept.target !== link.target,
+                          ),
+                        })
+                      }
+                    >
+                      <Icon name="x" size={0} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className={styles.linkAdd}>
+              <select
+                className={cx(styles.select, styles.linkKind)}
+                data-audit="taskComposeLinkKind"
+                aria-label="Link kind"
+                value={linkKind}
+                onChange={(event) => {
+                  const kind = event.target.value
+                  if (isLinkKind(kind)) setLinkKind(kind)
+                }}
+              >
+                {LINK_KINDS.map((kind) => (
+                  <option key={kind} value={kind}>
+                    {linkLabel(kind, 'out')}
+                  </option>
+                ))}
+              </select>
+              {/*
+                * The target, by search — the same id-or-title autocomplete the card's picker
+                * uses, so finding a task reads identically on both surfaces. Picking clears the
+                * input, ready for the next one; no `onDismiss`, so Escape on the empty input
+                * still falls through to the dialog's own Escape, exactly as it does from every
+                * other field here.
+                */}
+              <LinkTargetInput
+                targets={tasks}
+                listboxId="compose-link-targets"
+                id="compose-link-target"
+                data-audit="taskComposeLinkTarget"
+                data-write="true"
+                aria-label="Link a task"
+                onPick={(target) => {
+                  // A duplicate pick collapses silently to the chip that is already drawn — the
+                  // gesture's outcome is on screen either way, which is more than a refusal
+                  // sentence would say here.
+                  if (
+                    draft.links.some((link) => link.kind === linkKind && link.target === target)
+                  ) {
+                    return
+                  }
+                  onDraft({ ...draft, links: [...draft.links, { kind: linkKind, target }] })
+                }}
+              />
+            </div>
+          </div>
         )}
 
         <Field field="body">

@@ -73,7 +73,7 @@ import {
   type StatusFilter,
   type TaskView,
 } from './model'
-import { phaseGlyph, type RunPhase } from '@/sidebar/AgentsPanel/model'
+import { glyphSpins, phaseGlyph, type RunPhase } from '@/sidebar/AgentsPanel/model'
 import { DeleteControl, TONE_CLASS, chipClass, cx } from './TaskDetail'
 import type { ProjectId } from '@/ipc/client'
 import { Icon, asIcon } from '@/icons/Icon'
@@ -622,7 +622,17 @@ function TaskLine({
               the phase verbatim and unvalidated, which is what that function's own guard is
               for. */}
           {chip.lit && (
-            <span className={styles.chipDot} aria-hidden="true">
+            <span
+              /* And it **turns** when it is the spinner. `glyphSpins` is the same table's
+                 companion, for the reason the import above gives: a second answer to which mark
+                 means *running* would drift from the first the day either moved. It did not turn
+                 for a milestone and a half — see `model.ts::SPINNING_GLYPH`. */
+              className={cx(
+                styles.chipDot,
+                glyphSpins(phaseGlyph((chip.phase ?? '') as RunPhase)) && styles.chipSpin,
+              )}
+              aria-hidden="true"
+            >
               <Icon name={asIcon(phaseGlyph((chip.phase ?? '') as RunPhase))} size={0} />
             </span>
           )}

@@ -1,0 +1,9 @@
+%YAML 1.2
+---
+# Nothing here is a shape this reader understands.
+rules: {proposal: [one, two]}
+operations:
+  apply: &anchor
+    guidance: *anchor
+a line that is not a mapping at all
+  - a list item belonging to nothing

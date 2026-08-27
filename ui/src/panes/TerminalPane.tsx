@@ -32,6 +32,7 @@ import { openTerminalFind } from '@/terminal/findStore'
 import findStyles from './TerminalFindBar.module.css'
 import { registerRestarter } from './paneRestart'
 import { acknowledge } from './awaiting'
+import { acknowledgesKey } from './awaitingRule'
 import {
   claudeSession,
   diag,
@@ -598,6 +599,25 @@ export function TerminalPane({
         getHost(paneId).sessionId = plan.session
         getHost(paneId).mirrored = true
       }
+    } else if (plan?.kind === 'resume') {
+      /*
+       * A **new child** continuing a conversation whose old one is gone. (M28)
+       *
+       * Deliberately not the mirror branch above it, and the difference is the ownership flag,
+       * not the flag's spelling: this pane spawns the process, so it owns it and closing the
+       * pane must end it. `mirrored` is therefore left unset — the mistake in the other
+       * direction killed an agent mid-turn once, and it is recorded at length beside
+       * `agent_open_pane` in `cmd/agents.rs`.
+       *
+       * And not `forkPrimary`, whose whole point is that it mints a *different* id so the two
+       * histories diverge. A `SessionId` is the value cide passes to `claude --session-id`, so
+       * keeping it is what makes this the same conversation — and what keeps every record that
+       * names it, a task's `session` field above all, naming the right one.
+       *
+       * `session_spawn` is told the id through `resume`; the pane's own `session` already holds
+       * it, put there by `pane_for`'s `Resume` arm, so the two agree by construction.
+       */
+      spec.resume = plan.session
     } else if (plan?.kind === 'forkPrimary' && primaryRef.current) {
       spec.resume = primaryRef.current
       spec.fork = true
@@ -854,7 +874,7 @@ export function TerminalPane({
     hostEl.addEventListener('contextmenu', onMenu)
 
     /*
-     * "The user has seen this session" — on a *keystroke*, not on terminal output.
+     * "The user has seen this session" — on a *keystroke* or a *scroll*, not on terminal output.
      *
      * This used to hang off `term.onData`, which is wrong in a way that only shows up in the
      * one situation the whole feature exists for. `onData` is xterm's outbound stream, and the
@@ -863,26 +883,58 @@ export function TerminalPane({
      * terminal at the end of a turn, so the sequence was reliably: the turn finishes, the
      * marker goes up, the CLI asks the terminal something, xterm replies on `onData`, and the
      * marker clears itself half a second later with nobody at the keyboard. Then the user comes
-     * back to a task bar that says nothing is waiting.
+     * back to a task bar that says nothing is waiting. `sessionSink.ts` carries the other half
+     * of that, where the keystrokes actually leave for the pty.
      *
-     * A `keydown` on the pane host cannot be forged by the child: it is the user pressing a
-     * key inside this pane, which is the strongest statement available that they are here and
-     * looking. Bare modifiers are excluded — holding Ctrl to read a chord, or Alt to reach a
-     * menu, is not reading a conversation, and on some layouts a modifier is pressed on the way
-     * to somewhere else entirely.
+     * Neither of these can be forged by the child: they are a person pressing a key or turning
+     * a wheel inside this pane, which is the strongest statement available that they are here
+     * and looking. `acknowledgesKey` is the rule about which strokes count.
      *
-     * Deliberately *not* routed through the key gate. The gate decides what a chord *does*; the
-     * question here is only whether a human touched this pane, and a keystroke the gate swallows
-     * for a global binding is still a human touching this pane.
+     * # Capture, and it is the whole of the reported bug
+     *
+     * Both listeners are registered in the **capture** phase, and a bubble listener here is
+     * silently dead rather than merely late. xterm's own handlers live on `term.textarea`,
+     * which is a descendant of this element (`paneHosts.ts` gives `host.el` to `term.open()`),
+     * and `_keyDown` ends every key it consumes with `cancel(ev, true)` — which is
+     * `preventDefault()` **and `stopPropagation()`**. So a bubble listener never sees a
+     * printable character, `Enter`, or an arrow key: it is alive for exactly the keys that mean
+     * nothing and dead for every key that means a person is here. This shipped, and the report
+     * was that the marker could only be cleared by clicking a pane the user was already typing
+     * in — `PaneTitleBar`'s pointer-down and focus handlers are React *capture* handlers, which
+     * is the only reason those two worked. `terminal/inputHost.ts` states the ordering rule at
+     * length and relies on it for the IME guard; this is the same rule, obeyed here too.
+     *
+     * The removals must carry the same flag: `removeEventListener` matches on the capture flag,
+     * and the host outlives this mount, so a mismatched removal leaks one acknowledger per
+     * mount onto an element that keeps the whole terminal reachable.
+     *
+     * # What does *not* acknowledge, and why the previous version of this comment was wrong
+     *
+     * A chord the key gate consumes — `ctrl+shift+p` and everything else in `keymap.json`.
+     * This used to claim that "a keystroke the gate swallows for a global binding is still a
+     * human touching this pane", which was a statement about intent that the code could not
+     * carry out: `keys/gate.ts`'s entry 2 is a capture listener on `window`, above every pane,
+     * and it calls `stopPropagation()` there — so the stroke never reaches this element in
+     * either phase and no listener here could ever have seen it. Opening the palette is not
+     * reading a conversation, so the boundary is left where the mechanism puts it.
      */
     const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === 'Shift' || ev.key === 'Control' || ev.key === 'Alt' || ev.key === 'Meta') {
-        return
-      }
+      if (!acknowledgesKey(ev.key)) return
       const id = getHost(paneId).sessionId
       if (id) acknowledge(id)
     }
-    hostEl.addEventListener('keydown', onKeyDown)
+    hostEl.addEventListener('keydown', onKeyDown, true)
+
+    // Scrolling this pane's scrollback is reading it — the one act that is unambiguously
+    // "I am looking at this output" and involves no keyboard at all, which is how a finished
+    // `make` is usually read. Passive: nothing here calls `preventDefault`, and a non-passive
+    // wheel listener on a scrolling surface makes the browser wait for this handler before it
+    // may scroll. Removed with a bare `true` — removal matches on the capture flag alone.
+    const onWheel = () => {
+      const id = getHost(paneId).sessionId
+      if (id) acknowledge(id)
+    }
+    hostEl.addEventListener('wheel', onWheel, { capture: true, passive: true })
 
     // Exit, busy and the eviction-protecting `setHostBusy` all arrive through
     // `sessionSink.ts`'s single module-level `cide://session-state` dispatch now, which is
@@ -906,7 +958,8 @@ export function TerminalPane({
       // pane remounted by a split would accumulate one right-click handler per mount and open
       // as many menus.
       hostEl.removeEventListener('contextmenu', onMenu)
-      hostEl.removeEventListener('keydown', onKeyDown)
+      hostEl.removeEventListener('keydown', onKeyDown, true)
+      hostEl.removeEventListener('wheel', onWheel, true)
       // Deliberately no `paneSession.detach` here — the sink belongs to the host now
       // (`sessionSink.ts`), and an unmount is usually a *park*: a project switch, a split,
       // a re-dock in transit. Detaching with the mount is exactly the frozen-pane bug this

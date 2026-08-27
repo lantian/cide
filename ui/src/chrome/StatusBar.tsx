@@ -1,10 +1,15 @@
 /**
  * The 24px status bar along the bottom of the window.
  *
- * Two of the mock's slots describe a language server, and v1 ships without one. Rather
- * than print the mock's `✗ 0 ⚠ 2` and `rust-analyzer` regardless, the diagnostics group
- * degrades to a visible gap and the server name is dropped altogether: a confident `✗ 0`
- * that really means "nobody looked" is the one failure mode a status bar cannot afford.
+ * # The four counters are gone
+ *
+ * The left group used to carry `⊕ — ⊖ — ✗ 0 ⚠ 2` beside the branch: a working-tree diff
+ * stat and the diagnostics pair. The diff half never had a source at all — there is no
+ * working-tree line count on the wire — so it spent every launch printing a dash, and the
+ * diagnostics half is a second rendering of a figure the ⚠ Problems rail button already
+ * badges two rows up. The user asked for the row back, and both slots went with it. What is
+ * *not* lost is the snapshot behind them: `App.tsx` still derives `diagCounts` and still feeds
+ * the rail's badge, so the count has one renderer instead of two.
  *
  * Every field is a prop with a placeholder default. The bar reads nothing from the store,
  * so it stays a pure render target that a screenshot test can drive directly.
@@ -27,19 +32,11 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { sameTrail, subscribeStatusReadout, type ReadoutLine } from '@/editor/statusReadout'
-import { NO_DIAGNOSTICS_SOURCE } from '@/sidebar/ProblemsPanel/model'
 import { crumbTargets } from '@/sidebar/rowPaths'
 import { BranchSelector } from './BranchSelector'
 import { Icon } from '@/icons/Icon'
 
 import styles from './StatusBar.module.css'
-
-export interface Diagnostics {
-  errors: number
-  warnings: number
-  /** Something is still scanning: the counts are live but may grow. */
-  pending?: boolean
-}
 
 export interface StatusBarProps {
   /*
@@ -47,25 +44,14 @@ export interface StatusBarProps {
    * slot printed a dash forever. `BranchSelector` reads the repository itself; a prop would be
    * a second source of truth for a value it already holds to draw its list.
    */
-  /**
-   * Lines added and removed in the working tree.
+  /*
+   * No `added`/`removed` and no `diagnostics` either, for the same reason and one more.
    *
-   * **Nothing supplies these, and nothing ever has.** They defaulted to `0`, so the slot has
-   * spent every launch claiming a clean tree with total confidence — which is the same failure
-   * the `branch` prop above is a note about, and worse, because a dash is obviously a
-   * placeholder and a zero is a measurement. They are `undefined` by default now and the slot
-   * draws a dash, exactly as the diagnostics pair does when no source has looked.
-   *
-   * Wiring them is a backend change rather than a prop: there is no working-tree line count on
-   * the wire at all. `cide_ipc::git`'s `insertions`/`deletions` belong to a *pull outcome*, and
-   * `cide_git::show::line_counts` is commit-oriented — it takes a rev. A real figure needs a
-   * diff of HEAD against the working tree, summed across every root, behind a command of its
-   * own and a subscription that refreshes it as files change.
+   * The diff pair had no producer anywhere in the workspace — there is no working-tree line
+   * count on the wire, so the slot could only ever draw a dash — and the diagnostics pair had
+   * one but shared it with the rail's ⚠ badge, which is nearer the eye and already there. See
+   * the header.
    */
-  added?: number | undefined
-  removed?: number | undefined
-  /** `null` means no diagnostics source is running, which is distinct from zero of each. */
-  diagnostics?: Diagnostics | null | undefined
   claude?: string | undefined
   /**
    * Every path the file tree can hang a row from — the project's roots plus each synthetic
@@ -94,28 +80,7 @@ export interface StatusBarProps {
   onRevealSegment?: ((path: string) => void) | undefined
 }
 
-/*
- * The wording now lives in `sidebar/ProblemsPanel/model.ts`, because the problems panel says
- * the same thing at length and these two are the only surfaces that speak for the missing
- * analyser. Two hand-kept copies of a user-visible claim are two claims, and this one had
- * already been written twice by the time the panel existed.
- *
- * The import goes chrome → sidebar, which is the wrong direction for a component but not for
- * this: `model.ts` is pure, importless data, so the bar stays a render target that pulls in
- * no store and no React tree. `ui/scripts/check-problems.mjs` fails if this file grows its
- * own copy of the sentence again.
- */
-const DIAGNOSTICS_PENDING = NO_DIAGNOSTICS_SOURCE
-
 const CLAUDE_PENDING = 'Session readout arrives from the Claude statusline hook.'
-
-/*
- * Deliberately says nobody has counted, rather than pretending a clean tree.
- *
- * The same distinction the diagnostics pair draws: `— —` means no source looked, `0 0` means a
- * source looked and found nothing. This slot has only ever been able to say the first.
- */
-const DIFF_PENDING = 'No working-tree line count is wired yet — this is not a claim of zero.'
 
 /** Shown until a real readout exists, and the value the pending title keys off. */
 const CLAUDE_PLACEHOLDER = 'claude · —'
@@ -150,9 +115,6 @@ function isSelecting(): boolean {
 }
 
 export function StatusBar({
-  added,
-  removed,
-  diagnostics = null,
   claude = CLAUDE_PLACEHOLDER,
   revealRoots,
   onRevealSegment,
@@ -186,9 +148,10 @@ export function StatusBar({
    * The rule is `sidebar/rowPaths.ts`, which is pure and import-free and is compiled and driven
    * by two check scripts. That is not a style preference: the four bugs this project has paid
    * most for were all rules written inside a hook or an event handler, where nothing can compile
-   * them. The import goes chrome → sidebar, which is the same direction — and the same
-   * justification — as `NO_DIAGNOSTICS_SOURCE` above: a pure, importless module, so the bar stays
-   * a render target that pulls in no store and no React tree.
+   * them. The import goes chrome → sidebar, which is the wrong direction for a component but
+   * not for this: `rowPaths.ts` is pure, importless data, so the bar stays a render target that
+   * pulls in no store and no React tree. (It is the last such import here — the problems
+   * model's no-source sentence went with the diagnostics counters.)
    */
   const targets = crumbTargets(
     crumbs.file,
@@ -210,75 +173,6 @@ export function StatusBar({
           * has to hold to render the list.
           */}
         <BranchSelector />
-
-        {/*
-         * The two counts sit in one slot rather than being separated by the gap between
-         * slots, so they read as a single diff stat.
-         *
-         * It was one template literal with two **non-breaking** spaces in it, because under
-         * `white-space: nowrap` a run of ordinary spaces collapses and the pair came out one
-         * space wide. With drawn marks the string is gone and so is that hazard: `.stat` is a
-         * flex row with its own gaps, and a gap cannot collapse.
-         *
-         * A dash rather than a zero while nothing supplies them — see the props above.
-         */}
-        <span
-          className={
-            added === undefined || removed === undefined
-              ? `${styles.diffStat} ${styles.unknownInk}`
-              : styles.diffStat
-          }
-          title={
-            added === undefined || removed === undefined
-              ? DIFF_PENDING
-              : `${added} lines added, ${removed} removed`
-          }
-        >
-          <span className={styles.stat}>
-            <Icon name="circle-plus" size={1} />
-            {added ?? '—'}
-          </span>
-          <span className={styles.stat}>
-            <Icon name="circle-minus" size={1} />
-            {removed ?? '—'}
-          </span>
-        </span>
-
-        {diagnostics === null ? (
-          <span className={styles.unknown} title={DIAGNOSTICS_PENDING}>
-            <span className={styles.stat}>
-              <Icon name="circle-x" size={1} />—
-            </span>
-            <span className={styles.stat}>
-              <Icon name="triangle-alert" size={1} />—
-            </span>
-          </span>
-        ) : (
-          <>
-            <span
-              className={`${styles.errors} ${styles.stat}`}
-              title={
-                diagnostics.pending
-                  ? `${diagnostics.errors} errors so far — still indexing`
-                  : `${diagnostics.errors} errors`
-              }
-            >
-              <Icon name="circle-x" size={1} />
-              {diagnostics.errors}
-            </span>
-            <span
-              className={`${styles.warnings} ${styles.stat}`}
-              title={
-                diagnostics.pending
-                  ? `${diagnostics.warnings} warnings so far — still indexing`
-                  : `${diagnostics.warnings} warnings`
-              }
-            >
-              <Icon name="triangle-alert" size={1} />
-              {diagnostics.warnings}
-            </span>
-          </>
-        )}
       </div>
 
       <div className={styles.right}>

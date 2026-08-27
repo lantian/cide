@@ -17,18 +17,17 @@
  * No `snapshot` prop: omitting it *is* the v1 answer (`NO_SOURCE` — nothing is analysing this
  * workspace). Passing `snapshot={NO_SOURCE}` explicitly would say the same thing twice.
  *
- * ## Keeping the status bar in step
+ * ## Keeping the rail's badge in step
  *
- * `StatusBar`'s `diagnostics` prop takes exactly what `statusBarCounts` returns, so one
- * snapshot drives both surfaces and they cannot disagree about whether the workspace is
- * clean:
+ * `statusBarCounts` is the bridge: `App.tsx` derives `diagCounts` from the same filtered
+ * snapshot the panel renders and hands its `errors` to the rail's ⚠ button, so the badge and
+ * the list cannot disagree about whether the workspace is clean. `null` — nobody looked —
+ * draws no badge, which is distinct from a badge reading zero.
  *
- * ```tsx
- * <StatusBar diagnostics={statusBarCounts(NO_SOURCE)} … />   // null → `✗ — ⚠ —`
- * ```
- *
- * App.tsx passes no `diagnostics` today and the prop already defaults to `null`, so the bar
- * is correct as it stands; wire this only when a real snapshot exists to thread through.
+ * The status bar was its second consumer and is not any more (M28): `✗ n ⚠ n` beside the
+ * branch was the same figure one row down, and it went with the diff counters next to it. The
+ * name of the function is the last trace of that; it is kept because the ids are what the
+ * check script imports.
  *
  * ## When a language server lands
  *

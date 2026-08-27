@@ -53,6 +53,8 @@ function tabTitle(kind: TabKind): string {
       return 'Settings'
     case 'extension':
       return kind.name
+    case 'openSpec':
+      return kind.subject.kind === 'change' ? kind.subject.change : kind.subject.spec
   }
 }
 

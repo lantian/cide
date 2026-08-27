@@ -58,6 +58,19 @@
   box-shadow: var(--shadow-3);
   /* The list's rows are square-cornered; without this they paint over the card's radius. */
   overflow: hidden;
+  /*
+   * Every dialog in the app is this card, portalled to `document.body` by `OverlayCard` — so it
+   * is a sibling of whatever opened it, not a descendant, and the panel-level opt-ins (say
+   * `TasksPanel.module.css`'s `.body`) never reach it. Under the app-wide `user-select: none` on
+   * `html, body` that made a task's comments, a conflict's paths and a changelist's file names
+   * unselectable and uncopyable — text a person opened the dialog to read.
+   *
+   * Chrome inside the card takes the `none` back below: `.inputRow`, `.counter` and `.list`,
+   * which is every keyboard-navigated row in the five pickers. Both spellings, prefixed first —
+   * WebKitGTK drops the unprefixed one, so an opt-in written once computes `none`.
+   */
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .inputRow {
@@ -68,6 +81,10 @@
   gap: 9px;
   padding: 0 14px;
   border-bottom: 1px solid var(--border);
+  /* Chrome, and outside `.list`: the prompt and the counter are not text anyone copies. The
+     `<input>` itself stays selectable — a form control is, whatever this says. */
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .prompt {
@@ -154,6 +171,9 @@
   font-size: var(--fs-ui-12);
   color: var(--faint);
   font-variant-numeric: tabular-nums;
+  /* "6 of 2,418" — a readout, not content, and it changes on every keystroke. */
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .list {
@@ -161,6 +181,16 @@
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  /*
+   * The one place inside the card that keeps the app-wide `none`, and it covers `.row`,
+   * `.viewport`, `.status` and `.usageSummary` in one rule — every virtualized row of all five
+   * pickers. A row is a navigation target reached with the arrow keys, not prose: a drag across
+   * it would smear a selection over rows that are about to be recycled under it, and a mousedown
+   * that starts a selection is a mousedown that moves focus off the search input, which is the
+   * caret-repaint failure `FilePicker.tsx` and `check-picker.mjs` already guard against.
+   */
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* The virtualizer's spacer: one tall relatively-positioned box the absolute rows sit in. */

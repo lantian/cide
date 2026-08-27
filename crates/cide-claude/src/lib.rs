@@ -34,6 +34,7 @@ pub mod version;
 pub use headless::{Headless, ToolAccess};
 pub use hook::{HookEvent, HookFrame};
 pub use orphans::{arm, on_spawn_thread, sweep_hook_sockets};
+pub use roster::claude_dir;
 pub use roster::names as session_names;
 pub use session::conversation;
 pub use settings::{ClaudeTheme, StatusLine, inline_settings};

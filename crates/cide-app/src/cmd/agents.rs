@@ -595,6 +595,14 @@ pub async fn agents_integrate(
 /// work lives on `cide/<role>-<task>` and `None` targets the role's base branch — the one its
 /// taskless dispatches commit to. Composed with the same `checkout_name` a dispatch uses, so
 /// the branch integrated is by construction the branch that run committed to.
+pub(crate) fn integrate_for(
+    root: &Path,
+    agent: &AgentId,
+    task: Option<&TaskId>,
+) -> Result<AgentIntegration> {
+    integrate(root, agent, task)
+}
+
 fn integrate(root: &Path, agent: &AgentId, task: Option<&TaskId>) -> Result<AgentIntegration> {
     let name = cide_agents::checkout_name(agent, task);
     match cide_git::worktree::integrate(root, &name) {
@@ -672,6 +680,48 @@ fn plan_dispatch(
         })
         .transpose()?;
 
+    /*
+     * The named refusal half of the blocking rule. (M30)
+     *
+     * The quiet half is `autodispatch::trigger`'s early return — an assignment on a blocked task
+     * records intent and starts nothing, with a debug line. But an *explicit* dispatch (the
+     * panel's button, `cide_agent_dispatch`, and auto-dispatch re-entering through
+     * `agents_dispatch`) is a gesture whose refusal must say why, and this function is the single
+     * funnel all three pass through — so neither path can be forgotten alone.
+     *
+     * Refused only while a blocker is live and not done: a blocker that no longer exists cannot
+     * gate (it can never become done, and its id is never reused — `blocker_statuses` has the
+     * argument). A run already *queued* when its task became blocked still spawns; the gate is at
+     * dispatch decision time, the same line the enqueue-vs-spawn note above draws.
+     */
+    if let Some(task) = task.as_ref() {
+        let board = store.list();
+        let blockers: Vec<String> = task
+            .links
+            .iter()
+            .filter(|l| l.link == cide_ipc::LinkType::BlockedBy && !l.deleted)
+            .filter_map(|l| board.iter().find(|t| t.id == l.target))
+            .filter(|t| t.status != cide_ipc::TaskStatus::Done)
+            .map(|t| {
+                let status = match t.status {
+                    cide_ipc::TaskStatus::Todo => "todo",
+                    cide_ipc::TaskStatus::Doing => "doing",
+                    cide_ipc::TaskStatus::Review => "review",
+                    cide_ipc::TaskStatus::Done => "done",
+                };
+                format!("{} ({status})", t.id)
+            })
+            .collect();
+        if !blockers.is_empty() {
+            return Err(CoreError::Io(format!(
+                "{} is blocked by {}: a task is dispatched only once every task it is blocked \
+                 by is done. Finish or dispatch the blockers first, or remove the link.",
+                task.id,
+                blockers.join(", ")
+            )));
+        }
+    }
+
     let prompt = opening_prompt(task.as_ref(), request.prompt.as_deref());
     if prompt.is_empty() {
         // Refused here as well as in `ClaudeHarness::spawn_spec`, which has the same guard for the
@@ -692,6 +742,14 @@ fn plan_dispatch(
         // Copied now, not looked up at spawn: it ends up in the child's terminal title and in
         // `/resume`, and those must still read correctly after the task has been renamed.
         task_title: task.as_ref().map(|task| task.title.clone()),
+        // **From the task, never from the request.** (M28) `DispatchRequest` has no `change`
+        // field and deliberately gains none: a dispatch that could name a different change than
+        // its task's would put the board and the branch in disagreement, with nothing in a
+        // position to correct either — `Task::agent`'s two-writers argument, one field along.
+        change: task
+            .as_ref()
+            .and_then(|task| task.change.as_ref())
+            .map(|change| change.as_str().to_string()),
         prompt,
         // Stamped *here* so the numbers the queue enforces are the numbers the project had
         // when the run was dispatched. The old worktree clamp to 1 is gone — worktrees are
@@ -735,7 +793,7 @@ fn plan_dispatch(
 ///
 /// The task's **title** is still named inline, because a run whose tools fail to attach should at
 /// least be able to say what it was asked to do.
-fn opening_prompt(task: Option<&Task>, extra: Option<&str>) -> String {
+pub(crate) fn opening_prompt(task: Option<&Task>, extra: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(task) = task {
         // The middle sentence is P4's checkpoint discipline (the preamble carries the durable
@@ -755,6 +813,21 @@ fn opening_prompt(task: Option<&Task>, extra: Option<&str>) -> String {
             task.id,
             one_line(&task.title)
         ));
+        // One clause more when the task names an OpenSpec change. (M28) Added *inside* this
+        // block rather than as its own `parts.push`, so it can only ever be one more sentence in
+        // a string that is already flattened — the one-line invariant this whole function exists
+        // to hold stays structural rather than remembered. The durable copy of these rules rides
+        // the system prompt in `cide_agents::harness::SPEC_PREAMBLE`; this is the half that lands
+        // while the run is deciding what to do first.
+        if let Some(change) = task.change.as_ref() {
+            parts.push(format!(
+                "This task implements the OpenSpec change {} — its proposal, design and task \
+                 checklist are in openspec/changes/{}/, and working that checklist in order is \
+                 the work.",
+                one_line(change.as_str()),
+                one_line(change.as_str())
+            ));
+        }
     }
     if let Some(extra) = extra.map(one_line).filter(|extra| !extra.is_empty()) {
         parts.push(extra);
@@ -763,7 +836,7 @@ fn opening_prompt(task: Option<&Task>, extra: Option<&str>) -> String {
 }
 
 /// Whatever it is handed, on one line. See [`opening_prompt`].
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -1186,6 +1259,9 @@ mod tests {
             status: cide_ipc::TaskStatus::Todo,
             agent: None,
             comments: Vec::new(),
+            change: None,
+            links: Vec::new(),
+            session: None,
             history: Vec::new(),
             created_by: cide_ipc::TaskAuthor::User,
             created_unix_ms: 0,
@@ -1194,6 +1270,20 @@ mod tests {
 
         let prompt = opening_prompt(Some(&task), Some("and\nmind the\ttabs"));
         assert!(!prompt.contains('\n'), "{prompt}");
+
+        // …and with a change on it, which is one more sentence in the same flattened string.
+        // A change name cannot legally hold a newline, but the value reaches here from a
+        // committed file that a person hand-edits, so it is flattened like everything else.
+        let with_change = Task {
+            change: Some(cide_ipc::ChangeName("add-dark\nmode".into())),
+            ..task.clone()
+        };
+        let prompt_with_change = opening_prompt(Some(&with_change), None);
+        assert!(!prompt_with_change.contains('\n'), "{prompt_with_change}");
+        assert!(
+            prompt_with_change.contains("openspec/changes/add-dark mode/"),
+            "name the change's directory: {prompt_with_change}"
+        );
         assert!(prompt.contains("t-14"), "name the task: {prompt}");
         assert!(
             prompt.contains("cide_task_get"),

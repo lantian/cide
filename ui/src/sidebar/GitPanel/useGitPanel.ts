@@ -1727,7 +1727,12 @@ export function useGitPanel(
           adopt(absorb(moved))
           return
         } catch (e) {
-          const detail = e instanceof Error ? e.message : String(e)
+          // Through `explain`, and never `String(e)` — which is what this line used to say and
+          // what made the whole message useless. A `GitError` is `{kind, detail}`, so `String()`
+          // of one is the literal text `[object Object]`, and the two refusals this gesture
+          // actually raises (`pathIgnored`, `nestedRepository`) were reported as exactly that.
+          // See the same rule at the top of `commit`, and `branchModel::explain`.
+          const detail = explain(e)
           note(
             TRACK_NOTE,
             added

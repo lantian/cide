@@ -157,11 +157,13 @@
  * out of this file's reach — same seam as `--pane-corner-clear`, in the other direction.
  * `check:rows` pins both ends and which leaves get which marks.
  *
- * The cost, stated because it is real: an edge pane's focus and awaiting border colours lose
- * the flush segments — on a single-pane tab, where every edge but the right is flush, the
- * amber awaiting border survives only on the right. A focused terminal keeps its full ring
- * (`.frameFocused::after` draws all four edges inside the frame regardless of border width),
- * and an awaiting pane still has the tab strip's chip.
+ * The cost, stated because it is real: an edge pane's *awaiting* border colour loses the
+ * flush segments — on a single-pane tab, where every edge but the right is flush, the amber
+ * survives only on the right, and the tab strip's chip carries the rest. The *focus* ring
+ * does not pay it any more: it did (only the `::after`'s single pixel survived on a flush
+ * edge, and the thinner edge was reported), so `.frameFocused::after` now widens itself by
+ * whatever width these marks remove — the calc in `PaneTitleBar.module.css` reads the same
+ * `--pane-edge-*` properties — keeping the accent at two pixels on every edge.
  */
 .leaf[data-edge-left] {
   --pane-edge-left: 0px;

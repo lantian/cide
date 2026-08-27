@@ -74,6 +74,7 @@ export type BuiltinView =
   | 'problems'
   | 'agents'
   | 'tasks'
+  | 'openspec'
   | 'extensions'
   | 'settings'
 

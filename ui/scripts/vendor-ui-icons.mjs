@@ -104,14 +104,16 @@ const ICONS = [
   // shared `↻` because there was no icon set to tell them apart; there is now.
   'refresh-cw', 'undo-2', 'arrow-down-to-line', 'plus', 'archive', 'columns-2', 'circle-dot',
   'chevrons-down-up', 'chevrons-up-down',
-  // Pane title bar and window controls.
-  'minus', 'square', 'x', 'square-plus', 'maximize', 'picture-in-picture-2',
+  // Pane title bar and window controls. `move` is the grab handle: press it and drag the pane
+  // into another row or column.
+  'minus', 'square', 'x', 'square-plus', 'maximize', 'picture-in-picture-2', 'move',
   // Chevrons, everywhere: menus, twisties, overflow, find bar, merge navigation.
   'chevron-down', 'chevron-left', 'chevron-right', 'chevron-up',
   'chevrons-left', 'chevrons-right',
   // Status bar and branch indicator. `git-branch` replaces `⑂` (U+2442), which the rail's own
-  // header records as being in no UI font.
-  'circle-plus', 'circle-minus', 'circle-x', 'arrow-up', 'arrow-down', 'ellipsis',
+  // header records as being in no UI font. `circle-plus` left with the status bar's diff stat
+  // (M28); `circle-minus` stayed because an interrupted agent run draws it.
+  'circle-minus', 'circle-x', 'arrow-up', 'arrow-down', 'ellipsis',
   // App header.
   'sun-moon', 'rows-2',
   // Tool window.

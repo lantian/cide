@@ -347,6 +347,29 @@ export const pane = {
       direction,
     }),
 
+  /**
+   * Move a pane already in this tab to a new home in it, beside `target`.
+   *
+   * `axis`/`side` mean what they mean for `split`. Distinct from `swap`, which only exchanges
+   * two panes' positions: this one re-parents the pane and collapses the row it left.
+   */
+  move: (
+    projectId: ProjectId,
+    tabId: TabId,
+    paneId: PaneId,
+    target: PaneId,
+    axis: Axis,
+    side: Side,
+  ) =>
+    invoke<{ rev: number }>('pane_move', {
+      project: projectId,
+      tab: tabId,
+      pane: paneId,
+      target,
+      axis,
+      side,
+    }),
+
   swap: (projectId: ProjectId, tabId: TabId, a: PaneId, b: PaneId) =>
     invoke<{ rev: number }>('pane_swap', { project: projectId, tab: tabId, a, b }),
 
@@ -3992,4 +4015,262 @@ export function extAssetUrl(id: ExtensionRef, path: string): string {
   const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent
   const windowsOrMac = /Windows|Macintosh|Mac OS X/.test(ua)
   return windowsOrMac ? `http://cide-ext.localhost/${tail}` : `cide-ext://localhost/${tail}`
+}
+
+/* ==========================================================================================
+ * OpenSpec — `openspec/`, read and written through the `openspec` CLI. (M28)
+ *
+ * Appended as its own block with its own imports, the house rule this file's header states: the
+ * `events` object closed a thousand lines above and a new subscription cannot reach inside it, so
+ * `specEvents` stands beside it exactly as `taskEvents` and `agentEvents` do.
+ *
+ * **Reads go through `pendingCommand`; gestures use a bare `invoke`.** The split is the one
+ * `tasks` makes and for its reasons. A read is called from an effect on mount — including on a
+ * project that has never had this panel open — and Tauri answers an unregistered command with a
+ * rejected promise, which unhandled out of a React 19 effect unmounts the whole tree. A gesture
+ * is a button press with somebody watching, and its rejection has to reach `notifyFailure` and
+ * be *shown*: a button that silently does nothing is the failure this project has paid for most.
+ *
+ * **Every mutation answers with the whole board, or the whole change.** A call that answered
+ * `{ok: true}` would be followed at once by a second asking what happened, and the frame between
+ * them shows a screen that is visibly wrong.
+ * ======================================================================================== */
+import type {
+  ChangeName,
+  SpecAcceptPlan,
+  SpecAccepted,
+  SpecArtifactText,
+  SpecBoard,
+  SpecChange,
+  SpecSubject,
+  SpecId,
+  SpecValidation,
+  SpecWriteOutcome,
+} from './generated'
+
+export const spec = {
+  board: (project: ProjectId) =>
+    pendingCommand(
+      'spec_board',
+      () => invoke<SpecBoard>('spec_board', { project }),
+      null as SpecBoard | null,
+    ),
+
+  /**
+   * One change in full.
+   *
+   * `worktree` names an agent's checkout, for a change a run is working on right now: the
+   * checklist that is being ticked is the one *in that worktree*, and `openspec` resolves its
+   * root from the working directory. Reading from the project root instead would answer with the
+   * project's own progress — plausible, and about a different copy of the file. Rust jails the
+   * value to this project's `.cide/worktrees/`.
+   */
+  change: (project: ProjectId, change: ChangeName, worktree?: string) =>
+    pendingCommand(
+      'spec_change',
+      () => invoke<SpecChange>('spec_change', { project, change, worktree }),
+      null as SpecChange | null,
+    ),
+
+  artifact: (project: ProjectId, path: string, worktree?: string) =>
+    pendingCommand(
+      'spec_artifact',
+      () => invoke<SpecArtifactText>('spec_artifact', { project, path, worktree }),
+      null as SpecArtifactText | null,
+    ),
+
+  validate: (project: ProjectId, change?: ChangeName, worktree?: string) =>
+    invoke<SpecValidation>('spec_validate', { project, change, worktree }),
+
+  init: (project: ProjectId) => invoke<SpecBoard>('spec_init', { project }),
+
+  /**
+   * Type one of OpenSpec's workflow commands into this project's Claude tab.
+   *
+   * `command` is cide's own handle — `propose`, `explore` — and never an invocation. Rust
+   * resolves it against the project's directory immediately before typing, because the
+   * invocation is a fact about that directory and has changed under cide once already; see
+   * `cide_spec::claude`.
+   *
+   * A bare `invoke`, and its rejection is deliberately **not** caught. This shipped three times
+   * as a button that looked broken: first as a silent clipboard write that did nothing a user
+   * could see; then typing `/opsx:onboard`, a command in the CLI's templates that its default
+   * profile does not install; then typing the whole `/opsx:` family after upstream had replaced
+   * it with skills, so every project answered `Unknown command`. Rust now refuses with a
+   * sentence naming what *is* installed, and `Failures` puts it on screen.
+   */
+  runCommand: (project: ProjectId, command: string, text?: string) =>
+    invoke<void>('spec_run_command', { project, command, text }),
+
+  propose: (project: ProjectId, change: ChangeName, title: string, body?: string) =>
+    invoke<SpecBoard>('spec_propose', { project, change, title, body }),
+
+  /**
+   * Start OpenSpec's propose workflow in a conversation, for a task that has no change yet.
+   *
+   * **The replacement for the compose dialog's *Propose a new change*.** That option called
+   * {@link propose}, which scaffolds a directory with a stub proposal, no delta specs and no
+   * checklist — a change `openspec validate` refuses and whose row reads `0/0` for ever. Writing
+   * a proposal is work; this hands it to a conversation that can read the codebase, and the line
+   * tells that conversation to link the change back to the task with `cide_task_update`.
+   *
+   * Answers the session it typed into, so the caller can reveal that pane. Uncaught by design —
+   * Rust refuses a task that already has a change, a project with no propose command, and a
+   * conversation that started before the command was installed, each with the sentence to act on.
+   */
+  proposeForTask: (project: ProjectId, task: TaskId) =>
+    invoke<SessionId>('spec_propose_for_task', { project, task }),
+
+  /**
+   * Ask this project's Claude conversation to fan a change's checklist out into a task tree.
+   *
+   * **The other shape of {@link proposeForTask}'s neighbour.** The change page's *Start work*
+   * makes one task for a change, which is the single-agent shape; this asks the conversation to
+   * make a main task carrying the change link and one `subtaskOf` child per unit of the
+   * checklist, look at the roster, and then **stop and ask** — nothing is dispatched by pressing
+   * it.
+   *
+   * Keyed on the change, not a task: the task does not exist yet, and cide writes none of them.
+   * Answers the session it typed into, so the caller can reveal that pane. Uncaught by design —
+   * Rust refuses a change that already has a task (naming it), a project with no Claude session,
+   * and a Claude tab that is not running, each with the sentence to act on.
+   */
+  splitWork: (project: ProjectId, change: ChangeName) =>
+    invoke<SessionId>('spec_split_work', { project, change }),
+
+  setRequirement: (
+    req: {
+      project: ProjectId
+      change: ChangeName
+      spec: SpecId
+      operation: SpecChange['deltas'][number]['operation']
+      requirement: string
+      block: string
+    },
+    worktree?: string,
+  ) => invoke<SpecWriteOutcome>('spec_requirement_set', { req, worktree }),
+
+  acceptPreview: (project: ProjectId, task: TaskId) =>
+    pendingCommand(
+      'spec_accept_preview',
+      () => invoke<SpecAcceptPlan>('spec_accept_preview', { project, task }),
+      null as SpecAcceptPlan | null,
+    ),
+
+  /**
+   * Hand a task's work to a Claude conversation that is already open.
+   *
+   * **Not a dispatch.** It writes `Task::session`, which no auto-dispatch trigger reads, and
+   * types the task's opening line into that conversation — so choosing a conversation cannot
+   * also spawn a subagent. Assigning a *role* is the gesture that starts a run, and it goes
+   * through `tasks.edit` instead. See `DispatchTarget` for the split.
+   *
+   * Uncaught by design: Rust refuses when the conversation is not one this project draws, or has
+   * stopped running, and `Failures` puts the sentence on screen.
+   */
+  dispatchToSession: (project: ProjectId, task: TaskId, session: SessionId) =>
+    invoke<void>('spec_dispatch_to_session', { project, task, session }),
+
+  accept: (project: ProjectId, task: TaskId) =>
+    invoke<SpecAccepted>('spec_accept', { project, task }),
+
+  /**
+   * What archiving this change would do, and every reason it would not — no task involved.
+   *
+   * The panel's own road to the last step of the lifecycle. A change proposed straight from the
+   * pinned session has no cide task, and the whole accept gesture was built on the task card —
+   * which left that (more common) road with no way to finish at all.
+   */
+  changePlan: (project: ProjectId, change: ChangeName) =>
+    invoke<SpecAcceptPlan>('spec_change_plan', { project, change }),
+
+  archiveChange: (project: ProjectId, change: ChangeName) =>
+    invoke<SpecAccepted>('spec_change_archive', { project, change }),
+
+  /**
+   * Open a change or a capability as a workspace tab, or activate the one it already has.
+   *
+   * A gesture, so a bare `invoke`: the panel row that calls it is a click with somebody watching,
+   * and a refusal has to reach `Failures` rather than leaving a row that does nothing.
+   */
+  openTab: (project: ProjectId, subject: SpecSubject) =>
+    invoke<TabId>('tab_open_spec', { project, subject }),
+}
+
+/**
+ * A standalone object, not a member of `events`: appending cannot reach inside a literal that
+ * closed a thousand lines ago. `taskEvents` and `agentEvents` are the precedents.
+ */
+export const specEvents = {
+  onChanged: (handler: (project: ProjectId, board: SpecBoard) => void) =>
+    listen<{ project: ProjectId; board: SpecBoard }>('cide://spec-changed', (event) =>
+      handler(event.payload.project, event.payload.board),
+    ),
+}
+
+/* ==========================================================================================
+ * OpenSpec configuration — `openspec/config.yaml`, read and written as a form. (M28)
+ *
+ * Its own block below `spec`, for the reason this file's OpenSpec header already states about
+ * `specEvents`: appending cannot reach inside a literal that closed above. The split is also
+ * honest about what these are — the four calls in `spec` all spawn the `openspec` CLI, and two
+ * of the three here never do. `openspec/config.yaml` is read and written by cide's own
+ * line-oriented, comment-preserving scanner in `cide_spec::config`, which is why the form works
+ * on a machine with no `openspec` on PATH at all.
+ *
+ * **Every one of these is a bare `invoke`.** `spec.board` uses `pendingCommand` because it is
+ * called from an effect on mount in a build that may not have the command registered, and an
+ * unhandled rejection out of a React 19 effect unmounts the tree. These are called from a
+ * Settings section that is only mounted when somebody navigates to it, every call site awaits
+ * and draws its own failure, and a config screen that silently showed an empty form because a
+ * read rejected would be the worst possible outcome — it invites a Save that writes the empty
+ * form back over the file.
+ * ======================================================================================== */
+import type { SpecConfig, SpecConfigEdit, SpecSchema } from './generated'
+
+export const specConfig = {
+  /** What `openspec/config.yaml` states. A missing file is an empty config, not a failure. */
+  get: (project: ProjectId) => invoke<SpecConfig>('spec_config_get', { project }),
+
+  /**
+   * Apply a form's worth of edits, and answer with the config as it now reads.
+   *
+   * One call for the whole form. `cide_spec::config::apply` splices every edit into one buffer
+   * and writes once — or, when every value already reads that way, does not write at all and
+   * does not move the mtime. Four calls would be four atomic renames of one committed file for
+   * one press of Save, and four chances to lose a race with an agent holding it.
+   *
+   * The answer is a **re-read**, not an echo, so the screen shows what is in the file rather
+   * than what the form hoped: the writer normalises, and an edit the scanner declined to make
+   * comes back as the value that is really there.
+   */
+  set: (project: ProjectId, edits: SpecConfigEdit[]) =>
+    invoke<SpecConfig>('spec_config_set', { project, edits }),
+
+  /**
+   * The workflow schemas this project can choose between, each with the artifacts it declares.
+   *
+   * Never rejects: every way of failing to ask the CLI degrades to a single row for
+   * `spec-driven`. The artifacts matter as much as the names — a schema declares its own with
+   * `generates` globs, so the four cide knows about are a *default and not a closed set*, and a
+   * rules editor with four hard-coded rows would offer the wrong ones on any custom schema with
+   * nothing on screen to say so.
+   */
+  schemas: (project: ProjectId) => invoke<SpecSchema[]>('spec_schemas', { project }),
+
+  /**
+   * Set OpenSpec up, having first asked for the project context.
+   *
+   * The same command `spec.init` calls, and deliberately a second entry point rather than a
+   * changed signature on that one: `spec.init` is the OpenSpec panel's plain Set-up button,
+   * which asks nothing, and this is the wizard, which asks first. Two names make which gesture a
+   * call site is performing readable at the call site.
+   *
+   * `context` is written *after* `openspec init` has created the file, through the same
+   * comment-preserving writer the form uses — so the three commented example blocks that are the
+   * only documentation these keys have survive the wizard. An empty or whitespace-only value
+   * writes no key at all, which is what Skip means.
+   */
+  setUp: (project: ProjectId, context: string) =>
+    invoke<SpecBoard>('spec_init', { project, context }),
 }

@@ -663,7 +663,13 @@ try {
   // equals the controls it reserves for" while agreeing with a number that did not. An
   // assertion that pins today's value rather than the property it names will do that.
   const px = (re) => Number(re.exec(paneCss)?.[1] ?? NaN)
-  const reserve = px(/--pane-corner:\s*(\d+)px/)
+  // Anchored on the bare `.frame` block, because there are two declarations now: the base
+  // four-button reserve, and a wider one on the pane kinds that draw the grab handle. An
+  // unanchored match would silently read whichever came first in the file.
+  const reserve = px(/\.frame \{[\s\S]*?--pane-corner:\s*(\d+)px/)
+  const terminalReserve = px(
+    /\.frame\[data-kind='claude'\],\s*\.frame\[data-kind='shell'\] \{[\s\S]*?--pane-corner:\s*(\d+)px/,
+  )
   // The three plain actions, and the menu button, which is wider and sets its floor with
   // `min-width` because its content is an icon plus a caret.
   const action = px(/\.action \{[\s\S]*?width:\s*(\d+)px/)
@@ -690,6 +696,15 @@ try {
       'and that sum is 125px. Spelled out as well as derived, because the derivation above '
         + 'agreed with 115 for a milestone by reading the wrong button: two ways of being '
         + 'wrong have to disagree before either is worth trusting',
+    )
+    // The grab handle is drawn on claude and shell panes only, so those two reserve one
+    // `.action` and one gap more. Derived from the same rules for the same reason, and pinned
+    // as well, so a sixth button has to disagree with itself twice before it passes.
+    eq(terminalReserve, want + action + gap,
+      "a terminal pane's cluster reserves one more action than the base",
+    )
+    eq(terminalReserve, 149,
+      'and that sum is 149px — the four-button reserve plus the grab handle',
     )
   }
 

@@ -1,0 +1,14 @@
+﻿schema: spec-driven
+
+# Project context (optional)
+# Example:
+#   context: |
+#     Tech stack: TypeScript
+context: |
+  Written on Windows.
+
+  Second paragraph.
+
+rules:
+  tasks:
+    - Keep them short

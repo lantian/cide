@@ -75,3 +75,8 @@ pub mod log;
 // a network — which is why every one of them is `async` and hands its work to `spawn_blocking`
 // rather than being a synchronous handler Tauri would poll on the GTK loop.
 pub mod ext;
+
+// M28: OpenSpec. Its own module rather than rows in `cmd::tasks`, because everything here spawns
+// a subprocess and answers with somebody else's file format — the two facts that keep `cide-spec`
+// a separate crate apply one layer up as well.
+pub mod spec;

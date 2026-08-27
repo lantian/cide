@@ -209,7 +209,25 @@ fn run(
                         // the directories under it: a `git clone` or a `mkdir -p a/b/c`
                         // creates the whole tree before we hear about the top of it.
                         if is_dir && backend.per_directory && !backend.watched.contains(path) {
-                            backend.watch_tree(path, &filter);
+                            // A path that *asked* for recursion gets it here too, and not only
+                            // at startup. Both non-git watched paths are listed before they
+                            // exist — that is how their arrival becomes an event — so the one
+                            // that needs recursion is exactly the one most likely to be created
+                            // mid-session. Falling back to `watch_tree` left it walking a tree
+                            // an agent was still writing, and everything below the first new
+                            // directory went unseen until the next launch.
+                            if filter.is_recursive_watch(path) {
+                                if let Err(err) = backend.watch(path, RecursiveMode::Recursive) {
+                                    tracing::debug!(
+                                        path = %path.display(),
+                                        kind = ?err.kind,
+                                        "could not take the recursive watch this path asked for"
+                                    );
+                                    backend.watch_tree(path, &filter);
+                                }
+                            } else {
+                                backend.watch_tree(path, &filter);
+                            }
                         }
                         // `is_git_path`, not `is_watched_path`: the flag becomes
                         // `FsChange::git`, which is what makes the branch readout and the

@@ -291,6 +291,37 @@ impl Inner {
         panes
     }
 
+    /// The pids of connected CLIs that no pane claims.
+    ///
+    /// The exact complement of [`Self::addressable_panes`] on the same two maps: a connection
+    /// that got through the handshake and announced a pid which is not a key of `pane_of_pid`.
+    /// Empty is the healthy state and the ordinary one.
+    ///
+    /// # Why this crate answers the question and does not act on it
+    ///
+    /// An unbound connection is not an error here. It is a fact — *somebody is on this
+    /// project's server and nothing says which pane they are in* — and the only way to resolve
+    /// it is to ask the operating system whose child that pid is, which needs a notion of
+    /// panes, of the children cide forked, and of a process tree. None of the three belongs in
+    /// a crate whose whole discipline is that it knows about sockets and nothing else. So the
+    /// pids go out, `cide_app::ide` walks each one's ancestry against the pids it forked, and
+    /// what comes back is an ordinary [`IdeServer::bind_pane`] call.
+    ///
+    /// Sorted and deduplicated for the same reason [`Self::addressable_panes`] is: the caller
+    /// does one lookup per entry, and two connections from one pid would ask twice.
+    fn unbound_pids(&self) -> Vec<u32> {
+        let c = self.conns.lock();
+        let mut pids: Vec<u32> = c
+            .open
+            .values()
+            .filter_map(|conn| conn.pid)
+            .filter(|pid| !c.pane_of_pid.contains_key(pid))
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
     /// Every open connection, bound to a pane or not.
     ///
     /// This used to require a pane binding, on the theory that including an unbound
@@ -492,6 +523,15 @@ impl IdeServer {
     /// workspace decision and belongs where the workspace is.
     pub fn addressable_panes(&self) -> Vec<String> {
         self.inner.addressable_panes()
+    }
+
+    /// Connected CLIs that no pane claims, so the caller can work out who they are.
+    ///
+    /// See [`Inner::unbound_pids`] for why the answer is pids rather than an action. The
+    /// caller is `cide_app::ide`, which walks each pid's ancestry and calls
+    /// [`Self::bind_pane`] with what it finds.
+    pub fn unbound_pids(&self) -> Vec<u32> {
+        self.inner.unbound_pids()
     }
 
     /// Tell the `claude` in `pane` where the user is looking.
@@ -1667,6 +1707,82 @@ mod tests {
             server.at_mentioned("pane-a", mention),
             Delivery::NoConnection { connections: 1 },
             "and the two stay in agreement afterwards"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// The wrapper case, from this crate's side of it.
+    ///
+    /// A `claude` that is not the process cide forked — launched through a shim, or typed into
+    /// a shell pane — announces a pid nothing ever bound. Everything about that connection
+    /// works except attribution: it counts towards `connection_count`, it receives broadcasts,
+    /// and an addressed mention has nowhere to go. `unbound_pids` is how the application is
+    /// told to go and find out whose child it is; the test is that the pid appears there
+    /// exactly while it is unclaimed, and that binding it — which is all the resolution in
+    /// `cide_app::ide` ultimately does — moves it into the routing table.
+    #[tokio::test]
+    async fn a_connection_nothing_bound_is_reported_until_something_binds_it() {
+        let server = server().await;
+        let mut events = server.events();
+
+        // 7100 is the pty child cide forked (the wrapper). 7101 is the CLI it went on to
+        // spawn, and 7101 is what reaches the socket.
+        server.bind_pane(7100, "pane-a".into());
+
+        let mut cli = connect(server.port(), TOKEN)
+            .await
+            .expect("the CLI connects");
+        handshake(&mut cli).await;
+        send(
+            &mut cli,
+            json!({"jsonrpc":"2.0","method":"ide_connected","params":{"pid":7101}}),
+        )
+        .await;
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Connected { pid: 7101, .. })
+        ));
+
+        assert!(
+            server.addressable_panes().is_empty(),
+            "the pane is bound and a claude is connected, and still nothing can be addressed \
+             — which is the whole of the reported bug"
+        );
+        assert_eq!(
+            server.unbound_pids(),
+            vec![7101],
+            "and this is the question whose answer makes it fixable"
+        );
+
+        let mention = AtMentioned {
+            file_path: "/src/main.rs".into(),
+            line_start: Some(0),
+            line_end: Some(0),
+        };
+        assert_eq!(
+            server.at_mentioned("pane-a", mention.clone()),
+            Delivery::NoConnection { connections: 1 },
+            "one connection, none of it addressable: the count the error sentence prints"
+        );
+
+        // What `cide_app::ide` does with the answer, once the ancestry walk has said that
+        // 7101 descends from 7100 and 7100 is pane-a's child.
+        server.bind_pane(7101, "pane-a".into());
+
+        assert!(
+            server.unbound_pids().is_empty(),
+            "nothing is unattributed any more"
+        );
+        assert_eq!(
+            server.addressable_panes(),
+            vec!["pane-a".to_string()],
+            "and the pane became addressable without the CLI doing anything differently"
+        );
+        assert_eq!(
+            server.at_mentioned("pane-a", mention),
+            Delivery::Sent,
+            "which is the send that used to fail"
         );
 
         server.shutdown().await;

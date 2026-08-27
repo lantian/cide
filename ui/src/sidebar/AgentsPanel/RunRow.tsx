@@ -51,6 +51,7 @@
  */
 import {
   elapsed,
+  glyphSpins,
   harnessLabel,
   isDonePhase,
   type RunRow as RunRowData,
@@ -150,7 +151,11 @@ export function ActivityRow({
     >
       <div className={styles.activityLine} data-audit="agentsRowTop">
         <span
-          className={cx(styles.glyph, TONE_CLASS[row.tone])}
+          className={cx(
+            styles.glyph,
+            TONE_CLASS[row.tone],
+            glyphSpins(row.glyph) && styles.glyphSpin,
+          )}
           data-audit="agentsGlyph"
           data-tone={row.tone}
           aria-hidden="true"
@@ -208,7 +213,11 @@ export function RunRow({
     >
       <div className={styles.rowTop} data-audit="agentsRowTop">
         <span
-          className={cx(styles.glyph, TONE_CLASS[row.tone])}
+          className={cx(
+            styles.glyph,
+            TONE_CLASS[row.tone],
+            glyphSpins(row.glyph) && styles.glyphSpin,
+          )}
           data-audit="agentsGlyph"
           data-tone={row.tone}
           aria-hidden="true"

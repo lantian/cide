@@ -235,6 +235,37 @@ export interface TaskView {
    * two writers for one fact is how a task ends up claiming an agent that exited an hour ago.
    */
   agent: string | null
+  /**
+   * The OpenSpec change this task implements, or `null`. (M28)
+   *
+   * The id only. Everything *about* the change — its checklist, its deltas, whether it validates
+   * — is read on demand by `TaskDetailHost` and lives in `TasksPanel/specCard.ts`, deliberately
+   * not here: this module is compiled standalone and pinned field-by-field against
+   * `crates/cide-ipc/src/tasks.rs`, and an OpenSpec vocabulary in it would be a second wire
+   * contract inside the module whose whole job is to restate one.
+   */
+  change: string | null
+  /**
+   * The live Claude conversation this task's work was handed to, or `null`. (M28)
+   *
+   * A restatement of `Task::session`, and a *different field from `agent`* on purpose — that
+   * separation is what makes "handing a task to an open conversation cannot start it twice" a
+   * property of the shape rather than a check somebody has to remember. Assigning a role is the
+   * edge `cide_agents::autodispatch` watches; this field is read by no trigger at all.
+   *
+   * **Not a claim that the conversation still exists.** A pane the user closed leaves this set,
+   * which is deliberate: it is the record of where the work went. Whether a pane still holds it
+   * is a fact about the *workspace tree*, looked up at render — see `SpecSessionRef.open`.
+   */
+  session: string | null
+  /**
+   * This task's own stored edges, live ones only — `adapt.ts` drops the tombstones. (M30)
+   *
+   * The *incoming* readings ("blocks", "subtask") are deliberately not a field: they are
+   * derived by [`taskLinks`] from the whole board at render, the [`agentChip`] arrangement, so
+   * a merge can never leave the two directions disagreeing.
+   */
+  links: readonly LinkView[]
   /** Oldest first on the wire; [`commentOrder`] is the defence against a file that is not. */
   comments: readonly CommentView[]
   /**
@@ -955,6 +986,219 @@ export function clock(atMs: number): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
+/* -------------------------------------------------------------------- the typed links (M30) */
+
+/**
+ * The three edge kinds. Restates `LinkType` in `crates/cide-ipc/src/tasks.rs`, wire spellings —
+ * `check-agents.mjs` pins this against `pub enum LinkType` the way [`TASK_STATUSES`] is pinned.
+ */
+export type LinkKind = 'related' | 'blockedBy' | 'subtaskOf'
+
+/** The vocabulary, in Rust's declaration order. */
+export const LINK_KINDS: readonly LinkKind[] = ['related', 'blockedBy', 'subtaskOf']
+
+/** Is this one of the three kinds? Takes `string`; [`isTaskStatus`]'s reason. */
+export function isLinkKind(value: string): value is LinkKind {
+  return LINK_KINDS.includes(value as LinkKind)
+}
+
+/**
+ * One stored edge, as the panel needs it. Structural restatement of `TaskLink` — minus
+ * `deleted` and `atUnixMs`, which are the merge's bookkeeping: `adapt.ts` drops tombstoned
+ * entries the way it drops nothing else, because a tombstone is an edge that *is not there* to
+ * every reader but the merge.
+ *
+ * `kind` is a `string` by the annotation-versus-fact rule every wire enum here follows: the
+ * file is hand-editable, and a kind this build cannot read must still render as *something*
+ * rather than vanish or throw.
+ */
+export interface LinkView {
+  kind: string
+  target: string
+}
+
+/**
+ * The direction labels. Each stored edge reads differently from its two ends — `blockedBy` on
+ * the task that waits is `Blocks` on the task being waited for — and the pair lives in one
+ * table so the card and the check cannot disagree about a reading.
+ */
+const LINK_LABEL: Record<LinkKind, { out: string; in: string }> = {
+  related: { out: 'Related to', in: 'Related to' },
+  blockedBy: { out: 'Blocked by', in: 'Blocks' },
+  subtaskOf: { out: 'Subtask of', in: 'Subtask' },
+}
+
+/** A chip's direction: `out` is the stored edge, `in` the derived reading from the other end. */
+export type LinkDirection = 'out' | 'in'
+
+/**
+ * The words on a link chip. **Never empty, for any input** — an unrecognised kind reads as its
+ * own raw text ([`statusGlyph`]'s posture: "cide does not know this kind", not "no kind"), and
+ * a blank kind gets a word. Explicit comparisons, not a table lookup: the value can be
+ * `'constructor'` (see [`restText`]).
+ */
+export function linkLabel(kind: string, direction: LinkDirection): string {
+  if (kind === 'related' || kind === 'blockedBy' || kind === 'subtaskOf') {
+    return LINK_LABEL[kind][direction]
+  }
+  return kind.trim() !== '' ? kind : 'Link'
+}
+
+/**
+ * One drawn link: the direction-resolved label, the target, and what the board knows about it.
+ *
+ * `gone` is carried beside the resolved fields rather than inferred from their nullness — a
+ * target the board holds always has a title string (possibly empty), so `targetTitle === null`
+ * alone would conflate "deleted" with "untitled".
+ */
+export interface LinkChip {
+  kind: string
+  direction: LinkDirection
+  label: string
+  target: string
+  /** The target's title, or `null` when the target is not on the board. */
+  targetTitle: string | null
+  targetStatus: TaskStatus | null
+  /**
+   * The target is not on the board: deleted, or living on a branch not pulled yet. Drawn
+   * marked, never hidden — a reference that silently vanished is the task-leaves-the-tracker
+   * failure this module keeps writing against, one edge over.
+   */
+  gone: boolean
+}
+
+/**
+ * Every link drawn on one task's card: its own stored edges, then the **derived** incoming
+ * readings. (M30)
+ *
+ * Each edge is stored once, on its canonical side (`crates/cide-ipc/src/tasks.rs`'s `LinkType`
+ * carries the argument — it is [`agentChip`]'s one-writer rule applied to edges), so the other
+ * end's reading is computed here from the whole board, which every caller already holds.
+ * `related` is deduplicated per pair: after a merge both sides can legally store the same
+ * related edge, and two chips saying one fact would read as two facts.
+ *
+ * Total and never throws: a self-link, a rogue kind, a target off the board are all ordinary
+ * states of a committed, merged, hand-editable file.
+ */
+export function taskLinks(task: TaskView, tasks: readonly TaskView[]): LinkChip[] {
+  const chip = (kind: string, direction: LinkDirection, target: string): LinkChip => {
+    const found = tasks.find((candidate) => candidate.id === target)
+    return {
+      kind,
+      direction,
+      label: linkLabel(kind, direction),
+      target,
+      targetTitle: found === undefined ? null : found.title,
+      targetStatus: found === undefined ? null : found.status,
+      gone: found === undefined,
+    }
+  }
+
+  const out: LinkChip[] = []
+  for (const link of task.links) {
+    out.push(chip(link.kind, 'out', link.target))
+  }
+  const relatedOut = task.links
+    .filter((link) => link.kind === 'related')
+    .map((link) => link.target)
+  for (const other of tasks) {
+    if (other.id === task.id) continue
+    for (const link of other.links) {
+      if (link.target !== task.id || !isLinkKind(link.kind)) continue
+      if (link.kind === 'related' && relatedOut.includes(other.id)) continue
+      out.push(chip(link.kind, 'in', other.id))
+    }
+  }
+  return out
+}
+
+/**
+ * The tasks a link picker may offer: everything on the board but the task itself, in the
+ * panel's own reading order — [`GROUP_ORDER`] between groups, recency within one — because the
+ * picker is the list, condensed, and a second ordering would make the same task sit in two
+ * places on one screen.
+ *
+ * Takes the id rather than a `TaskView` because the compose dialog has no task yet — `null`
+ * excludes nothing, and a created task can never link to itself anyway (its id is minted after
+ * the picker closed).
+ */
+export function linkableTargets(
+  selfId: string | null,
+  tasks: readonly TaskView[],
+): readonly TaskView[] {
+  const out: TaskView[] = []
+  for (const status of GROUP_ORDER) {
+    const bucket = tasks.filter(
+      (task) => task.id !== selfId && groupOf(task) === status,
+    )
+    out.push(...recencyOrder(bucket))
+  }
+  return out
+}
+
+/**
+ * One row the link-target search can offer: the three facts a person picks a task by. A
+ * lightweight shape rather than a whole [`TaskView`], because the compose dialog's host hands
+ * the picker a derived list and a full view would drag every field a popup row never draws.
+ */
+export interface LinkTargetOption {
+  id: string
+  title: string
+  status: TaskStatus
+}
+
+/**
+ * The most rows the target popup offers at once.
+ *
+ * A cap rather than a scrolling list, `DEFAULT_LIST_LIMIT`'s argument at popup scale: a
+ * hundred-row popup under a one-line input is a list nobody scans, and the query is the tool
+ * for shrinking it — every keystroke narrows, so the cap is only ever felt on queries too
+ * short to mean anything yet.
+ */
+export const LINK_TARGET_CAP = 12
+
+/**
+ * The targets matching `query`, best first — the link picker's autocomplete. (M30)
+ *
+ * `mentionOptions`' tier idea, over a task's two names: **id prefix** first (typing `t-1` is
+ * how a person who knows the key reaches for it, and it must not drown under titles containing
+ * "t-1"), then **title word-prefix**, then id substring, then title substring; no match is no
+ * row. The empty query offers everything, capped. Case-insensitive on both sides of the title
+ * comparison and on the query side of the id one — ids are minted lowercase, but a hand-edited
+ * file owes nothing.
+ *
+ * **Within a tier the input order is kept**, not re-sorted: `targets` arrives in the panel's
+ * own reading order (see [`linkableTargets`]), and the picker is the list condensed — the same
+ * task in a different position per surface is the disorientation `linkableTargets` exists to
+ * prevent, and it does not stop mattering inside a tier.
+ */
+export function linkTargetOptions(
+  query: string,
+  targets: readonly LinkTargetOption[],
+): LinkTargetOption[] {
+  const needle = query.trim().toLowerCase()
+  const ranked: Array<{ tier: number; option: LinkTargetOption }> = []
+  for (const option of targets) {
+    const tier = linkTargetTier(option, needle)
+    if (tier === null) continue
+    ranked.push({ tier, option })
+  }
+  // A stable sort on the tier alone, so equal tiers keep the panel order they arrived in.
+  ranked.sort((a, b) => a.tier - b.tier)
+  return ranked.slice(0, LINK_TARGET_CAP).map((entry) => entry.option)
+}
+
+function linkTargetTier(option: LinkTargetOption, needle: string): number | null {
+  if (needle === '') return 0
+  const id = option.id.toLowerCase()
+  const title = option.title.toLowerCase()
+  if (id.startsWith(needle)) return 0
+  if (title.split(/\s+/).some((word) => word.startsWith(needle))) return 1
+  if (id.includes(needle)) return 2
+  if (title.includes(needle)) return 3
+  return null
+}
+
 /* ------------------------------------------------------- the card's read/edit posture */
 
 /**
@@ -1006,7 +1250,15 @@ export function clock(atMs: number): string {
  */
 export type TaskField = 'title' | 'status' | 'assignee' | 'body'
 
-/** The four, in the order the card draws them. */
+/**
+ * The four, in the order the card draws them.
+ *
+ * **Links are deliberately not a fifth entry.** (M30) A `TaskField` is one value with one
+ * pencil — rest as text, open one editor, save one write — and an edge *set* is add-and-remove,
+ * not set-a-value: there is no draft, no dirty, no single `FieldCommit` for it. The card draws
+ * links as a **section**, like the spec block and the comment log, with its own controls; so
+ * this vocabulary, and every check pinned to it, stands exactly as it was.
+ */
 export const TASK_FIELDS: readonly TaskField[] = ['title', 'status', 'assignee', 'body']
 
 /** A field that rests as text and is put into edit by the control on its own row. */
@@ -1447,6 +1699,29 @@ export interface TaskDraft {
   status: TaskStatus
   assignee: string
   body: string
+  /**
+   * The OpenSpec change to link, or `''` for none. (M28) Always one that **already exists**.
+   *
+   * A string and not `string | null` for `assignee`'s reason: a `<select>` has no null, so its
+   * empty option *is* "none", and the two must agree or an untouched picker would write an empty
+   * change name into a committed file that no board could ever match. [`changeFromDraft`] is the
+   * other half.
+   *
+   * There was a `NEW_CHANGE` sentinel here, and the picker offered *New change from this task*.
+   * It called `spec_propose`, which scaffolds a stub — no delta specs, no checklist — so the
+   * task was born linked to a change `openspec validate` refuses. Proposing is work and needs a
+   * conversation; it is `spec_propose_for_task` now, offered on the card. See `TaskCompose`.
+   */
+  change: string
+  /**
+   * Edges to record with the creation. (M30)
+   *
+   * In the draft rather than as follow-up edits, because it matters *when* they land: a create
+   * naming an assignee dispatches, the trigger reads the task the mutation left behind, and a
+   * `blockedBy` added one call later is a gate the trigger could never have seen —
+   * `TaskNew::links` in `crates/cide-ipc/src/tasks.rs` carries the argument.
+   */
+  links: readonly LinkView[]
 }
 
 /**
@@ -1457,7 +1732,27 @@ export interface TaskDraft {
  * interaction with a create is answered by [`filterAfterCreate`] instead, which changes what is
  * *shown* rather than what is written.
  */
-export const EMPTY_DRAFT: TaskDraft = { title: '', status: 'todo', assignee: '', body: '' }
+export const EMPTY_DRAFT: TaskDraft = {
+  title: '',
+  status: 'todo',
+  assignee: '',
+  body: '',
+  change: '',
+  links: [],
+}
+
+/**
+ * A draft's change, as the create should send it.
+ *
+ * Blank collapses to `null` for `assigneeFromDraft`'s reason, which the field's own doc states.
+ *
+ * It also collapsed a `*new*` sentinel, back when the picker could ask for a change to be
+ * proposed. Every value here names a change that already exists now — see [`TaskDraft.change`].
+ */
+export function changeFromDraft(draft: TaskDraft): string | null {
+  const value = draft.change.trim()
+  return value === '' ? null : value
+}
 
 /**
  * May this draft be created?
@@ -1490,7 +1785,9 @@ export function draftDirty(draft: TaskDraft): boolean {
     draft.title.trim() !== '' ||
     draft.body.trim() !== '' ||
     draft.assignee !== '' ||
-    draft.status !== EMPTY_DRAFT.status
+    draft.status !== EMPTY_DRAFT.status ||
+    // A picked link is work worth protecting from the scrim, exactly as a typed word is. (M30)
+    draft.links.length > 0
   )
 }
 

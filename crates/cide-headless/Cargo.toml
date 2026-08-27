@@ -22,6 +22,10 @@ cide-pty = { workspace = true }
 # and `cide_agents::load_project` — so an `AppHandle` reached for in either crate stops this
 # binary building the same way one in `cide-core` does.
 cide-tasks = { workspace = true }
+# And `cide-spec`, for the same reason: M28 added it, and a crate this binary does not link is a
+# crate the no-tauri proof does not cover. It is also the only way to see whether this machine's
+# `openspec` is findable from a launch whose PATH is not a shell's.
+cide-spec = { workspace = true }
 cide-agents = { workspace = true }
 # M22's crate, linked for the same reason and after the same mistake: `tasks` and `agents` are in
 # this list because M18 added two crates the proof never linked, and for a milestone the guard

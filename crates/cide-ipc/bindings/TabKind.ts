@@ -4,6 +4,7 @@ import type { ExtensionId } from "./ExtensionId";
 import type { MarketplaceId } from "./MarketplaceId";
 import type { RepoId } from "./RepoId";
 import type { SettingsSection } from "./SettingsSection";
+import type { SpecSubject } from "./SpecSubject";
 
 export type TabKind = { "kind": "claudeHome" } | { "kind": "claudeFull", title: string, } | { "kind": "file", path: string, dirty: boolean, } | { "kind": "diff", spec: DiffSpec, 
 /**
@@ -85,4 +86,4 @@ dirty: boolean, } | { "kind": "settings", section: SettingsSection, } | { "kind"
 /**
  * What the extension calls itself. See the note above.
  */
-name: string, };
+name: string, } | { "kind": "openSpec", subject: SpecSubject, };

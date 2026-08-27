@@ -118,6 +118,51 @@ export function onAcknowledge(track: Track): Track {
   return { awaiting: false, gone: track.gone }
 }
 
+// --- which gestures *are* a person -----------------------------------------------------
+//
+// Both of these are here rather than inline at their listener for the reason everything else
+// in this file is here: they are the two remaining judgement calls in the feature, they are
+// pure, and `ui/scripts/check-awaiting.mjs` can drive them. Inline at the DOM they can only
+// ever be grepped for — and a grep is what let the keyboard acknowledger sit dead through a
+// passing check for a whole milestone (see `TerminalPane.tsx`'s comment on the capture phase).
+
+/**
+ * Whether a `keydown` is somebody reading this pane.
+ *
+ * Bare modifiers are excluded and nothing else is. Holding Ctrl to read a chord, or Alt to
+ * reach a menu, is not reading a conversation, and on some layouts a modifier is pressed on
+ * the way to somewhere else entirely — while *any* other key pressed inside a pane is the
+ * strongest statement available that a person is here and looking, whatever the key does.
+ *
+ * Deliberately not consulted about what the key gate did with the stroke: the question is
+ * whether a human touched this pane, not what the app made of it. (A stroke the gate *does*
+ * consume never arrives at a pane at all — it is stopped at `window` — so that distinction
+ * costs nothing here; `TerminalPane.tsx` carries the boundary.)
+ */
+export function acknowledgesKey(key: string): boolean {
+  return key !== 'Shift' && key !== 'Control' && key !== 'Alt' && key !== 'Meta'
+}
+
+/**
+ * Whether a pointer button pressed on a pane is somebody reading it.
+ *
+ * * **0, left** — the plain case, and the one that has always counted.
+ * * **1, middle** — a primary-selection paste. It puts text into *this* pane, which is a
+ *   person acting on it as surely as typing is; the marker survived it only because the
+ *   original screen was written as `button === 0` rather than as a question about people.
+ * * **2, right** — excluded, and this is the load-bearing one. A right-click opens the pane
+ *   menu rather than reading anything, and that menu is where `Minimize window` is chosen
+ *   from: putting a window away is the user saying *come back to this*, so clearing the
+ *   marker on the way there destroys the one thing that would bring them back, and the
+ *   `Awaiting: 1` in the task bar with it.
+ *
+ * Buttons 3 and 4 (back/forward) fall out as `false` — they are navigation gestures the app
+ * binds globally, not acts on the pane under the pointer.
+ */
+export function acknowledgesButton(button: number): boolean {
+  return button === 0 || button === 1
+}
+
 /**
  * Fold a whole `cide://session-awaiting` broadcast into a local table.
  *

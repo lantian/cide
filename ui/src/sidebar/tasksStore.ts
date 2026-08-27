@@ -50,6 +50,8 @@ import {
   EMPTY_DRAFT,
   assigneeFromDraft,
   canWrite,
+  changeFromDraft,
+  isLinkKind,
   newerBoard,
   type Board,
   type TaskDraft,
@@ -245,11 +247,42 @@ export const useTasks = create<TasksStore>((set, get) => ({
      */
     const body = draft.body.trim() === '' ? undefined : draft.body
     const agent = assigneeFromDraft(draft.assignee)
+
+    /*
+     * The change this task names, if it names one — an **existing** change and never a new one.
+     *
+     * This used to also *propose*: the picker offered "New change from this task", and this
+     * branch called `spec_propose` before the create so the task could be born linked. What that
+     * produced was a scaffold — a stub proposal, no delta specs, no checklist — which is a change
+     * `openspec validate` refuses and a board row stuck at `0/0`. The link was correct and the
+     * thing it linked to was broken.
+     *
+     * Proposing moved to `spec_propose_for_task`, which runs `/openspec-propose` in a
+     * conversation and tells it to link the change back with `cide_task_update`. That inverts the
+     * ordering argument this comment used to make, and the inversion is safe for the reason the
+     * original was not: nothing is dispatched from a task with no change, so there is no run to
+     * mislead — where a task born linked to an empty change would have dispatched a run at a
+     * checklist that did not exist.
+     */
+    const change = changeFromDraft(draft)
+
+    /*
+     * The draft's links, folded in with the creation rather than as follow-up edits. (M30)
+     * `TaskNew::links` carries the interleaving argument: a create naming an assignee
+     * dispatches, and a blockedBy attached one call later is a gate the trigger never saw.
+     * Through the `isLinkKind` guard rather than a cast — the dialog only offers the three,
+     * so the filter narrows without ever dropping anything a user picked.
+     */
+    const links = draft.links.flatMap((link) =>
+      isLinkKind(link.kind) ? [{ link: link.kind, target: link.target }] : [],
+    )
     const req: TaskNew = {
       project,
       title: draft.title.trim(),
       ...(body === undefined ? {} : { body }),
       ...(agent === null ? {} : { agent }),
+      ...(change === null ? {} : { change: change as never }),
+      ...(links.length === 0 ? {} : { links }),
       status: draft.status,
     }
     /*

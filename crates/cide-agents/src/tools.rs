@@ -1,18 +1,27 @@
-//! The eleven MCP tools cide serves a `claude`: their names, their schemas, and handlers that
+//! The fifteen MCP tools cide serves a `claude`: their names, their schemas, and handlers that
 //! touch nothing. (M18)
 //!
 //! Two families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
 //! connection's header line, never from anything the caller says:
 //!
-//! * the six `cide_task_*` tools ([`tool::ALL`]) — the shared tracker, served to the project's
+//! * the eight `cide_task_*` tools ([`tool::ALL`]) — the shared tracker, served to the project's
 //!   own session **and** to every dispatched subagent run, because the tracker is the medium
 //!   they exchange state through;
-//! * the five `cide_agent*` tools ([`tool::ORCHESTRATION`]) — the roster and the dispatch,
-//!   served **only** to the project's primary session, which is the product owner.
+//! * the seven `cide_agent*` tools ([`tool::ORCHESTRATION`]) — the roster, the two that author
+//!   a role, and the dispatch — served **only** to the project's primary session, which is the
+//!   product owner.
 //!
 //! That split is the whole of the answer to *may an agent dispatch another agent*: a run's
 //! connection is never handed the vocabulary, so the question never reaches a model at all. See
 //! `cide_app::agent_rpc`'s header for the table.
+//!
+//! `cide_task_link`/`cide_task_unlink` (M30) are in the *task* family deliberately, although a
+//! `blockedBy` edge gates dispatch: a run decomposing its work must be able to record the edges
+//! it discovers, and the safety property was never "runs cannot write facts that dispatch reads"
+//! — a run's *assign* is also such a fact. It is the same property both times: the author gate in
+//! [`crate::autodispatch`] means a run's write records intent and starts nothing, and the
+//! explicit-dispatch preflight in `cide_app::cmd::agents` is on a vocabulary a run is never
+//! served.
 //!
 //! # Where these are served, and why the vocabulary lives here
 //!
@@ -64,6 +73,34 @@
 //! on. So pause repairs no failure `cide_agent_stop` does not, and it adds a state only a human
 //! can leave.
 //!
+//! # `cide_agent_create` and `cide_agent_update` write a file the project commits (M33)
+//!
+//! They were absent until M33, and the argument for leaving them out was that a role *is* a
+//! markdown file and the product owner has file tools: `cide_app::cmd::session`'s preamble said
+//! so, and hand-writing `.cide/agents/<name>.md` does work. What that missed is that the grammar
+//! is not visible from outside — a definition that spells `max_concurrent` with an underscore, or
+//! names a `permission-mode` from another CLI's vocabulary, loads, is greyed, and is never
+//! dispatched. The model finds out from a dispatch that refuses, or does not find out at all.
+//! These two go through `crate::defs::validate` and `crate::defs::save`, which is the same writer
+//! the Agents panel's form uses, so a mistake comes back as the sentence naming the field.
+//!
+//! **A create goes to `.cide/agents/` and nowhere else**, and that is the one place this
+//! vocabulary is deliberately narrower than the panel's. The global scope is
+//! `$XDG_CONFIG_HOME/cide/agents/`: it is in no repository, appears in no review, and applies to
+//! every project the user opens — so a role written there on one project's behalf is a change to
+//! the user's *other* work, made by a model, that nothing would ever show them.
+//! [`tool::AGENT_UPDATE`] does take a scope, because editing a definition that already exists is
+//! bounded by what is already in it, and a role the orchestrator can see may well be a global
+//! one. Claude Code's two scopes are refused for a create by `defs::validate` itself, and for its
+//! own reason: cide does not author files in a directory whose format it does not define.
+//!
+//! # `cide_agent_delete` is deliberately absent
+//!
+//! For `cide_task_delete`'s reason, one turn further: a role's body is somebody's system prompt,
+//! and a *global* one is in no repository's history and has nothing to be restored from. Removing
+//! a definition is `cide_app::cmd::agents::agents_delete`, reachable from the panel, made by a
+//! person looking at it. An orchestrator that thinks a role should go says so in a task.
+//!
 //! # Nothing here does I/O
 //!
 //! Every handler takes already-parsed values plus a `&dyn TaskSink`, exactly as
@@ -95,12 +132,15 @@
 //! fact that lets a reader — a model or a person — weigh a line, and a log of anonymous
 //! assertions is a log an agent has no way to be sceptical about.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use cide_ipc::{
-    AgentDef, AgentId, AgentRun, Harness, RunId, RunState, Task, TaskAuthor, TaskEdit, TaskId,
-    TaskStatus,
+    AgentDef, AgentId, AgentRun, ChangeName, Harness, LinkType, RunId, RunState, Task, TaskAuthor,
+    TaskEdit, TaskId, TaskLinkSpec, TaskStatus,
+    agents::{AgentDraft, AgentField, AgentScope},
 };
 
 /// The tool names. Constants rather than literals so a rename is one edit and a typo is a
@@ -118,10 +158,26 @@ pub mod tool {
     pub const TASK_COMMENT: &str = "cide_task_comment";
     /// Set (or clear) the role a task is for. A subset of [`TASK_UPDATE`], on purpose.
     pub const TASK_ASSIGN: &str = "cide_task_assign";
+    /// Add one typed edge to another task. Its own tool rather than a `links` field on
+    /// [`TASK_UPDATE`], because an array field can say what the set *is* but never what the
+    /// caller *did* — add and remove both arrive as "here is the whole new set", every caller
+    /// must read-modify-write, and two concurrent adds erase each other before the store's
+    /// per-edge merge can even see them. `cide_ipc::TaskEdit::Link` carries the same argument
+    /// on the wire shape. (M30)
+    pub const TASK_LINK: &str = "cide_task_link";
+    /// Tombstone one edge, named by the same `(link, target)` pair [`TASK_GET`] shows.
+    pub const TASK_UNLINK: &str = "cide_task_unlink";
 
     /// The roles this project defines, and how each one is doing. The "what agents do I have"
     /// answer, and the call a product owner makes before any of the four below.
     pub const AGENTS_LIST: &str = "cide_agents_list";
+    /// Define a role that does not exist yet, by writing `.cide/agents/<name>.md`. Project scope
+    /// only, and validated by the writer the Agents panel's form uses — see the module header.
+    /// (M33)
+    pub const AGENT_CREATE: &str = "cide_agent_create";
+    /// Change one role's definition file, field by field. A field left out is left as the file
+    /// has it, which is what makes this safe to call on a definition nobody has read. (M33)
+    pub const AGENT_UPDATE: &str = "cide_agent_update";
     /// Hand a task to a role. **Enqueues and answers with a run id at once** — see the crate's
     /// `enqueue` and `agents_dispatch`, which both carry this rule in full.
     pub const AGENT_DISPATCH: &str = "cide_agent_dispatch";
@@ -147,15 +203,20 @@ pub mod tool {
         TASK_UPDATE,
         TASK_COMMENT,
         TASK_ASSIGN,
+        TASK_LINK,
+        TASK_UNLINK,
     ];
 
     /// The orchestration vocabulary, served to a project's **primary session only**.
     ///
-    /// Ordered the way the loop runs: find out what roles exist, hand one of them a task, watch,
-    /// intervene, take the work back. A model skimming this list in order reads the product
-    /// owner's job description, which is most of what makes it do the job.
+    /// Ordered the way the loop runs: find out what roles exist, define or correct the one the
+    /// work in front of you wants, hand it a task, watch, intervene, take the work back. A model
+    /// skimming this list in order reads the product owner's job description, which is most of
+    /// what makes it do the job.
     pub const ORCHESTRATION: &[&str] = &[
         AGENTS_LIST,
+        AGENT_CREATE,
+        AGENT_UPDATE,
         AGENT_DISPATCH,
         AGENT_RUNS,
         AGENT_STOP,
@@ -166,7 +227,7 @@ pub mod tool {
     ///
     /// Spelled out rather than concatenated, because a `const fn` concatenation of two slices is
     /// not expressible and a `Vec` would give up the `&'static [&'static str]` that lets a
-    /// connection's allow-list be a borrowed slice. `the_eleven_are_the_only_eleven` is what
+    /// connection's allow-list be a borrowed slice. `the_fifteen_are_the_only_fifteen` is what
     /// keeps the three lists from drifting — a name added to either family and forgotten here is
     /// a test failure, not a tool nobody is served.
     pub const EVERY: &[&str] = &[
@@ -176,7 +237,11 @@ pub mod tool {
         TASK_UPDATE,
         TASK_COMMENT,
         TASK_ASSIGN,
+        TASK_LINK,
+        TASK_UNLINK,
         AGENTS_LIST,
+        AGENT_CREATE,
+        AGENT_UPDATE,
         AGENT_DISPATCH,
         AGENT_RUNS,
         AGENT_STOP,
@@ -203,6 +268,26 @@ const STATUSES: &[TaskStatus] = &[
     TaskStatus::Review,
     TaskStatus::Done,
 ];
+
+/// The harnesses, as a slice, for [`STATUSES`]' reason: the schema's `enum` and the parser must
+/// be the same set by construction. (M33)
+const HARNESSES: &[Harness] = &[Harness::Claude, Harness::Opencode];
+
+/// The four scopes a definition can live in, as a slice, for [`STATUSES`]' reason. (M33)
+///
+/// In `defs::scopes()`' precedence order — highest first — because a model reading the enum of
+/// `cide_agent_update`'s `scope` is reading the list of places one name can be defined, and the
+/// order it shadows in is the one useful thing that list can also say.
+const SCOPES: &[AgentScope] = &[
+    AgentScope::Project,
+    AgentScope::Global,
+    AgentScope::ClaudeProject,
+    AgentScope::ClaudeGlobal,
+];
+
+/// The three link kinds, as a slice, for [`STATUSES`]' reason: the schema's `enum` and the
+/// parser must be the same set by construction. (M30)
+const LINK_TYPES: &[LinkType] = &[LinkType::Related, LinkType::BlockedBy, LinkType::SubtaskOf];
 
 // --- the result shape ------------------------------------------------------------------------
 
@@ -291,7 +376,23 @@ pub trait TaskSink: Send + Sync {
     ///
     /// `body` is `&str` and not `Option<&str>`: [`Task::body`] is not nullable, and "no body" and
     /// "an empty body" are the same fact about a task.
-    fn create(&self, title: &str, body: &str, agent: Option<&AgentId>) -> Result<Task, String>;
+    ///
+    /// `change` is a parameter rather than a follow-up [`TaskEdit`], and that is not tidiness.
+    /// The auto-dispatch trigger reads the task a mutation *left behind*, so a create-then-link
+    /// would publish a task with no change, dispatch a run from it, and only then attach the
+    /// change — leaving the run told nothing about the checklist it was started for. (M28)
+    ///
+    /// `links` is a parameter for the sharper version of the same interleaving (M30): a creation
+    /// naming an assignee dispatches, and a `blockedBy` edge attached one call later is a gate
+    /// the trigger could never have seen. An empty slice means none.
+    fn create(
+        &self,
+        title: &str,
+        body: &str,
+        agent: Option<&AgentId>,
+        change: Option<&ChangeName>,
+        links: &[TaskLinkSpec],
+    ) -> Result<Task, String>;
 
     /// Apply one change. The author of a [`TaskEdit::Comment`] is **not** a parameter — it is
     /// decided by the app from the connection this call arrived on, for the `spawned_as` reason
@@ -342,6 +443,36 @@ pub trait AgentSink: Send + Sync {
     /// not an empty list: "you have no roles" and "this project has not turned this on" are
     /// different facts and a model that reads the first will simply do the work itself.
     fn agents(&self) -> Result<Vec<AgentDef>, String>;
+
+    /// One role's definition file, as the draft an edit patches, or `Ok(None)` when that scope
+    /// has no role by that name. (M33)
+    ///
+    /// `Ok(None)` rather than `Err` for [`TaskSink::get`]'s reason: "there is no `qa` in
+    /// `.cide/agents/`" is a fact about the project that the handler turns into a sentence
+    /// naming what to call next, while `Err` is for a file that could not be read or whose front
+    /// matter does not parse — and that one carries the line number, because a model told *which*
+    /// line can fix it.
+    ///
+    /// This method is what makes [`tool::AGENT_UPDATE`] a patch rather than a replace. A tool
+    /// that took every field and wrote what it was given would delete a system prompt its caller
+    /// had never seen every time it changed a model name, and would delete a subagent's `hooks:`
+    /// block along with it — which is the failure `cide_ipc::AgentExtra` exists to prevent and
+    /// which only survives here because the draft carries the extras through untouched.
+    fn definition(&self, scope: AgentScope, name: &AgentId) -> Result<Option<AgentDraft>, String>;
+
+    /// Write a definition file, answering with the path it now occupies. (M33)
+    ///
+    /// Both kinds of refusal arrive as `Err`, carrying the sentence rather than a tag: a draft
+    /// the writer rejected — where the field is named *in* the sentence, because
+    /// `cide_ipc::AgentDraftProblem` is a field and a sentence and only the sentence is
+    /// actionable by the caller here — and a disk that would not take the write.
+    ///
+    /// The handler has already run `crate::defs::validate` over this draft, which is what makes
+    /// every ordinary refusal reachable from a test with no disk. What is left for the
+    /// implementation is the half that needs a directory: a name already taken by a file nobody
+    /// asked to overwrite, a rename that could not finish, a create into a scope cide does not
+    /// author.
+    fn write_definition(&self, draft: &AgentDraft) -> Result<PathBuf, String>;
 
     /// Every run this project has, newest last, finished ones included.
     ///
@@ -418,7 +549,7 @@ pub trait AgentSink: Send + Sync {
 /// `cide_ide_mcp::tools`'s rule, and its `every_advertised_tool_has_a_schema_and_a_description`
 /// has a twin below.
 ///
-/// **All eleven, always.** The per-connection filtering is `cide_app::agent_rpc`'s
+/// **All fifteen, always.** The per-connection filtering is `cide_app::agent_rpc`'s
 /// `descriptors_for`, which keeps this order and drops what the connection may not call: one
 /// definition of each tool, and the scope decided in exactly one place.
 pub fn descriptors() -> Vec<Value> {
@@ -452,7 +583,11 @@ pub fn description(name: &str) -> &'static str {
         }
         tool::TASK_CREATE => {
             "Add a task to this project's tracker. It starts in the `todo` status. Give it a \
-             title a person can act on, and put the statement of the work in the body."
+             title a person can act on, and put the statement of the work in the body. If the \
+             work is an OpenSpec change, name it in `change` — a run started on that task is \
+             pointed at its proposal, design and task checklist. `links` records edges to \
+             existing tasks at creation — name a `blockedBy` link here rather than adding it \
+             afterwards, so the task is never dispatchable before its blocker is known."
         }
         tool::TASK_UPDATE => {
             // Third person deliberately, here and in TASK_ASSIGN: `tool::ALL` serves these to
@@ -462,18 +597,33 @@ pub fn description(name: &str) -> &'static str {
             "Change a task's title, body, status or assigned role. Only the fields you send are \
              changed. To record *why* something changed, add a comment as well — the tracker is \
              read by the user and by the other agents. When subagents are enabled, an assignment \
-             made by the user or the product owner also starts that role on the task."
+             made by the user or the product owner also starts that role on the task. `change` \
+             links the task to an OpenSpec change, or unlinks it when null."
         }
         tool::TASK_COMMENT => {
-            "Append one line to a task's log: what you did, what you found, or why you are \
+            "Append an entry to a task's log: what you did, what you found, or why you are \
              stopping. Comments are append-only and are how agents report back on a task. Your \
-             identity is recorded by cide; do not sign the text."
+             identity is recorded by cide; do not sign the text. A person reads this, so give a \
+             report of any length structure — see `text` for the markdown the card draws."
         }
         tool::TASK_ASSIGN => {
             "Set the role a task is for, or pass agent: null to unassign it. This is the same as \
              the `assignee` field of cide_task_update and exists because it is the common call. \
              When subagents are enabled, an assignment made by the user or the product owner \
              also starts that role on the task; unassigning never stops a run."
+        }
+        tool::TASK_LINK => {
+            // Third person for TASK_UPDATE's stated reason: dispatched runs read this too.
+            "Link this task to another task in the same tracker. `blockedBy` means this task \
+             must not be worked until `target` is done — cide skips a blocked task when \
+             assignment would start a role, and refuses an explicit dispatch of one until every \
+             blocker is done. `subtaskOf` records that this task is one piece of `target`. \
+             `related` is a plain cross-reference and changes nothing. Links appear on both \
+             tasks in cide_task_list and cide_task_get."
+        }
+        tool::TASK_UNLINK => {
+            "Remove one link between two tasks. Name the same `link` kind and `target` that \
+             cide_task_get shows on either task."
         }
         tool::AGENTS_LIST => {
             "The subagent roles this project defines and can hand work to: what each one is for, \
@@ -482,6 +632,27 @@ pub fn description(name: &str) -> &'static str {
              files in the repository (`.cide/agents/<name>.md`), so a teammate's commit can add \
              or remove one while you are working, and a role file you write yourself takes \
              effect immediately."
+        }
+        tool::AGENT_CREATE => {
+            "Define a subagent role this project does not have yet: a name, one line saying what \
+             it is for, and the system prompt it works under. The definition is written to \
+             `.cide/agents/<name>.md`, committed with the project, and takes effect immediately — \
+             the role can be handed a task on your very next call. Reach for this when the work \
+             in front of you wants a kind of worker this project has not got. A role is long-lived \
+             and a task is not, so `systemPrompt` should describe the *job* — how this role \
+             works, what it must always do, what it must never do — and leave the particular \
+             piece of work to the task you dispatch it on. Every other field is optional and the \
+             harness's own default applies where you leave one out."
+        }
+        tool::AGENT_UPDATE => {
+            "Change a role's definition file. Only the fields you send are changed and everything \
+             else is left exactly as the file has it, so this is safe to call on a definition you \
+             have not read — except for `systemPrompt`, which replaces the whole prompt rather \
+             than adding to it. Pass null to clear an optional field and fall back to the \
+             default. This cannot rename a role (every task assigned to the old name would be \
+             pointing at nothing) and it cannot move one between scopes. `scope` says which file \
+             to edit when a name is defined in more than one place; leave it out for the \
+             definition that is in effect, which is the one cide_agents_list shows you."
         }
         tool::AGENT_DISPATCH => {
             "Hand one of this project's roles a task to work on. Create the task first with \
@@ -523,8 +694,19 @@ pub fn description(name: &str) -> &'static str {
 /// The JSON-Schema for one tool's arguments.
 pub fn input_schema(name: &str) -> Value {
     // Built from `STATUSES` through serde rather than spelled out, so the schema's `enum` is by
-    // construction the set `TaskStatus` will actually deserialise.
+    // construction the set `TaskStatus` will actually deserialise. `link_enum` gets the same
+    // discipline for `LinkType`.
     let status_enum: Vec<&'static str> = STATUSES.iter().copied().map(status_wire).collect();
+    let link_enum: Vec<&'static str> = LINK_TYPES.iter().copied().map(link_wire).collect();
+    // One description for every place a link kind is asked for, so the three directions are
+    // explained identically wherever the model meets them.
+    let link_kind = json!({
+        "type": "string",
+        "enum": link_enum,
+        "description":
+            "`blockedBy`: THIS task waits on `target`. `subtaskOf`: this task is one piece of \
+             `target`. `related`: a plain cross-reference, no direction that matters.",
+    });
 
     match name {
         tool::TASK_LIST => json!({
@@ -564,13 +746,40 @@ pub fn input_schema(name: &str) -> Value {
                 },
                 "body": {
                     "type": "string",
-                    "description": "The whole statement of the work. Absent means empty.",
+                    "description":
+                        "The whole statement of the work, as markdown — the card renders it the \
+                         way it renders a comment. Absent means empty.",
                 },
                 "assignee": {
                     "type": "string",
                     "description":
                         "The role this task is for, e.g. `developer`. Absent leaves it \
                          unassigned.",
+                },
+                "change": {
+                    "type": "string",
+                    "description":
+                        "The OpenSpec change this task implements, e.g. `add-dark-mode` — the \
+                         folder name under openspec/changes/. Absent means the task is not \
+                         spec-driven, which is most tasks.",
+                },
+                "links": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "link": link_kind,
+                            "target": {
+                                "type": "string",
+                                "description": "An existing task's id, e.g. `t-17`.",
+                            },
+                        },
+                        "required": ["link", "target"],
+                    },
+                    "description":
+                        "Edges to existing tasks, recorded with the creation. Name a blockedBy \
+                         link here rather than in a follow-up cide_task_link, so the task is \
+                         never dispatchable before its blocker is known.",
                 },
             },
             "required": ["title"],
@@ -579,8 +788,13 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "id": { "type": "string", "description": "A task id, e.g. `t-17`." },
-                "title": { "type": "string" },
-                "body": { "type": "string" },
+                "title": { "type": "string", "description": "One line. Replaces the old title." },
+                "body": {
+                    "type": "string",
+                    "description":
+                        "Replaces the whole statement of the work; markdown, as in \
+                         cide_task_create. Sending it does not append — comment instead.",
+                },
                 "status": { "type": "string", "enum": status_enum },
                 // Nullable *and* optional, and the two mean different things: absent leaves the
                 // assignment alone, `null` clears it. That is exactly the distinction
@@ -592,6 +806,15 @@ pub fn input_schema(name: &str) -> Value {
                     "description":
                         "The role this task is for. Omit to leave it alone; null to unassign.",
                 },
+                // Nullable for `assignee`'s reason, and the null case is the one that matters:
+                // a change that was proposed and abandoned has to be detachable without the
+                // task being deleted and retyped.
+                "change": {
+                    "type": ["string", "null"],
+                    "description":
+                        "The OpenSpec change this task implements. Omit to leave it alone; null \
+                         to unlink it.",
+                },
             },
             "required": ["id"],
         }),
@@ -601,7 +824,16 @@ pub fn input_schema(name: &str) -> Value {
                 "id": { "type": "string", "description": "A task id, e.g. `t-17`." },
                 "text": {
                     "type": "string",
-                    "description": "The line to append. Plain text; it is never rendered as markup.",
+                    // The wording is the fix for a real failure, not a nicety: this said "plain
+                    // text; it is never rendered as markup" for a milestone after M27 made it
+                    // markdown, and runs believed it — the tracker filled with single-paragraph
+                    // walls of prose because the tool told them formatting would be discarded.
+                    // `cide_ipc::TaskComment::text` carries the rest of the story.
+                    "description":
+                        "What to append, as markdown: blank line between paragraphs, `-` or `1.` \
+                         for a list, ``` for code, and one newline is one line break. A report \
+                         with more than a couple of parts should use them — this is read by a \
+                         person in a narrow card, not parsed.",
                 },
             },
             "required": ["id", "text"],
@@ -617,9 +849,107 @@ pub fn input_schema(name: &str) -> Value {
             },
             "required": ["id", "agent"],
         }),
+        tool::TASK_LINK => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The task the link is made from, e.g. `t-17`." },
+                "link": link_kind,
+                "target": { "type": "string", "description": "The other task's id, e.g. `t-3`." },
+            },
+            "required": ["id", "link", "target"],
+        }),
+        tool::TASK_UNLINK => json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description":
+                        "The task the link reads from: for blockedBy the blocked task, for \
+                         subtaskOf the subtask; for related, either end of the pair.",
+                },
+                "link": link_kind,
+                "target": {
+                    "type": "string",
+                    "description": "The other task's id, exactly as the link reads on `id`.",
+                },
+            },
+            "required": ["id", "link", "target"],
+        }),
         // No arguments at all. An empty `properties` rather than none, so a client that renders
         // the schema shows a call with nothing to fill in rather than a call it cannot describe.
         tool::AGENTS_LIST => json!({ "type": "object", "properties": {} }),
+        tool::AGENT_CREATE => {
+            let mut properties = json!({
+                "name": {
+                    "type": "string",
+                    "description":
+                        "The role's name, which becomes its file name and the word every other \
+                         tool asks for it by: 1–32 characters of a–z, 0–9 and `-`, starting with \
+                         a letter or digit. It also becomes a git branch and a directory under \
+                         `.cide/worktrees/`, which is why the rule is that narrow.",
+                },
+                "description": {
+                    "type": "string",
+                    "description":
+                        "One line saying what this role is for. It is what cide_agents_list shows \
+                         you months from now and what the harness tells the role about itself, so \
+                         write it for a reader deciding whether this is the role for a piece of \
+                         work.",
+                },
+                "systemPrompt": {
+                    "type": "string",
+                    "description":
+                        "The role's standing instructions, in markdown, any length. This is the \
+                         whole of what makes it a role rather than a name: without one cide \
+                         refuses the definition. Write the job — how this role works, what it \
+                         must always do, what it must never do — and leave the particular work to \
+                         the task.",
+                },
+            });
+            merge(&mut properties, definition_properties(false));
+            json!({
+                "type": "object",
+                "properties": properties,
+                "required": ["name", "description", "systemPrompt"],
+            })
+        }
+        tool::AGENT_UPDATE => {
+            let mut properties = json!({
+                "agent": {
+                    "type": "string",
+                    "description":
+                        "The role to change, e.g. `developer`. This tool cannot rename it — see \
+                         its description.",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": SCOPES.iter().copied().map(scope_wire).collect::<Vec<_>>(),
+                    "description":
+                        "Which file to edit, when one name is defined in more than one place: \
+                         `project` is this repository's `.cide/agents/`, `global` is your own, \
+                         and the two `claude*` scopes are Claude Code subagents. Leave it out for \
+                         the definition that is in effect — the scope cide_agents_list shows \
+                         beside the role.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Replaces the one line saying what this role is for.",
+                },
+                "systemPrompt": {
+                    "type": "string",
+                    "description":
+                        "Replaces the **whole** system prompt. What is there now is not shown to \
+                         you by any tool in this vocabulary, so read the definition file first \
+                         unless you wrote it yourself in this conversation.",
+                },
+            });
+            merge(&mut properties, definition_properties(true));
+            json!({
+                "type": "object",
+                "properties": properties,
+                "required": ["agent"],
+            })
+        }
         tool::AGENT_DISPATCH => json!({
             "type": "object",
             "properties": {
@@ -702,6 +1032,121 @@ pub fn input_schema(name: &str) -> Value {
     }
 }
 
+/// The optional front-matter keys both writers accept, as schema properties. (M33)
+///
+/// One builder rather than two literals, because a key described one way in
+/// [`tool::AGENT_CREATE`]'s schema and another way in [`tool::AGENT_UPDATE`]'s would be two
+/// accounts of one line of one file, side by side in one `tools/list`, with nothing to tell a
+/// reader which is current.
+///
+/// `nullable` is the whole difference between the two calls. A create has nothing to clear, so a
+/// missing field and a `null` mean the same thing there; an update reads `null` as *clear this
+/// and take the default*, which the schema has to admit or a client that validates before it
+/// sends will refuse to send the one value that expresses it.
+fn definition_properties(nullable: bool) -> Value {
+    // `["string", "null"]` rather than a `nullable` keyword: JSON Schema's own spelling, and the
+    // one every MCP client understands.
+    let kind = |base: &str| -> Value {
+        if nullable {
+            json!([base, "null"])
+        } else {
+            json!(base)
+        }
+    };
+    let clearable = if nullable {
+        " Pass null to clear it and take the default."
+    } else {
+        ""
+    };
+    json!({
+        "label": {
+            "type": kind("string"),
+            "description": format!(
+                "What the roster and the panel call this role. Defaults to the name, \
+                 title-cased.{clearable}"
+            ),
+        },
+        "harness": {
+            // From `HARNESSES` through `harness_wire`, so the schema's enum is by construction
+            // the set `harness_from_wire` will accept. `STATUSES` states the rule.
+            "type": kind("string"),
+            "enum": HARNESSES.iter().copied().map(harness_wire).collect::<Vec<_>>(),
+            "description": format!(
+                "Which CLI runs this role. Leave it out for the project's own default. A harness \
+                 that is not installed on this machine makes the role undispatchable, and \
+                 {} says so against the role.{clearable}",
+                tool::AGENTS_LIST
+            ),
+        },
+        "model": {
+            "type": kind("string"),
+            "description": format!(
+                "The model this role runs under, in the harness's own spelling — `sonnet`, \
+                 `opus`, or a full model id. cide passes it through and checks it against \
+                 nothing.{clearable}"
+            ),
+        },
+        "effort": {
+            "type": kind("string"),
+            "description": format!(
+                "A reasoning-effort knob, in the harness's own vocabulary. Passed through \
+                 unvalidated for `model`'s reason: the set differs per harness and per release, \
+                 so a list cide checked against would be wrong within a month.{clearable}"
+            ),
+        },
+        "tools": {
+            "type": kind("array"),
+            "items": { "type": "string" },
+            "description": format!(
+                "The only tools this role may use, e.g. [\"Read\", \"Grep\", \"Bash\"]. An empty \
+                 list — or leaving this out — does **not** restrict them: that is the harness's \
+                 own default, which is every tool, and not `no tools`.{clearable}"
+            ),
+        },
+        "permissionMode": {
+            "type": kind("string"),
+            "description": format!(
+                "How the harness answers permission prompts. cide's own scopes take one of {}. \
+                 A run nobody is watching that stops to ask waits until it is stopped, which is \
+                 what this field is for — and `{}` is the one that asks for nothing, which is \
+                 what it costs.{clearable}",
+                crate::defs::PERMISSION_MODES.join(", "),
+                crate::defs::BYPASS_PERMISSIONS
+            ),
+        },
+        "maxConcurrent": {
+            "type": if nullable { json!(["integer", "null"]) } else { json!("integer") },
+            "minimum": 1,
+            "description": format!(
+                "How many tasks this role may work on at the same time, each in its own \
+                 worktree. Defaults to 1.{clearable}"
+            ),
+        },
+        "worktree": {
+            "type": kind("boolean"),
+            "description": format!(
+                "Whether this role's runs get a checkout of their own. Defaults to true. `false` \
+                 puts its edits straight onto the branch you have checked out with nothing to \
+                 integrate — right for a role that only reads, wrong for anything that \
+                 writes.{clearable}"
+            ),
+        },
+    })
+}
+
+/// Fold one schema object's keys into another.
+///
+/// Panics on a non-object, which is unreachable: both arguments are `json!({…})` literals in this
+/// module. A `Result` here would be a branch no caller could act on.
+fn merge(into: &mut Value, from: Value) {
+    let (Some(target), Value::Object(source)) = (into.as_object_mut(), from) else {
+        return;
+    };
+    for (key, value) in source {
+        target.insert(key, value);
+    }
+}
+
 // --- dispatch ----------------------------------------------------------------------------------
 
 /// Run one tool call.
@@ -718,6 +1163,8 @@ pub fn dispatch(name: &str, arguments: &Value, sink: &dyn TaskSink) -> Option<To
         tool::TASK_UPDATE => Some(task_update(arguments, sink)),
         tool::TASK_COMMENT => Some(task_comment(arguments, sink)),
         tool::TASK_ASSIGN => Some(task_assign(arguments, sink)),
+        tool::TASK_LINK => Some(task_link(arguments, sink)),
+        tool::TASK_UNLINK => Some(task_unlink(arguments, sink)),
         _ => None,
     }
 }
@@ -774,7 +1221,7 @@ fn task_list(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
 
     let mut body = String::new();
     for task in shown {
-        body.push_str(&render_summary(task));
+        body.push_str(&render_summary(task, &all));
     }
     ToolResult::text(format!("{header}\n{}", fenced(&body)))
 }
@@ -784,11 +1231,31 @@ fn task_get(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Ok(id) => id,
         Err(result) => return result,
     };
-    match sink.get(&id) {
-        Ok(Some(task)) => ToolResult::text(fenced(&render_full(&task))),
-        Ok(None) => ToolResult::error(no_such(&id)),
-        Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_GET)),
+    // The whole list rather than `sink.get`, because rendering one task now needs its
+    // neighbours: an incoming link — "blocks t-7" — lives on the *other* task, and a link
+    // line resolves its target's status and title. (M30)
+    let all = match sink.list() {
+        Ok(tasks) => tasks,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_GET)),
+    };
+    match all.iter().find(|task| task.id == id) {
+        Some(task) => ToolResult::text(fenced(&render_full(task, &all))),
+        None => ToolResult::error(no_such(&id)),
     }
+}
+
+/// The board, re-read to render the task a mutation just returned, with its links in context.
+///
+/// Failing here is next to unreachable — the same in-memory store just accepted the write — and
+/// the message says the change *was* applied, so a model reading the error does not retry a
+/// mutation that landed.
+fn board_for_render(tool: &str, sink: &dyn TaskSink) -> Result<Vec<Task>, ToolResult> {
+    sink.list().map_err(|why| {
+        ToolResult::error(format!(
+            "{tool}: the change was applied, but the tracker could not be re-read to render the \
+             result: {why}"
+        ))
+    })
 }
 
 fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
@@ -813,12 +1280,28 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
     };
 
-    match sink.create(&title, &body, agent.as_ref()) {
-        Ok(task) => ToolResult::text(format!(
-            "Created {}.\n{}",
-            task.id,
-            fenced(&render_full(&task))
-        )),
+    let change = match optional_string(arguments, "change") {
+        Ok(value) => value.map(ChangeName),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+    };
+
+    let links = match optional_links(arguments) {
+        Ok(value) => value,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+    };
+
+    match sink.create(&title, &body, agent.as_ref(), change.as_ref(), &links) {
+        Ok(task) => {
+            let all = match board_for_render(tool::TASK_CREATE, sink) {
+                Ok(all) => all,
+                Err(result) => return result,
+            };
+            ToolResult::text(format!(
+                "Created {}.\n{}",
+                task.id,
+                fenced(&render_full(&task, &all))
+            ))
+        }
         Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
     }
 }
@@ -879,10 +1362,19 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         }),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
     }
+    match nullable_string(arguments, "change") {
+        Ok(Nullable::Absent) => {}
+        Ok(Nullable::Null) => edits.push(TaskEdit::SetChange { change: None }),
+        Ok(Nullable::Value(change)) => edits.push(TaskEdit::SetChange {
+            change: Some(ChangeName(change)),
+        }),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+    }
 
     if edits.is_empty() {
         return ToolResult::error(format!(
-            "{}: nothing to change. Send at least one of `title`, `body`, `status` or `assignee`.",
+            "{}: nothing to change. Send at least one of `title`, `body`, `status`, `assignee` \
+             or `change`.",
             tool::TASK_UPDATE
         ));
     }
@@ -904,11 +1396,17 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
     }
 
     match last {
-        Some(task) => ToolResult::text(format!(
-            "Updated {}.\n{}",
-            task.id,
-            fenced(&render_full(&task))
-        )),
+        Some(task) => {
+            let all = match board_for_render(tool::TASK_UPDATE, sink) {
+                Ok(all) => all,
+                Err(result) => return result,
+            };
+            ToolResult::text(format!(
+                "Updated {}.\n{}",
+                task.id,
+                fenced(&render_full(&task, &all))
+            ))
+        }
         // Unreachable: `edits` was checked non-empty above and the loop returns on the first
         // failure. Answered rather than unwrapped, because a panic in a tool handler takes the
         // whole app down under `panic = "abort"`.
@@ -936,11 +1434,17 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         // The whole task comes back rather than an acknowledgement, so an agent that comments as
         // its turn ends sees what the task now says — including any comment another agent added
         // while it was working, which is the only way it would ever find out.
-        Ok(task) => ToolResult::text(format!(
-            "Commented on {}.\n{}",
-            task.id,
-            fenced(&render_full(&task))
-        )),
+        Ok(task) => {
+            let all = match board_for_render(tool::TASK_COMMENT, sink) {
+                Ok(all) => all,
+                Err(result) => return result,
+            };
+            ToolResult::text(format!(
+                "Commented on {}.\n{}",
+                task.id,
+                fenced(&render_full(&task, &all))
+            ))
+        }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_COMMENT, &id, &why)),
     }
 }
@@ -965,15 +1469,116 @@ fn task_assign(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
     };
 
     match sink.edit(&id, TaskEdit::Assign { agent }) {
-        Ok(task) => ToolResult::text(format!(
-            "{}\n{}",
-            match &task.agent {
-                Some(role) => format!("{} is now for `{role}`.", task.id),
-                None => format!("{} is now unassigned.", task.id),
-            },
-            fenced(&render_summary(&task))
-        )),
+        Ok(task) => {
+            let all = match board_for_render(tool::TASK_ASSIGN, sink) {
+                Ok(all) => all,
+                Err(result) => return result,
+            };
+            ToolResult::text(format!(
+                "{}\n{}",
+                match &task.agent {
+                    Some(role) => format!("{} is now for `{role}`.", task.id),
+                    None => format!("{} is now unassigned.", task.id),
+                },
+                fenced(&render_summary(&task, &all))
+            ))
+        }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_ASSIGN, &id, &why)),
+    }
+}
+
+fn task_link(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
+    let id = match required_id(arguments, tool::TASK_LINK) {
+        Ok(id) => id,
+        Err(result) => return result,
+    };
+    let (link, target) = match required_edge(arguments, tool::TASK_LINK) {
+        Ok(pair) => pair,
+        Err(result) => return result,
+    };
+
+    // Every interesting refusal — self-link, duplicate, missing target, a cycle with its chain
+    // named — originates in `cide-tasks` and arrives here as a sentence through the sink.
+    match sink.edit(
+        &id,
+        TaskEdit::Link {
+            link,
+            target: target.clone(),
+        },
+    ) {
+        Ok(task) => {
+            let all = match board_for_render(tool::TASK_LINK, sink) {
+                Ok(all) => all,
+                Err(result) => return result,
+            };
+            ToolResult::text(format!(
+                "Linked {} {} {}.\n{}",
+                task.id,
+                link_wire(link),
+                target,
+                fenced(&render_full(&task, &all))
+            ))
+        }
+        Err(why) => ToolResult::error(edit_failure(tool::TASK_LINK, &id, &why)),
+    }
+}
+
+fn task_unlink(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
+    let id = match required_id(arguments, tool::TASK_UNLINK) {
+        Ok(id) => id,
+        Err(result) => return result,
+    };
+    let (link, target) = match required_edge(arguments, tool::TASK_UNLINK) {
+        Ok(pair) => pair,
+        Err(result) => return result,
+    };
+
+    match sink.edit(
+        &id,
+        TaskEdit::Unlink {
+            link,
+            target: target.clone(),
+        },
+    ) {
+        Ok(task) => {
+            let all = match board_for_render(tool::TASK_UNLINK, sink) {
+                Ok(all) => all,
+                Err(result) => return result,
+            };
+            ToolResult::text(format!(
+                "Unlinked {} {} {}.\n{}",
+                task.id,
+                link_wire(link),
+                target,
+                fenced(&render_full(&task, &all))
+            ))
+        }
+        Err(why) => ToolResult::error(edit_failure(tool::TASK_UNLINK, &id, &why)),
+    }
+}
+
+/// The `(link, target)` pair both link tools take.
+fn required_edge(arguments: &Value, tool: &str) -> Result<(LinkType, TaskId), ToolResult> {
+    let kind = match required_string(arguments, "link") {
+        Ok(text) => match link_from_wire(&text) {
+            Some(kind) => kind,
+            None => {
+                return Err(ToolResult::error(format!(
+                    "{tool}: `link` must be one of {}, not `{text}`",
+                    LINK_TYPES
+                        .iter()
+                        .copied()
+                        .map(link_wire)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        },
+        Err(why) => return Err(ToolResult::error(format!("{tool}: {why}"))),
+    };
+    match required_string(arguments, "target") {
+        Ok(target) => Ok((kind, TaskId(target))),
+        Err(why) => Err(ToolResult::error(format!("{tool}: {why}"))),
     }
 }
 
@@ -1011,6 +1616,8 @@ pub fn dispatch_orchestration(
 ) -> Option<ToolResult> {
     match name {
         tool::AGENTS_LIST => Some(agents_list(sink)),
+        tool::AGENT_CREATE => Some(agent_create(arguments, sink)),
+        tool::AGENT_UPDATE => Some(agent_update(arguments, sink)),
         tool::AGENT_DISPATCH => Some(agent_dispatch(arguments, sink)),
         tool::AGENT_RUNS => Some(agent_runs(arguments, sink)),
         tool::AGENT_STOP => Some(agent_stop(arguments, sink)),
@@ -1041,11 +1648,13 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         // itself without saying why. This used to end "the user adds one; you cannot" — true
         // until the fs router (`cide_app::dotcide`) made a written role file take effect live,
         // and a model still told it cannot would never use the one action it has.
-        return ToolResult::text(
-            "This project defines no subagent roles, so there is nobody to hand work to. A role \
-             is a markdown file at .cide/agents/<name>.md; one you write takes effect \
-             immediately.",
-        );
+        return ToolResult::text(format!(
+            "This project defines no subagent roles, so there is nobody to hand work to. Define \
+             one with {} — it writes .cide/agents/<name>.md and the role can be dispatched \
+             immediately. Claude Code subagents in .claude/agents/*.md are listed here too, but \
+             cide does not create those.",
+            tool::AGENT_CREATE
+        ));
     }
     let isolated = match sink.isolated() {
         Ok(isolated) => isolated,
@@ -1093,8 +1702,16 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         // The refusal sentence is passed through verbatim — it is `dispatch_refusal`'s, the same
         // one the Agents panel draws, and it names its own fix. Inventing a second wording here
         // would leave a user reading two different explanations of one state.
+        // Where the definition came from — for **every** role since M33, not only for the two
+        // Claude Code scopes it used to mark. Two things now turn on it. An orchestrator has to
+        // know before it edits one: a subagent is Claude Code's file in Claude Code's format,
+        // cide neither creates it nor applies its switches itself, and a model that "fixed" a
+        // `harness:` line into one would be editing a key nothing reads. And it is the word
+        // `cide_agent_update` takes as its `scope`, so a roster that named only half of them
+        // would leave a model guessing at the argument for the other half.
+        let source = format!(" | {}", scope_wire(def.scope));
         body.push_str(&format!(
-            "{} ({}) | {} | {} | {mine} live run(s), runs up to {at_once} at once{ground}\n",
+            "{} ({}) | {} | {} | {mine} live run(s), runs up to {at_once} at once{ground}{source}\n",
             one_line(def.id.as_str()),
             one_line(&def.label),
             harness_wire(def.harness),
@@ -1112,6 +1729,310 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         "{header}\n{}",
         fenced_with(agent_preamble(), &body)
     ))
+}
+
+/// Define a role from nothing, in this project's own `.cide/agents/`. (M33)
+fn agent_create(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let name = match required_role(arguments, "name", tool::AGENT_CREATE) {
+        Ok(name) => name,
+        Err(result) => return result,
+    };
+    let description = match required_string(arguments, "description") {
+        Ok(value) => value,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_CREATE)),
+    };
+    let system_prompt = match required_string(arguments, "systemPrompt") {
+        Ok(value) => value,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_CREATE)),
+    };
+    let fields = match Fields::read(arguments) {
+        Ok(fields) => fields,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_CREATE)),
+    };
+
+    let draft = AgentDraft {
+        // The project scope, always, and there is no argument for it. The module header carries
+        // the argument in full: a global role is the user's *other* projects, changed by a model,
+        // in a directory no pull request will ever show them.
+        scope: AgentScope::Project,
+        name,
+        // `None` **is** the create. `defs::save` reads this one field to tell a create from a
+        // rename, and answers a name a file already holds with a refusal rather than an
+        // overwrite — the file it would replace is somebody's system prompt.
+        original: None,
+        label: fields.label.onto(None),
+        harness: fields.harness.onto(None),
+        description,
+        model: fields.model.onto(None),
+        effort: fields.effort.onto(None),
+        tools: fields.tools.onto(None).unwrap_or_default(),
+        permission_mode: fields.permission_mode.onto(None),
+        max_concurrent: fields.max_concurrent.onto(None),
+        worktree: fields.worktree.onto(None),
+        system_prompt,
+        // A file cide is authoring in cide's own format has no key cide does not model.
+        extras: Vec::new(),
+    };
+
+    match persist(tool::AGENT_CREATE, &draft, sink) {
+        Ok(path) => ToolResult::text(format!(
+            "Defined `{}` in {}. It takes effect immediately — the role can be handed a task on \
+             your next call. Call {} to see whether its harness is available on this machine \
+             before you rely on it.\n{}",
+            draft.name,
+            path.display(),
+            tool::AGENTS_LIST,
+            fenced_with(agent_preamble(), &render_definition(&draft))
+        )),
+        Err(refusal) => refusal,
+    }
+}
+
+/// Change one role's definition file, leaving every field the caller did not name alone. (M33)
+fn agent_update(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let name = match required_role(arguments, "agent", tool::AGENT_UPDATE) {
+        Ok(name) => name,
+        Err(result) => return result,
+    };
+    // Refused rather than ignored. `name` is [`tool::AGENT_CREATE`]'s key for this same idea, so
+    // a model reaching for a rename reaches for it here — and a silently dropped `name` is a
+    // rename the caller believes happened, in a file it has no reason to read again.
+    if arguments.get("name").is_some() {
+        return ToolResult::error(format!(
+            "{}: this tool has no `name` — the role is named by `agent`, and a role cannot be \
+             renamed. Its name is what every task's assignee, every `cide/<role>-<task>` branch \
+             and every worktree is keyed on, so a rename would leave all of that pointing at \
+             nothing. Define the role you want with {} instead, and reassign the tasks.",
+            tool::AGENT_UPDATE,
+            tool::AGENT_CREATE
+        ));
+    }
+    let scope = match optional_scope(arguments, "scope") {
+        Ok(Some(scope)) => scope,
+        Ok(None) => match effective_scope(&name, sink) {
+            Ok(scope) => scope,
+            Err(result) => return result,
+        },
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_UPDATE)),
+    };
+
+    let before = match sink.definition(scope, &name) {
+        Ok(Some(draft)) => draft,
+        Ok(None) => {
+            return ToolResult::error(format!(
+                "{}: the `{}` scope defines no role called `{name}`. Call {} — it names the scope \
+                 beside every role — or {} to define this one in this project.",
+                tool::AGENT_UPDATE,
+                scope_wire(scope),
+                tool::AGENTS_LIST,
+                tool::AGENT_CREATE
+            ));
+        }
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_UPDATE)),
+    };
+
+    let fields = match Fields::read(arguments) {
+        Ok(fields) => fields,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_UPDATE)),
+    };
+    // The one key of the eight that does not exist in the other family's dialect — see
+    // `defs::canonical_key`, where `harness` is the single `!claude` arm. Written into a
+    // `.claude/agents/` file it would be a line nothing reads, put there by cide, in a file cide
+    // does not own; on the next read it would come back as an *extra* and be preserved for ever.
+    if scope.is_claude_code() && !matches!(fields.harness, Field::Absent) {
+        return ToolResult::error(format!(
+            "{}: `harness` cannot be set on a Claude Code subagent. It is cide's own key and \
+             `.claude/agents/` is a format cide does not define, so a `harness:` line there is \
+             read by nothing — a subagent runs under Claude Code by definition.",
+            tool::AGENT_UPDATE
+        ));
+    }
+
+    let mut next = AgentDraft {
+        label: fields.label.onto(before.label.clone()),
+        harness: fields.harness.onto(before.harness),
+        model: fields.model.onto(before.model.clone()),
+        effort: fields.effort.onto(before.effort.clone()),
+        // `null` and `[]` are one answer here, deliberately: an empty list is what "does not
+        // restrict them" is spelled as on disk, so there is nothing for a `null` to mean besides
+        // the same thing.
+        tools: fields
+            .tools
+            .onto(Some(before.tools.clone()))
+            .unwrap_or_default(),
+        permission_mode: fields.permission_mode.onto(before.permission_mode.clone()),
+        max_concurrent: fields.max_concurrent.onto(before.max_concurrent),
+        worktree: fields.worktree.onto(before.worktree),
+        // Everything else — the scope, the name, `original`, and above all the extras and the
+        // system prompt — comes through from the file untouched unless the two arms below say
+        // otherwise. That is the patch.
+        ..before.clone()
+    };
+    match optional_string(arguments, "description") {
+        Ok(Some(description)) => next.description = description,
+        Ok(None) => {}
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_UPDATE)),
+    }
+    match optional_string(arguments, "systemPrompt") {
+        Ok(Some(prompt)) => next.system_prompt = prompt,
+        Ok(None) => {}
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_UPDATE)),
+    }
+
+    // Normalised on both sides, so "this changes nothing" is decided by what would be *written*
+    // rather than by whitespace the writer folds anyway. Refused rather than performed, because a
+    // no-op save still rewrites a committed file — a modification time, a `git status` entry and
+    // a diff a teammate opens to find nothing in it.
+    if crate::defs::normalize(&next) == crate::defs::normalize(&before) {
+        return ToolResult::error(format!(
+            "{}: nothing to change — every field you sent is already what the file says. Send \
+             at least one field with a different value.",
+            tool::AGENT_UPDATE
+        ));
+    }
+
+    match persist(tool::AGENT_UPDATE, &next, sink) {
+        Ok(path) => ToolResult::text(format!(
+            "Updated `{name}` in {}. It takes effect immediately, including for runs dispatched \
+             from now on — a run already going keeps the definition it started with.\n{}",
+            path.display(),
+            fenced_with(agent_preamble(), &render_definition(&next))
+        )),
+        Err(refusal) => refusal,
+    }
+}
+
+/// Validate a draft and hand it to the sink; the `Err` is the refusal to answer with.
+///
+/// `defs::validate` runs **here** as well as inside `defs::save`, and the second call is not
+/// belt-and-braces for its own sake: it is what makes every refusal a model can provoke — an
+/// empty system prompt, a permission mode from another CLI's vocabulary, a name that could not be
+/// a directory — reachable from a unit test with no disk, which is the property this whole module
+/// is built on.
+fn persist(
+    tool_name: &str,
+    draft: &AgentDraft,
+    sink: &dyn AgentSink,
+) -> Result<PathBuf, ToolResult> {
+    let problems = crate::defs::validate(draft);
+    if !problems.is_empty() {
+        // Every problem rather than the first, for the reason `AgentSaveOutcome::Rejected` gives
+        // one crate over: a caller shown one at a time submits four times to find four problems.
+        return Err(ToolResult::error(format!(
+            "{tool_name}: **nothing was written**. {}\n{}",
+            if problems.len() == 1 {
+                "One field cannot be written as it stands:"
+            } else {
+                "These fields cannot be written as they stand:"
+            },
+            problems
+                .iter()
+                .map(|problem| format!(
+                    "  `{}`: {}",
+                    field_wire(problem.field),
+                    one_line(&problem.message)
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+    sink.write_definition(draft)
+        .map_err(|why| ToolResult::error(format!("{tool_name}: {why}")))
+}
+
+/// Which file [`tool::AGENT_UPDATE`] edits when the caller named no scope.
+///
+/// The roster's row, which is the definition *in effect* — `defs::load_from` merges the four
+/// directories and a project file shadows a global one — so an update with no scope changes the
+/// role the orchestrator can actually see, rather than a shadowed file whose contents nothing
+/// reads. Naming a scope addresses the shadowed one on purpose, and the answer always names the
+/// scope that was written, because *which of two files did that land in* is not a question a
+/// model should be left to infer.
+fn effective_scope(name: &AgentId, sink: &dyn AgentSink) -> Result<AgentScope, ToolResult> {
+    let agents = sink
+        .agents()
+        .map_err(|why| ToolResult::error(format!("{}: {why}", tool::AGENT_UPDATE)))?;
+    agents
+        .iter()
+        .find(|def| &def.id == name)
+        .map(|def| def.scope)
+        .ok_or_else(|| {
+            ToolResult::error(format!(
+                "{}: this project has no role called `{name}`. Call {} for the ones it does \
+                 define, or {} to define this one.",
+                tool::AGENT_UPDATE,
+                tool::AGENTS_LIST,
+                tool::AGENT_CREATE
+            ))
+        })
+}
+
+/// One definition as the two writers echo it back.
+///
+/// The front matter in full, and the system prompt as a line count and its opening — which is the
+/// shape the answer needs rather than a compromise. A caller that has just replaced a prompt it
+/// never read has to be able to see that it did; pasting two hundred lines of somebody's prompt
+/// into the turn to tell it so is the cost `render_summary` refuses one vocabulary over. The
+/// extras line is the same service for a subagent: it is the only place a caller can see that
+/// cide kept the `hooks:` block it does not understand.
+fn render_definition(draft: &AgentDraft) -> String {
+    let mut out = format!("name: {}\n", one_line(draft.name.as_str()));
+    out.push_str(&format!("scope: {}\n", scope_wire(draft.scope)));
+    let mut line = |key: &str, value: &str| out.push_str(&format!("{key}: {}\n", one_line(value)));
+    if let Some(label) = &draft.label {
+        line("label", label);
+    }
+    if let Some(harness) = draft.harness {
+        line("harness", harness_wire(harness));
+    }
+    if !draft.description.trim().is_empty() {
+        line("description", &draft.description);
+    }
+    if let Some(model) = &draft.model {
+        line("model", model);
+    }
+    if let Some(effort) = &draft.effort {
+        line("effort", effort);
+    }
+    if !draft.tools.is_empty() {
+        line("tools", &draft.tools.join(", "));
+    }
+    if let Some(mode) = &draft.permission_mode {
+        line("permission-mode", mode);
+    }
+    if let Some(max) = draft.max_concurrent {
+        line("max-concurrent", &max.to_string());
+    }
+    if let Some(worktree) = draft.worktree {
+        line("worktree", if worktree { "true" } else { "false" });
+    }
+    if !draft.extras.is_empty() {
+        line(
+            "kept as they were",
+            &draft
+                .extras
+                .iter()
+                .map(|extra| extra.key.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    let opening = draft
+        .system_prompt
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let opening = one_line(opening);
+    let opening = if opening.chars().count() > 72 {
+        format!("{}…", opening.chars().take(72).collect::<String>())
+    } else {
+        opening
+    };
+    out.push_str(&format!(
+        "system prompt: {} line(s), beginning “{opening}”\n",
+        draft.system_prompt.lines().count()
+    ));
+    out
 }
 
 fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
@@ -1398,6 +2319,46 @@ fn harness_wire(harness: Harness) -> &'static str {
     }
 }
 
+/// The inverse, through serde for [`status_from_wire`]'s reason. (M33)
+fn harness_from_wire(text: &str) -> Option<Harness> {
+    serde_json::from_value(Value::String(text.to_string())).ok()
+}
+
+/// A scope's wire spelling, from an exhaustive match for [`status_wire`]'s reason. (M33)
+///
+/// These are the words the roster prints beside every role *and* the words
+/// [`tool::AGENT_UPDATE`]'s `scope` takes, which has to be one set: a list that showed
+/// `claude-code` and an argument that wanted `claudeProject` would be a model guessing between
+/// them.
+fn scope_wire(scope: AgentScope) -> &'static str {
+    match scope {
+        AgentScope::Project => "project",
+        AgentScope::Global => "global",
+        AgentScope::ClaudeProject => "claudeProject",
+        AgentScope::ClaudeGlobal => "claudeGlobal",
+    }
+}
+
+/// The inverse, through serde for [`status_from_wire`]'s reason. (M33)
+fn scope_from_wire(text: &str) -> Option<AgentScope> {
+    serde_json::from_value(Value::String(text.to_string())).ok()
+}
+
+/// A draft field's wire name, through serde in the other direction. (M33)
+///
+/// `AgentField`'s variants are the draft's field names under a camelCase rename — that is the
+/// whole point of the type — so serde is the one place that spelling lives and a second table
+/// here would be the copy that drifts.
+fn field_wire(field: AgentField) -> String {
+    match serde_json::to_value(field) {
+        Ok(Value::String(name)) => name,
+        // Unreachable: a unit-variant enum with a rename serialises to a string. Answered rather
+        // than unwrapped, because a panic in a tool handler takes the process down under
+        // `panic = "abort"`.
+        _ => "field".to_string(),
+    }
+}
+
 fn optional_bool(arguments: &Value, key: &str) -> Result<Option<bool>, String> {
     match arguments.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -1412,11 +2373,66 @@ fn optional_bool(arguments: &Value, key: &str) -> Result<Option<bool>, String> {
 // --- reading model-authored arguments ------------------------------------------------------------
 
 /// Whether a JSON field was absent, explicitly null, or a value. See [`task_update`].
+///
+/// Generic since M33: [`tool::AGENT_UPDATE`] needs the same three-way answer for a boolean, a
+/// number and an enum, and the alternative was three more enums with the same three arms.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Nullable {
+enum Field<T> {
     Absent,
     Null,
-    Value(String),
+    Value(T),
+}
+
+impl<T> Field<T> {
+    /// Fold this answer onto what the file already says: absent keeps it, null clears it, a value
+    /// replaces it.
+    ///
+    /// This is the whole of what makes [`tool::AGENT_UPDATE`] a patch rather than a replace, and
+    /// it is three lines because the three-way answer is the part that had to be got right — a
+    /// serde struct with `Option<String>` fields would collapse *absent* and *null* onto `None`
+    /// and silently clear every field the caller did not mention. `TaskEdit`'s own doc records
+    /// how reliably that goes wrong.
+    fn onto(self, current: Option<T>) -> Option<T> {
+        match self {
+            Self::Absent => current,
+            Self::Null => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+}
+
+/// A [`Field`] of a string, which is every nullable argument the task tools take.
+type Nullable = Field<String>;
+
+/// The optional definition keys the two writers share, read out of one arguments object.
+///
+/// A struct rather than eight `match` blocks copied into both handlers: the copies would drift on
+/// the key spellings, and a key read as `permission_mode` in one tool and `permissionMode` in the
+/// other is a switch the model sets and the file never gets.
+struct Fields {
+    label: Field<String>,
+    harness: Field<Harness>,
+    model: Field<String>,
+    effort: Field<String>,
+    tools: Field<Vec<String>>,
+    permission_mode: Field<String>,
+    max_concurrent: Field<u16>,
+    worktree: Field<bool>,
+}
+
+impl Fields {
+    fn read(arguments: &Value) -> Result<Self, String> {
+        Ok(Self {
+            label: nullable_string(arguments, "label")?,
+            harness: nullable_harness(arguments, "harness")?,
+            model: nullable_string(arguments, "model")?,
+            effort: nullable_string(arguments, "effort")?,
+            tools: nullable_tools(arguments, "tools")?,
+            permission_mode: nullable_string(arguments, "permissionMode")?,
+            max_concurrent: nullable_u16(arguments, "maxConcurrent")?,
+            worktree: nullable_bool(arguments, "worktree")?,
+        })
+    }
 }
 
 fn required_id(arguments: &Value, tool: &str) -> Result<TaskId, ToolResult> {
@@ -1453,6 +2469,107 @@ fn nullable_string(arguments: &Value, key: &str) -> Result<Nullable, String> {
             "`{key}` must be a string or null, not {}",
             kind_of(other)
         )),
+    }
+}
+
+fn nullable_bool(arguments: &Value, key: &str) -> Result<Field<bool>, String> {
+    match arguments.get(key) {
+        None => Ok(Field::Absent),
+        Some(Value::Null) => Ok(Field::Null),
+        Some(Value::Bool(value)) => Ok(Field::Value(*value)),
+        Some(other) => Err(format!(
+            "`{key}` must be true, false or null, not {}",
+            kind_of(other)
+        )),
+    }
+}
+
+/// A count the front matter can hold: `max-concurrent:` is the only one, and it is a `u16`.
+///
+/// The range is stated in the refusal rather than left to a cast, because a silently truncating
+/// `as u16` would turn 65 537 into a role that runs one task at a time and report success.
+fn nullable_u16(arguments: &Value, key: &str) -> Result<Field<u16>, String> {
+    match arguments.get(key) {
+        None => Ok(Field::Absent),
+        Some(Value::Null) => Ok(Field::Null),
+        Some(value) => match value.as_u64().and_then(|n| u16::try_from(n).ok()) {
+            Some(count) => Ok(Field::Value(count)),
+            None => Err(format!(
+                "`{key}` must be a whole number from 1 to 65535, or null, not {}",
+                kind_of(value)
+            )),
+        },
+    }
+}
+
+fn nullable_harness(arguments: &Value, key: &str) -> Result<Field<Harness>, String> {
+    match nullable_string(arguments, key)? {
+        Field::Absent => Ok(Field::Absent),
+        Field::Null => Ok(Field::Null),
+        Field::Value(text) => harness_from_wire(&text).map(Field::Value).ok_or_else(|| {
+            format!(
+                "`{key}` must be one of {}, not `{}`",
+                HARNESSES
+                    .iter()
+                    .copied()
+                    .map(harness_wire)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                one_line(&text)
+            )
+        }),
+    }
+}
+
+/// The `tools` list. An empty array is [`Field::Null`], because on disk they are one answer.
+fn nullable_tools(arguments: &Value, key: &str) -> Result<Field<Vec<String>>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(Field::Absent);
+    };
+    if value.is_null() {
+        return Ok(Field::Null);
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`{key}` must be an array of tool names, not {}",
+            kind_of(value)
+        ));
+    };
+    let mut tools = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(name) = item.as_str() else {
+            return Err(format!(
+                "`{key}` must contain tool names as strings, not {}",
+                kind_of(item)
+            ));
+        };
+        tools.push(name.to_string());
+    }
+    if tools.is_empty() {
+        return Ok(Field::Null);
+    }
+    Ok(Field::Value(tools))
+}
+
+/// Which definition file to act on, when the caller says.
+///
+/// `Option` and not [`Field`]: there is nothing for a `null` scope to mean that an absent one
+/// does not already mean, which is "work it out from the roster".
+fn optional_scope(arguments: &Value, key: &str) -> Result<Option<AgentScope>, String> {
+    match optional_string(arguments, key)? {
+        None => Ok(None),
+        Some(text) => scope_from_wire(&text).map(Some).ok_or_else(|| {
+            format!(
+                "`{key}` must be one of {}, not `{}`",
+                SCOPES
+                    .iter()
+                    .copied()
+                    .map(scope_wire)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                one_line(&text)
+            )
+        }),
     }
 }
 
@@ -1516,6 +2633,47 @@ fn optional_status_list(arguments: &Value, key: &str) -> Result<Option<Vec<TaskS
     Ok(Some(statuses))
 }
 
+/// The optional `links` array of a create: `[{ "link": "blockedBy", "target": "t-3" }]`. (M30)
+fn optional_links(arguments: &Value) -> Result<Vec<TaskLinkSpec>, String> {
+    let Some(value) = arguments.get("links") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`links` must be an array of {{link, target}} objects, not {}",
+            kind_of(value)
+        ));
+    };
+    let mut links = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.get("link").and_then(Value::as_str) else {
+            return Err("every entry of `links` needs a `link` kind as a string".to_string());
+        };
+        let Some(kind) = link_from_wire(text) else {
+            return Err(format!(
+                "`links` contains the kind `{text}`, which is not one of {}",
+                LINK_TYPES
+                    .iter()
+                    .copied()
+                    .map(link_wire)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        };
+        let Some(target) = item.get("target").and_then(Value::as_str) else {
+            return Err("every entry of `links` needs a `target` task id as a string".to_string());
+        };
+        links.push(TaskLinkSpec {
+            link: kind,
+            target: TaskId(target.to_string()),
+        });
+    }
+    Ok(links)
+}
+
 fn optional_limit(arguments: &Value) -> Result<usize, String> {
     match arguments.get("limit") {
         None | Some(Value::Null) => Ok(DEFAULT_LIST_LIMIT),
@@ -1564,6 +2722,20 @@ fn status_wire(status: TaskStatus) -> &'static str {
 /// free to drift, and the direction that drifts silently is this one: a name the schema advertises
 /// and the parser refuses.
 fn status_from_wire(text: &str) -> Option<TaskStatus> {
+    serde_json::from_value(Value::String(text.to_string())).ok()
+}
+
+/// A link kind's wire spelling, for [`status_wire`]'s reason. (M30)
+fn link_wire(link: LinkType) -> &'static str {
+    match link {
+        LinkType::Related => "related",
+        LinkType::BlockedBy => "blockedBy",
+        LinkType::SubtaskOf => "subtaskOf",
+    }
+}
+
+/// The inverse, through serde — [`status_from_wire`]'s argument, for [`LinkType`].
+fn link_from_wire(text: &str) -> Option<LinkType> {
     serde_json::from_value(Value::String(text.to_string())).ok()
 }
 
@@ -1620,18 +2792,90 @@ fn fenced_with(preamble: &str, body: &str) -> String {
 /// The split is what keeps `cide_task_list` affordable. A list that inlined bodies would put every
 /// word of the project's backlog into a turn that asked "what is outstanding", which is the cost
 /// [`DEFAULT_LIST_LIMIT`] exists to bound and would defeat it at a stroke.
-fn render_summary(task: &Task) -> String {
+///
+/// `all` is the whole board, because a summary now reads facts that live on *other* tasks: the
+/// derived "blocks" edge, above all. (M30)
+fn render_summary(task: &Task, all: &[Task]) -> String {
+    // Only the blocking pair rides the summary, and both directions of it: the list is the
+    // dispatch-decision view, blocking is the one edge kind that changes that decision, and the
+    // decision needs both readings — "which of these must wait" and "which of these is holding
+    // others up". `subtaskOf` and `related` are full-view facts and stay out of the list, on
+    // `change`'s token discipline. Absent for the unlinked task, so nothing is spent on the
+    // common case and every summary rendered before links existed is byte-identical.
+    let blocked_on: Vec<String> = live_links(task)
+        .filter(|l| l.link == LinkType::BlockedBy)
+        .map(|l| l.target.to_string())
+        .collect();
+    let blocks: Vec<String> = incoming_links(all, LinkType::BlockedBy, &task.id)
+        .map(|t| t.id.to_string())
+        .collect();
     format!(
-        "{} [{}] {} | {} | {} comment(s)\n",
+        "{} [{}] {}{}{}{} | {} | {} comment(s)\n",
         task.id,
         status_wire(task.status),
         match &task.agent {
             Some(agent) => format!("for {}", one_line(agent.as_str())),
             None => "unassigned".to_string(),
         },
+        // One token, in the *list*, because this is where an orchestrator decides what to
+        // dispatch and "which of these are spec-driven" changes that decision. Absent for the
+        // ordinary task, so nothing is spent on the common case. (M28)
+        match &task.change {
+            Some(change) => format!(" | change {}", one_line(change.as_str())),
+            None => String::new(),
+        },
+        if blocked_on.is_empty() {
+            String::new()
+        } else {
+            format!(" | blocked by {}", blocked_on.join(" "))
+        },
+        if blocks.is_empty() {
+            String::new()
+        } else {
+            format!(" | blocks {}", blocks.join(" "))
+        },
         one_line(&task.title),
         task.comments.len(),
     )
+}
+
+/// A task's live outgoing edges — the tombstoned ones are bookkeeping for the merge, and no
+/// renderer or gate ever reads them.
+fn live_links(task: &Task) -> impl Iterator<Item = &cide_ipc::TaskLink> {
+    task.links.iter().filter(|l| !l.deleted)
+}
+
+/// The tasks on the board whose live `kind` edge names `id` — the derived inverse reading.
+///
+/// Derived at render rather than stored, which is the repo's standing answer to inverse edges
+/// (`AgentRun::task` read backwards): one stored row per fact, so a merge can never leave the
+/// two directions disagreeing.
+fn incoming_links<'a>(
+    all: &'a [Task],
+    kind: LinkType,
+    id: &'a TaskId,
+) -> impl Iterator<Item = &'a Task> {
+    all.iter().filter(move |t| {
+        &t.id != id
+            && t.links
+                .iter()
+                .any(|l| l.link == kind && !l.deleted && &l.target == id)
+    })
+}
+
+/// One `links:` line: the direction label, the target, and — because the reader is deciding what
+/// to do next — the target's status and title resolved from the board. A target that is not on
+/// the board is marked rather than dropped: a reference that silently vanished is the failure
+/// mode this whole file keeps writing against.
+fn link_line(label: &str, target: &TaskId, all: &[Task]) -> String {
+    match all.iter().find(|t| &t.id == target) {
+        Some(t) => format!(
+            "  - {label} {target} [{}] {}\n",
+            status_wire(t.status),
+            one_line(&t.title)
+        ),
+        None => format!("  - {label} {target} (deleted)\n"),
+    }
 }
 
 /// One task in full, with the author of every comment.
@@ -1640,8 +2884,8 @@ fn render_summary(task: &Task) -> String {
 /// every answer, and a model has no "now" to compare one against. The information they carry that
 /// an agent can actually use — what happened after what — is already in the order: `Task::comments`
 /// is oldest first, and its doc says so.
-fn render_full(task: &Task) -> String {
-    let mut out = render_summary(task);
+fn render_full(task: &Task, all: &[Task]) -> String {
+    let mut out = render_summary(task, all);
     /*
      * Who asked for this, on its own line. (M21)
      *
@@ -1656,6 +2900,43 @@ fn render_full(task: &Task) -> String {
         "  asked for by {}\n",
         author_label(&task.created_by)
     ));
+    /*
+     * Every edge, both readings, direction labelled. (M30)
+     *
+     * The summary carries the blocking pair only; here the reader is looking at one task and
+     * deciding what to do with it, so hierarchy and cross-references earn their lines. Incoming
+     * edges are derived from the board — they are stored on the other task — and `related` is
+     * drawn once per pair, whichever side stores it: after a merge *both* sides can legally hold
+     * the same related pair, and two lines saying one fact would read as two facts.
+     */
+    let mut link_lines = String::new();
+    for edge in live_links(task) {
+        let label = match edge.link {
+            LinkType::BlockedBy => "blocked by",
+            LinkType::SubtaskOf => "subtask of",
+            LinkType::Related => "related to",
+        };
+        link_lines.push_str(&link_line(label, &edge.target, all));
+    }
+    let related_out: Vec<&TaskId> = live_links(task)
+        .filter(|l| l.link == LinkType::Related)
+        .map(|l| &l.target)
+        .collect();
+    for other in incoming_links(all, LinkType::BlockedBy, &task.id) {
+        link_lines.push_str(&link_line("blocks", &other.id, all));
+    }
+    for other in incoming_links(all, LinkType::SubtaskOf, &task.id) {
+        link_lines.push_str(&link_line("subtask", &other.id, all));
+    }
+    for other in incoming_links(all, LinkType::Related, &task.id) {
+        if !related_out.contains(&&other.id) {
+            link_lines.push_str(&link_line("related to", &other.id, all));
+        }
+    }
+    if !link_lines.is_empty() {
+        out.push_str("  links:\n");
+        out.push_str(&link_lines);
+    }
     if !task.body.trim().is_empty() {
         out.push_str("  body:\n");
         out.push_str(&indented(&task.body));
@@ -1724,7 +3005,7 @@ fn indented(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cide_ipc::{CommentId, TaskComment};
+    use cide_ipc::{CommentId, TaskComment, TaskLink};
     use parking_lot::Mutex;
 
     /// A sink that answers from a `Vec`, so every handler is reachable with no socket, no store
@@ -1766,7 +3047,14 @@ mod tests {
             Ok(self.tasks.lock().iter().find(|t| &t.id == id).cloned())
         }
 
-        fn create(&self, title: &str, body: &str, agent: Option<&AgentId>) -> Result<Task, String> {
+        fn create(
+            &self,
+            title: &str,
+            body: &str,
+            agent: Option<&AgentId>,
+            change: Option<&ChangeName>,
+            links: &[TaskLinkSpec],
+        ) -> Result<Task, String> {
             if let Some(why) = &self.broken {
                 return Err(why.clone());
             }
@@ -1778,6 +3066,17 @@ mod tests {
                 status: TaskStatus::Todo,
                 agent: agent.cloned(),
                 comments: Vec::new(),
+                change: change.cloned(),
+                links: links
+                    .iter()
+                    .map(|spec| TaskLink {
+                        link: spec.link,
+                        target: spec.target.clone(),
+                        deleted: false,
+                        at_unix_ms: 1,
+                    })
+                    .collect(),
+                session: None,
                 history: Vec::new(),
                 // The real store stamps this from the identity the RPC connection carried; every
                 // call that reaches a `TaskSink` is one of those, so the fake answers as the side
@@ -1803,6 +3102,47 @@ mod tests {
                 TaskEdit::SetBody { body } => task.body = body,
                 TaskEdit::SetStatus { status } => task.status = status,
                 TaskEdit::Assign { agent } => task.agent = agent,
+                TaskEdit::SetChange { change } => task.change = change,
+                // Per `TaskEdit::SetSession`'s contract: a role and a session are exclusive.
+                TaskEdit::SetSession { session } => {
+                    task.agent = None;
+                    task.session = session;
+                }
+                // Shallow mirrors of the store's link arms — enough for the tool tests to see
+                // the refusal sentences. The real rules (cycles, target existence, related's
+                // inverse lookup) are `cide-tasks`' own tests; a fake that reproduced them
+                // would be a second store to keep in step. (M30)
+                TaskEdit::Link { link, target } => {
+                    if task
+                        .links
+                        .iter()
+                        .any(|l| l.link == link && l.target == target && !l.deleted)
+                    {
+                        return Err(format!(
+                            "{id} is already linked: {} {target}",
+                            link_wire(link)
+                        ));
+                    }
+                    task.links.push(TaskLink {
+                        link,
+                        target,
+                        deleted: false,
+                        at_unix_ms: 2,
+                    });
+                }
+                TaskEdit::Unlink { link, target } => {
+                    let Some(edge) = task
+                        .links
+                        .iter_mut()
+                        .find(|l| l.link == link && l.target == target && !l.deleted)
+                    else {
+                        return Err(format!(
+                            "no such link on {id}: {} {target}",
+                            link_wire(link)
+                        ));
+                    };
+                    edge.deleted = true;
+                }
                 TaskEdit::Comment { text } => task.comments.push(TaskComment {
                     id: CommentId::new(),
                     author: TaskAuthor::Orchestrator,
@@ -1838,6 +3178,9 @@ mod tests {
             status,
             agent: agent.map(|a| AgentId(a.to_string())),
             comments: Vec::new(),
+            change: None,
+            links: Vec::new(),
+            session: None,
             history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
@@ -1932,7 +3275,7 @@ mod tests {
     }
 
     #[test]
-    fn the_six_are_the_only_six() {
+    fn the_eight_are_the_only_eight() {
         assert_eq!(
             tool::ALL,
             [
@@ -1942,6 +3285,12 @@ mod tests {
                 "cide_task_update",
                 "cide_task_comment",
                 "cide_task_assign",
+                // The link pair is in the run-visible family on purpose: a run decomposing its
+                // work records the edges it discovers, and the author gate plus the dispatch
+                // preflight — not the vocabulary split — are what keep a run's blockedBy from
+                // starting anything. See the module header. (M30)
+                "cide_task_link",
+                "cide_task_unlink",
             ]
         );
         // Deletion belongs to the user, and it is worth a test rather than only a paragraph:
@@ -1951,11 +3300,13 @@ mod tests {
     }
 
     #[test]
-    fn the_eleven_are_the_only_eleven() {
+    fn the_fifteen_are_the_only_fifteen() {
         assert_eq!(
             tool::ORCHESTRATION,
             [
                 "cide_agents_list",
+                "cide_agent_create",
+                "cide_agent_update",
                 "cide_agent_dispatch",
                 "cide_agent_runs",
                 "cide_agent_stop",
@@ -1979,6 +3330,10 @@ mod tests {
         for absent in ["cide_agent_pause", "cide_agent_resume"] {
             assert!(!tool::EVERY.contains(&absent), "{absent} must not exist");
         }
+        // And deletion, for `cide_task_delete`'s reason one turn further — the module header
+        // makes the argument. Writing a role is a tool since M33 and removing one is not, which
+        // is exactly the asymmetry a later reader would "tidy up".
+        assert!(!tool::EVERY.contains(&"cide_agent_delete"));
 
         // Every advertised name is in exactly one family, which is what makes a connection's
         // allow-list a slice comparison rather than a policy.
@@ -2001,6 +3356,172 @@ mod tests {
 
         let listed = input_schema(tool::TASK_UPDATE)["properties"]["status"]["enum"].clone();
         assert_eq!(listed, json!(["todo", "doing", "review", "done"]));
+    }
+
+    #[test]
+    fn the_link_vocabulary_is_serdes_and_not_a_second_copy() {
+        for link in LINK_TYPES.iter().copied() {
+            // Exhaustive for `the_status_vocabulary`'s reason: a new kind that misses the
+            // schema is a kind no model can send.
+            match link {
+                LinkType::Related | LinkType::BlockedBy | LinkType::SubtaskOf => {}
+            }
+            assert_eq!(link_from_wire(link_wire(link)), Some(link));
+        }
+        assert_eq!(
+            link_from_wire("blocked_by"),
+            None,
+            "snake_case is not the wire"
+        );
+
+        for tool in [tool::TASK_LINK, tool::TASK_UNLINK] {
+            let listed = input_schema(tool)["properties"]["link"]["enum"].clone();
+            assert_eq!(
+                listed,
+                json!(["related", "blockedBy", "subtaskOf"]),
+                "{tool}"
+            );
+        }
+        let created = input_schema(tool::TASK_CREATE)["properties"]["links"]["items"]["properties"]
+            ["link"]["enum"]
+            .clone();
+        assert_eq!(created, json!(["related", "blockedBy", "subtaskOf"]));
+    }
+
+    #[test]
+    fn cide_task_link_writes_the_edge_and_answers_with_the_full_task() {
+        let sink = board();
+        let answer = call(
+            tool::TASK_LINK,
+            json!({"id": "t-2", "link": "blockedBy", "target": "t-1"}),
+            &sink,
+        );
+        let text = text_of(&answer);
+        assert!(!answer.is_error, "{text}");
+        assert!(text.starts_with("Linked t-2 blockedBy t-1."), "{text}");
+        // The full task, so the model sees the edge in context — with the blocker's status and
+        // title resolved, because that is what it decides its next call from.
+        assert!(
+            text.contains("- blocked by t-1 [doing] Add the retry bar"),
+            "{text}"
+        );
+
+        // And a second identical link is a sentence, not a duplicate.
+        let answer = call(
+            tool::TASK_LINK,
+            json!({"id": "t-2", "link": "blockedBy", "target": "t-1"}),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(text_of(&answer).contains("already linked"), "{answer:?}");
+    }
+
+    #[test]
+    fn a_link_and_its_inverse_render_on_both_tasks() {
+        let sink = board();
+        call(
+            tool::TASK_LINK,
+            json!({"id": "t-2", "link": "blockedBy", "target": "t-1"}),
+            &sink,
+        );
+        let list = text_of(&call(tool::TASK_LIST, json!({}), &sink));
+        // Stored once, on the blocked task; the list derives the other reading. Both are in the
+        // *summary* because blocking is the one edge that changes the dispatch decision the
+        // list exists to inform.
+        assert!(
+            list.contains("t-2 [todo] for qa | blocked by t-1 |"),
+            "{list}"
+        );
+        assert!(
+            list.contains("t-1 [doing] for developer | blocks t-2 |"),
+            "{list}"
+        );
+
+        // The full view labels the derived directions too.
+        let full = text_of(&call(tool::TASK_GET, json!({"id": "t-1"}), &sink));
+        assert!(full.contains("- blocks t-2 [todo]"), "{full}");
+    }
+
+    #[test]
+    fn an_unlink_of_a_link_that_is_not_there_is_a_sentence() {
+        let sink = board();
+        let answer = call(
+            tool::TASK_UNLINK,
+            json!({"id": "t-1", "link": "subtaskOf", "target": "t-2"}),
+            &sink,
+        );
+        assert!(answer.is_error);
+        let text = text_of(&answer);
+        assert!(
+            text.contains("no such link on t-1: subtaskOf t-2"),
+            "{text}"
+        );
+
+        // And a kind outside the vocabulary is named back with the legal set.
+        let answer = call(
+            tool::TASK_LINK,
+            json!({"id": "t-1", "link": "blocks", "target": "t-2"}),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("related, blockedBy, subtaskOf"),
+            "the refusal teaches the vocabulary: {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_dangling_target_renders_marked_rather_than_vanishing() {
+        // A dangling edge is a legal file state — the target was deleted, or lives on a branch
+        // not pulled yet — and hiding it would make the tracker lie about what the file says.
+        let mut linked = task("t-1", "survivor", TaskStatus::Todo, None);
+        linked.links.push(TaskLink {
+            link: LinkType::BlockedBy,
+            target: TaskId("t-99".into()),
+            deleted: false,
+            at_unix_ms: 1,
+        });
+        let sink = FakeSink::new(vec![linked]);
+        let full = text_of(&call(tool::TASK_GET, json!({"id": "t-1"}), &sink));
+        assert!(full.contains("- blocked by t-99 (deleted)"), "{full}");
+    }
+
+    #[test]
+    fn a_task_without_links_renders_exactly_as_it_did() {
+        // The additive-format claim, pinned as a whole line: every summary rendered before
+        // links existed is byte-identical, so nothing an agent or a test matched on has moved.
+        let sink = board();
+        let list = text_of(&call(tool::TASK_LIST, json!({}), &sink));
+        assert!(
+            list.contains("t-1 [doing] for developer | Add the retry bar | 0 comment(s)"),
+            "{list}"
+        );
+        let full = text_of(&call(tool::TASK_GET, json!({"id": "t-1"}), &sink));
+        assert!(!full.contains("links:"), "{full}");
+    }
+
+    #[test]
+    fn create_accepts_links_and_a_bad_kind_in_them_is_refused() {
+        let sink = board();
+        let answer = call(
+            tool::TASK_CREATE,
+            json!({"title": "follow-up", "links": [{"link": "blockedBy", "target": "t-1"}]}),
+            &sink,
+        );
+        let text = text_of(&answer);
+        assert!(!answer.is_error, "{text}");
+        assert!(text.contains("blocked by t-1"), "{text}");
+
+        let answer = call(
+            tool::TASK_CREATE,
+            json!({"title": "bad", "links": [{"link": "parent", "target": "t-1"}]}),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("related, blockedBy, subtaskOf"),
+            "{answer:?}"
+        );
     }
 
     #[test]
@@ -2357,6 +3878,16 @@ mod tests {
     struct FakeAgents {
         defs: Vec<AgentDef>,
         runs: Vec<AgentRun>,
+        /// The definition *files*, as `read_draft` would hand them back. Separate from `defs`,
+        /// which is the merged roster, because the two disagree on purpose: a shadowed global
+        /// file has a draft and no roster row, and that is the case `scope` exists for.
+        definitions: Vec<AgentDraft>,
+        /// Every draft the handlers asked to have written, in order. The assertion that a
+        /// refusal wrote **nothing** is this vector still being empty.
+        written: Mutex<Vec<AgentDraft>>,
+        /// When set, a write fails with this sentence — the name-already-taken road, which only
+        /// a directory can answer and which therefore cannot be provoked through `validate`.
+        refuse_write: Option<String>,
         dispatched: Mutex<Vec<(String, String, Option<String>)>>,
         stopped: Mutex<Vec<(RunId, Option<String>)>>,
         integration: Integrated,
@@ -2391,6 +3922,40 @@ mod tests {
                 Some(why) => Err(why.clone()),
                 None => Ok(self.runs.clone()),
             }
+        }
+
+        fn definition(
+            &self,
+            scope: AgentScope,
+            name: &AgentId,
+        ) -> Result<Option<AgentDraft>, String> {
+            if let Some(why) = &self.broken {
+                return Err(why.clone());
+            }
+            Ok(self
+                .definitions
+                .iter()
+                .find(|draft| draft.scope == scope && &draft.name == name)
+                .cloned())
+        }
+
+        fn write_definition(&self, draft: &AgentDraft) -> Result<PathBuf, String> {
+            if let Some(why) = &self.broken {
+                return Err(why.clone());
+            }
+            if let Some(why) = &self.refuse_write {
+                return Err(why.clone());
+            }
+            self.written.lock().push(draft.clone());
+            // The real writer answers with the file the definition now occupies, and the four
+            // scopes are four directories — which is the fact the answer's sentence carries.
+            let dir = match draft.scope {
+                AgentScope::Project => ".cide/agents",
+                AgentScope::Global => "~/.config/cide/agents",
+                AgentScope::ClaudeProject => ".claude/agents",
+                AgentScope::ClaudeGlobal => "~/.claude/agents",
+            };
+            Ok(PathBuf::from(format!("{dir}/{}.md", draft.name)))
         }
 
         fn dispatch(
@@ -2445,6 +4010,7 @@ mod tests {
         AgentDef {
             id: AgentId(id.to_string()),
             label: label.to_string(),
+            scope: cide_ipc::agents::AgentScope::Project,
             harness: Harness::Claude,
             description: description.to_string(),
             system_prompt: "You are …".to_string(),
@@ -2452,6 +4018,34 @@ mod tests {
             unavailable: unavailable.map(str::to_string),
             max_concurrent: 1,
             worktree: true,
+        }
+    }
+
+    /// One definition file, as `read_draft` hands it back: `original` set to where it was
+    /// found, and an unmodelled key on it so that every patch is asserted against a draft that
+    /// has something to lose.
+    fn draft(name: &str, scope: AgentScope) -> AgentDraft {
+        AgentDraft {
+            scope,
+            name: AgentId(name.to_string()),
+            original: Some(cide_ipc::agents::AgentLocation {
+                scope,
+                name: AgentId(name.to_string()),
+            }),
+            label: Some("Developer".to_string()),
+            harness: None,
+            description: "Implements one task end to end.".to_string(),
+            model: None,
+            effort: None,
+            tools: Vec::new(),
+            permission_mode: None,
+            max_concurrent: None,
+            worktree: None,
+            system_prompt: "You are the developer.\nWork one task at a time.".to_string(),
+            extras: vec![cide_ipc::agents::AgentExtra {
+                key: "hooks".to_string(),
+                value: "\n  PreToolUse: []".to_string(),
+            }],
         }
     }
 
@@ -2492,6 +4086,9 @@ mod tests {
                 run("developer", RunState::Queued, Some("t-2"), 1),
                 run("qa", RunState::Finished { code: 0 }, Some("t-3"), 90),
             ],
+            definitions: vec![draft("developer", AgentScope::Project)],
+            written: Mutex::new(Vec::new()),
+            refuse_write: None,
             dispatched: Mutex::new(Vec::new()),
             stopped: Mutex::new(Vec::new()),
             integration: Integrated::UpToDate,
@@ -2845,11 +4442,536 @@ mod tests {
             ),
             (tool::AGENT_STOP, json!({ "run": RunId::new().to_string() })),
             (tool::AGENT_INTEGRATE, json!({ "agent": "developer" })),
+            (
+                tool::AGENT_CREATE,
+                json!({ "name": "qa", "description": "Checks.", "systemPrompt": "You check." }),
+            ),
+            (
+                tool::AGENT_UPDATE,
+                json!({ "agent": "developer", "model": "opus" }),
+            ),
         ] {
             let answer = ask(name, args, &sink);
             assert!(answer.is_error, "{name} did not report the failure");
             assert!(text_of(&answer).contains("no longer open"), "{name}");
         }
+    }
+
+    // --- defining and correcting a role (M33) ---------------------------------------------
+
+    #[test]
+    fn a_role_can_be_defined_from_nothing() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_CREATE,
+            json!({
+                "name": "reviewer",
+                "description": "Reads a branch and reports what is wrong with it.",
+                "systemPrompt": "You are the reviewer.\nYou never push.",
+            }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        // Printed on purpose: this rendering *is* a prose contract with a language model. See
+        // `the_roster_names_every_role_whether_it_can_run_and_its_live_runs`.
+        eprintln!("{text}");
+        assert!(
+            text.contains("Defined `reviewer` in .cide/agents/reviewer.md"),
+            "{text}"
+        );
+        // The two facts a caller acts on next: it works now, and whether it can actually run is
+        // a question about this machine that only the roster answers.
+        assert!(text.contains("takes effect immediately"), "{text}");
+        assert!(text.contains(tool::AGENTS_LIST), "{text}");
+
+        let written = sink.written.lock();
+        assert_eq!(written.len(), 1);
+        let draft = &written[0];
+        assert_eq!(draft.name, AgentId("reviewer".into()));
+        assert_eq!(draft.scope, AgentScope::Project);
+        // `None` is what tells `defs::save` this is a create rather than a rename, which is what
+        // makes it refuse an existing file instead of overwriting somebody's system prompt.
+        assert_eq!(draft.original, None);
+        assert!(draft.system_prompt.contains("You never push."));
+        // cide authoring in cide's own format has nothing it does not model.
+        assert!(draft.extras.is_empty());
+    }
+
+    #[test]
+    fn a_create_carries_every_optional_field_through() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_CREATE,
+            json!({
+                "name": "reviewer",
+                "label": "Code Reviewer",
+                "description": "Reads a branch.",
+                "systemPrompt": "You are the reviewer.",
+                "harness": "opencode",
+                "model": "opus",
+                "effort": "high",
+                "tools": ["Read", "Grep"],
+                "permissionMode": "acceptEdits",
+                "maxConcurrent": 3,
+                "worktree": false,
+            }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let written = sink.written.lock();
+        let draft = &written[0];
+        assert_eq!(draft.label.as_deref(), Some("Code Reviewer"));
+        assert_eq!(draft.harness, Some(Harness::Opencode));
+        assert_eq!(draft.model.as_deref(), Some("opus"));
+        assert_eq!(draft.effort.as_deref(), Some("high"));
+        assert_eq!(draft.tools, vec!["Read".to_string(), "Grep".to_string()]);
+        assert_eq!(draft.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(draft.max_concurrent, Some(3));
+        assert_eq!(draft.worktree, Some(false));
+
+        // And the echo names them, because a caller that cannot see what it wrote has to write
+        // it again to find out.
+        let text = text_of(&answer);
+        assert!(text.contains("harness: opencode"), "{text}");
+        assert!(text.contains("tools: Read, Grep"), "{text}");
+        assert!(text.contains("worktree: false"), "{text}");
+        assert!(
+            text.contains("system prompt: 1 line(s), beginning"),
+            "{text}"
+        );
+    }
+
+    /// The one place this vocabulary is narrower than the panel's, and it is a decision rather
+    /// than an omission: see the module header. A model that sends a scope anyway gets a project
+    /// role, not somebody's global directory.
+    #[test]
+    fn a_create_is_always_this_project() {
+        assert!(
+            input_schema(tool::AGENT_CREATE)["properties"]["scope"].is_null(),
+            "a scope argument on a create would be a global role written by a model"
+        );
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_CREATE,
+            json!({
+                "name": "reviewer",
+                "description": "Reads a branch.",
+                "systemPrompt": "You are the reviewer.",
+                "scope": "global",
+            }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert_eq!(sink.written.lock()[0].scope, AgentScope::Project);
+    }
+
+    /// `defs::validate` is the authority and it runs before the sink is touched, which is what
+    /// makes this refusal reachable with no disk anywhere.
+    #[test]
+    fn a_definition_that_cannot_be_written_is_refused_and_nothing_is_written() {
+        let sink = roster();
+        for (why, arguments) in [
+            (
+                "an empty prompt",
+                json!({ "name": "qa", "description": "Checks.", "systemPrompt": "  " }),
+            ),
+            (
+                "a name that could be a path",
+                json!({ "name": "../qa", "description": "Checks.", "systemPrompt": "You check." }),
+            ),
+            (
+                "a permission mode from another CLI",
+                json!({
+                    "name": "qa",
+                    "description": "Checks.",
+                    "systemPrompt": "You check.",
+                    "permissionMode": "yolo",
+                }),
+            ),
+        ] {
+            let answer = ask(tool::AGENT_CREATE, arguments, &sink);
+            assert!(answer.is_error, "{why} was accepted");
+            let text = text_of(&answer);
+            assert!(text.contains("nothing was written"), "{why}: {text}");
+            // The field is named, which is the whole reason `AgentField` exists: "invalid" leaves
+            // a caller to guess which of eleven boxes it meant.
+            assert!(
+                text.contains("`systemPrompt`")
+                    || text.contains("`name`")
+                    || text.contains("`permissionMode`"),
+                "{why}: {text}"
+            );
+        }
+        assert!(sink.written.lock().is_empty(), "a refusal wrote a file");
+    }
+
+    #[test]
+    fn an_update_changes_only_what_it_names() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "model": "opus", "maxConcurrent": 2 }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        eprintln!("{text}");
+        assert!(
+            text.contains("Updated `developer` in .cide/agents/developer.md"),
+            "{text}"
+        );
+
+        let before = draft("developer", AgentScope::Project);
+        let written = sink.written.lock();
+        let draft = &written[0];
+        assert_eq!(draft.model.as_deref(), Some("opus"));
+        assert_eq!(draft.max_concurrent, Some(2));
+        // Everything else came through the patch untouched — and the two that matter are the
+        // prompt (which no tool in this vocabulary shows the caller) and the unmodelled key
+        // (which cide cannot even read).
+        assert_eq!(draft.system_prompt, before.system_prompt);
+        assert_eq!(draft.description, "Implements one task end to end.");
+        assert_eq!(draft.extras.len(), 1);
+        assert_eq!(draft.extras[0].key, "hooks");
+        // `original` is what makes this a rewrite of the file it was read from rather than a
+        // second file beside it.
+        assert!(draft.original.is_some());
+        // And the answer says the block survived, because that is the only place a caller can
+        // see it did.
+        assert!(text.contains("kept as they were: hooks"), "{text}");
+    }
+
+    #[test]
+    fn an_update_tells_absent_from_null() {
+        let mut sink = roster();
+        sink.definitions[0].model = Some("sonnet".to_string());
+        sink.definitions[0].label = Some("Developer".to_string());
+
+        // Absent leaves the label alone; null clears the model. Both in one call, so the two
+        // answers are asserted against each other rather than one at a time.
+        let answer = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "model": null }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let written = sink.written.lock();
+        assert_eq!(written[0].model, None);
+        assert_eq!(written[0].label.as_deref(), Some("Developer"));
+    }
+
+    #[test]
+    fn an_update_that_would_change_nothing_is_refused() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "description": "Implements one task end to end." }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("nothing to change"),
+            "{}",
+            text_of(&answer)
+        );
+        // A no-op save still rewrites a committed file, which is a diff a teammate opens to find
+        // nothing in it.
+        assert!(sink.written.lock().is_empty());
+    }
+
+    #[test]
+    fn an_update_cannot_rename_a_role() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "name": "dev" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        let text = text_of(&answer);
+        assert!(text.contains("cannot be renamed"), "{text}");
+        // Named rather than ignored: a dropped `name` is a rename the caller believes happened.
+        assert!(text.contains("`agent`"), "{text}");
+        assert!(sink.written.lock().is_empty());
+    }
+
+    #[test]
+    fn an_update_with_no_scope_edits_the_definition_in_effect() {
+        let mut sink = roster();
+        // The role the orchestrator sees is a *global* one, and its file is the only file.
+        sink.defs[0].scope = AgentScope::Global;
+        sink.definitions = vec![draft("developer", AgentScope::Global)];
+
+        let answer = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "model": "opus" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert_eq!(sink.written.lock()[0].scope, AgentScope::Global);
+        // The path is in the answer, because *which of two files did that land in* is not
+        // something a caller should have to infer.
+        assert!(
+            text_of(&answer).contains("~/.config/cide/agents/developer.md"),
+            "{}",
+            text_of(&answer)
+        );
+    }
+
+    #[test]
+    fn an_update_of_a_role_that_is_not_there_names_the_tool_that_would_define_it() {
+        let sink = roster();
+        let unknown = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "nobody", "model": "opus" }),
+            &sink,
+        );
+        assert!(unknown.is_error);
+        assert!(
+            text_of(&unknown).contains(tool::AGENT_CREATE),
+            "{}",
+            text_of(&unknown)
+        );
+
+        // And a scope that has no such file, which is a different sentence: the role exists,
+        // just not there.
+        let elsewhere = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "scope": "global", "model": "opus" }),
+            &sink,
+        );
+        assert!(elsewhere.is_error);
+        let text = text_of(&elsewhere);
+        assert!(text.contains("`global` scope defines no role"), "{text}");
+        assert!(text.contains(tool::AGENTS_LIST), "{text}");
+        assert!(sink.written.lock().is_empty());
+    }
+
+    /// The one key of the eight that does not exist in Claude Code's dialect. Written there it
+    /// would be a line nothing reads, put in a file cide does not own, and preserved for ever as
+    /// an extra on every save after it.
+    #[test]
+    fn a_subagent_keeps_its_own_vocabulary() {
+        let mut sink = roster();
+        sink.defs[0].scope = AgentScope::ClaudeProject;
+        sink.definitions = vec![draft("developer", AgentScope::ClaudeProject)];
+
+        let refused = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "harness": "opencode" }),
+            &sink,
+        );
+        assert!(refused.is_error);
+        assert!(
+            text_of(&refused).contains("Claude Code subagent"),
+            "{}",
+            text_of(&refused)
+        );
+        assert!(sink.written.lock().is_empty());
+
+        // What it *can* do is edit one — keeping every key cide does not model, which is the
+        // whole promise `AgentExtra` was added for.
+        let edited = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "developer", "description": "Reads and reports." }),
+            &sink,
+        );
+        assert!(!edited.is_error, "{}", text_of(&edited));
+        let written = sink.written.lock();
+        assert_eq!(written[0].scope, AgentScope::ClaudeProject);
+        assert_eq!(written[0].extras[0].key, "hooks");
+    }
+
+    /// The roster prints the word `cide_agent_update` takes. Two lists would be a model guessing
+    /// between `claude-code` and `claudeProject`.
+    #[test]
+    fn the_roster_names_the_scope_each_role_is_defined_in() {
+        let mut sink = roster();
+        sink.defs[1].scope = AgentScope::ClaudeGlobal;
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &sink));
+        assert!(text.contains("| project\n"), "{text}");
+        assert!(text.contains("| claudeGlobal\n"), "{text}");
+
+        let listed = input_schema(tool::AGENT_UPDATE)["properties"]["scope"]["enum"].clone();
+        assert_eq!(
+            listed,
+            json!(["project", "global", "claudeProject", "claudeGlobal"])
+        );
+        // Serde is the authority for both directions; a hand-written spelling here would be the
+        // copy that drifts.
+        for scope in SCOPES.iter().copied() {
+            assert_eq!(scope_from_wire(scope_wire(scope)), Some(scope));
+        }
+        for harness in HARNESSES.iter().copied() {
+            assert_eq!(harness_from_wire(harness_wire(harness)), Some(harness));
+        }
+    }
+
+    #[test]
+    fn a_write_the_directory_refuses_is_the_writers_sentence_and_not_ours() {
+        let mut sink = roster();
+        // The name-already-taken road: only a directory can answer it, so it arrives from the
+        // sink rather than from `validate`, and it must reach the model intact.
+        sink.refuse_write =
+            Some("there is already a role called `qa` in this project.".to_string());
+        let answer = ask(
+            tool::AGENT_CREATE,
+            json!({ "name": "qa", "description": "Checks.", "systemPrompt": "You check." }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("there is already a role called `qa`"),
+            "{}",
+            text_of(&answer)
+        );
+    }
+
+    /// The whole road on a real directory: define a role, have the **loader** list it, correct
+    /// it, and read the file back.
+    ///
+    /// Everything above this point runs against [`FakeAgents`], which is what makes the refusals
+    /// cheap to assert — and which cannot answer the one question that matters most here: is what
+    /// these two tools write a definition cide can actually load? `defs::save` and
+    /// `defs::read_draft` are the sink's real implementation in `cide_app::agent_rpc`, so a
+    /// `DiskSink` over the same two functions is the road end to end with only the `AppHandle`
+    /// missing.
+    #[test]
+    fn a_role_written_by_a_tool_is_a_role_the_loader_runs() {
+        struct DiskSink {
+            root: std::path::PathBuf,
+        }
+
+        impl AgentSink for DiskSink {
+            fn agents(&self) -> Result<Vec<AgentDef>, String> {
+                Ok(crate::defs::load(&self.root, Harness::Claude)
+                    .agents
+                    .iter()
+                    .map(|loaded| loaded.def.clone())
+                    .collect())
+            }
+
+            fn definition(
+                &self,
+                scope: AgentScope,
+                name: &AgentId,
+            ) -> Result<Option<AgentDraft>, String> {
+                // The sink in `cide_app::agent_rpc` maps `NotFound` onto `Ok(None)` — the one
+                // mapping that half of this test depends on.
+                match crate::defs::read_draft(&self.root, scope, name.as_str()) {
+                    Ok(draft) => Ok(Some(draft)),
+                    Err(crate::defs::WriteError::NotFound(_)) => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+
+            fn write_definition(&self, draft: &AgentDraft) -> Result<PathBuf, String> {
+                crate::defs::save(&self.root, draft).map_err(|error| error.to_string())
+            }
+
+            fn runs(&self) -> Result<Vec<AgentRun>, String> {
+                Ok(Vec::new())
+            }
+
+            fn dispatch(
+                &self,
+                _agent: &AgentId,
+                _task: &TaskId,
+                _instructions: Option<&str>,
+            ) -> Result<RunId, String> {
+                unreachable!("this test never dispatches")
+            }
+
+            fn stop(&self, _run: RunId, _reason: Option<&str>) -> Result<(), String> {
+                unreachable!("this test never stops a run")
+            }
+
+            fn integrate(
+                &self,
+                _agent: &AgentId,
+                _task: Option<&TaskId>,
+            ) -> Result<Integrated, String> {
+                unreachable!("this test never integrates")
+            }
+
+            fn now_unix_ms(&self) -> u64 {
+                NOW
+            }
+
+            fn isolated(&self) -> Result<bool, String> {
+                Ok(true)
+            }
+        }
+
+        // `std::env::temp_dir()` and the pid, the way `defs`' own tests build theirs: this
+        // workspace has no temp-dir crate and is not gaining one for a test helper.
+        let root = std::env::temp_dir().join(format!("cide-tools-roles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let sink = DiskSink { root: root.clone() };
+
+        let created = ask(
+            tool::AGENT_CREATE,
+            json!({
+                "name": "reviewer",
+                "description": "Reads a branch and reports what is wrong with it.",
+                "systemPrompt": "You are the reviewer.\n\nYou never push.",
+                "tools": ["Read", "Grep"],
+                "maxConcurrent": 2,
+            }),
+            &sink,
+        );
+        assert!(!created.is_error, "{}", text_of(&created));
+        let path = root.join(".cide/agents/reviewer.md");
+        assert!(path.exists(), "no file at {}", path.display());
+
+        // The loader's answer, not the writer's: this is the claim that the file is a role cide
+        // would actually run, and `unavailable` is the field that would carry a defect.
+        let listed = crate::defs::load(&root, Harness::Claude);
+        let loaded = listed
+            .get(&AgentId("reviewer".into()))
+            .expect("the loader lists it");
+        assert_eq!(loaded.def.max_concurrent, 2);
+        assert_eq!(loaded.tools, vec!["Read".to_string(), "Grep".to_string()]);
+        assert!(loaded.def.system_prompt.contains("You never push."));
+
+        // A create over the file it just wrote is refused — the file it would replace is
+        // somebody's system prompt — and the refusal is `defs::save`'s own sentence.
+        let again = ask(
+            tool::AGENT_CREATE,
+            json!({
+                "name": "reviewer",
+                "description": "Something else.",
+                "systemPrompt": "You are somebody else.",
+            }),
+            &sink,
+        );
+        assert!(again.is_error, "{}", text_of(&again));
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("still there")
+                .contains("You never push."),
+            "a refused create overwrote the definition"
+        );
+
+        // And the correction, with no scope: resolved from the roster, patched onto the file.
+        let updated = ask(
+            tool::AGENT_UPDATE,
+            json!({ "agent": "reviewer", "model": "opus", "maxConcurrent": null }),
+            &sink,
+        );
+        assert!(!updated.is_error, "{}", text_of(&updated));
+        let text = std::fs::read_to_string(&path).expect("still there");
+        assert!(text.contains("model: opus"), "{text}");
+        assert!(
+            !text.contains("max-concurrent"),
+            "null did not clear it: {text}"
+        );
+        // The half no tool shows the caller, which is why the patch exists at all.
+        assert!(text.contains("You never push."), "{text}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

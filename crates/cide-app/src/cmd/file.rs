@@ -1628,6 +1628,25 @@ pub enum ClaudeSendError {
 /// in the project is tried before this error is produced, a non-zero count can only mean that
 /// none of the attached CLIs is identified with a pane, which is precisely the case `/ide`
 /// repairs. The sentence did not have to change to become true; the code around it did.
+///
+/// # What a non-zero count means now (M29), and why the advice narrowed
+///
+/// It narrowed again, and this time the sentence *was* wrong for a whole class of user. A
+/// `claude` behind a launcher — a version manager, an npm shim, a `bbin agent claude`-style
+/// wrapper — announces its own pid and cide holds the wrapper's, so nothing bound it, so this
+/// error fired; and `/ide` does not repair that, because reconnecting announces the same pid
+/// again. The repair is [`crate::ide::resolve_unbound_connections`], which walks the announced
+/// pid's ancestry before this error can be produced at all, and it runs on this command's own
+/// path a few lines below.
+///
+/// So a non-zero count now means something narrower still: connected CLIs with **no ancestor
+/// cide forked** — somebody's `claude` in a Terminal window that found this project's lockfile
+/// — or a platform where [`cide_core::proc::PARENT_LOOKUP_WORKS`] is false. `/ide` is right for
+/// the first (it is what makes a foreign CLI connect from the pane you meant) and is all
+/// anybody can do about the second. The prose is unchanged; what changed is that far fewer
+/// people can now reach it. The log line
+/// `resolve_unbound_connections` writes on that path names the chain it walked and the
+/// children this project has, which is what a report of this error should carry.
 fn not_connected(connections: usize) -> String {
     match connections {
         0 => "No Claude session in this project is connected to cide's IDE server. Start a \
@@ -1891,6 +1910,14 @@ pub fn claude_send_lines(
             },
         );
     }
+
+    // Before asking who can receive, work out who the connected CLIs *are*. A `claude` behind
+    // a launcher announces its own pid rather than the wrapper's, which is the pid this pane
+    // bound, so without this the answer below is empty on exactly the machines the feature was
+    // reported broken on. Ordinarily a no-op: the same resolution ran when the connection
+    // arrived, and this only catches the one that beat its pane's binding. See
+    // `ide::resolve_unbound_connections`.
+    crate::ide::resolve_unbound_connections(&app, project);
 
     let ws = state.snapshot();
     let reachable: std::collections::HashSet<String> = servers

@@ -387,6 +387,41 @@
   min-width: 0;
 }
 
+/*
+ * One unmodelled front-matter key: a narrow key box, a value that grows, and the remove button.
+ *
+ * `align-items: start` rather than `center` — the value is a `textarea` and a multi-line block
+ * would otherwise push the key box and the remove button into its middle, where neither lines up
+ * with the row it belongs to.
+ */
+.extraRow {
+  display: flex;
+  gap: 6px;
+  align-items: start;
+}
+
+.extraRow .input {
+  min-width: 0;
+}
+
+/*
+ * `resize: vertical` and not `none`: the height follows the line count, which is right for the
+ * ordinary case and not enough for a `hooks:` block somebody is rewriting. Horizontal resizing is
+ * off because the row is a flex child and dragging it wider would push the remove button out.
+ *
+ * `white-space: pre` keeps a block's own indentation visible — the indentation *is* the YAML, and
+ * a box that wrapped it would show a structure the file does not have.
+ */
+.extraValue {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  white-space: pre;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+
 .add {
   align-self: flex-start;
   height: calc(24px * var(--ui-scale));

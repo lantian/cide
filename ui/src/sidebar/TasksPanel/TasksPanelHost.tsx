@@ -77,11 +77,12 @@ import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { fsReveal, type ProjectId } from '@/ipc/client'
 import { notifyFailure } from '@/chrome/notices'
 import { useTasks } from '@/sidebar/tasksStore'
+import { useSpec } from '../specStore'
 import { useAgents } from '@/sidebar/agentsStore'
 import { rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TasksPanelView } from './TasksPanel'
 import { TaskComposeModal } from './TaskCompose'
-import { assigneeHint, filterAfterCreate, queryAfterCreate } from './model'
+import { assigneeHint, filterAfterCreate, linkableTargets, queryAfterCreate } from './model'
 import type { ArmedDelete, RunRef, StatusFilter } from './model'
 
 export interface TasksPanelProps {
@@ -126,6 +127,31 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    */
   const roster = useAgents((s) => s.roster)
   const roles = useMemo(() => rosterRoles(roster), [roster])
+  /*
+   * The changes the picker offers. (M28) Selected as the board and mapped in a `useMemo`, never
+   * in the selector itself: a selector that built a fresh array would re-render for ever and end
+   * at *Maximum update depth exceeded* — the rule `check:selectors` enforces.
+   */
+  const specBoard = useSpec((state) => state.board)
+  const changeNames = useMemo(
+    () => (specBoard.kind === 'ready' ? specBoard.changes.map((change) => change.name) : []),
+    [specBoard],
+  )
+  /*
+   * What the compose dialog's link picker offers: the board's rows, in the panel's own reading
+   * order. (M30) `changeNames`' arrangement — derived in a memo, never in a selector.
+   */
+  const linkTargets = useMemo(
+    () =>
+      board.kind === 'ready'
+        ? linkableTargets(null, board.tasks).map((task) => ({
+            id: task.id,
+            title: task.title,
+            status: task.status,
+          }))
+        : [],
+    [board],
+  )
   /* `RunView` is structurally a `RunRef` — the five fields the chip reads, `phase` opaque. */
   const runs: readonly RunRef[] = roster.kind === 'ready' ? roster.runs : NO_RUNS
   const hint = assigneeHint(roster.kind)
@@ -285,6 +311,17 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
           draft={compose}
           roles={roles}
           assigneeHint={hint}
+          /*
+           * Only on a `ready` board. (M28) `undefined` is what withholds the whole row, so a
+           * project with no `openspec/` — or one whose board has not been read yet — sees the
+           * dialog exactly as it was before M28.
+           */
+          changes={specBoard.kind === 'ready' ? changeNames : undefined}
+          /*
+           * Same structural optionality for links. (M30) Only a `ready` board has rows to link
+           * to; withheld otherwise, so the dialog draws exactly as it did before M30.
+           */
+          tasks={board.kind === 'ready' ? linkTargets : undefined}
           busy={creating}
           onDraft={setDraft}
           onCancel={endCompose}

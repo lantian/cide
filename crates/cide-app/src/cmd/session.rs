@@ -449,9 +449,19 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef]) -> String {
          `worktree: false` for a role that should work in the project root instead of its own \
          checkout — right for read-only roles, wrong for anything that edits), the body is the \
          role's system prompt, the name lowercase letters, digits and dashes, at most 32 \
-         characters — and you may create or edit one with your ordinary file tools: it takes \
-         effect immediately, no restart, and a project file shadows a global one of the same \
-         name. Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
+         characters. Write one with `mcp__cide__cide_agent_create` and correct one with \
+         `mcp__cide__cide_agent_update`, which change only the fields you name and refuse a \
+         definition that would not load, naming the field: reach for them when the work in front \
+         of you wants a kind of worker this project has not got. Either takes effect \
+         immediately, no restart, and a project file shadows a global one of the same name. \
+         Editing the markdown yourself still works, and is the only way to remove a role. The \
+         roster names the scope every role is defined in, and lists this project's and your own \
+         **Claude Code subagents** (`.claude/agents/*.md`, the `claudeProject` and \
+         `claudeGlobal` scopes), which you may edit but cannot create — cide does not author \
+         files in a directory it does not own, and a subagent is dispatched by naming it to \
+         `claude --agent`, so its own `model`, `tools`, `permissionMode`, `skills` and `hooks` \
+         apply and cide adds none of them; where two files declare one name, `.cide/agents/` \
+         wins. Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
          write this project's shared task tracker at `.cide/tasks.json`: create the task before \
          you hand it to anybody, because a run is pointed at its task and reads the statement of \
          the work from there. Assigning a todo or doing task to a role — with \
@@ -1563,6 +1573,7 @@ mod tests {
             id: cide_ipc::AgentId(id.to_string()),
             label: id.to_string(),
             harness: cide_ipc::Harness::Claude,
+            scope: cide_ipc::agents::AgentScope::Project,
             description: description.to_string(),
             system_prompt: "You are …".into(),
             model: None,

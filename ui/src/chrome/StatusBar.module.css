@@ -36,24 +36,25 @@
   flex: 1 1 auto;
   min-width: 0;
   /*
-   * min-width:0 lets this box shrink past its own content, and every slot inside it but
-   * the branch refuses to shrink, so past that point the counts would paint straight over
-   * the right-hand readouts. Clipping at the group edge keeps the overflow invisible.
+   * min-width:0 lets this box shrink past its own content, so past that point the branch
+   * would paint straight over the right-hand readouts. Clipping at the group edge keeps the
+   * overflow invisible. (It held four counters beside the branch until M28; the rule outlives
+   * them because anything added here inherits it.)
    */
   overflow: hidden;
 }
 
 /*
  * Shrinkable since the file's trail joined it — an absolute path in a project with no root
- * is longer than the bar, and `flex: none` here would push the branch and the counts off the
- * left edge to fit it. Only `.path` inside actually gives way; see below.
+ * is longer than the bar, and `flex: none` here would push the branch off the left edge to
+ * fit it. Only `.path` inside actually gives way; see below.
  */
 .right {
   flex: 0 1 auto;
   min-width: 0;
 }
 
-/* Only the branch may give way; the counts and diagnostics keep their content width. */
+/* Only the branch may give way; anything else in this group keeps its content width. */
 .left > * {
   flex: none;
 }
@@ -70,7 +71,8 @@
 }
 
 /*
- * A figure with a mark in front of it: the diff stat, the error count, the warning count.
+ * A mark with a figure after it. The diff stat and the diagnostics pair used this before they
+ * were removed; the Claude session slot is what is left of it.
  *
  * A flex row rather than a run of text, which is what makes drawn marks possible here at all —
  * the old spelling was a template literal relying on two non-breaking spaces, because ordinary
@@ -83,49 +85,12 @@
   gap: var(--sp-2);
 }
 
-/*
- * The two halves of the diff stat, in one slot.
- *
- * Wider than a `.stat`'s own gap and narrower than the bar's: the pair has to read as one
- * figure sitting apart from the readouts either side of it, which is what the mock's two
- * non-breaking spaces were doing before there were flex gaps to say it with.
- */
-.diffStat {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-4);
-}
-
-/* Nobody has counted, as opposed to a count of zero. Matches `.unknown`'s ink. */
-.unknownInk {
-  color: var(--faint);
-}
-
 .branch {
   color: var(--purple);
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.errors {
-  color: var(--red);
-}
-
-.warnings {
-  color: var(--yellow);
-}
-
-/*
- * Diagnostics with no language server behind them. Faint rather than dim so the row reads
- * as absent data at a glance instead of as a count that happens to be low.
- */
-.unknown {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-5);
-  color: var(--faint);
 }
 
 .claude {

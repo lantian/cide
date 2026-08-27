@@ -227,19 +227,19 @@ try {
 
   eq(
     clusterPlan(1, false),
-    { maximize: false, close: 'tab', detach: 'tab' },
+    { maximize: false, close: 'tab', detach: 'tab', move: false },
     "a tab's only pane: maximize is withheld (it already fills the tab), and close/detach " +
       "act on the TAB — `layout::close`/`take_pane` refuse a last pane, and these buttons " +
       "used to run into that refusal and print `lastPane`",
   )
   eq(
     clusterPlan(2, false),
-    { maximize: true, close: 'pane', detach: 'pane' },
+    { maximize: true, close: 'pane', detach: 'pane', move: true },
     'a pane with a sibling keeps all three pane-scoped actions',
   )
   eq(
     clusterPlan(1, true),
-    { maximize: false, close: 'pane', detach: 'pane' },
+    { maximize: false, close: 'pane', detach: 'pane', move: false },
     "the pinned console's sole pane stays pane-scoped: the console cannot close or detach " +
       'as a tab, and the pane-scoped arms keep the role-based refusals that word the buttons',
   )

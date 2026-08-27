@@ -29,6 +29,9 @@ pub mod ext_assets;
 /// One store and not one per project — an extension is a tool the user chose, not a fact about a
 /// repository. `ext_state.rs`'s header argues it, and `cide_ext::config`'s argues the file layout.
 pub mod ext_state;
+mod spec_reveal;
+mod spec_state;
+mod spec_triggers;
 // M8: one file index, picker and watcher per project.
 pub mod files;
 pub mod graphics;
@@ -292,6 +295,10 @@ pub fn run() {
     // Behind an `Arc` because the flusher thread outlives the call that starts it; Tauri's
     // `State` hands out a reference, which a `thread::spawn` cannot keep.
     builder = builder.manage(std::sync::Arc::new(tasks_state::TasksStores::default()));
+    // M28. Behind an `Arc` for the same reason and one more: its coalescer spawns the flusher
+    // thread that reads a board and emits it, and being the *only* thing that does so is what
+    // lets `cide://spec-changed` carry no revision. See `emit::spec_changed`.
+    builder = builder.manage(std::sync::Arc::new(spec_state::SpecBoards::default()));
     // M18. Empty until something is dispatched, and managed from the start for the same reason:
     // `agents_roster` reads it on every call, and a command that cannot resolve its state fails
     // rather than answering "nothing is running", which is what an empty registry already says.
@@ -443,6 +450,7 @@ pub fn run() {
             cmd::pane::pane_set_ratio,
             cmd::pane::pane_distribute,
             cmd::pane::pane_navigate,
+            cmd::pane::pane_move,
             cmd::pane::pane_swap,
             cmd::pane::pane_bind_session,
             cmd::project::project_open,
@@ -560,6 +568,26 @@ pub fn run() {
             cmd::tasks::task_new,
             cmd::tasks::task_edit,
             cmd::tasks::task_delete,
+            // M28: OpenSpec.
+            cmd::spec::spec_board,
+            cmd::spec::spec_change,
+            cmd::spec::spec_artifact,
+            cmd::spec::spec_validate,
+            cmd::spec::spec_init,
+            cmd::spec::spec_propose,
+            cmd::spec::spec_propose_for_task,
+            cmd::spec::spec_split_work,
+            cmd::spec::spec_run_command,
+            cmd::spec::spec_dispatch_to_session,
+            cmd::spec::spec_requirement_set,
+            cmd::spec::spec_change_plan,
+            cmd::spec::spec_change_archive,
+            cmd::spec::spec_accept_preview,
+            cmd::spec::spec_accept,
+            cmd::spec::tab_open_spec,
+            cmd::spec::spec_config_get,
+            cmd::spec::spec_config_set,
+            cmd::spec::spec_schemas,
             // --- M18: subagent orchestration ---
             cmd::agents::agents_roster,
             cmd::agents::agents_config_get,

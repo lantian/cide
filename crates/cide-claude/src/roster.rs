@@ -103,17 +103,26 @@ pub struct Named {
     pub since: u64,
 }
 
-/// `~/.claude/sessions`, or `None` when there is no home to look under.
+/// `~/.claude`, or `None` when there is no home to look under.
 ///
-/// `CLAUDE_CONFIG_DIR` relocates the whole of `~/.claude`; honouring it here is the same
-/// courtesy `cide_app::lifecycle::claude_projects_dir` pays, and for the same reason — a user
-/// who sets it is exactly the user for whom a hardcoded `~/.claude` silently finds nothing.
+/// `CLAUDE_CONFIG_DIR` relocates the whole of the directory; honouring it is the same courtesy
+/// `cide_app::lifecycle::claude_projects_dir` pays, and for the same reason — a user who sets it
+/// is exactly the user for whom a hardcoded `~/.claude` silently finds nothing.
+///
+/// Lifted out of [`sessions_dir`] when a second caller appeared: `cide_agents::defs` reads
+/// `~/.claude/agents` for the user's Claude Code subagents. Two copies of this three-line rule
+/// is two places for `CLAUDE_CONFIG_DIR` to stop being honoured, and the failure is silent in
+/// both — an empty roster and an empty name table look exactly like "you have none".
+pub fn claude_dir() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude")),
+    }
+}
+
+/// `~/.claude/sessions`, or `None` when there is no home to look under.
 pub fn sessions_dir() -> Option<PathBuf> {
-    let base = match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".claude"),
-    };
-    Some(base.join("sessions"))
+    Some(claude_dir()?.join("sessions"))
 }
 
 /// Conversation id → the name the user gave it, for every live named session on this machine.

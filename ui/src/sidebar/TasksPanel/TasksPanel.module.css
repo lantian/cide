@@ -596,6 +596,20 @@
   font-size: var(--fs-ui-11);
 }
 
+/*
+ * The `running` mark inside a chip, turning. `model.ts::SPINNING_GLYPH` holds the rule and the
+ * reason it keys off the glyph rather than the phase; `.actionSpinner` below is the third copy
+ * of these six lines, and a CSS module cannot share a `@keyframes`, which is why there are three.
+ *
+ * `inline-flex`, because `.chipDot` is otherwise an inline box: a rotation about an inline box's
+ * origin wobbles the mark rather than turning it in place.
+ */
+.chipSpin {
+  display: inline-flex;
+  animation: tasks-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
 /* Assigned, idle: no ground, no dot, dim ink. Deliberately the quietest thing on the row. */
 .chipAssigned {
   color: var(--faint);
@@ -655,11 +669,25 @@
   border-bottom: 1px solid var(--border-soft);
 }
 
+/*
+ * A column of blocks. (M31)
+ *
+ * The OpenSpec config dialog's arrangement (`ConfigForm.module.css`'s `.form`/`.group`),
+ * adopted here because the card had grown eight sections — fields, links, the spec block, the
+ * run strip, the log, the composer — separated by nothing but 12px of air, and at that count
+ * whitespace stops saying where one thing ends and the next begins. Each section below is a
+ * bordered `--panel` box on the card's `--chrome` ground; the gap here is the **one** rule for
+ * the space between them, and the blocks own no margins, so reordering a section can never
+ * change the rhythm.
+ */
 .cardBody {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 4px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-4) 14px 14px;
 }
 
 /* The explicit way out. A glyph, because the head has an id and a status marker in it already,
@@ -713,8 +741,17 @@
   white-space: nowrap;
 }
 
+/*
+ * One section of the card or the compose dialog, as a **block** — `ConfigForm.module.css`'s
+ * `.group`, at this card's density. The border is what carries the separation (the ground is
+ * one step off `--chrome`, which both themes render subtly), and there is no margin here on
+ * purpose: `.cardBody`'s gap owns the space between blocks.
+ */
 .field {
-  margin-top: 12px;
+  padding: var(--sp-4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--panel);
 }
 
 /*
@@ -727,6 +764,10 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  /* The label's own 3px is zeroed inside this row (see below), so the head must carry the
+     space to whatever follows. It is visible on the one head with no pencil in it — status —
+     where the row is only the label's height and the segment sat flush against it. */
+  margin-bottom: 3px;
 }
 
 .fieldHead > .fieldLabel {
@@ -807,13 +848,20 @@
   margin-top: 6px;
 }
 
+/*
+ * The block's title — `.groupTitle`'s weight and ink, one rung smaller because the card is
+ * denser than the settings form. It was `--dim` at regular weight, which worked when the label
+ * was the only structure a field had; a bordered block whose heading is quieter than its value
+ * reads upside down.
+ */
 .fieldLabel {
   display: block;
   margin-bottom: 3px;
   font-size: var(--fs-ui-12);
+  font-weight: 600;
   letter-spacing: 0;
   text-transform: none;
-  color: var(--dim);
+  color: var(--text-hi);
 }
 
 .input,
@@ -873,6 +921,11 @@
 .mentionId {
   font-family: var(--font-mono);
   color: var(--text);
+  /* Never wraps and never shrinks: an id is the row's anchor, and a hyphenated one squeezed
+     by a long label breaks at the hyphen — `t-71` rendering as `t-` over `71`, which is how
+     the link popup shipped its first screenshot. Role ids just never showed it. */
+  flex: none;
+  white-space: nowrap;
 }
 
 .mentionLabel {
@@ -994,16 +1047,17 @@
   color: var(--dim);
 }
 
-/* The live-run strip: what is actually running against this task, right now. */
+/* The live-run strip: what is actually running against this task, right now. A block like its
+   siblings (no margin — `.cardBody`'s gap), but on `--panel-2` rather than `--panel`: it is the
+   one section reporting live activity, and one step more ground is what marks it. */
 .runStrip {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  margin-top: 10px;
-  padding: 5px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
   background: var(--panel-2);
 }
 
@@ -1092,8 +1146,13 @@
   margin-bottom: 0;
 }
 
+/* The comment composer, as its own block: it is the one form on the card that is not a field,
+   and boxing it beside the log says "this writes a new line" rather than "this edits one". */
 .composer {
-  margin-top: 10px;
+  padding: var(--sp-4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--panel);
 }
 
 /* ------------------------------------------------------- markdown, drawn and written (M27) */
@@ -1263,8 +1322,9 @@
   display: flex;
   justify-content: space-between;
   gap: 8px;
-  margin-top: 14px;
-  padding-top: 12px;
+  /* No margin — `.cardBody`'s gap spaces it off the last block; the rule and its own padding
+     are what say "the form ends here". */
+  padding-top: var(--sp-3);
   border-top: 1px solid var(--border-soft);
 }
 
@@ -1281,6 +1341,55 @@
   cursor: not-allowed;
 }
 
+/*
+ * The primary action while its call is in flight — `Integrate & Archive`, which merges a branch,
+ * archives the change, re-validates and closes the task.
+ *
+ * Two things, and the second is why this class exists at all rather than just an icon in the
+ * markup. A `<button>` is `display: inline-block`, so the mark and the words were two inline
+ * boxes on a shared baseline with no gap and no alignment: the svg sat on the text's baseline and
+ * the button visibly collapsed around them. `inline-flex` with `align-items: center` is the fix,
+ * and the gap is the row spacing every other icon-plus-label control here uses.
+ *
+ * `min-width` holds the button's own resting width, so pressing it does not reflow the row it is
+ * in — the label changes from `Integrate & Archive` to `Integrating…`, and a button that shrinks
+ * mid-gesture drags Delete leftward under the pointer.
+ */
+.actionBusy {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 9rem;
+  justify-content: center;
+}
+
+/*
+ * And it **turns**, which it did not.
+ *
+ * `loader-circle` is a three-quarter arc — a mark that means "spinning" only if it does. It was
+ * drawn static here (and everywhere else in cide, which the comment that shipped with it got
+ * wrong), so the one signal that the press had been taken was a shape nobody reads as motion.
+ *
+ * A loop, so it answers reduced motion through `--motion-loop` rather than through the duration
+ * tokens: an infinite animation at `0.01ms` strobes, which is the opposite of the request. Paused
+ * shows the 0% frame, and 0% here is the arc at rest — a legible static "working" mark. That rule
+ * is `tokens.css`'s, at `--dur-sweep`.
+ */
+.actionSpinner {
+  flex: none;
+  animation: tasks-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes tasks-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .action:disabled:hover {
   background: transparent;
 }
@@ -1295,8 +1404,9 @@
 .detailActions {
   display: flex;
   justify-content: flex-end;
-  margin-top: 14px;
-  padding-top: 10px;
+  /* No margin — `.cardBody`'s gap, like every block above it. The rule stays: this row is not
+     a block, it is the card's foot, and a border it shares with `.composeActions` says so. */
+  padding-top: var(--sp-3);
   border-top: 1px solid var(--border-soft);
 }
 
@@ -1406,4 +1516,489 @@
    belong to the form above them and not to the comment. */
 .logEditActions .logAction {
   color: var(--dim);
+}
+
+/* ------------------------------------------------------------- the OpenSpec block (M28) */
+
+/*
+ * The change chip in the card head, beside the creator. Monospace because it is a directory
+ * name — `openspec/changes/<this>/` — and a name a user will type into a terminal.
+ */
+.specChip {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  padding: 0 var(--sp-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 18ch;
+}
+
+.specSummary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.specValidity {
+  font-size: var(--fs-ui-11);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  padding: 0 var(--sp-1);
+  color: var(--dim);
+}
+
+.specValidity[data-state='ok'] {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.specValidity[data-state='failed'] {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/*
+ * The sentence that stands in for the block while it is being read, and the one that replaces it
+ * when the read came back with nothing.
+ *
+ * One class for both, because they are the same shape in the same place — a line of dim prose
+ * where the summary row will be — and `data-state` on the block is what distinguishes them for
+ * anything that needs to.
+ */
+.specPending {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+/*
+ * Where the work went, when it went to a conversation. (M28)
+ *
+ * A row and not a chip: it carries a state, a name and two controls, and the state has to be the
+ * first thing read — a name with a quiet badge after it makes the reader parse the label to find
+ * out whether anything is happening.
+ */
+.specSession {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin: var(--sp-2) 0 var(--sp-1);
+}
+
+/*
+ * The state, in three colours that are the ones the rest of the card already uses for these
+ * meanings: accent for *working* (something is happening), green for *waiting for you* (it is
+ * your move, and nothing is wrong), and the dim border for *closed*. Deliberately not red —
+ * a closed conversation is not a fault, it is a fact with a next step, and the hint states it.
+ */
+.specSessionState {
+  flex: none;
+  font-size: var(--fs-ui-11);
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  color: var(--dim);
+}
+
+.specSession[data-state='working'] .specSessionState {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.specSession[data-state='awaiting'] .specSessionState {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.specSessionName {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-ui-12);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.specSessionResume,
+.specSessionOpen,
+.specSessionElsewhere {
+  flex: none;
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  transition: background-color var(--dur-1) ease;
+}
+
+/* Resume leads and carries the accent; Reopen and Hand-elsewhere are the quieter pair. */
+.specSessionResume {
+  border-color: var(--accent);
+}
+
+.specSessionElsewhere {
+  color: var(--dim);
+}
+
+.specSessionResume:hover,
+.specSessionOpen:hover,
+.specSessionElsewhere:hover {
+  background: var(--panel-2);
+}
+
+.specProgressLabel {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.specBar {
+  height: 4px;
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  overflow: hidden;
+  margin: var(--sp-1) 0;
+}
+
+.specBarFill {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: var(--accent);
+  /*
+   * `transform: scaleX`, not `width`: `check:motion` bans transitioning a geometry property at
+   * all — a width animation lays out on every frame, which is the mechanism the ban exists for —
+   * while `transform` is composited and is on the allowed list.
+   *
+   * The scale is an **inline style** set by the component. It was
+   * `scaleX(calc(attr(data-pct type(<number>), 0) / 100))` so the markup would carry no `style=`,
+   * and typed `attr()` is CSS Values 5, which WebKitGTK does not implement — an unsupported value
+   * invalidates the whole declaration, so it was dropped and `width: 100%` stood alone. Every
+   * bar drew full whatever it said beside it. `data-pct` stays for the SSR digest.
+   */
+  transform-origin: left center;
+  transition: transform var(--dur-1) var(--ease-out);
+}
+
+.specPrimary {
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.specPrimary:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.specPrimaryOn {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.specHint {
+  margin: var(--sp-1) 0 0;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  line-height: 1.45;
+}
+
+.specSection {
+  margin-top: var(--sp-2);
+  border-top: 1px solid var(--border-soft);
+}
+
+.specSummaryRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) 0;
+  cursor: pointer;
+  font-size: var(--fs-ui-12);
+}
+
+.specSectionFile {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.specTasks {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 var(--sp-2);
+}
+
+.specTaskRow {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: 2px 0;
+  font-size: var(--fs-ui-12);
+}
+
+.specTaskRow[data-done='true'] {
+  color: var(--dim);
+}
+
+.specOpen {
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  text-align: left;
+}
+
+.specDelta {
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.specDeltaHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-ui-11);
+}
+
+.specDeltaOp {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+
+.specDeltaName {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.specDeltaSpec {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  color: var(--dim);
+}
+
+.specScenario {
+  margin-top: var(--sp-1);
+  padding-left: var(--sp-3);
+  border-left: 2px solid var(--border-soft);
+}
+
+.specScenarioTitle {
+  margin: 0 0 2px;
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  color: var(--dim);
+}
+
+.specIssue {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-2);
+  border-left: 2px solid var(--red);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  line-height: 1.45;
+}
+
+/* --- Typed links on the card. (M30) ----------------------------------------------------- */
+
+.linkChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.linkPair {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+/*
+ * A chip that navigates: the `.specChip` look on a `<button>`, because the two name the same
+ * kind of fact — which other thing this task stands in relation to — and must read as one
+ * family. Rounded like `.chip` rather than squared like the spec chip, because this one acts;
+ * the hover lift is what says so.
+ */
+.linkChip {
+  appearance: none;
+  background: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-full);
+  padding: 0 var(--sp-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.linkChip:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.linkChip:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* The target is off the board — deleted, or living on a branch not pulled yet. Marked and
+   still clickable (the card it opens is the honest "no such task" state), never hidden: a
+   reference that silently vanished is the failure this panel keeps writing against. */
+.linkChipGone {
+  color: var(--faint);
+  border-style: dashed;
+}
+
+.linkRemove {
+  appearance: none;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--faint);
+  padding: 0 2px;
+  border-radius: var(--r-1);
+  line-height: 1;
+}
+
+.linkRemove:hover {
+  color: var(--red);
+}
+
+.linkRemove:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.linkAdd {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+}
+
+/* ------------------------------------------- the actions row at the foot of the card (M28) */
+
+/*
+ * Pushes Delete to the right edge while Approve stays at the left.
+ *
+ * `.detailActions` is `justify-content: flex-end`, which was right when Delete was the only
+ * control in it. A spacer rather than changing that rule: every other caller of the row wants
+ * exactly the old behaviour, and "the destructive one is hard right" is worth keeping true.
+ */
+.actionsSpacer {
+  flex: 1 1 auto;
+}
+
+/* The one control that starts work. Emphasis, not colour — `--red` is spoken for. */
+.actionPrimary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.targets {
+  list-style: none;
+  /* No margin — `.cardBody`'s gap. The radius steps up to the blocks' so the open picker reads
+     as one of them rather than as a control that escaped its row. */
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  overflow: hidden;
+}
+
+.target {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  font: inherit;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.targets li:last-child .target {
+  border-bottom: 0;
+}
+
+.target:hover {
+  background: var(--panel-2);
+}
+
+.targetLabel {
+  font-size: var(--fs-ui-12);
+}
+
+/* The line that says what choosing it will actually do — a role runs unattended, a conversation
+   is typed into. That difference is the whole of the choice. */
+.targetDetail {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/* The link-target search: the input and its popup as one column, so the popup opens in normal
+   flow under the field — `MentionTextarea`'s no-absolute-positioning decision, in the row the
+   picker sits in. `flex: 1` so the input takes the row's remaining width beside the kind
+   select. */
+.linkTargetWrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+/* The status at a target row's end: half of choosing a blocker is which tasks are already
+   done, and it reads dim so the id and title stay the row. */
+.linkTargetStatus {
+  margin-left: auto;
+  flex: none;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+/* The link popup's id column: `.mentionId`'s look with a floor under its width, so every
+   title starts at the same x and the ids read as the column a key-scanning eye walks down.
+   `5ch` seats four-digit ids; a longer hand-written id simply takes more. */
+.linkTargetId {
+  font-family: var(--font-mono);
+  color: var(--text);
+  flex: none;
+  white-space: nowrap;
+  min-width: 5ch;
+}
+
+/* The kind select inside the picker row: sized to its words, not the card. `.select`'s
+   `width: 100%` is the field rows' posture, and here it shoved a three-word choice across
+   620px and wrapped the search input onto its own line. */
+.linkKind {
+  width: auto;
+  flex: none;
 }

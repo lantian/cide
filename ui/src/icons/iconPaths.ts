@@ -46,7 +46,6 @@ export const ICON_PATHS = {
   'circle-dot': 'M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0ZM11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0Z',  // from circle
   'circle-minus': 'M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0ZM8 12h8',  // from circle + path
   'circle-pause': 'M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0ZM10 15L10 9M14 15L14 9',  // from circle + line
-  'circle-plus': 'M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0ZM8 12h8M12 8v8',  // from circle + path
   'circle-slash': 'M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0ZM9 15L15 9',  // from circle + line
   'circle-x': 'M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0ZM15 9l-6 6M9 9l6 6',  // from circle + path
   'code': 'M16 18l6-6-6-6M8 6l-6 6 6 6',
@@ -73,6 +72,7 @@ export const ICON_PATHS = {
   'maximize': 'M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3',
   'message-square': 'M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z',
   'minus': 'M5 12h14',
+  'move': 'M12 2v20M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M5 9l-3 3 3 3M9 5l3-3 3 3',
   'panel-bottom': 'M5 3H19a2 2 0 0 1 2 2V19a2 2 0 0 1 -2 2H5a2 2 0 0 1 -2 -2V5a2 2 0 0 1 2 -2ZM3 15h18',  // from rect + path
   'panel-bottom-close': 'M5 3H19a2 2 0 0 1 2 2V19a2 2 0 0 1 -2 2H5a2 2 0 0 1 -2 -2V5a2 2 0 0 1 2 -2ZM3 15h18M15 8l-3 3-3-3',  // from rect + path
   'pause': 'M15 3H18a1 1 0 0 1 1 1V20a1 1 0 0 1 -1 1H15a1 1 0 0 1 -1 -1V4a1 1 0 0 1 1 -1ZM6 3H9a1 1 0 0 1 1 1V20a1 1 0 0 1 -1 1H6a1 1 0 0 1 -1 -1V4a1 1 0 0 1 1 -1Z',  // from rect

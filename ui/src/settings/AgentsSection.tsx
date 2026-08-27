@@ -92,6 +92,7 @@ import {
   fileKey,
   fromWire,
   harnessLabel,
+  isClaudeScope,
   isDirty,
   localProblems,
   modalFor,
@@ -111,6 +112,7 @@ import {
   type AgentFieldKey,
   type Draft,
   type Entry,
+  type Extra,
   type Modal,
   type Problem,
   type Row,
@@ -232,6 +234,37 @@ function AgentsEditor({ project }: { project: ProjectId }) {
    * meant for one project must not open a role in another.
    */
   const focusRole = useAgents((s) => (s.project === project ? s.focusRole : null))
+  /**
+   * A fingerprint of the roster this project currently has, so the listing below can follow the
+   * disk instead of freezing at whatever was there when this screen mounted.
+   *
+   * # Why this screen needs it when the panel does not
+   *
+   * The Agents panel renders straight out of the store, so `cide://agents-changed` moves it for
+   * free. This screen does not: its list is `entries`, built by probing `agents_draft` once per
+   * scope per name, because a **shadowed** definition is one the roster has already merged away
+   * and only a probe can find. That probe ran on mount and never again — so a role written while
+   * Settings was open (by Claude Code's own `/agents`, by a teammate's `git pull`, by an
+   * orchestrator's Write tool) appeared in the sidebar and was simply absent here, which reads as
+   * cide not supporting the thing rather than as a stale screen.
+   *
+   * **Selected, then derived — never built inside the selector.** `check:selectors` refuses a
+   * selector that constructs a value, because a fresh reference on every store read re-renders
+   * for ever and ends at *Maximum update depth exceeded*, which unmounts the whole window rather
+   * than this component. That the fingerprint below happens to end in a `join` and is therefore a
+   * string does not save it: the rule is syntactic on purpose, since the day somebody drops the
+   * `join` there is no failure to see. So the selector returns the **stored** roster — one
+   * reference, replaced only when `adopt` runs — and the string is derived here.
+   *
+   * The scope is in the key as well as the id because a *move* between scopes changes which file
+   * the list must open while leaving the set of names identical.
+   */
+  const projectRoster = useAgents((s) => (s.project === project ? s.roster : null))
+  const rosterMark = useMemo(() => {
+    if (projectRoster === null) return ''
+    if (projectRoster.kind !== 'ready') return projectRoster.kind
+    return projectRoster.agents.map((def) => `${def.scope}:${def.id}`).join('\n')
+  }, [projectRoster])
   /** The request, taken out of the store and held here until the listing can resolve it. */
   const [focusRequest, setFocusRequest] = useState<string | null>(null)
   /** A request the listing could not match, kept so the screen can say so rather than shrug. */
@@ -290,7 +323,7 @@ function AgentsEditor({ project }: { project: ProjectId }) {
     if (roster.kind === 'empty') {
       setRosterNote({
         title: 'No roles yet',
-        body: `Nothing in .cide/agents/ or in your global roles. New role writes the first one; ${roster.configPath} is where the project's own switches live.`,
+        body: `Nothing in .cide/agents/, in your global roles, or in this project's or your own .claude/agents/. New role writes the first one; ${roster.configPath} is where the project's own switches live.`,
       })
       return []
     }
@@ -336,7 +369,18 @@ function AgentsEditor({ project }: { project: ProjectId }) {
       })
   }, [listRoles])
 
-  useEffect(refresh, [refresh])
+  /*
+   * On mount, and again whenever the roster this project has actually changes.
+   *
+   * `refresh` re-reads through `agents_roster` and the probes rather than adopting the store's
+   * copy, which is the same freshness argument `agents_draft` makes one layer down: this screen
+   * *writes* these files, and a list assembled from a snapshot is a list that can save over
+   * whatever the user's editor did in between. `rosterMark` is only the signal to go and look.
+   *
+   * No loop: nothing in `refresh` writes to the agents store, so the mark cannot move because the
+   * listing ran.
+   */
+  useEffect(refresh, [refresh, rosterMark])
 
   const rows = useMemo(() => rowsFor(entries ?? []), [entries])
   const taken = useMemo(
@@ -1109,7 +1153,26 @@ function RoleForm({
             <Choice
               label="Scope"
               value={draft.scope}
-              options={SCOPES.map((scope) => ({ value: scope, label: scopeLabel(scope) }))}
+              /*
+               * A subagent's scope is fixed while the dialog is open, and the control is
+               * *rendered disabled* rather than hidden so the row still says where the file is.
+               *
+               * There are only two moves it could offer and neither is one. Into a cide scope is
+               * a **translation**, not a move — the field sets differ, so the file that arrived
+               * would be one nobody wrote — and Rust refuses it on this field. Between the two
+               * Claude scopes is a real file move with no reason to exist yet. Offering either
+               * and then refusing it is the listed-and-silently-inert state this codebase has
+               * paid for elsewhere; a control that plainly cannot be used is not.
+               */
+              disabled={isClaudeScope(draft.scope)}
+              options={
+                isClaudeScope(draft.scope)
+                  ? [{ value: draft.scope, label: scopeLabel(draft.scope) }]
+                  : SCOPES.filter((scope) => !isClaudeScope(scope)).map((scope) => ({
+                      value: scope,
+                      label: scopeLabel(scope),
+                    }))
+              }
               onChange={(value) => onEdit('scope', { scope: value as Scope })}
             />
           }
@@ -1122,7 +1185,11 @@ function RoleForm({
 
         <Field
           label="Name"
-          hint="1–32 characters of a–z, 0–9 and “-”. It is the file name and the word the orchestrator asks for this role by, so changing it renames the file."
+          hint={
+            isClaudeScope(draft.scope)
+              ? 'Lowercase letters, digits and “-”. Claude Code keys the subagent by this value and the file it lives in may be called anything, so changing it edits the key rather than renaming the file.'
+              : '1–32 characters of a–z, 0–9 and “-”. It is the file name and the word the orchestrator asks for this role by, so changing it renames the file.'
+          }
           errors={errorsFor('name')}
           control={
             <input
@@ -1156,24 +1223,35 @@ function RoleForm({
           }
         />
 
-        <Field
-          label="Harness"
-          hint="Which CLI runs this role. Left as the project default, the role follows .cide/config.json — which is a different state from naming the same harness here, because the default can change underneath a role that never named one."
-          errors={errorsFor('harness')}
-          control={
-            <Choice
-              label="Harness"
-              value={draft.harness ?? ''}
-              options={[
-                { value: '', label: harnessLabel(null) },
-                ...HARNESSES.map((harness) => ({ value: harness, label: harnessLabel(harness) })),
-              ]}
-              onChange={(value) =>
-                onEdit('harness', { harness: value === '' ? null : (value as 'claude' | 'opencode') })
-              }
-            />
-          }
-        />
+        {/*
+          * **No harness control for a subagent**, and this is the one place on the screen where
+          * a field disappears rather than greying out. The others grey because the question is
+          * still meaningful and the answer is fixed; here the question does not exist. A Claude
+          * Code subagent runs under Claude Code by construction — `.claude/agents/` has no
+          * `harness:` key, cide carries one as an unmodelled extra with a warning, and the
+          * dispatch names the definition with `--agent` rather than choosing a CLI for it.
+          * Drawing a disabled dropdown reading "claude" would suggest a decision was taken.
+          */}
+        {!isClaudeScope(draft.scope) && (
+          <Field
+            label="Harness"
+            hint="Which CLI runs this role. Left as the project default, the role follows .cide/config.json — which is a different state from naming the same harness here, because the default can change underneath a role that never named one."
+            errors={errorsFor('harness')}
+            control={
+              <Choice
+                label="Harness"
+                value={draft.harness ?? ''}
+                options={[
+                  { value: '', label: harnessLabel(null) },
+                  ...HARNESSES.map((harness) => ({ value: harness, label: harnessLabel(harness) })),
+                ]}
+                onChange={(value) =>
+                  onEdit('harness', { harness: value === '' ? null : (value as 'claude' | 'opencode') })
+                }
+              />
+            }
+          />
+        )}
 
         <Field
           label="Description"
@@ -1305,9 +1383,111 @@ function RoleForm({
             />
           }
         />
+
+        {/*
+          * **Meta: every front-matter key cide does not model.** (M30)
+          *
+          * Shown on both families of scope, and the reason is not symmetry. For a Claude Code
+          * subagent these are the *interesting* keys — `hooks`, `skills`, `mcpServers`,
+          * `maxTurns`, `disallowedTools`, `color` — and cide is writing the file back after the
+          * user changes a description, so a form that dropped them would delete somebody's hooks
+          * as a side effect of fixing a typo. For a cide role the list is ordinarily empty, and
+          * when it is not, the roster is already reporting the key against its own line: showing
+          * it here is what turns "cide says line 6 is wrong" into something the user can act on
+          * without leaving the dialog.
+          *
+          * Values are edited raw and written back raw. cide has no model for what is in them —
+          * that is the definition of the list — so the one honest thing it can do is not touch
+          * them.
+          */}
+        <Field
+          label="Meta"
+          hint={
+            isClaudeScope(draft.scope)
+              ? 'Keys cide does not model — hooks, skills, mcpServers, maxTurns and anything a Claude Code release adds. cide reads none of them and writes all of them back exactly as they are, so editing a description here cannot delete them. A value may span several lines; keep a block’s indentation.'
+              : 'Keys cide does not read. They are kept in the file rather than dropped by a save, and the roster reports each one against its own line — so an entry here is either a typo to fix or a key written for a newer cide.'
+          }
+          errors={errorsFor('extras')}
+          control={
+            <ExtraRows
+              extras={draft.extras}
+              onChange={(extras) => onEdit('extras', { extras })}
+            />
+          }
+        />
       </Group>
 
     </>
+  )
+}
+
+/**
+ * The unmodelled front-matter keys, as editable key/value rows.
+ *
+ * Shaped on [`ToolRows`] and differing in one respect that matters: the value is a `textarea`,
+ * not an `input`. A `hooks:` block arrives here as several lines with their own indentation, and
+ * a single-line box would show the first line, let the user retype it, and silently discard the
+ * rest the moment they touched it.
+ *
+ * `rows` follows the content so an ordinary one-line value does not get a text panel, and a block
+ * is legible without scrolling inside a box inside a dialog.
+ */
+function ExtraRows({
+  extras,
+  onChange,
+}: {
+  extras: readonly Extra[]
+  onChange: (next: Extra[]) => void
+}) {
+  const edit = (index: number, patch: Partial<Extra>) => {
+    const next = extras.map((extra) => ({ ...extra }))
+    next[index] = { ...next[index]!, ...patch }
+    onChange(next)
+  }
+  return (
+    <div className={styles.tools}>
+      {extras.map((extra, index) => (
+        // Keyed by position and key together, for `ToolRows`' reason.
+        <div key={`${index}:${extra.key}`} className={styles.extraRow}>
+          <input
+            className={cx(styles.input, styles.inputNarrow)}
+            type="text"
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            aria-label={`Meta key ${index + 1}`}
+            placeholder="maxTurns"
+            value={extra.key}
+            onChange={(e) => edit(index, { key: e.target.value })}
+          />
+          <textarea
+            className={cx(styles.input, styles.extraValue)}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            aria-label={`Meta value ${index + 1}`}
+            rows={Math.min(8, Math.max(1, extra.value.split('\n').length))}
+            value={extra.value}
+            onChange={(e) => edit(index, { value: e.target.value })}
+          />
+          <button
+            type="button"
+            className={styles.remove}
+            aria-label={`Remove meta key ${index + 1}`}
+            onClick={() => onChange(extras.filter((_, i) => i !== index))}
+          >
+            <Icon name="x" size={1} />
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        className={styles.add}
+        onClick={() => onChange([...extras.map((e) => ({ ...e })), { key: '', value: '' }])}
+      >
+        + Add key
+      </button>
+    </div>
   )
 }
 
@@ -1361,17 +1541,21 @@ function Choice({
   value,
   options,
   onChange,
+  disabled = false,
 }: {
   label: string
   value: string
   options: readonly { value: string; label: string }[]
   onChange: (next: string) => void
+  /** Rendered but not answerable — the control still says what the value is. */
+  disabled?: boolean
 }) {
   return (
     <select
       className={styles.select}
       aria-label={label}
       value={value}
+      disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
     >
       {options.map((option) => (

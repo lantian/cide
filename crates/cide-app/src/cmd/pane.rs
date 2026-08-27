@@ -55,7 +55,7 @@ fn default_intent(kind: &TabKind, axis: Axis) -> SplitIntent {
 fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
     let (kind, suffix) = match intent {
         SplitIntent::NewClaude | SplitIntent::ForkPrimary => (PaneKind::Claude, "claude"),
-        SplitIntent::Mirror { .. } => (PaneKind::Claude, "claude"),
+        SplitIntent::Mirror { .. } | SplitIntent::Resume { .. } => (PaneKind::Claude, "claude"),
         SplitIntent::Shell => (PaneKind::Shell, "bash"),
     };
     Pane {
@@ -65,9 +65,12 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // closed. Marking a second pane Primary would make two panes unclosable and leave
         // the tab with no way back to one.
         role: PaneRole::Auxiliary,
-        // A mirror shares an existing session rather than waiting for one to be bound.
+        // A mirror shares an existing session rather than waiting for one to be bound, and a
+        // resume re-uses a dead one's id — a `SessionId` *is* what cide passes to
+        // `claude --session-id`, so keeping it is what makes `--resume` continue the same
+        // transcript and keeps every record naming that conversation correct.
         session: match intent {
-            SplitIntent::Mirror { session } => Some(*session),
+            SplitIntent::Mirror { session } | SplitIntent::Resume { session } => Some(*session),
             _ => None,
         },
         // A mirror shows the same child as its source, so the CLI's conversation for it is
@@ -270,6 +273,35 @@ pub fn pane_navigate(
     Ok(layout::navigate(&t.tree, pane, direction))
 }
 
+/// Move a pane that is already in this tab to a new home in it, beside `target`.
+///
+/// `axis` and `side` mean what they mean for [`pane_split`] — `row` puts the pane beside
+/// `target` as a tile, `col` puts it in a full-width row above or below. The pane keeps its
+/// identity and its session, so the child process never notices; the frontend's host registry
+/// is keyed by `PaneId` and parks the terminal's DOM rather than destroying it, which is what
+/// carries the scrollback across.
+///
+/// Distinct from [`pane_swap`], which exchanges two panes' positions and cannot re-parent one
+/// across a row boundary or collapse the row it left behind. This is the gesture behind the
+/// pane's grab handle and `pane.move.*`.
+#[tauri::command(rename_all = "camelCase")]
+pub fn pane_move(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    target: PaneId,
+    axis: Axis,
+    side: Side,
+) -> Result<Mutated, CoreError> {
+    state
+        .update(|ws| {
+            let t = workspace::tab_mut(ws, project, tab)?;
+            layout::move_pane(&mut t.tree, pane, target, axis, side)
+        })
+        .map(|()| Mutated { rev: state.rev() })
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn pane_swap(
     state: State<'_, WorkspaceState>,
@@ -425,6 +457,37 @@ mod tests {
         assert_eq!(tree.focused, id);
         assert!(tree.panes[&id].session.is_none());
         assert_eq!(rows(&tree).len(), 2);
+    }
+
+    /// A resumed or mirrored pane carries its session **at creation**, before any child exists.
+    ///
+    /// The arm above it does not, and the difference is load-bearing one module over.
+    /// `agent_rpc::project_of_claude_pane` answers *which project's tracker this connection may
+    /// write* by finding the pane holding the session, and a connection's scope is resolved once
+    /// and fixed for its life (`initialize` advertises `listChanged: false`). For a pane whose
+    /// session is bound *after* the spawn — `NewClaude` — that is a race the child has to lose,
+    /// and it does by a wide margin: the binding is one IPC round trip while the child has a
+    /// whole CLI to boot before it forks `cide-hook mcp`. For a task's conversation there is no
+    /// race at all, because `TasksPanel/openSession.ts` splits with `SplitIntent::Resume` and
+    /// this arm writes the session into the row synchronously.
+    ///
+    /// So: moving `Resume` or `Mirror` into the `_ => None` arm would compile, would look like a
+    /// simplification, and would turn every task-conversation pane back into a `claude` served
+    /// an empty `tools/list` whenever it won the race.
+    #[test]
+    fn a_resumed_pane_holds_its_session_before_anything_is_spawned() {
+        let session = cide_ipc::SessionId::new();
+
+        let resumed = pane_for(&SplitIntent::Resume { session }, "cide");
+        assert_eq!(resumed.session, Some(session));
+        assert_eq!(resumed.kind, PaneKind::Claude);
+
+        let mirrored = pane_for(&SplitIntent::Mirror { session }, "cide");
+        assert_eq!(mirrored.session, Some(session));
+        assert_eq!(mirrored.kind, PaneKind::Claude);
+
+        // And the pane a plain split makes is still session-less, which is the case above.
+        assert!(pane_for(&SplitIntent::NewClaude, "cide").session.is_none());
     }
 
     #[test]

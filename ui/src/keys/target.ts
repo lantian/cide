@@ -150,12 +150,27 @@ export function claudeTargetOf(boot: Bootstrap | null): { project: ProjectId; pa
  * arms below are the ones that fire only while a window has no project.
  */
 export function consolePaneOf(boot: Bootstrap | null): { project: ProjectId; pane: PaneId } | null {
-  const project = activeProjectOf(boot)
+  const project = activeProjectIdOf(boot)
   if (project === null) return null
-  const console = project.tabs[0]
+  const pane = consolePaneOfProject(boot, project)
+  return pane === null ? null : { project, pane }
+}
+
+/**
+ * The console pane of a *named* project — [`consolePaneOf`]'s walk, addressable by id.
+ *
+ * For a caller that already holds a project id of its own — the OpenSpec panel restarting the
+ * console after `openspec init` — rather than asking which project this window is showing. The
+ * two share one walk because a second copy of `tabs[0]` drifting from this one is exactly the
+ * failure [`consolePaneOf`]'s doc names.
+ */
+export function consolePaneOfProject(boot: Bootstrap | null, project: ProjectId): PaneId | null {
+  if (boot === null) return null
+  const owner = boot.workspace.projects[project]
+  const console = owner?.tabs[0]
   if (console === undefined) return null
   const pane = Object.values(console.tree.panes).find((p) => p.kind === 'claude')
-  return pane === undefined ? null : { project: project.id, pane: pane.id }
+  return pane?.id ?? null
 }
 
 /**

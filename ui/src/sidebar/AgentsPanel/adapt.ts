@@ -75,11 +75,17 @@ function ms(value: bigint): number {
   return Number(value)
 }
 
-/** One role. `AgentDef` and `AgentDefView` are the same seven fields, restated. */
+/**
+ * One role. `AgentDefView` is `AgentDef` restated, field for field.
+ *
+ * No count in this sentence on purpose: it said *seven* while the struct carried eight, which is
+ * what a number in a comment does the first time somebody adds a field. `tsc` counts them.
+ */
 function def(from: WireDef): AgentDefView {
   return {
     id: from.id,
     label: from.label,
+    scope: from.scope,
     harness: from.harness,
     description: from.description,
     systemPrompt: from.systemPrompt,
@@ -95,6 +101,10 @@ function def(from: WireDef): AgentDefView {
      */
     unavailable: from.unavailable,
     maxConcurrent: from.maxConcurrent,
+    // `#[serde(default = "default_worktree")]` in Rust, so a payload from before the field
+    // existed omits it and means `true`. Restated rather than left to `??` at each reader: the
+    // one reader that forgot would print *Archive* over a run whose branch is about to merge.
+    worktree: from.worktree,
   }
 }
 

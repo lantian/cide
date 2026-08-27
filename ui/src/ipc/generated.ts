@@ -25,7 +25,31 @@ id: AgentId,
  * What the row says. Title-cased from the id unless the file gives one, so a roster is
  * readable before anybody has thought about presentation.
  */
-label: string, harness: Harness, 
+label: string, 
+/**
+ * Which of the four directories this definition was read from. (M30)
+ *
+ * # Why a roster row carries it when `origin`/`shadows` deliberately do not
+ *
+ * `LoadedAgent`'s doc has flagged for two milestones that the panel genuinely wants those
+ * two paths and that adding them "would be a reasonable addition to `AgentDef` when someone
+ * is next in there". This is the half that earned its way across, and a *path* is still not
+ * what crosses: a scope is a closed enum the frontend can switch on, where a path is a
+ * string it would have to parse to learn anything.
+ *
+ * What reads it is the roster's badge: a [`AgentScope::is_claude_code`] role is drawn
+ * **Claude Code**, because a definition cide did not author, cannot fully model, and applies
+ * through `--agent` rather than through its own flags is a fact the user has to be able to
+ * see without opening anything.
+ *
+ * **It does not replace the Settings screen's per-scope probing**, and that is worth saying
+ * because it looks as though it should. That screen issues one `agents_draft` per scope per
+ * name, which is not a lookup of something this field already knows: a roster row is the
+ * *merged* answer, one entry per name, so it names the scope that **won** and is silent
+ * about the file it shadowed. Listing both is the whole point of that screen — a shadowed
+ * definition must never be invisible — so the probe answers a question this field cannot.
+ */
+scope: AgentScope, harness: Harness, 
 /**
  * One line, from the front matter's `description`. What the role is *for*, in the author's
  * own words — the orchestrator is given this verbatim when it asks what agents it has, so
@@ -116,15 +140,26 @@ worktree: boolean, };
  *
  * # What a save through this loses, and why that is the design
  *
- * A save re-renders the whole file from these fields, so it keeps exactly what
- * `cide_agents::defs::KNOWN_KEYS` names and nothing else: comments in the front matter go, an
- * unknown key a newer cide would read goes, and a value cide's own vocabulary cannot hold —
- * `harness: bogus`, `max-concurrent: lots` — comes back as "not set" and is written out as
- * absent. That is lossy on purpose. The alternative is a draft that carries text it cannot
- * show the user, which the form would then be silently responsible for preserving, and a save
- * that re-emitted an unread key would be cide vouching for a line it does not understand. The
- * roster already reports every one of those cases as a problem against the file's line before
- * anybody opens the form.
+ * A save re-renders the whole file from these fields. What that costs, and what it no longer
+ * costs, changed in M30 and the distinction is worth stating precisely.
+ *
+ * **Still lost:** comments in the front matter, and a value cide's own vocabulary cannot hold —
+ * `harness: bogus`, `max-concurrent: lots` — which comes back as "not set" and is written out as
+ * absent. Both are lossy on purpose. A value cide could not read is one it cannot vouch for, and
+ * re-emitting it would be the form claiming a switch is set when nothing will act on it.
+ *
+ * **No longer lost: an unknown key.** It used to go, on the argument that "a save that
+ * re-emitted an unread key would be cide vouching for a line it does not understand". That
+ * argument holds for a directory cide *owns* and collapses for one it does not. Claude Code's
+ * `.claude/agents/` is now a scope ([`AgentScope::ClaudeProject`]), its whole vocabulary is
+ * outside `cide_agents::defs::KNOWN_KEYS`, and deleting a user's `hooks:` block because they
+ * edited a description is not a defensible thing to do to somebody else's file. So an unmodelled
+ * key rides [`Self::extras`], is shown in the form as an editable row — which is what keeps it
+ * from being text the user cannot see — and is written back verbatim.
+ *
+ * The reporting did not move with it. A key outside `KNOWN_KEYS` in a `.cide/agents/` file is
+ * still a problem against that file's line, exactly as before; it is now *reported and kept*
+ * rather than reported and deleted.
  */
 export type AgentDraft = { 
 /**
@@ -217,7 +252,18 @@ worktree?: boolean,
  * racing the user's editor is a bad idea in a surface nobody opened for editing. A form the
  * user deliberately opened to change this file is the surface that was missing.
  */
-systemPrompt: string, };
+systemPrompt: string, 
+/**
+ * Every front-matter key cide does not model, in the order the file had them. (M30)
+ *
+ * See [`AgentExtra`] for why they are carried at all. Empty is the ordinary state of a
+ * `.cide/agents/` definition — cide defines that format, so a key outside
+ * `cide_agents::defs::KNOWN_KEYS` there is a *defect* and is reported as one against the
+ * file's line. It is still preserved, which is the change M30 made to the paragraph above:
+ * reporting a key and deleting it are different services, and cide now performs only the
+ * first.
+ */
+extras: Array<AgentExtra>, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -233,6 +279,39 @@ export type AgentDraftProblem = { field: AgentField, message: string, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 /**
+ * One front-matter key cide does not model, carried through a save untouched. (M30)
+ *
+ * # The whole point is that cide does not understand it
+ *
+ * A Claude Code subagent's front matter is **Claude's vocabulary**: `hooks`, `mcpServers`,
+ * `skills`, `maxTurns`, `disallowedTools`, `color`, `background`, `initialPrompt`, `memory`, and
+ * whatever a release adds next month. cide has no model for any of them, will never have a model
+ * for all of them, and is nonetheless being asked to write the file back after a user edits the
+ * description. Re-rendering only the keys cide knows would **delete somebody's `hooks:` block**,
+ * silently, in a committed file, as a side effect of fixing a typo.
+ *
+ * So an unmodelled key is neither dropped nor guessed at: it is kept, in the order the file had
+ * it, and written back verbatim. [`Self::value`] may therefore be **multi-line** — a nested
+ * block or a block sequence is carried as the raw source lines it occupied, because the one
+ * thing cide can honestly promise about YAML it does not parse is that it did not touch it.
+ *
+ * The form renders these as editable key/value rows, which is the other half of the decision:
+ * preserving a key the user cannot see would make the form lie about what the file contains.
+ */
+export type AgentExtra = { 
+/**
+ * The key, without its colon.
+ */
+key: string, 
+/**
+ * Everything after the colon, and — when the key opened a nested block or a block sequence —
+ * the lines under it too, joined with `\n` and with their original indentation intact.
+ */
+value: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
  * Which box on the form a refusal belongs to.
  *
  * The whole reason [`AgentDraftProblem`] is not a string. A save that answers "invalid" leaves
@@ -244,7 +323,7 @@ export type AgentDraftProblem = { field: AgentField, message: string, };
  * translation table, and adding a field to [`AgentDraft`] without a variant here is a field
  * whose refusals have nowhere to land.
  */
-export type AgentField = "scope" | "name" | "label" | "harness" | "description" | "model" | "effort" | "tools" | "permissionMode" | "maxConcurrent" | "systemPrompt";
+export type AgentField = "scope" | "name" | "label" | "harness" | "description" | "model" | "effort" | "tools" | "permissionMode" | "maxConcurrent" | "systemPrompt" | "extras";
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -412,8 +491,8 @@ export type AgentSaveOutcome = { "kind": "saved", path: string, roster: AgentRos
 /**
  * Which of the two directories a definition lives in.
  *
- * The two `cide_agents::defs::load_from` merges, named on the wire because **a form has to say
- * which file it is about**. The panel draws one `developer` row where two files may declare it
+ * The four directories `cide_agents::defs::load_from` merges, named on the wire because **a
+ * form has to say which file it is about**. The panel draws one `developer` row where two files may declare it
  * — a project definition shadowing a global one, which `LoadedAgent::shadows` exists to make
  * visible — so a save that guessed would edit whichever the guess landed on, and the user would
  * watch their change have no effect for the same reason shadowing costs an afternoon today.
@@ -422,8 +501,29 @@ export type AgentSaveOutcome = { "kind": "saved", path: string, roster: AgentRos
  * `Global` is how it stops being this repository's and becomes theirs, on every project they
  * open; there is no key in the file for that, because it *is* which directory the file is in.
  * So scope is a field of the draft and changing it is a move — see `cide_agents::defs::save`.
+ *
+ * # Two families, four directories
+ *
+ * The first two are cide's own. The second two are **Claude Code's** (M30): a subagent is the
+ * same idea in somebody else's format, documented at <https://code.claude.com/docs/en/sub-agents>,
+ * and the directories are already populated on the machines of people who have never opened
+ * cide. Reading them is not a translation layer bolted on — they merge into the one catalog
+ * through the one merge, because a role's identity is its name and two lists keyed by name
+ * would be two answers to "who is `reviewer`".
+ *
+ * What the families do *not* share is who owns the vocabulary. cide defines the keys in
+ * `.cide/agents/` and may refuse one it does not know; it defines none of the keys in
+ * `.claude/agents/` and must therefore preserve every one of them — see
+ * [`AgentDraft::extras`], which exists for exactly that reason.
  */
-export type AgentScope = "project" | "global";
+export type AgentScope = "project" | "global" | "claudeProject" | "claudeGlobal";
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * How far one artifact has got.
+ */
+export type ArtifactState = "done" | "skipped" | "ready" | "blocked";
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -858,6 +958,45 @@ submodule: boolean,
  * changelist they *would* join if staged, which is always the active one.
  */
 changelist: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One OpenSpec change, as its directory name under `openspec/changes/` — `add-dark-mode`. (M28)
+ *
+ * [`TaskId`]'s argument, arriving at the same answer from the other direction: this is a string
+ * **a person types and a model quotes**, in a task body, in a comment, on a command line
+ * (`openspec show add-dark-mode`), and as a directory name in a pull request. OpenSpec's own
+ * grammar for it is `^[a-z0-9]+(?:-[a-z0-9]+)*$` with a 200-character ceiling, which is a
+ * kebab-case identifier for exactly those reasons.
+ *
+ * Not validated here, for [`SpecId`]'s reason — and the check matters more than most, because
+ * this value reaches `Path::join`. `cide-tasks` refuses one that is not kebab before it can be
+ * written into `.cide/tasks.json`, and `cide-spec` refuses one before it can name a directory.
+ */
+export type ChangeName = string;
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One active change, as the board lists it.
+ */
+export type ChangeSummary = { name: ChangeName, 
+/**
+ * Ticked and total checkboxes across the change's tracked-tasks artifact.
+ *
+ * **`total == 0` does not mean "complete"**, it means the checklist has no tasks yet, and
+ * the two must never be rendered the same. The Review hop keys off exactly this pair and
+ * fires only on `total > 0 && completed == total`.
+ */
+completedTasks: number, totalTasks: number, 
+/**
+ * The CLI's own word for where the change is (`no-tasks`, `in-progress`, `complete`).
+ * Carried as a string rather than an enum: it is upstream's vocabulary, it can grow in a
+ * point release, and a variant cide has not heard of must render as itself rather than
+ * vanish into an `Unknown` arm.
+ */
+status: string, lastModified?: string, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -1951,6 +2090,13 @@ export type DefinitionAnswer = { "kind": "found", path: string, line: number, co
  * answer is not the useful one.
  */
 interfaceMethod: boolean, } | { "kind": "notFound" } | { "kind": "unavailable", reason: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What a delta does. OpenSpec's four operations, and the set is closed there.
+ */
+export type DeltaOperation = "added" | "modified" | "removed" | "renamed";
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -3056,6 +3202,8 @@ export type FormatAnswer = { "kind": "formatted", text: string,
  * never the resolved path: a user's Rust is formatted by "rust-analyzer" whether the
  * file on disk was `cide-rust-analyzer` or their own build, and which one ran is
  * already in `server::supervise`'s `resolved` log line where a bug report finds it.
+ * One exception: `"cide"` (`cide_core::format::BUILTIN_FORMATTER_NAME`), when the
+ * builtin road did the work — no binary ran, so there is no binary to name.
  */
 by: string, } | { "kind": "unchanged", by: string, } | { "kind": "unavailable", reason: string, };
 
@@ -3174,7 +3322,7 @@ export type Geometry = { cols: number, rows: number, cellWidth: number, cellHeig
  * is not an error the user should see as a failure — it is the guard bar, and the UI needs
  * to tell it apart from a genuine libgit2 failure without matching on prose.
  */
-export type GitError = { "kind": "notARepository", "detail": { path: string, } } | { "kind": "noSuchRepo", "detail": { repo: RepoId, } } | { "kind": "bare", "detail": { path: string, } } | { "kind": "noSuchProject", "detail": { project: string, } } | { "kind": "indexChangedExternally", "detail": { expected: string, actual: string, } } | { "kind": "staleSelection", "detail": { path: string, } } | { "kind": "partialRefused", "detail": { path: string, reason: PartialRefusal, } } | { "kind": "noSuchChange", "detail": { path: string, } } | { "kind": "patchRejected", "detail": { detail: string, patch: string, } } | { "kind": "conflicted", "detail": { paths: Array<string>, } } | { "kind": "operationInProgress", "detail": { operation: string, } } | { "kind": "nothingToCommit" } | { "kind": "unborn" } | { "kind": "noSuchChangelist", "detail": { id: string, } } | { "kind": "defaultChangelist" } | { "kind": "duplicateChangelist", "detail": { name: string, } } | { "kind": "noSuchShelf", "detail": { id: string, } } | { "kind": "noSuchStash", "detail": { index: number, } } | { "kind": "noSuchBranch", "detail": { name: string, } } | { "kind": "branchExists", "detail": { name: string, } } | { "kind": "invalidBranchName", "detail": { name: string, } } | { "kind": "branchNotMerged", "detail": { name: string, } } | { "kind": "branchIsCurrent", "detail": { name: string, } } | { "kind": "checkoutWouldOverwrite", "detail": { branch: string, paths: Array<string>, } } | { "kind": "notFastForward", "detail": { branch: string, ahead: number, behind: number, } } | { "kind": "pullNeedsStrategy", "detail": Divergence } | { "kind": "rebaseWouldDropMerges", "detail": { branch: string, commits: Array<PulledCommit>, } } | { "kind": "rebaseTooLong", "detail": { branch: string, ahead: number, limit: number, } } | { "kind": "unrelatedHistories", "detail": { branch: string, upstream: string, } } | { "kind": "notConflicted", "detail": { path: string, } } | { "kind": "stagesGone", "detail": { path: string, } } | { "kind": "noUpstream", "detail": { branch: string, } } | { "kind": "detachedHead", "detail": { head: string, } } | { "kind": "noRemote", "detail": { name: string, } } | { "kind": "fetch", "detail": { output: string, } } | { "kind": "push", "detail": { output: string, } } | { "kind": "notTracked", "detail": { path: string, } } | { "kind": "noSuchRevision", "detail": { rev: string, } } | { "kind": "noSuchCommit", "detail": { rev: string, } } | { "kind": "fileTooLarge", "detail": { path: string, bytes: bigint, limit: bigint, } } | { "kind": "notHead", "detail": { oid: string, head: string, } } | { "kind": "replayWouldConflict", "detail": { op: ReplayOp, oid: string, paths: Array<string>, } } | { "kind": "mergeNeedsMainline", "detail": { oid: string, parents: Array<PulledCommit>, } } | { "kind": "notAMerge", "detail": { oid: string, } } | { "kind": "emptyReplay", "detail": { op: ReplayOp, oid: string, } } | { "kind": "tagExists", "detail": { name: string, oid: string, } } | { "kind": "invalidTagName", "detail": { name: string, } } | { "kind": "badRevspec", "detail": { spec: string, detail: string, } } | { "kind": "notACommit", "detail": { spec: string, kind: string, } } | { "kind": "ambiguousRev", "detail": { spec: string, } } | { "kind": "staleLogCursor" } | { "kind": "io", "detail": { detail: string, } } | { "kind": "git", "detail": { detail: string, } } | { "kind": "sidecar", "detail": { path: string, detail: string, } };
+export type GitError = { "kind": "notARepository", "detail": { path: string, } } | { "kind": "noSuchRepo", "detail": { repo: RepoId, } } | { "kind": "bare", "detail": { path: string, } } | { "kind": "noSuchProject", "detail": { project: string, } } | { "kind": "indexChangedExternally", "detail": { expected: string, actual: string, } } | { "kind": "staleSelection", "detail": { path: string, } } | { "kind": "partialRefused", "detail": { path: string, reason: PartialRefusal, } } | { "kind": "noSuchChange", "detail": { path: string, } } | { "kind": "pathIgnored", "detail": { path: string, } } | { "kind": "nestedRepository", "detail": { path: string, } } | { "kind": "patchRejected", "detail": { detail: string, patch: string, } } | { "kind": "conflicted", "detail": { paths: Array<string>, } } | { "kind": "operationInProgress", "detail": { operation: string, } } | { "kind": "nothingToCommit" } | { "kind": "unborn" } | { "kind": "noSuchChangelist", "detail": { id: string, } } | { "kind": "defaultChangelist" } | { "kind": "duplicateChangelist", "detail": { name: string, } } | { "kind": "noSuchShelf", "detail": { id: string, } } | { "kind": "noSuchStash", "detail": { index: number, } } | { "kind": "noSuchBranch", "detail": { name: string, } } | { "kind": "branchExists", "detail": { name: string, } } | { "kind": "invalidBranchName", "detail": { name: string, } } | { "kind": "branchNotMerged", "detail": { name: string, } } | { "kind": "branchIsCurrent", "detail": { name: string, } } | { "kind": "checkoutWouldOverwrite", "detail": { branch: string, paths: Array<string>, } } | { "kind": "notFastForward", "detail": { branch: string, ahead: number, behind: number, } } | { "kind": "pullNeedsStrategy", "detail": Divergence } | { "kind": "rebaseWouldDropMerges", "detail": { branch: string, commits: Array<PulledCommit>, } } | { "kind": "rebaseTooLong", "detail": { branch: string, ahead: number, limit: number, } } | { "kind": "unrelatedHistories", "detail": { branch: string, upstream: string, } } | { "kind": "notConflicted", "detail": { path: string, } } | { "kind": "stagesGone", "detail": { path: string, } } | { "kind": "noUpstream", "detail": { branch: string, } } | { "kind": "detachedHead", "detail": { head: string, } } | { "kind": "noRemote", "detail": { name: string, } } | { "kind": "fetch", "detail": { output: string, } } | { "kind": "push", "detail": { output: string, } } | { "kind": "notTracked", "detail": { path: string, } } | { "kind": "noSuchRevision", "detail": { rev: string, } } | { "kind": "noSuchCommit", "detail": { rev: string, } } | { "kind": "fileTooLarge", "detail": { path: string, bytes: bigint, limit: bigint, } } | { "kind": "notHead", "detail": { oid: string, head: string, } } | { "kind": "replayWouldConflict", "detail": { op: ReplayOp, oid: string, paths: Array<string>, } } | { "kind": "mergeNeedsMainline", "detail": { oid: string, parents: Array<PulledCommit>, } } | { "kind": "notAMerge", "detail": { oid: string, } } | { "kind": "emptyReplay", "detail": { op: ReplayOp, oid: string, } } | { "kind": "tagExists", "detail": { name: string, oid: string, } } | { "kind": "invalidTagName", "detail": { name: string, } } | { "kind": "badRevspec", "detail": { spec: string, detail: string, } } | { "kind": "notACommit", "detail": { spec: string, kind: string, } } | { "kind": "ambiguousRev", "detail": { spec: string, } } | { "kind": "staleLogCursor" } | { "kind": "io", "detail": { detail: string, } } | { "kind": "git", "detail": { detail: string, } } | { "kind": "sidecar", "detail": { path: string, detail: string, } };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -4168,6 +4316,18 @@ export type LineRef = { hunk: number,
  * Index into [`DiffHunkView::lines`].
  */
 line: number, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One kind of edge between two tasks. (M30)
+ *
+ * Each directed kind is **stored in one canonical direction** and read the other way round at
+ * render time — [`Task::agent`]'s one-writer rule applied to edges. Storing both directions
+ * would mean two rows for one fact, and the first merge with a stale file where only one row
+ * survived would be a link that exists from one task and not from the other.
+ */
+export type LinkType = "related" | "blockedBy" | "subtaskOf";
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -7036,6 +7196,544 @@ export type SourceStatus = { "kind": "unavailable", reason: string, } | { "kind"
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 /**
+ * What accepting a change would do, before anybody presses anything. (M28)
+ *
+ * # Why a preview exists at all
+ *
+ * Because the gesture behind it is two irreversible things in a row — a merge into the branch
+ * the user has checked out, and a rewrite of `openspec/specs/`, which is what every later run
+ * reads as ground truth. `ConfirmDestructive`'s rule is that a *count* is not enough: the user
+ * is about to act on specific files and "3 requirements" is not something anyone can check. So
+ * this names them.
+ */
+export type SpecAcceptPlan = { change: ChangeName, 
+/**
+ * The branch that would be merged — `cide/<role>-<task>` — or `None` for a role that runs
+ * in the checked-out tree (`worktree: false`), where there is nothing to merge.
+ *
+ * `None` is **not** a refusal, and the preview has to say so plainly, or a user will read a
+ * missing step as a step that was silently skipped.
+ */
+branch?: string, completedTasks: number, totalTasks: number, 
+/**
+ * The capability files `archive` would rewrite, and what it would do to each.
+ */
+specsTouched: Array<SpecTouch>, 
+/**
+ * Empty means the gesture will go through. Non-empty is the list of sentences to draw
+ * instead of the button, each naming what to do next.
+ */
+refusals: Array<string>, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What accepting actually did.
+ *
+ * Four arms, and three of them are ordinary outcomes rather than errors — which is the point:
+ * a conflict is a list of paths to go and look at, and a refusal is a sentence with a next
+ * action in it. Only a genuinely broken call is an `Err`.
+ */
+export type SpecAccepted = { "kind": "accepted", 
+/**
+ * `None` when there was no branch to merge — a `worktree: false` role.
+ */
+commit?: string, files: number, change: ChangeName, } | { "kind": "refused", plan: SpecAcceptPlan, } | { "kind": "conflicts", paths: Array<string>, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One of a change's artifacts, and where it actually is.
+ */
+export type SpecArtifact = { 
+/**
+ * The schema's id for it — `proposal`, `design`, `tasks`, `specs`.
+ */
+id: string, 
+/**
+ * What the schema says it generates, which may be a glob.
+ */
+generates: string, state: ArtifactState, 
+/**
+ * The files that exist for it, absolute.
+ *
+ * **This is the only way a filename is learned.** The artifact set is schema-driven, so
+ * `proposal.md` is a default and not a guarantee; anything that hard-coded it would break
+ * on the first project with a custom schema, and break by looking at the wrong file rather
+ * than by failing.
+ */
+existing: string[], };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One artifact's rules.
+ *
+ * `artifact` is a free string and not an enum, and that is load-bearing: a workflow schema
+ * declares its own artifacts with `generates` globs, so `rules:` may perfectly legally name one
+ * cide has never heard of. `cide_spec::config::DEFAULT_ARTIFACTS` exists so a form has something
+ * to *offer*; neither the reader nor the writer consults it, and neither does this.
+ */
+export type SpecArtifactRules = { artifact: string, rules: Array<string>, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One artifact file's text, and whether it is all of it.
+ *
+ * `truncated` is carried rather than inferred so the section can say so. A panel that showed
+ * three quarters of a design document with nothing on screen saying it had stopped would be a
+ * silent lie of exactly the kind this codebase keeps writing guards against — and the reader
+ * would blame the document.
+ */
+export type SpecArtifactText = { text: string, truncated: boolean, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What cide can say about a project's `openspec/` right now.
+ *
+ * Three shapes rather than an empty list, on [`crate::TaskBoard`]'s argument: an empty board
+ * cannot distinguish "this project does not use OpenSpec", "the tool that reads it is not
+ * installed" and "it is set up and there is nothing in flight", and those are three different
+ * screens with three different next actions.
+ *
+ * # Why `Absent` is decided by cide and not by the CLI
+ *
+ * It has to be. `openspec list --json` in a directory with no `openspec/` exits **0** with an
+ * empty list and `root.source: "implicit"` — indistinguishable, from the exit code alone, from
+ * a project that is set up and has proposed nothing. Worse, the CLI's root resolution *walks
+ * ancestors*, so a directory nested inside a repository that does have one will happily report
+ * the parent's board. `cide-spec` therefore stats the directory itself and pins the resolved
+ * root against the directory it asked about; see its `NoRoot` error.
+ */
+export type SpecBoard = { "kind": "absent", hint: string, path: string, } | { "kind": "unusable", reason: string, } | { "kind": "ready", changes: Array<ChangeSummary>, specs: Array<SpecSummary>, 
+/**
+ * The directory the CLI resolved, echoed so the panel can prove it is this project's.
+ */
+root: string, 
+/**
+ * Which of OpenSpec's own workflow commands this project has, and the line that runs
+ * each — see [`SpecCommand`]. Empty is a real state and not an error: a project can
+ * have an `openspec/` and no Claude Code surface at all.
+ */
+commands: Array<SpecCommand>, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Everything the card shows about one change.
+ */
+export type SpecChange = { name: ChangeName, 
+/**
+ * What the CLI calls it, which for a change with no explicit title is its own name.
+ */
+title: string, 
+/**
+ * The prose is **not** here, and that is a fact about the CLI rather than a choice.
+ *
+ * `openspec show <change> --json` carries the change's *deltas* and nothing of its
+ * proposal or design — those are files, and cide reads them on demand through
+ * `spec_artifact`. Which is the right shape anyway: the panel draws those sections
+ * collapsed, so fetching a document nobody has expanded would be a file read per board
+ * refresh for prose nobody is looking at.
+ */
+deltas: Array<SpecDelta>, 
+/**
+ * The change's artifacts, with the paths the CLI resolved for them.
+ */
+artifacts: Array<SpecArtifact>, progress: SpecProgress, 
+/**
+ * The strict-validation verdict at the moment this was read.
+ *
+ * Meaningless for an archived change and set to *valid with no issues* there — see
+ * [`SpecOrigin::Archived`], which every surface checks first.
+ */
+validation: SpecValidation, 
+/**
+ * Which of the two directories this was read from, and by which route.
+ */
+origin: SpecOrigin, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One of OpenSpec's workflow commands, as this project can actually invoke it.
+ *
+ * # Why the invocation is carried and not derived
+ *
+ * Because it has changed under cide once already, silently, and it will change again. OpenSpec
+ * installed its workflow as **slash commands** in `.claude/commands/opsx/`, so `propose` was
+ * `/opsx:propose` and cide spelled that prefix out in nine places. Somewhere before 1.7 the CLI
+ * moved the same workflow to **Claude Code skills** — `.claude/skills/openspec-propose/SKILL.md`,
+ * invoked as `/openspec-propose` — and every one of those nine places became a name no project
+ * has. The panel's buttons then refused with a sentence telling the user to run `openspec
+ * update`, which on a current CLI answers *"all tools up to date"* and writes nothing: a
+ * dead end, in cide's own words, for a project that was set up correctly.
+ *
+ * So `name` is cide's own handle for the command (`propose`) — stable, used by
+ * `spec_run_command` and by the panel's buttons — and `line` is what a *this* project types,
+ * read from its directory. A third surface costs one arm in `cide_spec::claude` and nothing
+ * anywhere else.
+ *
+ * # Why the panel is given the line rather than trusted with it
+ *
+ * It draws the line as a preview under the composer, and a preview that differed from what is
+ * sent would be its own small lie. `spec_run_command` still resolves `name` against the
+ * directory itself and never types a string the frontend handed it — the wire carries this so
+ * the two agree, not so one of them can be told what to do.
+ */
+export type SpecCommand = { 
+/**
+ * cide's handle: `propose`, `explore`. Kebab, and never carries a surface's prefix.
+ */
+name: string, 
+/**
+ * What to type, prefix and all: `/openspec-propose`, or `/opsx:propose` on a project set up
+ * by an older CLI.
+ */
+line: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * A project's OpenSpec configuration, as far as cide's reader understands it.
+ *
+ * # Why nothing here is filled in with a default
+ *
+ * `schema` stays `None` when the file states no schema, exactly as `cide_spec::config::Config`
+ * keeps it — and [`Self::default_schema`] is carried *beside* it rather than substituted into
+ * it. A form that showed `spec-driven` in both cases could not tell "unstated" from "stated,
+ * and happens to be the default", and pressing Save would then add a line to a committed file
+ * that nobody asked for. The round-trip guarantee `cide_spec::config` makes — writing a value
+ * back unchanged changes no byte — only survives if the value being written back is the one the
+ * file actually states.
+ */
+export type SpecConfig = { 
+/**
+ * The workflow schema id the file states, or `null` when it states none.
+ */
+schema: string | null, 
+/**
+ * What an unstated `schema:` means — `cide_spec::config::DEFAULT_SCHEMA`.
+ *
+ * On the wire rather than typed into TypeScript because it is the *CLI's* default, not
+ * cide's, and a second copy in the frontend is one that goes stale in silence the day
+ * OpenSpec ships a different one. The select shows it as the resolved value.
+ */
+defaultSchema: string, 
+/**
+ * Free prose injected into every artifact-generation prompt, newlines and all.
+ *
+ * The high-value field: everything an agent is told about this project's stack and
+ * conventions when it writes a proposal, a design or a spec comes from here.
+ */
+context: string | null, 
+/**
+ * Per-artifact rules, in the order the file states them.
+ *
+ * Ordered `Vec`s and not maps, for [`Self::operations`] too: document order is what the file
+ * says and what the form should show. A map would alphabetise a list the user chose the
+ * order of, and the write path splices lines back where it found them.
+ */
+rules: Array<SpecArtifactRules>, 
+/**
+ * Per-operation guidance, in the order the file states them.
+ */
+operations: Array<SpecOperationGuidance>, 
+/**
+ * `<root>/openspec/config.yaml`, absolute.
+ *
+ * Carried because the form deliberately shows **less** than the file holds. `openspec init`
+ * writes 922 bytes of which roughly eight hundred are comments, and those comments are the
+ * only documentation `context`, `rules` and `operations` have anywhere. A form that hid them
+ * with no way through to the file would be hiding instructions, so the surface links to this
+ * path and opens it in an editor tab.
+ */
+path: string, 
+/**
+ * Whether that file exists.
+ *
+ * A missing file reads as an empty config and is deliberately **not** an error — see
+ * `cide_spec::config::read` — so nothing else in this struct can distinguish "there is no
+ * config" from "there is a config that states nothing", and those two want different words
+ * above the same form.
+ */
+exists: boolean, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One change to make to `openspec/config.yaml`.
+ *
+ * The wire twin of `cide_spec::config::Edit`, and a `Vec` of these is what one Save sends. Four
+ * separate commands would be four reads, four validations and four atomic renames of one
+ * committed file for a single gesture — four chances to lose a race with an agent holding the
+ * same file, and up to four commits' worth of mtime churn. `config::apply` takes the whole slice
+ * and writes once, or, when every value already reads that way, not at all.
+ */
+export type SpecConfigEdit = { "kind": "schema", schema: string, } | { "kind": "context", context: string | null, } | { "kind": "rules", artifact: string, rules: Array<string>, } | { "kind": "operationGuidance", operation: string, guidance: Array<string>, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What one delta file does to one capability.
+ */
+export type SpecDelta = { spec: SpecId, operation: DeltaOperation, description: string, 
+/**
+ * The requirements this delta carries.
+ *
+ * **One vector, where the CLI has two spellings.** Its JSON carries `requirement` for a
+ * single one and `requirements` for a list, and both mean the same thing; `cide-spec`
+ * folds them here. Two spellings of one fact reaching the frontend would be two code paths
+ * in a renderer, and the one that is exercised less would rot.
+ */
+requirements: Array<SpecRequirement>, 
+/**
+ * Set only for [`DeltaOperation::Renamed`].
+ */
+rename?: SpecRename, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One OpenSpec capability, as its directory path under `openspec/specs/` — `user-auth`, or
+ * `identity/user-auth` where a project nests them. (M28)
+ *
+ * A path and not a flat name, because OpenSpec's own schema says so: a proposal's Capabilities
+ * section names `<capability-path>`, and the delta a change writes must sit at the *same* path
+ * under its own `specs/`. Flattening `identity/user-auth` to `user-auth` here would make two
+ * capabilities in different domains one id, and the archive that merged them would silently
+ * write one capability's requirements into the other's file.
+ *
+ * Deliberately not validated here, exactly as [`AgentId`] and [`MarketplaceId`] are not. This
+ * crate is the wire shape; `cide-spec` is where a name is checked, because that is the layer
+ * that knows the path to name in the refusal.
+ */
+export type SpecId = string;
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One validation complaint, in the shape the Problems panel already draws.
+ */
+export type SpecIssue = { 
+/**
+ * `ERROR`, `WARNING`, `INFO` — upstream's spelling, for [`ChangeSummary::status`]'s reason.
+ */
+level: string, 
+/**
+ * Where in the document, as the validator names it.
+ */
+path: string, message: string, line?: number, column?: number, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One operation's guidance — `apply` or `archive`.
+ */
+export type SpecOperationGuidance = { operation: string, guidance: Array<string>, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Where a [`SpecChange`] came from. (M28)
+ *
+ * # Why an archived change is a different kind of answer, not a missing one
+ *
+ * `openspec archive` **moves** a change to `openspec/changes/archive/<YYYY-MM-DD>-<name>/` and
+ * merges its deltas into the specs. The directory survives intact — proposal, design, checklist
+ * and delta files, all of it — but no CLI command reads it: `show` resolves
+ * `openspec/changes/<name>/proposal.md` and nothing else, so an archived change answers
+ * *not found*. A task linked to one therefore rendered as a failure ("could not be read, it may
+ * have been archived") from the moment the work was accepted, which is precisely the moment its
+ * record matters most.
+ *
+ * So cide reads the directory itself, and this field is the honest label on what comes back: the
+ * deltas are recovered with the same byte-range scanner the write path uses, and the two fields
+ * no directory listing can answer — [`SpecChange::progress`] and [`SpecChange::validation`] —
+ * carry neutral values that **no surface may draw** for this arm. A progress bar over `0/0` on a
+ * change that is finished, or a green *valid* nobody validated, would each be a worse lie than
+ * the refusal this replaced.
+ */
+export type SpecOrigin = { "kind": "active" } | { "kind": "archived", 
+/**
+ * The directory's own name, date stamp and all — the only place it is recoverable, and
+ * what a user needs to find the files on disk.
+ */
+folder: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * A change's checklist, as data.
+ */
+export type SpecProgress = { tasks: Array<SpecTask>, total: number, completed: number, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * A rename, `FROM:`/`TO:`.
+ */
+export type SpecRename = { from: string, to: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One requirement: its text, and the scenarios that make it testable.
+ */
+export type SpecRequirement = { 
+/**
+ * The name off the `### Requirement: <name>` header, which is what the archive matches on.
+ *
+ * **Read from the delta file, not from the CLI's JSON**, which does not carry it: a
+ * requirement's `text` there has already had its header folded away. See
+ * `cide_spec::block::parse` for the whole argument — the short version is that the name is
+ * how an edit addresses a block, so it has to come from the same scanner the writer uses.
+ */
+name: string, 
+/**
+ * The requirement's prose — everything between the header and the first scenario, as
+ * written.
+ */
+text: string, scenarios: Array<SpecScenario>, 
+/**
+ * The whole block, header included, exactly as it is in the file.
+ *
+ * This is what the editor edits and what `spec_requirement_set` replaces. Carried verbatim
+ * rather than recomposed from the fields above, because recomposing is lossy in a way
+ * nobody would notice until a diff: a requirement whose prose the user never touched would
+ * come back reflowed, and the blank lines, the indentation and any markup the fields do not
+ * model would be silently normalised away.
+ */
+block: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Set one requirement block in one delta file. (M28)
+ *
+ * Inbound, so `deny_unknown_fields`: a field the frontend sends that Rust has since renamed must
+ * be a refusal the developer sees, not a value silently dropped.
+ */
+export type SpecRequirementSet = { project: ProjectId, change: ChangeName, spec: SpecId, operation: DeltaOperation, 
+/**
+ * The requirement to replace, by the name on its header.
+ */
+requirement: string, 
+/**
+ * The whole replacement block, `### Requirement:` header included.
+ */
+block: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One `#### Scenario:` section of a requirement.
+ */
+export type SpecScenario = { 
+/**
+ * The title off its `#### Scenario: <title>` header.
+ *
+ * Also absent from the CLI's JSON — a scenario's `rawText` is its body alone — and also
+ * recovered from the file. A card that showed scenarios with no titles would be showing a
+ * reviewer a list of WHEN/THEN bullets with nothing saying what each one is a case *of*.
+ */
+title: string, 
+/**
+ * Everything under the header, as written.
+ */
+body: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One workflow schema the CLI offers.
+ *
+ * # Why this is not `Vec<String>`
+ *
+ * Because `openspec schemas --json` answers with the artifacts each schema declares, and the
+ * artifact list is exactly the thing cide is forbidden to assume. `cide_spec::config`'s
+ * `DEFAULT_ARTIFACTS` is documented as "a default and **not** a closed set — the schema decides",
+ * so a rules editor that offered four hard-coded rows would be offering the wrong ones for any
+ * project on a schema it did not ship with, with nothing on screen to say so. Taking the
+ * artifacts from the same document that names the schema is the only version of this that stays
+ * true when somebody installs a custom schema.
+ */
+export type SpecSchema = { 
+/**
+ * The id, as `schema:` would spell it.
+ */
+name: string, 
+/**
+ * One line, the CLI's own words, or `null` when it gave none.
+ */
+description: string | null, 
+/**
+ * The artifacts this schema generates, in workflow order.
+ */
+artifacts: Array<string>, 
+/**
+ * `package`, `project`, … — where the schema came from, in the CLI's spelling.
+ *
+ * Upstream's word rather than an enum, for [`ChangeSummary::status`]'s reason: it is shown
+ * and never branched on, and a fifth source arriving must not be a parse failure.
+ */
+source: string | null, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What an [`TabKind::OpenSpec`] tab is looking at. (M28)
+ *
+ * Carries the id and nothing else. The page reads everything it draws through `spec_change` /
+ * `spec_spec` — deliberately, because a change's contents move while an agent works on it, and
+ * a tab that had cached its own copy would be a second, staler answer than the panel's.
+ */
+export type SpecSubject = { "kind": "change", change: ChangeName, } | { "kind": "capability", spec: SpecId, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One capability under `openspec/specs/`, as the board lists it.
+ */
+export type SpecSummary = { id: SpecId, requirementCount: number, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One `- [ ]` line.
+ */
+export type SpecTask = { done: boolean, description: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One capability an archive would change.
+ */
+export type SpecTouch = { spec: SpecId, operation: DeltaOperation, requirements: number, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What `openspec validate --strict` said.
+ */
+export type SpecValidation = { valid: boolean, issues: Array<SpecIssue>, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What writing a requirement block did.
+ *
+ * Three arms rather than `Result<(), String>`, because two of the three failures are *states the
+ * panel draws differently*: a regression has issues to show against the fields that caused them,
+ * and a conflict has a file somebody else is holding and a Reload to offer.
+ */
+export type SpecWriteOutcome = { "kind": "written", change: SpecChange, path: string, } | { "kind": "regressed", issues: Array<SpecIssue>, } | { "kind": "conflicted", path: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
  * One interior node of a pane tree; carries the split ratio.
  */
 export type SplitId = string;
@@ -7048,7 +7746,7 @@ export type SplitId = string;
  * This enum *is* the multiplexing model: "one session but splittable" resolves as one
  * **primary** session plus panes that each declare what they want.
  */
-export type SplitIntent = { "kind": "newClaude" } | { "kind": "forkPrimary" } | { "kind": "mirror", session: SessionId, } | { "kind": "shell" };
+export type SplitIntent = { "kind": "newClaude" } | { "kind": "forkPrimary" } | { "kind": "mirror", session: SessionId, } | { "kind": "resume", session: SessionId, } | { "kind": "shell" };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -7329,7 +8027,7 @@ dirty: boolean, } | { "kind": "settings", section: SettingsSection, } | { "kind"
 /**
  * What the extension calls itself. See the note above.
  */
-name: string, };
+name: string, } | { "kind": "openSpec", subject: SpecSubject, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -7402,6 +8100,87 @@ body: string, status: TaskStatus,
  * with nothing anywhere in a position to correct it — the run that would have known is gone.
  */
 agent: AgentId | null, 
+/**
+ * The live Claude session this task's work was handed to, if it went to one. (M28)
+ *
+ * # Why this is a second field and not a widened [`Self::agent`]
+ *
+ * Because a role and a session are different kinds of thing with different id spaces —
+ * `AgentId` is a name a file in `.cide/agents/` gives itself, a [`SessionId`] is the uuid
+ * cide passes to `claude --session-id` — and because of what keying them apart buys.
+ *
+ * **Only one of the two is ever set.** `TaskStore::edit` clears the other on every write, so
+ * "who is on this" stays one fact with one writer; the card reads whichever is present.
+ *
+ * **And the auto-dispatch trigger fires on `agent` alone.** That is the whole of why
+ * handing a task to an open session cannot start it twice: assigning a *role* is a dispatch
+ * gesture (`cide_agents::autodispatch`'s assignment edge), and this field is not one, so a
+ * session target is structurally incapable of also spawning a subagent. It is not a check
+ * that could be forgotten — there is no code path from here into the queue.
+ *
+ * `#[serde(default)]`, on [`Self::history`]'s posture: `.cide/tasks.json` is committed, and
+ * a build that refused last week's file over a field it added would be the tracker locking
+ * the team out of its own repository. Absent means the task went to a role, or nowhere.
+ *
+ * **Not a claim that the session still exists.** A conversation the user closed leaves this
+ * pointing at nothing, exactly as [`Self::agent`] can name a role whose file was deleted;
+ * the panel resolves it against what is live and says so when it cannot, which is
+ * `agentChip`'s rule one layer up.
+ */
+session?: SessionId, 
+/**
+ * The OpenSpec change this task implements, if any — the folder name under
+ * `openspec/changes/`. (M28)
+ *
+ * # Why this one is a field, when six others are not
+ *
+ * The header above lists what a task deliberately does not carry, and every one of them is
+ * cut by the same test: *a field an agent must be taught to fill and a column the panel must
+ * draw, and neither changes what anybody does next.* This passes that test three times over,
+ * which is why it is here and `priority` is not. It changes what a dispatched run **reads**
+ * — `spec_preamble` points it at this change's proposal, design and checklist. It changes
+ * what the panel **draws** — a progress bar off that checklist, the delta as requirement
+ * cards, a validity badge. And it changes what accepting the task **does** — integrate, then
+ * archive this change, then `Done`. A task without it takes none of those paths and renders
+ * exactly as it did before this field existed.
+ *
+ * **It is the change this task belongs to, never "the change an agent is currently on".**
+ * [`Self::agent`]'s argument, restated for the same reason: one writer for one fact. What a
+ * live run is working through is `AgentRun::task` followed to this field, derived at render
+ * time and stored nowhere.
+ *
+ * `#[serde(default)]`, on [`Self::history`]'s posture and for its stated reason — and note
+ * that this does **not** bump [`TaskFile::CURRENT_SCHEMA`]: an additive field with a default
+ * is not a shape change, because every file that already exists still means exactly what it
+ * said.
+ *
+ * Not validated here — this crate is the wire shape. `cide-tasks` refuses a name that is not
+ * OpenSpec's kebab grammar before it can reach the file, because this value ends up in a
+ * `Path::join`.
+ */
+change?: ChangeName, 
+/**
+ * Typed edges to other tasks — this task's own gestures only. (M30)
+ *
+ * # Why this one is a field, when the header cut it twice
+ *
+ * The module header carries the reversal at length. The short form, against the same
+ * three-part test [`Self::change`] passed: a [`LinkType::BlockedBy`] edge changes what a
+ * run **reads** (the blocking pair rides `cide_task_list`), what the panel **draws** (a
+ * chip on both cards), and what dispatch **does** (auto-dispatch skips a blocked task and
+ * an explicit dispatch of one is refused, naming the blocker).
+ *
+ * **Each edge is stored once, on its canonical side** — see [`LinkType`] — and the other
+ * task's reading (`blocks`, `subtask`) is derived at render from the whole board, which
+ * every consumer already holds. Entries may be tombstoned ([`TaskLink::deleted`]) and may
+ * dangle after the target is deleted; both are legal states of the *file*, refused only as
+ * *gestures* — `cide-tasks`' `validate` doc says why the difference matters.
+ *
+ * `#[serde(default)]`, on [`Self::history`]'s posture and for its stated reason — and, as
+ * with [`Self::change`], no [`TaskFile::CURRENT_SCHEMA`] bump: an additive field with a
+ * default is not a shape change.
+ */
+links: Array<TaskLink>, 
 /**
  * Oldest first, which is the order the panel renders and the order an agent reads.
  */
@@ -7521,11 +8300,24 @@ export type TaskComment = {
  */
 id: CommentId, author: TaskAuthor, 
 /**
- * The text, verbatim.
+ * The text, verbatim. **Markdown**, since M27.
  *
- * **Never rendered as markup.** It is model-authored, and rendering model-authored markup
- * inside the IDE's own chrome is an injection surface bought for nothing at a 320px panel
- * width. `TasksPanel` draws it as text with whitespace preserved.
+ * This said "never rendered as markup" until M31, and by then it had been wrong for a
+ * milestone: `TaskMarkdown.tsx` renders it. The refusal it recorded was about a *road*, not
+ * about markup — `string -> HTML string` into `dangerouslySetInnerHTML`, model-authored, in
+ * the IDE's own chrome. That road is still not taken. The parser produces no HTML node of
+ * any kind, every string reaches the DOM as a React child through React's escaping, and a
+ * link is drawn as accented text that activates nothing; `TaskMarkdown.tsx`'s header carries
+ * the whole argument and `check:markdown` asserts the parser can never invent such a node.
+ *
+ * Leaving the stale sentence here was not free. It was mirrored into the MCP input schema
+ * (`cide_agents::tools`), so every agent was told in the tool it was about to call that its
+ * report would not be formatted — and wrote one flat paragraph, which is exactly what the
+ * card then drew. A comment is read by a person; the wording an agent is handed here is the
+ * thing that decides whether it is readable.
+ *
+ * One dialect note: the card parses with `softBreak: 'break'`, so a lone newline is a line.
+ * A comment is a message, not a `.md` file — the markdown *preview* keeps CommonMark.
  */
 text: string, 
 /**
@@ -7593,7 +8385,7 @@ deleted: boolean, };
  * from no code path, and whose handling arm would have minted a pane showing nothing. Add it
  * with the gesture, in the same commit.
  */
-export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, };
+export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "setSession", session: SessionId | null, } | { "kind": "setChange", change: ChangeName | null, } | { "kind": "link", link: LinkType, target: TaskId, } | { "kind": "unlink", link: LinkType, target: TaskId, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -7663,6 +8455,52 @@ export type TaskId = string;
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 /**
+ * One stored edge between two tasks, on the source task only. (M30)
+ *
+ * Unlike a [`TaskStatusChange`], an edge is **mutable** — unlink exists — so it carries the two
+ * fields that let it survive the out-of-process merge: a tombstone and a stamp. There is
+ * deliberately **no `LinkId`**: a comment needed a uuid because edits change its text while its
+ * identity must persist, but an edge *is* its `(link, target)` pair — there is nothing else to
+ * it — so the pair is the merge identity and a minted id would be a second name for the same
+ * fact, with all of [`TaskFile::tasks`]' two-identities hazard.
+ */
+export type TaskLink = { link: LinkType, 
+/**
+ * The other task. Never validated against existence *here* — `cide-tasks` refuses a target
+ * that does not exist at the gesture, but a target deleted afterwards leaves the edge
+ * dangling and legal, because ids are never reused (see [`TaskId`]) and so a dangling edge
+ * can never silently come to mean new work. Renderers mark it; nothing prunes it.
+ */
+target: TaskId, 
+/**
+ * A tombstone — but unlike [`TaskComment::deleted`] it is a **toggle**, not one-way.
+ * A deleted comment is replaced by writing a new comment under a new id; re-linking the
+ * same `(link, target)` pair recreates the *same* key, so "deleted wins for ever" would
+ * make an unlink permanent after any merge. The stamp below is what resolves the toggle;
+ * `cide_tasks::union_links` carries the argument.
+ */
+deleted: boolean, 
+/**
+ * Stamped by Rust when the link or unlink lands, for [`TaskComment::at_unix_ms`]'s reason —
+ * and load-bearing beyond display: per `(link, target)` key, the merge keeps the copy with
+ * the newer stamp.
+ */
+atUnixMs: bigint, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One edge named at task creation. Inbound. (M30)
+ *
+ * No tombstone and no stamp — those are the store's to write, for the same reason a comment's
+ * timestamp is: a stamp supplied by whoever is writing is a stamp an agent can get wrong, and
+ * this one decides a merge.
+ */
+export type TaskLinkSpec = { link: LinkType, target: TaskId, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
  * A new task. Inbound.
  */
 export type TaskNew = { project: ProjectId, 
@@ -7698,7 +8536,25 @@ agent?: AgentId,
  * and `TaskSink::create` has no such parameter, so the MCP path cannot express one. It is
  * not a check that could be forgotten; it is a signature.
  */
-status?: TaskStatus, };
+status?: TaskStatus, 
+/**
+ * The OpenSpec change this task implements, if it is known at creation. (M28)
+ *
+ * Set at creation and not in a follow-up edit, which matters more than it looks: the
+ * auto-dispatch trigger reads the task the mutation *left behind*, so a create-then-link
+ * would dispatch a run from a task that did not yet name its change, and the run would be
+ * told nothing about the checklist it was started for.
+ */
+change?: ChangeName, 
+/**
+ * Edges known at creation. Absent means none. (M30)
+ *
+ * Here for [`Self::change`]'s exact reason, with a sharper edge: a creation naming an
+ * assignee dispatches, and the trigger reads the task the mutation left behind — so
+ * create-then-link would dispatch a run from a task whose `blockedBy` did not exist yet,
+ * and the one interleaving the gate exists for is the one it could never see.
+ */
+links?: Array<TaskLinkSpec>, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 

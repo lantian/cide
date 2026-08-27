@@ -35,6 +35,9 @@ cide-ext = { workspace = true }
 # crate supplies the thread it deliberately does not own and the `AppHandle` it must not know
 # about. See `crate::tasks_state`.
 cide-tasks = { workspace = true }
+# M28's CLI adapter: `openspec/` read through the `openspec` binary. Linked here for the commands
+# and the watcher route; `cide-headless` links it too, which is what keeps it tauri-free.
+cide-spec = { workspace = true }
 # M18: the `cide_task_*` MCP vocabulary — names, schemas and handlers over a `TaskSink`. This
 # crate supplies the socket (`crate::agent_rpc`) and the sink; the vocabulary itself has exactly
 # one definition and is not in the `cide-hook` bridge, which is a dumb pipe.

@@ -46,20 +46,23 @@ import { TasksPanelView } from './TasksPanel'
 import { TaskDetail } from './TaskDetail'
 import { TaskCompose } from './TaskCompose'
 import { MentionList } from './MentionTextarea'
+import { LinkTargetList } from './LinkTargetInput'
 import {
   CARD_STORIES,
   COMPOSE_STORIES,
+  LINK_TARGET_STORIES,
   MENTION_STORIES,
   TASKS_STORIES,
   type CardStoryName,
   type ComposeStoryName,
+  type LinkTargetStoryName,
   type MentionStoryName,
   type TasksStoryName,
 } from './fixture'
 
 /** What the check script asserts on. */
 export interface TasksDigest {
-  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName
+  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName | LinkTargetStoryName
   /** The header's right-hand figure. Empty when `metaFigure` withheld it. */
   meta: string
   claim: string | null
@@ -175,6 +178,7 @@ export interface TasksDigest {
   openRows: string[]
   /** Whether the live-run strip is drawn. */
   runStrip: boolean
+  runStripSpin: boolean | null
   /** The status filter's toggles, in the order drawn: `<label>|<on>`. Empty when not drawn. */
   filters: string[]
   /** Whether the search box is on screen, and what is typed in it. */
@@ -232,6 +236,58 @@ export interface TasksDigest {
     fences: number
     links: number
   }
+  /**
+   * The OpenSpec block: `null` when the card draws none, otherwise its `data-state`. (M28)
+   *
+   * Three states, and the two that are not `ready` had no coverage at all — which is how `null`
+   * came to render as *nothing*, on a card whose own prop doc said it drew a pending row.
+   */
+  specBlock: string | null
+  /** The dispatch action at the foot of the card: its id, and whether it is live. */
+  specPrimary: string | null
+  specPropose: boolean
+  specBusyMark: 'spinning' | 'static' | null
+  specBarPct: string | null
+  specDeltas: string[]
+  specValidity: string | null
+  specProgressLabel: string | null
+  /** Its options, by kind, when the picker is open. */
+  dispatchKinds: string[]
+  /** Does the unarmed Delete carry the danger colour? */
+  deleteDanger: boolean
+  /** The `openspec: <change>` chip's change, or `null`. */
+  specChip: string | null
+  /** The session row's `data-state`, or `null` when there is no row. (M28) */
+  specSession: string | null
+  /** Its two controls, by hook, in document order. */
+  specSessionControls: string[]
+  /** The primary action's id, or `null` when the bar draws no button at all. */
+  specAction: string | null
+  /**
+   * The card's link chips, in the order drawn: `<kind>|<direction>|<target>|<gone>`. (M30)
+   *
+   * Both discriminators beside the target, `chipTone`'s reason one section up: the derived
+   * incoming reading and the dangling mark are each their own claim, and a digest carrying only
+   * the target could not tell "Blocks t-41" from "blocked by t-41" — which is the difference
+   * between holding work up and being held up.
+   */
+  linkChips: string[]
+  /** How many link removes are drawn. Never on a derived *directed* chip — that edge is the
+   *  other task's, and the chip itself is the road there. */
+  linkRemoves: number
+  /** Form controls inside the card's add-link picker. `0` at rest; the two selects when open.
+   *  Deliberately outside `fieldControls`, whose read-only-at-rest claim must stand untouched. */
+  linkAddControls: number
+  /** Whether the compose dialog draws the links row at all — only with the `tasks` prop. (M30) */
+  composeLinkRow: boolean
+  /** The draft's picked links, as `<kind>|<target>`. */
+  composeLinkChips: string[]
+  /**
+   * The link-target search popup's rows: `<id>|<title>|<status>|<aria-selected>`, in the order
+   * drawn — which is the model's tier order, so the digest is what pins "the key reaches by
+   * prefix and the summary by word" in markup rather than only in the pure drive. (M30)
+   */
+  linkTargetRows: string[]
   /** See the Agents digest: hooked-but-unstyled elements, plus `class` lists carrying
    *  the literal token `undefined`. */
   unclassed: number
@@ -250,11 +306,14 @@ const digests: TasksDigest[] = [
   ...(Object.keys(MENTION_STORIES) as MentionStoryName[]).map((story) =>
     digest(story, renderToStaticMarkup(<MentionList {...MENTION_STORIES[story]} />)),
   ),
+  ...(Object.keys(LINK_TARGET_STORIES) as LinkTargetStoryName[]).map((story) =>
+    digest(story, renderToStaticMarkup(<LinkTargetList {...LINK_TARGET_STORIES[story]} />)),
+  ),
 ]
 console.log(JSON.stringify(digests))
 
 function digest(
-  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName,
+  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName | LinkTargetStoryName,
   html: string,
 ): TasksDigest {
   /*
@@ -344,6 +403,17 @@ function digest(
       .filter((row) => attr(row, 'data-open') === 'true')
       .map((row) => attr(row, 'data-task')),
     runStrip: html.includes('data-audit="tasksRunStrip"'),
+    /**
+     * Does the run strip's phase mark carry the class that turns it? `null` when there is no
+     * strip.
+     *
+     * By the **class**, not the icon name: the arc was drawn correctly and animated nowhere, so
+     * a name-only check passed a static spinner for a milestone and a half. See
+     * `AgentsPanel/model.ts::SPINNING_GLYPH`.
+     */
+    runStripSpin: ((f) => (f === undefined ? null : /Spin/.test(f)))(
+      html.match(/<div[^>]*data-audit="tasksRunStrip"[\s\S]*?<\/div>/)?.[0],
+    ),
     filters: all(html, 'tasksFilter').map(
       (button) => `${text(/>([^<]*)<\/button>/.exec(button)?.[1] ?? '')}|${attr(button, 'data-on')}`,
     ),
@@ -373,6 +443,98 @@ function digest(
       links: count(html, 'mdLink'),
     },
     mentionRows: all(html, 'tasksMentionPopup').flatMap((popup) =>
+      [...popup.matchAll(/<div[^>]*role="option"[^>]*>([\s\S]*?)<\/div>/g)].map((m) => {
+        const selected = /aria-selected="([^"]*)"/.exec(m[0])?.[1] ?? ''
+        return `${text(m[1] ?? '')}|${selected}`
+      }),
+    ),
+    /*
+     * `<action>|on|off`, plus `|busy` while the call is in flight. Appended rather than made a
+     * third position, so every digest that predates the spinner reads exactly as it did.
+     */
+    specPrimary: ((f) =>
+      f === undefined
+        ? null
+        : `${attr(f, 'data-action')}|${f.includes('disabled') ? 'off' : 'on'}` +
+          (attr(f, 'data-busy') === 'true' ? '|busy' : ''))(
+      html.match(/<button[^>]*data-audit="specPrimary"[^>]*>/)?.[0],
+    ),
+    /** Whether the card offers to start a proposal — see `TaskDetailProps::onProposeChange`. */
+    specPropose: html.includes('data-audit="specProposeForTask"'),
+    /**
+     * The mark inside the primary button while it works, by its **class**, not just its name.
+     *
+     * The class is what makes it turn. The first version drew `loader-circle` wrapped in a
+     * run-strip class with no animation on it anywhere in the app, so the one signal that the
+     * press had been taken was a static arc — reported as *"loader was not spinning"*. A digest
+     * that only checked the icon's name would have passed that.
+     */
+    specBusyMark: ((f) =>
+      f === undefined || !/data-icon="loader-circle"/.test(f)
+        ? null
+        : /Spinner/.test(f)
+          ? 'spinning'
+          : 'static')(
+      html.match(/<button[^>]*data-audit="specPrimary"[\s\S]*?<\/button>/)?.[0],
+    ),
+    dispatchKinds: [...html.matchAll(/data-audit="taskDispatchTarget"[^>]*data-kind="([a-z]+)"/g)].map(
+      (m) => m[1] ?? '',
+    ),
+    deleteDanger: (html.match(/<button[^>]*data-audit="tasksDelete"[^>]*>/)?.[0] ?? '').includes(
+      'actionDanger',
+    ),
+    specBlock: ((f) => (f === undefined ? null : attr(f, 'data-state')))(
+      all(html, 'taskSpecBlock')[0],
+    ),
+    /**
+     * The checklist bar's percentage, or `null` when there is **no bar at all**.
+     *
+     * The distinction is the assertion: an archived change carries `0/0` because a directory
+     * listing cannot answer a checklist, and an empty bar over work that is finished and merged
+     * is a picture that is wrong rather than one that is missing.
+     */
+    specBarPct: ((f) => (f === undefined ? null : attr(f, 'aria-valuenow')))(
+      all(html, 'specProgress')[0],
+    ),
+    /** The validity badge's state and words — `unchecked|Archived` once it has been archived. */
+    specValidity: ((f) =>
+      f === undefined ? null : `${attr(f, 'data-state')}|${text(f)}`)(
+      html.match(/<span[^>]*data-audit="specValidate"[^>]*>[\s\S]*?<\/span>/)?.[0],
+    ),
+    /** The requirement cards under *What this changes*, as `<op>|<capability>`. */
+    specDeltas: all(html, 'specDeltaCard').map(
+      (f) => `${attr(f, 'data-op')}|${attr(f, 'data-spec')}`,
+    ),
+    /** The line beside the badge: `3 / 9 steps`, or where an archived change went. */
+    specProgressLabel: ((f) => (f === undefined ? null : text(f)))(
+      html.match(/<span[^>]*data-audit="specProgressLabel"[^>]*>[\s\S]*?<\/span>/)?.[0],
+    ),
+    specChip: ((f) => (f === undefined ? null : attr(f, 'data-change')))(
+      all(html, 'taskSpecChip')[0],
+    ),
+    specSession: ((f) => (f === undefined ? null : attr(f, 'data-state')))(
+      all(html, 'specSession')[0],
+    ),
+    specSessionControls: ['specSessionResume', 'specSessionOpen', 'specSessionElsewhere'].filter(
+      (hook) => all(html, hook).length > 0,
+    ),
+    specAction: ((f) => (f === undefined ? null : attr(f, 'data-action')))(
+      all(html, 'specPrimary')[0],
+    ),
+    linkChips: all(html, 'taskLinkChip').map(
+      (chip) =>
+        `${attr(chip, 'data-kind')}|${attr(chip, 'data-direction')}|${attr(chip, 'data-target')}|${attr(chip, 'data-gone')}`,
+    ),
+    linkRemoves: count(html, 'data-audit="taskLinkRemove"'),
+    linkAddControls: all(html, 'taskLinkAdd').reduce(
+      (n, picker) => n + [...picker.matchAll(/<(input|textarea|select)\b/g)].length,
+      0,
+    ),
+    composeLinkRow: html.includes('data-audit="taskComposeLinkRow"'),
+    composeLinkChips: all(html, 'taskComposeLinkChip').map(
+      (chip) => `${attr(chip, 'data-kind')}|${attr(chip, 'data-target')}`,
+    ),
+    linkTargetRows: all(html, 'taskLinkTargetPopup').flatMap((popup) =>
       [...popup.matchAll(/<div[^>]*role="option"[^>]*>([\s\S]*?)<\/div>/g)].map((m) => {
         const selected = /aria-selected="([^"]*)"/.exec(m[0])?.[1] ?? ''
         return `${text(m[1] ?? '')}|${selected}`

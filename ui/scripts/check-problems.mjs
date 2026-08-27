@@ -25,7 +25,8 @@
  *
  * The three source pins at the end are there because each one is a fix that a later,
  * well-meaning edit would silently undo:
- *   - `StatusBar.tsx` re-growing its own copy of the "no language server" sentence,
+ *   - `StatusBar.tsx` re-growing a diagnostics slot, with its own copy of the "no language
+ *     server" sentence,
  *   - `AppHeader.tsx` drawing ⊞/⧉ live again with no handler behind them,
  *   - `App.module.css` letting the bench button paint over the workspace again.
  *
@@ -514,14 +515,24 @@ try {
 
   const read = (rel) => readFileSync(join(UI, rel), 'utf8')
 
+  /*
+   * The status bar draws no diagnostics at all any more (M28). The `✗ n ⚠ n` pair was a second
+   * rendering of the figure the rail's ⚠ badge carries one row up, and the user asked for the
+   * counters beside the branch to go; the whole left group went with them.
+   *
+   * The pin is inverted rather than deleted, because the failure it guards against is the same
+   * one in both directions: a bar that grows its own copy of the panel's no-source sentence.
+   * Re-adding the slot means re-importing the sentence, and this line says so.
+   */
   const statusBar = read('src/chrome/StatusBar.tsx')
   ok(
-    statusBar.includes("from '@/sidebar/ProblemsPanel/model'"),
-    'StatusBar imports the no-source sentence rather than keeping a second copy of it',
+    !statusBar.includes('/ProblemsPanel/model'),
+    'StatusBar draws no diagnostics, so it reaches into the problems model for nothing',
   )
   ok(
     !statusBar.includes('Diagnostics need a language server.'),
-    'and does not hold that copy inline — two hand-kept copies of a user-visible claim are two claims',
+    'and holds no copy of the no-source sentence inline either — two hand-kept copies of a '
+      + 'user-visible claim are two claims, and that is what a re-added slot must not do',
   )
 
   const header = read('src/chrome/AppHeader.tsx')
@@ -551,12 +562,18 @@ try {
     /<ProblemsPanel[\s\S]{0,400}snapshot=\{/.test(app),
     'App.tsx passes a live snapshot to ProblemsPanel rather than letting it default to NO_SOURCE',
   )
-  // The derivation moved into one `useMemo` (`diagCounts`) so the rail and the status bar
-  // share one identity per snapshot — same intent, one call instead of two.
+  // The derivation is a single `useMemo` (`diagCounts`) so the rail's badge gets one identity
+  // per snapshot rather than a fresh object on every render of the shell. Its second consumer,
+  // the status bar, is gone (M28) — hence a pin on the rail's prop rather than on the bar's.
   ok(
     /const diagCounts = useMemo\(\(\) => statusBarCounts\(diagnostics\.snapshot\)/.test(app) &&
-      app.includes('diagnostics={diagCounts}'),
-    'and derives the status bar’s counts from that same snapshot, so the two cannot disagree',
+      /errors=\{diagCounts\?\.errors \?\? null\}/.test(app),
+    'and derives the rail’s badge from that same snapshot, so the panel and the badge cannot '
+      + 'disagree about whether the workspace is clean',
+  )
+  ok(
+    !app.includes('diagnostics={diagCounts}'),
+    'and does not feed it to the status bar as well — one figure, one renderer',
   )
   ok(
     app.includes('applyFilters('),

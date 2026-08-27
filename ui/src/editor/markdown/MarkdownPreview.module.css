@@ -39,8 +39,28 @@
   padding-top: 14px;
 }
 
+/*
+ * Scroll-past-end, so the last line of a document can reach the top of the pane.
+ *
+ * Load-bearing for split view: `scrollSync.ts` maps a buffer line to a preview offset, and with
+ * no room under the final block the bottom of a file has nowhere to scroll to and the two panes
+ * come apart exactly where a reader is most likely to be looking.
+ */
 .anchor:last-child {
   padding-bottom: 40vh;
+}
+
+/*
+ * …and off again for a rendering that is a *section of a page* rather than a scroller.
+ *
+ * The OpenSpec change page draws a proposal between its Documents list and its checklist. There
+ * the reserved 40vh is a screenful of blank between two sections — reported as "there is a huge
+ * space after" — and there is no scroll sync to serve, because the page scrolls as one document.
+ * `MarkdownPreview`'s `scrolls` prop is what picks; see its doc for why this is not something the
+ * caller can override from outside (a CSS module's class name is hashed).
+ */
+.anchor.inFlow:last-child {
+  padding-bottom: 0;
 }
 
 .paragraph {

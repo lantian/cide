@@ -273,6 +273,22 @@ pub fn take_pane(tree: &mut PaneTree, pane: PaneId) -> Result<Pane> {
         return Err(CoreError::PanePrimary);
     }
 
+    lift(tree, pane)
+}
+
+/// [`take_pane`]'s removal, without the `Primary` refusal.
+///
+/// Split out for [`move_pane`], and for that caller only. The refusal above is about a pane
+/// **leaving the tree** — `take_pane`'s own note spells out the failure it prevents: while a
+/// primary sat in a detached window its console tab would hold no `Primary` at all, and
+/// permanently so if the re-dock anchor went stale. A move never takes the pane out: it
+/// removes and re-inserts under one lock, and the leaf set at the end is the leaf set at the
+/// start, so `validate_console` holds throughout rather than being re-checked afterwards.
+///
+/// This is deliberately **not** a second removal path — it is the only one, and `take_pane` is
+/// now a role check in front of it. That keeps the property the module header claims, that
+/// [`close`] is `take_pane` rather than something kept in agreement with it.
+fn lift(tree: &mut PaneTree, pane: PaneId) -> Result<Pane> {
     // The sole leaf has no sibling to collapse into, so there is nothing this could
     // possibly leave behind.
     if let LayoutNode::Leaf { pane: only } = tree.root
@@ -301,6 +317,95 @@ pub fn take_pane(tree: &mut PaneTree, pane: PaneId) -> Result<Pane> {
         tree.maximized = None;
     }
     Ok(removed)
+}
+
+/// Move a pane that is already in this tree to a new home in it, beside `target`.
+///
+/// The gesture behind it is the pane's grab handle and `pane.move.*`; the pane keeps its
+/// identity, its `session` and — because the frontend's host registry is keyed by `PaneId` and
+/// only ever *parks* a pane's DOM — its scrollback and its running child. That is the whole
+/// point of the operation: the layout was wrong, not the conversation.
+///
+/// `axis` and `side` mean at the destination exactly what they mean for [`split`], and the
+/// routing is the mirror of `cmd::pane::apply_split` — `Row` puts a tile beside `target`,
+/// `Col` puts a full-width row above or below it. It has to be that mirror: a pane dropped on
+/// another pane's right edge must land where splitting there would have put it, or the drag
+/// and the `+` button build different trees from the same picture.
+///
+/// # Why the whole thing runs on a clone
+///
+/// Not defensive tidiness. The destination's legality is only decidable **after** the removal:
+/// reordering a tile inside a full row takes it to [`MAX_MEMBERS`] `- 1` and back, so a
+/// pre-flight count against the tree as it stands would refuse the one gesture a full row most
+/// needs. Doing the removal first and asking afterwards is therefore the only order that
+/// answers correctly — and it puts the pane in [`lift`]'s return value, off the tree, where a
+/// refusal from [`add_tile`] would **drop it on the floor**: a live session with no leaf and no
+/// `panes` entry pointing at it, unreachable and unkillable. Committing a clone only on success
+/// makes every refusal leave the caller's tree bit for bit as it was.
+///
+/// # What it does to the room the pane had
+///
+/// The removal is [`close`]'s, not [`take_pane`]'s — `removal_plan` is read before the surgery
+/// and written after it, so the vacated row's space is spread back over its whole chain in
+/// proportion instead of landing entirely on whichever neighbour the binary tree happened to
+/// pair the pane with. Move the only other member out of a row and the row itself collapses,
+/// its height going to the rows above and below in proportion. That is the same arithmetic
+/// closing the pane would have done, which is what makes a move feel like a move rather than a
+/// close followed by a split somewhere else.
+///
+/// At the destination the pane is a newcomer and is treated as one: [`add_tile`] gives it
+/// `1 / (n + 1)` of the row. A pane shuffled within its own row therefore comes back at the
+/// row's fair share rather than at the width it had — the honest composition of the two halves,
+/// and identical to what closing it and splitting there already does.
+///
+/// Refuses nothing that [`take_pane`] refuses except `Primary`: see [`lift`] for why a pane
+/// that never leaves the tree is a different question from one that does. `LastPane` cannot
+/// fire here — a distinct `target` means the tree has at least two leaves — and is left in
+/// place as a backstop rather than as a live path.
+pub fn move_pane(
+    tree: &mut PaneTree,
+    pane: PaneId,
+    target: PaneId,
+    axis: Axis,
+    side: Side,
+) -> Result<()> {
+    // Both, and before anything else, so a drag that outlived its snapshot names the id it
+    // could not find rather than some consequence of it.
+    if !tree.panes.contains_key(&pane) {
+        return Err(CoreError::NoSuchPane(pane));
+    }
+    if !tree.panes.contains_key(&target) {
+        return Err(CoreError::NoSuchPane(target));
+    }
+
+    // A pane dropped on itself. A no-op rather than a refusal, for the reason [`distribute`]
+    // gives about its own empty case: the gesture meant nothing, and an error toast for it
+    // teaches a rule that does not exist. Returning before any mutation is also what lets
+    // `WorkspaceState::update` see an unchanged workspace, leave `rev` alone and broadcast
+    // nothing.
+    if pane == target {
+        return Ok(());
+    }
+
+    let mut next = tree.clone();
+
+    // Measured before the surgery and written after, exactly as `close` does it and for the
+    // reason stated there: `prune` collapses the very split that records how much room the
+    // pane had, so asking afterwards finds the shares already merged into a sibling.
+    let plan = removal_plan(&next.root, pane);
+    let moved = lift(&mut next, pane)?;
+    if let Some((path, spread_axis, shares)) = plan {
+        write_weights(node_at_mut(&mut next.root, &path), spread_axis, &shares);
+    }
+
+    match axis {
+        Axis::Row => add_tile(&mut next, target, side, moved)?,
+        Axis::Col => add_row(&mut next, Some(target), side, moved)?,
+    };
+
+    // Only now. Every `?` above left `tree` untouched.
+    *tree = next;
+    Ok(())
 }
 
 /// A member's minimum share of its chain.
@@ -2206,6 +2311,247 @@ mod tests {
             "and it is still a number the wire promises: {stored}"
         );
         validate(&tree).expect("the backstop kept every ratio inside the band");
+    }
+
+    // --- moving a pane -----------------------------------------------------------------
+
+    /// A tab of two full-width rows: the top one holds `n` equal tiles, the bottom holds one.
+    fn two_rows(n: usize) -> (PaneTree, Vec<PaneId>, PaneId) {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let mut top = vec![a];
+        let mut last = a;
+        for _ in 1..n {
+            last = add_tile(&mut tree, last, Side::After, aux()).expect("a tile joins the row");
+            top.push(last);
+        }
+        let bottom = add_row(&mut tree, None, Side::After, aux()).expect("a row is appended");
+        validate(&tree).expect("fixture is well formed");
+        (tree, top, bottom)
+    }
+
+    /// Every leaf the tree holds, as a set, so a move can be checked for conservation.
+    fn leaf_set(tree: &PaneTree) -> std::collections::BTreeSet<PaneId> {
+        leaves(&tree.root).into_iter().collect()
+    }
+
+    /// A move never invents, loses or duplicates a pane, and never leaves an illegal tree.
+    ///
+    /// The exhaustive one: every pane of the asymmetric fixture moved beside every other, on
+    /// both axes and both sides. It is the test that would have caught a `graft` that dropped
+    /// the lifted pane on a path it could not find.
+    #[test]
+    fn moving_a_pane_conserves_every_leaf_and_stays_valid() {
+        let (fixture, ids) = asymmetric();
+        let want = leaf_set(&fixture);
+        for &pane in &ids {
+            for &target in &ids {
+                if pane == target {
+                    continue;
+                }
+                for axis in [Axis::Row, Axis::Col] {
+                    for side in [Side::Before, Side::After] {
+                        let mut tree = fixture.clone();
+                        move_pane(&mut tree, pane, target, axis, side)
+                            .expect("a leaf can always move beside another leaf");
+                        assert_eq!(
+                            leaf_set(&tree),
+                            want,
+                            "moving {pane} beside {target} changed which panes exist"
+                        );
+                        validate(&tree).expect("a move leaves a legal tree");
+                        assert_eq!(tree.focused, pane, "the moved pane takes focus");
+                        assert_eq!(tree.maximized, None, "and nothing is left maximized");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The user's requirement, stated as arithmetic: a row that loses a member gives its width
+    /// back to the whole row in proportion, not to whichever neighbour the binary tree paired
+    /// it with. The inverse of `add_tile`, and the same spread `close` performs.
+    #[test]
+    fn moving_a_tile_out_of_a_row_of_four_leaves_three_equal_thirds() {
+        let (mut tree, top, bottom) = two_rows(4);
+        let (_, tiles) = shape(&tree);
+        assert!(
+            close_to(&tiles[0], &[0.25; 4]),
+            "the fixture starts even: {tiles:?}"
+        );
+
+        move_pane(&mut tree, top[1], bottom, Axis::Row, Side::After)
+            .expect("a tile moves down into the bottom row");
+
+        let (_, tiles) = shape(&tree);
+        assert!(
+            close_to(&tiles[0], &[1.0 / 3.0; 3]),
+            "the vacated width spread over the whole row, not into one neighbour: {tiles:?}"
+        );
+        validate(&tree).unwrap();
+    }
+
+    /// Take the last other member out of a row and the row itself goes, its height going to the
+    /// rows that remain. This is the case the user chose when they picked "collapse it".
+    #[test]
+    fn moving_the_only_other_member_out_collapses_its_row() {
+        // Three rows, the middle one holding two tiles.
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let mid = add_row(&mut tree, None, Side::After, aux()).expect("a middle row");
+        let low = add_row(&mut tree, None, Side::After, aux()).expect("a bottom row");
+        let mate = add_tile(&mut tree, mid, Side::After, aux()).expect("a tile beside it");
+        validate(&tree).unwrap();
+
+        let (spine, _) = shape(&tree);
+        assert_eq!(spine.len(), 3, "three rows to begin with");
+
+        // `mate` leaves; `mid` is then alone, and the row survives with `mid` in it.
+        move_pane(&mut tree, mate, low, Axis::Row, Side::After).expect("the tile moves away");
+        let (spine, tiles) = shape(&tree);
+        assert_eq!(
+            spine.len(),
+            3,
+            "the row is still there — `mid` is still in it"
+        );
+        assert_eq!(tiles[1].len(), 1, "but it holds one tile now");
+
+        // Now `mid` itself leaves, and the row it was the whole of must go with it.
+        move_pane(&mut tree, mid, a, Axis::Row, Side::After).expect("the last member moves out");
+        let (spine, _) = shape(&tree);
+        assert_eq!(spine.len(), 2, "the vacated row collapsed");
+        assert!(
+            close_to(&spine, &[0.5, 0.5]),
+            "and its height went back to the survivors in proportion: {spine:?}"
+        );
+        validate(&tree).unwrap();
+    }
+
+    /// The point of the whole feature: the pane that arrives is the pane that left, session and
+    /// all. A move that rebuilt the pane would strand a live `claude` with nothing attached.
+    #[test]
+    fn a_move_carries_the_pane_itself_session_and_all() {
+        let (mut tree, top, bottom) = two_rows(3);
+        let moved = top[1];
+        let before = tree
+            .panes
+            .get(&moved)
+            .cloned()
+            .expect("the pane is in the fixture");
+        assert!(before.session.is_some(), "the fixture binds a session");
+
+        move_pane(&mut tree, moved, bottom, Axis::Row, Side::After).expect("it moves");
+
+        let after = tree.panes.get(&moved).expect("and it is still here");
+        assert_eq!(after, &before, "the whole Pane record survived the move");
+    }
+
+    /// A drag released where it began. A no-op, not a refusal — and it must not even touch the
+    /// weights, or `WorkspaceState::update` would bump `rev` and repaint every window.
+    #[test]
+    fn moving_a_pane_onto_itself_changes_nothing() {
+        let (fixture, ids) = asymmetric();
+        let mut tree = fixture.clone();
+        move_pane(&mut tree, ids[2], ids[2], Axis::Row, Side::After).expect("a no-op succeeds");
+        assert_eq!(tree, fixture, "the tree is untouched, ratios included");
+    }
+
+    /// The atomicity guard, and the reason `move_pane` works on a clone.
+    ///
+    /// A refusal arrives from `add_tile` *after* the pane has been lifted out. If the function
+    /// mutated in place, this would leave the tree without the pane and the session unreachable
+    /// — so the assertion that matters is not the `Err`, it is that the tree still has it.
+    #[test]
+    fn a_refused_move_leaves_the_tree_bit_for_bit_untouched() {
+        let (fixture, top, bottom) = two_rows(MAX_MEMBERS);
+        let mut tree = fixture.clone();
+        // The bottom row is one pane; the top row is full. Moving the bottom pane into the
+        // full row is the refusal.
+        let err = move_pane(&mut tree, bottom, top[0], Axis::Row, Side::After)
+            .expect_err("a full row refuses an eleventh tile");
+        assert!(
+            matches!(err, CoreError::Invariant(_)),
+            "refused for capacity: {err:?}"
+        );
+        assert_eq!(tree, fixture, "and the pane it lifted is back where it was");
+    }
+
+    /// The case a pre-flight capacity check would have got wrong: a full row can still be
+    /// reordered, because the move takes it to `MAX_MEMBERS - 1` and back.
+    #[test]
+    fn a_tile_can_be_reordered_inside_a_full_row() {
+        let (mut tree, top, _) = two_rows(MAX_MEMBERS);
+        move_pane(
+            &mut tree,
+            top[0],
+            top[MAX_MEMBERS - 1],
+            Axis::Row,
+            Side::After,
+        )
+        .expect("a full row can be reordered");
+        let (_, tiles) = shape(&tree);
+        assert_eq!(tiles[0].len(), MAX_MEMBERS, "still full, and still legal");
+        validate(&tree).unwrap();
+    }
+
+    /// The one invariant this feature relaxes, and its limit.
+    ///
+    /// The console's primary pane may be repositioned inside its own tab — it never leaves the
+    /// tree, so the tab holds a `Primary` throughout — but it still cannot be closed or taken
+    /// out of it. Both halves are asserted, because relaxing the first by accidentally
+    /// relaxing the second is the way this goes wrong.
+    #[test]
+    fn the_primary_pane_can_move_inside_its_tab_but_still_cannot_leave_it() {
+        let first = primary();
+        let p = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, p, Side::After, aux()).expect("a shell beside it");
+        let c = add_row(&mut tree, None, Side::After, aux()).expect("a row below");
+        validate_console(&tree).expect("a console to begin with");
+
+        move_pane(&mut tree, p, c, Axis::Row, Side::After).expect("the console pane may move");
+        assert_eq!(
+            primary_of(&tree),
+            Some(p),
+            "and it is still the tab's primary"
+        );
+        validate(&tree).unwrap();
+        validate_console(&tree).expect("the console invariant held right through the move");
+
+        assert!(matches!(
+            take_pane(&mut tree, p),
+            Err(CoreError::PanePrimary)
+        ));
+        assert!(matches!(close(&mut tree, p), Err(CoreError::PanePrimary)));
+        assert_eq!(
+            leaf_set(&tree).len(),
+            3,
+            "and nothing was removed by either refusal"
+        );
+        let _ = b;
+    }
+
+    /// A drag whose snapshot moved under it names the id it could not find.
+    #[test]
+    fn moving_a_pane_that_is_not_here_is_refused_by_id() {
+        let (fixture, ids) = asymmetric();
+        let ghost = PaneId::new();
+
+        let mut tree = fixture.clone();
+        assert!(matches!(
+            move_pane(&mut tree, ghost, ids[0], Axis::Row, Side::After),
+            Err(CoreError::NoSuchPane(id)) if id == ghost
+        ));
+        assert_eq!(tree, fixture);
+
+        let mut tree = fixture.clone();
+        assert!(matches!(
+            move_pane(&mut tree, ids[0], ghost, Axis::Row, Side::After),
+            Err(CoreError::NoSuchPane(id)) if id == ghost
+        ));
+        assert_eq!(tree, fixture);
     }
 
     // --- rows and tiles ----------------------------------------------------------------

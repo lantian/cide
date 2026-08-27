@@ -245,6 +245,7 @@ mod tests {
             def: AgentDef {
                 id: AgentId("developer".into()),
                 label: "Developer".into(),
+                scope: cide_ipc::agents::AgentScope::Project,
                 harness: Harness::Claude,
                 description: "Implements one task end to end.".into(),
                 system_prompt: "You are the developer agent.".into(),
@@ -258,6 +259,7 @@ mod tests {
             tools: vec!["Read".into(), "Edit".into()],
             permission_mode: permission_mode.map(str::to_string),
             effort: None,
+            extras: Vec::new(),
         }
     }
 

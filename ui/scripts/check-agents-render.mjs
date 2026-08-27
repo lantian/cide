@@ -397,6 +397,54 @@ try {
   }
 
   /*
+   * ===== The source badge, which is a claim about a file cide did not write. =============== (M30)
+   *
+   * Three assertions, and the third is the one that makes the first two mean anything.
+   *
+   * A badged row exists at all. **Both** Claude scopes badge, with the *same* text — so the mark
+   * is keyed on the family and not on one directory, which is what `scopeBadge`'s doc promises
+   * and what a single-row story could not distinguish. And the cide role standing beside them
+   * carries **none**: without that, a chip drawn unconditionally on every row would pass.
+   */
+  {
+    const d = a('role-claude-code')
+    eq(d.roles?.length, 3, 'a cide role and both Claude Code scopes, in one story')
+    const badged = (d.roles ?? []).filter((r) => r.badge !== '')
+    eq(
+      badged.map((r) => r.id),
+      ['code-reviewer', 'researcher'],
+      'exactly the two subagents are badged',
+    )
+    eq(
+      badged.map((r) => r.badgeScope),
+      ['claudeProject', 'claudeGlobal'],
+      'and each names the scope it came from, which is what the Settings screen opens the ' +
+        'right file from',
+    )
+    eq(
+      [...new Set(badged.map((r) => r.badge))],
+      ['Claude Code'],
+      'one mark for both, because which of the two a subagent is in matters when you go to ' +
+        'edit it and not when you are reading a roster',
+    )
+    eq(
+      (d.roles ?? []).find((r) => r.id === 'developer')?.badge,
+      '',
+      'and cide’s own role carries NO badge — a chip on every row would say nothing, which is ' +
+        'the assertion the other two depend on',
+    )
+    // A badged row is an ordinary row in every other respect. If it were not, this is where it
+    // would show: the subagents dispatch, take Configure, and refuse nothing.
+    for (const role of badged) {
+      ok(
+        role.buttons.includes('Dispatch') && role.buttons.includes('Configure'),
+        `${role.id}: a subagent row is dispatchable and configurable like any other`,
+      )
+      eq(role.reason, '', `${role.id}: and refuses nothing`)
+    }
+  }
+
+  /*
    * ===== The cross-link, which is half a link with either half missing. ====================
    */
   {
@@ -501,6 +549,34 @@ try {
       'and never an empty cell or a stringified `Object.prototype.constructor`, which is what ' +
         'a `?? fallback` over a prototype key hands back',
     )
+  }
+
+  /*
+   * The running mark **turns**, and nothing else does.
+   *
+   * `PHASE_GLYPH` picks a three-quarter arc for `running` *because* it reads as turning — its own
+   * comment says `idle`'s ringed dot is only distinguishable from it on that reading. It animated
+   * nowhere: not here, not on the task list's chip, not on the card's run strip. So for a
+   * milestone and a half the single signal that an assigned agent was working was a static shape
+   * beside the state the shape was chosen to contrast with, and it was reported as exactly that.
+   *
+   * Read off the **class**, because the icon name was always right — a digest of names passed
+   * every one of those renders. `check:agents` pins the other half, that the rule and the glyph
+   * table name the same mark.
+   */
+  {
+    const spinning = new Set()
+    const still = new Set()
+    for (const story of Object.keys(agents)) {
+      for (const entry of agents[story].glyphSpins ?? []) {
+        const [glyph, how] = entry.split('|')
+        ;(how === 'spin' ? spinning : still).add(glyph)
+      }
+    }
+    ok(spinning.size > 0, 'some story renders a running run at all — else this proves nothing')
+    eq([...spinning], ['loader-circle'], 'and only the spinner mark is ever drawn turning')
+    ok(!still.has('loader-circle'), 'the spinner is never drawn still')
+    ok(still.has('circle-dot'), 'while idle — the mark it must be told apart from — sits still')
   }
 
   {
@@ -1033,6 +1109,16 @@ try {
 
     const live = t('card-with-live-run')
     eq(live.runStrip, true, 'a live run against this task gets its strip')
+    /*
+     * And its mark **turns**.
+     *
+     * `PHASE_GLYPH` picks a three-quarter arc for `running` *because* it reads as turning — its
+     * own comment says `idle`'s ringed dot is distinguishable from it only on that reading. It
+     * animated nowhere, so for a milestone and a half the one signal that an assigned agent was
+     * working was a static shape sitting next to the state it was chosen to contrast with. Read
+     * off the class rather than the icon name, because the icon name was always right.
+     */
+    eq(live.runStripSpin, true, 'the run strip\u2019s running mark carries the class that spins it')
     ok(live.buttons?.includes('Open'), 'and the strip can attach a pane to it')
 
     /*
@@ -1149,6 +1235,29 @@ try {
         'be ZERO at rest, which is the pair these two numbers make',
     )
     eq(empty.composeControls, filled.composeControls, 'the same four whether or not it is filled in')
+    /*
+     * The links row rides its own hook — `taskComposeLinkRow`, never `taskComposeRow` — exactly
+     * as the spec row does and for its stated reason, so the three above stay three with the
+     * row on screen. (M30)
+     */
+    {
+      const linking = t('compose-linking')
+      eq(
+        linking.composeControls,
+        3,
+        'the count the paragraph above argues is UNMOVED by the links row — its selects are ' +
+          'under their own hook, which is the honest fix the spec row already made',
+      )
+      eq(linking.composeLinkRow, true, 'the row draws when the board offers targets')
+      eq(
+        linking.composeLinkChips,
+        ['blockedBy|t-14'],
+        'a picked edge renders as a chip in the draft — choosing the target IS the add, the ' +
+          'assignee select’s choosing-is-the-commit argument',
+      )
+      eq(empty.composeLinkRow, false, 'and no `tasks` prop is no row at all — the pre-M30 claim')
+      eq(filled.composeLinkRow, false, 'in both of the stories whose digests predate it')
+    }
     eq(
       empty.composeStatuses,
       ['todo|true', 'doing|false', 'review|false', 'done|false'],
@@ -1374,6 +1483,274 @@ try {
       'the two stories are the same four rows: the rev is the only thing that differs, which ' +
         'is what makes the line above a statement about the arming',
     )
+
+    /* ----------------------------------------------- the OpenSpec block's three states (M28) */
+
+    /*
+     * A change costs four `openspec` invocations, each of them a node process — about six tenths
+     * of a second now that they run at once, and two and a half before that. The card has to say
+     * something for that whole time, and it said nothing: the block was behind `spec != null`
+     * for *both* states, so a task with a change opened looking exactly like a task without one
+     * and then grew a whole section out of nowhere.
+     *
+     * That shipped despite the prop's own doc saying `null` "draws the chip and a pending
+     * progress row rather than nothing", because none of the three states had a story. These are
+     * those stories, and the pair below is the assertion the doc was making.
+     */
+    eq(
+      t('card-spec-reading').specBlock,
+      'reading',
+      'a linked task says its change is being read, from the moment the card opens',
+    )
+    eq(
+      t('card-spec-reading').specChip,
+      'add-dark-mode',
+      'and names which change, off the task itself — the card carries the name before the read ' +
+        'answers, so there is no reason to withhold it for six tenths of a second',
+    )
+    /*
+     * The read finished and there is nothing — most often the change was archived, which is a
+     * thing the user did. Its pair with `card-spec-reading` is the whole point: the same `null`
+     * means two different things, and collapsing them is a spinner that never stops. The host had
+     * no `.catch` at all, so a rejection went nowhere and the card sat on "Reading…" for ever.
+     */
+    eq(t('card-spec-failed').specBlock, 'failed', 'a read that came back with nothing says so')
+    ok(
+      (t('card-spec-failed').text ?? '').includes('archived'),
+      'and names the likeliest reason rather than showing a spinner that never stops',
+    )
+    ok(
+      !(t('card-spec-reading').text ?? '').includes('archived'),
+      'while the one still reading claims nothing about why',
+    )
+
+    /*
+     * And the optionality claim, restated as an assertion rather than as prose: a task with no
+     * change draws no block and no chip, so its markup is what it was before M28.
+     */
+    eq(t('card').specBlock, null, 'a task with no change draws no OpenSpec block at all')
+    eq(t('card').specChip, null, 'and no chip')
+
+    /* ------------------------------- handed to a conversation, and the button that must go (M28) */
+
+    /*
+     * Choosing *New Claude session* started the session, typed the task in — and left the card
+     * still offering **Approve & dispatch** over a conversation that was already working.
+     * Pressing it again would open the picker and invite a second dispatch of the same task.
+     *
+     * It shipped because the card only ever read `assignee`, and `TaskStore::edit` **clears**
+     * `Task::agent` when a session is set: the one gesture that hands work to a conversation left
+     * every field the button was derived from exactly as it found them. So this pair — the row
+     * appearing and the button going — is one claim and is asserted as one.
+     */
+    eq(t('card-spec-ready').specAction, 'approve', 'a change nobody has dispatched offers approval')
+    eq(t('card-spec-ready').specSession, null, 'and draws no session row')
+
+    eq(
+      t('card-spec-session').specAction,
+      null,
+      'a change whose work is with a conversation draws no Approve & dispatch — the gesture has ' +
+        'been made, and a second press would dispatch the same task twice',
+    )
+    eq(
+      t('card-spec-session').specSession,
+      'working',
+      'what stands in its place is the session row, saying the conversation is working',
+    )
+    eq(
+      t('card-spec-session-awaiting').specSession,
+      'awaiting',
+      'and saying so when it has finished a turn and is waiting',
+    )
+    /*
+     * `Task::session` records where the work went and deliberately survives the pane closing, so
+     * *closed* is a state the card must be able to draw. Three and not two: it is not a quieter
+     * shade of "not waiting", it is work with nowhere to continue.
+     */
+    eq(
+      t('card-spec-session-closed').specSession,
+      'closed',
+      'a conversation whose pane is gone says so rather than reading as idle',
+    )
+    /*
+     * **A closed conversation keeps every control**, and that is the fix rather than an
+     * oversight. Open was withheld once the pane was gone, on the reasoning that a control
+     * opening onto nothing is what this card refuses — which left a closed conversation with no
+     * way to proceed except handing the work somewhere else, throwing away everything it had
+     * already worked out.
+     *
+     * The premise was wrong. A closed conversation is not nothing: its transcript is on disk
+     * under the id cide passed to `--session-id`, and `claude --resume <id>` brings all of it
+     * back under the same id — so the task's own record of where the work went keeps naming the
+     * right conversation.
+     */
+    eq(
+      t('card-spec-session-closed').specSessionControls,
+      ['specSessionResume', 'specSessionOpen', 'specSessionElsewhere'],
+      'a closed conversation can still be resumed and reopened — withholding those left the ' +
+        'only road forward as starting again somewhere else',
+    )
+    eq(
+      t('card-spec-session').specSessionControls,
+      ['specSessionResume', 'specSessionOpen', 'specSessionElsewhere'],
+      'and a live one draws the same three, so the row does not rearrange itself under the ' +
+        'pointer when a pane is closed in another window',
+    )
+    ok(
+      (t('card-spec-session-closed').text ?? '').includes('--resume'),
+      'and the hint names the mechanism rather than leaving a grey chip to be interpreted',
+    )
+
+    /*
+     * ------------------------------------------ and then the change is archived (M31)
+     *
+     * What shipped, on a card that drew both the archive line and the session row:
+     *
+     *     Archived
+     *     archived as 2026-08-27-add-todo-list
+     *     Working                  Conversation a7d4fd80   Resume  Open  Hand it elsewhere
+     *     It is working. The checklist above ticks as it goes.
+     *
+     * Three separate false claims — a live-work chip, a sentence about a checklist this arm
+     * draws no bar for, and two controls that dispatch against a change directory `openspec
+     * archive` has moved. `primaryAction` had refused the arm since M28; this row was the second
+     * door onto the same gesture and carried none of that reasoning.
+     *
+     * Asserted as a **pair** against `card-spec-session`, which is the identical open,
+     * not-awaiting conversation. Without the pair the archived assertions would pass just as
+     * happily if the row had gone quiet for some unrelated reason, and the claim is specifically
+     * that the archive is what changed it.
+     */
+    const archivedRow = t('card-spec-archived-session')
+    eq(t('card-spec-session').specSession, 'working', 'the live conversation reads as working')
+    eq(
+      archivedRow.specSession,
+      'archived',
+      'and the identical conversation under an archived change does not',
+    )
+    eq(
+      archivedRow.specSessionControls,
+      ['specSessionOpen'],
+      'only Open survives: Resume hands the task back and Hand it elsewhere dispatches it anew, ' +
+        'and both act on a change that is merged into openspec/specs/ and no longer there',
+    )
+    ok(
+      !(archivedRow.text ?? '').includes('It is working'),
+      'and nothing on the card claims the work is still happening',
+    )
+    ok(
+      !(archivedRow.buttons ?? []).some((label) => label === 'Hand it elsewhere'),
+      'the dispatch road is gone from the row, not merely restyled',
+    )
+
+    /*
+     * And the role road is untouched, which is the other half of the fix. A task assigned to a
+     * role has no session — Rust clears one when the other is set — so no row is drawn and the
+     * run strip reports the subagent exactly as it did.
+     */
+    eq(t('card-with-live-run').specSession, null, 'a run on a role draws no session row')
+
+    /*
+     * == Typed links. (M30) ================================================================
+     *
+     * The Links section is a section and not a fifth field — `check-agents.mjs` pins the field
+     * vocabulary at four with the argument — so the assertions here are about what only markup
+     * can settle: which chips draw, which of them carry a remove, and that none of it moves the
+     * read-only-at-rest claim one pixel.
+     */
+    {
+      const linked = t('card-linked')
+      eq(
+        linked.linkChips,
+        [
+          'blockedBy|out|t-14|false',
+          'subtaskOf|out|t-16|false',
+          'related|out|t-17|false',
+          'blockedBy|out|t-99|true',
+          'blockedBy|in|t-41|false',
+        ],
+        'five chips: the three stored kinds in order, the dangling t-99 MARKED rather than ' +
+          'hidden (a reference that silently vanished is the task-leaves-the-tracker failure, ' +
+          'one edge over), and the derived `blocks` reading from t-41’s own stored edge — ' +
+          'stored once, read from both ends',
+      )
+      ok(
+        linked.buttons?.includes('Blocked by t-14'),
+        'a chip is a BUTTON — it navigates to its target — not a decorated span',
+      )
+      ok(
+        linked.buttons?.includes('Blocked by t-99 (gone)'),
+        'and the dangling one says so in words as well as in the attribute',
+      )
+      eq(
+        linked.linkRemoves,
+        4,
+        'a remove on each of the four outgoing chips and NONE on the derived directed one: ' +
+          'that edge belongs to the other task, and its chip is the road there',
+      )
+      eq(
+        linked.fields,
+        ['title|rest', 'status|live', 'assignee|rest', 'body|rest'],
+        'the four fields stand exactly as `card` draws them — links moved nothing',
+      )
+      eq(
+        linked.fieldControls,
+        0,
+        'and the card is still read-only at rest: the link controls live outside the field ' +
+          'rows, which is the markup half of links-are-a-section',
+      )
+      eq(linked.linkAddControls, 0, 'the picker is shut until asked for')
+      ok(linked.buttons?.includes('Link…'), 'and the affordance that opens it is drawn')
+
+      const adding = t('card-link-adding')
+      eq(
+        adding.linkAddControls,
+        2,
+        'open, the picker is a kind `<select>` and a target search `<input>` — the reported ' +
+          'gesture is "find the task by its key or summary", which a native dropdown answers ' +
+          'with scroll — and both are still outside `fieldControls`, whose zero stands',
+      )
+      eq(adding.fieldControls, 0, 'stated as its own line because it is the claim that matters')
+      ok(
+        !adding.buttons?.includes('Add link'),
+        'and there is NO Add button: picking a row IS the commit, the assignee select\u2019s ' +
+          'choosing-is-the-commit argument — a confirm after the pick would have nothing left ' +
+          'to do',
+      )
+      ok(adding.buttons?.includes('Cancel'), 'the way out is the header affordance')
+
+      /*
+       * The search popup itself, drawn open through the exported `LinkTargetList` — the same
+       * arrangement the mention popup uses, because the stateful input only ever opens it from
+       * DOM events a server render cannot fire. The rows are the model's tier order, so this is
+       * the markup half of "the key reaches by prefix, the summary by word".
+       */
+      const targetsOpen = t('link-target-open')
+      eq(
+        targetsOpen.linkTargetRows.length,
+        4,
+        'the empty query offers the whole target list (four tasks fit under the cap)',
+      )
+      eq(
+        targetsOpen.linkTargetRows.filter((row) => row.endsWith('|true')).length,
+        1,
+        'exactly one row is aria-selected — the highlight the arrows move',
+      )
+      eq(
+        t('link-target-filtered').linkTargetRows,
+        ['t-14 Add the retry bar Doing|true'],
+        'a query reaches by the SUMMARY: `retry` finds t-14 through its title, with the status ' +
+          'on the row because which tasks are already done is half of choosing a blocker',
+      )
+
+      /* The pre-M30 claim, as an assertion rather than as prose. */
+      eq(t('card').linkChips, [], 'a card handed no links prop draws no chips')
+      eq(t('card').linkRemoves, 0, 'no removes')
+      ok(
+        !(t('card').text ?? '').includes('Links'),
+        'and no Links heading at all — its markup is what it was before M30',
+      )
+    }
 
     const card = t('card')
     ok(
@@ -1756,6 +2133,186 @@ try {
         'the literal token `undefined` — the two shapes a `styles.typo` takes, both invisible ' +
         'to tsc and to vite build',
     )
+  }
+
+  /* ----------------------------- the dispatch row at the foot of the card (M28) */
+
+  {
+    /*
+     * **This is the assertion whose absence let the control ship invisible.**
+     *
+     * Until `card-spec-ready` no story anywhere carried a *loaded* spec — only "still reading"
+     * and "could not be read" — so the card's most consequential control had never been rendered
+     * by any check, and a version of it that drew nothing passed every one of them.
+     */
+    const ready = tasks['card-spec-ready']
+    eq(ready.specPrimary, 'approve|on', 'a proposed change offers Approve & dispatch, live')
+    ok(
+      ready.buttons.includes('Approve & dispatch'),
+      `and the words are on it: ${JSON.stringify(ready.buttons)}`,
+    )
+
+    /*
+     * Approve immediately before Delete, in one row. They were two bordered blocks stacked, each
+     * drawing its own rule — so a card with no change still showed the second rule above a lone
+     * right-aligned Delete, which reads as a stray line rather than as a control.
+     */
+    const at = ready.buttons.indexOf('Approve & dispatch')
+    eq(
+      ready.buttons[at + 1],
+      'Delete task',
+      'Approve sits beside Delete in the same row, with nothing between them',
+    )
+
+    // Approve opens the picker; it does not assign on the spot. That is the whole gesture.
+    eq(ready.dispatchKinds, [], 'the picker is closed until asked for')
+    eq(
+      tasks['card-spec-picking'].dispatchKinds,
+      ['role', 'session', 'fresh'],
+      'and offers all three kinds — a role dispatches through the queue, a conversation already ' +
+        'open is typed into, and the last one makes a pane first',
+    )
+
+    // A task with no change has no dispatch control at all, rather than a disabled one.
+    eq(tasks['card'].specPrimary, null, 'an ordinary task offers nothing to approve')
+    eq(tasks['card-spec-reading'].specPrimary, null, 'and neither does one still being read')
+
+    /*
+     * ------------------------------------------------------ the accept, while it is running
+     *
+     * `Integrate & Archive` merges a branch, runs `openspec archive`, re-validates and closes the
+     * task. It shipped drawing **nothing at all** while that happened: the card sat exactly as it
+     * was, which is indistinguishable from a click that missed — and a second press would have
+     * started a second merge.
+     *
+     * Three things, and each is a different way the fix could be half-done: the control goes
+     * inert, it says something else, and what it says is not the resting label with a spinner
+     * bolted on.
+     */
+    const accepting = tasks['card-spec-accepting']
+    eq(accepting.specPrimary, 'accept|off|busy', 'inert and marked busy while the call runs')
+    ok(
+      accepting.buttons.includes('Integrating…'),
+      `and it says so: ${JSON.stringify(accepting.buttons)}`,
+    )
+    ok(
+      !accepting.buttons.includes('Integrate & Archive'),
+      'a button that still reads Integrate & Archive looks pressable and is not',
+    )
+    /*
+     * And the mark **turns**. Checked by the class that animates it and not by the icon's name,
+     * because the first version drew exactly the right icon and nothing in the app animated it:
+     * a static three-quarter arc, reported as *"loader was not spinning"*. It also sat in a
+     * run-strip class with no layout of its own, so the button collapsed around a
+     * baseline-aligned svg — `.actionBusy` is the other half.
+     */
+    eq(accepting.specBusyMark, 'spinning', 'the in-flight mark carries the class that turns it')
+    eq(tasks['card-spec-ready'].specBusyMark, null, 'and there is no mark when nothing is running')
+    eq(
+      tasks['card-spec-ready'].specPrimary,
+      'approve|on',
+      'and nothing is busy when nothing was pressed',
+    )
+
+    /*
+     * ------------------------------------------------ the accept that merges nothing (M31)
+     *
+     * The same control, over work that is already on the user's own branch. A task handed to a
+     * Claude conversation carries no role — `TaskEdit::SetSession` clears `Task::agent` — so
+     * `plan_accept` finds no branch and `spec_accept` merges nothing; the press is a plain
+     * archive. The button nonetheless read *Integrate & Archive*, naming a step it would not
+     * take, over a conversation that had already committed everything.
+     *
+     * Asserted through the rendered **text**, and as a pair against `card-spec-accepting`: the
+     * claim is only worth anything if the two stories differ, because a label that always said
+     * *Archive* would pass a one-sided check and lie the other way — over a run whose branch
+     * really is waiting to be merged.
+     */
+    const archiveOnly = tasks['card-spec-archive-only']
+    eq(archiveOnly.specPrimary, 'accept|on', 'still the accept gesture, and still pressable')
+    ok(
+      archiveOnly.buttons.includes('Archive'),
+      `and it says what it will do: ${JSON.stringify(archiveOnly.buttons)}`,
+    )
+    ok(
+      !archiveOnly.buttons.some((label) => label.includes('Integrate')),
+      'never Integrate, because there is no branch to integrate',
+    )
+
+    /*
+     * -------------------------------------------------- the road *into* OpenSpec (M28)
+     *
+     * The compose dialog used to offer *New change from this task*, which scaffolded a stub — no
+     * delta specs, no checklist — so the task was born linked to a change `openspec validate`
+     * refuses and whose row reads `0/0` for ever. Writing a proposal needs the codebase; it is a
+     * conversation's job now, and this button starts one on it.
+     *
+     * The pair is the claim: drawn when the host passes a handler, and **absent** when it does
+     * not — a project with no `openspec/`, or with no propose command installed, sees the card it
+     * saw before M28.
+     */
+    eq(tasks['card-propose'].specPropose, true, 'a task with no change can start a proposal')
+    ok(
+      tasks['card-propose'].buttons.includes('Make a proposal'),
+      `with words that say what it does: ${JSON.stringify(tasks['card-propose'].buttons)}`,
+    )
+    eq(
+      tasks['card'].specPropose,
+      false,
+      'and no handler is no button — the optionality claim, made structurally',
+    )
+    eq(
+      tasks['card-spec-ready'].specPropose,
+      false,
+      'nor is it offered on a task that already implements a change',
+    )
+
+    /*
+     * ------------------------------------------------- the change, after it was archived (M28)
+     *
+     * The card said *"add-dark-mode could not be read. It may have been archived."* here, from
+     * the moment the work landed onwards: `openspec archive` **moves** the directory and no CLI
+     * command reads the result, so the task that did the work lost its record at exactly the
+     * point the record was worth keeping. cide reads the directory itself now.
+     *
+     * Two of the three assertions are about what must **not** be drawn, and they are the ones
+     * that would fail quietly. An archive cannot answer the checklist or the verdict — which
+     * file is the checklist is the schema's business, and `openspec validate` cannot see a moved
+     * directory — so both come back neutral: `0/0` and vacuously clean. Rendered as they stand
+     * that is an empty progress bar and a green **Valid** over finished, merged work.
+     */
+    const archived = tasks['card-spec-archived']
+    eq(archived.specBlock, 'archived', 'the block says which of the two reads this was')
+    eq(archived.specBarPct, null, 'no progress bar at all, rather than one sitting empty at 0')
+    eq(
+      archived.specValidity,
+      'unchecked|Archived',
+      'and never `ok|Valid`: nothing validated this and nothing can',
+    )
+    ok(
+      (archived.specProgressLabel ?? '').includes('2026-08-27-add-dark-mode'),
+      `the line names the directory instead of counting steps: ${archived.specProgressLabel}`,
+    )
+    eq(archived.specPrimary, null, 'nothing prominent left to press on merged work')
+    eq(
+      archived.specDeltas,
+      ['added|dark-mode'],
+      'and the requirements are still drawn — recovered from the archived delta file by the same ' +
+        'byte-range scanner the write path uses, which is the whole point of reading the ' +
+        'directory rather than refusing',
+    )
+    // The pair: the same card before it was archived still counts steps and still validates.
+    eq(tasks['card-spec-ready'].specBarPct, '33', 'a live change keeps its bar')
+    eq(tasks['card-spec-ready'].specValidity, 'ok|Valid', 'and its verdict')
+
+    /*
+     * Delete is red before it is armed, not only after. The colour is what tells somebody
+     * scanning the foot of the card which of the two buttons destroys something — and by the
+     * time it is armed they have already pressed it.
+     */
+    for (const name of ['card', 'card-spec-ready']) {
+      eq(tasks[name].deleteDanger, true, `${name}: Delete carries the danger colour unarmed`)
+    }
   }
 
   if (failed === 0) {

@@ -37,9 +37,18 @@ import { Icon } from '@/icons/Icon'
 import styles from './TasksPanel.module.css'
 
 export function TaskMarkdown({ text }: { text: string }): JSX.Element {
-  // Memoised on the text: the card re-renders on every keystroke of an *unrelated* field's
-  // draft, and re-parsing a long body for each is work the identity of the string can skip.
-  const doc = useMemo(() => parseMarkdown(text), [text])
+  /*
+   * Memoised on the text: the card re-renders on every keystroke of an *unrelated* field's
+   * draft, and re-parsing a long body for each is work the identity of the string can skip.
+   *
+   * `softBreak: 'break'` is the one place this renderer diverges from `MarkdownPreview.tsx`, and
+   * the divergence is deliberate — do not "unify" them. The preview renders a `.md` *file*, where
+   * CommonMark is right: the author wrapped at 100 columns and meant nothing by it. A task body
+   * or a comment is a *message*, written in a textarea and read at 620px, and every comment box a
+   * person has ever used treats a newline as a line. Without this, an agent reporting five
+   * numbered steps one per line is drawn as one wall of prose — which is what it was.
+   */
+  const doc = useMemo(() => parseMarkdown(text, { softBreak: 'break' }), [text])
   return <>{blocks(doc.blocks, 'b')}</>
 }
 

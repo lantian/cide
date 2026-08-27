@@ -269,6 +269,10 @@ try {
     // exercises `!flag` on both entry points against `ArrowUp`/`ArrowDown`/`Enter`, in the
     // editor-focused context where these must pass through and the terminal one where they
     // must fire.
+    { key: 'ctrl+alt+shift+h', command: 'pane.move.left', when: 'terminalFocused' },
+    { key: 'ctrl+alt+shift+l', command: 'pane.move.right', when: 'terminalFocused' },
+    { key: 'ctrl+alt+shift+k', command: 'pane.move.up', when: 'terminalFocused' },
+    { key: 'ctrl+alt+shift+j', command: 'pane.move.down', when: 'terminalFocused' },
     { key: 'alt+up', command: 'pane.navigate.up', when: '!editorFocused' },
     { key: 'alt+down', command: 'pane.navigate.down', when: '!editorFocused' },
     { key: 'alt+enter', command: 'pane.maximize', when: '!editorFocused' },

@@ -1187,6 +1187,28 @@ pub enum GitError {
     NoSuchChange {
         path: String,
     },
+    /// A path a `.gitignore` rule covers was handed to a staging gesture.
+    ///
+    /// Its own tag rather than [`Self::NoSuchChange`], which is what it used to arrive as and
+    /// what it literally is — an ignored path has no diff, so every walk of the working tree
+    /// finds nothing to apply. "It has no changes" is a true sentence and a useless one: the
+    /// file is right there on screen with content in it, and the reason git will not take it is
+    /// the one thing the message did not say. Reachable from the `Ignored Files` group and from
+    /// a drop of a path some *other* repository's rules ignore.
+    PathIgnored {
+        path: String,
+    },
+    /// The path is a directory holding a git repository of its own — an agent worktree, a
+    /// vendored clone, a submodule that was never registered as one.
+    ///
+    /// libgit2 refuses it as `invalid path: 'x/'`, which is its complaint about the trailing
+    /// slash rather than about the nesting, and reads as a bug in cide. A status walk only ever
+    /// reports an untracked *directory* when it stopped at a repository boundary
+    /// ([`crate::git`]'s walk recurses untracked directories otherwise), so a trailing-slash
+    /// entry that is not ignored is this and nothing else.
+    NestedRepository {
+        path: String,
+    },
 
     /// libgit2 or `git apply` rejected the patch. `patch` is the exact text we synthesized,
     /// because a rejection here is the one failure mode that needs the input to diagnose.
@@ -1525,6 +1547,10 @@ impl std::fmt::Display for GitError {
                 write!(f, "{path} cannot be partially staged: {reason:?}")
             }
             Self::NoSuchChange { path } => write!(f, "{path} has no changes to apply"),
+            Self::PathIgnored { path } => write!(f, "{path} is ignored by a .gitignore rule"),
+            Self::NestedRepository { path } => {
+                write!(f, "{path} is a git repository of its own")
+            }
             Self::PatchRejected { detail, .. } => write!(f, "patch rejected: {detail}"),
             Self::Conflicted { paths } => {
                 write!(f, "{} path(s) are unresolved", paths.len())

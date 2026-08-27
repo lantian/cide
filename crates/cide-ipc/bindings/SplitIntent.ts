@@ -7,4 +7,4 @@ import type { SessionId } from "./SessionId";
  * This enum *is* the multiplexing model: "one session but splittable" resolves as one
  * **primary** session plus panes that each declare what they want.
  */
-export type SplitIntent = { "kind": "newClaude" } | { "kind": "forkPrimary" } | { "kind": "mirror", session: SessionId, } | { "kind": "shell" };
+export type SplitIntent = { "kind": "newClaude" } | { "kind": "forkPrimary" } | { "kind": "mirror", session: SessionId, } | { "kind": "resume", session: SessionId, } | { "kind": "shell" };

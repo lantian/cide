@@ -19,6 +19,23 @@
 }
 
 /*
+ * **A terminal's cluster is one button wider**, because only a terminal draws the grab handle.
+ *
+ * The base `--pane-corner` below is the four-button cluster, and it stays that number: the
+ * three surfaces that actually *reserve* it — `panes/DiffPane`, `panes/GitDiffPane` and
+ * `panes/EditorPane`, which park their own controls in the same corner — are precisely the pane
+ * kinds that get no handle. So they keep the reserve they had, and the wider cluster only
+ * appears on panes whose content is an xterm and reserves nothing.
+ *
+ * 125 + one 22px `.action` + one 2px gap = 149. `check:rows` derives that sum rather than
+ * restating it, so a sixth button fails there instead of quietly eating a neighbour's edge.
+ */
+.frame[data-kind='claude'],
+.frame[data-kind='shell'] {
+  --pane-corner: 149px;
+}
+
+/*
  * **The one rule that moves the cluster down a strip.** (M16)
  *
  * The find bar is a CodeMirror top panel — `position: sticky; top: 0`, the full width of the
@@ -224,6 +241,19 @@
   position: absolute;
   inset: 0;
   border: 1px solid var(--accent);
+  /*
+   * On a chrome-flush edge the frame's own border is 0 wide (`--pane-edge-*`, set by the
+   * leaf), so of the ring's two accent pixels only this pseudo-element's one survived there —
+   * the first pane in a row wore a thinner left edge than its siblings, and it was reported
+   * as such. The ring compensates: `2px - <the frame's width on that edge>` keeps the total
+   * at exactly two accent pixels on every edge without touching the frame's widths, which
+   * must stay zero on flush edges (the seam argument in `SplitTree.module.css`) and must not
+   * change on focus (the resize note at the top of this file — a pseudo-element border moves
+   * no content). The right edge has no mark and stays the plain 1px over the 1px frame.
+   */
+  border-left-width: calc(2px - var(--pane-edge-left, 1px));
+  border-top-width: calc(2px - var(--pane-edge-top, 1px));
+  border-bottom-width: calc(2px - var(--pane-edge-bottom, 1px));
   /* Above the body, below the cluster. Never a hit target. */
   z-index: 1;
   pointer-events: none;
@@ -507,6 +537,72 @@
  */
 .frame:hover .reveal {
   opacity: 1;
+}
+
+/*
+ * The pane being dragged keeps its cluster up.
+ *
+ * Without this the handle vanishes the moment the pointer leaves the pane it started in —
+ * `.frame:hover .reveal` stops matching — so the user is dragging a control that is no longer
+ * drawn. The file tree pins `data-dragging` for the same reason.
+ */
+.frame[data-drop='source'] .reveal {
+  opacity: 1;
+}
+
+/*
+ * And the pane being dragged is dimmed, so the picture says which one is in flight.
+ *
+ * On `.body`, not on `.frame`: dimming the frame would take the drop band down with it, and
+ * the band is the other half of the same message.
+ */
+.frame[data-drop='source'] .body {
+  opacity: 0.55;
+}
+
+/*
+ * The drop band: which edge of this pane the release would land on.
+ *
+ * A quarter of the pane, so the target reads as a *half-of-a-half* — the shape the layout will
+ * actually take — rather than as a hairline that only says "here". Never a hit target: the
+ * gesture is tracked on `window`, and a live element here would take the pointer off the pane
+ * it is describing. No transition, deliberately: `check:motion` fences this file's pane
+ * surfaces off, because an interpolated overlay repaints a live terminal underneath it.
+ */
+.dropBand {
+  position: absolute;
+  background: var(--accent);
+  opacity: 0.28;
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  pointer-events: none;
+  /* Above the body, below the cluster — the same band the focus ring sits in. */
+  z-index: 1;
+}
+
+.dropBand[data-edge='left'] {
+  inset: 0 auto 0 0;
+  width: 50%;
+}
+
+.dropBand[data-edge='right'] {
+  inset: 0 0 0 auto;
+  width: 50%;
+}
+
+.dropBand[data-edge='top'] {
+  inset: 0 0 auto 0;
+  height: 50%;
+}
+
+.dropBand[data-edge='bottom'] {
+  inset: auto 0 0 0;
+  height: 50%;
+}
+
+/* The handle is a drag source, so it says so on hover rather than offering a click. */
+.actionGrab {
+  cursor: grab;
 }
 
 /* The keyboard's route in. Scoped to the cluster, emphatically not `.frame:focus-within` —

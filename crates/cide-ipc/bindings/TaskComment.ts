@@ -39,11 +39,24 @@ export type TaskComment = {
  */
 id: CommentId, author: TaskAuthor, 
 /**
- * The text, verbatim.
+ * The text, verbatim. **Markdown**, since M27.
  *
- * **Never rendered as markup.** It is model-authored, and rendering model-authored markup
- * inside the IDE's own chrome is an injection surface bought for nothing at a 320px panel
- * width. `TasksPanel` draws it as text with whitespace preserved.
+ * This said "never rendered as markup" until M31, and by then it had been wrong for a
+ * milestone: `TaskMarkdown.tsx` renders it. The refusal it recorded was about a *road*, not
+ * about markup — `string -> HTML string` into `dangerouslySetInnerHTML`, model-authored, in
+ * the IDE's own chrome. That road is still not taken. The parser produces no HTML node of
+ * any kind, every string reaches the DOM as a React child through React's escaping, and a
+ * link is drawn as accented text that activates nothing; `TaskMarkdown.tsx`'s header carries
+ * the whole argument and `check:markdown` asserts the parser can never invent such a node.
+ *
+ * Leaving the stale sentence here was not free. It was mirrored into the MCP input schema
+ * (`cide_agents::tools`), so every agent was told in the tool it was about to call that its
+ * report would not be formatted — and wrote one flat paragraph, which is exactly what the
+ * card then drew. A comment is read by a person; the wording an agent is handed here is the
+ * thing that decides whether it is readable.
+ *
+ * One dialect note: the card parses with `softBreak: 'break'`, so a lone newline is a line.
+ * A comment is a message, not a `.md` file — the markdown *preview* keeps CommonMark.
  */
 text: string, 
 /**

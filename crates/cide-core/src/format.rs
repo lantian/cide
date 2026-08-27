@@ -23,8 +23,49 @@
 //! so `--stdin-filepath=${file}` is one argument and stays one however many spaces the path
 //! contains. That is the whole of the substitution language, on purpose: a user who needs a
 //! pipeline writes a two-line script and names the script.
+//!
+//! # The builtin road (M32)
+//!
+//! [`configured`] still answers only the settings question. [`builtin`] is a different one —
+//! *does cide itself know how to format this language?* — and it is the floor beneath both
+//! other roads: `cide_app::cmd::format` reaches it only when no settings row exists **and**
+//! no language server claims the language, so a user's row and an installed server both stay
+//! live levers over it. Today the answer is yes for exactly one language, JSON, whose
+//! reprinter lives in [`json`].
 
 use std::path::Path;
+
+pub mod json;
+
+/// What the readout names when cide's own formatter did the work.
+///
+/// Every other `by` is a binary's file name — `prettier`, `rustfmt` — because every other
+/// road runs a binary. This road is compiled in, so the honest name is the application's own;
+/// the exception is documented on `FormatAnswer::Formatted::by`.
+pub const BUILTIN_FORMATTER_NAME: &str = "cide";
+
+/// cide's own formatter for `language_id`, when it has one.
+///
+/// `None` — cide has no builtin for this language, and the caller falls through to its
+/// no-formatter sentence. `Some(Err(sentence))` — cide has one and the text refuses to
+/// parse; the sentence is shown to the user verbatim, the same refused-rather-than-ignored
+/// contract as [`Configured::Refused`]. `Some(Ok(text))` may equal the input, which the
+/// caller maps to `Unchanged` so a reflexive reformat stays silent.
+#[must_use]
+pub fn builtin(
+    language_id: &str,
+    text: &str,
+    tab_size: u8,
+    insert_spaces: bool,
+) -> Option<Result<String, String>> {
+    match language_id {
+        "json" => Some(
+            json::reformat(text, tab_size, insert_spaces)
+                .map_err(|error| format!("Not formatted: {error}. The buffer was left alone.")),
+        ),
+        _ => None,
+    }
+}
 
 /// The placeholder for the buffer's own path — absolute, as the editor holds it.
 ///
@@ -252,6 +293,23 @@ mod tests {
         let settings = map(&[("typescript", &["", "prettier"])]);
         let answer = configured(&settings, "typescript", Path::new("/w/a.ts"));
         assert!(matches!(answer, Configured::Refused(_)), "got {answer:?}");
+    }
+
+    #[test]
+    fn json_has_a_builtin_and_typescript_does_not() {
+        // The `None` side is as load-bearing as the `Some`: a builtin for a language cide
+        // cannot actually reprint would silently mangle files, so the table is a closed match
+        // and this test pins its edge.
+        assert!(matches!(builtin("json", "{\"a\":1}", 2, true), Some(Ok(_))));
+        assert_eq!(builtin("typescript", "let x = 1;\n", 2, true), None);
+    }
+
+    #[test]
+    fn the_builtin_reports_a_syntax_error_as_a_sentence() {
+        let Some(Err(sentence)) = builtin("json", "{\"a\": 1", 2, true) else {
+            panic!("broken JSON must be refused with a sentence");
+        };
+        assert!(sentence.contains("line"), "names the position: {sentence}");
     }
 
     #[test]

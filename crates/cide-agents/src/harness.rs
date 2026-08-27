@@ -133,10 +133,82 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
      set the role a task is for with mcp__cide__cide_task_assign, and open a new one with \
      mcp__cide__cide_task_create. Those comments are how you report back: whoever dispatched you \
      reads the task, not your transcript, so a run that finishes without leaving one has reported \
-     nothing. Before you start, comment your plan on the task, and commit each coherent step of \
+     nothing, and a comment is markdown a person reads: give a report of any length structure. \
+     Before you start, comment your plan on the task, and commit each coherent step of \
      the work as you finish it: a run can die mid-turn, and the plan comment plus your branch's \
      commits are the only record of how far you got. When the work is done, set the task's status to review and comment what you did \
      and where; done is the reviewer's call, not yours.";
+
+/// What a run working an OpenSpec change is told, on top of [`TRACKER_PREAMBLE`]. (M28)
+///
+/// # It names one command and then gets out of the way
+///
+/// The rules below are cide's and cannot come from upstream: `openspec` knows nothing about
+/// `.cide/tasks.json`, about the review hop cide watches for, or about who is allowed to archive.
+/// But the *work list* is upstream's, and so is the apply instruction that belongs to whichever
+/// workflow schema the project chose — `apply.tracks` is configurable, the tracked file is a glob,
+/// and any summary written here would be a paraphrase that goes stale on the next `npm i -g`.
+///
+/// So this says its own six sentences and points at
+/// `openspec instructions apply --change <c> --json`, whose answer **outranks it**. That sentence
+/// is in the text deliberately: a model given two overlapping instruction sets needs to be told
+/// which loses.
+///
+/// # Why the path is interpolated rather than the bare word
+///
+/// [`RunPlan::hook_bin`]'s rule, for the same failure. `openspec` is installed by `npm -g`, so it
+/// lives in a Node directory that a *shell* rc file puts on `PATH` and a desktop launcher does
+/// not — and `child_env::prepare_command` gives a child `toolchain::extra_dirs`, which is
+/// `~/.cargo/bin` and `~/go/bin`. A bare `openspec` in this paragraph would therefore resolve to
+/// nothing for exactly the users whose machine has it. cide has already located the binary; it
+/// hands over the path it found.
+///
+/// The template holds `{CHANGE}` and `{OPENSPEC}`; [`spec_preamble`] fills them.
+pub const SPEC_PREAMBLE: &str = concat!(
+    "This task implements the OpenSpec change {CHANGE}, whose proposal, design, task checklist and delta specs are in openspec/changes/{CHANGE}/. ",
+    "Before your first edit, run `{OPENSPEC} instructions apply --change {CHANGE} --json` from the repository root: it answers with that change's context files, its schema's own apply instruction, and the checklist as data — that list is the work, in that order, and it outranks any summary of it including this one. ",
+    "Tick each box off in its file as you finish that step, and commit as you go, so the checklist always says how far you got. ",
+    "If implementing shows you that the proposal, the design or a delta spec was wrong, correct that file in the same commit — a spec that no longer describes the code is worse than no spec. ",
+    "When every box is ticked, set the task's status to review with mcp__cide__cide_task_update and comment what you did. ",
+    "Never run `{OPENSPEC} archive`: archiving merges the deltas into openspec/specs/, and that is the reviewer's call once your branch has been integrated.",
+);
+
+/// The sentence added when the project installed OpenSpec's own apply workflow. (M28)
+///
+/// # Why it points at the command instead of replacing the paragraph with it
+///
+/// Because a headless run is not a chat and cide cannot verify that a slash command reached the
+/// Skill tool the way it does in a pane. What it *can* do is name the thing and say it outranks
+/// the paraphrase — the same move [`SPEC_PREAMBLE`] already makes for
+/// `openspec instructions apply`, and for the same reason: the workflow belongs to whichever
+/// schema the project chose, and any summary of it here goes stale on the next `npm i -g`.
+///
+/// `{APPLY}` is the resolved line, never a name — see [`RunPlan::spec_apply`].
+const SPEC_APPLY_CLAUSE: &str = concat!(
+    " This project installs OpenSpec's own apply workflow as {APPLY}: run it and follow what it says, ",
+    "in preference to the paragraph above, which is cide's summary of the same thing.",
+);
+
+/// [`SPEC_PREAMBLE`] with its two placeholders filled.
+///
+/// `cli` is the absolute path cide resolved, or `None` when it could not find one — in which case
+/// the bare word is used, which is still a runnable line for a user whose shell has it and is a
+/// far better answer than refusing to mention the command at all.
+pub fn spec_preamble(change: &str, cli: Option<&std::path::Path>, apply: Option<&str>) -> String {
+    let openspec = match cli {
+        Some(path) => path.display().to_string(),
+        None => "openspec".to_string(),
+    };
+    let mut text = SPEC_PREAMBLE
+        .replace("{CHANGE}", change)
+        .replace("{OPENSPEC}", &openspec);
+    // Appended rather than interpolated into the middle, so a project without the command gets
+    // byte-for-byte the paragraph it always got — the optionality claim, made structurally.
+    if let Some(apply) = apply.map(str::trim).filter(|line| !line.is_empty()) {
+        text.push_str(&SPEC_APPLY_CLAUSE.replace("{APPLY}", apply));
+    }
+    text
+}
 
 /// Everything one implementation of a CLI has to answer.
 ///
@@ -260,6 +332,25 @@ pub struct RunPlan<'a> {
     /// Absolute, and that is not a detail: the child's cwd is a worktree and its `PATH` is the
     /// user's, so a bare `cide-hook` in a `--mcp-config` resolves to nothing and the CLI reports
     /// `CONNECTION_CLOSED` from a process three levels below anything cide logs.
+    /// The OpenSpec change this run's task implements, if it has one. (M28)
+    ///
+    /// Copied at dispatch from `Task::change`, for [`Self::task_title`]'s reason: this crate
+    /// reads no disk and holds no `Task`, so everything it needs about the work arrives as a
+    /// value. **Derived from the task and never from the dispatch request** — a dispatch that
+    /// could name a different change than its task's would put the board and the branch in
+    /// disagreement with nothing in a position to correct either.
+    pub change: Option<String>,
+    /// Where `openspec` is, for [`spec_preamble`] to interpolate. Two fields rather than one
+    /// struct, mirroring `hook_bin`/`hook_sock`.
+    pub spec_cli: Option<PathBuf>,
+    /// What this project types to run OpenSpec's apply workflow — `/openspec-apply-change`, or
+    /// `/opsx:apply` on a project set up by an older CLI. `None` when it has no such command.
+    ///
+    /// A resolved *line* and not a name, for `spec_cli`'s reason one level up: which spelling a
+    /// project answers to is read off its `.claude/` directory by `cide_spec::claude`, and this
+    /// crate must not carry a second opinion about it. See [`spec_preamble`] for what it does
+    /// with it.
+    pub spec_apply: Option<String>,
     pub hook_bin: Option<PathBuf>,
     /// The socket `cide-hook <event>` writes frames to. `CIDE_HOOK_SOCK`.
     pub hook_sock: Option<PathBuf>,
@@ -541,6 +632,105 @@ mod tests {
         assert_ne!(Delivery::Stdin(b"hi\r".to_vec()), Delivery::Respawn);
     }
 
+    /// The spec paragraph names the change, the resolved binary and the six rules. (M28)
+    #[test]
+    fn the_spec_preamble_names_the_change_the_cli_and_the_rules() {
+        let cli = std::path::Path::new("/home/u/.nvm/versions/node/v22.21.0/bin/openspec");
+        let rendered = spec_preamble("m28-openspec", Some(cli), None);
+
+        // **The assertion that actually catches a rename.** A renamed placeholder leaves its
+        // braces in the text, and a model reading `openspec/changes/{CHANGE}/` would go looking
+        // for a directory with braces in its name — a failure with nothing in a log to find.
+        assert!(
+            !rendered.contains('{'),
+            "a placeholder survived into the rendered text: {rendered}"
+        );
+
+        assert!(
+            rendered.contains("openspec/changes/m28-openspec/"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("/home/u/.nvm/versions/node/v22.21.0/bin/openspec instructions apply"),
+            "the *resolved* path is named, not the bare word — a child's PATH is not a \
+             shell's: {rendered}"
+        );
+        assert!(
+            rendered.contains("--change m28-openspec --json"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("outranks any summary"),
+            "a model given two overlapping instruction sets has to be told which loses: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("status to review with mcp__cide__cide_task_update"),
+            "the hand-back is the hop cide watches for: {rendered}"
+        );
+
+        // The prohibition has to attach to archiving. Asserted on word order rather than on a
+        // byte distance: the interpolated path is as long as the user's home directory, so a
+        // "within N characters" rule fails on a machine with a deep nvm install and passes on a
+        // shallow one — which is a test that reports on the wrong thing.
+        let never = rendered
+            .find("Never run")
+            .expect("the prohibition is there");
+        assert!(rendered[never..].starts_with("Never run `"), "{rendered}");
+        assert!(
+            rendered[never..].contains("archive`: archiving merges the deltas"),
+            "the prohibition names archiving and says what it does: {rendered}"
+        );
+
+        // And the prose is prose: a `\`-continued literal keeps the source's own indentation,
+        // which is how this const first shipped with six-space runs inside sentences.
+        assert!(!rendered.contains("  "), "{rendered:?}");
+
+        // With no binary found, the bare word — still a runnable line for a user whose shell
+        // has it, and a far better answer than not naming the command at all.
+        let bare = spec_preamble("x", None, None);
+        assert!(bare.contains("`openspec instructions apply"), "{bare}");
+        assert!(!bare.contains('{'), "{bare}");
+
+        // A project that installed OpenSpec's own apply workflow gets one sentence more, naming
+        // the *line* that project answers to — `/opsx:apply` on a project set up by an older
+        // CLI, which is why this is a resolved string and not a name this crate spells. It says
+        // which of the two loses, for the reason the paragraph above already says it once.
+        let with_skill = spec_preamble("x", None, Some("/openspec-apply-change"));
+        assert!(
+            with_skill.starts_with(&bare),
+            "appended, never woven in: {with_skill}"
+        );
+        assert!(
+            with_skill.contains("/openspec-apply-change"),
+            "{with_skill}"
+        );
+        assert!(
+            with_skill.contains("in preference to the paragraph above"),
+            "two overlapping instruction sets, and the model is told which loses: {with_skill}"
+        );
+        assert!(!with_skill.contains('{'), "{with_skill}");
+        assert!(!with_skill.contains("  "), "{with_skill:?}");
+        assert_eq!(
+            spec_preamble("x", None, Some("   ")),
+            bare,
+            "a blank line is no command at all, not a sentence naming nothing"
+        );
+    }
+
+    /// A budget, not a measurement — [`TRACKER_PREAMBLE`]'s rule, applied to the paragraph that
+    /// now sits beside it. Two of these in front of a role's own prompt is already most of what
+    /// a short role says about itself.
+    #[test]
+    fn the_spec_preamble_stays_within_its_budget() {
+        assert!(
+            SPEC_PREAMBLE.len() < 1_200,
+            "the spec preamble has grown to {} bytes",
+            SPEC_PREAMBLE.len()
+        );
+    }
+
     /// Every name in the paragraph is a name the model can actually call.
     ///
     /// The tools arrive as `mcp__<server>__<tool>` — measured while `claude.rs::mcp_config` was
@@ -616,6 +806,7 @@ mod tests {
                 def: AgentDef {
                     id: AgentId("developer".into()),
                     label: "Developer".into(),
+                    scope: cide_ipc::agents::AgentScope::Project,
                     harness,
                     description: "Implements one task end to end.".into(),
                     system_prompt: BRIEF.into(),
@@ -629,6 +820,7 @@ mod tests {
                 tools: Vec::new(),
                 permission_mode: None,
                 effort: None,
+                extras: Vec::new(),
             }
         }
 
@@ -641,6 +833,11 @@ mod tests {
                 project: ProjectId::new(),
                 task: Some(TaskId("t-14".into())),
                 task_title: Some("Teach the parser about tabs".into()),
+                // No change in the fixture, so every argv assertion below is about the two
+                // paragraphs a run has always had; the third has its own fixture beside it.
+                change: None,
+                spec_cli: None,
+                spec_apply: None,
                 prompt: "Do the task described above.".into(),
                 hook_bin: Some(PathBuf::from("/opt/cide/cide-hook")),
                 hook_sock: Some(PathBuf::from("/run/user/1000/cide-hooks-42.sock")),

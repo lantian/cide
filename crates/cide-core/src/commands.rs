@@ -449,6 +449,29 @@ fn build() -> Vec<Command> {
         // The row, not the tab: it evens out the tiles beside this pane and leaves every
         // other chain — the rows above and below it included — bit for bit as it was.
         Command::new("pane.evenRow", "Even out the panes in this row", WINDOW).when("paneFocused"),
+        /*
+         * Move the pane itself, rather than the focus. (M31)
+         *
+         * The user's words: *"hotkeys to move panel between rows/columns"*, beside a grab
+         * handle in the pane's corner that does the same with the mouse.
+         *
+         * `terminalFocused`, not `paneFocused`, and the clause is doing real work. The handle
+         * is drawn on claude and shell panes only, and one flag keeps the chord and the button
+         * describing the same gesture — a palette row offering to move an editor pane that has
+         * nothing to grab would be the listed-but-inert state this module exists to prevent.
+         * The flag is also the honest one for the job: it is false for a diff pane, which an
+         * earlier `kind != 'editor'` spelling counted as a terminal.
+         *
+         * The direction names the neighbour the pane moves *past*, and it is resolved by the
+         * same `layout::navigate` walk `pane.navigate.*` uses — so these four and those four
+         * can never disagree about which pane is up. At the edge of the tree the walk answers
+         * nothing and the command is a no-op, deliberately: a move that wrapped would cycle a
+         * layout for ever with no fixed point, which is a worse bargain than a focus that wraps.
+         */
+        Command::new("pane.move.left", "Move pane left", WINDOW).when("terminalFocused"),
+        Command::new("pane.move.right", "Move pane right", WINDOW).when("terminalFocused"),
+        Command::new("pane.move.up", "Move pane up", WINDOW).when("terminalFocused"),
+        Command::new("pane.move.down", "Move pane down", WINDOW).when("terminalFocused"),
         Command::new("pane.navigate.left", "Focus pane left", WINDOW).when("paneFocused"),
         Command::new("pane.navigate.right", "Focus pane right", WINDOW).when("paneFocused"),
         Command::new("pane.navigate.up", "Focus pane up", WINDOW).when("paneFocused"),
@@ -1345,6 +1368,45 @@ fn build() -> Vec<Command> {
         Command::new("sidebar.tasks", "Show tasks sidebar", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["todo", "board", "tracker", "backlog"]),
+        // M28. `projectOpen` for the reason the two above carry it: the panel is about a
+        // project's files, and a detached-pane window has neither a project nor a sidebar.
+        Command::new("sidebar.openspec", "Show OpenSpec sidebar", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&[
+                "spec",
+                "specs",
+                "requirements",
+                "proposal",
+                "change",
+                "spec-driven",
+            ]),
+        /*
+         * Propose a change, and explore before proposing. (M28)
+         *
+         * Both open the composer — the same one the OpenSpec panel's two buttons open — and both
+         * end in the project's pinned Claude session being typed at. They are here because that
+         * is where a gesture with no home on screen goes: the panel is one click away when the
+         * sidebar happens to be showing OpenSpec, and behind two otherwise, and *propose a
+         * change* is the single most common thing a user of this feature does.
+         *
+         * `projectOpen` and not a board condition: whether a project has `openspec/` is a
+         * subprocess away, `CONTEXT_FLAGS` may only name flags the webview actually supplies, and
+         * a flag nobody sets is false for ever and the command silently vanishes from the palette.
+         * The composer itself is what says so — it is the surface that knows the board.
+         */
+        Command::new("spec.propose", "OpenSpec: propose a change", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&[
+                "openspec",
+                "proposal",
+                "change",
+                "spec",
+                "new change",
+                "opsx",
+            ]),
+        Command::new("spec.explore", "OpenSpec: explore before proposing", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["openspec", "explore", "investigate", "spec", "opsx"]),
         /*
          * The extension manager. (M22)
          *

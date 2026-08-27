@@ -63,9 +63,18 @@
  * the panel refusing to read what its main authors write.
  */
 import { useRef, useState, type JSX } from 'react'
-import { canOpen, canPause, elapsed, phaseGlyph, type RunPhase, type RunView } from '@/sidebar/AgentsPanel/model'
+import {
+  canOpen,
+  canPause,
+  elapsed,
+  glyphSpins,
+  phaseGlyph,
+  type RunPhase,
+  type RunView,
+} from '@/sidebar/AgentsPanel/model'
 import { OverlayCard } from '@/overlays/ModalShell'
 import {
+  LINK_KINDS,
   TASK_STATUSES,
   UNASSIGNED,
   agentChip,
@@ -81,6 +90,8 @@ import {
   historyOrder,
   fieldLabel,
   isFieldEmpty,
+  isLinkKind,
+  linkLabel,
   restText,
   statusGlyph,
   statusLabel,
@@ -89,6 +100,9 @@ import {
   type EditIntent,
   type EditableField,
   type FieldEdit,
+  type LinkChip,
+  type LinkKind,
+  type LinkTargetOption,
   type RunRef,
   type TaskStatus,
   type TaskView,
@@ -96,7 +110,23 @@ import {
 } from './model'
 import { Icon, asIcon } from '@/icons/Icon'
 import { MentionTextarea } from './MentionTextarea'
+import { LinkTargetInput } from './LinkTargetInput'
 import { TaskMarkdown } from './TaskMarkdown'
+import { RequirementEditor } from '@/sidebar/OpenSpecPanel/RequirementEditor'
+import {
+  artifactPath,
+  progressLabel,
+  progressPercent,
+  sessionHint,
+  sessionState,
+  showsAssignee,
+  targetKey,
+  validityLabel,
+  type DispatchTarget,
+  busyLabel,
+  type SpecCardView,
+  type SpecEditView,
+} from './specCard'
 
 import styles from './TasksPanel.module.css'
 
@@ -263,7 +293,16 @@ export function DeleteControl({
     return (
       <button
         type="button"
-        className={compact ? cx(styles.rowDelete) : cx(styles.action)}
+        /*
+         * Red **unarmed** as well as armed. It was `--red` only once it had been pressed, on the
+         * theory that arming is what makes it dangerous — but the colour is what tells somebody
+         * scanning the foot of the card which of these two buttons is the one that destroys
+         * something, and by the time it is armed they have already pressed it. `--red` means
+         * "this destroys work" in exactly one place in this app; a delete is that place.
+         */
+        className={
+          compact ? cx(styles.rowDelete) : cx(styles.action, styles.actionDanger)
+        }
         data-audit="tasksDelete"
         data-write="true"
         title={DELETE_TITLE}
@@ -312,6 +351,34 @@ function asRun(chip: Chip): RunView {
   }
 }
 
+/**
+ * The change's artifacts, by the schema's id for each, and the file each one *is*. (M28)
+ *
+ * The file names are printed beside the section headings on purpose. The brand is shown, not
+ * hidden: a user who has driven three changes through this card knows the directory layout
+ * without ever having been taught it, and everything they learned transfers to the CLI, to the
+ * docs and to a teammate's editor. `artifactPath` resolves the real path from what the CLI
+ * reported — nothing here joins a filename, because the artifact set is schema-driven.
+ */
+const SPEC_SECTIONS: readonly { id: string; label: string; file: string }[] = [
+  { id: 'proposal', label: 'Proposal', file: 'proposal.md' },
+  { id: 'design', label: 'Design', file: 'design.md' },
+  { id: 'tasks', label: 'Steps', file: 'tasks.md' },
+]
+
+/**
+ * The add picker's state: which kind the next link takes. (M30)
+ *
+ * It used to carry a `target` as well, chosen from a `<select>` and committed by an Add
+ * button. The target lives in the search input now (`LinkTargetInput`, whose query is its own
+ * transient state, the mention popup's arrangement) and **choosing is the commit** — so the
+ * only fact the host must hold is which kind a pick will mean, and the shape says exactly
+ * that.
+ */
+export interface LinkAdd {
+  kind: LinkKind
+}
+
 export interface TaskDetailProps {
   task: TaskView
   /** Every run cide knows about, so the live-run strip can find this task's. */
@@ -326,6 +393,109 @@ export interface TaskDetailProps {
   assigneeHint?: string | null | undefined
   /** The clock, as a prop, so the comment log's ages are deterministic under SSR. */
   nowMs: number
+  /**
+   * The OpenSpec change this task implements, once it has been read. (M28)
+   *
+   * **`undefined` means "this task has no spec block"** and is the whole of the optionality
+   * claim: with the prop absent the card's markup is identical to what it was before M28, which
+   * is what `check:agents-render`'s `task-spec-none` story asserts. `null` is the different
+   * statement *there is a change and cide has not read it yet*, which draws the chip and a
+   * pending progress row rather than nothing.
+   */
+  spec?: SpecCardView | null | undefined
+  /**
+   * Why there is no card, when `spec` is `null` and the read has finished. (M28)
+   *
+   * Consulted **only** while `spec === null`, so it is not a second source of truth about what
+   * the block draws — it is the sentence for one of that state's two outcomes. `null` there means
+   * *still reading*; a string means *the read finished and there is nothing*, most often because
+   * the change was archived, which is something the user did and should be told about.
+   *
+   * Without this the two are the same screen, and a failed read is a spinner that never stops.
+   */
+  specProblem?: string | null | undefined
+  /** Press the one prominent action. Absent leaves it drawn but inert with its reason. */
+  onSpecPrimary?: ((task: string, action: 'approve' | 'accept') => void) | undefined
+  /**
+   * `Integrate & Archive` is running. (M28)
+   *
+   * The button goes inert and says so. It is one press that merges a branch, runs
+   * `openspec archive`, re-validates and closes the task — four subprocesses and a git merge, so
+   * seconds, sometimes many — and it shipped with no feedback at all: the card sat exactly as it
+   * was, which reads as a click that missed. A second press while the first is in flight would
+   * be a second merge.
+   */
+  specBusy?: boolean | undefined
+  /**
+   * Start OpenSpec's propose workflow for a task that has no change. (M28)
+   *
+   * **Absent means the button is not drawn**, and that is the optionality claim made
+   * structurally: a project with no `openspec/`, one whose board has not been read, one with no
+   * propose command installed, and a task that already has a change all see the card exactly as
+   * it was before M28. `TaskComposeProps::changes` makes the same claim the same way.
+   */
+  onProposeChange?: ((task: string) => void) | undefined
+  /** Open one of the change's files in an editor pane. */
+  onOpenSpecFile?: ((path: string) => void) | undefined
+  /**
+   * Get back to the conversation this task's work went to, and close the card. (M28)
+   *
+   * `mode` is the whole of the difference. `open` puts the transcript back on screen and stops;
+   * `resume` does that and hands the task to it again, through the same dispatch every other run
+   * gets. Both spawn `claude --resume <id>` when nothing is showing the conversation — a
+   * `SessionId` *is* what cide passes to `--session-id`, so the id, the transcript and the task's
+   * own record of where the work went all stay the same one.
+   *
+   * Closing the card is part of it rather than a second call: a modal left standing over the pane
+   * it just revealed puts the thing the user asked to see behind a scrim.
+   */
+  onOpenSession?: ((session: string, mode: 'open' | 'resume') => void) | undefined
+  /**
+   * The requirement editor, when one is open. (M28)
+   *
+   * `undefined` means no editor and — more importantly — **no pencils**: with it absent the
+   * delta cards are exactly the read-only cards they were, which is what a card belonging to a
+   * change an agent is holding should be.
+   */
+  specEdit?: SpecEditView | null | undefined
+  /** Open the editor on one requirement, by `data-target`. */
+  onSpecEditOpen?: ((target: string) => void) | undefined
+  /**
+   * Where a run could happen — roles, open conversations, and a fresh one. (M28)
+   *
+   * Absent means the picker is not offered at all, which is every ordinary task.
+   */
+  dispatchTargets?: readonly DispatchTarget[] | undefined
+  /** Is the picker open? Owned by the host, so this component stays a function of its props. */
+  dispatchOpen?: boolean | undefined
+  onDispatchOpen?: ((open: boolean) => void) | undefined
+  /** Chosen. The card never decides *how* a target starts — see `DispatchTarget`. */
+  onDispatchTo?: ((task: string, target: DispatchTarget) => void) | undefined
+  /**
+   * The card's link chips, both directions, from `model.ts::taskLinks`. (M30)
+   *
+   * **Absent draws no Links section at all** — the `spec` prop's optionality claim, restated:
+   * with this and `onLink` absent the card's markup is identical to what it was before M30,
+   * which is what the render check's unchanged stories assert. Present-but-empty draws the
+   * section with only the add affordance, because a card that *can* link should say so.
+   */
+  links?: readonly LinkChip[] | undefined
+  /** What the add picker offers — every other task, in panel order (`linkableTargets`). */
+  linkTargets?: readonly LinkTargetOption[] | undefined
+  /**
+   * The add editor's state, or `null`/absent for at rest. Controlled by the host (like
+   * `editing`) rather than a `useState` here, so the render check can draw the open picker as
+   * a story.
+   */
+  linkAdd?: LinkAdd | null | undefined
+  /** Set or clear the add editor's state. */
+  onLinkAdd?: ((state: LinkAdd | null) => void) | undefined
+  /** Write one edge. The host maps it onto `TaskEdit::Link`. */
+  onLink?: ((task: string, kind: LinkKind, target: string) => void) | undefined
+  /** Tombstone one edge. `kind` is the chip's own, verbatim — the store names the refusals. */
+  onUnlink?: ((task: string, kind: string, target: string) => void) | undefined
+  /** Open another task's card — a link chip's click. The host moves `selected`. */
+  onOpenTask?: ((task: string) => void) | undefined
   /**
    * The one field in edit and what has been typed into it, or `null` for a fully read-only card.
    *
@@ -430,9 +600,41 @@ export function TaskDetail(props: TaskDetailProps) {
     onOpenRun,
     onPauseRun,
     onResumeRun,
+    spec,
+    specProblem,
+    onSpecPrimary,
+    specBusy,
+    onProposeChange,
+    onOpenSpecFile,
+    onOpenSession,
+    specEdit,
+    onSpecEditOpen,
+    links,
+    linkTargets,
+    linkAdd,
+    onLinkAdd,
+    onLink,
+    onUnlink,
+    onOpenTask,
+    dispatchTargets,
+    dispatchOpen,
+    onDispatchOpen,
+    onDispatchTo,
   } = props
 
   const chip = agentChip(task, runs, roles)
+
+  /*
+   * Which change this card is looking at, whether or not it has been read. (M28)
+   *
+   * `spec === undefined` is *this task has no change* and must stay indistinguishable from a
+   * pre-M28 card — that is the whole optionality claim. Anything else means there is a change, so
+   * the name comes off the task itself while `spec` is still `null`, and off the card once it
+   * arrives. It was read only off the card, so a task with a change drew **nothing at all** until
+   * four subprocesses had answered: the modal opened with no chip, no block and nothing on screen
+   * saying OpenSpec was being read, and then a whole section appeared out of nowhere.
+   */
+  const specChange = spec === undefined ? null : (spec?.change ?? task.change)
   const comments = commentOrder(task)
   /**
    * Which comment is open in its editor, by id.
@@ -521,6 +723,20 @@ export function TaskDetail(props: TaskDetailProps) {
         >
           Created by {authorLabel(task.createdBy)}
         </span>
+        {/*
+          * The change this task implements. (M28)
+          *
+          * Beside the creator and **not** as a `FieldRow`, for the creator's own reason: it is an
+          * unchangeable fact about *which* task this is rather than a value the card offers to
+          * edit, and a row with no pencil in a column of rows that all have one reads as a
+          * broken affordance. Linking and unlinking are the compose dialog's and the agent's;
+          * this is the card saying what it is looking at.
+          */}
+        {specChange !== null && (
+          <span className={styles.specChip} data-audit="taskSpecChip" data-change={specChange}>
+            openspec: {specChange}
+          </span>
+        )}
         {/*
           * The explicit way out, and the one that is always available.
           *
@@ -620,8 +836,156 @@ export function TaskDetail(props: TaskDetailProps) {
           )}
         </div>
 
-        <FieldRow field="assignee" task={task} roles={roles} editing={editing} run={run} props={props} />
+        {/*
+          * Hidden on an unapproved OpenSpec task. (M28)
+          *
+          * There the assignee is not a field somebody fills in — it is what Approve & dispatch
+          * *sets*, and leaving the row here would be a second road to the same fact that skips
+          * the one choice that matters: whether this work goes to a role, to a conversation
+          * already open, or to a new one. Once something is assigned the row returns, so it can
+          * still be changed the ordinary way. An ordinary task has no Approve button and is
+          * unaffected — `showsAssignee` is the whole rule.
+          */}
+        {showsAssignee(spec, task.agent !== null) && (
+          <FieldRow field="assignee" task={task} roles={roles} editing={editing} run={run} props={props} />
+        )}
         <FieldRow field="body" task={task} roles={roles} editing={editing} run={run} props={props} />
+
+        {/*
+          * Typed links, as a **section** — deliberately not a fifth `FieldRow`. (M30)
+          *
+          * A field is one value with one pencil; an edge set is add-and-remove, with no draft
+          * and no single commit — the argument is written beside `TASK_FIELDS`, whose vocabulary
+          * this section leaves untouched. After the body because a link is context for reading
+          * the statement above it; before the spec block and the run strip, which are about the
+          * change and the process rather than about which tasks this one stands in relation to.
+          *
+          * A chip is a `<button>` that *navigates* — `onOpenTask` moves the card to the target —
+          * and its ✕ is the write. The ✕ is omitted on a directed *incoming* chip: that edge is
+          * stored on (and belongs to) the other task, and the chip itself is the road there. A
+          * `related` chip keeps its ✕ from either end — the store looks on both.
+          */}
+        {links !== undefined && (links.length > 0 || onLink !== undefined) && (
+          <div className={styles.field} data-audit="taskLinks">
+            <div className={styles.fieldHead}>
+              <span className={styles.fieldLabel}>Links</span>
+              {/*
+                * No `data-write`, the pencil's own rule: at rest this opens a picker and writes
+                * nothing. Same element in both states, so the control keeps its place.
+                */}
+              {onLink !== undefined && (
+                <button
+                  type="button"
+                  className={styles.fieldEdit}
+                  data-audit={linkAdd == null ? 'taskLinkAddOpen' : 'taskLinkAddCancel'}
+                  title={linkAdd == null ? 'Link to another task' : 'Stop adding a link'}
+                  aria-label={
+                    linkAdd == null
+                      ? `Link ${task.id} to another task`
+                      : `Cancel linking ${task.id}`
+                  }
+                  onClick={() => onLinkAdd?.(linkAdd == null ? { kind: 'related' } : null)}
+                >
+                  {linkAdd == null ? 'Link…' : 'Cancel'}
+                </button>
+              )}
+            </div>
+            {links.length > 0 && (
+              <div className={styles.linkChips} data-audit="taskLinkChips">
+                {links.map((chip) => (
+                  <span
+                    className={styles.linkPair}
+                    key={`${chip.kind}:${chip.direction}:${chip.target}`}
+                  >
+                    <button
+                      type="button"
+                      className={cx(styles.linkChip, chip.gone ? styles.linkChipGone : undefined)}
+                      data-audit="taskLinkChip"
+                      data-kind={chip.kind}
+                      data-direction={chip.direction}
+                      data-target={chip.target}
+                      data-gone={chip.gone ? 'true' : 'false'}
+                      /*
+                       * The title resolves the target for a hover; a `gone` chip says so instead.
+                       * The chip's own text stays `label id` — a 320px panel cannot afford the
+                       * target's whole title inline, and the id is what agents quote anyway.
+                       */
+                      title={
+                        chip.gone
+                          ? `${chip.target} is no longer on the board`
+                          : `${chip.target}: ${chip.targetTitle?.trim() !== '' ? chip.targetTitle : 'Untitled'}`
+                      }
+                      aria-label={`${chip.label} ${chip.target} — open it`}
+                      onClick={() => onOpenTask?.(chip.target)}
+                    >
+                      {chip.label} {chip.target}
+                      {chip.gone ? ' (gone)' : ''}
+                    </button>
+                    {/* No ✕ on a kind this build cannot spell on the wire — an unlink the store
+                        would refuse is a dead control; the chip itself still draws and still
+                        navigates. */}
+                    {onUnlink !== undefined &&
+                      isLinkKind(chip.kind) &&
+                      (chip.direction === 'out' || chip.kind === 'related') && (
+                        <button
+                          type="button"
+                          className={styles.linkRemove}
+                          data-audit="taskLinkRemove"
+                          data-write="true"
+                          title={`Remove this ${chip.label.toLowerCase()} link`}
+                          aria-label={`Unlink ${chip.target} from ${task.id}`}
+                          onClick={() => onUnlink(task.id, chip.kind, chip.target)}
+                        >
+                          <Icon name="x" size={0} />
+                        </button>
+                      )}
+                  </span>
+                ))}
+              </div>
+            )}
+            {linkAdd != null && onLink !== undefined && (
+              <div className={styles.linkAdd} data-audit="taskLinkAdd">
+                <select
+                  className={cx(styles.select, styles.linkKind)}
+                  data-audit="taskLinkKind"
+                  aria-label="Link kind"
+                  value={linkAdd.kind}
+                  onChange={(event) => {
+                    const kind = event.target.value
+                    // Through the guard, never a cast: the DOM hands back a string, and the
+                    // options below are the only legal ones — `isTaskStatus`'s posture.
+                    if (isLinkKind(kind)) onLinkAdd?.({ kind })
+                  }}
+                >
+                  {LINK_KINDS.map((kind) => (
+                    <option key={kind} value={kind}>
+                      {linkLabel(kind, 'out')}
+                    </option>
+                  ))}
+                </select>
+                {/*
+                  * The target, by search — id-or-title autocomplete, and picking a row IS the
+                  * write (`LinkTargetInput`'s header carries the argument). `data-write` sits on
+                  * the input because a pick from it commits an edge, the same claim the old
+                  * target `<select>` + Add pair made in two controls.
+                  */}
+                <LinkTargetInput
+                  targets={linkTargets ?? []}
+                  listboxId={`task-link-targets-${task.id}`}
+                  data-audit="taskLinkTarget"
+                  data-write="true"
+                  aria-label="Link target"
+                  autoFocus
+                  onPick={(target) => {
+                    onLink(task.id, linkAdd.kind, target)
+                    onLinkAdd?.(null)
+                  }}
+                  onDismiss={() => onLinkAdd?.(null)}
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         {/*
           * The live-run strip: what is running against this task right now, from the same
@@ -629,12 +993,384 @@ export function TaskDetail(props: TaskDetailProps) {
           * three states this task is in. Drawn only when a run is genuinely live — an assignment
           * alone is the assignee row above, not a strip claiming activity.
           */}
+        {/*
+          * The change, in full. (M28)
+          *
+          * **After the body and before the run strip**, and the order is argued: the run strip is
+          * *what is happening right now*, while this is *what the work is against* — which is
+          * context for reading the body immediately above it. Putting it below the strip would
+          * separate a task's statement from its specification with a line about process.
+          *
+          * The whole block is behind `spec === undefined`, which is what keeps a task with no
+          * change rendering byte for byte as it did before M28.
+          */}
+        {/*
+          * The block before it has been read — a state, not an absence. (M28)
+          *
+          * Reading a change is four `openspec` invocations, and each one is a node process: it is
+          * about six tenths of a second even now that they run at once, and it was two and a half
+          * before. That whole time the card drew nothing where the block would be, so a task with
+          * a change opened looking like a task without one, and then grew a section.
+          *
+          * The bar is drawn here too, empty and `aria-valuenow` absent rather than `0`: a bar
+          * reporting zero percent is a *claim about the checklist*, and this state has not read
+          * it. `aria-busy` is what tells a screen reader the difference between an empty bar and
+          * a bar at nothing.
+          */}
+        {spec === null && specChange !== null && (
+          <div
+            className={styles.field}
+            data-audit="taskSpecBlock"
+            data-state={specProblem == null ? 'reading' : 'failed'}
+          >
+            {specProblem == null ? (
+              <>
+                <p className={styles.specPending} data-audit="specPending">
+                  Reading {specChange} from OpenSpec…
+                </p>
+                <div
+                  className={styles.specBar}
+                  data-audit="specProgress"
+                  role="progressbar"
+                  aria-busy="true"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                />
+              </>
+            ) : (
+              /*
+               * The read finished and there is nothing. Most often the change was archived, which
+               * is a thing the user did — so it is a sentence, not a spinner that never stops.
+               * The `.catch` in the host is what makes this reachable at all; without one the
+               * promise rejected into nowhere and the card sat on "Reading…" for ever.
+               */
+              <p className={styles.specPending} data-audit="specFailed">
+                {specProblem}
+              </p>
+            )}
+          </div>
+        )}
+        {spec != null && (
+          <div
+            className={styles.field}
+            data-audit="taskSpecBlock"
+            data-state={spec.archived == null ? 'ready' : 'archived'}
+          >
+            <div className={styles.specSummary}>
+              <span
+                className={styles.specValidity}
+                data-audit="specValidate"
+                data-state={validityLabel(spec).state}
+              >
+                {validityLabel(spec).label}
+              </span>
+              <span className={styles.specProgressLabel} data-audit="specProgressLabel">
+                {progressLabel(spec)}
+              </span>
+            </div>
+            {/*
+              * A real `progressbar`, because a bar that is only a coloured div tells a screen
+              * reader nothing — and this one is the main thing on the card that moves while an
+              * agent works.
+              *
+              * **Not drawn for an archived change.** Its checklist is not recoverable from the
+              * directory — which file is the checklist and what counts as an item are the
+              * schema's business — so the numbers come back `0/0`, and an empty bar over work
+              * that is finished and merged is a picture that is wrong rather than absent. The
+              * summary line above says *archived as …* in its place.
+              */}
+            {spec.archived == null && (
+            <div
+              className={styles.specBar}
+              data-audit="specProgress"
+              role="progressbar"
+              aria-valuenow={progressPercent(spec)}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              {/*
+                * The scale is inline because typed `attr()` is not implemented here — see
+                * `.specBarFill`. `data-pct` is what the digest reads.
+                */}
+              <span
+                className={styles.specBarFill}
+                data-pct={progressPercent(spec)}
+                style={{ transform: `scaleX(${progressPercent(spec) / 100})` }}
+              />
+            </div>
+            )}
+
+            {/*
+              * Where the work went, when it went to a conversation. (M28)
+              *
+              * This row *is* what stands in place of Approve & dispatch: `primaryAction` returns
+              * `none` once `Task::session` is set, so a card that drew neither would be a card
+              * with nothing to do and nothing to look at. Choosing *New Claude session* used to
+              * leave the button standing over a conversation that was already working, which is
+              * an invitation to dispatch the same task twice.
+              *
+              * Three states and not two — see `sessionState`. *Closed* is not a quieter shade of
+              * *not waiting*: it is work with nowhere to continue, and the only one of the three
+              * that names a next step.
+              *
+              * The role path is untouched by all of this. A task assigned to a role has no
+              * session — Rust clears one when the other is set — so this row is absent and the
+              * run strip below is what reports the subagent, exactly as before.
+              */}
+            {spec.session !== null && (
+              <div
+                className={styles.specSession}
+                data-audit="specSession"
+                data-state={sessionState(spec.session, spec.archived !== null).state}
+              >
+                <span className={styles.specSessionState}>
+                  {sessionState(spec.session, spec.archived !== null).label}
+                </span>
+                <span className={styles.specSessionName}>{spec.session.label}</span>
+                {/*
+                  * Drawn whether or not a pane still holds it, which is the fix. (M28)
+                  *
+                  * It used to be withheld once the pane was gone, on the reasoning that a
+                  * control opening onto nothing is what this card refuses — and that left a
+                  * closed conversation with **no way to proceed at all** except handing the work
+                  * somewhere else, which throws away everything it had already worked out. The
+                  * premise was wrong: a closed conversation is not nothing. Its transcript is on
+                  * disk under the id cide passed to `--session-id`, and `claude --resume <id>`
+                  * brings all of it back.
+                  *
+                  * Two controls, and the difference is one nudge: **Open** puts it back on screen
+                  * and stops, **Resume** puts it back and hands the task to it again through the
+                  * same dispatch every other run gets. Resume leads, because on a conversation
+                  * somebody deliberately closed it is the one that carries the work forward.
+                  */}
+                {/*
+                  * Both write controls go once the change is archived. (M31)
+                  *
+                  * **Resume** hands the task to the conversation again through the same dispatch
+                  * every other run gets, and **Hand it elsewhere** dispatches it somewhere new —
+                  * on work that is merged into `openspec/specs/` and whose change directory has
+                  * moved, each of them starts a run against a change that is not there any more.
+                  * `primaryAction` already refuses this arm (`id: 'none'`, *this change has been
+                  * archived*); the row is the second door onto the same gesture and had none of
+                  * that reasoning, so it kept offering both under the card's own *Archived* line.
+                  *
+                  * **Open** stays, and it is the reason the row stays at all: which conversation
+                  * did this work is exactly the thing worth keeping a record of, and reading it
+                  * back writes nothing.
+                  */}
+                {onOpenSession !== undefined && spec.archived === null && (
+                  <button
+                    type="button"
+                    className={styles.specSessionResume}
+                    data-audit="specSessionResume"
+                    data-write="true"
+                    title={
+                      spec.session.open
+                        ? 'Show this conversation and hand it this task again'
+                        : 'Bring this conversation back with `claude --resume` and hand it this task again'
+                    }
+                    onClick={() => onOpenSession(spec.session?.id ?? '', 'resume')}
+                  >
+                    Resume
+                  </button>
+                )}
+                {onOpenSession !== undefined && (
+                  <button
+                    type="button"
+                    className={styles.specSessionOpen}
+                    data-audit="specSessionOpen"
+                    title={
+                      spec.session.open
+                        ? 'Show this conversation and close this card'
+                        : 'Bring this conversation back with `claude --resume`, without asking it for anything'
+                    }
+                    onClick={() => onOpenSession(spec.session?.id ?? '', 'open')}
+                  >
+                    {spec.session.open ? 'Open' : 'Reopen'}
+                  </button>
+                )}
+                {/*
+                  * The way back out, and the reason removing the button does not trap anybody:
+                  * the same picker Approve opens, reachable from the row that replaced it. It
+                  * matters most in the `closed` state, where there is no conversation left to
+                  * carry on in.
+                  */}
+                {dispatchTargets !== undefined && spec.archived === null && (
+                  <button
+                    type="button"
+                    className={styles.specSessionElsewhere}
+                    data-audit="specSessionElsewhere"
+                    data-write="true"
+                    aria-expanded={dispatchOpen === true}
+                    title="Hand this task to a role, another conversation, or a new one"
+                    onClick={() => onDispatchOpen?.(dispatchOpen !== true)}
+                  >
+                    Hand it elsewhere
+                  </button>
+                )}
+              </div>
+            )}
+            {spec.session !== null && (
+              <p className={styles.specHint} data-audit="specSessionHint">
+                {sessionHint(spec.session, spec.archived !== null)}
+              </p>
+            )}
+
+            {/*
+              * Four disclosures, all shut. `open` is never set, `tasksHistory`'s rule: a card
+              * that opens with four expanded documents in it is a card nobody can see the log of.
+              * Each header names the file it is, which is how the vocabulary is taught.
+              */}
+            {SPEC_SECTIONS.map((section) => {
+              const path = artifactPath(spec, section.id)
+              // Drawn only when the artifact exists. The set is decided by the workflow schema in
+              // `openspec/config.yaml`, so a project legitimately need not have a `design.md` —
+              // and a disclosure onto nothing is a control that does nothing.
+              if (path === null && section.id !== 'tasks') return null
+              return (
+                <details
+                  key={section.id}
+                  className={styles.specSection}
+                  data-audit="specSection"
+                  data-section={section.id}
+                >
+                  <summary className={styles.specSummaryRow} data-audit="specSectionSummary">
+                    {section.label}
+                    <span className={styles.specSectionFile}>{section.file}</span>
+                  </summary>
+                  {section.id === 'tasks' ? (
+                    <ul className={styles.specTasks}>
+                      {spec.tasks.map((item, index) => (
+                        <li
+                          key={`${index}:${item.description}`}
+                          className={styles.specTaskRow}
+                          data-audit="specTaskRow"
+                          data-done={item.done ? 'true' : 'false'}
+                        >
+                          <Icon name={asIcon(item.done ? 'check' : 'square')} size={1} />
+                          <span>{item.description}</span>
+                        </li>
+                      ))}
+                      {/*
+                        * Read-only, and one button out to the file. Ticking a box here would
+                        * write into a file a live agent may be holding — and progress is a thing
+                        * to read, not a control.
+                        */}
+                      {path !== null && (
+                        <li className={styles.specTaskRow}>
+                          <button
+                            type="button"
+                            className={styles.specOpen}
+                            data-audit="specOpenFile"
+                            onClick={() => onOpenSpecFile?.(path)}
+                          >
+                            Open {section.file}
+                          </button>
+                        </li>
+                      )}
+                    </ul>
+                  ) : (
+                    <button
+                      type="button"
+                      className={styles.specOpen}
+                      data-audit="specOpenFile"
+                      onClick={() => {
+                        if (path !== null) onOpenSpecFile?.(path)
+                      }}
+                    >
+                      Open {section.file}
+                    </button>
+                  )}
+                </details>
+              )
+            })}
+
+            <details className={styles.specSection} data-audit="specSection" data-section="deltas">
+              <summary className={styles.specSummaryRow} data-audit="specSectionSummary">
+                What this changes
+                <span className={styles.specSectionFile}>specs/</span>
+              </summary>
+              {spec.deltas.map((delta) =>
+                delta.requirements.map((requirement) => (
+                  <div
+                    key={`${delta.spec}:${delta.op}:${requirement.name}`}
+                    className={styles.specDelta}
+                    data-audit="specDeltaCard"
+                    data-op={delta.op}
+                    data-spec={delta.spec}
+                  >
+                    <div className={styles.specDeltaHead}>
+                      <span className={styles.specDeltaOp}>{delta.op}</span>
+                      <span className={styles.specDeltaName}>{requirement.name}</span>
+                      <span className={styles.specDeltaSpec}>{delta.spec}</span>
+                      {specEdit != null && onSpecEditOpen !== undefined && (
+                        <button
+                          type="button"
+                          className={styles.specOpen}
+                          data-audit="specEditOpen"
+                          data-target={requirement.target}
+                          data-write="true"
+                          title="Edit this requirement"
+                          onClick={() => onSpecEditOpen(requirement.target)}
+                        >
+                          <Icon name={asIcon('pencil')} size={1} label="Edit" />
+                        </button>
+                      )}
+                    </div>
+                    {specEdit?.target === requirement.target && specEdit.draft !== null ? (
+                      <RequirementEditor
+                        draft={specEdit.draft}
+                        busy={specEdit.busy}
+                        problem={specEdit.problem}
+                        onDraft={specEdit.onDraft}
+                        onSave={specEdit.onSave}
+                        onCancel={specEdit.onCancel}
+                      />
+                    ) : (
+                      <>
+                        <TaskMarkdown text={requirement.text} />
+                        {requirement.scenarios.map((scenario, index) => (
+                          <div
+                            key={`${index}:${scenario.title}`}
+                            className={styles.specScenario}
+                            data-audit="specScenario"
+                            data-title={scenario.title}
+                          >
+                            <p className={styles.specScenarioTitle}>{scenario.title}</p>
+                            <TaskMarkdown text={scenario.body} />
+                          </div>
+                        ))}
+                        {/*
+                          * The issues this requirement caused, beside it. Never a toast: an
+                          * error about a paragraph belongs next to the paragraph, where the
+                          * thing to change is already on screen.
+                          */}
+                        {requirement.issues.map((issue, index) => (
+                          <p key={index} className={styles.specIssue} data-audit="specIssue">
+                            {issue}
+                          </p>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )),
+              )}
+            </details>
+          </div>
+        )}
         {chip !== null && chip.lit && (
           <div className={styles.runStrip} data-audit="tasksRunStrip">
             <span className={chipClass(chip)} data-audit="tasksStripChip" data-lit="true">
-              <span className={styles.chipDot} aria-hidden="true">
-                {/* `phaseGlyph` returns an icon *name* (`loader-circle`), not a drawable
-                    character — same as the list row's chip, it must go through `Icon`. */}
+              <span
+                /* `phaseGlyph` returns an icon *name* (`loader-circle`), not a drawable
+                   character — same as the list row's chip, it must go through `Icon`. And the
+                   spinner turns, which it did not: `model.ts::SPINNING_GLYPH`. */
+                className={cx(
+                  styles.chipDot,
+                  glyphSpins(phaseGlyph((chip.phase ?? '') as RunPhase)) && styles.chipSpin,
+                )}
+                aria-hidden="true"
+              >
                 <Icon name={asIcon(phaseGlyph((chip.phase ?? '') as RunPhase))} size={0} />
               </span>
               <span className={styles.chipLabel}>{chip.label}</span>
@@ -896,7 +1632,106 @@ export function TaskDetail(props: TaskDetailProps) {
           * there is one answer to what confirms a delete — and it stays a two-click arming here
           * rather than becoming a confirmation dialog, for `DELETE_CONFIRM_TITLE`'s reason.
           */}
+        {/*
+          * The one prominent thing to do about this change, at the **bottom** of the card. (M28)
+          *
+          * It sat inside the spec block, in the middle, which put the card's most consequential
+          * control between two disclosures and above the conversation it is usually decided
+          * from. The eye reaches a decision last, after reading the statement of the work, its
+          * checklist and whatever the log says about it — so that is where the button goes.
+          *
+          * Above the delete row and never below it: `DeleteControl` stays last for its own
+          * stated reason, that a destructive control the hand reaches on the way to something
+          * else is the thing this card refuses.
+          *
+          * Only for an OpenSpec task. `spec == null` is every ordinary one, and there the whole
+          * bar is absent rather than disabled — approving a change is a gesture about a change.
+          */}
+        {/*
+          * One row at the foot of the card: what to do about this change, and what to do about
+          * the task. (M28)
+          *
+          * They were two bordered blocks stacked — each drawing its own rule, so a card with no
+          * change on it still showed the second rule with a lone right-aligned Delete under it,
+          * which read as a stray line. One row, one rule.
+          *
+          * Approve sits at the *left* and Delete stays hard right: they are the two ends of what
+          * can be done here, and a destructive control the hand reaches on its way to something
+          * else is what this card refuses.
+          */}
         <div className={styles.detailActions} data-audit="tasksDetailActions">
+          {spec != null && spec.action.id !== 'none' && (
+            <button
+              type="button"
+              className={cx(
+                styles.action,
+                spec.action.enabled && styles.actionPrimary,
+                specBusy === true && styles.actionBusy,
+              )}
+              data-audit="specPrimary"
+              data-action={spec.action.id}
+              data-write="true"
+              disabled={!spec.action.enabled || specBusy === true}
+              data-busy={specBusy === true ? 'true' : undefined}
+              aria-busy={specBusy === true ? true : undefined}
+              aria-expanded={spec.action.id === 'approve' ? dispatchOpen === true : undefined}
+              title={spec.action.enabled ? spec.action.hint : spec.action.reason}
+              onClick={() => {
+                // Approve opens the picker rather than assigning: *where* the run happens is the
+                // choice this gesture exists to make. Accept has nothing to choose.
+                if (spec.action.id === 'approve') {
+                  onDispatchOpen?.(dispatchOpen !== true)
+                  return
+                }
+                if (spec.action.id === 'accept') onSpecPrimary?.(task.id, 'accept')
+              }}
+            >
+              {/*
+                * A turning spinner and a present participle while it runs, not a frozen label.
+                *
+                * `Integrate & Archive` merges a branch, archives the change, re-validates and
+                * closes the task — and it shipped drawing nothing at all while it did, so the
+                * only honest reading of the card was that the click had missed.
+                *
+                * The mark **rotates**, through `.actionSpinner`. The first version put the same
+                * `loader-circle` here that the run strip draws, on the reasoning that a user has
+                * already learnt what it means there — which was wrong twice: nothing in cide was
+                * animating that mark, so it read as a static shape rather than as progress, and
+                * it was wrapped in `.chipDot`, a run-strip class with no layout of its own, so
+                * the button collapsed around a baseline-aligned svg. See `.actionBusy`.
+                */}
+              {specBusy === true && (
+                <Icon
+                  name={asIcon('loader-circle')}
+                  size={1}
+                  className={styles.actionSpinner ?? ''}
+                />
+              )}
+              {specBusy === true ? busyLabel(spec.action.id) : spec.action.label}
+            </button>
+          )}
+          {/*
+            * The road *into* OpenSpec for a task that is not one. (M28)
+            *
+            * Drawn only when the host passes a handler, which it does only for a project whose
+            * board is ready and whose `.claude/` has a propose command — the `spec` prop's own
+            * optionality rule. This replaced the compose dialog's *New change from this task*,
+            * which scaffolded a stub `openspec validate` refuses; writing a proposal needs the
+            * codebase, so it is a conversation's job and this starts one on it.
+            */}
+          {task.change === null && onProposeChange !== undefined && (
+            <button
+              type="button"
+              className={styles.action}
+              data-audit="specProposeForTask"
+              data-write="true"
+              title="Runs OpenSpec's propose workflow in this project's Claude conversation, and asks it to link the change it writes back to this task."
+              onClick={() => onProposeChange(task.id)}
+            >
+              Make a proposal
+            </button>
+          )}
+          <span className={styles.actionsSpacer} />
           <DeleteControl
             task={task.id}
             label={task.title.trim() !== '' ? task.title : task.id}
@@ -906,6 +1741,34 @@ export function TaskDetail(props: TaskDetailProps) {
             onDelete={onDelete}
           />
         </div>
+
+        {/*
+          * The picker, under the row rather than inside it: it is a list, and a list inside a
+          * flex row of buttons would either squash the row or scroll sideways.
+          *
+          * Each option says what choosing it *does*, because that is the whole of the choice — a
+          * role runs unattended in its own worktree, a conversation already open is typed into.
+          */}
+        {dispatchOpen === true && dispatchTargets !== undefined && (
+          <ul className={styles.targets} data-audit="taskDispatchTargets">
+            {dispatchTargets.map((target) => (
+              <li key={targetKey(target)}>
+                <button
+                  type="button"
+                  className={styles.target}
+                  data-audit="taskDispatchTarget"
+                  data-target={targetKey(target)}
+                  data-kind={target.kind}
+                  data-write="true"
+                  onClick={() => onDispatchTo?.(task.id, target)}
+                >
+                  <span className={styles.targetLabel}>{target.label}</span>
+                  <span className={styles.targetDetail}>{target.detail}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   )

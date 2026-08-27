@@ -15,6 +15,7 @@
   "cide://session-state",
   "cide://session-status",
   "cide://session-tool",
+  "cide://spec-changed",
   "cide://tasks-changed",
   "cide://workspace-changed"
 ]

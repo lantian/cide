@@ -138,6 +138,29 @@ const GIT_DIR: &str = ".git";
 /// The dotfile rule alone would make that impossible; see [`Filter::watched_paths`].
 const CIDE_DIR: &str = ".cide";
 
+/// The project's Claude Code subagents, relative to a root. (M30)
+///
+/// Watched, never drawn — `admits` rejects it on the dot-prefixed rule before any gitignore
+/// matcher runs, exactly as it rejects `.cide`, so nothing here appears in the file tree, in a
+/// `Ctrl+Shift+F` hit list or in the symbol walk. What would otherwise land there is a directory
+/// of system prompts, which is a lot of prose to put in front of somebody searching for a
+/// function name.
+///
+/// The **parent** `.claude/` is deliberately not the unit: see [`Filter::watched_paths`].
+const CLAUDE_AGENTS_DIR: &str = ".claude/agents";
+
+/// OpenSpec's directory: the requirements as they stand, and the changes in flight. (M28)
+///
+/// Watched for [`CIDE_DIR`]'s reason, arrived at from the other side: this one is committed *and
+/// authored by agents*. A dispatched run ticks boxes in `changes/<name>/tasks.md` while it works,
+/// and the progress bar on the task card is fed by exactly those events — so a project that was
+/// not watching this directory would show a run's progress frozen at zero until it finished.
+///
+/// It carries no dot, so the ordinary walk would already reach it; the entry in
+/// [`Filter::watched_paths`] is what makes that true *unconditionally*, including when the
+/// project is gitignoring it and when it does not exist yet.
+const SPEC_DIR: &str = "openspec";
+
 /// Which of the two populations the walk used to drop wholesale the tree actually shows.
 ///
 /// Two independent booleans rather than one "show everything" flag, because they cost
@@ -337,6 +360,52 @@ impl Filter {
                 git: false,
             });
 
+            // And the project's `openspec/`, on the same argument and with one difference. (M28)
+            //
+            // **`recursive: true`**, which only `refs` has earned before now, and it is earned
+            // here for a reason a non-recursive watch cannot cover: the file that matters is
+            // `changes/<name>/specs/<capability>/spec.md`, four levels down, and the one that
+            // moves most is a `tasks.md` an agent ticks a box in. A watch on the top directory
+            // alone would see `changes/` being created and nothing that happens inside it. The
+            // cost is bounded in a way `.git` is not — this tree is documents in tens of
+            // directories, with no `target/` and no object store.
+            //
+            // `git: false`: editing a spec is not a commit, and raising `FsChange::git` for one
+            // would refresh the branch readout every time somebody typed in a proposal.
+            //
+            // Unguarded by `exists()` for the reason the `.cide` entry above states in full: the
+            // event that matters most is `openspec/` *appearing* — an `openspec init` run in a
+            // terminal pane, or a teammate's `git pull` — and a list built from what happened to
+            // be on disk at index time could never report it.
+            watched_paths.push(WatchedPath {
+                path: root.join(SPEC_DIR),
+                recursive: true,
+                git: false,
+            });
+
+            // And the project's Claude Code subagents. (M30)
+            //
+            // **`.claude/agents`, never `.claude`.** The parent also holds transcripts, session
+            // records and whatever a future release puts there; a recursive watch on it is a
+            // storm with no upper bound and no benefit, since nothing outside `agents/` changes
+            // a roster. This is `openspec/`'s bargain — recursive, but over a bounded subtree of
+            // documents — and not `.git`'s.
+            //
+            // `recursive: true` rather than `.cide`'s `false` because the files that matter are
+            // one level *inside* this directory, and Claude Code allows a nested layout
+            // (`agents/team/reviewer.md`) that cide reads as flat but must still notice changing.
+            //
+            // `git: false`: editing a subagent is not a commit.
+            //
+            // Unguarded by `exists()`, on the same argument the two entries above make: the event
+            // that matters most is the directory *appearing* — somebody running Claude Code's
+            // `/agents` for the first time, or a teammate's `git pull`.
+            watched_paths.push(WatchedPath {
+                path: root.join(CLAUDE_AGENTS_DIR),
+                recursive: true,
+                git: false,
+            });
+
             // `info/exclude` is still resolved from the root's *own* git directory, which for
             // a linked worktree is `<common>/worktrees/<name>` and holds no `info/` — so a
             // linked worktree's `info/exclude` is not read. Left as it was on purpose: that
@@ -450,6 +519,33 @@ impl Filter {
     }
 
     /// Whether a path is one of [`Filter::watched_paths`], or lives under one of them.
+    /// Does this exact path ask for a **recursive** watch?
+    ///
+    /// # Why the event loop needs to ask, and not just `Filter::build`
+    ///
+    /// A watched path is registered at startup with the recursion it asked for — but a path that
+    /// is not on disk yet cannot be watched at all, and both non-git entries are deliberately
+    /// listed *before* they exist so that their arrival is an event rather than a silence.
+    ///
+    /// When one does arrive, `crate::watch`'s event loop gives it a watch. Until M28 that was
+    /// always `watch_tree`, which takes a **non-recursive** descriptor per directory it can see
+    /// — so a path that asked for recursion silently lost it for the rest of the session, and
+    /// only got it back on the next launch, when the walk found the directory already there.
+    ///
+    /// That is the failure `refs` earned `recursive` for, arriving from the other direction, and
+    /// `openspec/` hits it squarely: `openspec init` creates the directory mid-session, and the
+    /// next thing to happen is an agent writing `changes/<name>/specs/<cap>/spec.md` — a tree
+    /// several levels deep, created far faster than a per-directory walk can chase it. The
+    /// events for everything below the first new directory are simply never seen.
+    ///
+    /// Exact match, not a prefix: recursion is a property of the entry, and a *child* of a
+    /// recursive watch needs no descriptor of its own.
+    pub fn is_recursive_watch(&self, path: &Path) -> bool {
+        self.watched_paths
+            .iter()
+            .any(|watched| watched.recursive && watched.path == path)
+    }
+
     pub fn is_watched_path(&self, path: &Path) -> bool {
         self.watched_paths.iter().any(|w| path.starts_with(&w.path))
     }
@@ -947,6 +1043,77 @@ mod tests {
         assert!(filter.watchable(&dir.join(".cide"), true));
         assert!(filter.watchable(&dir.join(".cide/config.json"), false));
         assert!(!filter.admits(&dir.join(".cide/config.json"), false));
+    }
+
+    /// The recursion a watched path asks for survives it arriving late. (M28)
+    ///
+    /// The gap this closes: a watched path that does not exist yet cannot be watched at all, so
+    /// `openspec/` — created mid-session by `openspec init` — got its descriptor from the event
+    /// loop instead, which took a *non-recursive* one per directory it could see. An agent then
+    /// wrote `changes/<name>/specs/<cap>/spec.md` faster than that walk could chase it, and every
+    /// event below the first new directory was lost until the next launch.
+    #[test]
+    fn a_watched_path_that_arrives_late_still_asks_for_its_recursion() {
+        let dir = scratch("filter-recursive");
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            vec![dir.path()],
+            Visibility::CONSERVATIVE,
+        );
+
+        assert!(
+            filter.is_recursive_watch(&dir.join("openspec")),
+            "openspec/ asks for recursion, and the event loop has to be able to find that out"
+        );
+        assert!(
+            !filter.is_recursive_watch(&dir.join(".cide")),
+            "…and .cide does not: it is one directory of small files"
+        );
+        // Exact, not a prefix: a child of a recursive watch needs no descriptor of its own, and
+        // answering `true` for one would have the event loop take a second recursive watch
+        // inside the first.
+        assert!(!filter.is_recursive_watch(&dir.join("openspec/changes")));
+        assert!(!filter.is_recursive_watch(&dir.join("src")));
+    }
+
+    /// `openspec/` is watched recursively, is not a git path, and is on the list before it
+    /// exists. (M28)
+    #[test]
+    fn the_openspec_directory_is_watched_recursively_and_is_not_git() {
+        let dir = scratch("filter-openspec");
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            vec![dir.path()],
+            Visibility::CONSERVATIVE,
+        );
+
+        let openspec = dir.join("openspec");
+        assert!(!openspec.exists(), "the point is that it is not there yet");
+        let entry = filter
+            .watched_paths()
+            .iter()
+            .find(|w| w.path == openspec)
+            .expect("openspec/ is watched before it exists — `git pull` can create it");
+
+        assert!(
+            entry.recursive,
+            "the file that matters is changes/<name>/specs/<cap>/spec.md, four levels down, and \
+             the one that moves most is a tasks.md an agent ticks a box in"
+        );
+        assert!(
+            !entry.git,
+            "editing a spec is not a commit; raising FsChange::git would refresh the branch \
+             readout every time somebody typed in a proposal"
+        );
+
+        // And a deep file under it is watchable, which is the property the progress bar needs.
+        assert!(filter.watchable(&openspec.join("changes/add-dark-mode"), true));
+        assert!(filter.watchable(
+            &openspec.join("changes/add-dark-mode/specs/dark-mode/spec.md"),
+            false
+        ));
+        // …while staying an ordinary, visible directory in the tree, unlike `.cide`.
+        assert!(filter.admits(&openspec.join("project.md"), false));
     }
 
     /// The reported bug: `.claude` could not be shown at all.

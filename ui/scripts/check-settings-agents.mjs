@@ -166,6 +166,7 @@ try {
     EFFORT_SUGGESTIONS,
     HARNESSES,
     PERMISSION_MODES,
+    isClaudeScope,
     REQUIRED_FIELDS,
     SCOPES,
     blankDraft,
@@ -241,7 +242,20 @@ try {
 
   const rustScopes = variants(agentsRs, 'pub enum AgentScope {', 'AgentScope')
   eq(sorted(rustScopes), sorted(SCOPES), 'SCOPES is cide_ipc::AgentScope, as a set')
-  eq(SCOPES.length, 2, 'two scopes: a project directory and a global one')
+  eq(
+    SCOPES.length,
+    4,
+    'four scopes: cide’s project and global directories, and Claude Code’s two — see ' +
+      'cide_ipc::AgentScope’s "two families, four directories"',
+  )
+  // The families are a *behavioural* split — the name rule, the harness control, the scope
+  // control and whether Save may create all turn on it — so the predicate is pinned rather than
+  // left to four comparisons that can drift apart.
+  eq(
+    SCOPES.filter((scope) => isClaudeScope(scope)),
+    ['claudeProject', 'claudeGlobal'],
+    'isClaudeScope names exactly the two directories cide does not own',
+  )
 
   const rustHarnesses = variants(agentsRs, 'pub enum Harness {', 'Harness')
   eq(sorted(rustHarnesses), sorted(HARNESSES), 'HARNESSES is cide_ipc::Harness, as a set')
@@ -507,7 +521,14 @@ try {
   )
   eq(fromWire(toWire(full)), { ...full, tools: ['Read', 'Grep'] }, 'a full draft round-trips')
   eq(
-    fromWire({ scope: 'global', name: 'qa', description: '', tools: [], systemPrompt: 'x' }),
+    fromWire({
+      scope: 'global',
+      name: 'qa',
+      description: '',
+      tools: [],
+      systemPrompt: 'x',
+      extras: [],
+    }),
     { ...blankDraft('global'), name: 'qa', systemPrompt: 'x' },
     'and a wire draft with every optional absent comes back as a form with every one unset',
   )
@@ -523,6 +544,32 @@ try {
    * under the *global* file because the project file that shadows it has none, sending the user
    * to edit the file that is not the problem.
    */
+  /*
+   * And the same rule across the two *families*. (M30)
+   *
+   * A `.cide/agents/` role wins over a Claude Code subagent of the same name — that is the
+   * loader's merge order — so the subagent's row must draw as inert. Before the scopes went from
+   * two to four this function asked `scope === 'global'`, which would have answered
+   * `shadowed: false` here and drawn the file that will never run as the one that does.
+   */
+  {
+    const across = rowsFor([
+      { scope: 'claudeProject', name: 'qa', label: 'QA', harness: null, unavailable: null },
+      { scope: 'project', name: 'qa', label: 'QA', harness: null, unavailable: null },
+      { scope: 'claudeGlobal', name: 'solo', label: 'Solo', harness: null, unavailable: null },
+    ])
+    eq(
+      across.map((r) => [r.scope, r.effective, r.shadowed, r.shadows]),
+      [
+        ['project', true, false, true],
+        ['claudeProject', false, true, false],
+        ['claudeGlobal', true, false, false],
+      ],
+      'cide’s own directory wins over Claude Code’s, the stronger row sorts first, and a name ' +
+        'only one file declares shadows nothing whichever scope it is in',
+    )
+  }
+
   const shadowedPair = [
     { scope: 'project', name: 'qa', label: 'QA', harness: null, unavailable: 'claude is not on PATH.' },
     { scope: 'global', name: 'qa', label: 'QA', harness: 'opencode', unavailable: 'claude is not on PATH.' },

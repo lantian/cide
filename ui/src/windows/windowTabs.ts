@@ -137,6 +137,14 @@ export interface ClusterPlan {
   readonly close: 'pane' | 'tab'
   /** What detach acts on. */
   readonly detach: 'pane' | 'tab'
+  /**
+   * Whether the grab handle is drawn — a pane that is its tab's only one has nowhere to go.
+   *
+   * The *kind* gate is not here: it belongs to the frame, which knows what it is drawing.
+   * This answers the question the whole cluster asks, "is there more than one pane", so that
+   * the handle and the maximize toggle cannot disagree about it.
+   */
+  readonly move: boolean
 }
 
 /**
@@ -154,6 +162,7 @@ export function clusterPlan(paneCount: number, pinned: boolean): ClusterPlan {
     maximize: !sole,
     close: sole && !pinned ? 'tab' : 'pane',
     detach: sole && !pinned ? 'tab' : 'pane',
+    move: !sole,
   }
 }
 

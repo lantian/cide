@@ -125,6 +125,7 @@ import {
   windowProjectsOf,
 } from './target'
 import { clusterPlan, detachedTabs } from '@/windows/windowTabs'
+import { useProposeDialog } from '@/sidebar/OpenSpecPanel/ProposeDialog'
 
 export interface DispatchDeps {
   /**
@@ -563,6 +564,34 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         }
         const already = target.tab.tree.maximized === on.pane
         return void ws.maximizePane(on.project, on.tab, already ? null : on.pane)
+      }
+
+      case 'pane.move.left':
+      case 'pane.move.right':
+      case 'pane.move.up':
+      case 'pane.move.down': {
+        if (on === null) return unmet(command, 'no focused pane')
+        // The suffix is the direction, the same shape `pane.navigate.*` below uses.
+        const direction = command.slice('pane.move.'.length) as Direction
+        return void ws.movePaneToward(on.project, on.tab, on.pane, direction).then((moved) => {
+          // `null` is the edge of the tree, and it is not a failure — there was simply nothing
+          // that way. Logged rather than silent so a chord that appears to do nothing can be
+          // told apart from one that is not wired.
+          if (moved === null) return unmet(command, 'nothing in that direction')
+          /*
+           * The keyboard has to follow the pane, and this is the line that is easy to leave
+           * out. `move_pane` leaves the domain's focus on the moved pane, but the move
+           * re-parents it into a different chain grid, so React unmounts its slot and
+           * `paneHosts.parkHost` blurs the terminal on the way out. Without this the ring is
+           * on the pane and the keystrokes are nowhere — the exact defect
+           * `panes/paneFocus.ts` was written about, and the one `pane.navigate.*` shipped with
+           * for two milestones.
+           */
+          if (focusPaneDom(moved)) return
+          void diag.log(
+            `[cide] ${command}: nothing in this window can take the keyboard for pane ${moved}`,
+          )
+        })
       }
 
       case 'pane.navigate.left':
@@ -2112,6 +2141,29 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       case 'task.focusBoard':
       case 'sidebar.tasks':
         if (!requestPanel('tasks')) return unmet(command, 'this window has no sidebar')
+        return
+
+      case 'sidebar.openspec':
+        if (!requestPanel('openspec')) return unmet(command, 'this window has no sidebar')
+        return
+
+      /*
+       * Propose a change, and explore before proposing. (M28)
+       *
+       * These open the composer and nothing else — the send, the refusal and the reveal are all
+       * `ProposeDialog`'s, which is rendered once at top level so this works with the sidebar
+       * shut or showing Files. The panel's two buttons open the same store.
+       *
+       * No project check here: `projectOpen` is the command's own `when` clause, resolved in
+       * Rust against a flag the webview supplies, and a second one in this switch would be a
+       * second answer to the same question.
+       */
+      case 'spec.propose':
+        useProposeDialog.getState().open('propose')
+        return
+
+      case 'spec.explore':
+        useProposeDialog.getState().open('explore')
         return
 
       case 'sidebar.extensions':

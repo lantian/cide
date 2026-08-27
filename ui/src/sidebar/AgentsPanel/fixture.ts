@@ -57,12 +57,16 @@ const TASK_TITLES: Readonly<Record<string, string>> = {
 
 function role(over: Partial<AgentDefView> & Pick<AgentDefView, 'id' | 'label'>): AgentDefView {
   return {
+    scope: 'project',
     harness: 'claude',
     description: 'Implements one task end to end and reports back on it.',
     systemPrompt: 'You are the developer agent for this project. …',
     model: 'sonnet',
     unavailable: null,
     maxConcurrent: 1,
+    // The wire's own default. A role that isolates is the ordinary role, and a story that had
+    // to say so on every line would bury the one story where it matters.
+    worktree: true,
     ...over,
   }
 }
@@ -87,6 +91,29 @@ const ARTIST = role({
   harness: 'opencode',
   description: 'Produces the assets a task asks for.',
   unavailable: 'opencode is not installed.',
+})
+
+/*
+ * The two roles cide did not author. (M30)
+ *
+ * A subagent read out of `.claude/agents/` behaves like every other row — it dispatches, it takes
+ * a slot, it has a description — and the *only* thing that distinguishes it is where it came
+ * from. So both fixtures are deliberately ordinary in every other respect: if a badged row
+ * rendered differently anywhere else, the render check would catch it as a diff against these.
+ *
+ * Both scopes, because they must draw the **same** mark and only a pair can assert that.
+ */
+const REVIEWER = role({
+  id: 'code-reviewer',
+  label: 'Code Reviewer',
+  scope: 'claudeProject',
+  description: 'Reviews a diff for correctness and says what it would change.',
+})
+const RESEARCHER = role({
+  id: 'researcher',
+  label: 'Researcher',
+  scope: 'claudeGlobal',
+  description: 'Reads around a question and reports what it found.',
 })
 
 function run(over: Partial<RunView> & Pick<RunView, 'run' | 'agent' | 'agentLabel'>): RunView {
@@ -353,6 +380,7 @@ export type AgentsStoryName =
   | 'role-finished-only'
   | 'role-multi-run'
   | 'role-unavailable'
+  | 'role-claude-code'
   | 'role-undefined'
   | 'stale-turn'
   | 'rogue-phase'
@@ -442,6 +470,18 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
    */
   'role-unavailable': story({
     roster: ready([RUNNING], [DEVELOPER, QA, ARTIST]),
+  }),
+
+  /*
+   * Claude Code subagents beside a cide role. (M30)
+   *
+   * The whole assertion is the badge: **two** rows carry it, they carry the *same* text, and the
+   * cide role beside them carries none. A story with only one badged row could not tell a badge
+   * keyed on the scope from one keyed on anything else, and a story with no unbadged row could
+   * not tell a badge from a chip drawn on every row.
+   */
+  'role-claude-code': story({
+    roster: ready([], [DEVELOPER, REVIEWER, RESEARCHER]),
   }),
 
   /*

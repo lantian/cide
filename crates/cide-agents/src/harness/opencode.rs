@@ -725,7 +725,21 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
     role.insert(
         "prompt".into(),
         json!(match plan.hook_bin.is_some() {
-            true => format!("{}\n\n{}", def.system_prompt, TRACKER_PREAMBLE),
+            true => {
+                // Three paragraphs at most, in the same order and with the same `\n\n` join the
+                // claude side's fold produces — so one role pointed at either CLI reads the same
+                // brief. (M28 added the third.)
+                let mut prompt = format!("{}\n\n{}", def.system_prompt, TRACKER_PREAMBLE);
+                if let Some(change) = plan.change.as_deref() {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&super::spec_preamble(
+                        change,
+                        plan.spec_cli.as_deref(),
+                        plan.spec_apply.as_deref(),
+                    ));
+                }
+                prompt
+            }
             false => def.system_prompt.clone(),
         }),
     );
@@ -791,6 +805,7 @@ mod tests {
             def: AgentDef {
                 id: AgentId("developer".into()),
                 label: "Developer".into(),
+                scope: cide_ipc::agents::AgentScope::Project,
                 harness: cide_ipc::Harness::Opencode,
                 description: "Implements one task end to end.".into(),
                 system_prompt: "You are the developer agent. Finish the task.".into(),
@@ -804,6 +819,7 @@ mod tests {
             tools: Vec::new(),
             permission_mode: None,
             effort: None,
+            extras: Vec::new(),
         }
     }
 
@@ -816,6 +832,9 @@ mod tests {
             project: ProjectId::new(),
             task: Some(TaskId("t-14".into())),
             task_title: Some("Teach the parser about tabs".into()),
+            change: None,
+            spec_cli: None,
+            spec_apply: None,
             prompt: "Work on task t-14 (Teach the parser about tabs).".into(),
             hook_bin: Some(PathBuf::from("/opt/cide/cide-hook")),
             hook_sock: Some(PathBuf::from("/run/user/1000/cide-hooks-42.sock")),

@@ -65,11 +65,12 @@ import { Icon, type IconName } from '@/icons/Icon'
 import styles from './ProblemsPanel.module.css'
 
 /**
- * The severity marks, and they are deliberately the status bar's and the editor gutter's.
+ * The severity marks, and they are deliberately the editor gutter's.
  *
- * A user reading the margin of a file, the status bar's counters and this panel is looking at
- * one alphabet in three places — which was already the intent when all three were `✗ ⚠ ℹ ·`, and
- * is now literally true: `styles/iconMasks.css` draws the gutter from the same vendored paths.
+ * A user reading the margin of a file and this panel is looking at one alphabet in two places —
+ * which was already the intent when both were `✗ ⚠ ℹ ·`, and is now literally true:
+ * `styles/iconMasks.css` draws the gutter from the same vendored paths. The status bar's
+ * counters were the third place until they were removed (M28).
  */
 const SEVERITY_ICON: Record<Severity, IconName> = {
   error: 'circle-x',

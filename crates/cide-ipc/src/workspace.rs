@@ -708,6 +708,65 @@ pub enum TabKind {
         /// What the extension calls itself. See the note above.
         name: String,
     },
+    /// One OpenSpec change or capability, as a page. (M28)
+    ///
+    /// # Why a tab kind, when these really are files in the project
+    ///
+    /// Because neither is *one* file. A change is a directory — a proposal, a design, a task
+    /// checklist and a delta spec per capability it touches — and which files those are is
+    /// decided by the workflow schema in `openspec/config.yaml`, not by cide. Opening
+    /// `proposal.md` was the first thing the panel did and it is the weakest part of the
+    /// feature: it answers *show me this change* with one of its five documents and no way to
+    /// reach the others, the checklist, the requirement edits, or anything that can be done
+    /// about any of it.
+    ///
+    /// The page also draws things no file contains: whether the change validates, how far its
+    /// checklist has got, which task tracks it, and the actions — because those are what a
+    /// person opening a change is deciding about. `Extension`'s note above makes the same
+    /// argument from the other direction.
+    ///
+    /// # Why one variant and not two
+    ///
+    /// A change and a capability are the same page at two moments — a capability is what a
+    /// change becomes once it is archived — and every arm that has to handle a tab kind would
+    /// otherwise have to handle two of them. The discriminator lives in [`SpecSubject`], where
+    /// exhaustiveness is checked once.
+    OpenSpec {
+        subject: SpecSubject,
+    },
+}
+
+/// What an [`TabKind::OpenSpec`] tab is looking at. (M28)
+///
+/// Carries the id and nothing else. The page reads everything it draws through `spec_change` /
+/// `spec_spec` — deliberately, because a change's contents move while an agent works on it, and
+/// a tab that had cached its own copy would be a second, staler answer than the panel's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum SpecSubject {
+    /// `openspec/changes/<name>/`.
+    Change { change: ChangeName },
+    /// `openspec/specs/<id>/spec.md`.
+    Capability { spec: SpecId },
+}
+
+impl SpecSubject {
+    /// What the tab strip prints.
+    ///
+    /// The bare id, which is what the user typed and what every other tool calls it — a change
+    /// is `add-dark-mode` in the directory, in `openspec show`, and in a teammate's editor.
+    /// Prefixing it with "Change: " would be cide inventing a name for something that has one.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Change { change } => change.as_str().to_string(),
+            Self::Capability { spec } => spec.as_str().to_string(),
+        }
+    }
 }
 
 impl TabKind {
@@ -733,6 +792,7 @@ impl TabKind {
             ),
             Self::Settings { .. } => "Settings".into(),
             Self::Extension { name, .. } => name.clone(),
+            Self::OpenSpec { subject } => subject.label(),
         }
     }
 }

@@ -1,0 +1,465 @@
+/*
+ * The OpenSpec page. (M28)
+ *
+ * A full-width document rather than a panel: it replaces the pane tree the way Settings and an
+ * extension page do, so it has the whole tab to lay out in and reads as a page rather than as a
+ * wide sidebar. Tokens only; every size on the `--fs-ui-*` ladder.
+ */
+
+.page {
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--sp-6) var(--sp-7);
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--fs-ui-13);
+  /* Written twice: WebKitGTK 2.52 drops the unprefixed property. See `check-css-prefix.mjs`. */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-16);
+  font-weight: 600;
+}
+
+.stage,
+.badge {
+  font-size: var(--fs-ui-11);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  color: var(--dim);
+}
+
+.stage[data-stage='ready'] {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.stage[data-stage='invalid'],
+.badge[data-state='failed'] {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.badge[data-state='ok'] {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+/*
+ * The design marker.
+ *
+ * `--accent`, the same ink the primary action uses, because it is telling the reader to do
+ * something — read the design before starting — rather than reporting a verdict. Deliberately not
+ * `--red`: a design document is a good sign about a change, not a fault with it, and the two
+ * badges beside it already own the red and green.
+ */
+.design {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-ui-11);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-1);
+  color: var(--accent);
+}
+
+/*
+ * The proposal's prose.
+ *
+ * `MarkdownPreview` brings its own stylesheet — the same one the editor's preview pane uses — so
+ * there is nothing to restyle here and deliberately no attempt to.
+ *
+ * **No height cap and no scroller of its own.** It shipped with `max-height: 60vh; overflow-y:
+ * auto`, on the reasoning that a long proposal would push the checklist and the requirement cards
+ * off the bottom of a page somebody opened to see them. That was solving the wrong problem with
+ * the wrong tool: the block is a `<details>`, so a reader who wants the rest of the page collapses
+ * it in one click — and a scrollport nested inside a scrolling page is the thing that makes a
+ * wheel gesture land on whichever of the two the pointer happens to be over.
+ *
+ * It also broke the page's own machinery. Every other section flows, so the find bar's
+ * `scrollIntoView` and the run of `data-hit` indices address one scroller; a second one inside a
+ * block means a hit *inside* the prose is scrolled within the box while the page stays put, and
+ * printing the tab would stop at the fold.
+ */
+.prose {
+  padding: var(--sp-2) 0;
+}
+
+.strip {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: var(--sp-4) 0;
+}
+
+.bar {
+  flex: 1;
+  height: 4px;
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+/*
+ * `transform: scaleX`, not `width` — `check:motion` bans transitioning a geometry property, and a
+ * width animation lays out on every frame, which is the mechanism that ban exists for.
+ *
+ * The scale itself is an **inline style**, set by the component. It was
+ * `scaleX(calc(attr(data-pct type(<number>), 0) / 100))`, reading the number off the element's own
+ * attribute so the markup carried no `style=` — and that is CSS Values 5 typed `attr()`, which
+ * WebKitGTK does not implement. An unsupported value makes the whole declaration invalid, so it
+ * was **dropped**, `width: 100%` stood alone, and every change drew a full orange bar over
+ * "0 / 31 steps". Nothing failed and nothing logged; the bar simply asserted the opposite of the
+ * figure beside it.
+ *
+ * `data-pct` stays, because the SSR digest reads the number off the markup and an assertion about
+ * a `style=` string would be an assertion about how React spells a transform.
+ */
+.barFill {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: var(--accent);
+  transform-origin: left center;
+  transition: transform var(--dur-1) var(--ease-out);
+}
+
+.figure {
+  flex: 0 0 auto;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-5);
+}
+
+.button {
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  padding: var(--sp-1) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color var(--dur-1) ease;
+}
+
+.button:hover {
+  background: var(--panel);
+}
+
+.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.hint,
+.empty,
+.reading,
+.failed {
+  margin: 0;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+/*
+ * A block is open by default and collapses on its own summary. `list-style: none` plus the
+ * marker rule below because the default triangle sits outside the flow and pulls the heading
+ * off the left edge every other section starts on.
+ */
+.block {
+  margin-top: var(--sp-5);
+}
+
+.block > summary::marker,
+.block > summary::-webkit-details-marker {
+  content: '';
+}
+
+.heading {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  cursor: pointer;
+  list-style: none;
+  margin: var(--sp-6) 0 var(--sp-2);
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--dim);
+}
+
+.doc {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-2);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  background: none;
+  border: 0;
+  border-radius: var(--r-1);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.doc:hover {
+  background: var(--panel-2);
+}
+
+/* An artifact whose file is not there yet. Not a control — there is nothing to open. */
+/* An artifact whose file is not there yet. Not a control — there is nothing to open. */
+.missing {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  margin-top: var(--sp-5);
+  font-size: var(--fs-ui-12);
+  color: var(--faint);
+}
+
+/* The document itself. `pre-wrap`, because these are markdown files and their line breaks are
+ * theirs — reflowing a proposal would be the page rewriting the thing it is showing. */
+.document {
+  margin: 0;
+  padding: var(--sp-2) 0 var(--sp-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.open {
+  margin-left: var(--sp-2);
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.docName {
+  font-weight: 500;
+}
+
+.docPath {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: 2px 0;
+  font-size: var(--fs-ui-12);
+}
+
+.step[data-done='true'] {
+  color: var(--dim);
+}
+
+.delta {
+  padding: var(--sp-3) 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.deltaHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-size: var(--fs-ui-11);
+}
+
+.op {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+
+.op[data-op='added'] {
+  color: var(--green);
+}
+
+.op[data-op='removed'] {
+  color: var(--red);
+}
+
+.deltaName {
+  font-weight: 600;
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
+.deltaSpec {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  color: var(--faint);
+}
+
+.edit {
+  flex: 0 0 auto;
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0 var(--sp-1);
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.deltaText {
+  margin: var(--sp-2) 0;
+  line-height: 1.55;
+}
+
+.scenario {
+  margin: var(--sp-2) 0;
+  padding-left: var(--sp-4);
+  border-left: 2px solid var(--border-soft);
+}
+
+.scenarioTitle {
+  margin: 0 0 2px;
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  color: var(--dim);
+}
+
+.scenarioBody {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+/*
+ * The capability page's body.
+ *
+ * There was a `.specBody` here — monospace, `white-space: pre-wrap` — because the page printed
+ * `spec.md` as source. It renders it now, so the rule is `.prose` plus the top margin the `<pre>`
+ * carried: `.prose` is a *section* of a page and needs none, and this is the page.
+ */
+.specProse {
+  margin-top: var(--sp-4);
+}
+
+.problems {
+  margin: var(--sp-3) 0;
+}
+
+.problem {
+  margin: var(--sp-1) 0;
+  padding-left: var(--sp-3);
+  border-left: 2px solid var(--red);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  line-height: 1.45;
+}
+
+/* ------------------------------------------------------------------------ finding (M28) */
+
+/*
+ * Sticky at the top of the page's own scroller, which is what the editor's find bar does.
+ *
+ * The negative margins pull it out to the page's padding edge so it spans the full width and
+ * nothing scrolls past it down the sides; the matching padding puts its contents back where the
+ * rest of the page's content starts. `z-index: 1` because the marks below carry a background and
+ * would otherwise paint over it as they pass under.
+ */
+.find {
+  position: sticky;
+  top: calc(-1 * var(--sp-6));
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: calc(-1 * var(--sp-6)) calc(-1 * var(--sp-7)) var(--sp-4);
+  padding: var(--sp-2) var(--sp-7);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.findInput {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  border: 0;
+  background: none;
+  color: var(--text);
+  outline: none;
+}
+
+.findCount {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.findClose {
+  flex: 0 0 auto;
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+/*
+ * A hit, and the current hit.
+ *
+ * Two classes because a find bar that highlights every match identically leaves the reader
+ * counting rows to work out which one Enter just moved to.
+ */
+.hit {
+  background: var(--accent-dim);
+  color: var(--bg);
+  border-radius: 2px;
+}
+
+.hitCurrent {
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 2px;
+}

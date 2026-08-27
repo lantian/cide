@@ -3,8 +3,8 @@
 /**
  * Which of the two directories a definition lives in.
  *
- * The two `cide_agents::defs::load_from` merges, named on the wire because **a form has to say
- * which file it is about**. The panel draws one `developer` row where two files may declare it
+ * The four directories `cide_agents::defs::load_from` merges, named on the wire because **a
+ * form has to say which file it is about**. The panel draws one `developer` row where two files may declare it
  * — a project definition shadowing a global one, which `LoadedAgent::shadows` exists to make
  * visible — so a save that guessed would edit whichever the guess landed on, and the user would
  * watch their change have no effect for the same reason shadowing costs an afternoon today.
@@ -13,5 +13,19 @@
  * `Global` is how it stops being this repository's and becomes theirs, on every project they
  * open; there is no key in the file for that, because it *is* which directory the file is in.
  * So scope is a field of the draft and changing it is a move — see `cide_agents::defs::save`.
+ *
+ * # Two families, four directories
+ *
+ * The first two are cide's own. The second two are **Claude Code's** (M30): a subagent is the
+ * same idea in somebody else's format, documented at <https://code.claude.com/docs/en/sub-agents>,
+ * and the directories are already populated on the machines of people who have never opened
+ * cide. Reading them is not a translation layer bolted on — they merge into the one catalog
+ * through the one merge, because a role's identity is its name and two lists keyed by name
+ * would be two answers to "who is `reviewer`".
+ *
+ * What the families do *not* share is who owns the vocabulary. cide defines the keys in
+ * `.cide/agents/` and may refuse one it does not know; it defines none of the keys in
+ * `.claude/agents/` and must therefore preserve every one of them — see
+ * [`AgentDraft::extras`], which exists for exactly that reason.
  */
-export type AgentScope = "project" | "global";
+export type AgentScope = "project" | "global" | "claudeProject" | "claudeGlobal";

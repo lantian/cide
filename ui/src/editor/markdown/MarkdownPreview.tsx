@@ -33,6 +33,20 @@ export interface MarkdownPreviewProps {
   path: string
   /** Activating a link. The host decides what a local, external or fragment target does. */
   onNavigate: (href: string) => void
+  /**
+   * Does this rendering own the scrollport it is drawn in? (M28)
+   *
+   * `true` — the default, and what `MarkdownFrame` is — means the preview *is* the scroller, and
+   * the last block reserves 40vh under itself so the end of a document can still be scrolled to
+   * the top. That is what makes split-view scroll sync usable at the bottom of a file.
+   *
+   * `false` is for a rendering that is a **section of a longer page**: the OpenSpec change page
+   * draws a proposal between its Documents list and its checklist, and there the reserved 40vh is
+   * simply a screenful of blank between two sections. The affordance is right where it came from
+   * and meaningless here, so it is a prop rather than something either caller works around — a
+   * `:last-child` override from the outside cannot reach a CSS module's hashed class anyway.
+   */
+  scrolls?: boolean | undefined
 }
 
 /** What the recursive renderers need that is not a block. */
@@ -42,7 +56,12 @@ interface Ctx {
   readonly onNavigate: (href: string) => void
 }
 
-export function MarkdownPreview({ doc, path, onNavigate }: MarkdownPreviewProps): JSX.Element {
+export function MarkdownPreview({
+  doc,
+  path,
+  onNavigate,
+  scrolls = true,
+}: MarkdownPreviewProps): JSX.Element {
   /*
    * A fresh slug map per document, and per *render* of that document.
    *
@@ -58,7 +77,11 @@ export function MarkdownPreview({ doc, path, onNavigate }: MarkdownPreviewProps)
   return (
     <>
       {doc.blocks.map((block, index) => (
-        <div key={`${block.line}:${index}`} className={styles.anchor} data-line={block.line}>
+        <div
+          key={`${block.line}:${index}`}
+          className={scrolls ? styles.anchor : `${styles.anchor} ${styles.inFlow}`}
+          data-line={block.line}
+        >
           {renderBlock(block, ctx, `${index}`)}
         </div>
       ))}

@@ -27,25 +27,37 @@
 //!   panel already groups by.
 //! * **Due date** — nothing in this app can act on a date passing, so it would be decoration
 //!   that ages into a lie.
-//! * **Parent/child** — the orchestrator holds the decomposition in its own context; a tree the
-//!   panel would have to draw at 320px buys hierarchy at the cost of the flat list being
-//!   readable.
 //! * **A human assignee** — the human is the product owner and is on every task. A field whose
 //!   value is constant is not a field.
-//! * **`blocked_by`** — the orchestrator sequences by *dispatching*, so a dependency edge would
-//!   be advisory at best; and a dependency graph the panel cannot draw is a graph nobody reads.
-//!   What a real block looks like in practice — a failed worktree merge — is [`TaskStatus::Todo`]
-//!   plus a comment naming the conflicting paths, which is a shape an agent can actually write.
 //!
 //! Adding any of them later is a field plus a column plus a line in every agent's prompt. That
-//! is the price, and it is worth paying only for one that changes a decision.
+//! is the price, and it is worth paying only for one that changes a decision. Three additions
+//! have now paid it — [`Task::change`] (M28, its doc carries the argument) and, under
+//! [`Task::links`] (M30), two entries this list used to hold:
+//!
+//! * **`blocked_by`** was cut with "the orchestrator sequences by *dispatching*, so a dependency
+//!   edge would be advisory at best" — and for as long as the edge would have been advisory, the
+//!   cut was right. [`LinkType::BlockedBy`] is admitted because it is not advisory: auto-dispatch
+//!   skips a task whose blockers are not done, and an explicit dispatch of one is *refused*, with
+//!   the blocker named in the refusal. It changes what a run reads (`cide_task_list` prints the
+//!   blocking pair), what the panel draws (a chip on both cards), and what accepting the task
+//!   does (nothing, until the blocker is done) — the three-part test above, passed in full. What
+//!   it does not change: a *narrative* block — a failed worktree merge — is still
+//!   [`TaskStatus::Todo`] plus a comment naming the conflicting paths, because that block has a
+//!   story to tell and an edge cannot tell it.
+//! * **Parent/child** was cut because a *tree* the panel must draw at 320px buys hierarchy at
+//!   the cost of the flat list being readable. The flat list is still the rendering;
+//!   [`LinkType::SubtaskOf`] is a pointer drawn as a chip on the card, never as indentation in
+//!   the list. What changed is where the decomposition lives: the orchestrator used to hold it
+//!   only in its own context window, which a compaction or a restart silently discards, and a
+//!   durable edge is that plan surviving the session that made it.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::ids::{AgentId, CommentId, ProjectId, TaskId};
+use crate::ids::{AgentId, ChangeName, CommentId, ProjectId, SessionId, TaskId};
 
 /// Where a task is.
 ///
@@ -154,11 +166,24 @@ pub struct TaskComment {
     #[serde(default)]
     pub id: CommentId,
     pub author: TaskAuthor,
-    /// The text, verbatim.
+    /// The text, verbatim. **Markdown**, since M27.
     ///
-    /// **Never rendered as markup.** It is model-authored, and rendering model-authored markup
-    /// inside the IDE's own chrome is an injection surface bought for nothing at a 320px panel
-    /// width. `TasksPanel` draws it as text with whitespace preserved.
+    /// This said "never rendered as markup" until M31, and by then it had been wrong for a
+    /// milestone: `TaskMarkdown.tsx` renders it. The refusal it recorded was about a *road*, not
+    /// about markup — `string -> HTML string` into `dangerouslySetInnerHTML`, model-authored, in
+    /// the IDE's own chrome. That road is still not taken. The parser produces no HTML node of
+    /// any kind, every string reaches the DOM as a React child through React's escaping, and a
+    /// link is drawn as accented text that activates nothing; `TaskMarkdown.tsx`'s header carries
+    /// the whole argument and `check:markdown` asserts the parser can never invent such a node.
+    ///
+    /// Leaving the stale sentence here was not free. It was mirrored into the MCP input schema
+    /// (`cide_agents::tools`), so every agent was told in the tool it was about to call that its
+    /// report would not be formatted — and wrote one flat paragraph, which is exactly what the
+    /// card then drew. A comment is read by a person; the wording an agent is handed here is the
+    /// thing that decides whether it is readable.
+    ///
+    /// One dialect note: the card parses with `softBreak: 'break'`, so a lone newline is a line.
+    /// A comment is a message, not a `.md` file — the markdown *preview* keeps CommonMark.
     pub text: String,
     /// Milliseconds since the Unix epoch, stamped by Rust when the comment lands.
     ///
@@ -248,6 +273,74 @@ pub struct TaskStatusChange {
     pub at_unix_ms: u64,
 }
 
+/// One kind of edge between two tasks. (M30)
+///
+/// Each directed kind is **stored in one canonical direction** and read the other way round at
+/// render time — [`Task::agent`]'s one-writer rule applied to edges. Storing both directions
+/// would mean two rows for one fact, and the first merge with a stale file where only one row
+/// survived would be a link that exists from one task and not from the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum LinkType {
+    /// Symmetric: reads as "related to" from both ends, and either end may unlink it. Gates
+    /// nothing — it is a cross-reference for a reader, never an instruction to the dispatcher.
+    Related,
+    /// Directed, and the one kind that changes what dispatch *does*: this task is not dispatched
+    /// until the target is [`TaskStatus::Done`]. Stored on the **blocked** task, so the field
+    /// that changes a task's dispatch sits on the task whose dispatch it changes; the target's
+    /// "blocks" reading is derived at render.
+    BlockedBy,
+    /// Directed: this task is one piece of the target's decomposition. Stored on the **child** —
+    /// decomposing creates children pointing at one parent, one edge per create, rather than a
+    /// parent whose edge list must be rewritten once per child. Gates nothing.
+    SubtaskOf,
+}
+
+/// One stored edge between two tasks, on the source task only. (M30)
+///
+/// Unlike a [`TaskStatusChange`], an edge is **mutable** — unlink exists — so it carries the two
+/// fields that let it survive the out-of-process merge: a tombstone and a stamp. There is
+/// deliberately **no `LinkId`**: a comment needed a uuid because edits change its text while its
+/// identity must persist, but an edge *is* its `(link, target)` pair — there is nothing else to
+/// it — so the pair is the merge identity and a minted id would be a second name for the same
+/// fact, with all of [`TaskFile::tasks`]' two-identities hazard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskLink {
+    pub link: LinkType,
+    /// The other task. Never validated against existence *here* — `cide-tasks` refuses a target
+    /// that does not exist at the gesture, but a target deleted afterwards leaves the edge
+    /// dangling and legal, because ids are never reused (see [`TaskId`]) and so a dangling edge
+    /// can never silently come to mean new work. Renderers mark it; nothing prunes it.
+    pub target: TaskId,
+    /// A tombstone — but unlike [`TaskComment::deleted`] it is a **toggle**, not one-way.
+    /// A deleted comment is replaced by writing a new comment under a new id; re-linking the
+    /// same `(link, target)` pair recreates the *same* key, so "deleted wins for ever" would
+    /// make an unlink permanent after any merge. The stamp below is what resolves the toggle;
+    /// `cide_tasks::union_links` carries the argument.
+    #[serde(default)]
+    pub deleted: bool,
+    /// Stamped by Rust when the link or unlink lands, for [`TaskComment::at_unix_ms`]'s reason —
+    /// and load-bearing beyond display: per `(link, target)` key, the merge keeps the copy with
+    /// the newer stamp.
+    pub at_unix_ms: u64,
+}
+
+/// One edge named at task creation. Inbound. (M30)
+///
+/// No tombstone and no stamp — those are the store's to write, for the same reason a comment's
+/// timestamp is: a stamp supplied by whoever is writing is a stamp an agent can get wrong, and
+/// this one decides a merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct TaskLinkSpec {
+    pub link: LinkType,
+    pub target: TaskId,
+}
+
 /// One task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -274,6 +367,86 @@ pub struct Task {
     /// Two writers for one fact is how a task ends up claiming an agent that exited an hour ago,
     /// with nothing anywhere in a position to correct it — the run that would have known is gone.
     pub agent: Option<AgentId>,
+    /// The live Claude session this task's work was handed to, if it went to one. (M28)
+    ///
+    /// # Why this is a second field and not a widened [`Self::agent`]
+    ///
+    /// Because a role and a session are different kinds of thing with different id spaces —
+    /// `AgentId` is a name a file in `.cide/agents/` gives itself, a [`SessionId`] is the uuid
+    /// cide passes to `claude --session-id` — and because of what keying them apart buys.
+    ///
+    /// **Only one of the two is ever set.** `TaskStore::edit` clears the other on every write, so
+    /// "who is on this" stays one fact with one writer; the card reads whichever is present.
+    ///
+    /// **And the auto-dispatch trigger fires on `agent` alone.** That is the whole of why
+    /// handing a task to an open session cannot start it twice: assigning a *role* is a dispatch
+    /// gesture (`cide_agents::autodispatch`'s assignment edge), and this field is not one, so a
+    /// session target is structurally incapable of also spawning a subagent. It is not a check
+    /// that could be forgotten — there is no code path from here into the queue.
+    ///
+    /// `#[serde(default)]`, on [`Self::history`]'s posture: `.cide/tasks.json` is committed, and
+    /// a build that refused last week's file over a field it added would be the tracker locking
+    /// the team out of its own repository. Absent means the task went to a role, or nowhere.
+    ///
+    /// **Not a claim that the session still exists.** A conversation the user closed leaves this
+    /// pointing at nothing, exactly as [`Self::agent`] can name a role whose file was deleted;
+    /// the panel resolves it against what is live and says so when it cannot, which is
+    /// `agentChip`'s rule one layer up.
+    #[serde(default)]
+    #[ts(optional)]
+    pub session: Option<SessionId>,
+    /// The OpenSpec change this task implements, if any — the folder name under
+    /// `openspec/changes/`. (M28)
+    ///
+    /// # Why this one is a field, when six others are not
+    ///
+    /// The header above lists what a task deliberately does not carry, and every one of them is
+    /// cut by the same test: *a field an agent must be taught to fill and a column the panel must
+    /// draw, and neither changes what anybody does next.* This passes that test three times over,
+    /// which is why it is here and `priority` is not. It changes what a dispatched run **reads**
+    /// — `spec_preamble` points it at this change's proposal, design and checklist. It changes
+    /// what the panel **draws** — a progress bar off that checklist, the delta as requirement
+    /// cards, a validity badge. And it changes what accepting the task **does** — integrate, then
+    /// archive this change, then `Done`. A task without it takes none of those paths and renders
+    /// exactly as it did before this field existed.
+    ///
+    /// **It is the change this task belongs to, never "the change an agent is currently on".**
+    /// [`Self::agent`]'s argument, restated for the same reason: one writer for one fact. What a
+    /// live run is working through is `AgentRun::task` followed to this field, derived at render
+    /// time and stored nowhere.
+    ///
+    /// `#[serde(default)]`, on [`Self::history`]'s posture and for its stated reason — and note
+    /// that this does **not** bump [`TaskFile::CURRENT_SCHEMA`]: an additive field with a default
+    /// is not a shape change, because every file that already exists still means exactly what it
+    /// said.
+    ///
+    /// Not validated here — this crate is the wire shape. `cide-tasks` refuses a name that is not
+    /// OpenSpec's kebab grammar before it can reach the file, because this value ends up in a
+    /// `Path::join`.
+    #[serde(default)]
+    #[ts(optional)]
+    pub change: Option<ChangeName>,
+    /// Typed edges to other tasks — this task's own gestures only. (M30)
+    ///
+    /// # Why this one is a field, when the header cut it twice
+    ///
+    /// The module header carries the reversal at length. The short form, against the same
+    /// three-part test [`Self::change`] passed: a [`LinkType::BlockedBy`] edge changes what a
+    /// run **reads** (the blocking pair rides `cide_task_list`), what the panel **draws** (a
+    /// chip on both cards), and what dispatch **does** (auto-dispatch skips a blocked task and
+    /// an explicit dispatch of one is refused, naming the blocker).
+    ///
+    /// **Each edge is stored once, on its canonical side** — see [`LinkType`] — and the other
+    /// task's reading (`blocks`, `subtask`) is derived at render from the whole board, which
+    /// every consumer already holds. Entries may be tombstoned ([`TaskLink::deleted`]) and may
+    /// dangle after the target is deleted; both are legal states of the *file*, refused only as
+    /// *gestures* — `cide-tasks`' `validate` doc says why the difference matters.
+    ///
+    /// `#[serde(default)]`, on [`Self::history`]'s posture and for its stated reason — and, as
+    /// with [`Self::change`], no [`TaskFile::CURRENT_SCHEMA`] bump: an additive field with a
+    /// default is not a shape change.
+    #[serde(default)]
+    pub links: Vec<TaskLink>,
     /// Oldest first, which is the order the panel renders and the order an agent reads.
     pub comments: Vec<TaskComment>,
     /// Every status transition, oldest first. (M27)
@@ -451,6 +624,22 @@ pub struct TaskNew {
     /// not a check that could be forgotten; it is a signature.
     #[ts(optional)]
     pub status: Option<TaskStatus>,
+    /// The OpenSpec change this task implements, if it is known at creation. (M28)
+    ///
+    /// Set at creation and not in a follow-up edit, which matters more than it looks: the
+    /// auto-dispatch trigger reads the task the mutation *left behind*, so a create-then-link
+    /// would dispatch a run from a task that did not yet name its change, and the run would be
+    /// told nothing about the checklist it was started for.
+    #[ts(optional)]
+    pub change: Option<ChangeName>,
+    /// Edges known at creation. Absent means none. (M30)
+    ///
+    /// Here for [`Self::change`]'s exact reason, with a sharper edge: a creation naming an
+    /// assignee dispatches, and the trigger reads the task the mutation left behind — so
+    /// create-then-link would dispatch a run from a task whose `blockedBy` did not exist yet,
+    /// and the one interleaving the gate exists for is the one it could never see.
+    #[ts(optional)]
+    pub links: Option<Vec<TaskLinkSpec>>,
 }
 
 /// One change to one task. Inbound.
@@ -502,6 +691,50 @@ pub enum TaskEdit {
     Assign {
         agent: Option<AgentId>,
     },
+    /// Hand this task's work to a live Claude session, or take it back. (M28)
+    ///
+    /// **Applying this clears [`Task::agent`]**, and `Assign` clears [`Task::session`] — the two
+    /// are one fact with two shapes, and `TaskStore::edit` is where that invariant lives. A task
+    /// claiming both a role and a session would be a card that cannot say who is working on it.
+    ///
+    /// Unlike `Assign`, this is **not** a dispatch gesture: nothing downstream reads it and
+    /// starts anything. See [`Task::session`] for why that is the point.
+    SetSession {
+        session: Option<SessionId>,
+    },
+    /// Link this task to an OpenSpec change, or unlink it. (M28)
+    ///
+    /// `change: null` **unlinks**, which is [`Self::Assign`]'s shape and is here for the same
+    /// reason: absent and null are different instructions, and an enum arm is how the difference
+    /// survives the wire. A task whose change was proposed and then abandoned must be able to go
+    /// back to being an ordinary task without being deleted and retyped.
+    SetChange {
+        change: Option<ChangeName>,
+    },
+    /// Add one edge to another task. (M30)
+    ///
+    /// A pair of variants rather than a `SetLinks` array, and the header's patch-struct argument
+    /// is why: an array field can say what the set *is* but not what the caller *did* — absent,
+    /// null and `[]` between them cannot spell add-versus-remove, so every caller would have to
+    /// read-modify-write the whole set and two concurrent adds would erase each other at the
+    /// seam before the merge ever saw them.
+    ///
+    /// Refused for a self-link, a live duplicate, a target that does not exist, and a
+    /// `blockedBy`/`subtaskOf` edge that would close a cycle — each refusal is a sentence at the
+    /// gesture; `cide_tasks::TaskStore::edit` owns them.
+    Link {
+        link: LinkType,
+        target: TaskId,
+    },
+    /// Tombstone one edge. (M30)
+    ///
+    /// Named by the same `(link, target)` pair `cide_task_get` shows. For [`LinkType::Related`]
+    /// either end may unlink — the edge lives on whichever task made it, and the store looks on
+    /// both.
+    Unlink {
+        link: LinkType,
+        target: TaskId,
+    },
     /// Append one line to the log. There is no edit and no delete — see [`TaskComment`].
     ///
     /// The author is *not* a field here. It is decided by the app from the connection the call
@@ -543,6 +776,14 @@ mod tests {
             body: String::new(),
             status: TaskStatus::Doing,
             agent: Some(AgentId("developer".into())),
+            change: None,
+            links: vec![TaskLink {
+                link: LinkType::BlockedBy,
+                target: TaskId("t-3".into()),
+                deleted: false,
+                at_unix_ms: 1_700_000_000_000,
+            }],
+            session: None,
             comments: vec![TaskComment {
                 id: CommentId("c-1".into()),
                 author: TaskAuthor::Agent {
@@ -570,11 +811,75 @@ mod tests {
     fn a_task_round_trips_under_its_wire_names() {
         let json = serde_json::to_string(&a_task()).expect("serialize");
         // Equality alone would pass with snake_case on both sides, and every multi-word field
-        // would read `undefined` in the webview.
-        for wire in ["createdBy", "createdUnixMs", "updatedUnixMs", "atUnixMs"] {
+        // would read `undefined` in the webview. `blockedBy` pins the LinkType spelling the
+        // MCP tools and the TypeScript union both repeat.
+        for wire in [
+            "createdBy",
+            "createdUnixMs",
+            "updatedUnixMs",
+            "atUnixMs",
+            "blockedBy",
+        ] {
             assert!(json.contains(wire), "missing {wire} in {json}");
         }
         assert_eq!(serde_json::from_str::<Task>(&json).unwrap(), a_task());
+    }
+
+    /// A task from a file written before `Task::links` existed still parses, with no links. (M30)
+    ///
+    /// The same claim `a_task_written_before_the_creator_field_still_parses` pins for M21's
+    /// field, and it has to be re-made per field because `#[serde(default)]` is one attribute a
+    /// refactor can drop with no compile error.
+    #[test]
+    fn a_task_written_before_links_existed_still_parses() {
+        let json = r#"{
+            "id": "t-3",
+            "title": "Write the loader",
+            "body": "",
+            "status": "todo",
+            "agent": null,
+            "comments": [],
+            "createdUnixMs": 1699999999000,
+            "updatedUnixMs": 1700000000000
+        }"#;
+        let task: Task =
+            serde_json::from_str(json).expect("a file this build has to be able to open");
+        assert!(task.links.is_empty());
+    }
+
+    #[test]
+    fn a_link_edit_names_its_kind_and_target() {
+        // The two arms an MCP tool fills in: the wire spelling is the serde camelCase one, and
+        // an unlink is not an absent field — it is its own instruction, `assign_can_say_nobody`'s
+        // point restated for edges.
+        let edit: TaskEdit =
+            serde_json::from_str(r#"{"kind":"link","link":"blockedBy","target":"t-3"}"#).unwrap();
+        assert_eq!(
+            edit,
+            TaskEdit::Link {
+                link: LinkType::BlockedBy,
+                target: TaskId("t-3".into()),
+            }
+        );
+        let edit: TaskEdit =
+            serde_json::from_str(r#"{"kind":"unlink","link":"related","target":"t-9"}"#).unwrap();
+        assert_eq!(
+            edit,
+            TaskEdit::Unlink {
+                link: LinkType::Related,
+                target: TaskId("t-9".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_inbound_link_spec_refuses_a_field_it_does_not_know() {
+        // A caller that sends a stamp or a tombstone is a caller trying to write the store's
+        // fields; `deny_unknown_fields` makes that a parse error rather than a silent drop.
+        let err = serde_json::from_str::<TaskLinkSpec>(
+            r#"{"link":"related","target":"t-2","atUnixMs":5}"#,
+        );
+        assert!(err.is_err(), "a store-owned field was accepted inbound");
     }
 
     /// A task from a file written before `Task::created_by` existed still parses, and reads as

@@ -43,6 +43,7 @@ usage:
   cide-headless keymap                    list resolved bindings with their layer
   cide-headless tasks <root>              render a project's .cide/tasks.json
   cide-headless agents <root>             render its subagent roles and config
+  cide-headless spec <root> [change]      render its openspec/ board, or one change in full
   cide-headless ext                       render marketplaces, extensions and contributions";
 
 fn main() {
@@ -61,6 +62,7 @@ fn main() {
         "keymap" => keymap(),
         "tasks" => tasks(rest),
         "agents" => agents(rest),
+        "spec" => spec(rest),
         "ext" => ext(),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         other => {
@@ -332,6 +334,167 @@ fn tasks(args: &[String]) {
                 ""
             }
         )),
+    }
+}
+
+/// Renders a project's OpenSpec board — its capabilities and the changes in flight. (M28)
+///
+/// The third reason this binary exists, after the no-tauri proof and reading `.cide/`: this one
+/// **spawns a subprocess**, and whether it can find `openspec` on the PATH a given launch has is
+/// the single most likely thing to be wrong on a user's machine. Reproducing that from a terminal
+/// — where the PATH is the shell's, not a desktop launcher's — is how the difference gets
+/// established without a GUI in the way.
+///
+/// It also links `cide-spec`, which is the standing rule this file's header states: a domain
+/// crate that cannot be linked without a webview is a domain crate in the wrong place.
+fn spec(args: &[String]) {
+    // `spec <root>` is the board; `spec <root> <change>` is one change in full. The second form
+    // exists because the board and a card are read by *different* CLI calls — `list` for one,
+    // `show`/`status`/`instructions`/`validate` for the other — so a project whose board renders
+    // and whose card does not is an ordinary state, and this is the only way to see which of the
+    // four is the one that refuses.
+    let (root_args, change) = match args {
+        [root, change] => (std::slice::from_ref(root), Some(change.clone())),
+        _ => (args, None),
+    };
+    let root = project_root(root_args, "spec");
+
+    // cide's own answer, and it has to be: `openspec list --json` in a directory with no
+    // `openspec/` exits 0 with an empty list, so the CLI cannot tell "not set up" from "set up
+    // and empty". Answered before the binary is even looked for, because a project that does not
+    // use OpenSpec is not a machine that is missing a tool.
+    if !cide_spec::present(&root) {
+        emit(&format!(
+            "{}\nno openspec here — `openspec init` creates it, and it is committed with the code\n",
+            cide_spec::spec_path(&root).display()
+        ));
+        return;
+    }
+
+    let os = match cide_spec::Openspec::open(&root) {
+        Ok(os) => os,
+        // The refusal is a sentence naming the install command and the launcher-PATH difference.
+        // Printed whole rather than summarised: it is the only thing on screen that can explain
+        // why a machine with `openspec` installed reports that it has not.
+        Err(error) => fail(error),
+    };
+    emit(&format!("{}\n", os.binary().display()));
+    let Some(change) = change else {
+        match os.board() {
+            Ok(board) => emit(&render_spec(&board)),
+            Err(error) => fail(error),
+        }
+        return;
+    };
+    match os.change(&cide_ipc::ChangeName(change)) {
+        Ok(detail) => emit(&render_change(&detail)),
+        Err(error) => fail(error),
+    }
+}
+
+/// One change as text: what it edits, how far it has got, and whether it validates.
+fn render_change(change: &cide_ipc::SpecChange) -> String {
+    let mut out = format!("{}  {}\n", change.name, change.title);
+    out.push_str(&format!(
+        "  {}/{} task(s)  {}\n",
+        change.progress.completed,
+        change.progress.total,
+        if change.validation.valid {
+            "valid".to_string()
+        } else {
+            format!("{} issue(s)", change.validation.issues.len())
+        }
+    ));
+    for artifact in &change.artifacts {
+        out.push_str(&format!(
+            "  artifact {}  [{:?}]  {} file(s)\n",
+            artifact.id,
+            artifact.state,
+            artifact.existing.len()
+        ));
+    }
+    for delta in &change.deltas {
+        out.push_str(&format!(
+            "  delta {} {}  {} requirement(s)\n",
+            delta.spec,
+            delta.operation.header(),
+            delta.requirements.len()
+        ));
+        for requirement in &delta.requirements {
+            // The name is the field the CLI's JSON does not carry — recovered from the file by
+            // `cide_spec::block::parse`. An empty one here is the symptom that reads as a
+            // nameless card in the panel.
+            out.push_str(&format!(
+                "    {}  ({} scenario(s))\n",
+                if requirement.name.is_empty() {
+                    "<no name recovered>"
+                } else {
+                    &requirement.name
+                },
+                requirement.scenarios.len()
+            ));
+        }
+    }
+    for issue in &change.validation.issues {
+        out.push_str(&format!("  {} {}\n", issue.level, issue.message));
+    }
+    out
+}
+
+/// A spec board as text.
+///
+/// Pure `&T -> String`, this file's rule, so the test below asserts on the exact output rather
+/// than on the shape of something in the middle.
+fn render_spec(board: &cide_ipc::SpecBoard) -> String {
+    match board {
+        cide_ipc::SpecBoard::Absent { hint, path } => {
+            format!("{}\n{hint}\n", path.display())
+        }
+        cide_ipc::SpecBoard::Unusable { reason } => format!("{reason}\n"),
+        cide_ipc::SpecBoard::Ready {
+            changes,
+            specs,
+            commands,
+            ..
+        } => {
+            let mut out = format!(
+                "{} capability(s), {} change(s) in flight\n",
+                specs.len(),
+                changes.len()
+            );
+            // Printed because it is the one question a user cannot answer from the panel when it
+            // goes wrong: the panel's buttons refused on every project for a release, because
+            // OpenSpec moved `/opsx:propose` to `/openspec-propose` and cide had the old spelling
+            // compiled in. An empty list here is that failure, visible, with no window running.
+            if commands.is_empty() {
+                out.push_str(
+                    "  no OpenSpec commands for Claude Code — `openspec init --tools claude` \
+                     installs them\n",
+                );
+            } else {
+                out.push_str("  commands");
+                for command in commands {
+                    out.push_str(&format!(" {}", command.line));
+                }
+                out.push('\n');
+            }
+            for spec in specs {
+                out.push_str(&format!(
+                    "  spec   {}  {} requirement(s)\n",
+                    spec.id, spec.requirement_count
+                ));
+            }
+            for change in changes {
+                // `0/0` is printed as itself and never as "complete": a change whose tracked file
+                // exists and holds no checkboxes is not a finished one, which is the rule the
+                // Review hop turns on.
+                out.push_str(&format!(
+                    "  change {}  {}/{} task(s)  [{}]\n",
+                    change.name, change.completed_tasks, change.total_tasks, change.status
+                ));
+            }
+            out
+        }
     }
 }
 
@@ -1413,6 +1576,9 @@ mod tests {
             body: String::new(),
             status,
             agent: agent.map(|a| AgentId(a.into())),
+            change: None,
+            links: Vec::new(),
+            session: None,
             comments: (0..comments)
                 .map(|i| TaskComment {
                     // Derived from the index, not minted: this fixture's output is compared
@@ -1503,6 +1669,7 @@ mod tests {
                 id: AgentId(id.into()),
                 label: defs::label_from_id(id),
                 harness: Harness::Claude,
+                scope: cide_ipc::agents::AgentScope::Project,
                 description: "does the work".into(),
                 system_prompt: "You are a developer.".into(),
                 model: None,
@@ -1512,6 +1679,7 @@ mod tests {
             },
             origin: PathBuf::from(format!("/p/.cide/agents/{id}.md")),
             shadows: None,
+            extras: Vec::new(),
             tools: Vec::new(),
             permission_mode: None,
             effort: None,

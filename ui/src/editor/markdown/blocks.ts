@@ -31,7 +31,16 @@
  * Import-free apart from its own siblings, so `ui/scripts/check-markdown.mjs` can run it.
  */
 import { normaliseLabel, parseInline } from './inline'
-import type { Align, Block, Inline, LinkDef, ListItem, MarkdownDoc, TableRow } from './types'
+import type {
+  Align,
+  Block,
+  Inline,
+  LinkDef,
+  ListItem,
+  MarkdownDoc,
+  MarkdownOptions,
+  TableRow,
+} from './types'
 
 /** One source line, with the number it had in the file. 1-based, like everything else. */
 interface Line {
@@ -613,7 +622,11 @@ function takeParagraph(
 
 /* --- the inline pass ------------------------------------------------------------------------ */
 
-function finishBlocks(raw: readonly Raw[], refs: ReadonlyMap<string, LinkDef>): Block[] {
+function finishBlocks(
+  raw: readonly Raw[],
+  refs: ReadonlyMap<string, LinkDef>,
+  opts: MarkdownOptions,
+): Block[] {
   const out: Block[] = []
   for (const block of raw) {
     switch (block.k) {
@@ -621,11 +634,20 @@ function finishBlocks(raw: readonly Raw[], refs: ReadonlyMap<string, LinkDef>): 
         // The level came from counting `#`s or from a setext underline; both are already bounded
         // to 1–6, and the cast is what tells the type system so.
         const level = Math.min(6, Math.max(1, block.level)) as 1 | 2 | 3 | 4 | 5 | 6
-        out.push({ kind: 'heading', line: block.line, level, body: parseInline(block.text, refs) })
+        out.push({
+          kind: 'heading',
+          line: block.line,
+          level,
+          body: parseInline(block.text, refs, opts),
+        })
         break
       }
       case 'para':
-        out.push({ kind: 'paragraph', line: block.line, body: parseInline(block.text, refs) })
+        out.push({
+          kind: 'paragraph',
+          line: block.line,
+          body: parseInline(block.text, refs, opts),
+        })
         break
       case 'code':
         out.push({ kind: 'code', line: block.line, lang: block.lang, text: block.text })
@@ -634,13 +656,13 @@ function finishBlocks(raw: readonly Raw[], refs: ReadonlyMap<string, LinkDef>): 
         out.push({ kind: 'rule', line: block.line })
         break
       case 'quote':
-        out.push({ kind: 'quote', line: block.line, body: finishBlocks(block.body, refs) })
+        out.push({ kind: 'quote', line: block.line, body: finishBlocks(block.body, refs, opts) })
         break
       case 'list': {
         const items: ListItem[] = block.items.map((item) => ({
           line: item.line,
           checked: item.checked,
-          body: finishBlocks(item.body, refs),
+          body: finishBlocks(item.body, refs, opts),
         }))
         out.push({
           kind: 'list',
@@ -653,10 +675,10 @@ function finishBlocks(raw: readonly Raw[], refs: ReadonlyMap<string, LinkDef>): 
         break
       }
       case 'table': {
-        const head: Inline[][] = block.head.map((cell) => parseInline(cell, refs))
+        const head: Inline[][] = block.head.map((cell) => parseInline(cell, refs, opts))
         const rows: TableRow[] = block.rows.map((row) => ({
           line: row.line,
-          cells: row.cells.map((cell) => parseInline(cell, refs)),
+          cells: row.cells.map((cell) => parseInline(cell, refs, opts)),
         }))
         out.push({ kind: 'table', line: block.line, head, align: block.align, rows })
         break
@@ -672,8 +694,11 @@ function finishBlocks(raw: readonly Raw[], refs: ReadonlyMap<string, LinkDef>): 
  * `\r\n` and bare `\r` are normalised here rather than by the caller, because the caller is the
  * live CodeMirror buffer and `editor/lineEndings.ts` deliberately keeps a document's original
  * breaks: the preview must not be the reason a file's line endings are a question.
+ *
+ * `opts` defaults to CommonMark in every respect — see `MarkdownOptions` in `types.ts` for the
+ * one thing a caller can change and why only a caller rendering a *message* should change it.
  */
-export function parseMarkdown(source: string): MarkdownDoc {
+export function parseMarkdown(source: string, opts: MarkdownOptions = {}): MarkdownDoc {
   const text = source.replace(/\r\n?/g, '\n')
   const lines: Line[] = text.split('\n').map((value, index) => ({ text: value, no: index + 1 }))
   /*
@@ -683,6 +708,6 @@ export function parseMarkdown(source: string): MarkdownDoc {
    */
   if (lines.length > 1 && (lines[lines.length - 1]?.text ?? '') === '') lines.pop()
   const refs = new Map<string, LinkDef>()
-  const blocks = finishBlocks(parseBlocks(lines, refs), refs)
+  const blocks = finishBlocks(parseBlocks(lines, refs), refs, opts)
   return { blocks, lines: blocks.map((block) => block.line) }
 }

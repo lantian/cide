@@ -1,0 +1,22 @@
+[package]
+name = "cide-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The DTOs this crate answers with. They are cide's contract, not OpenSpec's — the shapes the
+# `openspec` CLI emits live in `model.rs` here, `Deserialize`-only, so an upstream JSON change
+# lands in this crate without touching the wire the panels are built against.
+cide-ipc = { workspace = true }
+# `child_env::run_filter_with` (the spawn chokepoint, and the `PATH` a shebang needs),
+# `toolchain::which`, and `persist::{write_atomic_with_mode, FileStamp}` for the write path —
+# `openspec/` is written exactly the way `.cide/tasks.json` is.
+cide-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+# No dev-dependencies, `cide-tasks`' reason: the tests build scratch directories out of
+# `std::env::temp_dir()` keyed by pid, and the fixtures are checked-in files.

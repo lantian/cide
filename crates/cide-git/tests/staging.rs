@@ -1801,3 +1801,106 @@ fn a_rejected_push_is_an_error_and_not_a_silent_success() {
         "nothing of the refused push landed"
     );
 }
+
+/*
+ * The two paths a staging gesture can be handed that git will never take, and the reason both
+ * have a tag of their own. (M30)
+ *
+ * Reported as *"nothing was added to git — [object Object]"* after dropping `.cide/worktrees`
+ * on a changelist. Two separate bugs met there: the panel printed a tagged wire object with
+ * `String(e)`, which is the frontend's half; and the two refusals it was printing were, in one
+ * case, a sentence about the wrong thing and, in the other, libgit2's complaint about a
+ * trailing slash. A user reading either learns nothing about why the file they can see is not
+ * going in.
+ *
+ * Both cases are asserted through a real `.gitignore` and a real nested repository rather than
+ * by calling the classifier directly, because the input that matters is what a *status walk*
+ * hands the panel — a directory entry with a trailing slash — and that shape is libgit2's
+ * choice, not ours.
+ */
+
+/// An ignored path is refused as ignored, not as "no changes to apply".
+///
+/// The trailing slash is the point: the row the panel drags comes out of `repo_changes`, and
+/// for an ignored directory libgit2 writes it with one. `is_path_ignored` has to answer for
+/// that spelling, and this is what says it does.
+#[test]
+fn an_ignored_path_is_refused_as_ignored() {
+    let repo = TempRepo::new("stage-ignored");
+    repo.write("seed.txt", b"seed\n");
+    repo.write(".gitignore", b"/.cide/worktrees/\n");
+    repo.commit_all("base");
+    repo.write(".cide/worktrees/agent/f.txt", b"hi\n");
+
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    let changes = status::repo_changes(
+        &info,
+        status::StatusRequest {
+            include_ignored: true,
+        },
+    )
+    .expect("status");
+    let row = changes
+        .ignored
+        .iter()
+        .find(|entry| entry.path.starts_with(".cide/worktrees"))
+        .expect("the ignored directory is a row the panel can drag");
+    assert_eq!(
+        row.path, ".cide/worktrees/",
+        "libgit2 spells it with a slash"
+    );
+
+    let err = stage::stage(&repo.root, &[selection(&row.path, Selection::Whole)])
+        .expect_err("an ignored path cannot be added");
+    let GitError::PathIgnored { path } = err else {
+        panic!("an ignored path must say so, got {err:?}");
+    };
+    assert_eq!(path, row.path);
+}
+
+/// A path that is a repository of its own is refused as one.
+///
+/// This is what an agent worktree is on a project whose `.gitignore` has no rule for it, and
+/// what a vendored clone is everywhere. The status walk recurses untracked directories, so an
+/// untracked *directory* row can only be a repository boundary — which is what makes the
+/// classification safe to make from the file system alone.
+#[test]
+fn a_nested_repository_is_refused_as_one() {
+    let repo = TempRepo::new("stage-nested");
+    repo.write("seed.txt", b"seed\n");
+    repo.commit_all("base");
+    repo.write("vendor/clone/f.txt", b"hi\n");
+    let nested = repo.root.join("vendor/clone");
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&nested)
+        .status()
+        .expect("git init");
+    assert!(status.success());
+
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    let changes = status::repo_changes(&info, status::StatusRequest::default()).expect("status");
+    let row = changes
+        .unversioned
+        .iter()
+        .find(|entry| entry.path.starts_with("vendor/"))
+        .expect("the nested repository is an unversioned row");
+    assert_eq!(
+        row.path, "vendor/clone/",
+        "the walk stops at the repository boundary rather than listing its files"
+    );
+
+    let err = stage::stage(&repo.root, &[selection(&row.path, Selection::Whole)])
+        .expect_err("a nested repository cannot be added to the outer one");
+    let GitError::NestedRepository { path } = err else {
+        panic!("a nested repository must say so, got {err:?}");
+    };
+    assert_eq!(path, row.path);
+
+    // And nothing landed. A refusal that half-wrote the index would be worse than the message.
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]).trim(),
+        "",
+        "the refusal left the index alone"
+    );
+}

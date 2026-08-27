@@ -129,7 +129,6 @@ import {
 } from '@/ipc/client'
 import { adaptRoster } from './AgentsPanel/adapt'
 import { ROSTER_UNKNOWN, type Roster } from './AgentsPanel/model'
-import { openRunInPane } from './AgentsPanel/openRun'
 
 interface AgentsStore {
   project: ProjectId | null
@@ -543,6 +542,20 @@ export const useAgents = create<AgentsStore>((set, get) => ({
      * Awaited, and its rejection deliberately reaches the caller — `enable`'s and `dispatch`'s
      * argument. `AgentsPanelHost` puts the sentence on screen through `notifyFailure`.
      */
+    /*
+     * Imported here rather than at the top of the module, and it is not a style choice.
+     *
+     * `openRun` reaches `layout/paneHosts`, which imports `terminal/xterm`, which imports
+     * `@xterm/addon-clipboard` — and that addon touches `self` at module scope. Any SSR bundle
+     * that statically reaches this store therefore dies under node with
+     * `ReferenceError: self is not defined` before a single assertion runs, which is what
+     * `check:openspec-render` hit the moment a panel host read the roster. The same rule
+     * `GitDiffView` keeps its tokenizer behind, for the same reason and the same check shape.
+     *
+     * Free to do here because this is already an async action behind a user gesture: nothing
+     * renders while the chunk loads, and the rejection still reaches the caller below.
+     */
+    const { openRunInPane } = await import('./AgentsPanel/openRun')
     await openRunInPane(view)
     if (get().project !== project) return
     /*

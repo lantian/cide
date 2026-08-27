@@ -60,13 +60,38 @@
  * the one neither render check mounts, and it shipped an empty-forever dropdown once already.
  */
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
-import { notifyFailure } from '@/chrome/notices'
+import { notify, notifyFailure } from '@/chrome/notices'
 import { useTasks } from '@/sidebar/tasksStore'
+import { useWorkspace } from '@/store/workspace'
 import { useAgents } from '@/sidebar/agentsStore'
 import { rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TaskDetailModal } from './TaskDetail'
-import { activeEdit, armedDelete, assigneeHint, openTask } from './model'
-import type { ArmedDelete, FieldEdit, RunRef } from './model'
+import { useSpec } from '../specStore'
+import { spec as specApi, claudeSend, file, type ChangeName } from '@/ipc/client'
+import { useAwaiting } from '@/panes/awaiting'
+import { openTaskSession } from './openSession'
+import { errorText } from '@/ipc/errorText'
+import { adaptChange } from '../OpenSpecPanel/adapt'
+import { issuesFor, primaryAction } from '../OpenSpecPanel/model'
+import {
+  draftOf,
+  parseTarget,
+  compose,
+  targetId,
+  type RequirementDraft,
+} from '../OpenSpecPanel/editModel'
+import { acceptNotice, dispatchTargets, type SpecCardView } from './specCard'
+import {
+  activeEdit,
+  armedDelete,
+  assigneeHint,
+  isLinkKind,
+  linkableTargets,
+  openTask,
+  taskLinks,
+} from './model'
+import type { ArmedDelete, FieldEdit, LinkChip, LinkTargetOption, RunRef } from './model'
+import type { LinkAdd } from './TaskDetail'
 
 /** How often the comment log's ages are recomputed. See the header for why it is not 1 s. */
 const TICK_MS = 30_000
@@ -80,6 +105,7 @@ export const TaskDetailHost = memo(TaskDetailHostImpl)
 
 function TaskDetailHostImpl() {
   const board = useTasks((s) => s.board)
+  const project = useTasks((s) => s.project)
   const selected = useTasks((s) => s.selected)
   const select = useTasks((s) => s.select)
   const editTask = useTasks((s) => s.edit)
@@ -95,6 +121,29 @@ function TaskDetailHostImpl() {
   const pauseRun = useAgents((s) => s.pause)
   const resumeRun = useAgents((s) => s.resume)
   const roles = useMemo(() => rosterRoles(roster), [roster])
+  /*
+   * A role's own sentence, for the picker's second line. Derived here rather than added to
+   * `rosterRoles`, which is pinned by `check:agents` as an id→label map and read by three other
+   * surfaces that want exactly that.
+   */
+  const roleDescriptions = useMemo(
+    () =>
+      roster.kind === 'ready'
+        ? Object.fromEntries(roster.agents.map((def) => [def.id, def.description]))
+        : {},
+    [roster],
+  )
+  /* The console tab is where this project's Claude panes live — `tabs[0]`, the pinned one. */
+  const workspaceProject = useWorkspace((state) =>
+    project === null ? undefined : state.boot?.workspace.projects[String(project)],
+  )
+  const addRow = useWorkspace((state) => state.addRow)
+  const [sessionNames, setSessionNames] = useState<Readonly<Record<string, string>>>({})
+  useEffect(() => {
+    // Best effort: a machine where `claude` has never run answers `{}`, which costs each row its
+    // name and nothing else — so this never rejects and never blocks the picker.
+    void claudeSend.names().then(setSessionNames).catch(() => {})
+  }, [])
   /* `RunView` is structurally a `RunRef` — the five fields the chip reads, `phase` opaque. */
   const runs: readonly RunRef[] = roster.kind === 'ready' ? roster.runs : NO_RUNS
   const hint = assigneeHint(roster.kind)
@@ -128,6 +177,18 @@ function TaskDetailHostImpl() {
    */
   const [editing, setEditing] = useState<FieldEdit | null>(null)
   useEffect(() => setEditing(null), [selected])
+
+  /**
+   * The link picker's draft — which kind, aimed at which task — or `null` at rest. (M30)
+   *
+   * The `editing` arrangement, for its reason: the card is SSR'd with fixed props, so an open
+   * picker must arrive as one. Cleared with the selection — including when a link chip's click
+   * *moves* it: a half-picked link aimed at `t-14` must not still be open over `t-15`'s card.
+   * Deliberately not cleared on a board change, `editing`'s rule — a picker is the user's own
+   * gesture, and an agent commenting elsewhere must not close it.
+   */
+  const [linkAdd, setLinkAdd] = useState<LinkAdd | null>(null)
+  useEffect(() => setLinkAdd(null), [selected])
 
   /**
    * The delete the user has armed **in the card**, and the board they armed it against. The
@@ -166,6 +227,297 @@ function TaskDetailHostImpl() {
   const open = openTask(board, selected)
   const edit = activeEdit(board, open, editing)
 
+  /*
+   * The card's link chips and the picker's options, derived per render pass. (M30) Memoised on
+   * the board's identity, which `newerBoard` keeps stable across dropped snapshots — and both
+   * derivations need the *whole* board, because an incoming edge lives on the other task.
+   */
+  const links: readonly LinkChip[] = useMemo(
+    () => (open === null || board.kind !== 'ready' ? NO_LINKS : taskLinks(open, board.tasks)),
+    [open, board],
+  )
+  const linkTargets = useMemo(
+    () =>
+      open === null || board.kind !== 'ready'
+        ? NO_TARGETS
+        : linkableTargets(open.id, board.tasks).map((task) => ({
+            id: task.id,
+            title: task.title,
+            // The status rides along for the search popup's rows: which tasks are already
+            // done is half of choosing a blocker.
+            status: task.status,
+          })),
+    [open, board],
+  )
+
+  /*
+   * The change this task implements, read on demand. (M28)
+   *
+   * Read here rather than folded into the board, because a change costs three subprocesses:
+   * `show`, `status` and `validate`. Fetching one per card that happens to be linked, when it is
+   * opened, is a cost the user asked for by opening it; fetching every change on the board would
+   * be that cost on every refresh for cards nobody has looked at.
+   *
+   * It re-reads when the *board* changes, which is what makes the progress bar move while an
+   * agent works: `cide://spec-changed` fires on the watcher's route for the run's own worktree,
+   * `specStore` adopts it, and this effect asks again.
+   */
+  const specBoard = useSpec((state) => state.board)
+  const [specCard, setSpecCard] = useState<SpecCardView | null>(null)
+  /*
+   * Why there is no card, once the read has finished. (M28)
+   *
+   * `null` while the read is in flight, a sentence when it came back with nothing — and the card
+   * draws a spinner for the first and the sentence for the second. Before this the read had **no
+   * `.catch` at all**: a rejection went nowhere, `specCard` stayed `null`, and there was no way
+   * for the card to tell that apart from *still reading*.
+   */
+  const [specProblem, setSpecProblem] = useState<string | null>(null)
+  /**
+   * `Integrate & Archive` is in flight. See `TaskDetailProps::specBusy`.
+   *
+   * Local to the host and not in a store: it is transient gesture state about *this card*, which
+   * is the webview's half of the state loop — `ui/src/store/workspace.ts`'s header draws the
+   * line, and a durable flag would survive a reload that the merge it describes did not.
+   */
+  const [specBusy, setSpecBusy] = useState(false)
+  /**
+   * May this project be asked to write a proposal? (M28)
+   *
+   * Two facts, and both are needed: the board has to be `ready` (a project with no `openspec/`
+   * has nothing to propose *into*), and `.claude/` has to carry a propose command — cide types
+   * that command into a conversation and cannot invent it. `SpecBoard::Ready` carries the
+   * installed list precisely so a surface can ask this without a subprocess.
+   */
+  const canPropose =
+    specBoard.kind === 'ready' &&
+    specBoard.commands.some((command) => command.name === 'propose')
+  /*
+   * The requirement editor's state. (M28)
+   *
+   * Held here and not in the card, for the reason every other edit on this card is: the card is
+   * SSR'd by the render check with fixed props, so anything stateful in it would be invisible to
+   * that gate. `target` is which requirement is open, `draft` is what has been typed, and
+   * `problem` is what the last save answered — a refusal is a *state this form draws*, never an
+   * error thrown past it, because a failed save has to leave the typing on screen to fix.
+   */
+  /*
+   * The dispatch picker. (M28) Transient gesture state — ADR 0002's one category the webview
+   * owns — and here rather than in the card so the card stays a function of its props.
+   */
+  const [dispatchOpen, setDispatchOpen] = useState(false)
+  const [editTarget, setEditTarget] = useState<string | null>(null)
+  const [editDraft, setEditDraft] = useState<RequirementDraft | null>(null)
+  const [editBusy, setEditBusy] = useState(false)
+  const [editProblem, setEditProblem] = useState<
+    { kind: 'regressed' | 'conflicted'; messages: readonly string[] } | null
+  >(null)
+  const change = open?.change ?? null
+  /*
+   * Does this task's role run in its own checkout? `null` for a task with no role, or a roster
+   * nobody has read yet.
+   *
+   * The fact `primaryAction`'s accept arm names the gesture from — see its fifth parameter. It
+   * is a **lookup, not a git call**: `AgentDef::worktree` is already on the wire and already
+   * here, so the card can tell an integrate-and-archive from a plain archive without spawning a
+   * second `openspec` beside the one the change read costs.
+   *
+   * `null` for a task handed to a conversation is the whole point: `TaskEdit::SetSession` clears
+   * `Task::agent`, so there is no `cide/<role>-<task>` and the press only archives.
+   */
+  const roleWorktree = useMemo(() => {
+    const agent = open?.agent ?? null
+    if (agent === null || roster.kind !== 'ready') return null
+    return roster.agents.find((def) => def.id === agent)?.worktree ?? null
+  }, [roster, open?.agent])
+
+  useEffect(() => {
+    if (project === null || change === null) {
+      setSpecCard(null)
+      setSpecProblem(null)
+      return
+    }
+    let live = true
+    /*
+     * `null` first, and both of them.
+     *
+     * A card opened onto a different change must never show the previous one's numbers while the
+     * read is in flight — and must not show the previous one's *refusal* either, which is what
+     * leaving `specProblem` standing would do: the new change would open reading "the old change
+     * could not be read". `spec === null` with no problem is what the card draws as "reading".
+     */
+    setSpecCard(null)
+    setSpecProblem(null)
+    // And the in-flight flag, for the same reason: a spinner belongs to the accept that started
+    // it, and carrying it onto the next card would claim that card's button was working.
+    setSpecBusy(false)
+    void specApi
+      .change(project, change as ChangeName)
+      .then((wire) => {
+        if (!live) return
+        const view = adaptChange(wire)
+        if (view === null) {
+          setSpecCard(null)
+          setSpecProblem(`${change} could not be read. It may have been archived.`)
+          return
+        }
+        const action = primaryAction(
+          view,
+          open?.agent ?? null,
+          open?.status ?? null,
+          open?.session ?? null,
+          roleWorktree,
+        )
+        setSpecCard({
+          // `null` here, and filled in below. Whether the pane still exists and whether it is
+          // waiting are facts about the *workspace tree* and the *live session*, and both move
+          // without the change being re-read — baking them into this snapshot would freeze them
+          // at whatever they were when four subprocesses last answered.
+          session: null,
+          change: view.name,
+          // What every other number here has to be read against: an archived change carries
+          // `0/0` and a vacuously clean verdict, because a directory listing cannot answer
+          // either. See `SpecCardView.archived`.
+          archived: view.archivedAs ?? null,
+          done: view.completed,
+          total: view.total,
+          valid: view.validation.valid,
+          issues: view.validation.issues.filter((issue) => issue.level.toLowerCase() === 'error')
+            .length,
+          tasks: view.tasks,
+          deltas: view.deltas.map((delta, deltaIndex) => ({
+            spec: delta.spec,
+            op: delta.op,
+            requirements: delta.requirements.map((requirement, index) => ({
+              // The address a pencil sends back. Built here, from the same indices the draft is
+              // read by, so the requirement a click opens is by construction the one it edits.
+              target: targetId({ delta: deltaIndex, requirement: index }),
+              // Every validator complaint whose path names this requirement, beside it — and
+              // `unattributedIssues` puts the rest in the block's own banner, so each one is drawn
+              // exactly once. An issue that fell out of both would be reported by the validator,
+              // carried across the wire, and rendered on no screen at all.
+              issues: issuesFor(view.validation, requirement.name).map((issue) => issue.message),
+              name: requirement.name,
+              text: requirement.text,
+              scenarios: requirement.scenarios,
+              block: requirement.block,
+            })),
+          })),
+          artifacts: view.artifacts.flatMap((artifact) =>
+            artifact.existing.map((path) => ({ id: artifact.id, path })),
+          ),
+          action: {
+            id: action.id,
+            label: action.label,
+            hint: action.hint,
+            enabled: action.gate.ok,
+            reason: action.gate.ok ? '' : action.gate.reason,
+          },
+        })
+      })
+      .catch((error: unknown) => {
+        // Not `notifyFailure`: a toast about a panel the user is looking at is worse than the
+        // sentence in the panel, and it would fire again on every board move for as long as the
+        // card stayed open.
+        if (live) setSpecProblem(errorText(error))
+      })
+    return () => {
+      live = false
+    }
+  }, [project, change, specBoard, open?.agent, open?.status, open?.session, roleWorktree])
+
+  /*
+   * Where a run could happen: every role, every Claude conversation this project has open, and
+   * one more that does not exist yet.
+   *
+   * The conversations come from the console tab's own pane tree — `tabs[0]` is the pinned Claude
+   * tab — because a session id is a fact about a *pane*, and that is where panes live. Sessions
+   * with no `/rename` of their own get a positional label; see `dispatchTargets`.
+   */
+  const targets = useMemo(() => {
+    const consoleTab = workspaceProject?.tabs[0]
+    const panes = consoleTab === undefined ? [] : Object.values(consoleTab.tree.panes)
+    const sessions = panes
+      .filter((pane) => pane.kind === 'claude' && pane.session !== null)
+      .map((pane) => ({
+        id: String(pane.session),
+        // Keyed the way a pane is looked up: `/rename`'s name is stored against the id cide
+        // addresses the conversation under, which is the conversation id when there is one.
+        name: sessionNames[String(pane.conversation ?? pane.session)] ?? null,
+      }))
+    return dispatchTargets(roles, roleDescriptions, sessions)
+  }, [workspaceProject, roles, roleDescriptions, sessionNames])
+
+  /*
+   * Where the conversation this task went to actually is, right now. (M28)
+   *
+   * `Task::session` records where the work went and **survives the pane closing** — that is
+   * deliberate and documented on the Rust field — so "is it still open" cannot be read off the
+   * task. It is a walk of the workspace tree, which is where panes live, and it is done here
+   * every render rather than cached in `specCard`: the tree moves when somebody closes a pane,
+   * and the change is only re-read when four subprocesses answer.
+   */
+  const sessionPane = useMemo(() => {
+    const wanted = open?.session ?? null
+    if (wanted === null) return null
+    for (const openTab of workspaceProject?.tabs ?? []) {
+      for (const [id, node] of Object.entries(openTab.tree.panes)) {
+        if (node.kind === 'claude' && String(node.session) === wanted) {
+          return { tab: openTab.id, pane: id, conversation: node.conversation ?? node.session }
+        }
+      }
+    }
+    return null
+  }, [workspaceProject, open?.session])
+
+  /*
+   * Hooks are unconditional, so this is called with `null` on every card that has no session and
+   * simply answers `false` — `useAwaiting` takes `null | undefined` for exactly this.
+   */
+  const sessionAwaiting = useAwaiting(open?.session ?? null)
+
+  const sessionRef = useMemo(() => {
+    const id = open?.session ?? null
+    if (id === null) return null
+    return {
+      id,
+      // The conversation's own `/rename`, or a short form of the id. Never the bare uuid: a row
+      // reading `11111111-2222-…` names nothing a person can recognise on screen.
+      label: sessionNames[String(sessionPane?.conversation ?? id)] ?? `Conversation ${id.slice(0, 8)}`,
+      open: sessionPane !== null,
+      awaiting: sessionAwaiting,
+    }
+  }, [open?.session, sessionPane, sessionNames, sessionAwaiting])
+
+  /*
+   * Get back to the conversation a task's work went to, and close the card doing it.
+   *
+   * The reveal and the close are one gesture, not two calls: choosing a conversation left the
+   * modal standing over the pane it had just typed into, so the thing the user asked to see was
+   * behind a scrim.
+   *
+   * `openTaskSession` is where the rest lives — see its header for why the pane is built here and
+   * not by a command, and for the ownership flag that makes a resumed pane different from a
+   * mirrored one. `mode` decides whether the task is handed back to the conversation or it is
+   * merely put on screen.
+   *
+   * `select(null)` **first**, and only for a gesture that is going to succeed: the reveal raises
+   * a window and moves focus, and doing that under a modal scrim is what the close is for. A
+   * refusal still reaches `guarded`, so a card that closed and then failed would report into
+   * nothing — which is why the close is inside the promise rather than beside it.
+   */
+  const openSession = useCallback(
+    async (id: string, mode: 'open' | 'resume') => {
+      if (project === null) return
+      select(null)
+      await openTaskSession(id, {
+        project,
+        ...(mode === 'resume' && open !== null ? { task: open.id } : {}),
+      })
+    },
+    [project, select, open],
+  )
+
   if (open === null) return null
   return (
     <TaskDetailModal
@@ -186,6 +538,155 @@ function TaskDetailHostImpl() {
       editing={edit}
       onEditing={setEditing}
       onClose={() => select(null)}
+      /*
+       * The session ref is merged in here rather than stored in `specCard`, so it follows the
+       * workspace tree and the awaiting set instead of the last four-subprocess read. See
+       * `sessionPane` above.
+       */
+      spec={
+        change === null
+          ? undefined
+          : specCard === null
+            ? null
+            : { ...specCard, session: sessionRef }
+      }
+      onOpenSession={(id, mode) => guarded(openSession(id, mode))}
+      specProblem={specProblem}
+      specEdit={
+        change === null || specCard === null
+          ? undefined
+          : {
+              target: editTarget,
+              draft: editDraft,
+              busy: editBusy,
+              problem: editProblem,
+              onDraft: setEditDraft,
+              onCancel: () => {
+                setEditTarget(null)
+                setEditDraft(null)
+                setEditProblem(null)
+              },
+              onSave: () => {
+                if (project === null || editDraft === null || editTarget === null) return
+                const at = parseTarget(editTarget)
+                const delta = at === null ? undefined : specCard.deltas[at.delta]
+                const requirement =
+                  at === null || delta === undefined
+                    ? undefined
+                    : delta.requirements[at.requirement]
+                if (delta === undefined || requirement === undefined) return
+                setEditBusy(true)
+                setEditProblem(null)
+                guarded(
+                  specApi
+                    .setRequirement({
+                      project,
+                      change: change as never,
+                      spec: delta.spec as never,
+                      operation: delta.op as never,
+                      // The name the block is addressed by is the one it had when the editor
+                      // opened, never the one in the draft: renaming a requirement is a RENAMED
+                      // delta, and Rust refuses a header that does not match. Sending the new
+                      // name would ask it to replace a block that does not exist.
+                      requirement: requirement.name,
+                      block: compose(editDraft),
+                    })
+                    .then((outcome) => {
+                      setEditBusy(false)
+                      if (outcome.kind === 'written') {
+                        setEditTarget(null)
+                        setEditDraft(null)
+                        return
+                      }
+                      // Both failures leave the form up with the typing in it. A save that closed
+                      // the editor and reported elsewhere would throw away the paragraph it
+                      // failed to write.
+                      setEditProblem(
+                        outcome.kind === 'conflicted'
+                          ? { kind: 'conflicted', messages: [outcome.path] }
+                          : {
+                              kind: 'regressed',
+                              messages: outcome.issues.map((issue) => issue.message),
+                            },
+                      )
+                    })
+                    .catch((error: unknown) => {
+                      setEditBusy(false)
+                      throw error
+                    }),
+                )
+              },
+            }
+      }
+      onSpecEditOpen={(target) => {
+        const at = parseTarget(target)
+        const requirement =
+          at === null ? undefined : specCard?.deltas[at.delta]?.requirements[at.requirement]
+        if (requirement === undefined) return
+        setEditTarget(target)
+        setEditDraft(draftOf(requirement))
+        setEditProblem(null)
+      }}
+      onOpenSpecFile={(path) => {
+        if (project !== null) guarded(file.open(project, path).then(() => undefined))
+      }}
+      specBusy={specBusy}
+      onSpecPrimary={(task, action) => {
+        // `approve` is *assigning*, which the assignee row already does and which the trigger in
+        // Rust turns into a dispatch — so the button focuses that decision rather than making it
+        // for the user. `accept` is the one gesture that belongs here.
+        if (action === 'accept' && project !== null) {
+          /*
+           * The board refreshes itself: `spec_accept` broadcasts both `tasks-changed` and
+           * `spec-changed`, and both stores adopt what arrives. Asking again here would be a
+           * second read of state that has already been pushed.
+           *
+           * The flag around it is what the card draws as a spinner. Cleared in every arm and not
+           * only on success — a refusal that left the button inert for ever would be a worse
+           * failure than the silence this replaced.
+           */
+          setSpecBusy(true)
+          guarded(
+            specApi
+              .accept(project, task as never)
+              .then((outcome) => {
+                setSpecBusy(false)
+                // What it did, in a notice. `refused` and `conflicts` are `Ok` arms, so
+                // without this the two failures reach nothing at all — see `acceptNotice`.
+                const said = acceptNotice(outcome)
+                notify(said.text, { kind: said.kind, detail: said.detail })
+              })
+              .catch((error: unknown) => {
+                setSpecBusy(false)
+                throw error
+              }),
+          )
+        }
+      }}
+      /*
+       * Drawn only when this project can actually run the workflow. (M28)
+       *
+       * `undefined` is *no button*, which is the whole optionality claim — see the prop's doc.
+       * The board being `ready` is not enough on its own: a project can have `openspec/` and no
+       * `.claude/skills/openspec-propose/`, and a button that always refuses is worse than one
+       * that is not there.
+       */
+      onProposeChange={
+        canPropose
+          ? (task) => {
+              if (project === null) return
+              guarded(
+                specApi.proposeForTask(project, task as never).then((session) => {
+                  // Closed and revealed, `onDispatchTo`'s rule and its reason: the line has gone
+                  // into a pane, and leaving the modal over it hides the thing the press was
+                  // about. Chained, so a refusal leaves the card up carrying it.
+                  select(null)
+                  return openTaskSession(String(session), { project })
+                }),
+              )
+            }
+          : undefined
+      }
       deleteArmed={armedDelete(board, deleteArmed) === open.id}
       onDeleteArm={(task) => {
         if (board.kind !== 'ready') return
@@ -195,6 +696,91 @@ function TaskDetailHostImpl() {
         setDeleteArmed(null)
         guarded(removeTask(task))
       }}
+      links={links}
+      linkTargets={linkTargets}
+      linkAdd={linkAdd}
+      onLinkAdd={setLinkAdd}
+      /* The M30 wire shapes' dispatch sites, landed with the shapes themselves — `setChange`
+         shipped without one and sat unreachable from any UI; `TaskEdit`'s own rule is the
+         gesture and the shape in the same commit. */
+      onLink={(task, kind, target) => guarded(editTask(task, { kind: 'link', link: kind, target }))}
+      onUnlink={(task, kind, target) => {
+        // Through the guard: a chip whose kind this build cannot read never draws an ✕, so
+        // this is belt-and-braces against a caller the card did not make.
+        if (isLinkKind(kind)) guarded(editTask(task, { kind: 'unlink', link: kind, target }))
+      }}
+      /* Navigation: the card is keyed on the open id, so moving the selection remounts it
+         cleanly and the `selected` effects clear the drafts. A gone target opens nothing —
+         `openTask` finds no row and the card simply closes onto the board, which is the honest
+         rendering of "this task is not here". */
+      dispatchTargets={change === null ? undefined : targets}
+      dispatchOpen={dispatchOpen}
+      onDispatchOpen={setDispatchOpen}
+      onDispatchTo={(task, target) => {
+        if (project === null) return
+        setDispatchOpen(false)
+        /*
+         * **One road each, and that is what stops a double start.**
+         *
+         * A role is assigned and nothing else happens here: `cide_agents::autodispatch` sees the
+         * assignment edge and starts the run through the same queue the Agents panel uses. Doing
+         * anything more on this branch — dispatching as well as assigning — is exactly how a
+         * task ends up with two runs on it.
+         *
+         * A conversation is not an assignment edge at all. `spec_dispatch_to_session` writes
+         * `Task::session`, which no trigger reads, and types the task in. See `DispatchTarget`.
+         */
+        if (target.kind === 'role') {
+          guarded(editTask(task, { kind: 'assign', agent: target.id as never }))
+          return
+        }
+        if (target.kind === 'session') {
+          /*
+           * And then show it. Choosing a conversation left the modal standing over the pane it
+           * had just typed the task into — the thing the user asked to see, behind a scrim. The
+           * reveal is chained rather than fired alongside, so a dispatch that Rust refuses (a
+           * pane closed while the picker was open) leaves the card up with the refusal on it
+           * instead of navigating away from the error.
+           */
+          guarded(
+            specApi
+              .dispatchToSession(project, task as never, target.id as never)
+              .then(() => {
+                select(null)
+                return openTaskSession(target.id, { project })
+              }),
+          )
+          return
+        }
+        // Fresh: make the pane first, then hand the task to the session it came up with. The
+        // pane has to exist before there is a session to name.
+        const consoleTab = workspaceProject?.tabs[0]
+        if (consoleTab === undefined) return
+        guarded(
+          addRow(project, consoleTab.id, null, 'after', { kind: 'newClaude' }).then(
+            async (created) => {
+              /*
+               * The pane exists now, but *this* component's copy of the tree does not know it:
+               * the snapshot arrives on `workspace_changed`, one round trip later. So the
+               * session is read from the store's current state rather than from the closure,
+               * which is the value that has been updated by the time this resolves.
+               */
+              const fresh = useWorkspace
+                .getState()
+                .boot?.workspace.projects[String(project)]?.tabs[0]
+              const paneNode = fresh?.tree.panes[String(created.pane)]
+              const session = paneNode?.session ?? null
+              if (session === null) return
+              await specApi.dispatchToSession(project, task as never, session as never)
+              // The pane was made a moment ago and is not on screen unless its tab is the one
+              // showing; reveal it for the same reason the branch above does.
+              select(null)
+              await openTaskSession(String(session), { project })
+            },
+          ),
+        )
+      }}
+      onOpenTask={(task) => select(task)}
       onSetTitle={(task, title) => guarded(editTask(task, { kind: 'setTitle', title }))}
       onSetStatus={(task, status) => guarded(editTask(task, { kind: 'setStatus', status }))}
       onSetAssignee={(task, agent) => guarded(editTask(task, { kind: 'assign', agent }))}
@@ -218,3 +804,5 @@ function TaskDetailHostImpl() {
  * a fresh `[]` per render would be a new prop identity for a value that has not changed.
  */
 const NO_RUNS: readonly RunRef[] = []
+const NO_LINKS: readonly LinkChip[] = []
+const NO_TARGETS: readonly LinkTargetOption[] = []

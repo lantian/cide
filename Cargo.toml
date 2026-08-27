@@ -10,6 +10,7 @@ members = [
     "crates/cide-fs",
     "crates/cide-search",
     "crates/cide-tasks",
+    "crates/cide-spec",
     "crates/cide-agents",
     "crates/cide-lang",
     "crates/cide-lsp",
@@ -45,6 +46,7 @@ cide-git = { path = "crates/cide-git" }
 cide-fs = { path = "crates/cide-fs" }
 cide-search = { path = "crates/cide-search" }
 cide-tasks = { path = "crates/cide-tasks" }
+cide-spec = { path = "crates/cide-spec" }
 cide-agents = { path = "crates/cide-agents" }
 cide-lang = { path = "crates/cide-lang" }
 cide-lsp = { path = "crates/cide-lsp" }

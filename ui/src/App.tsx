@@ -79,6 +79,10 @@ import { ExtensionTab } from '@/ext/ExtensionTab'
 import { liveCount } from '@/sidebar/AgentsPanel/model'
 import { useAgents } from '@/sidebar/agentsStore'
 import { TasksPanel, TaskDetailHost } from '@/sidebar/TasksPanel'
+import { OpenSpecPanel } from '@/sidebar/OpenSpecPanel'
+import { ProposeDialog, useProposeDialog } from '@/sidebar/OpenSpecPanel/ProposeDialog'
+import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
+import { useSpec } from '@/sidebar/specStore'
 import { openCount } from '@/sidebar/TasksPanel/model'
 import { useTasks } from '@/sidebar/tasksStore'
 import { OverlayHost } from '@/overlays/OverlayHost'
@@ -100,7 +104,7 @@ import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
 import { jumpTo, pendingJump } from '@/editor/jump'
 import { UNKNOWN_LINE } from '@/editor/navHistory'
-import { claudeSend } from '@/ipc/client'
+import { claudeSend, specEvents } from '@/ipc/client'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
@@ -108,6 +112,7 @@ import { PaneFrame } from '@/layout/PaneTitleBar'
 import { PaneBody } from '@/panes/PaneBody'
 import { GitDiffPane } from '@/panes/GitDiffPane'
 import { changeNavPresent, subscribeChangeNav } from '@/panes/changeNav'
+import { focusPaneDom } from '@/panes/paneFocus'
 import { liveHosts } from '@/layout/paneHosts'
 import { SettingsTab } from '@/settings/SettingsTab'
 import { toggleTheme as togglePersistedTheme } from '@/settings/useSettings'
@@ -732,9 +737,10 @@ export function App() {
     () => applyFilters(rawDiagnostics, diagnosticFilters),
     [rawDiagnostics, diagnosticFilters],
   )
-  // One derivation for the rail's badge and the status bar — the panel-model rule about not
-  // computing a count twice, applied to identity as well: `statusBarCounts` builds a fresh
-  // object, and two inline calls handed two consumers two identities per render.
+  // The rail's ⚠ badge, and since M28 its only consumer: the status bar's `✗ n ⚠ n` pair was
+  // a second rendering of this figure one row down and went with the diff counters beside it.
+  // Still a memo — `statusBarCounts` builds a fresh object, so an inline call would hand the
+  // rail a new identity on every render of the shell.
   const diagCounts = useMemo(() => statusBarCounts(diagnostics.snapshot), [diagnostics])
 
   useEffect(() => {
@@ -798,6 +804,30 @@ export function App() {
       void off.then((stop) => stop())
     }
   }, [adoptTasks])
+
+  /*
+   * OpenSpec: one board per project. (M28)
+   *
+   * Attached and subscribed here for the two blocks above's reason, with a third of its own: a
+   * board read costs **two subprocesses**, so the event's payload is adopted directly and Rust is
+   * never asked anything in response to it. Breaking that rule here would cost a Node process
+   * every time an agent ticks a box.
+   */
+  const attachSpec = useSpec((s) => s.attach)
+  const adoptSpec = useSpec((s) => s.adopt)
+
+  useEffect(() => {
+    attachSpec(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
+  }, [attachSpec, activeProjectId, boot?.role.kind])
+
+  useEffect(() => {
+    const off = specEvents.onChanged((project, board) => {
+      adoptSpec(project, board)
+    })
+    return () => {
+      void off.then((stop) => stop())
+    }
+  }, [adoptSpec])
 
   /*
    * Subagents: one roster, read by the panel and by the rail's ⌬ badge. (M18)
@@ -1594,6 +1624,22 @@ export function App() {
                 <AgentsPanel project={activeProjectId} />
               </PanelBoundary>
             )}
+            {/*
+              * OpenSpec. (M28)
+              *
+              * Below Agents and above Extensions, matching the rail's own order. Like every panel
+              * here it draws props only; the `cide://spec-changed` subscription and the attach
+              * are above, in this component, for the reason the Agents comment gives — the rail's
+              * badge outlives the panel.
+              */}
+            {sidebar.view === 'openspec' && (
+              <PanelBoundary
+                name="OpenSpec"
+                onClose={() => setSidebar((st) => selectView(st, 'openspec'))}
+              >
+                <OpenSpecPanel project={activeProjectId} />
+              </PanelBoundary>
+            )}
             {sidebar.view === 'extensions' && (
               <PanelBoundary
                 name="Extensions"
@@ -1642,8 +1688,14 @@ export function App() {
                 panel={
                   sidebar.view === 'git'
                     ? 'git'
-                    : sidebar.view === 'agents' || sidebar.view === 'tasks'
-                      ? 'agents'
+                    : sidebar.view === 'agents' ||
+                        sidebar.view === 'tasks' ||
+                        sidebar.view === 'openspec'
+                      ? // The `agents` width token, reused rather than a fifth of its own:
+                        // `check:sidebar` pins the token list, and a new one would mean editing
+                        // `sidebarWidth.ts`, `tokens.css`, Rust's `SidebarSettings` and that
+                        // check — for a panel that wants exactly the width these two already do.
+                        'agents'
                       : sidebar.view?.startsWith('ext:') === true
                         ? 'ext'
                         : 'files'
@@ -1890,6 +1942,23 @@ export function App() {
         )}
 
         {/*
+          * The OpenSpec composer. (M28)
+          *
+          * Here and not in the panel, which is where it used to be: there are three doors to it
+          * now — the panel's two buttons and the `spec.propose` / `spec.explore` palette commands
+          * — and two of them exist whether or not the sidebar is showing OpenSpec. A composer
+          * mounted inside the panel would make the palette command work only when the surface it
+          * was meant to replace was already on screen.
+          *
+          * Behind a boundary for the sidebar panels' reason: it is a portal, and a throw inside
+          * it must not take the window down. Closing clears the store, which unmounts this and
+          * thereby resets the boundary for the next open.
+          */}
+        <PanelBoundary name="OpenSpec compose" onClose={() => useProposeDialog.getState().close()}>
+          <ProposeDialog project={activeProjectId} />
+        </PanelBoundary>
+
+        {/*
           * The switcher popup — one component for Ctrl+Tab (tabs) and Ctrl+` (projects). No
           * props and no keyboard handling: the walk, its claim on the walk key and on Escape,
           * and the release watcher all live in `keys/switcherStore.ts`, so the gesture already
@@ -1943,9 +2012,6 @@ export function App() {
           */}
         <StatusBar
           claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
-          /* The *filtered* snapshot, so the bar and the panel cannot disagree — and `null`
-             whenever nothing has looked, which is what makes it print `✗ — ⚠ —`. */
-          diagnostics={diagCounts}
           revealRoots={revealRoots}
           /*
            * A crumb of the open file's path trail, straight to `file.reveal` and to nothing
@@ -2044,6 +2110,7 @@ const WorkspaceContent = memo(function WorkspaceContent({
   const closePane = useWorkspace((s) => s.closePane)
   const focusPane = useWorkspace((s) => s.focusPane)
   const maximizePane = useWorkspace((s) => s.maximizePane)
+  const movePane = useWorkspace((s) => s.movePane)
   const setRatio = useWorkspace((s) => s.setRatio)
   const bindSession = useWorkspace((s) => s.bindSession)
   const detachPane = useWorkspace((s) => s.detachPane)
@@ -2127,6 +2194,27 @@ const WorkspaceContent = memo(function WorkspaceContent({
                         id={{ marketplace: tab.kind.marketplace, extension: tab.kind.extension }}
                         name={tab.kind.name}
                       />
+                    ) : tab.kind.kind === 'openSpec' ? (
+                      /*
+                       * A change or a capability, replacing the pane tree for the two reasons
+                       * above: it is a page about a *directory* rather than a document, and
+                       * there is nothing for a split to split. `TabKind::OpenSpec` argues why
+                       * opening `proposal.md` was not enough.
+                       */
+                      <SpecTab
+                        project={activeProject.id}
+                        /*
+                         * **Every tab is mounted**, hidden or not — `TabContent`'s own rule, and
+                         * hidden means `visibility: hidden` rather than unmounted. So a page that
+                         * bound a window-level key listener would bind one per open change and
+                         * they would all fire at once. `active` is what tells this one the chord
+                         * is meant for it.
+                         */
+                        active={active}
+                        {...(tab.kind.subject.kind === 'change'
+                          ? { change: tab.kind.subject.change }
+                          : { spec: tab.kind.subject.spec })}
+                      />
                     ) : (
                     <SplitTree
                       tree={tab.tree}
@@ -2178,6 +2266,33 @@ const WorkspaceContent = memo(function WorkspaceContent({
                           }
                           onAddRow={() =>
                             void splitPane(activeProject.id, tab.id, tab.tree.focused, 'col', 'after')
+                          }
+                          /*
+                           * The grab handle's commit. Withheld for a tab's only pane — there
+                           * is nowhere to move it to — and `PaneFrame` withholds it again for
+                           * a pane that is not a terminal, which is the kind gate.
+                           *
+                           * The DOM focus has to be put back by hand: the move re-parents the
+                           * pane into a different chain grid, so React unmounts its slot and
+                           * `parkHost` blurs the terminal on the way out. Without this the
+                           * ring lands on the moved pane and the keystrokes go nowhere — the
+                           * defect `panes/paneFocus.ts` was written about.
+                           */
+                          onMove={
+                            plan.move
+                              ? (outcome) => {
+                                  void movePane(
+                                    activeProject.id,
+                                    tab.id,
+                                    outcome.pane,
+                                    outcome.target,
+                                    outcome.axis,
+                                    outcome.side,
+                                  ).then(() => {
+                                    focusPaneDom(outcome.pane)
+                                  })
+                                }
+                              : undefined
                           }
                           onMaximize={
                             plan.maximize

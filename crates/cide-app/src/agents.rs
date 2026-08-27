@@ -191,6 +191,10 @@ struct LiveRun {
     /// Copied at dispatch like the label, and for the same reason: it ends up in the child's
     /// terminal title and in `/resume`, which must still read correctly after a rename.
     task_title: Option<String>,
+    /// The OpenSpec change this run is working, copied at dispatch. (M28) Kept beside the title
+    /// so a **respawn** tells the new child the same thing the first one was told — a resumed run
+    /// that lost its change would go back to working from the task body alone.
+    change: Option<String>,
     state: RunState,
     started_unix_ms: u64,
     /// The last prompt delivered — the opening one today, a follow-up once the queue can send
@@ -321,6 +325,10 @@ pub struct DispatchSpec {
     pub harness: Harness,
     pub task: Option<TaskId>,
     pub task_title: Option<String>,
+    /// The OpenSpec change the task names, if any. (M28) Stamped at dispatch beside
+    /// `task_title`, and for its reason: `cide-agents` reads no disk, so a run's brief has to
+    /// arrive as values.
+    pub change: Option<String>,
     pub prompt: String,
     pub agent_limit: u16,
     pub project_limit: u16,
@@ -340,6 +348,7 @@ struct Admission {
     agent: AgentId,
     task: Option<TaskId>,
     task_title: Option<String>,
+    change: Option<String>,
     prompt: String,
     /// `Some` for a resumed [`RunState::Interrupted`] run: the conversation the new child
     /// continues. `None` is an ordinary first start.
@@ -459,6 +468,7 @@ impl AgentRegistry {
                 session: None,
                 task: spec.task,
                 task_title: spec.task_title,
+                change: spec.change,
                 state: RunState::Queued,
                 started_unix_ms: now_unix_ms(),
                 prompt: spec.prompt,
@@ -594,6 +604,7 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
                 agent: key.1,
                 task: live.task.clone(),
                 task_title: live.task_title.clone(),
+                change: live.change.clone(),
                 prompt,
                 resume,
             });
@@ -1573,6 +1584,7 @@ impl AgentRegistry {
                 agent: live.agent.clone(),
                 task: live.task.clone(),
                 task_title: live.task_title.clone(),
+                change: live.change.clone(),
                 prompt: prompt.to_string(),
                 // A retry's continuation travels as `bring_up`'s explicit argument, not here:
                 // this admission never goes through the queue, so there is no later point at
@@ -2107,6 +2119,11 @@ impl AgentRegistry {
                     session,
                     task: saved.task,
                     task_title: saved.task_title,
+                    // Not persisted: a restored run is `Interrupted` and its *next* child is a
+                    // resume, which re-reads the task. Persisting it would be a third copy of a
+                    // fact `.cide/tasks.json` already holds, and the one most likely to be stale
+                    // after a restart — the change may have been archived while cide was down.
+                    change: None,
                     state,
                     started_unix_ms: saved.started_unix_ms,
                     prompt: saved.prompt,
@@ -2235,6 +2252,19 @@ struct Facts {
     hook_bin: Option<PathBuf>,
     hook_sock: Option<PathBuf>,
     agent_sock: Option<PathBuf>,
+    /// Where `openspec` is, for `spec_preamble` to name. (M28)
+    ///
+    /// Resolved here rather than left to the child, and for `hook_bin`'s reason exactly: it is
+    /// installed by `npm -g` into a Node directory that a shell rc file puts on `PATH` and a
+    /// desktop launcher does not, while a child gets `toolchain::extra_dirs` — `~/.cargo/bin`
+    /// and `~/go/bin`. A bare `openspec` in a run's brief would resolve to nothing on precisely
+    /// the machines that have it.
+    spec_cli: Option<PathBuf>,
+    /// What this project types to run OpenSpec's apply workflow, or `None`. (M28)
+    ///
+    /// Read off `.claude/` here, on the thread that already has the root, because
+    /// `cide_agents` may not go to disk — see `RunPlan::spec_apply`.
+    spec_apply: Option<String>,
 }
 
 /// Read the workspace and the two sockets. One lock acquisition, released before anything forks.
@@ -2257,6 +2287,9 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
     })?;
 
     Ok(Facts {
+        // A project that never ran `openspec init --tools claude` has none, which is the
+        // ordinary case and adds nothing to the brief. Read before `root` moves into the struct.
+        spec_apply: cide_spec::claude::line(&root, "apply-change"),
         root,
         theme,
         proxy,
@@ -2268,6 +2301,11 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
         agent_sock: app
             .try_state::<crate::agent_rpc::AgentRpcServer>()
             .map(|server| server.socket().to_path_buf()),
+        // A miss is not a failure: a project with no OpenSpec never reads this, and a run whose
+        // change cannot name an absolute path still gets the bare word, which works for a user
+        // whose shell has it. `find` re-probes on a miss, so installing it mid-session and
+        // dispatching again picks it up without a relaunch.
+        spec_cli: cide_spec::discover::find().ok(),
     })
 }
 
@@ -2744,6 +2782,9 @@ fn start_child(
         project: admission.project,
         task: admission.task.clone(),
         task_title: admission.task_title.clone(),
+        change: admission.change.clone(),
+        spec_cli: facts.spec_cli.clone(),
+        spec_apply: facts.spec_apply.clone(),
         prompt: admission.prompt.clone(),
         hook_bin: facts.hook_bin.clone(),
         hook_sock: facts.hook_sock.clone(),
@@ -3058,6 +3099,7 @@ mod tests {
             harness: Harness::Claude,
             task: None,
             task_title: None,
+            change: None,
             prompt: "do the thing".into(),
             agent_limit,
             project_limit,

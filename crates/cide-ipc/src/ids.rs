@@ -256,6 +256,87 @@ impl From<String> for AgentId {
     }
 }
 
+/// One OpenSpec capability, as its directory path under `openspec/specs/` — `user-auth`, or
+/// `identity/user-auth` where a project nests them. (M28)
+///
+/// A path and not a flat name, because OpenSpec's own schema says so: a proposal's Capabilities
+/// section names `<capability-path>`, and the delta a change writes must sit at the *same* path
+/// under its own `specs/`. Flattening `identity/user-auth` to `user-auth` here would make two
+/// capabilities in different domains one id, and the archive that merged them would silently
+/// write one capability's requirements into the other's file.
+///
+/// Deliberately not validated here, exactly as [`AgentId`] and [`MarketplaceId`] are not. This
+/// crate is the wire shape; `cide-spec` is where a name is checked, because that is the layer
+/// that knows the path to name in the refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(export, type = "string")]
+pub struct SpecId(pub String);
+
+impl SpecId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SpecId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for SpecId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SpecId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// One OpenSpec change, as its directory name under `openspec/changes/` — `add-dark-mode`. (M28)
+///
+/// [`TaskId`]'s argument, arriving at the same answer from the other direction: this is a string
+/// **a person types and a model quotes**, in a task body, in a comment, on a command line
+/// (`openspec show add-dark-mode`), and as a directory name in a pull request. OpenSpec's own
+/// grammar for it is `^[a-z0-9]+(?:-[a-z0-9]+)*$` with a 200-character ceiling, which is a
+/// kebab-case identifier for exactly those reasons.
+///
+/// Not validated here, for [`SpecId`]'s reason — and the check matters more than most, because
+/// this value reaches `Path::join`. `cide-tasks` refuses one that is not kebab before it can be
+/// written into `.cide/tasks.json`, and `cide-spec` refuses one before it can name a directory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(export, type = "string")]
+pub struct ChangeName(pub String);
+
+impl ChangeName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ChangeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ChangeName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ChangeName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 /// One task in `.cide/tasks.json`, as a short string — `t-17`. (M18)
 ///
 /// The shortness is the design, not a saving. **Agents quote task ids inside prompts and

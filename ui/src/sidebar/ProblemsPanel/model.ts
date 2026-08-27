@@ -10,10 +10,11 @@
  * shape here is a tagged union, and `unavailable` is a first-class state rather than the
  * absence of one.
  *
- * `StatusBar` already made this call for the bottom bar: its `diagnostics` prop is
- * `Diagnostics | null`, where `null` means nobody looked and prints `✗ — ⚠ —`. `statusBarCounts`
- * below is the bridge, so the panel and the bar are two renderings of one snapshot and cannot
- * drift into disagreeing about whether the workspace is clean.
+ * `statusBarCounts` below carries the same distinction to the activity rail's ⚠ badge: it
+ * returns `null` when nobody looked, which draws no badge at all, and that is not the same
+ * answer as a badge reading zero. The panel and the badge are therefore two renderings of one
+ * snapshot and cannot drift into disagreeing about whether the workspace is clean. (It fed the
+ * status bar too until M28, which is where the name comes from.)
  *
  * # Why this file imports nothing
  *
@@ -26,9 +27,9 @@
 /**
  * The severities a language server can report, in LSP's own set.
  *
- * v1 renders all four rather than the two the status bar counts: dropping info and hint at
- * the model boundary would mean the panel could not show a diagnostic that exists, which is
- * the same class of lie as an empty list.
+ * The panel renders all four rather than the two the rail's badge counts: dropping info and
+ * hint at the model boundary would mean the panel could not show a diagnostic that exists,
+ * which is the same class of lie as an empty list.
  */
 export type Severity = 'error' | 'warning' | 'info' | 'hint'
 
@@ -113,8 +114,8 @@ export interface Diagnostic {
 /**
  * What the panel knows right now.
  *
- * - `unavailable` — no diagnostics source is running. The v1 state, and the reason string is
- *   what both this panel and the status bar's tooltip say.
+ * - `unavailable` — no diagnostics source is running, and the reason string is what the panel
+ *   says. (It was the status bar's tooltip too until M28 — see [`NO_DIAGNOSTICS_SOURCE`].)
  * - `scanning` — a source is attached but has not answered yet. Distinct from `unavailable`
  *   because the honest render differs: "starting up" invites waiting, "not installed" does not.
  * - `ready` — a source answered. `items: []` is then a real, reportable zero.
@@ -185,10 +186,11 @@ export type SourceStatus =
 /**
  * The sentence the app uses for "nobody looked".
  *
- * Exported rather than written twice: `chrome/StatusBar.tsx` shows it as the tooltip on its
- * `✗ — ⚠ —` slot and this panel shows it as body text, and two hand-maintained copies of a
- * user-visible claim are two claims. `check-problems.mjs` asserts the status bar imports this
- * constant instead of holding its own string.
+ * Exported rather than written twice: this panel shows it as body text, and
+ * `chrome/StatusBar.tsx` showed it as the tooltip on its `✗ — ⚠ —` slot until that slot was
+ * removed (M28). Two hand-maintained copies of a user-visible claim are two claims, so
+ * `check-problems.mjs` still pins the bar — inverted now, asserting it reaches for neither the
+ * constant nor a copy of the string. A re-added slot has to import this one.
  */
 export const NO_DIAGNOSTICS_SOURCE =
   'No language server is running for this project. Rust needs rust-analyzer and Go needs gopls on PATH.'
@@ -276,7 +278,7 @@ export function countBySeverity(items: readonly Diagnostic[]): SeverityCounts {
   return counts
 }
 
-/** The status bar's `Diagnostics | null`, derived from the same snapshot the panel renders. */
+/** The rail badge's counts, or `null` when nobody looked. Same snapshot the panel renders. */
 /**
  * Whether any analyser is currently working, for the rail's busy dot and nothing else.
  *
@@ -476,8 +478,8 @@ export function summaryLine(counts: SeverityCounts): string {
  * The header's right-aligned meta figure.
  *
  * `—` rather than `0` whenever nothing looked. This is the same decision the explorer makes
- * when it withholds its row count during the first walk, and the same one the status bar
- * makes with `✗ —`: a digit in a counter is a claim.
+ * when it withholds its row count during the first walk, and the one the status bar used to
+ * make with `✗ —`: a digit in a counter is a claim.
  */
 export function metaFigure(snapshot: DiagnosticsSnapshot): string {
   if (snapshot.kind !== 'ready') return '—'
@@ -649,8 +651,9 @@ export const ALL_VISIBLE: DiagnosticFilters = {
  * Is this diagnostic shown?
  *
  * One predicate, three consumers — the editor's squiggles, the panel's rows, and (through
- * [`applyFilters`] → `statusBarCounts`) the status bar's counts. That is what makes "the toggles
- * affect all three consistently" a property of the code rather than a promise in a comment.
+ * [`applyFilters`] → `statusBarCounts`) the activity rail's ⚠ badge. That is what makes "the
+ * toggles affect all three consistently" a property of the code rather than a promise in a
+ * comment.
  */
 export function visible(item: Diagnostic, filters: DiagnosticFilters): boolean {
   if (filters.level === 'none') return false

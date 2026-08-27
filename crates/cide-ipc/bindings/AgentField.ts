@@ -12,4 +12,4 @@
  * translation table, and adding a field to [`AgentDraft`] without a variant here is a field
  * whose refusals have nowhere to land.
  */
-export type AgentField = "scope" | "name" | "label" | "harness" | "description" | "model" | "effort" | "tools" | "permissionMode" | "maxConcurrent" | "systemPrompt";
+export type AgentField = "scope" | "name" | "label" | "harness" | "description" | "model" | "effort" | "tools" | "permissionMode" | "maxConcurrent" | "systemPrompt" | "extras";

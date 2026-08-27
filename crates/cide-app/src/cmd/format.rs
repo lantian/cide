@@ -1,12 +1,18 @@
-//! Reformat code: one command, two roads. (M26)
+//! Reformat code: one command, three roads. (M26; the builtin road in M32)
 //!
 //! Ctrl+Alt+F reaches exactly one `#[tauri::command]`, and *which* formatter runs is decided
 //! here rather than in the webview. That is the same argument `cmd::diagnostics` makes about
 //! document sync: the frontend would need a copy of the settings map, a copy of the "is a server
 //! running for this language" question and a copy of the precedence rule, and the copy is the
-//! one that would be wrong when a third road is added.
+//! one that would be wrong when a third road is added — which M32 did add, and this header now
+//! states in full: a configured filter beats a language server that claims the language, and
+//! both beat cide's own builtin (today: JSON, `cide_core::format::json`). The gate on the
+//! server road is whether a registered server *claims* the language, never whether its answer
+//! was an error — falling back on failure would hand a user who installed a JSON server output
+//! that changes with server health, and matching on an `Unavailable` sentence to decide is the
+//! prose-matching `cide_core::error`'s header forbids.
 //!
-//! # Both roads are filters, and neither touches the disk
+//! # Every road is a filter, and none touches the disk
 //!
 //! The buffer arrives as `text`, the answer leaves as text, and nothing here opens, writes or
 //! stats the file. Formatting the file *on disk* under a dirty buffer is the failure
@@ -56,8 +62,10 @@ const MAX_FORMAT_BYTES: usize = 1 << 20;
 /// entirely on the configured-filter road, where a syntactic fragment on stdin is not something
 /// any formatter can make sense of.
 ///
-/// `spawn_blocking`, because both roads wait: one on a JSON-RPC reply, the other on a child
-/// process. A command polled on the main thread holds the GTK loop and freezes every window.
+/// `spawn_blocking`, because two of the three roads wait: one on a JSON-RPC reply, one on a
+/// child process. (The builtin road is pure compute, but it rides the same thread — a megabyte
+/// of minified JSON is still work.) A command polled on the main thread holds the GTK loop and
+/// freezes every window.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn format_document(
     registry: State<'_, DiagnosticsRegistry>,
@@ -72,9 +80,22 @@ pub async fn format_document(
     // the shape `cmd/session.rs` documents.
     let editor = state.with(|ws| ws.settings.editor.clone());
     let diagnostics = registry.get(project);
+    // Whether any registered server claims this language is read here, once, and handed to
+    // `run` as a plain bool: `cide_lsp::discover`'s registry is a process-global `RwLock`, and
+    // a `run` that read it directly could not be tested for the claimed case without one
+    // test's `install` bleeding into every other test in the binary.
+    let server_claims_language = cide_lsp::discover::by_language(&language_id).is_some();
 
     Ok(tauri::async_runtime::spawn_blocking(move || {
-        run(&editor, &diagnostics, &path, &language_id, &text, range)
+        run(
+            &editor,
+            &diagnostics,
+            &path,
+            &language_id,
+            &text,
+            range,
+            server_claims_language,
+        )
     })
     .await
     .unwrap_or(FormatAnswer::Unavailable {
@@ -93,6 +114,7 @@ fn run(
     language_id: &str,
     text: &str,
     range: Option<FormatRange>,
+    server_claims_language: bool,
 ) -> FormatAnswer {
     if text.len() > MAX_FORMAT_BYTES {
         return FormatAnswer::Unavailable {
@@ -105,18 +127,19 @@ fn run(
         };
     }
 
-    // The precedence, stated once: a configured filter beats the language server. See
-    // `cide_core::format`'s header for why that way round.
+    // The precedence, stated once: a configured filter beats a language server that claims
+    // the language, and both beat the builtin — see this file's header and
+    // `cide_core::format`'s for why each is that way round.
     match cide_core::format::configured(&editor.formatters, language_id, path) {
         cide_core::format::Configured::Filter { argv, name } => filter(&argv, &name, text),
         cide_core::format::Configured::Refused(reason) => FormatAnswer::Unavailable { reason },
-        cide_core::format::Configured::None => match diagnostics {
+        cide_core::format::Configured::None if server_claims_language => match diagnostics {
             Some(diagnostics) => {
                 diagnostics.format(path, text, range, options(editor), FORMAT_TIMEOUT)
             }
-            // No server for this project at all — an unopened project, or one whose language has
-            // none. The sentence names the settings road, because for the nine builtin languages
-            // with no server that is the only road there is.
+            // A server claims the language but this project has none running — an unopened
+            // project, mid-startup. Saying so beats silently formatting with the builtin,
+            // which would give this keystroke two different outputs depending on timing.
             None => FormatAnswer::Unavailable {
                 reason: format!(
                     "No formatter for {language_id}: no language server is running for this \
@@ -124,6 +147,35 @@ fn run(
                 ),
             },
         },
+        // Nothing claims the language, so the builtin is next — whole-document only, which is
+        // why `range` is not passed: the LSP road already formats the whole document when a
+        // server lacks `rangeFormatting`, so a selection falling back to the full buffer is
+        // this feature's established shape, not a new one.
+        cide_core::format::Configured::None => {
+            match cide_core::format::builtin(
+                language_id,
+                text,
+                editor.tab_size,
+                editor.insert_spaces,
+            ) {
+                Some(Ok(out)) if out == text => FormatAnswer::Unchanged {
+                    by: cide_core::format::BUILTIN_FORMATTER_NAME.to_string(),
+                },
+                Some(Ok(out)) => FormatAnswer::Formatted {
+                    text: out,
+                    by: cide_core::format::BUILTIN_FORMATTER_NAME.to_string(),
+                },
+                Some(Err(reason)) => FormatAnswer::Unavailable { reason },
+                // A builtin language with no server and no builtin formatter. The sentence
+                // names the settings road, because that is the only road there is.
+                None => FormatAnswer::Unavailable {
+                    reason: format!(
+                        "No formatter for {language_id}: no language server claims this file \
+                         type, and none is configured in Settings → Editor → Formatters."
+                    ),
+                },
+            }
+        }
     }
 }
 
@@ -243,6 +295,7 @@ mod tests {
             "rust",
             &huge,
             None,
+            false,
         );
         let FormatAnswer::Unavailable { reason } = answer else {
             panic!("a buffer past the cap must be refused, got {answer:?}");
@@ -266,8 +319,9 @@ mod tests {
 
     #[test]
     fn no_server_and_no_row_names_the_settings_road() {
-        // The nine builtin languages with no language server. The sentence has to point
-        // somewhere the user can act, or Ctrl+Alt+F is a key that does nothing and says nothing.
+        // The builtin languages with neither a server nor a builtin formatter (JSON left this
+        // set in M32). The sentence has to point somewhere the user can act, or Ctrl+Alt+F is
+        // a key that does nothing and says nothing.
         let answer = run(
             &settings(&[]),
             &None,
@@ -275,6 +329,7 @@ mod tests {
             "typescript",
             "let x=1\n",
             None,
+            false,
         );
         let FormatAnswer::Unavailable { reason } = answer else {
             panic!("expected a refusal, got {answer:?}");
@@ -284,6 +339,137 @@ mod tests {
             "names the language: {reason}"
         );
         assert!(reason.contains("Formatters"), "names the screen: {reason}");
+    }
+
+    #[test]
+    fn a_json_buffer_with_no_server_formats_with_the_builtin() {
+        // The whole point of the third road: no diagnostics, nothing claiming the language,
+        // no settings row — and the keystroke still formats.
+        let answer = run(
+            &settings(&[]),
+            &None,
+            std::path::Path::new("/w/a.json"),
+            "json",
+            "{\"a\":1}",
+            None,
+            false,
+        );
+        assert_eq!(
+            answer,
+            FormatAnswer::Formatted {
+                // Four spaces: the default `EditorSettings::tab_size`, which is the point —
+                // the builtin follows the same settings the server road sends as
+                // `FormattingOptions`.
+                text: "{\n    \"a\": 1\n}".to_string(),
+                by: cide_core::format::BUILTIN_FORMATTER_NAME.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_configured_row_still_beats_the_builtin() {
+        // The settings row is the user's most explicit lever, and the builtin must not
+        // shadow it — the same dead-lever argument `cide_core::format`'s header makes
+        // against the server winning over a row.
+        let editor = settings(&[("json", &["cat"])]);
+        let answer = run(
+            &editor,
+            &None,
+            std::path::Path::new("/w/a.json"),
+            "json",
+            "{\"a\":1}",
+            None,
+            false,
+        );
+        assert_eq!(
+            answer,
+            FormatAnswer::Unchanged {
+                by: "cat".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_language_a_server_claims_never_reaches_the_builtin() {
+        // The future-JSON-LSP pin: the day an extension contributes a server with
+        // `language_ids: ["json"]`, installing it must route formatting to that server —
+        // never leave the builtin silently winning, and never fall back to the builtin on
+        // the server road's errors (output that changes with server health is untraceable).
+        let answer = run(
+            &settings(&[]),
+            &None,
+            std::path::Path::new("/w/a.json"),
+            "json",
+            "{\"a\":1}",
+            None,
+            true,
+        );
+        assert!(
+            matches!(answer, FormatAnswer::Unavailable { .. }),
+            "a claimed language with no running server must refuse, got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_json_is_refused_with_its_position() {
+        let answer = run(
+            &settings(&[]),
+            &None,
+            std::path::Path::new("/w/a.json"),
+            "json",
+            "{\"a\": 1",
+            None,
+            false,
+        );
+        let FormatAnswer::Unavailable { reason } = answer else {
+            panic!("broken JSON must refuse, got {answer:?}");
+        };
+        assert!(reason.contains("line"), "names the position: {reason}");
+    }
+
+    #[test]
+    fn already_formatted_json_is_silently_unchanged() {
+        // `Unchanged` is what keeps a reflexive Shift+Alt+F from dirtying the tab — the same
+        // contract the filter road states with `cat`.
+        let answer = run(
+            &settings(&[]),
+            &None,
+            std::path::Path::new("/w/a.json"),
+            "json",
+            "{\n    \"a\": 1\n}\n",
+            None,
+            false,
+        );
+        assert_eq!(
+            answer,
+            FormatAnswer::Unchanged {
+                by: cide_core::format::BUILTIN_FORMATTER_NAME.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_builtin_honours_the_users_own_indent_settings() {
+        // The same disagreement `options` guards against on the server road: a formatter
+        // told a width the user did not set reformats every line to the wrong indent.
+        let editor = cide_ipc::EditorSettings {
+            tab_size: 2,
+            insert_spaces: true,
+            ..Default::default()
+        };
+        let answer = run(
+            &editor,
+            &None,
+            std::path::Path::new("/w/a.json"),
+            "json",
+            "{\"a\":1}",
+            None,
+            false,
+        );
+        let FormatAnswer::Formatted { text, .. } = answer else {
+            panic!("expected formatted output, got {answer:?}");
+        };
+        assert_eq!(text, "{\n  \"a\": 1\n}");
     }
 
     #[test]
@@ -298,6 +484,7 @@ mod tests {
             "typescript",
             "let x = 1;\n",
             None,
+            false,
         );
         assert_eq!(
             answer,
@@ -320,6 +507,7 @@ mod tests {
             "typescript",
             "let x = 1;\n",
             None,
+            false,
         );
         assert_eq!(
             answer,
@@ -342,6 +530,7 @@ mod tests {
             "rust",
             "fn  main(){}\n",
             None,
+            false,
         );
         let FormatAnswer::Unavailable { reason } = answer else {
             panic!("must refuse, got {answer:?}");
@@ -362,6 +551,7 @@ mod tests {
             "typescript",
             "x\n",
             None,
+            false,
         );
         let FormatAnswer::Unavailable { reason } = answer else {
             panic!("must refuse, got {answer:?}");
@@ -382,6 +572,7 @@ mod tests {
             "typescript",
             "x\n",
             None,
+            false,
         );
         let FormatAnswer::Unavailable { reason } = answer else {
             panic!("must refuse, got {answer:?}");
@@ -404,6 +595,7 @@ mod tests {
             "rust",
             "fn main(){}\n",
             None,
+            false,
         );
         assert!(
             matches!(answer, FormatAnswer::Unavailable { .. }),

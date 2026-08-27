@@ -31,6 +31,9 @@ pub mod keymap;
 pub mod layout;
 pub mod notes;
 pub mod persist;
+/// Process ancestry: whose child a pid is. The join key when a `claude` is not the process
+/// cide forked — a wrapper, a shell, a re-exec through a proxy.
+pub mod proc;
 pub mod profile;
 pub mod proxy;
 /// Editor colour schemes: importing a VS Code theme, and the imported ones on disk.

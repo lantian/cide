@@ -280,6 +280,39 @@ eq(kinds('a  \nb'), ['text', 'break', 'text'], 'two trailing spaces is a hard br
 eq(kinds('a\\\nb'), ['text', 'break', 'text'], 'and so is a trailing backslash')
 eq(text(inline('a\nb')), 'a b', 'a soft break is a space')
 
+/*
+ * `softBreak: 'break'` — the message dialect. (M31)
+ *
+ * `TaskMarkdown.tsx` is its only caller and the divergence from the preview is deliberate: a task
+ * comment is a message, and every comment box treats a newline as a line. What is pinned here is
+ * that it changes *only* the soft break — block structure, fences and hard breaks are untouched,
+ * because the failure this guards is a "message mode" that quietly stopped being markdown.
+ */
+const MSG = { softBreak: 'break' }
+const msgInline = (src) => parseInline(src, NO_REFS, MSG)
+const msgKinds = (src) => msgInline(src).map((n) => n.kind)
+
+eq(msgKinds('a\nb'), ['text', 'break', 'text'], 'a soft break is a line break in message mode')
+eq(text(msgInline('a\nb')), 'ab', '...and contributes no space of its own')
+eq(msgKinds('a  \nb'), ['text', 'break', 'text'], 'a hard break is still one break, not two')
+eq(msgKinds('a\\\nb'), ['text', 'break', 'text'], '...and so is the backslash spelling')
+eq(msgKinds('*a\nb*'), ['em'], 'emphasis still spans the break')
+eq(msgInline('*a\nb*')[0].body.map((n) => n.kind), ['text', 'break', 'text'], '...and holds it')
+eq(msgKinds('`a\nb`'), ['code'], 'a code span is still one span')
+eq(msgInline('`a\nb`')[0].text, 'a b', '...and its own newline rule is unchanged')
+
+{
+  // Blocks are the parser's job either way: the option must not turn a document into one paragraph
+  // of `break`s, and a fence's newlines are fence content, never inline nodes.
+  const doc = parseMarkdown('# h\n\n- one\n- two\n\n```\na\nb\n```\n', MSG)
+  eq(doc.blocks.map((b) => b.kind), ['heading', 'list', 'code'], 'message mode still reads blocks')
+  eq(doc.blocks[1].items.length, 2, '...and a list is still two items, not one with a break')
+  eq(doc.blocks[2].text, 'a\nb', '...and a fence keeps its own newlines verbatim')
+  const para = parseMarkdown('plan:\nfirst step\nsecond step', MSG).blocks[0]
+  eq(para.body.map((n) => n.kind), ['text', 'break', 'text', 'break', 'text'],
+    'the reported case: three lines an agent wrote are drawn as three lines')
+}
+
 // ---------------------------------------------------------------------------------------
 // 3. Nothing is ever markup
 // ---------------------------------------------------------------------------------------

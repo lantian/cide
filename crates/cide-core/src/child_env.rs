@@ -472,8 +472,52 @@ pub fn child_path_in(
 /// The `PATH` pass goes last, so that where both produce a `PATH` the appended list wins; it was
 /// built *from* the scrubbed value, so nothing the scrub removed comes back.
 pub fn prepare_command(command: &mut Command) {
+    prepare_command_with(command, &[]);
+}
+
+/// [`crate::toolchain::extra_dirs`] with a caller's own directories appended.
+///
+/// Pure, and separate from [`prepare_command_with`], so the append-and-dedup rule is a thing a
+/// test can state: the impure half reads the process environment and mutates a [`Command`], and
+/// neither is observable from a unit test on a machine whose `PATH` is whatever CI gave it.
+///
+/// [`push_unique`]'s rule, restated one layer up: an empty entry means the current directory in
+/// a `PATH` and cide has no business putting a child's cwd on its own search path, and a
+/// duplicate costs a `stat` on every lookup for ever.
+fn dirs_with(base: &[std::path::PathBuf], extra: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut dirs = base.to_vec();
+    for dir in extra {
+        if !dir.as_os_str().is_empty() && !dirs.contains(dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    dirs
+}
+
+/// [`prepare_command`], with directories appended to the child's `PATH` beyond
+/// [`crate::toolchain::extra_dirs`].
+///
+/// # The rule: the directory a binary was found in is a directory its process must search
+///
+/// `toolchain`'s header states the invariant this one obeys from the other side — the
+/// directories cide searches to *find* a binary and the directories it gives that binary's
+/// process are one list, and widening `search_paths` alone turns a refusal that names a remedy
+/// into an opaque `ENOENT`. So a caller that resolved a binary through a search of its *own*
+/// (M28's `cide-spec`, which probes Node installation directories `extra_dirs` deliberately does
+/// not know about) must hand that directory back here, or it has widened one half of the pair.
+///
+/// The failure this prevents is not hypothetical and does not look like a `PATH` problem.
+/// `openspec` is a `#!/usr/bin/env node` script: with its own directory missing from the child's
+/// `PATH`, `execve` **succeeds** and the interpreter line fails, so the error is
+/// `env: node: No such file or directory` from a process cide never mentions — bit for bit the
+/// compounding failure `toolchain`'s header records for a `gopls` that cannot exec `go`.
+///
+/// Appended, never prepended, and de-duplicated: [`child_path_in`]'s contract is unchanged, so
+/// nothing here can shadow a directory the user arranged themselves.
+pub fn prepare_command_with(command: &mut Command, extra: &[std::path::PathBuf]) {
     let scrub = bundle_scrub();
-    let path = child_path(&scrub);
+    let dirs = dirs_with(crate::toolchain::extra_dirs(), extra);
+    let path = child_path_in(&scrub, std::env::var_os("PATH").as_deref(), &dirs);
     for (name, value) in scrub.into_iter().chain(path) {
         match value {
             Some(value) => command.env(name, value),
@@ -543,14 +587,30 @@ pub enum FilterError {
 /// before returning. That is also why this must not be moved onto [`on_spawn_thread`], which
 /// exists for the opposite case: children nobody waits for.
 pub fn run_filter(
+    command: Command,
+    stdin: Option<&[u8]>,
+    deadline: std::time::Duration,
+) -> Result<Filtered, FilterError> {
+    run_filter_with(command, stdin, deadline, &[])
+}
+
+/// [`run_filter`], with directories appended to the child's `PATH`.
+///
+/// Split out rather than added as a parameter to [`run_filter`] because the two existing callers
+/// — `cide-git`'s `blame` and M26's Reformat — resolve their binaries through
+/// `toolchain::which`, whose search *is* the list the child already gets, so an empty slice is
+/// the honest answer for both and neither call site should have to write it. See
+/// [`prepare_command_with`] for the rule and for the shebang failure it prevents.
+pub fn run_filter_with(
     mut command: Command,
     stdin: Option<&[u8]>,
     deadline: std::time::Duration,
+    extra_path: &[std::path::PathBuf],
 ) -> Result<Filtered, FilterError> {
     use std::io::{Read, Write};
     use std::process::Stdio;
 
-    prepare_command(&mut command);
+    prepare_command_with(&mut command, extra_path);
     arm(&mut command);
     command
         .stdin(if stdin.is_some() {
@@ -1279,6 +1339,58 @@ mod tests {
         assert!(
             !path.contains(".mount_"),
             "the bundle's own directories came back through the PATH pass: {path}"
+        );
+    }
+
+    /// M28's half of `toolchain`'s one-list rule: a binary found through a search of the
+    /// caller's own must have that directory on the `PATH` its process is given.
+    ///
+    /// The failure it guards is invisible as a `PATH` bug. `openspec` is a
+    /// `#!/usr/bin/env node` script, so with its own nvm directory missing the `execve`
+    /// *succeeds* and the shebang dies — `env: node: No such file or directory`, from a process
+    /// cide never names.
+    #[test]
+    fn the_path_a_child_searches_includes_the_directory_the_binary_came_from() {
+        let base = extra(["/home/u/.cargo/bin", "/home/u/go/bin"].as_slice());
+        let found = extra(["/home/u/.nvm/versions/node/v22.21.0/bin"].as_slice());
+
+        let dirs = dirs_with(&base, &found);
+        assert_eq!(
+            dirs,
+            extra(
+                [
+                    "/home/u/.cargo/bin",
+                    "/home/u/go/bin",
+                    "/home/u/.nvm/versions/node/v22.21.0/bin",
+                ]
+                .as_slice()
+            ),
+            "the directory the binary came from is appended, and appended last so it can \
+             shadow nothing the user arranged"
+        );
+
+        let scrub = vec![("PATH".to_string(), Some("/usr/bin".to_string()))];
+        let path = path_of(child_path_in(&scrub, None, &dirs)).expect("directories were added");
+        assert!(
+            path.ends_with("/home/u/.nvm/versions/node/v22.21.0/bin"),
+            "and it reaches the child: {path}"
+        );
+    }
+
+    #[test]
+    fn a_directory_already_searched_is_not_searched_twice_and_an_empty_one_is_dropped() {
+        // The empty entry is the interesting half: in a `PATH` it means the current directory,
+        // and a child's cwd is the one place cide must never put on a search path.
+        let base = extra(["/home/u/.cargo/bin"].as_slice());
+        assert_eq!(
+            dirs_with(
+                &base,
+                &[
+                    std::path::PathBuf::from("/home/u/.cargo/bin"),
+                    std::path::PathBuf::new(),
+                ]
+            ),
+            base
         );
     }
 

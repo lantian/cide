@@ -149,6 +149,18 @@ const ITEMS: readonly RailItem[] = [
   { id: 'agents', icon: 'hexagon', label: 'Agents' },
   { id: 'tasks', icon: 'square-check-big', label: 'Tasks' },
   /*
+   * M28's, and it goes here for the reason the comment above gives — before the bottom-anchored
+   * Settings, so `SPACER_AT` moves with it.
+   *
+   * **Always drawn, even in a project with no `openspec/`.** This array is a module constant
+   * precisely so `chrome/layoutAudit.ts` can drive it with fixed props; a rail whose buttons
+   * depended on what a project happened to contain would make the audit's measurements depend on
+   * the repository the developer had open. So the button is permanent and unbadged, and it *is*
+   * the one quiet entry point — everything else the feature adds stays hidden until the board is
+   * ready.
+   */
+  { id: 'openspec', icon: 'book-open-text', label: 'OpenSpec' },
+  /*
    * M22's manager panel, and the *contributed* panels arrive separately through the `extra` prop
    * below rather than by being pushed onto this array. Two reasons, and the second is the real
    * one: this array is a module constant that `chrome/layoutAudit.ts` drives with fixed props,

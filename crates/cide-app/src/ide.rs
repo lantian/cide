@@ -56,6 +56,21 @@ struct Entry {
 pub struct IdeServers {
     rt: Runtime,
     servers: DashMap<ProjectId, Entry>,
+    /// Bindings this app derived by ancestry, keyed by the pid they were derived **from**.
+    ///
+    /// `pane_of_pid` inside a server has one key per attributed process, and until M29 every
+    /// one of them was a pid cide had forked itself — so `lifecycle::report_exit` could undo a
+    /// binding with nothing but the pid it had just reaped. [`resolve_unbound_connections`]
+    /// adds keys cide never forked: the `claude` a wrapper spawned, whose pid the reaper never
+    /// sees. This is how those get undone with the child they came from, and it is the whole
+    /// reason the resolver records the ancestor as well as the pane.
+    ///
+    /// Leaving them would not resurrect a dead pane on its own — the join needs an open
+    /// connection and that connection died with the process — but a recycled pid would make an
+    /// unrelated child answer for a pane, which is the hazard `IdeServer::unbind_pane`'s own
+    /// note already spells out. One `Vec` because a pty child can spawn a CLI, have it exit,
+    /// and spawn another before anything is reaped.
+    derived: DashMap<u32, Vec<u32>>,
 }
 
 /// An [`IdeServers`] that has not yet been shown the restored workspace.
@@ -128,6 +143,7 @@ impl PendingIdeServers {
                 .thread_name("cide-ide")
                 .build()?,
             servers: DashMap::new(),
+            derived: DashMap::new(),
         }))
     }
 
@@ -258,6 +274,15 @@ impl IdeServers {
         for entry in self.servers.iter() {
             entry.server.unbind_pane(pid);
         }
+        // And every descendant that was attributed *through* this pid. See `derived`: those
+        // keys are pids cide never forked, so this reaper call is the only notice they get.
+        if let Some((_, descendants)) = self.derived.remove(&pid) {
+            for descendant in descendants {
+                for entry in self.servers.iter() {
+                    entry.server.unbind_pane(descendant);
+                }
+            }
+        }
     }
 
     /// Which of this project's panes an addressed notification can actually reach.
@@ -272,6 +297,32 @@ impl IdeServers {
         self.servers
             .get(&project)
             .map(|entry| entry.server.addressable_panes())
+    }
+
+    /// Connected CLIs in this project that no pane claims.
+    ///
+    /// Input to [`resolve_unbound_connections`], which is the only caller. Empty for a project
+    /// with no server, which is the same answer as a project whose every connection is
+    /// attributed — correct here, because there is nothing to resolve either way.
+    pub fn unbound_pids(&self, project: ProjectId) -> Vec<u32> {
+        self.servers
+            .get(&project)
+            .map(|entry| entry.server.unbound_pids())
+            .unwrap_or_default()
+    }
+
+    /// Attribute a connected CLI to the pane whose child — or descendant — it is.
+    ///
+    /// `via` is the pid the attribution came from: the process cide actually forked. When it
+    /// equals `pid` this is an ordinary binding and nothing is recorded, because
+    /// `lifecycle::report_exit` already unbinds that pid when it reaps the child. When it does
+    /// not, `pid` is a process cide never forked and the pairing is remembered so that reaping
+    /// `via` takes it down too. See [`Self::derived`].
+    fn bind_resolved(&self, project: ProjectId, pid: u32, via: u32, pane: PaneId) {
+        self.bind_pane(project, pid, pane);
+        if via != pid {
+            self.derived.entry(via).or_default().push(pid);
+        }
     }
 
     /// Tell every connected `claude` in a project where the editor selection is.
@@ -457,6 +508,12 @@ async fn pump(
                 // this event fires once per Claude pane, in an app that may have four open,
                 // and a debounce written inline here would be a rule no test could reach.
                 record_handshake(client_version);
+                // And work out *which pane* just connected, when the pid alone does not say.
+                // Here rather than only at send time so that a diff opened by a wrapper's
+                // `claude` is attributed to the right pane too — attribution is not only about
+                // mentions — and so the log line above is followed by the one that names the
+                // pane, which is the pair a reader of a bug report needs.
+                resolve_unbound_connections(&app, project);
             }
             ServerEvent::Disconnected { .. } => {}
             ServerEvent::OpenFile {
@@ -495,6 +552,134 @@ fn record_handshake(client_version: Option<String>) {
         cide_claude::version::verified_range(),
     );
     let _ = cide_core::handshake::record(&cide_core::handshake::handshake_path(), record);
+}
+
+/// Attribute every connected `claude` in `project` that no pane claims yet.
+///
+/// # The bug
+///
+/// A pane and a connection are joined by pid equality: `pane_bind_session` records the pid of
+/// the process cide forked into the pty, the CLI announces `ide_connected {pid: process.pid}`,
+/// and `cide_ide_mcp` matches them. That holds only while the process cide forked *is* the
+/// process that opened the socket, and a launcher breaks it: `claude` on a given machine may be
+/// a shim — a version manager, an `npm` launcher, a `bbin agent claude`-style wrapper — that
+/// **spawns** the real CLI instead of `exec`ing it. cide then holds the wrapper's pid and the
+/// CLI announces its own, the join finds nothing, and *Send lines to Claude* fails with
+/// `cmd::file::not_connected`'s sentence: one session connected, nothing saying which pane it
+/// is. The same shape covers a `claude` typed into a cide **shell** pane, which
+/// `cide_ide_mcp::server`'s notes have described as unaddressable since it was written.
+///
+/// It looked platform-specific and is not: it was reported from a Mac whose `claude` is a
+/// wrapper, against a Linux box whose `claude` is a symlink to the executable — one `execve`,
+/// one process, pids equal. Nothing in this path is `cfg`-gated.
+///
+/// # The fix, and its one rule
+///
+/// The announced process is a *descendant* of one cide forked, so the join becomes an ancestry
+/// walk: [`cide_core::proc::owning_ancestor`] climbs from the announced pid and stops at the
+/// **first** pid this project has a pane for. Nearest wins, which is what makes a `claude`
+/// inside a shell pane belong to the shell pane rather than to whatever pane is above it.
+///
+/// # Why it is safe to do this at all
+///
+/// Attribution decides where an `@`-mention is typed and which pane a diff is credited to.
+/// Both are wrong-but-recoverable if this misfires, and it is hard to misfire: parentage is
+/// exact, the walk is capped, and a chain with no owned ancestor is left unattributed rather
+/// than guessed at — somebody else's `claude`, connected to this project through the lockfile
+/// from a Terminal window, has no ancestor cide forked and stays exactly as unaddressable as
+/// it is today.
+///
+/// # Why it runs twice
+///
+/// Once on `Connected`, which is the ordinary path, and once from `cmd::file::claude_send_lines`
+/// before it decides a send has nowhere to go. The second is not belt-and-braces: the pane
+/// binding is a workspace mutation the *frontend* makes after a spawn resolves, so a connection
+/// that beats it — a fast wrapper, a loaded machine — would find `pane_pids` empty, and a
+/// feature that depends on the order of two independent round trips is a feature that works on
+/// the machine it was written on. Resolving again at the point of use costs one lock and one
+/// syscall per unattributed connection, on a gesture a human just made, and there is normally
+/// nothing to do.
+pub fn resolve_unbound_connections(app: &AppHandle, project: ProjectId) {
+    let Some(servers) = app.try_state::<IdeServers>() else {
+        return;
+    };
+    let unbound = servers.unbound_pids(project);
+    if unbound.is_empty() {
+        return;
+    }
+
+    let panes = pane_pids(app, project);
+    for pid in unbound {
+        match cide_core::proc::owning_ancestor(
+            pid,
+            |p| panes.get(&p).copied(),
+            cide_core::proc::parent_of_pid,
+        ) {
+            Some((via, pane)) => {
+                tracing::info!(
+                    %project, %pane, pid, via,
+                    "attributed a claude to a pane through its ancestry"
+                );
+                servers.bind_resolved(project, pid, via, pane);
+            }
+            None => {
+                // The sentence a bug report needs, and the one that was missing: it names the
+                // chain that was walked and the children this project has, so the two can be
+                // compared without a debugger. `PARENT_LOOKUP_WORKS` is in it because on a
+                // platform that cannot walk at all the chain is one element and the *reason*
+                // it is one element is not otherwise visible.
+                tracing::warn!(
+                    %project,
+                    pid,
+                    ancestry = ?cide_core::proc::ancestry_of(pid),
+                    pane_children = ?panes,
+                    lookup_works = cide_core::proc::PARENT_LOOKUP_WORKS,
+                    "a claude is connected to this project and no pane owns it"
+                );
+            }
+        }
+    }
+}
+
+/// The pid of every live child this project's panes hold, and which pane holds it.
+///
+/// The map the ancestry walk climbs towards. Built from the workspace (which pane holds which
+/// session) and the session registry (which session has which child), because those are the two
+/// halves and nothing holds both — the same pair `pane_bind_session` joins, read in the other
+/// direction.
+///
+/// **Every pane kind, not only Claude ones.** A `claude` typed into a shell pane is genuinely
+/// running in that pane and attributing it there is the true answer; that it is not a pane an
+/// `@`-mention can be *routed* to is `cmd::file::mention_candidates`' decision and belongs
+/// there, not in a function about parentage. Diff attribution wants the true answer too.
+///
+/// The lock is released before the registry is touched: this runs on the IDE runtime and on a
+/// command worker, and holding the workspace across another map's lock is how two subsystems
+/// learn to wait for each other.
+fn pane_pids(app: &AppHandle, project: ProjectId) -> std::collections::HashMap<u32, PaneId> {
+    let (Some(state), Some(registry)) = (
+        app.try_state::<WorkspaceState>(),
+        app.try_state::<crate::state::SessionRegistry>(),
+    ) else {
+        return std::collections::HashMap::new();
+    };
+
+    let sessions: Vec<(cide_ipc::SessionId, PaneId)> = state.with(|ws| {
+        let Ok(p) = cide_core::workspace::project(ws, project) else {
+            return Vec::new();
+        };
+        p.tabs
+            .iter()
+            .flat_map(|tab| tab.tree.panes.values())
+            .chain(p.detached.values())
+            .filter_map(|pane| pane.session.map(|s| (s, pane.id)))
+            .collect()
+    });
+
+    sessions
+        .into_iter()
+        .filter_map(|(session, pane)| Some((registry.get(session)?.child_pid()?, pane)))
+        .collect()
 }
 
 /// Open the diff tab for a blocked `openDiff`, or reject it.
@@ -819,5 +1004,51 @@ mod tests {
 
         let served: Vec<ProjectId> = servable_projects(&ws).into_iter().map(|(p, _)| p).collect();
         assert!(served.contains(&ids[38]));
+    }
+
+    /// A derived binding is undone by reaping the child it was derived from.
+    ///
+    /// The rule [`IdeServers::derived`] exists for. `lifecycle::report_exit` unbinds the pid it
+    /// reaped, and the CLI behind a wrapper has a pid that reaper never sees — so without the
+    /// pairing, the one binding cide invented is the one binding nothing ever removes, and a
+    /// recycled pid would answer for a dead pane.
+    ///
+    /// **What it does not cover.** There is no server in this map, so `bind_pane` and
+    /// `unbind_pane` reach nothing: this asserts the bookkeeping and not the routing. Starting
+    /// a real server needs a bound port and a lockfile in the user's `~/.claude/ide`, which is
+    /// the same limitation the test above states. The routing half is
+    /// `cide-ide-mcp`'s `a_connection_nothing_bound_is_reported_until_something_binds_it`,
+    /// which drives an actual socket.
+    #[test]
+    fn reaping_a_wrapper_forgets_the_cli_it_spawned() {
+        let servers = IdeServers {
+            rt: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime"),
+            servers: DashMap::new(),
+            derived: DashMap::new(),
+        };
+        let project = ProjectId::new();
+        let pane = PaneId::new();
+
+        // 7100 is the wrapper cide forked; 7101 is the `claude` it spawned and the pid that
+        // reached the socket.
+        servers.bind_resolved(project, 7101, 7100, pane);
+        assert_eq!(
+            servers.derived.get(&7100).map(|v| v.clone()),
+            Some(vec![7101]),
+            "the invented binding is recorded against the child that explains it"
+        );
+
+        servers.unbind_pid(7100);
+        assert!(
+            servers.derived.get(&7100).is_none(),
+            "and reaping that child takes it with it"
+        );
+
+        // The ordinary case records nothing: `report_exit` already unbinds a pid cide forked,
+        // and a second copy of that fact is a second thing to keep in step.
+        servers.bind_resolved(project, 7200, 7200, pane);
+        assert!(servers.derived.is_empty());
     }
 }

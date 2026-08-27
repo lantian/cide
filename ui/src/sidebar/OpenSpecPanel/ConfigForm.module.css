@@ -1,0 +1,441 @@
+/*
+ * The OpenSpec configuration form. (M28)
+ *
+ * Self-contained rather than reusing `settings/controls.module.css`, and the reason is the audit
+ * hooks: every element `check-openspec-config.mjs` reads carries a `data-audit`, and the shared
+ * controls carry none. Wrapping them would mean a hook on a div that is not the control, which is
+ * the shape that lets a digest keep passing after the control it was meant to describe is gone.
+ * The type ladder, the radii and the spacing steps are the same tokens that file uses, so the
+ * screen reads as one form with the eleven sections around it.
+ */
+
+/*
+ * Both screens' root. It scrolls, and the dialog around it does not: the card is capped at `80vh`
+ * and Save lives at the bottom of this box, so a form longer than the card has to scroll *inside*
+ * it or the commit control ends up below the window with nothing able to reach it.
+ */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-4);
+}
+
+/* --- the file, and the way through to it ------------------------------------------------- */
+
+.fileRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+}
+
+.fileText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.fileLabel {
+  font-size: var(--fs-ui-13);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.fileHint {
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+/*
+ * Selectable and monospaced, `settings/controls`' `PathReadout` reason exactly: the whole point
+ * of printing the path next to a button that opens it is the case where the button cannot do
+ * what it says, and there the only useful thing is a path somebody can copy into a terminal.
+ */
+.path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--text);
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* --- groups -------------------------------------------------------------------------------- */
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--panel);
+}
+
+.groupTitle {
+  margin: 0;
+  font-size: var(--fs-ui-13);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.groupHint {
+  margin: 0;
+  font-size: var(--fs-ui-12);
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+.groupHint code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--text);
+}
+
+.groupHint strong {
+  color: var(--text-hi);
+  font-weight: 600;
+}
+
+.warnHint {
+  color: var(--yellow);
+}
+
+/* --- controls ------------------------------------------------------------------------------ */
+
+.select {
+  appearance: none;
+  align-self: flex-start;
+  min-width: 14rem;
+  padding: var(--sp-2) var(--sp-4) var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--chrome);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  transition: border-color var(--dur-1) var(--ease-out);
+}
+
+.select:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+}
+
+.select:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+.select:disabled {
+  opacity: 0.5;
+}
+
+.textarea {
+  width: 100%;
+  min-height: 8rem;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.6;
+  resize: vertical;
+  transition: border-color var(--dur-1) var(--ease-out);
+}
+
+.textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.textarea:disabled {
+  opacity: 0.5;
+}
+
+.text {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  transition: border-color var(--dur-1) var(--ease-out);
+}
+
+.text:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.text:disabled {
+  opacity: 0.5;
+}
+
+/* --- the string lists ---------------------------------------------------------------------- */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+}
+
+.listHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.listTitle {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  color: var(--text-hi);
+}
+
+.listCount {
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.listHint {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.listRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* --- buttons ------------------------------------------------------------------------------- */
+
+.primary,
+.secondary,
+.add,
+.remove {
+  border-radius: var(--r-1);
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.primary:disabled,
+.secondary:disabled,
+.add:disabled,
+.remove:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.primary {
+  padding: var(--sp-2) var(--sp-5);
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--accent-hi);
+}
+
+.secondary {
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid var(--border);
+  background: var(--chrome);
+  color: var(--text);
+  font-size: var(--fs-ui-12);
+  white-space: nowrap;
+}
+
+.secondary:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text-hi);
+}
+
+.add {
+  align-self: flex-start;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+
+.add:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text);
+}
+
+.remove {
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+}
+
+.remove:hover:not(:disabled) {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* --- notes and the footer ------------------------------------------------------------------ */
+
+.note {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-4);
+  border-left: 2px solid var(--accent-dim);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+}
+
+.noteWarn {
+  border-left-color: var(--yellow);
+}
+
+.noteTitle {
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.noteBody {
+  font-size: var(--fs-ui-12);
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.status {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/* ------------------------------------------------------------------- the modal (M28) */
+
+/*
+ * The dialog's own frame, inside `OverlayCard`'s card.
+ *
+ * **It states no width**, and that is the fix for how it first shipped. `Overlay.module.css`'s
+ * `.card` is `width: 620px` with `overflow: hidden`; a child asking for `min(760px, 92vw)` does
+ * not widen it, it *overflows* it — and the card centres, so the excess was clipped off **both
+ * edges**. On screen that read as a dialog with its left-hand quarter sliced away: the title, the
+ * config path and every label lost their first characters, with nothing anywhere saying why.
+ * `TasksPanel.module.css`'s `.taskCard` is the house pattern and sets no width either.
+ *
+ * The height cap is this element's job, though: the form is long — schema, project context,
+ * per-artifact rules, per-operation guidance — and the body has to scroll inside a bounded card
+ * or Save ends up below the bottom of the window with nothing able to reach it.
+ */
+.dialog {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: calc(100vh - 160px);
+}
+
+.dialogHead {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.dialogTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-ui-13);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialogClose {
+  flex: none;
+  font: inherit;
+  display: flex;
+  align-items: center;
+  padding: var(--sp-1);
+  border: 0;
+  border-radius: var(--r-1);
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+  transition: background-color var(--dur-1) ease;
+}
+
+.dialogClose:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+/*
+ * The read, in flight. Three calls, two of which spawn the `openspec` CLI — so this is on screen
+ * for the better part of a second every time the dialog opens, and drawing nothing for that long
+ * is what made the card look broken rather than busy.
+ */
+.reading {
+  margin: 0;
+  padding: var(--sp-4);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+/*
+ * A read that failed. Drawn here rather than through `settings/controls.tsx`'s `Note`, which is
+ * what this used while it lived under Settings — importing a Settings control into a sidebar
+ * modal would be the one line still asserting this screen belongs there.
+ */
+.readFailed {
+  padding: var(--sp-4);
+}
+
+.readFailedHead {
+  margin: 0 0 var(--sp-1);
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  color: var(--red);
+}
+
+.readFailedLine {
+  margin: 0;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+  line-height: 1.5;
+}

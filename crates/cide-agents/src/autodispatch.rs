@@ -18,6 +18,19 @@
 //! * **Only `Todo` and `Doing` tasks start work.** Assigning a `review` or `done` task records
 //!   who it is *for* — `Task::agent`'s documented meaning — and starts nothing; a reviewer role
 //!   is put on a `review` task with an explicit `cide_agent_dispatch`.
+//! * **A blocked task starts nothing until every blocker is `Done`.** (M30) The rule that makes
+//!   `LinkType::BlockedBy` a real edge rather than the advisory one `cide_ipc::tasks`' header
+//!   used to cut: an assignment or mention on a blocked task records intent exactly as one on a
+//!   `review` task does, and the block clearing is not itself a trigger — somebody re-gestures,
+//!   or the orchestrator dispatches, once the blocker lands. `Done` alone satisfies, not
+//!   `Review`: review work can bounce back to `Doing`, and a dependent run dispatched against
+//!   unaccepted work builds on a branch `integrate` may yet rewrite. The blockers arrive as a
+//!   parameter ([`blocker_statuses`] is the caller's half) because this function is pure over
+//!   one task and must stay a table row in the tests; a blocker that no longer exists is not in
+//!   the slice at all, because a deleted task can never become `Done` and an edge that gated
+//!   for ever would make deleting a task corrupt every task that pointed at it. Blocking gates
+//!   **dispatch only** — status edits stay free, which is both how a wedge is broken by hand
+//!   and why `spec_triggers`' auto-moves need no gate of their own.
 //! * **An assign *gesture* always dispatches; an assignment merely carried along never does.**
 //!   The rule used to be change-only — "re-saving the same assignee does not dispatch" — and the
 //!   debug report showed why that reads wrong at the board: after a run died, re-picking the
@@ -43,9 +56,25 @@
 //!   change would be a destructive act with no confirm; `agents_stop` and the Stop button stay
 //!   the only ways to end a run, and the run-end nudge is what surfaces any work left orphaned.
 
-use cide_ipc::{AgentId, Task, TaskAuthor, TaskStatus};
+use cide_ipc::{AgentId, LinkType, Task, TaskAuthor, TaskStatus};
 
 use crate::mentions;
+
+/// The statuses of `task`'s live blockers that exist on `board` — the caller's half of the
+/// blocking rule, kept beside the policy that consumes it. (M30)
+///
+/// A dangling blocker contributes nothing, deliberately: a deleted task can never become
+/// [`TaskStatus::Done`] and its id is never reused, so an edge to one must not gate for ever —
+/// see the module header. Tombstoned edges are not blockers at all.
+#[must_use]
+pub fn blocker_statuses(task: &Task, board: &[Task]) -> Vec<TaskStatus> {
+    task.links
+        .iter()
+        .filter(|l| l.link == LinkType::BlockedBy && !l.deleted)
+        .filter_map(|l| board.iter().find(|t| t.id == l.target))
+        .map(|t| t.status)
+        .collect()
+}
 
 /// What one mutation asks the registry to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -58,13 +87,17 @@ pub struct Trigger {
 
 /// The decision. `None` when the mutation starts nothing.
 ///
-/// `assign_gesture` says whether this mutation *was* an assignment gesture (the dropdown, an
-/// explicit `Assign` edit, a creation naming an assignee) rather than a save that carries the
-/// field along; `fresh_text` is the prose *this mutation introduced*; `roles` is the loaded
-/// catalog's id set, used to filter mentions only — see the module header for all three.
+/// `blockers` is [`blocker_statuses`] over the board the mutation left behind — statuses rather
+/// than a pre-chewed `bool`, so the Done-only satisfaction rule lives *here*, where the table
+/// tests can see it, and not in every caller; `assign_gesture` says whether this mutation *was*
+/// an assignment gesture (the dropdown, an explicit `Assign` edit, a creation naming an
+/// assignee) rather than a save that carries the field along; `fresh_text` is the prose *this
+/// mutation introduced*; `roles` is the loaded catalog's id set, used to filter mentions only —
+/// see the module header for all of them.
 pub fn trigger(
     before: Option<&Task>,
     after: &Task,
+    blockers: &[TaskStatus],
     author: &TaskAuthor,
     assign_gesture: bool,
     fresh_text: &[&str],
@@ -74,6 +107,12 @@ pub fn trigger(
         return None;
     }
     if !matches!(after.status, TaskStatus::Todo | TaskStatus::Doing) {
+        return None;
+    }
+    // After the status gate, before the mention scan: a blocked task's mention must not adopt
+    // it either — an assignee written by a gesture that then starts nothing is exactly the
+    // carried-along state the `assign_gesture` rule exists to keep inert.
+    if blockers.iter().any(|s| *s != TaskStatus::Done) {
         return None;
     }
 
@@ -124,6 +163,9 @@ mod tests {
             status,
             agent: agent.map(|a| AgentId(a.into())),
             comments: Vec::new(),
+            change: None,
+            links: Vec::new(),
+            session: None,
             history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
@@ -139,6 +181,89 @@ mod tests {
         trigger.dispatch.iter().map(|id| id.0.as_str()).collect()
     }
 
+    /// The blocking table: Done is the one status that satisfies, and the empty slice — no
+    /// blockers, or only dangling ones — gates nothing. (M30)
+    #[test]
+    fn a_blocked_task_starts_nothing_until_its_blockers_are_done() {
+        let after = task(TaskStatus::Todo, Some("qa"));
+        let rows: &[(&[TaskStatus], bool)] = &[
+            (&[], true),
+            (&[TaskStatus::Done], true),
+            (&[TaskStatus::Done, TaskStatus::Done], true),
+            (&[TaskStatus::Todo], false),
+            (&[TaskStatus::Doing], false),
+            // Review blocks, deliberately: review work can bounce back to Doing, and a run
+            // dispatched against it builds on a branch integrate may yet rewrite.
+            (&[TaskStatus::Review], false),
+            (&[TaskStatus::Done, TaskStatus::Doing], false),
+        ];
+        for (blockers, starts) in rows {
+            let hit = trigger(
+                None,
+                &after,
+                blockers,
+                &TaskAuthor::User,
+                true,
+                &[],
+                &roles(&["qa"]),
+            );
+            assert_eq!(
+                hit.is_some(),
+                *starts,
+                "blockers {blockers:?} must {}start the role",
+                if *starts { "" } else { "not " }
+            );
+        }
+
+        // And a mention on a blocked task neither adopts nor starts — an assignee written by a
+        // gesture that then starts nothing is the carried-along state the gesture rule keeps
+        // inert.
+        let unassigned = task(TaskStatus::Todo, None);
+        assert_eq!(
+            trigger(
+                None,
+                &unassigned,
+                &[TaskStatus::Doing],
+                &TaskAuthor::User,
+                false,
+                &["@qa please"],
+                &roles(&["qa"]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn blocker_statuses_ignores_a_blocker_that_no_longer_exists() {
+        let mut blocked = task(TaskStatus::Todo, None);
+        blocked.id = cide_ipc::TaskId("t-9".into());
+        blocked.links = vec![
+            cide_ipc::TaskLink {
+                link: LinkType::BlockedBy,
+                target: cide_ipc::TaskId("t-1".into()),
+                deleted: false,
+                at_unix_ms: 1,
+            },
+            // A dangling blocker: t-77 is on nobody's board. A deleted task can never become
+            // Done and its id is never reused, so it must not gate for ever.
+            cide_ipc::TaskLink {
+                link: LinkType::BlockedBy,
+                target: cide_ipc::TaskId("t-77".into()),
+                deleted: false,
+                at_unix_ms: 1,
+            },
+            // A tombstoned edge is not a blocker at all.
+            cide_ipc::TaskLink {
+                link: LinkType::BlockedBy,
+                target: cide_ipc::TaskId("t-2".into()),
+                deleted: true,
+                at_unix_ms: 2,
+            },
+        ];
+        let board = vec![task(TaskStatus::Doing, None), blocked.clone()];
+        assert_eq!(blocker_statuses(&blocked, &board), vec![TaskStatus::Doing]);
+    }
+
     #[test]
     fn the_author_gate_refuses_a_runs_own_assign() {
         let after = task(TaskStatus::Todo, Some("qa"));
@@ -147,7 +272,15 @@ mod tests {
             label: "Developer".into(),
         };
         assert_eq!(
-            trigger(None, &after, &author, true, &["@qa on it"], &roles(&["qa"])),
+            trigger(
+                None,
+                &after,
+                &[],
+                &author,
+                true,
+                &["@qa on it"],
+                &roles(&["qa"])
+            ),
             None,
             "a subagent assigned/mentioned a role and cide would have spawned it"
         );
@@ -158,14 +291,30 @@ mod tests {
         for status in [TaskStatus::Review, TaskStatus::Done] {
             let after = task(status, Some("qa"));
             assert_eq!(
-                trigger(None, &after, &TaskAuthor::User, true, &[], &roles(&["qa"])),
+                trigger(
+                    None,
+                    &after,
+                    &[],
+                    &TaskAuthor::User,
+                    true,
+                    &[],
+                    &roles(&["qa"])
+                ),
                 None,
                 "assigning a {status:?} task records intent, never spawns"
             );
         }
         let after = task(TaskStatus::Doing, Some("qa"));
-        let hit =
-            trigger(None, &after, &TaskAuthor::User, true, &[], &roles(&["qa"])).expect("doing");
+        let hit = trigger(
+            None,
+            &after,
+            &[],
+            &TaskAuthor::User,
+            true,
+            &[],
+            &roles(&["qa"]),
+        )
+        .expect("doing");
         assert_eq!(ids(&hit), ["qa"]);
     }
 
@@ -176,6 +325,7 @@ mod tests {
         let hit = trigger(
             None,
             &after,
+            &[],
             &TaskAuthor::Orchestrator,
             true,
             &[],
@@ -195,6 +345,7 @@ mod tests {
         let hit = trigger(
             Some(&before),
             &after,
+            &[],
             &TaskAuthor::User,
             true,
             &[],
@@ -210,6 +361,7 @@ mod tests {
         let hit = trigger(
             Some(&after),
             &after,
+            &[],
             &TaskAuthor::User,
             true,
             &[],
@@ -224,6 +376,7 @@ mod tests {
             trigger(
                 Some(&after),
                 &after,
+                &[],
                 &TaskAuthor::User,
                 false,
                 &[],
@@ -236,6 +389,7 @@ mod tests {
             trigger(
                 Some(&after),
                 &unassigned,
+                &[],
                 &TaskAuthor::User,
                 true,
                 &[],
@@ -252,6 +406,7 @@ mod tests {
         let hit = trigger(
             None,
             &after,
+            &[],
             &TaskAuthor::User,
             false,
             &["@qa and @developer, please"],
@@ -266,6 +421,7 @@ mod tests {
         let hit = trigger(
             Some(&after),
             &after,
+            &[],
             &TaskAuthor::Orchestrator,
             false,
             &["@qa please verify"],
@@ -288,6 +444,7 @@ mod tests {
             trigger(
                 None,
                 &after,
+                &[],
                 &TaskAuthor::User,
                 false,
                 &["@develoepr have a look"],
@@ -306,6 +463,7 @@ mod tests {
         let hit = trigger(
             None,
             &after,
+            &[],
             &TaskAuthor::User,
             true,
             &["@developer builds it, @qa checks it"],

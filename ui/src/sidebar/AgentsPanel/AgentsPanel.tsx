@@ -108,6 +108,7 @@ import {
   ROSTER_UNKNOWN,
   isDonePhase,
   metaFigure,
+  scopeBadge,
   sections,
   type RoleRow,
   type Roster,
@@ -832,6 +833,30 @@ function RoleLine({
         <span className={styles.roleName} title={def.id}>
           {def.label}
         </span>
+        {/*
+          * Where the definition came from, but **only when that is a surprise** — see
+          * `scopeBadge`, which returns a mark for the two Claude Code scopes and `null` for
+          * cide's own two. Immediately after the name because it qualifies the name: this row
+          * names a subagent `claude` also knows about outside cide, with no harness to choose
+          * and a definition cide applies through `--agent` rather than through its own flags.
+          *
+          * `title` carries the longer sentence rather than the row: the roster is a list to scan,
+          * and a paragraph on every subagent row would push the runs off the bottom.
+          */}
+        {scopeBadge(def.scope) !== null && (
+          <span
+            className={styles.roleBadge}
+            data-audit="agentsRoleBadge"
+            data-scope={def.scope}
+            title={
+              def.scope === 'claudeGlobal'
+                ? 'A Claude Code subagent from ~/.claude/agents — cide runs it with `claude --agent`.'
+                : 'A Claude Code subagent from this project’s .claude/agents — cide runs it with `claude --agent`.'
+            }
+          >
+            {scopeBadge(def.scope)}
+          </span>
+        )}
         <span className={styles.sep} aria-hidden="true">
           ·
         </span>

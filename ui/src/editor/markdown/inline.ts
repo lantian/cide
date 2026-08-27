@@ -31,7 +31,7 @@
  * Import-free apart from its own types, so `ui/scripts/check-markdown.mjs` can compile and run
  * it with no bundler.
  */
-import type { Inline, LinkDef } from './types'
+import type { Inline, LinkDef, MarkdownOptions } from './types'
 
 /**
  * How far past a `[` or a `(` the link matcher will look for its closer.
@@ -306,6 +306,7 @@ function tokenize(
   src: string,
   refs: ReadonlyMap<string, LinkDef>,
   depth: number,
+  opts: MarkdownOptions,
 ): List {
   const list: List = { head: null, tail: null }
   const n = src.length
@@ -454,7 +455,9 @@ function tokenize(
             link.href = target.def.href
             link.title = target.def.title
             link.head =
-              depth >= MAX_NESTING ? textOnly(inner) : parseNodes(inner, refs, depth + 1).head
+              depth >= MAX_NESTING
+                ? textOnly(inner)
+                : parseNodes(inner, refs, depth + 1, opts).head
             push(list, link)
           }
           i = target.end
@@ -499,7 +502,11 @@ function tokenize(
     if (ch === '\n') {
       /*
        * Two or more spaces before a newline is a hard break; otherwise the break is soft and
-       * renders as a space, because a paragraph is one flow however the source was wrapped.
+       * renders as a space, because a paragraph is one flow however the source was wrapped —
+       * unless the caller asked for `softBreak: 'break'`, which is a message rather than a
+       * document and means the line it wrote (`types.ts`'s `MarkdownOptions` carries the
+       * argument). Either way the trailing whitespace is trimmed off the text node first: it is
+       * the *spelling* of the hard break, never content.
        */
       const last = list.tail
       let hard = false
@@ -514,7 +521,7 @@ function tokenize(
           else list.tail.next = null
         }
       }
-      if (hard) push(list, node('break'))
+      if (hard || opts.softBreak === 'break') push(list, node('break'))
       else pushText(list, ' ')
       i++
       // Leading whitespace on the continuation line is not content.
@@ -729,8 +736,13 @@ function toInline(head: Node | null): Inline[] {
 }
 
 /** Tokenize and resolve emphasis. The whole pipeline, so a link's text gets it too. */
-function parseNodes(src: string, refs: ReadonlyMap<string, LinkDef>, depth: number): List {
-  const list = tokenize(src, refs, depth)
+function parseNodes(
+  src: string,
+  refs: ReadonlyMap<string, LinkDef>,
+  depth: number,
+  opts: MarkdownOptions,
+): List {
+  const list = tokenize(src, refs, depth, opts)
   processEmphasis(list)
   return list
 }
@@ -741,6 +753,10 @@ function parseNodes(src: string, refs: ReadonlyMap<string, LinkDef>, depth: numb
  * `refs` is the document's link reference definitions, which is why this cannot run until
  * `blocks.ts` has read the whole file: `[cide]` on line 3 may be defined on line 900.
  */
-export function parseInline(src: string, refs: ReadonlyMap<string, LinkDef>): Inline[] {
-  return toInline(parseNodes(src, refs, 0).head)
+export function parseInline(
+  src: string,
+  refs: ReadonlyMap<string, LinkDef>,
+  opts: MarkdownOptions = {},
+): Inline[] {
+  return toInline(parseNodes(src, refs, 0, opts).head)
 }

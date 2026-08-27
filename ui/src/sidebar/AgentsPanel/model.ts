@@ -74,6 +74,54 @@ export function harnessLabel(harness: string): string {
   return harness.trim() === '' ? 'unknown harness' : harness
 }
 
+/* -------------------------------------------------------------------------------- the scopes */
+
+/**
+ * Which of the four directories a definition was read from. Restates `AgentScope` in
+ * `crates/cide-ipc/src/agents.rs`, and `check-agents.mjs` pins the two as sets — a variant added
+ * in Rust and missed here fails the frontend build rather than rendering as nothing.
+ */
+export type Scope = 'project' | 'global' | 'claudeProject' | 'claudeGlobal'
+
+export const SCOPES: readonly Scope[] = [
+  'project',
+  'global',
+  'claudeProject',
+  'claudeGlobal',
+]
+
+/** Is this one of the scopes this build knows how to label? */
+export function isScope(value: string): value is Scope {
+  return SCOPES.includes(value as Scope)
+}
+
+/**
+ * The badge a role's row carries for where it came from, or `null` for no badge at all.
+ *
+ * # Why only one of the four scopes gets a mark
+ *
+ * A badge is a claim that something is *unusual*, and three of these four are not: `.cide/agents/`
+ * and its global twin are cide's own directories, and a row from either behaves exactly as every
+ * row in this panel has always behaved. Badging all four would put a chip on every line and say
+ * nothing.
+ *
+ * What a Claude Code subagent needs the user to know is a real difference in kind. cide did not
+ * define that file's format and cannot model all of it; the definition is applied by the CLI
+ * through `--agent` rather than by cide's own flags; there is no harness to choose; and the same
+ * file is read by `claude` outside cide entirely. "Why does this role have no harness dropdown"
+ * and "why did editing this change what my terminal does" both have one answer, and this chip is
+ * where it is visible without opening anything.
+ *
+ * Project and user share the mark deliberately: which of the two a subagent is in matters when you
+ * go to edit it and not when you are reading a roster, and two chips a character apart would be
+ * two chips nobody reads carefully.
+ */
+export function scopeBadge(scope: string): string | null {
+  return scope === 'claudeProject' || scope === 'claudeGlobal'
+    ? 'Claude Code'
+    : null
+}
+
 /* ----------------------------------------------------------------------------- the phases */
 
 /**
@@ -175,7 +223,9 @@ export const TONES: readonly Tone[] = ['idle', 'busy', 'attention', 'paused', 'd
 const PHASE_GLYPH: Record<RunPhase, string> = {
   queued: 'circle',
   starting: 'circle-dashed',
-  // An arc, so the mark reads as *turning*: that is the distinction `idle` below turns on.
+  // An arc, so the mark reads as *turning*: that is the distinction `idle` below turns on. It
+  // has to *actually* turn for that to be true, and for a long time it did not — see
+  // [`SPINNING_GLYPH`].
   running: 'loader-circle',
   // A ringed dot rather than a hollow or a filled one: the child is *there* (the centre) but is
   // not turning (the ring). It has to be readable against both `queued`'s empty circle and
@@ -227,6 +277,30 @@ const PHASE_TONE: Record<RunPhase, Tone> = {
 const UNKNOWN_GLYPH = 'circle-slash'
 const UNKNOWN_LABEL = 'Unknown'
 const UNKNOWN_TONE: Tone = 'idle'
+
+/**
+ * The one mark in this vocabulary that is drawn **rotating**.
+ *
+ * # Why the animation keys off the glyph and not off the phase
+ *
+ * Because the claim being animated is the *mark's*, not the state's. `loader-circle` is a
+ * three-quarter arc: it says "turning", and `idle`'s ringed dot is distinguishable from it only
+ * on that reading — [`PHASE_GLYPH`] says so in as many words. A phase-keyed rule would let the
+ * two drift: give `running` a different mark and it would spin something that is not a spinner;
+ * give another phase the arc and it would sit still next to one that moves.
+ *
+ * It sat still everywhere for a milestone and a half — the task list's chip, the task card's run
+ * strip, the Agents panel's rows, and the accept button's own copy — so the single signal that
+ * anything was happening was a static shape. Every surface that draws a phase mark now asks this
+ * and adds its stylesheet's spin class. Three stylesheets, one rule, because a CSS module cannot
+ * share a `@keyframes`.
+ */
+export const SPINNING_GLYPH = 'loader-circle'
+
+/** Should this mark be drawn turning? See [`SPINNING_GLYPH`]. */
+export function glyphSpins(glyph: string): boolean {
+  return glyph === SPINNING_GLYPH
+}
 
 /** The dot at the head of a run row. Never empty, for any input. */
 export function phaseGlyph(phase: RunPhase): string {
@@ -366,6 +440,12 @@ export interface AgentDefView {
   id: string
   /** What the row says. Title-cased from the id by Rust unless the definition gives one. */
   label: string
+  /**
+   * Which of the four directories this definition came from. Drawn through [`scopeBadge`], and
+   * carried as the scope rather than as a boolean so the Settings screen can open the right file
+   * from a roster row instead of probing each scope in turn.
+   */
+  scope: Scope
   harness: Harness
   /** One line: what the role is *for*, in the author's own words. */
   description: string
@@ -382,6 +462,17 @@ export interface AgentDefView {
   unavailable: string | null
   /** How many runs of this role may hold a slot at once. */
   maxConcurrent: number
+  /**
+   * `AgentDef::worktree` — does this role's runs take a checkout under `.cide/worktrees/`?
+   *
+   * Carried into the view because it decides what a *button somewhere else* is allowed to say:
+   * `OpenSpecPanel/model.ts`'s `primaryAction` names the accept gesture *Integrate & Archive*
+   * only when there is a branch to merge, and `worktree: false` means the role committed
+   * straight into the user's own checkout, so there is not one. Reading it here is a lookup;
+   * the alternative was a second `openspec`/git round trip per card open to learn a fact
+   * already on the wire.
+   */
+  worktree: boolean
 }
 
 /**
@@ -840,7 +931,8 @@ export const RESTING_TONE: Tone = 'idle'
  * definition under this id — rather than as an accusation, because the ordinary way to reach it
  * is to edit `.cide/agents/` while something is running, which is a reasonable thing to do.
  */
-export const ROLE_UNDEFINED = 'No definition for this role in .cide/agents/ any more.'
+export const ROLE_UNDEFINED =
+  'No definition for this role in .cide/agents/ or .claude/agents/ any more.'
 
 /**
  * One role, and everything about it the panel draws. **The panel's only list.**
@@ -1003,12 +1095,28 @@ function undefinedRole(run: RunView): AgentDefView {
     id: run.agent,
     // The label copied at dispatch, which is the only name anything still has for this role.
     label: run.agentLabel.trim() === '' ? run.agent : run.agentLabel,
+    // Nothing on the wire says where a deleted role's definition used to live, and a run does
+    // not carry it. `project` is the answer with the fewest consequences: it draws no badge, and
+    // a badge on a row that exists only because a definition is *missing* would be a claim about
+    // a file nobody can point at.
+    scope: 'project',
     harness: run.harness,
     description: '',
     systemPrompt: '',
     model: null,
     unavailable: ROLE_UNDEFINED,
     maxConcurrent: 0,
+    /*
+     * The wire's default, and the safe one here.
+     *
+     * Nothing a run carries says whether the definition that has gone isolated its checkouts.
+     * `true` is the answer that keeps a *later* surface honest rather than the one that reads
+     * best on this row: `primaryAction` prints *Archive* on `false`, so guessing `false` for a
+     * role whose branch really is waiting would tell the user there was nothing to merge. This
+     * row cannot dispatch anything anyway — `unavailable` is set — so the value is never read
+     * to start work.
+     */
+    worktree: true,
   }
 }
 

@@ -146,6 +146,8 @@ try {
 
   const {
     HARNESSES,
+    SCOPES,
+    scopeBadge,
     RUN_PHASES,
     WORKING_PHASES: AGENT_WORKING_PHASES,
     ACTIVE_PHASES,
@@ -157,9 +159,11 @@ try {
     RESTING_GLYPH,
     RESTING_LABEL,
     ROLE_UNDEFINED,
+    glyphSpins,
     isActivePhase,
     isRunPhase,
     phaseGlyph,
+    SPINNING_GLYPH,
     phaseHint,
     phaseLabel,
     phaseTone,
@@ -227,7 +231,48 @@ try {
     closeCard,
     openTask,
     activeEdit,
+    LINK_KINDS,
+    isLinkKind,
+    linkLabel,
+    taskLinks,
+    linkableTargets,
+    linkTargetOptions,
+    LINK_TARGET_CAP,
   } = tasks
+
+  /* == 0 ============================ an optional wire field is `null`, not missing (M28) == */
+
+  /*
+   * `Task`'s optional fields carry **`#[serde(default)]` and no `skip_serializing_if`**, so a
+   * value that is `None` in Rust reaches the webview as `"field": null` — the key is present.
+   * An adapter testing `=== undefined` therefore falls straight through to `String(null)`, which
+   * is the seven-character string `"null"`: a truthy id on every row.
+   *
+   * That is not hypothetical. `session` shipped that way for an afternoon: every task on the
+   * board grew a session row reading *Conversation null*, and `primaryAction` — which refuses the
+   * approve road once a task has a session — took **Approve & dispatch off every OpenSpec task
+   * there was**. `tsc` cannot see it (both branches type), and no render check can, because the
+   * fixtures are written by hand and never carry a wire value.
+   *
+   * So the rule is a grep, and it is a grep over the one file that touches wire values: in
+   * `adapt.ts`, an absent optional is tested with `== null`, which catches both.
+   */
+  {
+    const adapt = read('../src/sidebar/TasksPanel/adapt.ts')
+    const code = adapt
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '')
+    ok(
+      !/===\s*undefined/.test(code),
+      'TasksPanel/adapt.ts tests an absent wire field with `=== undefined` — `Task`\'s optionals ' +
+        'have no `skip_serializing_if`, so they arrive as an explicit `null` and that branch ' +
+        'reads it as a value. Use `== null`, which catches both',
+    )
+    ok(
+      /session:\s*from\.session\s*==\s*null/.test(code),
+      'and `session` in particular, which is the field that proved it',
+    )
+  }
 
   /* == 1 ================================================== the vocabularies match Rust == */
 
@@ -254,6 +299,54 @@ try {
     'RUN_PHASES is exactly the tags of `pub enum RunState`',
   )
   eq(sorted(HARNESSES), sorted(rustHarnesses), 'HARNESSES is exactly `pub enum Harness`')
+
+  /*
+   * The scopes, pinned the way the harnesses are. (M30)
+   *
+   * A variant Rust gained and the panel has not is a row whose badge silently reads `null` — and
+   * for a source cide does not own, that is precisely the fact the badge exists to state.
+   */
+  const rustScopes = variants(agentsRs, 'pub enum AgentScope {', 'AgentScope')
+  eq(sorted(SCOPES), sorted(rustScopes), 'SCOPES is exactly `pub enum AgentScope`')
+  /*
+   * And the badge itself is total in the only sense that matters: **a mark or nothing, never an
+   * empty string.** An empty badge renders as a bordered box with no text in it, which reads as a
+   * rendering fault rather than as "no badge" — the same argument `canDispatch` makes about
+   * returning exactly one of a green light and a sentence.
+   */
+  for (const scope of SCOPES) {
+    const badge = scopeBadge(scope)
+    ok(
+      badge === null || (typeof badge === 'string' && badge.trim() !== ''),
+      `scopeBadge(${scope}) is a real mark or null, never blank`,
+    )
+  }
+  eq(
+    SCOPES.filter((scope) => scopeBadge(scope) !== null),
+    ['claudeProject', 'claudeGlobal'],
+    'exactly the two Claude Code scopes are badged — badging cide’s own two would put a chip ' +
+      'on every row and say nothing',
+  )
+  eq(
+    scopeBadge('claudeProject'),
+    scopeBadge('claudeGlobal'),
+    'project and user share one mark: which of the two a subagent is in matters when you go to ' +
+      'edit it, not when you are reading a roster',
+  )
+
+  /* The link kinds, pinned the way the statuses are. (M30) */
+  const rustLinkKinds = variants(tasksRs, 'pub enum LinkType {', 'LinkType')
+  ok(
+    rustLinkKinds.length === 3,
+    `read ${rustLinkKinds.length} LinkType variants — the scan still matches`,
+  )
+  eq(
+    sorted(LINK_KINDS),
+    sorted(rustLinkKinds),
+    'LINK_KINDS is exactly `pub enum LinkType` — a kind Rust gained and the panel has not is ' +
+      'an edge the tracker can hold and never draw, which is the task-leaves-the-tracker ' +
+      'failure applied to an edge',
+  )
 
   eq(
     sorted(GROUP_ORDER),
@@ -325,6 +418,28 @@ try {
     nonEmptyString(phaseLabel(phase), `phaseLabel(${phase}) is a non-empty string`)
     nonEmptyString(phaseTone(phase), `phaseTone(${phase}) is a non-empty string`)
     ok(RUN_TONES.includes(phaseTone(phase)), `phaseTone(${phase}) is a declared tone`)
+  }
+
+  /*
+   * Exactly one mark turns, and it is `running`'s.
+   *
+   * `PHASE_GLYPH`'s own comment says the arc is chosen *because* it reads as turning, and that
+   * `idle`'s ringed dot is only distinguishable from it on that reading. It did not turn — not on
+   * the task list's chip, not on the card's run strip, not on the Agents panel's rows — so for a
+   * milestone and a half the single signal that an assigned agent was working was a static shape,
+   * indistinguishable at a glance from the state it was chosen to contrast with.
+   *
+   * Keyed off the *glyph* and not the phase, so the animation and the mark cannot drift apart:
+   * give `running` a different mark and it stops spinning, give another phase the arc and it
+   * starts. The three stylesheets each carry their own `@keyframes` — a CSS module cannot share
+   * one — and `check:agents-render` is what pins the class onto the markup.
+   */
+  {
+    const spinning = RUN_PHASES.filter((phase) => glyphSpins(phaseGlyph(phase)))
+    eq(spinning, ['running'], 'one phase turns, and it is the one whose mark is a spinner')
+    eq(phaseGlyph('running'), SPINNING_GLYPH, 'and the table and the rule name the same mark')
+    ok(!glyphSpins(phaseGlyph('idle')), 'idle sits still — the contrast the arc was chosen for')
+    ok(!glyphSpins(''), 'and an unknown phase\u2019s fallback mark does not spin')
   }
 
   /*
@@ -539,6 +654,7 @@ try {
     status: 'doing',
     agent: 'developer',
     comments: [],
+    links: [],
     createdBy: { kind: 'user' },
     createdMs: 1_699_999_000_000,
     updatedMs: 1_700_000_000_000,
@@ -1463,6 +1579,164 @@ try {
     eq(armedDelete(BOARD_UNKNOWN, { task: 't-1', rev: 9 }), null, 'or before anything looked')
   }
 
+  /* == typed links (M30) ==================================================================== */
+  //
+  // The pure half of the Links section: the direction labels, the derived inverse reading, the
+  // related dedupe, and the gone flag. The section's markup claims are `check-agents-render`'s;
+  // what belongs here is everything that must hold for ANY board, which no fixture can say.
+
+  {
+    for (const kind of [...LINK_KINDS, 'constructor', '']) {
+      nonEmptyString(
+        linkLabel(kind, 'out'),
+        `linkLabel(${JSON.stringify(kind)}, out) is a real label`,
+      )
+      nonEmptyString(
+        linkLabel(kind, 'in'),
+        `linkLabel(${JSON.stringify(kind)}, in) is a real label`,
+      )
+    }
+    eq(linkLabel('blockedBy', 'out'), 'Blocked by', 'the stored direction reads as waiting')
+    eq(
+      linkLabel('blockedBy', 'in'),
+      'Blocks',
+      'and the derived one as holding up — one stored edge, two readings, and the difference ' +
+        'is the difference between being held up and holding work up',
+    )
+    eq(
+      linkLabel('related', 'out'),
+      linkLabel('related', 'in'),
+      'related reads identically from both ends — it has no direction that matters',
+    )
+    eq(isLinkKind('blockedBy'), true, 'the wire spelling is the vocabulary')
+    eq(isLinkKind('blocked_by'), false, 'snake_case is not — serde writes camelCase')
+    eq(isLinkKind('constructor'), false, 'a prototype key is not a kind')
+
+    const linked = task({
+      id: 't-1',
+      links: [
+        { kind: 'blockedBy', target: 't-2' },
+        { kind: 'related', target: 't-3' },
+        { kind: 'blockedBy', target: 't-99' },
+      ],
+    })
+    const blocker = task({ id: 't-2', title: 'The loader', status: 'doing', links: [] })
+    // Both sides hold the related pair — the legal post-merge state the dedupe exists for.
+    const relatedBack = task({ id: 't-3', links: [{ kind: 'related', target: 't-1' }] })
+    const child = task({ id: 't-4', links: [{ kind: 'subtaskOf', target: 't-1' }] })
+    // A rogue kind naming t-1: the derived scan must skip what it cannot read rather than
+    // invent a direction label for it.
+    const rogue = task({ id: 't-5', links: [{ kind: 'constructor', target: 't-1' }] })
+    const board = [linked, blocker, relatedBack, child, rogue]
+
+    eq(
+      taskLinks(linked, board).map((c) => `${c.kind}|${c.direction}|${c.target}|${c.gone}`),
+      [
+        'blockedBy|out|t-2|false',
+        'related|out|t-3|false',
+        'blockedBy|out|t-99|true',
+        'subtaskOf|in|t-4|false',
+      ],
+      'the whole derivation at once: outgoing edges in stored order, then the derived incoming ' +
+        'readings; the related pair drawn ONCE although both sides store it (two chips saying ' +
+        'one fact would read as two facts); the dangling t-99 marked gone rather than hidden; ' +
+        'and the rogue-kind edge on t-5 invisible to the derived scan',
+    )
+    eq(
+      taskLinks(linked, board).find((c) => c.target === 't-2')?.targetTitle,
+      'The loader',
+      'a chip resolves its target from the board — the reader decides what to do next from it',
+    )
+    eq(
+      taskLinks(linked, board).find((c) => c.target === 't-99')?.targetTitle ?? null,
+      null,
+      'and a gone target resolves to nothing, with the flag carried beside it — title-is-null ' +
+        'alone could not tell deleted from untitled',
+    )
+    eq(
+      taskLinks(rogue, board).map((c) => `${c.kind}|${c.direction}`),
+      ['constructor|out'],
+      'a rogue-kind edge still draws on its OWN task — labelled as its raw text, never ' +
+        'vanished: the file is hand-editable and a future cide may have written it',
+    )
+
+    const targets = linkableTargets('t-1', board)
+    ok(
+      !targets.some((t) => t.id === 't-1'),
+      'the picker never offers the task itself — a self-link would gate a task on itself',
+    )
+    eq(targets.length, board.length - 1, 'and offers everything else')
+    eq(
+      targets[0]?.id,
+      't-2',
+      'in the panel’s own reading order — doing before todo, the list condensed into a picker; ' +
+        'a second ordering would put the same task in two places on one screen',
+    )
+    eq(
+      linkableTargets(null, board).length,
+      board.length,
+      'and the compose dialog (no task yet, nothing to exclude) is offered the whole board',
+    )
+
+    /* -- the target search: find a task by its key or its summary -------------------------- */
+
+    const T = (id, title, status = 'todo') => ({ id, title, status })
+    const list = [
+      T('t-2', 'Fix the loader', 'doing'),
+      T('t-10', 'Ship the retry bar'),
+      T('t-14', 'Teach the parser about tabs'),
+      T('t-1', 'Sweep the phase table', 'done'),
+    ]
+
+    eq(
+      linkTargetOptions('', list).map((o) => o.id),
+      ['t-2', 't-10', 't-14', 't-1'],
+      'the empty query offers everything IN THE ORDER IT ARRIVED — the input order is the ' +
+        'panel order (`linkableTargets`), and the picker is the list condensed, so re-sorting ' +
+        'would put the same task in two places on one screen',
+    )
+    eq(
+      linkTargetOptions('t-1', list).map((o) => o.id),
+      ['t-10', 't-14', 't-1'],
+      'an id query matches by PREFIX first and keeps arrival order within the tier — typing ' +
+        'the key is how a person who knows it reaches for it, and t-2 (no match) is gone',
+    )
+    eq(
+      linkTargetOptions('retry', list).map((o) => o.id),
+      ['t-10'],
+      'a summary word reaches the task whose title says it',
+    )
+    eq(
+      linkTargetOptions('RETRY', list).map((o) => o.id),
+      ['t-10'],
+      'case-insensitively — a query is typed, not quoted',
+    )
+    eq(
+      linkTargetOptions('loader', list).map((o) => o.id),
+      ['t-2'],
+      'a word-prefix on the title outranks nothing here, but the tier exists so `t` in a ' +
+        'title cannot drown the ids: the row order above is the pinned claim',
+    )
+    eq(linkTargetOptions('quaternion', list), [], 'and no match is no row, never a guess')
+    eq(
+      linkTargetOptions('constructor', list),
+      [],
+      'a prototype key is a query like any other — nothing here does a bare table lookup',
+    )
+    {
+      const many = Array.from({ length: LINK_TARGET_CAP + 5 }, (_, i) =>
+        T(`t-${i + 100}`, `Task number ${i + 100}`),
+      )
+      eq(
+        linkTargetOptions('', many).length,
+        LINK_TARGET_CAP,
+        'the popup is capped: a hundred-row list under a one-line input is a list nobody ' +
+          'scans, and every keystroke narrows — the cap is only ever felt on queries too ' +
+          'short to mean anything yet',
+      )
+    }
+  }
+
   /* == the card's read/edit posture ========================================================= */
   //
   // The card is a modal now, and read-only until a field is put into edit. These are the rules
@@ -1509,8 +1783,10 @@ try {
     eq(
       sorted(TASK_FIELDS),
       sorted(['title', 'status', 'assignee', 'body']),
-      'the card draws four fields — comments are not one of them: the log is append-only and ' +
-        'has no affordance here',
+      'the card draws four fields — comments are not one of them (the log is append-only and ' +
+        'has no affordance here), and neither are links (M30): a field is one value with one ' +
+        'pencil, an edge set is add-and-remove with no draft and no single commit, so links ' +
+        'are a SECTION like the spec block and this vocabulary stands exactly as it was',
     )
     eq(isEditableField('status'), false, 'and the exclusion is what the predicate says too')
     eq(isEditableField('constructor'), false, 'a prototype key is not a field')
@@ -1776,6 +2052,12 @@ try {
         true,
         '...and so is moving the status off the default, which is a deliberate choice about a ' +
           'field the dialog is the only caller allowed to send',
+      )
+      eq(
+        draftDirty(draft({ links: [{ kind: 'related', target: 't-1' }] })),
+        true,
+        '...and so is a picked link (M30) — work worth protecting from the scrim, exactly as a ' +
+          'typed word is',
       )
       eq(
         draftDirty({ ...EMPTY_DRAFT }),
@@ -2160,7 +2442,7 @@ try {
     process.exit(1)
   }
   console.log(
-    `check-agents: ok (${TASK_STATUSES.length} statuses and ${RUN_PHASES.length} phases pinned ` +
+    `check-agents: ok (${TASK_STATUSES.length} statuses, ${LINK_KINDS.length} link kinds and ${RUN_PHASES.length} phases pinned ` +
       `to Rust, ${tableEntries} table entries non-empty, ${gated} role×roster pairs through ` +
       `the gate, ${chips} agentChip inputs survived, ${wired} commands wired end to end)`,
   )

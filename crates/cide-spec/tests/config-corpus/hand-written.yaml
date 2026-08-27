@@ -1,0 +1,11 @@
+# A file somebody typed, not one a tool wrote.
+schema: spec-driven    # the default, stated anyway
+
+context: We ship on Fridays.
+
+rules:
+    proposal:
+    - 'Mention the on-call rota'
+    - "Say what happens if it is reverted"
+    design:
+    - Draw the state machine

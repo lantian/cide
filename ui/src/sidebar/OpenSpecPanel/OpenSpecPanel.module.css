@@ -1,0 +1,530 @@
+/*
+ * The OpenSpec panel. (M28)
+ *
+ * Tokens only — no literal colours, and every size on the `--fs-ui-*` ladder so the whole panel
+ * follows the UI font size (`check:ui-scale`). Transitions are paint-only and take a `--dur-*`
+ * token (`check:motion`).
+ */
+
+/*
+ * Sized from `--w-sidebar-agents`, the same token the Agents and Tasks panels take — and
+ * declaring it here is what makes the splitter work at all.
+ *
+ * `App.tsx`'s `SidebarSplitter` decides *which* token a drag writes to, and this panel was added
+ * to that ternary's `agents` arm; but a drag only moves what a stylesheet reads. Without this
+ * declaration the panel took its width from the flex row instead, so the divider dragged and
+ * nothing followed it. `check:sidebar` asserts that *some* stylesheet reads each token, which
+ * the two older panels already satisfied — so nothing caught the omission.
+ *
+ * `flex: none` for their reason too: with the default `flex-shrink: 1` the panel would give way
+ * under a wide editor and the width the user dragged to would silently stop being the width.
+ */
+.panel {
+  width: var(--w-sidebar-agents);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--fs-ui-12);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/*
+ * The panel header, and it is `TasksPanel`'s rule for rule.
+ *
+ * This shipped as tracked-out uppercase in `--dim`, which is precisely the style the sidebar was
+ * moved **off** — that panel's own header comment records the four changes and the reasoning:
+ * 10.5px was under the readable floor; tracking is what small caps need and there are none;
+ * `text-transform` was doing all of the shouting over a label already written in sentence case;
+ * and a header quieter than the rows beneath it is not a header.
+ *
+ * The height is `--h-panelheader`, which must stay equal to `--h-tabstrip` — see that token's
+ * comment. The two are the same line across the window, and a panel with its own padding instead
+ * puts a few-pixel step in the sidebar seam.
+ */
+.head {
+  height: var(--h-panelheader);
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
+  /* Written twice: WebKitGTK 2.52 drops the unprefixed property. See `check-css-prefix.mjs`. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.meta {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  letter-spacing: 0;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The header's own control — the configuration gear, last and hard against the right edge.
+ *
+ * No `margin-left: auto`: `.title` above already takes `flex: 1`, so every header child after it
+ * is pushed right whether or not `.meta` is drawn — and the figure *is* withheld on three of the
+ * six board arms, so a rule that depended on it would move the gear when the board changed.
+ */
+.headAction {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: var(--sp-1);
+  border: 0;
+  border-radius: var(--r-1);
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+  transition: background-color var(--dur-1) ease;
+}
+
+.headAction:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-2) 0;
+}
+
+/* ---------------------------------------------------------------- the empty screens */
+
+/*
+ * Every screen and every row starts on the same left edge as the header's title — `--sp-5`.
+ * The panel first shipped with the header at one indent and its content at another, which reads
+ * as a rendering fault rather than as a design.
+ */
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5);
+}
+
+.claim {
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+}
+
+.detail {
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+.path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  overflow-wrap: anywhere;
+  padding: var(--sp-2);
+  background: var(--panel-2);
+  border-radius: var(--r-1);
+}
+
+.actions {
+  display: flex;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin-top: var(--sp-1);
+}
+
+.button {
+  font: inherit;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color var(--dur-1) ease;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/*
+ * The in-flight mark inside Set up. Inline-block with a small negative dip rather than making the
+ * button a flexbox: the button is otherwise plain text, and re-laying every button out to centre
+ * one occasional 12px mark is the larger change.
+ *
+ * And it **turns**.
+ *
+ * `loader-circle` is a three-quarter arc: it means "spinning" only if it does. This said *no
+ * animation* and gave two reasons, and both were wrong — `check:motion` fences **transitions**,
+ * not animations, and "the run strip never spins either" described a second place with the same
+ * bug rather than justifying this one. It was reported against the task card's copy of it.
+ *
+ * A loop, so reduced motion is answered through `--motion-loop` rather than by zeroing a duration
+ * — an infinite animation at `0.01ms` strobes. Paused renders the 0% frame, which is the arc at
+ * rest and a legible static "working" mark. `tokens.css` at `--dur-sweep` states the rule.
+ */
+.busyMark {
+  display: inline-block;
+  vertical-align: -2px;
+  margin-right: var(--sp-1);
+  animation: openspec-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes openspec-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/*
+ * The composer that opens under the toolbar. (M28)
+ *
+ * `/opsx:propose` and `/opsx:explore` both take free text, and sending either bare is legal and
+ * useless — Claude just asks what to propose, which is a round trip the panel already had the
+ * user's attention for. So the buttons open this instead of firing.
+ *
+ * The preview is monospace and shows the exact line that will be typed, because a box that sent
+ * something different from what it displayed would be its own small lie.
+ */
+/*
+ * The composer, which is a **modal** now rather than a box in this panel. (M28)
+ *
+ * The rule lives here because it is still this stylesheet's — `ProposeForm.tsx` may import
+ * `model.ts` and one stylesheet and nothing else, which is what keeps it SSR-able by the render
+ * check. No bottom border any more: it was the line that said "this box belongs to the panel
+ * above it", and inside `OverlayCard` it is a rule across the middle of a card.
+ */
+.ask {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+}
+
+/*
+ * The dialog's heading — cide's words for what the command is *for*, above the invocation.
+ *
+ * The pair is the point: a modal titled `/openspec-propose` names the mechanism where the reader
+ * needs the intent, and one titled only *Propose a change* hides which line is about to be typed.
+ */
+.askHeading {
+  margin: 0;
+  font-size: var(--fs-ui-13);
+  font-weight: 500;
+}
+
+.askTitle {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.askInput {
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  width: 100%;
+  padding: var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  color: var(--text);
+  resize: vertical;
+}
+
+.askPreview {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+
+/*
+ * The two actions, above the tree and always present.
+ *
+ * A bottom border rather than a gap: it is a toolbar over a list, and the line is what says the
+ * buttons belong to the panel rather than to the first section under them.
+ */
+.toolbar {
+  display: flex;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* -------------------------------------------------------------------------- the tree */
+
+.section {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-5);
+  font: inherit;
+  font-weight: 600;
+  color: var(--dim);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.sectionCount {
+  margin-left: auto;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/*
+ * Drawn only when its section is empty — see `sectionHint` in the model for that decision. It can
+ * therefore wrap, because in that state it is the only thing in the section; `--faint` because
+ * even then it is a caption rather than content.
+ */
+.sectionHint {
+  padding: 0 var(--sp-5) var(--sp-2) calc(var(--sp-5) + var(--sp-4));
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+}
+
+/*
+ * A change row is two controls side by side: the row itself, and the action.
+ *
+ * Siblings in a wrapper and not a button inside a button, which is not legal markup — the browser
+ * un-nests it and the inner control ends up outside the row it belongs to.
+ */
+.changeRow {
+  display: flex;
+  align-items: center;
+}
+
+.changeRow .row {
+  flex: 1;
+  min-width: 0;
+  padding-right: var(--sp-2);
+}
+
+.rowAction {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  margin-right: var(--sp-5);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  transition: background-color var(--dur-1) ease;
+}
+
+.rowAction:hover {
+  background: var(--panel-2);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-5) var(--sp-1) calc(var(--sp-5) + var(--sp-4));
+  font: inherit;
+  background: none;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.row:hover {
+  background: var(--panel-2);
+}
+
+.rowLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowMeta {
+  margin-left: auto;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+
+/* ------------------------------------------------------------------------ the stages */
+
+.stage {
+  flex: 0 0 auto;
+  font-size: var(--fs-ui-11);
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-1);
+  border: 1px solid var(--border);
+  color: var(--dim);
+}
+
+.stageReady {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.stageInProgress {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.stageInvalid {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* ------------------------------------------------------------- the requirement editor (M28) */
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) 0;
+}
+
+.editorLabel {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.editorInput {
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  width: 100%;
+  padding: var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.editorArea {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  width: 100%;
+  padding: var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  color: var(--text);
+  resize: vertical;
+}
+
+.editorScenario {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-1) 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.editorScenarioHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.editorDrop {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0 var(--sp-1);
+  color: var(--dim);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.editorClauses {
+  display: flex;
+  gap: var(--sp-1);
+}
+
+.editorClause {
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.editorAdd {
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  align-self: flex-start;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.editorActions {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+
+.editorRefusal,
+.editorProblemHead,
+.editorProblemLine {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  line-height: 1.45;
+}
+
+.editorProblem {
+  padding: var(--sp-1);
+  border: 1px solid var(--red);
+  border-radius: var(--r-1);
+}
+
+.editorProblemLine {
+  font-family: var(--font-mono);
+}

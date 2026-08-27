@@ -275,13 +275,41 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     );
     args.extend(conversation);
 
+    // **Is this role a Claude Code subagent?** (M30) One question, asked once, because four
+    // decisions below turn on it and a second `is_claude_code()` written out at any of them is a
+    // second place for the answer to drift.
+    //
+    // Under `--agent <name>` the CLI reads the whole definition itself — the system prompt (which
+    // it *replaces* rather than appends), `model`, `tools`, `permissionMode`, and the four things
+    // cide has no vocabulary for at all: `skills`, `hooks`, `mcpServers`, `maxTurns`. Writing
+    // cide's own flags alongside would be cide re-deriving a subset of somebody else's semantics
+    // and getting the other half silently wrong, which is exactly what choosing `--agent`
+    // avoided.
+    //
+    // Discovery is the reason this works with no materialising step: `--agent` resolves a project
+    // subagent by walking **up** from the child's working directory, and a run's cwd is
+    // `<root>/.cide/worktrees/<role>-<task>` — inside the project root — so the walk reaches
+    // `<root>/.claude/agents/` on its own. `~/.claude/agents/` is always visible.
+    // `a_worktree_is_inside_the_project_root_so_agent_discovery_reaches_it` is what stops a later
+    // change to `WORKTREES_DIR` breaking that quietly. (A *committed* `.claude/agents/` also
+    // appears inside the worktree at the revision the run's branch points at, and being closer it
+    // wins; same content, worth knowing when a stale one confuses somebody.)
+    let subagent = plan.agent.def.scope.is_claude_code();
+
     // ---- 3. the role's system prompt ----
     //
     // Folded, never pushed: a second `--append-system-prompt` silently deletes the first, so a
     // raw push would take the user's prompt away with nothing on screen saying so. The fold is
     // a no-op when the role has no prompt, which cannot happen — `defs` marks an empty one
     // `unavailable` — but the function is the one that decides that, not this line.
-    cide_core::claude_cli::fold_append_system_prompt(&mut args, &plan.agent.def.system_prompt);
+    //
+    // **Skipped for a subagent.** `--agent` makes the definition's body the child's system
+    // prompt outright, so folding a copy of the same text in would say the whole brief twice —
+    // and the second copy would arrive *appended to* the prompt it duplicates, where the first
+    // arrived as the prompt itself.
+    if !subagent {
+        cide_core::claude_cli::fold_append_system_prompt(&mut args, &plan.agent.def.system_prompt);
+    }
 
     // ---- 3b. and then cide's own paragraph about the task tracker ----
     //
@@ -298,6 +326,15 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     // `tracker` above and `TRACKER_PREAMBLE`'s own header.
     if tracker.is_some() {
         cide_core::claude_cli::fold_append_system_prompt(&mut args, TRACKER_PREAMBLE);
+        // And, for a run working an OpenSpec change, one paragraph more. (M28) Gated on the same
+        // `tracker`, because it names `mcp__cide__cide_task_update` — a run with no bridge must
+        // not be told to call a tool it does not have.
+        if let Some(change) = plan.change.as_deref() {
+            cide_core::claude_cli::fold_append_system_prompt(
+                &mut args,
+                &super::spec_preamble(change, plan.spec_cli.as_deref(), plan.spec_apply.as_deref()),
+            );
+        }
     }
 
     // ---- 4. what the definition asked for, and nothing it did not ----
@@ -311,7 +348,15 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     // `fold_append_system_prompt` measured for `--append-system-prompt`. That is the right
     // precedence: the role file is a statement about *this run*, and the launch configuration
     // is a default for every `claude` cide starts.
-    if let Some(model) = &plan.agent.def.model {
+    //
+    // Every one of the four is **skipped for a subagent**, because the CLI reads all four out of
+    // the definition file that `--agent` names. A second copy here would not merely be redundant:
+    // it would win, so a `permissionMode` a subagent's author wrote could be overridden by a
+    // value cide had re-derived, and `--allowedTools` would silently drop the `disallowedTools`
+    // half of a definition cide has no flag for.
+    if let Some(model) = &plan.agent.def.model
+        && !subagent
+    {
         args.push("--model".into());
         args.push(model.clone());
     }
@@ -319,17 +364,21 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     // differs per harness and per release, and cide has no list to check it against that would
     // not be wrong within a month. A bad value is the CLI's refusal to make, loudly, in the
     // run's own transcript.
-    if let Some(effort) = &plan.agent.effort {
+    if let Some(effort) = &plan.agent.effort
+        && !subagent
+    {
         args.push("--effort".into());
         args.push(effort.clone());
     }
     // Already validated against `defs::PERMISSION_MODES` at load, so it is not checked again
     // here; what matters is that the role's own word always wins — an author who wrote a
     // mode meant it, restrictive or not, and the project default below never overrides one.
-    if let Some(mode) = &plan.agent.permission_mode {
+    if let Some(mode) = &plan.agent.permission_mode
+        && !subagent
+    {
         args.push("--permission-mode".into());
         args.push(mode.clone());
-    } else if plan.skip_permissions {
+    } else if plan.agent.permission_mode.is_none() && plan.skip_permissions {
         // The project's default for unattended children (`agents.skipPermissions`, on unless
         // switched off): a headless run cannot answer a prompt, and a claude run that hits
         // one parks in AwaitingPermission holding its slot and its role's only worktree
@@ -344,9 +393,20 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     // There is no `--disallowedTools` counterpart because a definition cannot express one:
     // the front matter has a `tools` key and no `disallowed-tools` key (`defs::KNOWN_KEYS`).
     // Emitting an empty one would be a restriction the role's author never wrote.
-    if !plan.agent.tools.is_empty() {
+    if !plan.agent.tools.is_empty() && !subagent {
         args.push("--allowedTools".into());
         args.extend(plan.agent.tools.iter().cloned());
+    }
+
+    // ---- 4b. and, for a Claude Code subagent, the definition itself ----
+    //
+    // Non-variadic, so it disturbs nothing written after it — the rule step 4's header states
+    // about `--allowedTools` and step 5's about `--mcp-config` does not apply here, and this
+    // sitting between them is safe only because of that. After the user's own arguments, like
+    // every other token cide adds, so a definition outranks a launch default.
+    if subagent {
+        args.push("--agent".into());
+        args.push(plan.agent.def.id.to_string());
     }
 
     // ---- 5. cide's own MCP server ----
@@ -630,6 +690,7 @@ mod tests {
             def: AgentDef {
                 id: AgentId("developer".into()),
                 label: "Developer".into(),
+                scope: cide_ipc::agents::AgentScope::Project,
                 harness: cide_ipc::Harness::Claude,
                 description: "Implements one task end to end.".into(),
                 system_prompt: "You are the developer agent. Finish the task.".into(),
@@ -643,6 +704,7 @@ mod tests {
             tools: Vec::new(),
             permission_mode: None,
             effort: None,
+            extras: Vec::new(),
         }
     }
 
@@ -655,6 +717,9 @@ mod tests {
             project: ProjectId::new(),
             task: Some(TaskId("t-14".into())),
             task_title: Some("Teach the parser about tabs".into()),
+            change: None,
+            spec_cli: None,
+            spec_apply: None,
             prompt: "Do the task described above.".into(),
             hook_bin: Some(PathBuf::from("/opt/cide/cide-hook")),
             hook_sock: Some(PathBuf::from("/run/user/1000/cide-hooks-42.sock")),
@@ -1248,5 +1313,97 @@ mod tests {
             h.observe(paused, Observation::Exit(0)),
             Some(RunState::Finished { code: 0 }),
         );
+    }
+
+    // ======================================================================================
+    // Claude Code subagents: `--agent`, and the four flags that stand down for it. (M30)
+    // ======================================================================================
+
+    /// The same role, read from `.claude/agents/` instead of `.cide/agents/`, with every switch
+    /// a definition can carry set — so a flag that leaks through has something to leak.
+    fn subagent() -> LoadedAgent {
+        let mut agent = role();
+        agent.def.scope = cide_ipc::agents::AgentScope::ClaudeProject;
+        agent.def.id = AgentId("code-reviewer".into());
+        agent.def.model = Some("sonnet".into());
+        agent.origin = PathBuf::from("/repo/.claude/agents/code-reviewer.md");
+        agent.tools = vec!["Read".into(), "Grep".into()];
+        agent.permission_mode = Some("acceptEdits".into());
+        agent.effort = Some("high".into());
+        agent
+    }
+
+    /// **The whole of the dispatch decision, in one assertion.** `--agent` names the definition
+    /// and the four flags cide would otherwise have re-derived are absent, because the CLI reads
+    /// all four out of the file itself — and a second copy on the command line would *win*.
+    #[test]
+    fn a_subagent_is_named_rather_than_re_derived() {
+        let agent = subagent();
+        let plan = plan_for(&agent, SessionId::new());
+        let args = spawn(&plan).spec.args;
+
+        assert_eq!(value_of(&args, "--agent"), "code-reviewer");
+
+        for flag in ["--model", "--effort", "--allowedTools"] {
+            assert!(
+                !args.iter().any(|a| a == flag),
+                "{flag} is the definition's to state, not cide's: {args:?}"
+            );
+        }
+        // The role names a mode, so cide neither passes it nor substitutes its own.
+        assert!(!args.iter().any(|a| a == "--permission-mode"), "{args:?}");
+    }
+
+    /// The role's brief reaches the child as the CLI's *system prompt*, not appended to one — so
+    /// cide must not fold a second copy in. What it must still fold is its own housekeeping, or
+    /// the run has no idea the task tracker exists and reports to nobody.
+    #[test]
+    fn a_subagents_prompt_is_the_clis_to_set_but_the_tracker_paragraph_is_not() {
+        let agent = subagent();
+        let plan = plan_for(&agent, SessionId::new());
+        let args = spawn(&plan).spec.args;
+
+        let folded = args
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .map(|at| args[at + 1].clone())
+            .unwrap_or_default();
+        assert!(
+            !folded.contains(&agent.def.system_prompt),
+            "the definition's body is `--agent`'s to apply, not ours to repeat: {folded}"
+        );
+        assert!(
+            folded.contains("cide_task_"),
+            "a run nobody can hear from is a run nobody can see: {folded}"
+        );
+    }
+
+    /// A subagent that names no `permissionMode` still gets cide's unattended default, for the
+    /// reason it has always got it: a headless run cannot answer a prompt, and one that hits a
+    /// prompt parks holding its slot and its checkout until a human opens its pane.
+    #[test]
+    fn a_subagent_without_a_mode_still_gets_the_unattended_default() {
+        let mut agent = subagent();
+        agent.permission_mode = None;
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.skip_permissions = true;
+        let args = spawn(&plan).spec.args;
+        assert_eq!(
+            value_of(&args, "--permission-mode"),
+            crate::defs::BYPASS_PERMISSIONS
+        );
+    }
+
+    /// A cide role is untouched by any of it — the four flags are back and `--agent` is not.
+    #[test]
+    fn a_cide_role_is_spawned_exactly_as_before() {
+        let mut agent = subagent();
+        agent.def.scope = cide_ipc::agents::AgentScope::Project;
+        let plan = plan_for(&agent, SessionId::new());
+        let args = spawn(&plan).spec.args;
+        assert!(!args.iter().any(|a| a == "--agent"), "{args:?}");
+        for flag in ["--model", "--effort", "--allowedTools", "--permission-mode"] {
+            assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
+        }
     }
 }

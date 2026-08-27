@@ -200,10 +200,16 @@ fn remembered(kind: &TabKind) -> bool {
         // read of a file that only changes when the user updates the extension. The one way it
         // can come back stale is that the extension was uninstalled in between, and the page draws
         // that state honestly rather than as an empty tab.
+        // An OpenSpec page is remembered for the extension page's reason: it is a *query* — one
+        // change or one capability, read fresh every time it is drawn — so reopening it costs
+        // the same two subprocesses the first open did and lands on whatever is true now. The
+        // one way it comes back changed is that the change was archived in between, which is a
+        // state the page draws honestly rather than an empty tab. (M28)
         TabKind::ClaudeFull { .. }
         | TabKind::File { .. }
         | TabKind::Revision { .. }
         | TabKind::Extension { .. }
+        | TabKind::OpenSpec { .. }
         | TabKind::Settings { .. } => true,
     }
 }

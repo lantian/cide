@@ -42,7 +42,18 @@
 /* -------------------------------------------------------------------- the wire, restated */
 
 /** `cide_ipc::AgentScope`. Which directory the definition file lives in. */
-export type Scope = 'project' | 'global'
+export type Scope = 'project' | 'global' | 'claudeProject' | 'claudeGlobal'
+
+/**
+ * Is this scope a directory **Claude Code** owns rather than one cide does?
+ *
+ * `cide_ipc::AgentScope::is_claude_code`, restated. Four things on this screen turn on it — the
+ * name rule, the harness control, the scope control, and whether Save may create — so it is a
+ * function rather than four comparisons that can drift apart.
+ */
+export function isClaudeScope(scope: Scope): boolean {
+  return scope === 'claudeProject' || scope === 'claudeGlobal'
+}
 
 /** `cide_ipc::Harness`. Which CLI actually runs a role. */
 export type HarnessName = 'claude' | 'opencode'
@@ -67,6 +78,7 @@ export type AgentFieldKey =
   | 'permissionMode'
   | 'maxConcurrent'
   | 'systemPrompt'
+  | 'extras'
 
 /** One refusal, against the field that carries it. Mirrors `cide_ipc::AgentDraftProblem`. */
 export interface Problem {
@@ -102,6 +114,29 @@ export interface Draft {
   permissionMode: string | null
   maxConcurrent: number | null
   systemPrompt: string
+  /**
+   * Every front-matter key cide does not model, in the order the file had them.
+   *
+   * Mirrors `cide_ipc::AgentExtra`. Ordinarily empty for a cide role and ordinarily not for a
+   * Claude Code subagent, where `hooks`, `skills`, `mcpServers` and `maxTurns` all land here.
+   *
+   * **Edited as rows, not carried invisibly.** A draft that preserved text the form did not show
+   * would make the form lie about what the file contains — which is the objection `AgentDraft`'s
+   * own header used to raise against preserving anything at all, and the reason the answer is a
+   * visible list rather than a hidden one.
+   */
+  extras: Extra[]
+}
+
+/** One unmodelled front-matter key. Mirrors `cide_ipc::AgentExtra`. */
+export interface Extra {
+  key: string
+  /**
+   * Everything after the colon. **May contain newlines**: a key that opened a nested block or a
+   * block sequence carries the block's own lines, indentation intact, because the one honest
+   * thing to do with YAML cide does not parse is not to touch it.
+   */
+  value: string
 }
 
 /* --------------------------------------------------------------------- closed vocabularies */
@@ -113,7 +148,12 @@ export interface Draft {
  * *reviewable*: a definition under `<root>/.cide/agents/` is committed, arrives in a pull
  * request, and is the same for everyone who checks the project out.
  */
-export const SCOPES: readonly Scope[] = ['project', 'global']
+export const SCOPES: readonly Scope[] = [
+  'project',
+  'global',
+  'claudeProject',
+  'claudeGlobal',
+]
 
 /** `cide_ipc::Harness`, as a set. Pinned to the Rust enum by the check script. */
 export const HARNESSES: readonly HarnessName[] = ['claude', 'opencode']
@@ -185,6 +225,7 @@ export const AGENT_FIELDS: readonly AgentFieldKey[] = [
   'permissionMode',
   'maxConcurrent',
   'systemPrompt',
+  'extras',
 ]
 
 /**
@@ -214,6 +255,7 @@ export function blankDraft(scope: Scope): Draft {
     permissionMode: null,
     maxConcurrent: null,
     systemPrompt: '',
+    extras: [],
   }
 }
 
@@ -296,6 +338,10 @@ function signature(draft: Draft): string {
     draft.permissionMode,
     draft.maxConcurrent,
     draft.systemPrompt,
+    // Included, or editing a `hooks:` block and clicking away would cost no confirm and the edit
+    // would be gone. `JSON.stringify` over an array of objects compares order as well as
+    // content, which is right: reordering the keys of a file *is* a change to that file.
+    draft.extras,
   ])
 }
 
@@ -355,6 +401,13 @@ export function scopeChangeWarning(draft: Draft, taken: ReadonlySet<string>): st
 
   const renamed = original.name !== name && name !== ''
   const moved = original.scope !== draft.scope
+
+  // A subagent is rewritten where it lies: Claude Code keys by the `name:` value and its filename
+  // need not agree, so renaming one is an edit *inside* a file rather than a move between two.
+  // The sentences below all describe a file appearing and another going away, and none of that
+  // happens here — saying it would be a warning about a consequence that has none.
+  if (isClaudeScope(draft.scope) && !moved) return null
+
   if (!renamed && !moved) return null
 
   if (name !== '' && taken.has(target)) {
@@ -406,10 +459,30 @@ export interface Entry {
 }
 
 /**
+ * Which scope wins when two files declare one name. Lower is stronger.
+ *
+ * `cide_agents::defs::scopes()` merges lowest-precedence first, so this is that list reversed and
+ * it must stay that list reversed: a screen that ranked them differently from the loader would
+ * draw the *inert* file as the one that runs, which is the failure `shadowed` exists to prevent
+ * pointing the wrong way round.
+ *
+ * The rule is two rules composed. *Project beats user* is what both formats already say about
+ * themselves. *cide's own directory beats Claude Code's* is the one this had to invent, and it
+ * goes this way because `.cide/agents/` is the only one of the four that can state how cide
+ * should run a role — `max-concurrent`, `worktree`, a harness that is not Claude.
+ */
+const SCOPE_RANK: Readonly<Record<Scope, number>> = {
+  project: 0,
+  global: 1,
+  claudeProject: 2,
+  claudeGlobal: 3,
+}
+
+/**
  * One row of the role list.
  *
- * `shadowed` is the reason this function exists. A project role and a global role may share a
- * name, and the project one wins **whole-file** — not key by key — so the two rows are not
+ * `shadowed` is the reason this function exists. Two files may share a name across any of the
+ * four scopes, and the stronger one wins **whole-file** — not key by key — so the rows are not
  * duplicates and are not alternatives either: one of them is what runs and the other is inert
  * until it is deleted. Two identical-looking rows would be the worst possible drawing of that,
  * and dropping the shadowed one would hide a file the user still owns and can still edit.
@@ -417,26 +490,32 @@ export interface Entry {
 export interface Row extends Entry {
   /** This file is what a dispatch of this name actually uses. */
   effective: boolean
-  /** A project role of the same name wins over this one. Never true for a project row. */
+  /** A stronger scope declares this name too, so nothing will ever run this file. */
   shadowed: boolean
-  /** This row wins over a global role of the same name. */
+  /** This row wins over a weaker scope's file of the same name. */
   shadows: boolean
 }
 
 /**
  * The list, sorted by name and with the shadowing worked out.
  *
- * Project before global within a name, so a shadowed row is drawn directly under the row that
+ * Stronger scope first within a name, so a shadowed row is drawn directly under the row that
  * shadows it and the relationship needs no line to connect them.
  */
 export function rowsFor(entries: readonly Entry[]): Row[] {
-  const projectNames = new Set(entries.filter((e) => e.scope === 'project').map((e) => e.name))
-  const rank = (scope: Scope) => (scope === 'project' ? 0 : 1)
+  const rank = (scope: Scope) => SCOPE_RANK[scope]
+  // The strongest scope holding each name. Computed once rather than per row, and as a *rank*
+  // rather than as a set of names per scope — with four scopes the set-per-scope shape would be
+  // four sets and six comparisons, and the one that got forgotten would be a silent wrong answer.
+  const strongest = new Map<string, number>()
+  for (const entry of entries) {
+    const best = strongest.get(entry.name)
+    if (best === undefined || rank(entry.scope) < best) strongest.set(entry.name, rank(entry.scope))
+  }
   return [...entries]
     .sort((a, b) => a.name.localeCompare(b.name) || rank(a.scope) - rank(b.scope))
     .map((entry) => {
-      const collides = projectNames.has(entry.name)
-      const shadowed = entry.scope === 'global' && collides
+      const shadowed = rank(entry.scope) > (strongest.get(entry.name) ?? rank(entry.scope))
       return {
         ...entry,
         harness: entry.harness ?? null,
@@ -456,7 +535,9 @@ export function rowsFor(entries: readonly Entry[]): Row[] {
         unavailable: shadowed ? null : (entry.unavailable ?? null),
         effective: !shadowed,
         shadowed,
-        shadows: entry.scope === 'project' && entries.some((e) => e.scope === 'global' && e.name === entry.name),
+        shadows: entries.some(
+          (other) => other.name === entry.name && rank(other.scope) > rank(entry.scope),
+        ),
       }
     })
 }
@@ -711,6 +792,8 @@ export function screenOpening(
 
 /** What the scope segment and the badges say. */
 export function scopeLabel(scope: Scope): string {
+  if (scope === 'claudeProject') return 'Claude Code (project)'
+  if (scope === 'claudeGlobal') return 'Claude Code (user)'
   return scope === 'project' ? 'Project' : 'Global'
 }
 
@@ -753,6 +836,7 @@ export interface WireDraft {
   permissionMode?: string
   maxConcurrent?: number
   systemPrompt: string
+  extras: Extra[]
 }
 
 /**
@@ -777,6 +861,13 @@ export function toWire(draft: Draft): WireDraft {
     description: draft.description.trim(),
     tools: draft.tools.map((tool) => tool.trim()).filter((tool) => tool !== ''),
     systemPrompt: draft.systemPrompt,
+    // Sent whole and always, empty list included: `extras` is `Vec` and not `Option`, and a save
+    // that omitted it would deserialise as "this file has no unmodelled keys" — which is how a
+    // `hooks:` block gets deleted by a form that thought it was preserving one. The empty rows a
+    // half-typed key leaves behind are dropped, so an abandoned "Add" is not a refusal.
+    extras: draft.extras
+      .map((extra) => ({ key: extra.key.trim(), value: extra.value }))
+      .filter((extra) => extra.key !== ''),
   }
   if (draft.original !== null) wire.original = draft.original
   const text = (value: string | null): string | null => {
@@ -811,5 +902,6 @@ export function fromWire(wire: WireDraft): Draft {
     permissionMode: wire.permissionMode ?? null,
     maxConcurrent: wire.maxConcurrent ?? null,
     systemPrompt: wire.systemPrompt,
+    extras: wire.extras.map((extra) => ({ ...extra })),
   }
 }

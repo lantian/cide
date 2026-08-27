@@ -290,6 +290,30 @@ export function getHost(paneId: string): PaneHost {
   el.dataset.paneId = paneId
   el.style.position = 'absolute'
   el.style.inset = '0'
+  /*
+   * A gutter between the frame and the first column, on the left only. The focus ring is
+   * drawn *inside* the frame (`.frameFocused::after`), overlaying the body's first pixels,
+   * so a terminal flush with the body painted its text against — under, for those pixels —
+   * the accent line.
+   *
+   * The `calc` is not decoration, and a flat `3px` shipped first and read as no change at
+   * all. How much of the body the ring overlays depends on where the pane sits: the ring is
+   * `2px - <frame border width>` on each edge (`PaneTitleBar.module.css`), and on a
+   * chrome-flush leaf the frame's left border is 0 (`--pane-edge-left`), so the ring is 2px
+   * of overlay there against 1px on an interior pane. A fixed inset therefore showed 2px of
+   * ground on an interior pane and a single pixel on an edge one — and the pane a user
+   * focuses most, a claude pane at the row's left, is an edge one. Reading the same custom
+   * property the frame and the ring read makes the *visible* gap 2px everywhere; custom
+   * properties inherit, so an inline `var()` resolves against the leaf's declaration, and a
+   * detached window (no leaf) rides the same 1px fallback as the frame.
+   *
+   * Here and not as padding on `.body`: an `inset: 0` absolute child resolves against the
+   * padding box, so padding there would sit *under* this element and move nothing. Here it
+   * narrows the very element `fit()` measures, so the column count stays honest. Hosts are
+   * terminal-only (only `TerminalPane` renders a `PaneSlot`), so no editor is touched —
+   * CodeMirror carries its own gutter.
+   */
+  el.style.left = 'calc(4px - var(--pane-edge-left, 1px))'
   el.style.overflow = 'hidden'
 
   const host: PaneHost = {

@@ -55,8 +55,8 @@ pub use theme::{BUILTIN_SCHEME, ColorScheme, SCHEME_SURFACE, SCHEME_TOKENS, sche
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, HistoryTab, LayoutNode,
     MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry, RecentProject,
-    SettingsSection, TOOL_WINDOW_MAX_HEIGHT, TOOL_WINDOW_MIN_HEIGHT, Tab, TabKind, ToolWindowState,
-    WindowRole, Workspace,
+    SettingsSection, SpecSubject, TOOL_WINDOW_MAX_HEIGHT, TOOL_WINDOW_MIN_HEIGHT, Tab, TabKind,
+    ToolWindowState, WindowRole, Workspace,
 };
 
 // --- M8: file tree, watcher, pickers ---
@@ -106,8 +106,8 @@ pub use agents::{
     OrchestrationPatch, RunState,
 };
 pub use tasks::{
-    Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskNew, TaskStatus,
-    TaskStatusChange,
+    LinkType, Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskLink, TaskLinkSpec,
+    TaskNew, TaskStatus, TaskStatusChange,
 };
 
 // --- M22: extensions, and the marketplaces they come from ---
@@ -131,6 +131,22 @@ pub use ext::{
 pub use lang::{
     FileExtension, FoldSpecDto, GrammarRule, GrammarSpecDto, LanguageDef, LanguageServerDef,
     RuleAt, ScratchTypeDto,
+};
+
+// --- M28: OpenSpec ---
+//
+// Its own module for `tasks`' reason applied to somebody else's file format: `openspec/` is read
+// through the `openspec` CLI and is meaningful with no task anywhere near it, and the only thing
+// the two share is one id — `Task::change` — carried so that `cide-spec` never has to hold a
+// `Task` and `cide-tasks` never has to know what a requirement is.
+pub mod spec;
+
+pub use spec::{
+    ArtifactState, ChangeSummary, DeltaOperation, SpecAcceptPlan, SpecAccepted, SpecArtifact,
+    SpecArtifactRules, SpecArtifactText, SpecBoard, SpecChange, SpecCommand, SpecConfig,
+    SpecConfigEdit, SpecDelta, SpecIssue, SpecOperationGuidance, SpecOrigin, SpecProgress,
+    SpecRename, SpecRequirement, SpecRequirementSet, SpecScenario, SpecSchema, SpecSummary,
+    SpecTask, SpecTouch, SpecValidation, SpecWriteOutcome,
 };
 
 use serde::{Deserialize, Serialize};
@@ -332,6 +348,25 @@ pub enum SplitIntent {
     ForkPrimary,
     /// A second sink on an existing session. No new process.
     Mirror { session: SessionId },
+    /// `claude --resume <session>` — a **new child** picking up a conversation that has ended.
+    ///
+    /// # Why this is not [`Self::Mirror`], and not [`Self::ForkPrimary`]
+    ///
+    /// `Mirror` attaches a second sink to a session the registry still holds, and spawns nothing;
+    /// pointed at a conversation whose child is gone it gives a pane with an empty screen and no
+    /// way forward. `ForkPrimary` resumes *and* forks, which mints a second id on purpose so the
+    /// two histories diverge — the opposite of picking one up where it left off.
+    ///
+    /// This one keeps the id. A [`SessionId`] **is** the value cide passes to
+    /// `claude --session-id`, which is what makes resume free: the same id spawned with
+    /// `--resume` continues the same transcript, and every record that names it — a task's
+    /// `session` field above all — goes on naming the right conversation.
+    ///
+    /// The pane that gets this **owns** its child, unlike a mirror's: it started the process, so
+    /// closing the pane must end it. That is why the two cannot share a variant — the ownership
+    /// flag the frontend sets is keyed off exactly this distinction, and getting it wrong once
+    /// already killed an agent mid-turn (see `cide_app::cmd::agents`' note on `agent_open_pane`).
+    Resume { session: SessionId },
     /// `$SHELL -l`
     Shell,
     // There is deliberately no `Diff`. A diff pane is not something a *split* can produce:

@@ -112,7 +112,13 @@ pub fn stage(root: &Path, selections: &[PathSelection]) -> Result<()> {
     // halfway through would otherwise leave the index holding some of what was asked for and
     // none of the rest, with no record of which.
     for selection in selections {
-        let file = resolve(&repo, selection, DiffSide::Unstaged)?;
+        let file = resolve(&repo, selection, DiffSide::Unstaged).map_err(|error| {
+            // The one refusal that has to be re-read before it is reported. See `why_nothing`.
+            match error {
+                GitError::NoSuchChange { path } => why_nothing(&repo, path),
+                other => other,
+            }
+        })?;
         if is_whole(&file, &selection.selection)? {
             plans.push(Plan::Whole(file.path.clone()));
             continue;
@@ -165,6 +171,34 @@ fn apply_plans(repo: &Repository, plans: &[Plan], location: ApplyLocation) -> Re
     index.write().wrap()
 }
 
+/// Why a path the caller asked to stage produced no diff at all.
+///
+/// `file_diff` answering `None` is the same value for two states a user cannot tell apart from
+/// the message: the row moved under the gesture (a real [`GitError::NoSuchChange`]), and the
+/// path is **ignored**, where there was never going to be a diff and never will be until a
+/// `.gitignore` rule changes. Dropping an ignored path on a changelist used to report *"…has no
+/// changes to apply"* about a file sitting on screen with content in it — technically true,
+/// and it reads as cide failing rather than as git refusing.
+///
+/// An ignore lookup failure is not worth a distinct answer: the original refusal is still
+/// correct, only less specific, and a second error about reading `.gitignore` would replace the
+/// one the user is trying to understand.
+fn why_nothing(repo: &Repository, path: String) -> GitError {
+    // Tracked beats ignored, and `is_path_ignored` does not know that — it answers from the
+    // rules alone, so a file that is in the index *and* matched by a rule (which git allows, and
+    // which is how a checked-in `.env.example` under an `.env*` rule lives) would be reported as
+    // ignored when the real answer is that it has no changes right now.
+    if in_index(repo, &path).unwrap_or(false) {
+        return GitError::NoSuchChange { path };
+    }
+    // libgit2 takes the trailing slash a status walk puts on a directory entry, and answers for
+    // the directory — verified in `tests/staging.rs`.
+    if repo.is_path_ignored(Path::new(&path)).unwrap_or(false) {
+        return GitError::PathIgnored { path };
+    }
+    GitError::NoSuchChange { path }
+}
+
 /// Stage a whole path exactly the way `git add` does.
 fn add_or_remove(repo: &Repository, index: &mut git2::Index, path: &str) -> Result<()> {
     let absolute = repo
@@ -173,9 +207,32 @@ fn add_or_remove(repo: &Repository, index: &mut git2::Index, path: &str) -> Resu
             path: repo.path().display().to_string(),
         })?
         .join(path);
+    // A directory that is not a *registered* submodule is a repository of its own, and git will
+    // not take it. The status walk recurses untracked directories, so the only thing that makes
+    // it stop at one and report the directory itself is a repository boundary — an agent
+    // worktree under `.cide/worktrees/`, a vendored clone, a submodule nobody registered.
+    // `add_path` refuses it as `invalid path: 'x/'`, which is libgit2 complaining about the
+    // trailing slash rather than about the nesting, and is the sort of message that gets
+    // reported as a cide bug.
+    //
+    // The `find_submodule` half is load-bearing and was missing at first: a registered submodule
+    // whose HEAD moved is also a directory, and staging it — the gitlink bump — is an ordinary
+    // gesture `add_path` handles correctly (`a_submodule_refuses_partial_staging_and_stages_whole`
+    // is what caught it). The trailing slash would have separated the two cases as well, but it
+    // is libgit2's spelling of a status row rather than a fact about the repository, and a caller
+    // that trimmed it would have silently re-broken the submodule.
+    //
+    // A symlink is never this, whatever it points at: staging one stages the link.
+    let symlink = std::fs::symlink_metadata(&absolute);
+    let is_symlink = symlink.as_ref().is_ok_and(|meta| meta.is_symlink());
+    if absolute.is_dir() && !is_symlink && repo.find_submodule(path).is_err() {
+        return Err(GitError::NestedRepository {
+            path: path.to_string(),
+        });
+    }
     // `symlink_metadata`, not `exists`: a dangling symlink is a real, stageable entry, and
     // `exists` follows the link and calls it absent.
-    if std::fs::symlink_metadata(&absolute).is_ok() {
+    if symlink.is_ok() {
         // `add_bypath` is the one call that handles regular files, executables, symlinks and
         // submodule gitlinks correctly, and it runs the repo's filters — so a `text=auto`
         // file lands in the index with LF exactly as `git add` would leave it.

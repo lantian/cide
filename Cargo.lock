@@ -620,6 +620,7 @@ dependencies = [
  "cide-lsp",
  "cide-pty",
  "cide-search",
+ "cide-spec",
  "cide-tasks",
  "dashmap",
  "gtk",
@@ -748,6 +749,7 @@ dependencies = [
  "cide-ext",
  "cide-ipc",
  "cide-pty",
+ "cide-spec",
  "cide-tasks",
 ]
 
@@ -842,6 +844,17 @@ dependencies = [
  "nucleo",
  "parking_lot",
  "regex",
+ "tracing",
+]
+
+[[package]]
+name = "cide-spec"
+version = "0.5.0"
+dependencies = [
+ "cide-core",
+ "cide-ipc",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

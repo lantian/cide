@@ -413,6 +413,40 @@ pub fn defaults() -> Vec<Binding> {
              * other pane un-maximizes (`layout::focus_pane`), so Alt+Arrow out of a
              * full-screen pane lands on a visible tile, never behind one.
              */
+            /*
+             * Move the pane, rather than the focus. (M31)
+             *
+             * The vim block above one modifier up: `ctrl+alt+<hjkl>` focuses a pane,
+             * `ctrl+alt+shift+<hjkl>` moves it. What it costs in each layer:
+             *
+             * * **In `defaults()`**: nothing. The only Alt-bearing letters bound anywhere in
+             *   this table are `alt+shift+s`, `alt+shift+d`, `alt+shift+f`, `ctrl+alt+shift+n`
+             *   and `ctrl+alt+shift+s`, plus the `ctrl+alt+<hjkl>` four directly above. No
+             *   `h`, `j`, `k` or `l` with Shift. Free.
+             * * **In the terminal**: `ESC` + a shifted letter, which readline and tmux leave
+             *   alone — and the clause below means a terminal is the only place these fire, so
+             *   this is the whole of the cost.
+             * * **In CodeMirror**: unreachable. `terminalFocused` is false in a buffer.
+             * * **On macOS**: `platform_layer` rewrites `ctrl`-bearing chords it names, and it
+             *   names none of these; none is in `MACOS_MENU_CHORDS` either.
+             *
+             * **Not `alt+shift+<arrow>`**, which reads better and is spent: the note on
+             * `alt+left` above banks that stroke deliberately — *"`Shift-Alt-Arrow` is a
+             * different stroke, so select-syntax and move-line survive untouched"* — and
+             * taking it here would make that sentence false. **Not `ctrl+alt+shift+left`/
+             * `right` either**: `README.md` prints those two lines twice as the binding a user
+             * should add for `navigate.back`/`forward`, so a default there would collide with
+             * advice already in the manual.
+             *
+             * `terminalFocused` rather than the `!editorFocused` its neighbours carry, and it
+             * is the stronger clause: it excludes diff and image panes too, so nothing is taken
+             * from any surface that is not a terminal — and it is the same flag that decides
+             * whether the pane draws a grab handle, so the chord and the button agree.
+             */
+            ("ctrl+alt+shift+h", "pane.move.left", "terminalFocused"),
+            ("ctrl+alt+shift+l", "pane.move.right", "terminalFocused"),
+            ("ctrl+alt+shift+k", "pane.move.up", "terminalFocused"),
+            ("ctrl+alt+shift+j", "pane.move.down", "terminalFocused"),
             ("alt+up", "pane.navigate.up", "!editorFocused"),
             ("alt+down", "pane.navigate.down", "!editorFocused"),
             ("alt+enter", "pane.maximize", "!editorFocused"),

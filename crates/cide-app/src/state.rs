@@ -22,6 +22,8 @@ pub struct SessionRegistry {
     attachments: DashMap<AttachmentKey, SinkId>,
     /// The highest write sequence number applied per writer. See [`Self::accept_write`].
     applied_write: DashMap<WriterKey, u64>,
+    /// When each live session's child was forked. See [`Self::started`].
+    started: DashMap<SessionId, std::time::SystemTime>,
 }
 
 /// Who minted a write sequence number.
@@ -67,7 +69,31 @@ pub struct AttachmentKey {
 
 impl SessionRegistry {
     pub fn insert(&self, id: SessionId, session: Arc<PtySession>) {
+        // Stamped on every insert, restarts included — `claude.restart` forks a new child under
+        // the same [`SessionId`], and the whole point of the stamp is that the new one *has*
+        // read whatever was on disk by then. A registry that kept the first time would go on
+        // refusing a conversation the user had already restarted.
+        self.started.insert(id, std::time::SystemTime::now());
         self.sessions.insert(id, session);
+    }
+
+    /// When this session's current child was forked, wall-clock.
+    ///
+    /// # What reads it, and why it is wall-clock rather than an `Instant`
+    ///
+    /// `spec_run_command`, to compare against the mtime of the skill file it is about to type
+    /// the name of. Claude Code reads a project's skills and slash commands **once, at
+    /// startup**, so a conversation older than the file cannot know the command and typing it
+    /// answers `Unknown command` — which is what enabling OpenSpec from the panel did to the
+    /// console pane that came up with the window. The comparison is against a file's `mtime`,
+    /// which is a `SystemTime`, so this is one too; an `Instant` cannot be compared with one at
+    /// all.
+    ///
+    /// A clock the user moves backwards makes this answer *older than the file* and cide refuses
+    /// a conversation that would have worked. That is the safe direction — the refusal names the
+    /// restart, and a restart fixes it either way.
+    pub fn started(&self, id: SessionId) -> Option<std::time::SystemTime> {
+        self.started.get(&id).map(|at| *at)
     }
 
     pub fn get(&self, id: SessionId) -> Option<Arc<PtySession>> {
@@ -122,6 +148,7 @@ impl SessionRegistry {
         // A retry arriving after this point is rejected by `session_write`'s registry lookup
         // long before it reaches a watermark, so keeping them would only be dead entries.
         self.applied_write.retain(|k, _| k.session != id);
+        self.started.remove(&id);
         self.sessions.remove(&id).map(|(_, v)| v)
     }
 

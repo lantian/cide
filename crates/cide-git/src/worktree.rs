@@ -901,3 +901,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// **The one fact Claude Code subagent discovery rests on.** (M30)
+///
+/// A run dispatched to a `.claude/agents/` subagent is spawned with `--agent <name>`, and the CLI
+/// resolves a *project* subagent by walking up from the child's working directory. That works
+/// only because a run's checkout is **inside** the project root: the walk goes
+/// `.cide/worktrees/<name>` → `.cide/worktrees` → `.cide` → `<root>`, and finds
+/// `<root>/.claude/agents/` on the last step.
+///
+/// Moving worktrees to a sibling directory, a temp dir or an XDG state path would break every
+/// project-scoped subagent with **no error anywhere** — the CLI would simply not find the
+/// definition and the run would come up as the default agent, doing plausible work under the
+/// wrong brief. Pinned here rather than in `cide-agents` because this is the module that decides
+/// it.
+#[cfg(test)]
+mod discovery_containment {
+    use super::*;
+
+    #[test]
+    fn a_worktree_lives_under_the_project_root() {
+        let root = Path::new("/repo");
+        let path = root.join(WORKTREES_DIR).join("code-reviewer-t-1");
+        assert!(
+            path.starts_with(root),
+            "{} must be under {}, or `claude --agent` cannot see `.claude/agents/`",
+            path.display(),
+            root.display()
+        );
+        assert!(
+            !WORKTREES_DIR.starts_with('/') && !WORKTREES_DIR.contains(".."),
+            "`{WORKTREES_DIR}` must stay a relative path inside the root"
+        );
+    }
+}

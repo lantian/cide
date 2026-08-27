@@ -686,6 +686,29 @@ interface WorkspaceStore {
   setRatio: (project: ProjectId, tab: TabId, split: SplitId, ratio: number) => Promise<void>
   /** Every member of the pane's chain to an equal share of it. `'row'` is its tiles. */
   distributePanes: (project: ProjectId, tab: TabId, pane: PaneId, axis: Axis) => Promise<void>
+  /** Move a pane beside `target`. `axis`/`side` mean what they mean for a split. */
+  movePane: (
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    target: PaneId,
+    axis: Axis,
+    side: Side,
+  ) => Promise<void>
+  /**
+   * Move the focused pane one step in `direction`, or answer `null` at the edge of the tree.
+   *
+   * The keyboard's half of the grab handle. Two hops for the reason `navigatePane` takes two:
+   * the domain separates "which pane is that way" from acting on it, and reusing that query
+   * here is what stops `pane.move.up` and `pane.navigate.up` ever disagreeing about which way
+   * is up. Answers the moved pane so the caller can put the caret back into it.
+   */
+  movePaneToward: (
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    direction: Direction,
+  ) => Promise<PaneId | null>
   /** Answers the pane focus landed on, or `null` at an edge — the caller moves the caret. */
   navigatePane: (
     project: ProjectId,
@@ -1086,6 +1109,35 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   distributePanes: async (project, tab, pane, axis) => {
     const { rev } = await paneApi.distribute(project, tab, pane, axis)
     await synced(rev)
+  },
+  movePane: async (project, tab, pane, target, axis, side) => {
+    const { rev } = await paneApi.move(project, tab, pane, target, axis, side)
+    await synced(rev)
+  },
+  movePaneToward: async (project, tab, pane, direction) => {
+    // The same query `navigatePane` uses, and deliberately: one walk decides both what
+    // Alt+Arrow focuses and what this moves the pane past, so the two can never disagree.
+    // `null` at the edge — no wrap-around, which for a *move* matters more than it does for
+    // focus: a wrapping move would cycle the layout for ever with no fixed point.
+    const target = await paneApi.navigate(project, tab, pane, direction)
+    if (target === null) return null
+    // Always a row. Joining the neighbour's row is what "move between rows" means, and it is
+    // the reading that can *reduce* the row count; minting a full-width row instead would
+    // promote the neighbour's own row-mates to rows of their own as a side effect of a
+    // keystroke aimed at this pane. A new row is still reachable — by dragging onto a pane's
+    // top or bottom band, and by `pane.split.down`.
+    //
+    // `side` is a position in a horizontal chain, so a vertical direction of travel has no
+    // opinion about it: `navigate` picked this target *because* the pane's horizontal midpoint
+    // falls inside it, so the pane belongs immediately beside it, and `after` is reading order
+    // — what every split gesture in this app already does.
+    const side: Side = direction === 'left' || direction === 'up' ? 'before' : 'after'
+    const { rev } = await paneApi.move(project, tab, pane, target, 'row', side)
+    await synced(rev)
+    // Handed back rather than acted on, exactly as `navigatePane` does it: moving the DOM's
+    // focus is the dispatcher's half, and this mutator is also driven by the audit, which has
+    // no keyboard to move.
+    return pane
   },
   navigatePane: async (project, tab, pane, direction) => {
     // Two calls because the domain separates "where would focus go" from "move it": the

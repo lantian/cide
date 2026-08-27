@@ -73,8 +73,13 @@ import {
 } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { chainAround } from './SplitTree'
+import { usePaneDropMark } from './paneDropZone'
+import { usePaneDrag } from './usePaneDrag'
+import type { MoveOutcome } from './paneMove'
 import { paneSessionId } from './paneHosts'
+import { focusPaneDom } from '@/panes/paneFocus'
 import { acknowledge, useAwaiting } from '@/panes/awaiting'
+import { acknowledgesButton } from '@/panes/awaitingRule'
 import { Icon } from '@/icons/Icon'
 
 import styles from './PaneTitleBar.module.css'
@@ -124,6 +129,20 @@ function paneLocation(
   return null
 }
 
+/**
+ * The four directions the pane can be moved in, in the order the menu lists them.
+ *
+ * Left/right before up/down because that is the order the `pane.navigate.*` block uses and the
+ * order the arrow keys sit in; the ids are the command suffixes, so a row and its key chip
+ * cannot name different commands.
+ */
+const MOVE_ROWS = [
+  { id: 'left', label: 'Move pane left' },
+  { id: 'right', label: 'Move pane right' },
+  { id: 'up', label: 'Move pane up' },
+  { id: 'down', label: 'Move pane down' },
+] as const
+
 export interface PaneFrameProps {
   pane: Pane
   /** 1-based depth-first position of this pane in its tab's tree. */
@@ -167,6 +186,15 @@ export interface PaneFrameProps {
    * closing half of it.
    */
   tabScoped?: boolean | undefined
+  /**
+   * Move this pane somewhere else in its tab. Absent hides the grab handle.
+   *
+   * Absent-means-hidden, like `onAddTile` and unlike `onSplitDown`: there is nothing to
+   * explain in a menu row here, because the two reasons it is missing are "this tab has one
+   * pane" and "this is not a terminal", and neither is a rule the user could act on. The
+   * keyboard's four `pane.move.*` rows carry the same gesture into the palette.
+   */
+  onMove?: ((outcome: MoveOutcome) => void) | undefined
 }
 
 export function PaneFrame({
@@ -183,6 +211,7 @@ export function PaneFrame({
   onDetach,
   onClose,
   tabScoped,
+  onMove,
 }: PaneFrameProps): ReactNode {
   // Withheld once this pane is already the focused one. `onFocus` is an IPC round trip
   // that re-reads the tree and re-renders every pane in the tab, and a click inside a
@@ -206,6 +235,33 @@ export function PaneFrame({
    * detach exactly as it does for close, so a live detach button here would be one gesture in
    * the frame guaranteed to fail, into an error toast that reads as a bug rather than a rule.
    */
+  /*
+   * The grab handle is a terminal's, and only a terminal's.
+   *
+   * The report asked for it on "claude/bash panels". An editor or a diff keeps the four-button
+   * cluster: those panes are still perfectly good *drop targets*, so a terminal can be moved
+   * next to one — it is only the picking-up that is withheld. Gated here rather than in CSS,
+   * because a button hidden with `display: none` still costs the cluster its width, and
+   * `--pane-corner` is a reserve other stylesheets read.
+   */
+  const grabbable = pane.kind === 'claude' || pane.kind === 'shell'
+
+  /*
+   * The drag, and the band this pane should draw for one in flight.
+   *
+   * `usePaneDropMark` answers a plain string, so a pane that is not involved re-renders never
+   * and a pane that is re-renders only when its own band changes — see that module's header
+   * for why the snapshot may not be an object.
+   */
+  const dropMark = usePaneDropMark(pane.id)
+  const paneDrag = usePaneDrag({
+    pane: pane.id,
+    // Read at drop time, not captured: a snapshot landing mid-drag must be the tree the drop
+    // is judged against, or a no-op check answers about a layout that no longer exists.
+    tree: () => paneLocation(useWorkspace.getState().boot, pane.id)?.tree.root ?? null,
+    onMove: grabbable ? onMove : undefined,
+  })
+
   const closable = pane.role !== 'primary'
   const detachable = pane.role !== 'primary'
 
@@ -244,7 +300,11 @@ export function PaneFrame({
    *   pointer-down: clicking a button focuses it, so guarding one and not the other guards
    *   nothing.
    * * a **secondary button**. A right-click opens the pane menu rather than reading a
-   *   conversation — and that menu is where `Minimize window` is chosen from.
+   *   conversation — and that menu is where `Minimize window` is chosen from. Which buttons
+   *   *do* count is [`acknowledgesButton`], in the rule module with the rest of the feature's
+   *   judgement calls: the middle one does, because a primary-selection paste puts text into
+   *   this pane and is as much a person acting on it as typing is. It did not, until the
+   *   screen stopped being written as `button === 0` and started being a question about people.
    *
    * `raise` stays outside both screens: focus should follow the pointer either way, and a
    * right-click has to act on the pane it landed in.
@@ -336,6 +396,28 @@ export function PaneFrame({
     // out in exactly this case, so reaching here means the snapshot changed under the menu.
     if (target === null) return
     void useWorkspace.getState().distributePanes(target.project, target.tab, pane.id, 'row')
+  }
+
+  /*
+   * The menu rows' half of `pane.move.*`.
+   *
+   * Straight to the store, the way `addTile` and `evenRow` above already go: this file has no
+   * route into `keys/dispatch.ts` — the dispatcher is built in `App.tsx` and closed over there
+   * — and inventing a global command seam for four menu rows would be a new mechanism to carry
+   * a gesture the store already exposes. `movePaneToward` is the same action the chord runs, so
+   * the row, the chip and the keystroke are one code path from here down.
+   */
+  const moveToward = (direction: 'left' | 'right' | 'up' | 'down'): void => {
+    const target = paneLocation(useWorkspace.getState().boot, pane.id)
+    if (target === null) return
+    void useWorkspace
+      .getState()
+      .movePaneToward(target.project, target.tab, pane.id, direction)
+      .then((moved) => {
+        // Same reason the dispatcher does it: the move re-parents the pane, so its terminal is
+        // parked and blurred on the way out and the keyboard would otherwise land nowhere.
+        if (moved !== null) focusPaneDom(moved)
+      })
   }
 
   const tileMenu = useContextMenu({
@@ -432,6 +514,25 @@ export function PaneFrame({
         run: tiles > 1 ? evenRow : undefined,
         disabledReason: tiles > 1 ? undefined : 'This pane is the only one in its row',
       },
+      ...(grabbable && onMove && !maximized
+        ? ([
+            { kind: 'separator' },
+            /*
+             * The keyboard's half of the grab handle, one row per direction.
+             *
+             * Here rather than only on the button because a drag cannot advertise a chord: the
+             * `command:` id is what prints the key chip, and this menu is where a gesture stays
+             * discoverable for anyone who never finds the 22px handle. Each row runs the same
+             * dispatcher the chord does, so the two can only ever do one thing.
+             */
+            ...MOVE_ROWS.map(({ id, label }) => ({
+              id: `move-${id}`,
+              label,
+              command: `pane.move.${id}`,
+              run: () => moveToward(id),
+            })),
+          ] satisfies MenuEntry[])
+        : []),
       { kind: 'separator' },
       {
         id: 'maximize',
@@ -523,6 +624,13 @@ export function PaneFrame({
        */
       data-awaiting={awaiting ? 'true' : 'false'}
       /*
+       * What this pane should draw for a drag in flight: `source` while it is the one being
+       * carried, or the edge the drop would land on. An attribute the stylesheet reads, rather
+       * than a rebuilt subtree — `children` is the element `App.tsx` already made, so a
+       * re-render of this frame never reaches the terminal inside it.
+       */
+      data-drop={dropMark === 'none' ? undefined : dropMark}
+      /*
        * The index and the title, permanently, for the reader who gets none of the chrome.
        * `role="group"` is what makes the name reachable at all — `aria-label` on a bare div
        * is dropped — and `group` rather than `region` because six landmarks in a 2x3 grid is
@@ -532,7 +640,7 @@ export function PaneFrame({
       aria-label={`Pane ${index}: ${pane.title}`}
       onContextMenu={onContextMenu}
       onPointerDownCapture={(event) => {
-        if (event.button === 0 && !onWindowControl(event.target)) seen()
+        if (acknowledgesButton(event.button) && !onWindowControl(event.target)) seen()
         raise?.()
       }}
       onFocusCapture={(event) => {
@@ -543,6 +651,12 @@ export function PaneFrame({
       {/* Before the cluster in DOM order, so Tab reaches the pane's own content first and the
           chrome after it, and so the cluster paints on top without a second z-index. */}
       <div className={styles.body}>{children}</div>
+
+      {/* The drop band. Never a hit target — the gesture is tracked on `window`, and a live
+          element here would take the pointer off the pane underneath it. */}
+      {dropMark !== 'none' && dropMark !== 'source' && (
+        <span className={styles.dropBand} data-edge={dropMark} aria-hidden="true" />
+      )}
 
       <div
         ref={clusterRef}
@@ -641,6 +755,36 @@ export function PaneFrame({
               </>
             ) : (
               <>
+                {/*
+                 * The grab handle, and it is deliberately **first**.
+                 *
+                 * The cluster is right-aligned, so growing it leftwards leaves `×` exactly
+                 * where muscle memory has it — and a handle reads as the thing you pick the
+                 * pane up by, which belongs at the leading edge rather than between two
+                 * one-shot actions.
+                 *
+                 * `onPointerDown`, never `onClick`: this button has no click. It is a drag
+                 * source, and the gesture is abandoned below the 4px threshold.
+                 *
+                 * Withheld while this pane is **maximized**, and that is a correctness gate
+                 * rather than tidiness: the renderer hides every other pane with
+                 * `visibility: hidden`, which leaves their boxes measurable — so a drag would
+                 * happily land on a pane that is not on screen, and the layout would rearrange
+                 * itself out of sight. The maximized pane is also the only one whose cluster is
+                 * reachable, so gating on this pane's own flag gates the whole tab.
+                 */}
+                {grabbable && onMove && !maximized && (
+                  <button
+                    type="button"
+                    className={`${styles.action} ${styles.actionGrab}`}
+                    data-pane-grab
+                    title="Drag to move this pane to another row or column"
+                    aria-label="Move this pane to another row or column"
+                    onPointerDown={paneDrag.onPointerDown}
+                  >
+                    <Icon name="move" size={1} />
+                  </button>
+                )}
                 {onAddTile && (
                   /*
                    * A menu trigger, not a one-shot. The `▾` is drawn *inside* the same button

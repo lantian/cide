@@ -69,6 +69,7 @@ export interface AgentsDigest {
   staleBarButtons: number
   /** Every phase mark drawn, in order, by name — the fallback `circle-slash` included. */
   glyphs: string[]
+  glyphSpins: string[]
   /**
    * Every mark in the subtree, by name, phase marks and control marks alike.
    *
@@ -106,6 +107,16 @@ export interface AgentsRoleDigest {
   buttons: string[]
   /** The refusal sentence, or `''` when the row carries a Dispatch button instead. */
   reason: string
+  /**
+   * The source chip's text, or `''` when the row draws none. (M30)
+   *
+   * Sliced out of the row rather than counted across the document, because the assertion the
+   * check makes is per row — *these* rows are badged and *that* one is not — and a document-wide
+   * count could not tell a badge keyed on the scope from a chip drawn on everything.
+   */
+  badge: string
+  /** The scope the chip claims, so the check can tell the two Claude scopes apart. */
+  badgeScope: string
 }
 
 const digests = (Object.keys(AGENTS_STORIES) as AgentsStoryName[]).map((story) =>
@@ -131,6 +142,9 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
       text(m[1] ?? ''),
     ),
     reason: text(/data-audit="agentsRoleReason"[^>]*>([^<]*)</.exec(role)?.[1] ?? ''),
+    badge: text(/data-audit="agentsRoleBadge"[^>]*>([^<]*)</.exec(role)?.[1] ?? ''),
+    badgeScope:
+      /data-audit="agentsRoleBadge"[^>]*\bdata-scope="([^"]*)"/.exec(role)?.[1] ?? '',
   }))
   const empty = all(html, 'agentsEmpty')[0] ?? ''
   const bars = all(html, 'agentsStaleBar')
@@ -158,6 +172,17 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
     glyphs: [
       ...html.matchAll(/data-audit="agentsGlyph"[^>]*>\s*<svg[^>]*data-icon="([^"]*)"/g),
     ].map((m) => m[1] ?? ''),
+    /**
+     * Each phase mark as `<icon>|spin` or `<icon>|still`.
+     *
+     * The class, not the name. `loader-circle` was the right mark everywhere and animated
+     * nowhere, so `glyphs` above — which reads names — passed a static spinner for a milestone
+     * and a half. See `model.ts::SPINNING_GLYPH`.
+     */
+    glyphSpins: [...html.matchAll(/<span[^>]*data-audit="agentsGlyph"[\s\S]*?<\/span>/g)].map(
+      (m) =>
+        `${/data-icon="([^"]*)"/.exec(m[0])?.[1] ?? ''}|${/Spin/.test(m[0]) ? 'spin' : 'still'}`,
+    ),
     unclassed: unclassed(html),
   }
 }
