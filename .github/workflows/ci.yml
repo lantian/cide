@@ -4,13 +4,24 @@ name: CI
 # remembered to run it. `cargo xtask codegen --check` and `cargo xtask contract-check` are
 # described throughout the source as "CI gates"; this is the CI that makes that true.
 on:
-  # Push is unrestricted rather than `branches: [main]`. This project's work happens on
-  # long-lived feature branches (m7-hooks-and-fixes, m8-m11-integration, agent worktrees)
-  # that may go days before a PR exists, and a gate that only fires at merge time is a
-  # gate that reports the breakage after the branch it broke has moved on. The cost is a
-  # duplicate run for a same-repo PR branch, which the concurrency group below does not
-  # collapse because push and pull_request carry different refs.
+  # Push is master only. It was unrestricted while this repository was private and every
+  # branch was one person's — the argument then was that work happens on long-lived branches
+  # (m7-hooks-and-fixes, m8-m11-integration, agent worktrees) that may go days before a PR
+  # exists, so a gate firing only at merge time reports the breakage after the branch that
+  # broke it has moved on. Publishing changed the arithmetic rather than the argument: five
+  # jobs on every push to every branch, on shared runners, is a lot of minutes spent
+  # re-answering a question nobody asked yet.
+  #
+  # `pull_request` is what keeps the gate real — nothing reaches master unreviewed without
+  # passing it — and `workflow_dispatch` is how a feature branch gets a full run on demand
+  # before there is a PR. The old duplicate-run cost is gone with this: a same-repo PR branch
+  # now produces one run, not two.
+  #
+  # Not covered any more, and worth knowing: `release/v<version>`, which release.yml cuts
+  # and pushes. Its content is master plus a version bump, and the release jobs build the
+  # package without running the test suite. Add 'release/**' below to get that gate back.
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
