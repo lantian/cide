@@ -181,7 +181,15 @@ jobs:
           # Cargo.lock records every workspace member's version, and every cargo invocation in
           # this workflow passes --locked. Without this the first one fails with "the lock file
           # needs to be updated but --locked was passed".
-          cargo update --workspace --offline
+          #
+          # `--workspace` is what keeps this honest: it restricts the update to this
+          # repository's own packages, so a release can never quietly move a third-party
+          # dependency. **Not `--offline`.** That was here first and it cannot work: this job
+          # installs no system dependencies and compiles nothing, so `Swatinem/rust-cache` has
+          # nothing to restore on a cold key and `~/.cargo/registry` is empty — cargo then
+          # reports `no matching package named 'serde' found`, naming a dependency that is
+          # not the problem. A release must not depend on a warm cache to resolve at all.
+          cargo update --workspace
 
           # packaging/flatpak/* is generated from tauri.conf.json's AppInfo — the manifest, the
           # desktop entry and the AppStream metainfo, which publishes the version as a
@@ -238,8 +246,13 @@ jobs:
           # Cheap, and it is the one thing that can go wrong silently here: `--locked` proves
           # Cargo.lock actually absorbed the new version, and `package --check` proves the
           # generated flatpak files match what the new AppInfo produces.
+          #
+          # `metadata` resolves the whole graph, so it carries the same cold-cache rule as the
+          # `cargo update` above: no `--offline`. It downloads dependency manifests and
+          # compiles none of them, which is seconds, and the download is what makes `--locked`
+          # mean something here rather than pass for lack of anything to check.
           cargo --locked xtask package --check
-          cargo --locked metadata --format-version 1 --offline > /dev/null
+          cargo --locked metadata --format-version 1 > /dev/null
 
       - name: Commit, tag and push
         env:
