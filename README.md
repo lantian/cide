@@ -81,7 +81,7 @@ Prerequisites: **Rust 1.92**, **Node + pnpm**, **WebKitGTK 4.1 / GTK 3**, and th
 hosts it, it does not ship it.
 
 ```sh
-git clone <this repository> cide && cd cide
+git clone https://github.com/lantian/cide && cd cide
 pnpm --dir ui install
 ./run.sh                   # builds and launches from the working tree
 ```
@@ -90,10 +90,11 @@ That is the whole of it: a source build finds `rust-analyzer` and `gopls` on you
 needs nothing else.
 
 **A packaged build carries its own language servers**, and that is the one extra step:
-`./build.sh` produces an AppImage and installs it into `~/bin`, but it first needs cide's
-rust-analyzer fork and its patched salsa checked out as siblings of the repository — the
-preflight fails with the exact `git clone` command when they are missing. `cargo xtask package`
-can also produce a `.deb`, a Flatpak, a binary tarball or a source tarball.
+`./build.sh` produces an AppImage and installs it into `~/bin`, but it first needs cide's three
+sibling forks — a patched rust-analyzer, the salsa it is built against, and a gopls — checked out
+beside the repository. `./scripts/clone-forks.sh` does that, at the revisions `packaging/*.lock`
+pin; [`docs/forks.md`](docs/forks.md) is what they are and why. `cargo xtask package` can also
+produce a `.deb`, a Flatpak, a binary tarball or a source tarball.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the rest: the run.sh flags, profiles, every check CI runs,
 and packaging.
@@ -159,6 +160,7 @@ crates/
 | [docs/adr/](docs/adr/) | the decisions a refactor would otherwise undo, with the losing option written down |
 | [docs/platforms.md](docs/platforms.md) | what is known, and what is only read, off Linux |
 | [docs/journal.md](docs/journal.md) | the milestone-by-milestone record, including what was never verified |
+| [docs/forks.md](docs/forks.md) | the three sibling forks, their pins, and what moving one costs |
 | [BENCH.md](BENCH.md) | the IPC transport measurement the pane grid is built on |
 
 ## Licence

@@ -15,10 +15,14 @@ on:
   workflow_dispatch:
 
 # A second push to a branch makes the first run's answer worthless, and the rust job is
-# minutes long. main is exempt: its runs are the record of what shipped.
+# minutes long. The trunk is exempt: its runs are the record of what shipped.
+#
+# `master`, not `main` — this repository's trunk is master (release.yml cuts
+# release/v<version> from it), and the exemption named a branch that does not exist here, so
+# the one branch it was written to protect was the one being cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:
   contents: read
@@ -393,10 +397,12 @@ jobs:
           failed=""
           check() {
             local what="$1" url="$2" rev="$3"
-            # A tag prints two lines here (the tag object and its ^{} peel) and a branch or
-            # commit one; zero lines is the answer that matters. `ls-remote <url> <rev>` also
-            # matches a bare commit id only when the server advertises it, which is why the
-            # locks prefer tags — a 40-hex pin that resolves locally can be unreachable here.
+            # One line for a tag, one for a branch; zero is the answer that matters. Not two:
+            # `ls-remote <url> <pattern>` tail-matches ref *names*, and an annotated tag's
+            # peeled `refs/tags/X^{}` line does not match the pattern `X` — so this sees the
+            # tag object and never its commit, which is all a reachability check needs.
+            # A bare commit id matches only when the server advertises it, which is why the
+            # locks prefer tags: a 40-hex pin that resolves locally can be unreachable here.
             if [ -z "$(git ls-remote "$url" "$rev" 2>/dev/null)" ]; then
               echo "::error file=packaging/$what.lock::$rev does not resolve in $url. A release run fetches exactly this revision with a depth-1 fetch and would fail there instead."
               failed="$failed $what"
