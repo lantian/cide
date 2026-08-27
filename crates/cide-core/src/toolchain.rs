@@ -60,7 +60,7 @@ use std::sync::OnceLock;
 // `the_path_a_child_searches_is_the_path_which_searched` asserts the two cannot drift, which
 // matters more than it looks: widening `search_paths` alone widens `claude_cli::resolve`'s
 // acceptance, turning a refusal that names a remedy into an opaque `ENOENT` from `execvp` —
-// the compounding failure `README.md` records under *Finding `claude` from a Finder-launched
+// the compounding failure `docs/platforms.md` records under *Finding `claude` from a Finder-launched
 // `.app`*.
 
 /// The directories cide adds to whatever `PATH` it was started with.
@@ -680,7 +680,7 @@ mod tests {
     ///
     /// `which` searches [`search_paths`]; a child searches the `PATH` [`child_path_from`] built.
     /// If those two ever name different directories, cide is back to the compounding failure
-    /// `README.md` records: `claude_cli::resolve` says yes about a directory the child cannot
+    /// `docs/platforms.md` records: `claude_cli::resolve` says yes about a directory the child cannot
     /// see, and a refusal that named a remedy becomes an opaque `ENOENT` from `execvp` three
     /// processes down. Making it structural rather than a convention is the whole design.
     #[test]
@@ -762,7 +762,7 @@ mod tests {
     /// composes the four sources in `path_helper` order, that a directory arriving from both
     /// `/etc/paths` and the hardcoded floor is listed once, and that the two toolchain
     /// directories stay in front. Whether `/opt/homebrew/bin` is *the right name* is still a
-    /// claim from Homebrew's documentation and not from a Mac; see `README.md`.
+    /// claim from Homebrew's documentation and not from a Mac; see `docs/platforms.md`.
     #[test]
     fn the_macos_list_is_path_helper_then_the_hardcoded_floor_with_no_repeats() {
         let etc = temp("macos-extras");

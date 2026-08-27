@@ -162,11 +162,11 @@ try {
   )
 
   eq(
-    only('    at f (/home/lantian/work/cide/ui/scripts/check-theme.mjs:42:11)'),
+    only('    at f (/home/u/work/cide/ui/scripts/check-theme.mjs:42:11)'),
     {
-      text: '/home/lantian/work/cide/ui/scripts/check-theme.mjs',
+      text: '/home/u/work/cide/ui/scripts/check-theme.mjs',
       start: 10,
-      end: 66,
+      end: 60,
       line: 42,
       column: 11,
     },
@@ -209,11 +209,11 @@ try {
    * Code sample was relative.
    */
   eq(
-    only('Update(/home/lantian/work/cide/ui/src/chrome/ProjectSwitcher.tsx)'),
+    only('Update(/home/u/work/cide/ui/src/chrome/ProjectSwitcher.tsx)'),
     {
-      text: '/home/lantian/work/cide/ui/src/chrome/ProjectSwitcher.tsx',
+      text: '/home/u/work/cide/ui/src/chrome/ProjectSwitcher.tsx',
       start: 7,
-      end: 64,
+      end: 58,
       line: null,
       column: null,
     },
@@ -222,8 +222,8 @@ try {
       'never have come from here — it came from the child cide forwarded the click to',
   )
   eq(
-    only('⏺ Update(/home/lantian/work/cide/run.sh)'),
-    { text: '/home/lantian/work/cide/run.sh', start: 9, end: 39, line: null, column: null },
+    only('⏺ Update(/home/u/work/cide/run.sh)'),
+    { text: '/home/u/work/cide/run.sh', start: 9, end: 33, line: null, column: null },
     'and the ⏺ bullet the TUI prefixes shifts the span by two, not the text',
   )
   eq(
@@ -287,8 +287,8 @@ try {
   )
 
   eq(
-    texts('   Compiling cide-app v0.1.0 (/home/lantian/work/cide)'),
-    ['/home/lantian/work/cide'],
+    texts('   Compiling cide-app v0.1.0 (/home/u/work/cide)'),
+    ['/home/u/work/cide'],
     'cargo names a DIRECTORY in parentheses; the grammar admits it and stage 3 is what refuses it',
   )
 
@@ -300,7 +300,7 @@ try {
     ['   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s', 'nor `target(s)`'],
     ['e.g. the README file, or Cargo.toml', 'nor any other dotted English word'],
     ['http://localhost:5173/src/main.tsx', 'a URL contributes nothing, insides included'],
-    ['file:///home/lantian/work/cide/run.sh', 'and neither does a file:// URL'],
+    ['file:///home/u/work/cide/run.sh', 'and neither does a file:// URL'],
     ['  ui/src/sidebar/GitPa…', 'a path the TUI truncated is the TUI saying this is not the path'],
     ['  ui/src/sidebar/GitPa...', 'including when it spells the ellipsis in ASCII'],
     ['/etc', 'one segment behind a slash is a word with a slash on it'],
@@ -337,7 +337,7 @@ try {
 
   // --- stage 2: which absolute paths could this name? -------------------------------------
 
-  const ROOT = '/home/lantian/work/cide'
+  const ROOT = '/home/u/work/cide'
   const bases = (cwds, roots = [ROOT]) => ({ cwds, roots })
 
   eq(
@@ -386,13 +386,13 @@ try {
       'private key, and the user would have approved it having read six characters of it',
   )
   eq(
-    outsidePaths('.ssh/id_rsa', bases(['/home/lantian'])),
+    outsidePaths('.ssh/id_rsa', bases(['/home/u'])),
     [],
     'and neither does a plain relative one that happens to resolve outside: the whole ' +
       'property is that the full path was on screen before the click',
   )
   eq(
-    outsidePaths('/home/lantian/work/cide/../../.ssh/id_rsa', bases([`${ROOT}/ui`])),
+    outsidePaths('/home/u/work/cide/../../.ssh/id_rsa', bases([`${ROOT}/ui`])),
     [],
     'a climbing ABSOLUTE path is refused too — it normalises to something outside, but that ' +
       'string was never written on screen, and Rust refuses `..` however anyone approves it',
@@ -449,7 +449,7 @@ try {
     'prose that parses as a path names no file, so nothing is ever drawn for it',
   )
   eq(
-    resolveCandidate('/home/lantian/work/cide', ctx([], [ROOT])),
+    resolveCandidate('/home/u/work/cide', ctx([], [ROOT])),
     { kind: 'none' },
     "cargo's `(/abs/dir)` is a directory: `isFile` is false for it and no link is offered",
   )
@@ -489,7 +489,7 @@ try {
       'every `.so` in a linker error stay un-underlined',
   )
   eq(
-    resolveCandidate('../../.ssh/id_rsa', ctx(['/home/lantian/.ssh/id_rsa'], ['/home/lantian/w/x'], ['/home/lantian/w/x'])),
+    resolveCandidate('../../.ssh/id_rsa', ctx(['/home/u/.ssh/id_rsa'], ['/home/u/w/x'], ['/home/u/w/x'])),
     { kind: 'none' },
     'THE ONE THAT MATTERS: a climbing relative path resolves to a real private key on disk ' +
       'and is still offered nothing, because neither candidate set will produce it',
@@ -515,8 +515,8 @@ try {
     'a directory resolves, so a ctrl+click on it can be answered by cide instead of by the child',
   )
   eq(
-    resolveDirectory('/home/lantian/work/cide', dirCtx(['/home/lantian/work/cide'], [], [ROOT])),
-    { kind: 'one', path: '/home/lantian/work/cide' },
+    resolveDirectory('/home/u/work/cide', dirCtx(['/home/u/work/cide'], [], [ROOT])),
+    { kind: 'one', path: '/home/u/work/cide' },
     "cargo's `Compiling … (/abs/dir)` line is the everyday case, and it is a real answer now",
   )
   eq(
@@ -526,7 +526,7 @@ try {
       'file — the refusal is the same one, because it is literally the same function',
   )
   eq(
-    resolveDirectory('../../.ssh', dirCtx(['/home/lantian/.ssh'], ['/home/l/w/x'], ['/home/l/w/x'])),
+    resolveDirectory('../../.ssh', dirCtx(['/home/u/.ssh'], ['/home/l/w/x'], ['/home/l/w/x'])),
     { kind: 'none' },
     'THE ONE THAT MATTERS, again: containment is shared with the file resolver, so a climbing ' +
       'relative path names no directory either. A second copy of this function would be a ' +

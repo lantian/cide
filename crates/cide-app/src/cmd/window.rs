@@ -645,7 +645,7 @@ pub fn window_reveal_pane(
 ///
 /// Its only caller today is [`crate::dock`]'s AppKit half, which exists on one platform. `cfg`-ing
 /// this to match would mean the whole of it — the domain call, the reconcile, the raise — is
-/// never compiled on the platform cide is developed on, and `README.md`'s Platforms section is
+/// never compiled on the platform cide is developed on, and `docs/platforms.md` is
 /// the record of what that costs: both errors the first Mac build reported were in code no Linux
 /// build had ever type-checked. Compiled everywhere and called on one platform is the trade, and
 /// the `allow` is the price of saying so rather than inventing a caller for it.

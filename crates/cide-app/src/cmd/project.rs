@@ -851,7 +851,7 @@ pub fn tab_close(
 /// feature was implemented and reachable from nothing, which is this project's signature defect
 /// and the eighteenth recorded instance. (`project_reorder` beside it is the nineteenth and is
 /// still in that state — registered, exposed at `ui/src/ipc/client.ts:165`, and called by no
-/// line of TypeScript. It is named in `README.md` rather than fixed here.) The lesson this
+/// line of TypeScript. It is named in `docs/journal.md` rather than fixed here.) The lesson this
 /// batch takes from it: a domain function with no command is not "half done", it is *absent*,
 /// and its tests passing says nothing about whether a user can do the thing.
 ///

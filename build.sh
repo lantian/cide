@@ -14,7 +14,7 @@
 #             a .dmg is an installer you open, not a binary for PATH. Set CIDE_INSTALL_DIR to
 #             have it copied somewhere as well.
 #
-# **macOS has never been built or run.** README's Platforms section is the record and this script
+# **macOS has never been built or run.** `docs/platforms.md` is the record and this script
 # does not pretend otherwise. The Darwin branch is the documented plan and not an observation:
 # `dmg` is in `Targets::MACOS`, `cargo tauri build --bundles dmg` runs the .app bundler first, and
 # `tauri.macos.conf.json` overrides `bundle.targets` so a Mac does not try to build an AppImage.
@@ -84,7 +84,7 @@ case "$host" in
   *)
     echo "[build] $host is not a platform cide targets." >&2
     echo "[build] Linux and macOS only, and neither cross-compiles to the other." >&2
-    echo "[build] See README's Platforms section." >&2
+    echo "[build] See docs/platforms.md." >&2
     exit 2
     ;;
 esac

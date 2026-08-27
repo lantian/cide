@@ -97,7 +97,7 @@ pub fn parent_of_pid(pid: u32) -> Option<u32> {
 /// in the record because it is the obvious answer and it is a trap: the `kinfo_proc` it fills
 /// is not a type the `libc` crate defines for Apple at all, so reaching for it means either
 /// hand-declaring a large kernel struct or adding a dependency. The Darwin type-check in
-/// README's *Type-checking for macOS from Linux* is what caught that from a Linux machine, and
+/// `docs/platforms.md`'s *Type-checking for macOS from Linux* is what caught that from a Linux machine, and
 /// it is exactly the class of thing that check exists for.
 ///
 /// **The short flavour rather than `PROC_PIDTBSDINFO`**, deliberately: it is the variant the

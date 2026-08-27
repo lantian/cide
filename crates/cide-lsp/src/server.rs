@@ -32,6 +32,28 @@ const GRACE: Duration = Duration::from_secs(2);
 /// And after `SIGTERM`, before `SIGKILL`.
 const KILL_AFTER: Duration = Duration::from_secs(1);
 
+/// The log target for whatever a server writes *after* it has been told to exit.
+///
+/// A separate target rather than a lower level, because `tauri-plugin-log`'s floor is `Trace`
+/// and a demotion would have changed nothing: `cide-app`'s `log_plugin` pins **this** target to
+/// `Info`, the same way it pins `notify`, so the noise leaves the log without lowering what a
+/// live `cide::lsp` says. Flipping that one line brings it all back.
+///
+/// It exists because one server is very loud on the way out. `sqls` 0.2.48 handles `exit` by
+/// calling its own `Stop` (`internal/handler/handler.go`'s `handleExit`) and then `main` runs the
+/// *same* `Stop` from a `defer`; the second `close(w.done)` panics with `close of closed
+/// channel`, so an orderly quit ends in a forty-line Go traceback per server per project root.
+/// `shutdown` alone does not do it and `exit` alone does, and cide must go on sending `exit` —
+/// gopls writes its cache there (see [`Session::shutdown`]). Nothing downstream was ever fooled:
+/// the pump has already broken `Ok` on the stop flag, so a panic exit code is not read as a crash
+/// and nothing is restarted. The whole cost was that the log a user is asked to send back ended
+/// in a traceback from a program that was already leaving.
+///
+/// What it costs: a server that says something genuinely useful while quitting says it where the
+/// default log will not show it. That is the trade — after `exit`, there is nothing left to act
+/// on but the ladder, which owns the process from there.
+pub const EXIT_LOG_TARGET: &str = "cide::lsp::exit";
+
 /// How much of a crashed server's stderr to keep for the report.
 ///
 /// Enough to name the cause, not enough to paste the user's environment into a toast — the same
@@ -1077,6 +1099,9 @@ fn run_once(
 
     let (inbound_tx, inbound_rx) = crossbeam_channel::unbounded::<Value>();
     let tail = Arc::new(parking_lot::Mutex::new(String::new()));
+    // Set the moment the shutdown ladder starts, and read by the stderr drain alone: it is what
+    // moves a dying server's stderr onto [`EXIT_LOG_TARGET`].
+    let stopping = Arc::new(AtomicBool::new(false));
 
     // Reader. Ends on EOF, which is what a server exiting looks like.
     let reader = std::thread::Builder::new()
@@ -1098,6 +1123,7 @@ fn run_once(
     // only evidence a crash report can carry.
     let stderr_thread = {
         let tail = Arc::clone(&tail);
+        let stopping = Arc::clone(&stopping);
         std::thread::Builder::new()
             .name(format!("cide-lsp-{}-err", server.binary()))
             .spawn(move || {
@@ -1108,7 +1134,13 @@ fn run_once(
                         return;
                     }
                     let text = String::from_utf8_lossy(&buf[..read]);
-                    tracing::debug!(target: "cide::lsp", "{}", text.trim_end());
+                    // Same level, different target, once the ladder has begun — see
+                    // [`EXIT_LOG_TARGET`] for what that buys and what it costs.
+                    if stopping.load(Ordering::Acquire) {
+                        tracing::debug!(target: EXIT_LOG_TARGET, "{}", text.trim_end());
+                    } else {
+                        tracing::debug!(target: "cide::lsp", "{}", text.trim_end());
+                    }
                     let mut tail = tail.lock();
                     tail.push_str(&text);
                     if tail.len() > KEEP_STDERR {
@@ -1243,6 +1275,10 @@ fn run_once(
 
     // The ladder. `shutdown` then `exit` first, always: gopls writes its cache on `exit`, and a
     // signal first costs the user that cache and makes the next start re-index from nothing.
+    //
+    // The flag goes up before the write, not after: `sqls` panics *inside* its handling of
+    // `exit`, so a flag raised afterwards would be raised after the traceback had been logged.
+    stopping.store(true, Ordering::Release);
     let _ = write(&mut stdin, session.shutdown(), &mut ready_at);
     drop(stdin);
 
@@ -1293,6 +1329,20 @@ fn terminate(_child: &Child) {}
 
 #[cfg(test)]
 mod tests {
+    /// The dying-server target is a *child* of the live one, and that is the whole safety of the
+    /// pin in `cide-app`'s `log_plugin`.
+    ///
+    /// `fern`'s `level_for` matches by prefix, so pinning `cide::lsp::exit` to `Info` leaves
+    /// `cide::lsp` alone — while pinning anything a live server's stderr also starts with would
+    /// silence the diagnostics a bug report is collected for. Renaming the constant to something
+    /// outside that namespace, or shortening it to the live target, is the one edit here that
+    /// fails silently: the log simply stops saying what a language server said.
+    #[test]
+    fn the_exit_log_target_is_a_narrower_target_and_not_the_live_one() {
+        assert!(super::EXIT_LOG_TARGET.starts_with("cide::lsp::"));
+        assert_ne!(super::EXIT_LOG_TARGET, "cide::lsp");
+    }
+
     /// The request path, driven without a child process.
     ///
     /// Everything below exercises `take_reply` + the pending map directly, because the interesting

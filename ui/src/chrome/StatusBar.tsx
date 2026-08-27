@@ -29,9 +29,26 @@
  *
  * Both used to be a 28px row above every buffer. See `statusReadout.ts` for why they moved,
  * and `editor/EditorSurface.tsx` for the row that is no longer there.
+ *
+ * # Where they sit, and when they say anything (M34)
+ *
+ * The trail is in the **left** group, after the branch: `⑂ master` and `src › lib.rs` answer the
+ * same question, and the right group is then only the readouts a user watches — the caret line
+ * and the Claude session. It arrived in the right group when the breadcrumb row was deleted and
+ * stayed there by inertia.
+ *
+ * Both file slots are gated on `editorFocused`, because the claim stack behind them never
+ * demotes: a terminal pane holds no editor, claims nothing, and so left the previous buffer's
+ * path and caret standing on the bar while the user typed somewhere else entirely. See that
+ * prop for why this hides rather than releases.
  */
 import { useEffect, useRef, useState } from 'react'
-import { sameTrail, subscribeStatusReadout, type ReadoutLine } from '@/editor/statusReadout'
+import {
+  sameTrail,
+  statusReadout,
+  subscribeStatusReadout,
+  type ReadoutLine,
+} from '@/editor/statusReadout'
 import { crumbTargets } from '@/sidebar/rowPaths'
 import { BranchSelector } from './BranchSelector'
 import { Icon } from '@/icons/Icon'
@@ -78,6 +95,34 @@ export interface StatusBarProps {
    * a detached pane's terminal.
    */
   onRevealSegment?: ((path: string) => void) | undefined
+  /**
+   * Whether the pane the user is actually in is an editor. (M34)
+   *
+   * The bar's two file slots — the trail and `Rust · UTF-8 · LF · Ln 7, Col 48` — are fed by
+   * `editor/statusReadout.ts`'s claim stack, and that stack deliberately **never demotes**: it
+   * is moved by an editor mounting, by a tab coming forward and by DOM focus, and a Claude or
+   * bash pane is none of those because it holds no editor and so claims nothing. So the last
+   * buffer's path used to stand on the bar for as long as the user typed in a terminal, naming
+   * a file they had walked away from. That was the report this prop answers.
+   *
+   * `App.tsx` derives it from the `focused` pane it already computes for the key context —
+   * `focused?.pane.kind === 'editor'`, one derivation, which is what that const exists for.
+   * `PaneKind::Editor` is exactly the right grain: it is what `panes/PaneBody.tsx` keys the
+   * editor branch on, so it covers `EditorSurface` **and** `ImagePane`, the only two surfaces
+   * that ever claim the slot.
+   *
+   * **Hiding, not releasing.** The claim stack is untouched — it keeps holding the editor's
+   * line, so focus coming back restores the trail from state this component already has, with
+   * no round trip, no re-claim and no frame of blankness. Releasing on blur would additionally
+   * have to re-take the claim in a position the stack cannot express: an unfocused half of a
+   * split still owns its place in it.
+   *
+   * Absent means *no opinion* — draw whatever was claimed, which is this bar's behaviour up to
+   * M34 and what a fixture rendering it standalone wants. The default is deliberately the
+   * visible one: a call site that forgets to pass this loses the feature loudly rather than
+   * blanking two slots for a reason nobody can find.
+   */
+  editorFocused?: boolean | undefined
 }
 
 const CLAUDE_PENDING = 'Session readout arrives from the Claude statusline hook.'
@@ -118,9 +163,30 @@ export function StatusBar({
   claude = CLAUDE_PLACEHOLDER,
   revealRoots,
   onRevealSegment,
+  editorFocused = true,
 }: StatusBarProps) {
   const readoutRef = useRef<HTMLSpanElement | null>(null)
-  const [crumbs, setCrumbs] = useState<Crumbs>(NO_CRUMBS)
+  const [claimed, setClaimed] = useState<Crumbs>(NO_CRUMBS)
+
+  /*
+   * Read by the subscription below, which runs once and therefore closes over the prop's
+   * first value for ever. A ref is the only way that callback can see the current one.
+   */
+  const focusedRef = useRef(editorFocused)
+  focusedRef.current = editorFocused
+
+  /**
+   * What the bar draws: the claim, or nothing at all while the user is in a terminal.
+   *
+   * Named `crumbs` because everything below is about what is *on screen* — the claim keeps
+   * its own name above. Gating here rather than at the subscription is what makes the trail
+   * come back instantly when focus returns: the state was never thrown away.
+   *
+   * `NO_CRUMBS` is an empty trail, so `.path` renders empty and the stylesheet's `.path:empty`
+   * takes the box **and its 12px gap** out of the row. That is the whole hiding mechanism —
+   * a JSX branch here would leave `.path:empty` looking like dead CSS.
+   */
+  const crumbs = editorFocused ? claimed : NO_CRUMBS
 
   // Returns the unsubscriber directly, and runs once: the subscription fires immediately
   // with whatever the current editor is showing, so a bar that mounts after an editor —
@@ -130,15 +196,35 @@ export function StatusBar({
     () =>
       subscribeStatusReadout((line) => {
         const el = readoutRef.current
-        if (el !== null) el.textContent = line.detail
+        // The same gate as `crumbs` above, and it has to be applied here as well as in the
+        // effect below: a readout arriving *while* a terminal is focused — a background pane's
+        // outline landing, a mirrored buffer being edited — would otherwise write over the
+        // slot the effect just cleared.
+        if (el !== null) el.textContent = focusedRef.current ? line.detail : ''
         // Returning the previous object is what keeps a caret move out of React: the state
         // setter bails on an identical value, and these three move only when the user changes
         // file or crosses a member boundary. Without the guard this would re-render the bar on
         // every keystroke — the whole reason `detail` above goes straight into the DOM.
-        setCrumbs((prev) => (sameCrumbs(prev, line) ? prev : line))
+        setClaimed((prev) => (sameCrumbs(prev, line) ? prev : line))
       }),
     [],
   )
+
+  /*
+   * The other half of the gate, for the slot React does not own.
+   *
+   * `detail` is written straight into the DOM node, so nothing repaints it when a prop
+   * changes — and focus moving between panes produces no readout event at all. Without this,
+   * clicking into a bash pane would leave `Rust · UTF-8 · LF · Ln 7, Col 48` standing until
+   * the next caret move in a buffer nobody is looking at, which is the reported bug with an
+   * extra step. Reading `statusReadout()` on the way back in is what refills the slot without
+   * waiting for one either.
+   */
+  useEffect(() => {
+    const el = readoutRef.current
+    if (el === null) return
+    el.textContent = editorFocused ? statusReadout().detail : ''
+  }, [editorFocused])
 
   /*
    * Which crumbs lead somewhere. One call per render of the bar, which happens when the file or
@@ -173,15 +259,29 @@ export function StatusBar({
           * has to hold to render the list.
           */}
         <BranchSelector />
-      </div>
 
-      <div className={styles.right}>
         {/*
          * `crates › cide-core › src › lib.rs › Workspace › open_project`. Empty — and gone, along
-         * with its gap — when no editor is open at all; clicking into a terminal leaves the last
-         * buffer's trail standing, which is what it means. This is the only thing on the bar
-         * allowed to give way when the window narrows, and it gives way from the *left*, so the
-         * innermost symbol is the last segment to go.
+         * with its gap — when no editor is open at all. This is the only thing on the bar allowed
+         * to give way when the window narrows, and it gives way from the *left*, so the innermost
+         * symbol is the last segment to go.
+         *
+         * # M34: beside the branch, and only while the user is in a file
+         *
+         * It sat in the right group until M34, and the note here used to end *"clicking into a
+         * terminal leaves the last buffer's trail standing, which is what it means"*. It does not
+         * mean that. The claim stack has no way to demote — a Claude or bash pane holds no editor,
+         * so it claims nothing and cannot displace what is there — so the bar went on naming a
+         * file the user had walked away from for as long as they typed in the terminal. That is
+         * what `editorFocused` answers, and it answers it for the `Rust · UTF-8 · LF · Ln 7, Col
+         * 48` slot below in the same breath: half a fix leaves a caret position on the bar for a
+         * buffer nobody is in.
+         *
+         * The move to the left group is the other half of the same report — `where am I` belongs
+         * next to `which branch`, and the right group is left holding the two readouts that are
+         * actually watched. It is still the one slot that shrinks; `.left > .path` in the
+         * stylesheet is what re-grants that, because the left group's blanket `flex: none`
+         * would otherwise take it away silently.
          *
          * # M12: the tail is now symbols, not only path
          *
@@ -248,7 +348,9 @@ export function StatusBar({
             )
           })}
         </div>
+      </div>
 
+      <div className={styles.right}>
         {/*
          * `Rust · UTF-8 · LF · Ln 7, Col 48`. Written from `editor/statusReadout.ts` and
          * therefore childless in JSX: giving React a child here would let the next render —

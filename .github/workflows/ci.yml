@@ -289,7 +289,7 @@ jobs:
   # this code for that target, and a red X on it is *information*, not a broken branch.
   #
   # Making it blocking is the right move the moment it has been green once. Do that by
-  # deleting the `continue-on-error` line and saying so in README.md's Platforms section,
+  # deleting the `continue-on-error` line and saying so in docs/platforms.md,
   # which is where the honest state of macOS support is recorded. Leaving it advisory after
   # it goes green is how a gate becomes decoration.
   #
@@ -355,3 +355,61 @@ jobs:
       # unreachable branch inside one is invisible on Linux.
       - name: cargo clippy --locked --workspace --all-targets -- -D warnings
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------------
+  # The fork pins, checked for reachability and nothing else.
+  #
+  # `cargo xtask package` compares each lock against a *local* checkout, which proves the
+  # machine doing the packaging agrees with the pin and proves nothing about the machine
+  # doing the release: release.yml fetches these three revisions anonymously from GitHub,
+  # and every way that fetch can fail is invisible until a release run is ten minutes in.
+  # A pin can stop resolving without anyone touching this repository — a tag force-moved or
+  # deleted in a fork, a rewritten `cide` branch orphaning the commit it named, a fork made
+  # private, a repository renamed. All of those are somebody else's action on somebody
+  # else's repository, so nothing here changes and the file keeps looking correct.
+  #
+  # `git ls-remote <url> <rev>` is the whole check: seconds, no clone, anonymous exactly as
+  # the release fetch is anonymous — so a fork that has gone private fails here too, which
+  # is the point. It does not build anything and does not verify content; `--locked` and
+  # preflight cover that. A pin is not verified as *reachable* by anything else.
+  # ---------------------------------------------------------------------------------
+  fork-pins:
+    name: the fork pins still resolve
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Every pin resolves in the repository its lock names
+        run: |
+          set -euo pipefail
+
+          # Sourced, not parsed: these files are the shell-sourceable subset on purpose, and
+          # release.yml reads them exactly this way. Each lock uses its own key names so one
+          # shell can hold all three without a later source clobbering an earlier pin.
+          . packaging/rust-analyzer.lock
+          . packaging/salsa.lock
+          . packaging/gopls.lock
+
+          failed=""
+          check() {
+            local what="$1" url="$2" rev="$3"
+            # A tag prints two lines here (the tag object and its ^{} peel) and a branch or
+            # commit one; zero lines is the answer that matters. `ls-remote <url> <rev>` also
+            # matches a bare commit id only when the server advertises it, which is why the
+            # locks prefer tags — a 40-hex pin that resolves locally can be unreachable here.
+            if [ -z "$(git ls-remote "$url" "$rev" 2>/dev/null)" ]; then
+              echo "::error file=packaging/$what.lock::$rev does not resolve in $url. A release run fetches exactly this revision with a depth-1 fetch and would fail there instead."
+              failed="$failed $what"
+            else
+              echo "ok: $what -> $url @ $rev"
+            fi
+          }
+
+          check rust-analyzer "$CIDE_RA_URL" "$CIDE_RA_REV"
+          check salsa "$CIDE_SALSA_URL" "$CIDE_SALSA_REV"
+          check gopls "$CIDE_GOPLS_URL" "$CIDE_GOPLS_REV"
+
+          if [ -n "$failed" ]; then
+            echo "::error::unreachable fork pins:$failed. Push the tag the lock names, or move the lock to a revision that exists."
+            exit 1
+          fi

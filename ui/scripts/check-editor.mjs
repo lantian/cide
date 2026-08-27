@@ -2385,7 +2385,7 @@ try {
     )
 
     // --- the trail -------------------------------------------------------------------------
-    const ROOT = '/home/lantian/work/cide'
+    const ROOT = '/home/u/work/cide'
     eq(
       readout.pathTrail(`${ROOT}/crates/cide-core/src/lib.rs`, ROOT),
       ['crates', 'cide-core', 'src', 'lib.rs'],
@@ -2409,7 +2409,7 @@ try {
     eq(readout.pathTrail('/etc/hosts', ''), ['etc', 'hosts'], 'an empty root is no root')
     eq(
       readout.pathTrail(`${ROOT}-other/src/lib.rs`, ROOT),
-      ['home', 'lantian', 'work', 'cide-other', 'src', 'lib.rs'],
+      ['home', 'u', 'work', 'cide-other', 'src', 'lib.rs'],
       'a sibling whose name merely starts with the root is not inside it — the trailing ' +
         'separator is what makes `cide-other` fall through to its own path',
     )
@@ -2835,6 +2835,66 @@ try {
           + 'repeated defect with a shorter fuse',
       )
     }
+
+    // --- and the bar says nothing about a file while the user is not in one (M34) ------------
+    //
+    // The claim stack in `statusReadout.ts` has no demotion and deliberately keeps none: a
+    // terminal pane holds no editor, so it claims nothing and cannot displace what is there.
+    // That left the previous buffer's path AND its caret position standing on the bar for as
+    // long as somebody typed in a Claude or bash pane, naming a file they had clicked away
+    // from. `editorFocused` is the answer, and every way of getting it wrong is silent.
+    ok(
+      /editorFocused = true/.test(bar),
+      'the gate DEFAULTS TO VISIBLE. A `false` default would mean a call site that forgets the '
+        + 'prop loses two slots of the bar with nothing to grep for; this way the omission is '
+        + "today's behaviour, which is at least the behaviour somebody reported",
+    )
+    ok(
+      /const crumbs = editorFocused \? claimed : NO_CRUMBS/.test(bar),
+      'the trail is HIDDEN, not released: the claim stays in `claimed`, so focus coming back '
+        + 'redraws it from state the bar already holds — no re-claim, no round trip, no frame '
+        + 'of blankness. `.path:empty` is what removes the box and its gap',
+    )
+    ok(
+      /el\.textContent = focusedRef\.current \? line\.detail : ''/.test(bar)
+        && /el\.textContent = editorFocused \? statusReadout\(\)\.detail : ''/.test(bar),
+      'and the SAME gate reaches the readout span, in both directions. It is written straight '
+        + 'into the DOM, so a prop change repaints nothing on its own and focus moving between '
+        + 'panes produces no readout event at all: without the effect, `Ln 7, Col 48` stands '
+        + 'until the next caret move in a buffer nobody is looking at — the reported bug with '
+        + 'one extra step — and without the ref, a background pane\'s outline landing writes '
+        + 'straight back over the slot the effect just cleared',
+    )
+    ok(
+      /editorFocused=\{focused\?\.pane\.kind === 'editor'\}/.test(appSrc),
+      'and `App.tsx` derives it from the `focused` const it already computes for the key '
+        + 'context, not from a second walk of the tree. Three derivations of "what is focused" '
+        + 'is three chances to disagree — that const\'s own doc says so, and names this bar',
+    )
+
+    // --- the trail sits in the LEFT group, after the branch (M34) ----------------------------
+    //
+    // `⑂ master` and `src › lib.rs` answer one question between them; the right group is the two
+    // readouts that move while the user types. Asserted as an ordering because nothing else can
+    // see it: the trail renders identically in either group.
+    const leftAt = bar.indexOf('styles.left')
+    const rightAt = bar.indexOf('styles.right')
+    const branchAt = bar.indexOf('<BranchSelector />')
+    const pathAt = bar.indexOf('styles.path')
+    ok(
+      leftAt >= 0 && branchAt > leftAt && pathAt > branchAt && rightAt > pathAt,
+      'the trail is in the LEFT group and AFTER the branch selector, with the caret readout and '
+        + 'the Claude slot left alone on the right',
+    )
+    ok(
+      /\.left > \.path \{[^}]*flex:\s*0 1 auto/.test(barCss)
+        && /\.left > \.path \{[^}]*min-width:\s*0/.test(barCss),
+      'and the left group RE-GRANTS its shrink. `.left > *` is `flex: none` at (0,2,0) and beats '
+        + "`.path`'s own (0,1,0) declaration, so without this rule the trail stops shrinking — "
+        + 'and `.left` is `overflow: hidden`, so what that looks like is a path cut off '
+        + 'mid-character with no ellipsis and the branch pushed out of the group. No error, no '
+        + 'warning, and the ellipsis test above still passes',
+    )
   }
 
   // ---------------------------------------------------------------------------------------

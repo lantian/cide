@@ -2,8 +2,23 @@ import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-export default defineConfig({
+// The repository this `ui/` sits in. The audits (`run.sh --audit-*`) need a real project to
+// open, and the only one guaranteed to exist on the machine running them is the checkout
+// they were launched from — so it is computed here rather than written down. It was written
+// down once, as one author's absolute home path, which made every audit a silent no-op on
+// any other clone.
+const repoRoot = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
+
+export default defineConfig(({ command }) => ({
   plugins: [react()],
+
+  // Substituted into `App.tsx`'s `AUDIT_PROJECT_ROOT`. Only while *serving*: a production
+  // build gets the empty string, so no machine's directory layout is ever baked into
+  // `ui/dist` — which ships to users. `command === 'serve'` is the whole guard, and the
+  // audits are dev-only, so nothing that reads it loses anything.
+  define: {
+    __CIDE_REPO_ROOT__: JSON.stringify(command === 'serve' ? repoRoot : ''),
+  },
 
   // Declared here as well as in tsconfig `paths`. tsconfig covers typechecking, but
   // Vite's dependency pre-bundling scan does not read it, and without this the scan fails
@@ -40,4 +55,4 @@ export default defineConfig({
   },
 
   clearScreen: false,
-})
+}))

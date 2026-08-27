@@ -62,7 +62,7 @@ pub fn languages() -> Vec<LanguageDef> {
 ///
 /// What it does **not** do is start or stop anything. A newly contributed server reaches a project
 /// when its `ProjectDiagnostics` is next created; an existing project keeps the servers it has
-/// until it is reopened. That is the honest limit of this call and `README.md` records it.
+/// until it is reopened. That is the honest limit of this call and `docs/journal.md` records it.
 pub fn install(snapshot: &ExtensionSnapshot) {
     let languages: Vec<LanguageDef> = snapshot
         .resolved

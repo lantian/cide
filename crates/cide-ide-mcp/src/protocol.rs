@@ -47,7 +47,7 @@
 //! the CLI installed on the development machine:
 //!
 //! ```text
-//! xtask: using /home/lantian/.local/bin/claude
+//! xtask: using /home/u/.local/bin/claude
 //! xtask: `claude --version` says 2.1.231 (Claude Code)
 //! a real claude connected and named pid 2320201
 //! the CLI that connected calls itself 2.1.231

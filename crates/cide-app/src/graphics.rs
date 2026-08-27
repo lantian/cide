@@ -35,7 +35,7 @@
 ///
 /// * `cmd::settings::graphics_status`, and through it **Settings → Appearance, which off Linux
 ///   offers three switches that persist and do nothing.** That is a known defect rather than a
-///   decision — see `README.md`'s Platforms section. This constant is the seam to gate it on
+///   decision — see `docs/platforms.md`. This constant is the seam to gate it on
 ///   when someone with a Mac can see the screen.
 /// * `apply_graphics_overrides`, which puts the user's stored choices into the environment; the
 ///   same reasoning applies to it and for the same reason it is harmless rather than wrong.

@@ -18,7 +18,7 @@
 //! **cide has never been compiled, run or bundled on macOS.** What exists is
 //! `crates/cide-app/tauri.macos.conf.json`, the plan, and the preflight verdicts — all of which
 //! were written by reading `tauri-utils`' config schema and `tauri-bundler`'s macOS bundler
-//! rather than by watching one succeed. `README.md`'s Platforms section is the honest record;
+//! rather than by watching one succeed. `docs/platforms.md` is the honest record;
 //! keep the two in step.
 //!
 //! That overlay file is safe in a way `tauri.linux.conf.json` is not, and the asymmetry is the
@@ -273,6 +273,24 @@ const GOPLS_FORK_DIR: &str = "../forks/tools";
 
 /// The gopls pin, [`RA_LOCK`]'s twin: `CIDE_GOPLS_URL` / `CIDE_GOPLS_REV`, shell-sourceable.
 const GOPLS_LOCK: &str = "packaging/gopls.lock";
+
+/// Where the salsa fork is checked out — a *sibling of the rust-analyzer fork*, which is the
+/// only reason this constant is spelled relative to this repository at all.
+///
+/// The path that decides the build is `../salsa` inside `../forks/rust-analyzer/Cargo.toml`,
+/// and cargo resolves it against the fork, not against here. This constant exists so the
+/// preflight can name the directory in a message and compare its HEAD; it is correct only
+/// while the two forks are siblings, which [`fork_verdicts`] checks through the fork's own
+/// path rather than through this one.
+const SALSA_FORK_DIR: &str = "../forks/salsa";
+
+/// The salsa pin, the third of the set: `CIDE_SALSA_URL` / `CIDE_SALSA_REV`.
+///
+/// Added when the rust-analyzer pin moved onto the fork proper. Until then the fork's
+/// manifest carried no `[patch.crates-io] salsa`, so there was nothing to pin; from then on
+/// the salsa beside it is a source input to every packaged binary, and preflight checking
+/// only that *some* salsa existed made "whichever one was lying there" a silent input.
+const SALSA_LOCK: &str = "packaging/salsa.lock";
 
 /// The `cargo-tauri` major version this configuration requires.
 ///
@@ -614,6 +632,11 @@ fn parse_gopls_lock(text: &str) -> Option<RaLock> {
     parse_lock(text, "CIDE_GOPLS_URL", "CIDE_GOPLS_REV")
 }
 
+/// [`SALSA_LOCK`]'s parser — the same format again, its own key names.
+fn parse_salsa_lock(text: &str) -> Option<RaLock> {
+    parse_lock(text, "CIDE_SALSA_URL", "CIDE_SALSA_REV")
+}
+
 fn parse_lock(text: &str, url_key: &str, rev_key: &str) -> Option<RaLock> {
     let mut url = None;
     let mut rev = None;
@@ -658,6 +681,43 @@ pub fn read_gopls_lock(root: &Path) -> Result<RaLock> {
             "{} does not state both CIDE_GOPLS_URL and CIDE_GOPLS_REV",
             path.display()
         )
+    })
+}
+
+/// Read and parse [`SALSA_LOCK`], or say what is wrong with it in a sentence.
+pub fn read_salsa_lock(root: &Path) -> Result<RaLock> {
+    let path = root.join(SALSA_LOCK);
+    let text = fs::read_to_string(&path).context(format!("reading {}", path.display()))?;
+    parse_salsa_lock(&text).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} does not state both CIDE_SALSA_URL and CIDE_SALSA_REV",
+            path.display()
+        )
+    })
+}
+
+/// The three fork pins together.
+///
+/// A struct rather than three parameters because the generated Flatpak manifest embeds all of
+/// them, and every place that reads one reads the others: threading a third `&RaLock` through
+/// `generated`/`flatpak_manifest` was the change that made it obvious a fourth fork would do
+/// it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pins {
+    pub ra: RaLock,
+    pub gopls: RaLock,
+    pub salsa: RaLock,
+}
+
+/// Read all three locks, or fail naming the one that could not be read.
+///
+/// Each reader's error already carries its path, so callers do not restate which file: they
+/// say what the pins were *for*, which is the part a message cannot recover.
+pub fn read_pins(root: &Path) -> Result<Pins> {
+    Ok(Pins {
+        ra: read_ra_lock(root)?,
+        gopls: read_gopls_lock(root)?,
+        salsa: read_salsa_lock(root)?,
     })
 }
 
@@ -1142,7 +1202,7 @@ fn fork_steps(triple: Option<&str>, rev: Option<&str>) -> Vec<Step> {
         ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS".into(), "1".into()),
     ];
     if let Some(rev) = rev {
-        build_env.push(("CFG_RELEASE".into(), format!("{rev}+cide")));
+        build_env.push(("CFG_RELEASE".into(), cide_version_stamp(rev)));
     }
     let mut steps = vec![
         Step {
@@ -1229,28 +1289,19 @@ fn fork_verdicts(root: &Path) -> Vec<Verdict> {
             rev = lock.rev,
         ))];
     }
-    // The fork's disk index rides a patched salsa: when its manifest carries the sibling
-    // path patch, the build needs the salsa fork too, and dying inside cargo's patch
-    // resolution twenty minutes into a bundler run is the failure this sentence pre-empts.
-    // `../salsa` in the manifest resolves relative to the *fork*, so that is where the check
-    // looks — resolving it against this repository was a latent bug that only worked while
-    // everything happened to be siblings.
-    if std::fs::read_to_string(fork.join("Cargo.toml"))
-        .is_ok_and(|manifest| manifest.contains("salsa = { path = \"../salsa\" }"))
-        && !fork.join("../salsa/Cargo.toml").exists()
-    {
-        return vec![Verdict::Fail(format!(
-            "the rust-analyzer fork patches salsa to its sibling ../salsa, which is not \
-             checked out. Clone the salsa fork beside the rust-analyzer fork (as \
-             {RA_FORK_DIR}/../salsa) first",
-        ))];
+    // The fork's disk index rides a patched salsa. Its verdicts are a separate function's,
+    // but they are *this* preflight's: nothing else knows the fork's manifest is what decides
+    // whether salsa is an input at all.
+    let salsa = salsa_verdicts(root, &fork);
+    if salsa.iter().any(|v| matches!(v, Verdict::Fail(_))) {
+        return salsa;
     }
 
     // HEAD against the pin, both resolved to commits **in the sibling**, so a tag in the lock
     // compares as the commit it names rather than as a string.
     let head = git_commit(&fork, "HEAD");
     let pinned = git_commit(&fork, &format!("{}^{{commit}}", lock.rev));
-    vec![match (head, pinned) {
+    let mut out = vec![match (head, pinned) {
         (Some(head), Some(pinned)) if head == pinned => Verdict::Ok(format!(
             "{RA_FORK_DIR} is at the pinned fork revision ({})",
             lock.rev
@@ -1263,6 +1314,69 @@ fn fork_verdicts(root: &Path) -> Vec<Verdict> {
         )),
         _ => Verdict::Warn(format!(
             "could not compare {RA_FORK_DIR}'s HEAD with the pinned revision {} — is {} \
+             fetched there?",
+            lock.rev, lock.rev,
+        )),
+    }];
+    out.extend(salsa);
+    out
+}
+
+/// The salsa fork's preflight, which only exists when the rust-analyzer fork asks for it.
+///
+/// The trigger is the consumer's manifest, not this repository's opinion: a fork whose
+/// `[patch.crates-io]` does not name salsa builds against the registry crate, and then a
+/// missing (or wrong, or absent-pin) sibling is not a fact about the package at all. So a
+/// stock-rust-analyzer pin — which is what [`RA_LOCK`] held through M25 and M26 — produces no
+/// salsa verdicts rather than a row of green ones about a directory nothing reads.
+///
+/// `../salsa` in the fork's manifest resolves relative to the **fork**, so that is where the
+/// existence check looks; resolving it against this repository was a latent bug that only
+/// worked while everything happened to be siblings. The pin comparison is [`fork_verdicts`]'s
+/// shape exactly: absence fails, a mismatch only warns, because a local `--run` against a
+/// work-in-progress salsa is a legitimate thing to do and release.yml always checks out the
+/// pinned rev.
+fn salsa_verdicts(root: &Path, fork: &Path) -> Vec<Verdict> {
+    let patched = fs::read_to_string(fork.join("Cargo.toml"))
+        .is_ok_and(|manifest| manifest.contains("salsa = { path = \"../salsa\" }"));
+    if !patched {
+        return Vec::new();
+    }
+    let lock = match read_salsa_lock(root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return vec![Verdict::Fail(format!(
+                "{RA_FORK_DIR} patches salsa to its sibling ../salsa, so which salsa is \
+                 checked out there is part of what this package *is* — and {SALSA_LOCK} \
+                 could not be read ({error})"
+            ))];
+        }
+    };
+    let salsa = fork.join("../salsa");
+    if !salsa.join("Cargo.toml").exists() {
+        return vec![Verdict::Fail(format!(
+            "the rust-analyzer fork patches salsa to its sibling ../salsa, which is not \
+             checked out. Run: git clone {url} {SALSA_FORK_DIR} && git -C {SALSA_FORK_DIR} \
+             checkout {rev}",
+            url = lock.url,
+            rev = lock.rev,
+        ))];
+    }
+    let head = git_commit(&salsa, "HEAD");
+    let pinned = git_commit(&salsa, &format!("{}^{{commit}}", lock.rev));
+    vec![match (head, pinned) {
+        (Some(head), Some(pinned)) if head == pinned => Verdict::Ok(format!(
+            "{SALSA_FORK_DIR} is at the pinned salsa revision ({})",
+            lock.rev
+        )),
+        (Some(head), Some(_)) => Verdict::Warn(format!(
+            "{SALSA_FORK_DIR} is at {} but {SALSA_LOCK} pins {} — fine for a local build, but \
+             this package will not match what a release run would produce",
+            &head[..head.len().min(12)],
+            lock.rev,
+        )),
+        _ => Verdict::Warn(format!(
+            "could not compare {SALSA_FORK_DIR}'s HEAD with the pinned revision {} — is {} \
              fetched there?",
             lock.rev, lock.rev,
         )),
@@ -1283,7 +1397,7 @@ fn gopls_steps(triple: Option<&str>, rev: Option<&str>) -> Vec<Step> {
     let mut args = vec!["build".to_string(), "-trimpath".to_string()];
     if let Some(rev) = rev {
         args.push("-ldflags".into());
-        args.push(format!("-X main.version={rev}+cide"));
+        args.push(format!("-X main.version={}", cide_version_stamp(rev)));
     }
     args.extend(["-o".to_string(), GOPLS_BIN.to_string(), ".".to_string()]);
     let mut steps = vec![
@@ -1621,7 +1735,7 @@ fn tarball_steps(info: &AppInfo, triple: &str) -> Vec<Step> {
     }
 
     // Both, and neither is decoration. `LICENSE` is the licence this archive is distributed
-    // under and a binary distribution has to carry it; `README.md` is where "it needs WebKitGTK
+    // under and a binary distribution has to carry it; `CONTRIBUTING.md` is where "it needs WebKitGTK
     // 4.1" is written down, which is the first thing that goes wrong for someone who unpacked
     // this instead of downloading the AppImage.
     install("-m644", "LICENSE".into(), format!("{root}/LICENSE"));
@@ -2003,19 +2117,12 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
                     .into(),
             ),
         });
-        let generated_set = match (read_ra_lock(root), read_gopls_lock(root)) {
-            (Ok(ra), Ok(gopls)) => generated(info, &ra, &gopls),
-            (Err(error), _) => {
+        let generated_set = match read_pins(root) {
+            Ok(pins) => generated(info, &pins),
+            Err(error) => {
                 out.push(Verdict::Fail(format!(
-                    "{RA_LOCK} could not be read ({error}), so the generated manifest cannot \
-                     be checked — it embeds the fork pin"
-                )));
-                Vec::new()
-            }
-            (_, Err(error)) => {
-                out.push(Verdict::Fail(format!(
-                    "{GOPLS_LOCK} could not be read ({error}), so the generated manifest \
-                     cannot be checked — it embeds the gopls pin"
+                    "a fork pin could not be read ({error}), so the generated manifest cannot \
+                     be checked — it embeds all three"
                 )));
                 Vec::new()
             }
@@ -2409,7 +2516,7 @@ fn frontend_verdicts(
         Some(false) => {
             let install = match frontend_tool(script) {
                 // `--dir` is pnpm's spelling (npm's is `--prefix`), so the run-it-from-the-root
-                // form — which is how README and CLAUDE.md write it — is only offered for the
+                // form — which is how the docs and CLAUDE.md write it — is only offered for the
                 // tool this repository actually ships.
                 Some("pnpm") => format!("Run `pnpm --dir {dir} install`"),
                 Some(tool) => format!("Run `{tool} install` in {dir}/"),
@@ -2852,9 +2959,9 @@ fn which(program: &str) -> Option<PathBuf> {
 /// same reason as the manifest: all three restate the app id and version, and a package whose
 /// `.desktop` names a different id than its manifest installs and then does not appear in any
 /// launcher, with nothing failing.
-pub fn generated(info: &AppInfo, ra: &RaLock, gopls: &RaLock) -> Vec<(String, String)> {
+pub fn generated(info: &AppInfo, pins: &Pins) -> Vec<(String, String)> {
     vec![
-        (manifest_path(info), flatpak_manifest(info, ra, gopls)),
+        (manifest_path(info), flatpak_manifest(info, pins)),
         (
             format!("{FLATPAK_DIR}/{}.desktop", info.identifier),
             desktop_entry(info),
@@ -2867,9 +2974,8 @@ pub fn generated(info: &AppInfo, ra: &RaLock, gopls: &RaLock) -> Vec<(String, St
 }
 
 fn write_generated(root: &Path, info: &AppInfo) -> Result<()> {
-    let ra = read_ra_lock(root)?;
-    let gopls = read_gopls_lock(root)?;
-    for (relative, contents) in generated(info, &ra, &gopls) {
+    let pins = read_pins(root)?;
+    for (relative, contents) in generated(info, &pins) {
         let path = root.join(&relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context(format!("creating {}", parent.display()))?;
@@ -2881,10 +2987,9 @@ fn write_generated(root: &Path, info: &AppInfo) -> Result<()> {
 }
 
 fn check_generated(root: &Path, info: &AppInfo) -> Result<()> {
-    let ra = read_ra_lock(root)?;
-    let gopls = read_gopls_lock(root)?;
+    let pins = read_pins(root)?;
     let mut stale = Vec::new();
-    for (relative, expected) in generated(info, &ra, &gopls) {
+    for (relative, expected) in generated(info, &pins) {
         match fs::read_to_string(root.join(&relative)) {
             Ok(current) if current == expected => {}
             Ok(_) => stale.push(format!("  changed  {relative}")),
@@ -2902,7 +3007,7 @@ fn check_generated(root: &Path, info: &AppInfo) -> Result<()> {
     }
     println!(
         "package: {} packaging files in sync",
-        generated(info, &ra, &gopls).len()
+        generated(info, &pins).len()
     );
     Ok(())
 }
@@ -2987,7 +3092,26 @@ fn ra_source_key(rev: &str) -> &'static str {
     if is_commit { "commit" } else { "tag" }
 }
 
-pub fn flatpak_manifest(info: &AppInfo, ra: &RaLock, gopls: &RaLock) -> String {
+/// What a built sidecar reports as its version: the pinned rev, marked as cide's build.
+///
+/// The `+cide` suffix exists for one reason — a bug report saying `rust-analyzer 2026-08-24`
+/// is about upstream's binary, and one saying `2026-08-24+cide` is about ours. Once the pins
+/// moved onto the forks their tags say `cide-` themselves, and `cide-2026-08-28+cide` states
+/// it twice; a rev that already names cide is left alone.
+///
+/// Used by **both** channels — `fork_steps`/`gopls_steps` for the direct builds and the
+/// Flatpak manifest for the sandboxed one — because the same pin building two packages that
+/// answer `--version` differently is a support conversation with no bottom.
+fn cide_version_stamp(rev: &str) -> String {
+    if rev.contains("cide") {
+        rev.to_string()
+    } else {
+        format!("{rev}+cide")
+    }
+}
+
+pub fn flatpak_manifest(info: &AppInfo, pins: &Pins) -> String {
+    let (ra, gopls, salsa) = (&pins.ra, &pins.gopls, &pins.salsa);
     format!(
         r#"# GENERATED FILE — DO NOT EDIT.
 #
@@ -3067,11 +3191,11 @@ modules:
       # rather than build-options: those profile settings are upstream's own dist choices for
       # the fork, and putting them in the module environment would silently re-profile cide's
       # own release build above.
-      - env CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CFG_RELEASE={ra_rev}+cide cargo build --release --locked --manifest-path rust-analyzer-fork/Cargo.toml -p rust-analyzer
+      - env CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CFG_RELEASE={ra_stamp} cargo build --release --locked --manifest-path rust-analyzer-fork/Cargo.toml -p rust-analyzer
       # cide's gopls, from its own pinned git source. Built in the checkout's gopls/ module
       # directory; CGO off because gopls is pure Go and static is simpler; the -X stamp is
       # logs-only, same rule as CFG_RELEASE above.
-      - cd gopls-fork/gopls && env CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags "-X main.version={gopls_rev}+cide" -o {gopls_bin} .
+      - cd gopls-fork/gopls && env CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags "-X main.version={gopls_stamp}" -o {gopls_bin} .
       - install -Dm755 target/release/cide /app/bin/{command}
       # cide-hook must sit beside the main binary: `cmd::session::hook_settings` locates it
       # relative to `current_exe`, because the child's cwd is the project root and its PATH
@@ -3095,6 +3219,17 @@ modules:
         url: {ra_url}
         {ra_key}: {ra_rev}
         dest: rust-analyzer-fork
+      # The salsa fork, which the rust-analyzer fork's `[patch.crates-io]` reaches as
+      # `../salsa` — relative to *its own* manifest, so `dest: salsa` beside
+      # `rust-analyzer-fork` is what makes that path resolve inside the build. Emitted
+      # unconditionally: this generator reads locks and never the fork checkout, so it cannot
+      # know whether the pinned rust-analyzer patches salsa, and the two failure modes are
+      # not comparable — an unused source costs one clone, a missing one dies inside cargo's
+      # patch resolution well into the build.
+      - type: git
+        url: {salsa_url}
+        {salsa_key}: {salsa_rev}
+        dest: salsa
       - type: git
         url: {gopls_url}
         {gopls_key}: {gopls_rev}
@@ -3108,10 +3243,15 @@ modules:
         ra_url = ra.url,
         ra_key = ra_source_key(&ra.rev),
         ra_rev = ra.rev,
+        ra_stamp = cide_version_stamp(&ra.rev),
+        salsa_url = salsa.url,
+        salsa_key = ra_source_key(&salsa.rev),
+        salsa_rev = salsa.rev,
         gopls_bin = GOPLS_BIN,
         gopls_url = gopls.url,
         gopls_key = ra_source_key(&gopls.rev),
         gopls_rev = gopls.rev,
+        gopls_stamp = cide_version_stamp(&gopls.rev),
     )
 }
 
@@ -3318,6 +3458,21 @@ mod tests {
         }
     }
 
+    fn salsa_lock() -> RaLock {
+        RaLock {
+            url: "https://example.com/salsa".into(),
+            rev: "cide-salsa-v0.28.2".into(),
+        }
+    }
+
+    fn pins() -> Pins {
+        Pins {
+            ra: ra_lock(),
+            gopls: gopls_lock(),
+            salsa: salsa_lock(),
+        }
+    }
+
     #[test]
     fn the_checked_in_fork_lock_parses() {
         // The same claim `the_real_config_is_readable` makes about tauri.conf.json: the
@@ -3334,18 +3489,27 @@ mod tests {
         let lock = read_gopls_lock(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
             .expect("packaging/gopls.lock");
         assert!(lock.url.starts_with("https://"), "{lock:?}");
-        // The rev is a gopls release tag in golang/tools, whose tag namespace is prefixed.
-        assert!(lock.rev.starts_with("gopls/"), "{lock:?}");
+        // Two tag namespaces are legitimate and no third is: `gopls/vX.Y.Z` while the pin sits
+        // on an upstream release of golang/tools, and `cide-` once it sits on the fork's own
+        // branch. The prefix is not cosmetic — `git fetch upstream --tags` in the fork brings
+        // upstream's namespace with it, so a cide pin living inside it is one upstream can
+        // move out from under a release.
+        assert!(
+            lock.rev.starts_with("gopls/") || lock.rev.starts_with("cide-"),
+            "{lock:?}"
+        );
     }
 
     #[test]
     fn the_two_locks_use_distinct_key_names() {
-        // release.yml sources both files into one shell; shared key names would have the
-        // second `source` silently clobber the first pin.
-        let text =
-            "CIDE_RA_URL=https://a\nCIDE_RA_REV=1\nCIDE_GOPLS_URL=https://b\nCIDE_GOPLS_REV=2\n";
+        // release.yml sources all three files into one shell; shared key names would have the
+        // last `source` silently clobber the earlier pins.
+        let text = "CIDE_RA_URL=https://a\nCIDE_RA_REV=1\nCIDE_GOPLS_URL=https://b\n\
+                    CIDE_GOPLS_REV=2\nCIDE_SALSA_URL=https://c\nCIDE_SALSA_REV=3\n";
         let ra = parse_ra_lock(text).expect("ra keys");
         let gopls = parse_gopls_lock(text).expect("gopls keys");
+        let salsa = parse_salsa_lock(text).expect("salsa keys");
+        assert_eq!((salsa.url.as_str(), salsa.rev.as_str()), ("https://c", "3"));
         assert_eq!((ra.url.as_str(), ra.rev.as_str()), ("https://a", "1"));
         assert_eq!((gopls.url.as_str(), gopls.rev.as_str()), ("https://b", "2"));
     }
@@ -3447,8 +3611,53 @@ mod tests {
     }
 
     #[test]
+    fn the_salsa_lock_has_its_own_keys_and_the_checked_in_one_parses() {
+        // Three locks are sourced into one shell by release.yml, so the key names must not
+        // collide — a shared CIDE_URL would have the last `.` win and pin every fork to it.
+        let lock = parse_salsa_lock("CIDE_SALSA_URL=https://example.com/salsa\nCIDE_SALSA_REV=t\n")
+            .expect("parses");
+        assert_eq!(lock.url, "https://example.com/salsa");
+        assert!(parse_salsa_lock("CIDE_RA_URL=x\nCIDE_RA_REV=y\n").is_none());
+        let real = read_salsa_lock(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+            .expect("the checked-in salsa lock parses");
+        assert!(real.url.starts_with("https://"), "{real:?}");
+        assert!(!real.rev.is_empty());
+    }
+
+    #[test]
+    fn a_rev_that_already_names_cide_is_not_stamped_twice() {
+        // The stamp exists so a bug report can be told apart from one about upstream's
+        // binary. Once the pins moved onto the forks, their tags say it themselves.
+        assert_eq!(cide_version_stamp("2026-08-24"), "2026-08-24+cide");
+        assert_eq!(cide_version_stamp("cide-2026-08-28"), "cide-2026-08-28");
+        assert_eq!(
+            cide_version_stamp("cide-gopls-v0.23.0"),
+            "cide-gopls-v0.23.0"
+        );
+    }
+
+    #[test]
+    fn the_manifest_carries_salsa_as_the_forks_sibling() {
+        // `[patch.crates-io] salsa = { path = "../salsa" }` in the rust-analyzer fork
+        // resolves against that manifest, so the source must land beside the fork's dest and
+        // under exactly that name — `dest: salsa-fork` would build a manifest that clones
+        // everything correctly and then fails in cargo.
+        let manifest = flatpak_manifest(&info(), &pins());
+        assert!(
+            manifest.contains("url: https://example.com/salsa"),
+            "{manifest}"
+        );
+        assert!(manifest.contains("tag: cide-salsa-v0.28.2"), "{manifest}");
+        assert!(manifest.contains("dest: salsa\n"), "{manifest}");
+        assert!(
+            !manifest.contains("dest: salsa-fork"),
+            "the fork's patch path names ../salsa exactly"
+        );
+    }
+
+    #[test]
     fn the_manifest_builds_and_installs_the_fork_at_the_pin() {
-        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
+        let manifest = flatpak_manifest(&info(), &pins());
         assert!(
             manifest.contains("/app/bin/cide-rust-analyzer"),
             "{manifest}"
@@ -4088,14 +4297,14 @@ mod tests {
     fn the_manifest_is_byte_stable() {
         // `--check` is only a gate if a no-op run produces identical bytes.
         assert_eq!(
-            flatpak_manifest(&info(), &ra_lock(), &gopls_lock()),
-            flatpak_manifest(&info(), &ra_lock(), &gopls_lock())
+            flatpak_manifest(&info(), &pins()),
+            flatpak_manifest(&info(), &pins())
         );
     }
 
     #[test]
     fn the_manifest_names_the_real_binaries_and_id() {
-        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
+        let manifest = flatpak_manifest(&info(), &pins());
         assert!(manifest.contains("app-id: dev.cide.ide"));
         assert!(manifest.contains("/app/bin/cide-hook"));
         assert!(manifest.contains("command: cide"));
@@ -4105,7 +4314,7 @@ mod tests {
     fn the_manifest_vendors_rather_than_taking_libgit2_from_the_runtime() {
         // Adding a libgit2 or openssl module would silently take precedence over the
         // vendored build and tie the package to the runtime's ABI.
-        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
+        let manifest = flatpak_manifest(&info(), &pins());
         assert!(
             !manifest.contains("name: libgit2"),
             "libgit2 is vendored; it must not also be a module"
@@ -4120,7 +4329,7 @@ mod tests {
         // manifest's first build command, so the whole channel failed on it, and nothing in
         // this repository would have noticed — flatpak-builder is the only thing that reads
         // this file.
-        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
+        let manifest = flatpak_manifest(&info(), &pins());
         assert!(
             !manifest.contains("npm --prefix ui ci"),
             "npm ci needs a package-lock.json this repository does not have"
@@ -4132,7 +4341,7 @@ mod tests {
     fn the_flatpak_can_reach_the_host_cli() {
         // Without both of these the app installs, launches, and then fails to spawn a single
         // Claude pane — the one failure mode that makes this channel worthless.
-        let manifest = flatpak_manifest(&info(), &ra_lock(), &gopls_lock());
+        let manifest = flatpak_manifest(&info(), &pins());
         assert!(manifest.contains("--filesystem=host"));
         assert!(manifest.contains("--talk-name=org.freedesktop.Flatpak"));
     }
@@ -4179,7 +4388,7 @@ mod tests {
 
     #[test]
     fn the_generated_set_is_the_manifest_plus_its_two_companions() {
-        let paths: Vec<String> = generated(&info(), &ra_lock(), &gopls_lock())
+        let paths: Vec<String> = generated(&info(), &pins())
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -4199,8 +4408,8 @@ mod tests {
         // and the metainfo. If `generated` stopped writing one, the build would fail deep
         // inside flatpak-builder with a missing-file error naming a path nobody recognises.
         let info = info();
-        let manifest = flatpak_manifest(&info, &ra_lock(), &gopls_lock());
-        for (path, _) in generated(&info, &ra_lock(), &gopls_lock()) {
+        let manifest = flatpak_manifest(&info, &pins());
+        for (path, _) in generated(&info, &pins()) {
             if path.ends_with(".yml") {
                 continue;
             }

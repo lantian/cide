@@ -29,12 +29,12 @@
 //!
 //! That split is the same one `cmd::window`'s `title_with` makes for the same reason, and here it
 //! is not a preference but the only option: **`cide-app` cannot be type-checked for Darwin from
-//! Linux** — `README.md`'s *Type-checking for macOS from Linux* excludes this crate, because
+//! Linux** — `docs/platforms.md`'s *Type-checking for macOS from Linux* excludes this crate, because
 //! `git2` is `vendored-openssl` and building OpenSSL for Darwin needs a real cross toolchain.
 //!
 //! # What has actually been verified, and what has not
 //!
-//! Stated plainly, because `README.md`'s Platforms section exists to keep this distinction and
+//! Stated plainly, because `docs/platforms.md` exists to keep this distinction and
 //! the estimate it corrects was wrong in the direction estimates are always wrong.
 //!
 //! * [`entries`] and its tests **run**, here, in `cargo test --workspace`.
@@ -42,7 +42,7 @@
 //!   `aarch64-apple-darwin`**, against the real `objc2 0.6` and `objc2-app-kit 0.3`. Not through
 //!   this crate — through a throwaway crate carrying a verbatim copy of the module with the four
 //!   cide-side types (`AppHandle`, `Manager`, `WorkspaceState`, `ProjectId`) stubbed, the same
-//!   `DOCS_RS=1` + `scripts/darwin-cc.sh` recipe `README.md` gives, and those three dependencies
+//!   `DOCS_RS=1` + `scripts/darwin-cc.sh` recipe `docs/platforms.md` gives, and those three dependencies
 //!   at the versions the workspace pins. Two real errors came out of it — a missing
 //!   `MainThreadOnly` import and both `transmute` annotations — which is the argument for doing
 //!   it rather than a note about diligence.

@@ -733,7 +733,7 @@ pub fn run_filter_with(
 /// It appends the directories `toolchain::search_paths` already searches, and it is built
 /// *from* the scrub's `PATH` so nothing the scrub dropped comes back.
 ///
-/// This is also what closes the exec gap `README.md` records under *Finding `claude` from a
+/// This is also what closes the exec gap `docs/platforms.md` records under *Finding `claude` from a
 /// Finder-launched `.app`*: `claude_cli::resolve` validates a bare `claude` against
 /// `search_paths()`, and portable-pty resolves a bare program against the builder's own `PATH`
 /// — so the check and the spawn now consult the same list instead of disagreeing about a
@@ -871,7 +871,7 @@ pub const DEATH_SIGNAL: libc::c_int = libc::SIGTERM;
 /// `true` only on Linux, where `PR_SET_PDEATHSIG` exists. It is a public constant rather than a
 /// private `cfg!` so that the gap is a *value* other code can read, report and test against,
 /// instead of a silence — see [`set_parent_death_signal`]'s non-Linux arm for what is and is not
-/// still true off Linux, and `README.md`'s Platforms section for the consequence.
+/// still true off Linux, and `docs/platforms.md` for the consequence.
 ///
 /// Nothing branches on this to change behaviour; [`arm`] is called unconditionally at every
 /// spawn site and the platform decides how much of it takes effect. It exists so that "cide's
@@ -1040,7 +1040,7 @@ fn signal_self_if_already_orphaned(expected_parent: u32, signal: libc::c_int) {
 /// exactly this shape for hook sockets — same liveness rule, same bias towards leaving things
 /// alone — but it sweeps *files*, and nothing in the workspace records a child pid, so this is
 /// new state rather than an extension. It also recovers at the next launch instead of
-/// immediately, which is strictly weaker than `PDEATHSIG`. Both are written up in `README.md`
+/// immediately, which is strictly weaker than `PDEATHSIG`. Both are written up in `docs/platforms.md`
 /// under Platforms; neither is implemented, and [`PARENT_DEATH_IS_ENFORCED`] is `false` here so
 /// that no caller can read this arm as equivalent.
 #[cfg(all(unix, not(target_os = "linux")))]

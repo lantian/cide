@@ -1335,7 +1335,7 @@ fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
 /// let alone run, on this machine, and it is the *permission* model that decides whether it is
 /// worth having — `PROC_PIDVNODEPATHINFO` on another user's process needs root, and whether it
 /// answers for a same-user child under macOS's hardened runtime is exactly the sort of thing
-/// that has to be observed rather than read. Written down in `README.md` under Platforms.
+/// that has to be observed rather than read. Written down in `docs/platforms.md`.
 ///
 /// The BSDs want a third answer again (`sysctl KERN_PROC_CWD`), which is why this is
 /// `not(target_os = "linux")` rather than a macOS arm: everything that is not Linux is honestly
@@ -2591,7 +2591,7 @@ mod tests {
             cwd_of_pid(std::process::id()),
             None,
             "cwd_of_pid is unimplemented off Linux; if this now answers, the test above it is \
-             the one to turn on — see README.md's Platforms section"
+             the one to turn on — see docs/platforms.md"
         );
         let here = std::env::current_dir().expect("a cwd");
         assert_eq!(

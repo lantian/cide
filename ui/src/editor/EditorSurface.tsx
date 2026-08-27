@@ -176,7 +176,7 @@ export interface EditorSurfaceProps {
    *
    * Absent shows the whole absolute path, which is right for a file outside any project and
    * wrong-looking for one inside it — `crates › cide-core › src › lib.rs` is the mock, not
-   * `home › lantian › work › cide › crates › …`. See `pathTrail`.
+   * `home › u › work › cide › crates › …`. See `pathTrail`.
    */
   root?: string | undefined
   /**

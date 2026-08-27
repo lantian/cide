@@ -20,7 +20,7 @@
 //! app's tick and before quitting" and is called by **neither** — `grep -rn flush_if_due` finds
 //! its definition and a mention inside a comment — so `workspace.json` is in fact written
 //! exactly once per run, on shutdown, and its 500 ms debounce is inert. That is a real defect
-//! (`README.md` records it), and `positions_state::PositionsState` answered it by starting its
+//! (`docs/journal.md` records it), and `positions_state::PositionsState` answered it by starting its
 //! own thread rather than by pretending a tick exists. This does the same.
 //!
 //! It matters more here than for either of those, because this store is the only one in the

@@ -79,7 +79,7 @@ gtk = { workspace = true }
 # exactly one hook for it (`applicationDockMenu:` on the app delegate) and neither tauri, tao nor
 # muda exposes a dock menu, so the method is added to tao's delegate class at runtime and the
 # `NSMenu` is built by hand. See `dock.rs`, which is also honest about what has and has not been
-# verified: this crate is one of the three `README.md` excludes from the Darwin type-check, so
+# verified: this crate is one of the three `docs/platforms.md` excludes from the Darwin type-check, so
 # that module was checked by lifting a copy of it into a throwaway crate carrying exactly these
 # three dependencies at exactly these versions — which is what makes the versions here load
 # bearing rather than decorative.

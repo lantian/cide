@@ -2999,8 +2999,7 @@ mod notice_accumulation {
     /// the last restore printed on it, so each launch appended one more.
     #[test]
     fn a_restored_screen_carries_one_notice_however_often_it_is_restored() {
-        let mut screen =
-            b"lantian@powerhall:~/work/cide> pwd\r\n/home/lantian/work/cide\r\n".to_vec();
+        let mut screen = b"u@host:~/work/cide> pwd\r\n/home/u/work/cide\r\n".to_vec();
         for _ in 0..6 {
             // Each round is the next launch: yesterday's screen in, today's screen out.
             screen = preload_from(Some(screen));
@@ -3012,7 +3011,7 @@ mod notice_accumulation {
             .sum::<usize>();
         assert_eq!(notices, 1, "six launches left {notices} notices:\n{text}");
         // And the shell's own output is still there — stripping must not take the transcript.
-        assert!(text.contains("/home/lantian/work/cide"), "{text}");
+        assert!(text.contains("/home/u/work/cide"), "{text}");
     }
 
     /// A screen with no notice is passed through untouched.

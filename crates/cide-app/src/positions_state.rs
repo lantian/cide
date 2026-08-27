@@ -29,7 +29,7 @@
 //! app's tick and before quitting" and **is called from neither** — `grep -rn flush_if_due`
 //! finds the definition and one mention inside a comment. So `workspace.json` is in fact
 //! written exactly once per run, on shutdown, and its debounce is inert. That is a real defect
-//! (recorded in `README.md`) and it is *not* fixed by pretending a tick exists here: this store
+//! (recorded in `docs/journal.md`) and it is *not* fixed by pretending a tick exists here: this store
 //! flushes from the thread that already owns the write, on a timer it starts itself, so its
 //! debounce works whether or not anyone ever builds that tick.
 

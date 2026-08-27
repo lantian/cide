@@ -169,7 +169,7 @@ pub fn defaults() -> Vec<Binding> {
         //
         // ⌃⇧E is *Recent Locations* in IDEA; *Select Opened File* has no default chord there at
         // all (it is a gear-menu action). cide has no Recent Locations, so nothing is lost — but
-        // a user coming from IDEA will press this expecting one, and `README.md` says so. On
+        // a user coming from IDEA will press this expecting one, and `docs/journal.md` says so. On
         // macOS `platform_layer` rewrites it to ⇧⌘E, which is free there too and needs no
         // exception in `keeps_ctrl_on_macos`.
         ("ctrl+shift+e", "file.reveal"),
@@ -316,7 +316,7 @@ pub fn defaults() -> Vec<Binding> {
         // had asked to put there, and later *did* pay for `pane.navigate.left`/`right` above,
         // where the chord was asked for by name; either way the pair is spent.
         // `ctrl+alt+shift+left`/`right` are free in every layer and are
-        // what a user should add if they want them — `README.md` prints the two lines. Shipping
+        // what a user should add if they want them — `docs/journal.md` prints the two lines. Shipping
         // an unbound pair rather than guessing is the same trade `file.saveAll` already makes.
         ("mouseback", "navigate.back"),
         ("mouseforward", "navigate.forward"),
@@ -434,7 +434,7 @@ pub fn defaults() -> Vec<Binding> {
              * `alt+left` above banks that stroke deliberately — *"`Shift-Alt-Arrow` is a
              * different stroke, so select-syntax and move-line survive untouched"* — and
              * taking it here would make that sentence false. **Not `ctrl+alt+shift+left`/
-             * `right` either**: `README.md` prints those two lines twice as the binding a user
+             * `right` either**: `docs/journal.md` prints those two lines twice as the binding a user
              * should add for `navigate.back`/`forward`, so a default there would collide with
              * advice already in the manual.
              *
@@ -509,7 +509,7 @@ pub fn defaults() -> Vec<Binding> {
              * * **On macOS**: `platform_layer` only rewrites chords containing Ctrl, so bare
              *   F-keys pass through untouched, and F7 is not in `MACOS_MENU_CHORDS`. It is
              *   previous-track on the system keyboard, so it needs Fn — the same tax F4 already
-             *   pays, and recorded in README's Platforms rather than worked around.
+             *   pays, and recorded in `docs/platforms.md` rather than worked around.
              *
              * The first compound clause in this table. To give F7 back:
              * `{"key":"f7","command":"-navigate.nextChange","when":"diffFocused && !terminalFocused"}`
@@ -2375,7 +2375,7 @@ mod tests {
         assert_eq!(command_for(&resolved, "meta+1"), ["tab.console"]);
     }
 
-    /// F4 is the panel toggle, and the one-line escape hatch the README prints actually works.
+    /// F4 is the panel toggle, and the one-line escape hatch `docs/journal.md` prints actually works.
     ///
     /// The binding costs every terminal pane in the shell window the `ESC O S` xterm sends for
     /// F4 — a real key to `mc`, `htop` and any curses TUI — and the whole justification for
@@ -2402,7 +2402,7 @@ mod tests {
         assert_eq!(
             command_for(&unscoped, "f4"),
             ["sidebar.toggle"],
-            "a removal that forgets the `when` matches nothing — the README must not print it"
+            "a removal that forgets the `when` matches nothing — `docs/journal.md` must not print it"
         );
     }
 
@@ -2568,7 +2568,7 @@ mod tests {
         assert_eq!(command_for(&bound, "alt+shift+d"), ["theme.toggle"]);
     }
 
-    /// Ctrl+G goes to a line, and the escape hatch the README offers for it actually works —
+    /// Ctrl+G goes to a line, and the escape hatch `docs/journal.md` offers for it actually works —
     /// **including the `when`, which is the half a user will leave out.**
     ///
     /// The binding costs something real: `@codemirror/search` binds `Mod-g` to find-next, and the
@@ -2581,7 +2581,7 @@ mod tests {
     /// The sharp edge is `when`. Removal matches on (key, command, `when`), so the unscoped
     /// removal a user would write first matches *nothing* and the chord stays bound — with a
     /// `RemovalMatchedNothing` diagnostic and no visible change. Both halves are asserted here so
-    /// the README cannot document the wrong line.
+    /// `docs/journal.md` cannot document the wrong line.
     #[test]
     fn ctrl_g_goes_to_a_line_and_can_be_given_back_to_codemirror() {
         let shipped = resolve_pc(&[]);
@@ -2600,7 +2600,7 @@ mod tests {
         assert_eq!(
             command_for(&unscoped, "ctrl+g"),
             ["navigate.line"],
-            "a removal that forgets the `when` matches nothing — the README must not print it"
+            "a removal that forgets the `when` matches nothing — `docs/journal.md` must not print it"
         );
         let (_, diags) = resolve_with_diagnostics_pc(&[Binding::new("ctrl+g", "-navigate.line")]);
         assert!(
@@ -2618,7 +2618,7 @@ mod tests {
     /// menu on the F keys — and the gate is a window *capture* listener, so an unscoped binding
     /// would swallow ⌥F7 in every terminal pane in every window for a command that needs a caret
     /// to mean anything. The escape hatch is asserted here for the same reason ⌃G's is: so the
-    /// README cannot print a line that matches nothing.
+    /// `docs/journal.md` cannot print a line that matches nothing.
     #[test]
     fn alt_f7_finds_usages_and_only_where_a_caret_is() {
         let shipped = resolve(&[]);
@@ -2645,7 +2645,7 @@ mod tests {
         assert_eq!(
             command_for(&unscoped, "alt+f7"),
             ["navigate.usages"],
-            "a removal that forgets the `when` matches nothing — the README must not print it"
+            "a removal that forgets the `when` matches nothing — `docs/journal.md` must not print it"
         );
     }
 
@@ -2708,7 +2708,7 @@ mod tests {
     /// Not a lint and not a wish: it is an allowlist of conflicts somebody looked at and decided
     /// to live with, and it fails when the set **grows** (a new binding is dead on macOS and
     /// nobody noticed) *and* when it **shrinks** (an entry here has gone stale and is now
-    /// misleading prose in `README.md`). Set equality is the only assertion that catches both.
+    /// misleading prose in `docs/journal.md`). Set equality is the only assertion that catches both.
     ///
     /// It cannot be a behavioural test, because the thing that eats the keystroke is AppKit
     /// resolving a menu accelerator in a process this repository has never run.

@@ -30,7 +30,7 @@
 //! toolchain rustup would use — every override rule included. Measured on this machine:
 //!
 //! ```text
-//! cd /home/lantian/work/cide && rustc --print sysroot  -> …/toolchains/1.92.0-x86_64-unknown-linux-gnu
+//! cd /home/u/work/cide && rustc --print sysroot  -> …/toolchains/1.92.0-x86_64-unknown-linux-gnu
 //! cd /tmp                    && rustc --print sysroot  -> …/toolchains/stable-x86_64-unknown-linux-gnu
 //! RUSTUP_TOOLCHAIN=stable rustc --print sysroot        -> …/toolchains/stable-…   (env wins)
 //! ```

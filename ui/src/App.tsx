@@ -166,7 +166,19 @@ function settled(): Promise<void> {
   })
 }
 
-const PROJECT_ROOT = '/home/lantian/work/cide'
+/**
+ * The repository the audits seed an empty workspace with.
+ *
+ * `__CIDE_REPO_ROOT__` is substituted by `vite.config.ts`, and only when Vite is *serving*
+ * — a production build defines it as the empty string, so no machine's directory layout is
+ * ever baked into `ui/dist`. That is the whole reason it is not a plain literal: this was
+ * one author's absolute home path for six milestones, which made every audit a no-op on any
+ * other clone and put that path in a published bundle.
+ *
+ * The audits are dev-only (`run.sh --audit-*`), so an empty value here is never reached by
+ * one; `seedAuditWorkspace` refuses it rather than opening the process's cwd by accident.
+ */
+const AUDIT_PROJECT_ROOT = __CIDE_REPO_ROOT__
 
 /**
  * Open this repo and a second Claude tab, if the workspace is empty.
@@ -192,7 +204,8 @@ async function seedAuditWorkspace(
   if (boot === null) return
 
   if (Object.keys(boot.workspace.projects).length === 0) {
-    await openProject([PROJECT_ROOT])
+    if (!AUDIT_PROJECT_ROOT) return
+    await openProject([AUDIT_PROJECT_ROOT])
   }
   const project = activeProjectIdOfState()
   if (!project) return
@@ -482,7 +495,8 @@ export function App() {
         // an empty workspace. The pane audit seeds itself, in sequence — see below.
         if (!auditMode()) return
         if (Object.keys(useWorkspace.getState().boot?.workspace.projects ?? {}).length > 0) return
-        await openProject([PROJECT_ROOT])
+        if (!AUDIT_PROJECT_ROOT) return
+        await openProject([AUDIT_PROJECT_ROOT])
       })
       .catch((e) => diag.log(`bootstrap failed: ${String(e)}`))
   }, [hydrate, openProject])
@@ -1292,7 +1306,7 @@ export function App() {
       <>
         <DetachedPaneWindow
           pane={detachedPane}
-          cwd={owner.roots[0]?.path ?? PROJECT_ROOT}
+          cwd={owner.roots[0]?.path ?? '.'}
           project={project}
           roots={owner.roots.map((r) => r.path)}
           // The plan entry for this pane. `lifecycle::plan_restore` has always walked
@@ -2014,6 +2028,16 @@ export function App() {
           claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
           revealRoots={revealRoots}
           /*
+           * Whether the bar says anything about a file at all. The same expression
+           * `keyContext.editorFocused` is built from, off the same `focused` const — which is
+           * what that const exists for, and it is the status bar its doc names.
+           *
+           * Without it both file slots stand for ever: the readout claim stack has no demotion
+           * (a terminal pane claims nothing, so nothing displaces the last buffer), so the path
+           * and the caret position went on describing a file the user had clicked away from.
+           */
+          editorFocused={focused?.pane.kind === 'editor'}
+          /*
            * A crumb of the open file's path trail, straight to `file.reveal` and to nothing
            * else. Identical routing to `Explorer`'s ⌖ button above and to a Ctrl+click on a
            * directory in terminal output, and for the identical reason: that arm brings the
@@ -2334,7 +2358,7 @@ const WorkspaceContent = memo(function WorkspaceContent({
                           ) : (
                           <PaneBody
                             pane={paneNode}
-                            cwd={activeProject.roots[0]?.path ?? PROJECT_ROOT}
+                            cwd={activeProject.roots[0]?.path ?? '.'}
                             project={activeProject.id}
                             primarySession={activeProject.primarySession}
                             diff={tab.kind.kind === 'diff' ? tab.kind.spec : undefined}

@@ -23,15 +23,22 @@ inputs:
     description: Where the checkout lives, relative to the workspace
     required: true
   cache-path:
-    description: The build-output directory to cache, relative to the workspace
-    required: true
+    description: >-
+      The build-output directory to cache, relative to the workspace. Optional: the salsa
+      fork has no build output of its own — it is a path dependency compiled into the
+      rust-analyzer fork's target/, which that fork's own entry already caches — and a cache
+      step pointed at a directory that never exists warns on every release run for ever.
+    required: false
+    default: ""
   cache-prefix:
     description: Cache key prefix, so two forks never share entries
-    required: true
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
     - name: Cache the fork build
+      if: inputs.cache-path != ''
       uses: actions/cache@v4
       with:
         path: ${{ inputs.cache-path }}

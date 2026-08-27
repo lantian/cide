@@ -169,12 +169,18 @@ fn state_path_hint() -> String {
 /// bookkeeping. That is why `app_open_log_dir` exists and why it has never been useful, and it
 /// is what has to be fixed before any diagnostic added here is worth adding.
 ///
-/// The two noisy targets are pinned to `Info` rather than raising the global floor: a
+/// The noisy targets are pinned to `Info` rather than raising the global floor: a
 /// `tracing::debug!` from this workspace is exactly the thing a user is asked to send back.
 fn log_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     tauri_plugin_log::Builder::default()
         .level_for("notify", log::LevelFilter::Info)
         .level_for("notify_debouncer_full", log::LevelFilter::Info)
+        // The third noisy target, and the only one cide names itself: everything a language
+        // server writes after being told to exit. `sqls` answers `exit` with a forty-line Go
+        // traceback — its own double-`Stop` bug, one per server per project root, on every
+        // orderly quit — and that was the last thing in the log a user is asked to send back.
+        // See `cide_lsp::server::EXIT_LOG_TARGET` for why this is a target and not a level.
+        .level_for(cide_lsp::server::EXIT_LOG_TARGET, log::LevelFilter::Info)
         // Two megabytes, three files. A session's worth of diagnostics is a few hundred
         // kilobytes; the old 40 KB could not hold one project's start-up. `KeepSome` rather
         // than `KeepAll` because a log directory that grows for ever is the other way to

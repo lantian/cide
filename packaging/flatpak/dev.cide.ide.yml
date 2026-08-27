@@ -76,11 +76,11 @@ modules:
       # rather than build-options: those profile settings are upstream's own dist choices for
       # the fork, and putting them in the module environment would silently re-profile cide's
       # own release build above.
-      - env CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CFG_RELEASE=2026-08-24+cide cargo build --release --locked --manifest-path rust-analyzer-fork/Cargo.toml -p rust-analyzer
+      - env CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CFG_RELEASE=cide-2026-08-28 cargo build --release --locked --manifest-path rust-analyzer-fork/Cargo.toml -p rust-analyzer
       # cide's gopls, from its own pinned git source. Built in the checkout's gopls/ module
       # directory; CGO off because gopls is pure Go and static is simpler; the -X stamp is
       # logs-only, same rule as CFG_RELEASE above.
-      - cd gopls-fork/gopls && env CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags "-X main.version=gopls/v0.23.0+cide" -o cide-gopls .
+      - cd gopls-fork/gopls && env CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags "-X main.version=cide-gopls-v0.23.0" -o cide-gopls .
       - install -Dm755 target/release/cide /app/bin/cide
       # cide-hook must sit beside the main binary: `cmd::session::hook_settings` locates it
       # relative to `current_exe`, because the child's cwd is the project root and its PATH
@@ -101,10 +101,21 @@ modules:
       # rather than a second dir source so a Flatpak build cannot silently package whatever
       # the sibling checkout happens to hold.
       - type: git
-        url: https://github.com/rust-lang/rust-analyzer
-        tag: 2026-08-24
+        url: https://github.com/lantian/rust-analyzer
+        tag: cide-2026-08-28
         dest: rust-analyzer-fork
+      # The salsa fork, which the rust-analyzer fork's `[patch.crates-io]` reaches as
+      # `../salsa` — relative to *its own* manifest, so `dest: salsa` beside
+      # `rust-analyzer-fork` is what makes that path resolve inside the build. Emitted
+      # unconditionally: this generator reads locks and never the fork checkout, so it cannot
+      # know whether the pinned rust-analyzer patches salsa, and the two failure modes are
+      # not comparable — an unused source costs one clone, a missing one dies inside cargo's
+      # patch resolution well into the build.
       - type: git
-        url: https://github.com/golang/tools
-        tag: gopls/v0.23.0
+        url: https://github.com/lantian/salsa
+        tag: cide-salsa-v0.28.2
+        dest: salsa
+      - type: git
+        url: https://github.com/lantian/tools
+        tag: cide-gopls-v0.23.0
         dest: gopls-fork

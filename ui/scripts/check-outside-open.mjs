@@ -72,7 +72,7 @@ try {
 
   const { outsideAsk } = await import(`file://${join(out, 'outsideOpen.js')}`)
 
-  const SECRET = '/home/lantian/.claude/.credentials.json'
+  const SECRET = '/home/u/.claude/.credentials.json'
   const refusal = (over) => ({
     kind: 'outside',
     message: `${SECRET} is outside this project's roots.`,
@@ -119,7 +119,7 @@ try {
 
   // --- rule 2: it names the full path, and the real target when they differ ----------------
 
-  const LINK = '/home/lantian/work/cide/src/notes.md'
+  const LINK = '/home/u/work/cide/src/notes.md'
   const moved = outsideAsk(refusal({ path: LINK, real: SECRET }))
   eq(
     moved.files,

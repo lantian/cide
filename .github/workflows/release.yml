@@ -380,7 +380,7 @@ jobs:
 
       - uses: ./.github/actions/install-tauri-cli
 
-      # Both fork siblings, at exactly their pinned revisions — so a release never sees the
+      # All three fork siblings, at exactly their pinned revisions — so a release never sees the
       # "HEAD differs from the pin" warning a local build may choose to live with. The
       # cache-then-init ordering and the init+fetch choice live in the composite action.
       # A cold rust-analyzer release build is ~10 minutes and the pins move rarely, so the
@@ -394,6 +394,22 @@ jobs:
           dest: ../forks/rust-analyzer
           cache-path: ../forks/rust-analyzer/target
           cache-prefix: ra-fork
+
+      # salsa is not an optional extra: the rust-analyzer fork's manifest carries
+      # `[patch.crates-io] salsa = { path = "../salsa" }`, and that path resolves against the
+      # *fork*, so the checkout has to be its sibling under this exact name. Without it the
+      # run dies inside cargo's patch resolution minutes into a release build — preflight
+      # fails first only because it looks for the same directory.
+      #
+      # No cache entry: salsa is a path dependency compiled into the fork's target/, which the
+      # step above already caches.
+      - name: Check out the salsa fork at the pinned revision
+        uses: ./.github/actions/checkout-fork
+        with:
+          lock: packaging/salsa.lock
+          url-var: CIDE_SALSA_URL
+          rev-var: CIDE_SALSA_REV
+          dest: ../forks/salsa
 
       # gopls builds with Go; the version comes from the checkout's own go.mod after the
       # checkout below, so setup-go installs a floor and GOTOOLCHAIN=auto (the default)
@@ -462,12 +478,8 @@ jobs:
 
       - uses: ./.github/actions/install-tauri-cli
 
-      # The forks, exactly as the linux job does them — see the comments there.
-      # Both fork siblings, at exactly their pinned revisions — so a release never sees the
-      # "HEAD differs from the pin" warning a local build may choose to live with. The
-      # cache-then-init ordering and the init+fetch choice live in the composite action.
-      # A cold rust-analyzer release build is ~10 minutes and the pins move rarely, so the
-      # caches carry most of the cost.
+      # The forks, exactly as the linux job does them — see the comments there. All
+      # three: rust-analyzer, the salsa its manifest patches to, and gopls.
       - name: Check out the rust-analyzer fork at the pinned revision
         uses: ./.github/actions/checkout-fork
         with:
@@ -477,6 +489,14 @@ jobs:
           dest: ../forks/rust-analyzer
           cache-path: ../forks/rust-analyzer/target
           cache-prefix: ra-fork
+
+      - name: Check out the salsa fork at the pinned revision
+        uses: ./.github/actions/checkout-fork
+        with:
+          lock: packaging/salsa.lock
+          url-var: CIDE_SALSA_URL
+          rev-var: CIDE_SALSA_REV
+          dest: ../forks/salsa
 
       # gopls builds with Go; the version comes from the checkout's own go.mod after the
       # checkout below, so setup-go installs a floor and GOTOOLCHAIN=auto (the default)

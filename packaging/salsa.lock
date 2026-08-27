@@ -1,0 +1,17 @@
+# The salsa pin: which revision of cide's salsa fork the rust-analyzer fork is built against.
+# Read by the same three consumers as its two siblings, none of which may drift:
+#   - `cargo xtask package` preflight (xtask/src/package.rs, read_salsa_lock)
+#   - the generated Flatpak manifest (regenerate with `cargo xtask package --write`)
+#   - .github/workflows/release.yml, which sources this file as shell
+#
+# This pin exists because `../forks/rust-analyzer`'s manifest carries
+# `[patch.crates-io] salsa = { path = "../salsa" }`: the fork's disk index rides patched
+# tracked-struct and memo persistence, so the salsa beside it is part of what a package
+# *is*, not a detail of one machine's checkout. Preflight checked only that the sibling
+# existed until this file — which made "whatever salsa was lying there" a silent input to
+# every release.
+#
+# Same format as rust-analyzer.lock, same rule: a tag or a 40-hex commit, and it moves only
+# after a packaged build has been exercised against it.
+CIDE_SALSA_URL=https://github.com/lantian/salsa
+CIDE_SALSA_REV=cide-salsa-v0.28.2

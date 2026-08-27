@@ -68,7 +68,7 @@ fn run(manifest: &Path) -> Result<Vec<Package>, DepsError> {
         // pinned toolchain that is not present**, so without this a click on a twisty could
         // start a several-hundred-megabyte download with nothing on screen to say so. rustup
         // 1.28 honours this variable; on an older one the flag is inert and the shim behaves as
-        // it always did. Same shim hazard `README.md` already documents for rust-analyzer.
+        // it always did. Same shim hazard `docs/journal.md` already documents for rust-analyzer.
         .env("RUSTUP_AUTO_INSTALL", "0")
         // Colour codes in the stderr line the failure row prints verbatim would reach the user
         // as `\u{1b}[1m\u{1b}[31merror`.

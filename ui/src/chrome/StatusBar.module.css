@@ -31,6 +31,10 @@
  * squeezed, where a spacer plus two gaps would leave 32px. min-width:0 is what allows a
  * flex item to shrink below its content, so this is the side that gives way; the right
  * group holds the readouts a user is actually watching.
+ *
+ * The branch and — since M34 — the open file's trail. That pairing is the reason the trail
+ * moved: they answer one question between them, and the two things on the right are the ones
+ * that move while the user types.
  */
 .left {
   flex: 1 1 auto;
@@ -45,26 +49,41 @@
 }
 
 /*
- * Shrinkable since the file's trail joined it — an absolute path in a project with no root
- * is longer than the bar, and `flex: none` here would push the branch off the left edge to
- * fit it. Only `.path` inside actually gives way; see below.
+ * Nothing here shrinks any more. It was `flex: 0 1 auto` while the file's trail lived in this
+ * group — an absolute path in a project with no root is longer than the bar — and the trail
+ * moved to `.left` in M34, leaving two readouts that are read rather than skimmed. So this
+ * group keeps its content width and `.left` is the side that gives, which is what the comment
+ * above it has always claimed.
  */
 .right {
-  flex: 0 1 auto;
-  min-width: 0;
+  flex: none;
 }
 
-/* Only the branch may give way; anything else in this group keeps its content width. */
+/* Everything in this group keeps its content width — except the trail, immediately below. */
 .left > * {
   flex: none;
 }
 
 /*
+ * The trail is the exception, and it has to be spelled out here rather than left to `.path`'s
+ * own `flex: 0 1 auto`: `.left > *` above is (0,2,0) and `.path` is (0,1,0), so the blanket
+ * rule wins and the trail would stop shrinking. What that looks like is not an error — `.left`
+ * is `overflow: hidden`, so a long path is cut off mid-character with no ellipsis and the
+ * branch is pushed out of the group entirely. Same specificity trap the `.right > span` note
+ * below describes, from the other side.
+ */
+.left > .path {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/*
  * Same rule on the other side: the readout and the session slot keep their content width.
  *
- * Matched on the element rather than `.right > *`, which would tie with `.path` on
- * specificity and be settled by which rule happens to sit lower in this file. The trail is
- * the only child that is not a span, and it is the only one that may shrink.
+ * Kept after the trail left this group in M34, and matched on `span` still. Both children are
+ * spans now, so `.right > *` would say the same thing today — and the next thing added here
+ * that is not a span would silently inherit a shrink nobody asked for, which is exactly how
+ * `.path` came to need the rule above.
  */
 .right > span {
   flex: none;
@@ -122,13 +141,16 @@
 }
 
 /*
- * The open file's trail: `crates › cide-core › src › lib.rs`.
+ * The open file's trail: `crates › cide-core › src › lib.rs`. In `.left`, after the branch,
+ * since M34.
  *
  * The one slot on the bar that may shrink, and it clips from the *left* so the file name
  * survives a narrow window: `direction: rtl` moves the overflow — and the ellipsis — to the
  * start of the box, and the inner `ltr` puts the characters back the right way round. Without
  * it a squeezed bar shows `crates › cide-…` and hides the one segment the user needs. Carried
- * over from the editor's breadcrumb row, which is where this trick was first needed.
+ * over from the editor's breadcrumb row, which is where this trick was first needed. The
+ * `flex`/`min-width` pair that makes it shrinkable at all is `.left > .path` above, not here —
+ * see that rule for why stating it on `.path` is not enough.
  *
  * A block box and not a flex one, deliberately: `text-overflow` needs a block container with
  * inline content, and `display: flex` here silently drops the ellipsis and leaves a hard cut.
@@ -143,7 +165,12 @@
   color: var(--faint);
 }
 
-/* No file open: no box, and no 16px gap where one would have been. */
+/*
+ * No file open — or, since M34, no file *focused*: `StatusBar` draws an empty trail while the
+ * user is in a terminal, and this is what takes the box and its 12px gap out of the row rather
+ * than leaving a hole between the branch and the readouts. The hiding is deliberately a CSS
+ * fact and not a JSX branch, so there is one rule for both cases.
+ */
 .path:empty {
   display: none;
 }

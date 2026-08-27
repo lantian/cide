@@ -50,9 +50,17 @@
  * Mount, activation and DOM focus then all move the slot, and the three gestures that produce no
  * mount — Ctrl+Tab, a tab-strip click, `file.open` on an open file — work like the two that do.
  *
- * Nothing *demotes*: clicking into a terminal leaves the last buffer's trail standing, which is
- * `chrome/StatusBar.tsx`'s stated behaviour and unchanged, because a terminal tab holds no
- * editor and so claims nothing.
+ * Nothing *demotes*, and that is still true here: a terminal pane holds no editor, so it claims
+ * nothing and cannot displace what is on the stack. Until M34 that was also the bar's behaviour —
+ * clicking into a terminal left the last buffer's trail and caret standing, naming a file the
+ * user had walked away from, which is what was reported.
+ *
+ * The fix is deliberately **not** in this module. `chrome/StatusBar.tsx` takes an `editorFocused`
+ * prop and draws nothing while it is false; the claim stays exactly where it was, so focus coming
+ * back restores the line from state the bar already holds — no re-claim, no round trip, no frame
+ * of blankness. A `blur` that popped the claim would have to push it back in a *position*, and
+ * this stack cannot express one: an unfocused half of a split still owns its place in the order.
+ * So the rule is that the stack answers "which editor", and the bar answers "is the user in one".
  */
 
 /** The four facts, each owned by a different part of the editor. */
@@ -81,7 +89,7 @@ export function formatReadout({ language, ending, cursor }: Readout): string {
  * `crates › cide-core › src › lib.rs`, as segments the bar can put separators between.
  *
  * Relative to `root` when the file is inside it, and absolute when it is not — showing
- * `home › lantian › work › cide › crates › …` for a file in the open project is how a trail
+ * `home › u › work › cide › crates › …` for a file in the open project is how a trail
  * becomes noise. A missing root, an empty one, or a path outside it all fall through to the
  * whole path, which is the honest answer in each case.
  *

@@ -3,9 +3,17 @@
 #   - the generated Flatpak manifest (regenerate with `cargo xtask package --write`)
 #   - .github/workflows/release.yml, which sources this file as shell
 #
-# CIDE_RA_REV may be an upstream release tag or a 40-hex commit on the fork's `cide`
-# branch. Until the fork diverges from upstream, the URL is upstream and the rev is the
-# release tag the `cide` branch was cut from — a package then ships a stock rust-analyzer
-# under the cide-rust-analyzer name, which is Phase 0's contract exactly.
-CIDE_RA_URL=https://github.com/rust-lang/rust-analyzer
-CIDE_RA_REV=2026-08-24
+# CIDE_RA_REV may be a tag or a 40-hex commit on the fork's `cide` branch. It is a tag by
+# preference: `checkout-fork` fetches it with `git fetch --depth 1`, the Flatpak manifest
+# has to say `tag:` or `commit:` for it, and the rev is stamped into the built binary's
+# CFG_RELEASE — a name reads there, a hash does not. The `cide-` prefix is not decoration:
+# `git fetch upstream --tags` in the fork brings upstream's date tags with it, and a pin
+# living in that namespace is one someone else can move.
+#
+# The URL was upstream's and the rev an upstream release tag until 2026-08-28, while the
+# `cide` branch held nothing of its own — a package then shipped a stock rust-analyzer under
+# the cide-rust-analyzer name, which was Phase 0's contract exactly. It now points at the
+# fork, whose manifest patches salsa to the sibling packaging/salsa.lock pins; the two move
+# together or the build resolves a salsa nobody chose.
+CIDE_RA_URL=https://github.com/lantian/rust-analyzer
+CIDE_RA_REV=cide-2026-08-28

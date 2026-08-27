@@ -1697,7 +1697,7 @@ fn resident_memory_bytes(pid: u32) -> Option<u64> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // No `/proc` — the watchdog simply never fires. README's Platforms section records
+        // No `/proc` — the watchdog simply never fires. `docs/platforms.md` records
         // this as one of the macOS gaps: the honest alternative is `proc_pidinfo`, which
         // needs a Mac in front of the person writing it.
         let _ = pid;
