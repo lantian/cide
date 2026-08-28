@@ -662,7 +662,15 @@ jobs:
         run: |
           set -euo pipefail
           tag='${{ needs.prepare.outputs.tag }}'
+          # --repo, because this job never checks the repository out. It downloads two
+          # artefacts and assembles a page from them, and `gh` otherwise reads the target
+          # repository off a git remote — which here is `fatal: not a git repository`, a
+          # message about the *working directory* for a command whose problem is that it does
+          # not know what to publish to. `GITHUB_REPOSITORY` rather than a `${{ }}`
+          # interpolation: it is owner/repo from the runner itself, and it never reaches the
+          # shell as source text.
           args=(release create "$tag"
+                --repo "$GITHUB_REPOSITORY"
                 --title "cide ${{ needs.prepare.outputs.version }}"
                 --notes-file notes/notes.md
                 --target "${{ needs.prepare.outputs.branch }}")
