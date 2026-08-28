@@ -619,7 +619,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cide-git-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch");
-        path
+        // Canonicalised for the reason spelled out on `repo`'s copy of this helper: macOS
+        // resolves `$TMPDIR` through a symlink and the product's answers come back resolved.
+        std::fs::canonicalize(&path).unwrap_or(path)
     }
 
     /// The race the guard exists for, in one function: the oid the menu was drawn from is no

@@ -376,7 +376,13 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cide-git-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch");
-        path
+        // Canonicalised, and not for tidiness: `$TMPDIR` on macOS is under `/var`, a symlink
+        // to `/private/var`, while everything that resolves symlinks — `git`, libgit2's
+        // `workdir()`, this crate's own `canonical` — answers with the resolved spelling. A
+        // fixture root left as `/var/…` therefore compares unequal to the product's answer for
+        // the very same directory, which is four tests here and one in cide-fs. Falls back to
+        // the path as created rather than panicking.
+        std::fs::canonicalize(&path).unwrap_or(path)
     }
 
     /// The two shapes, side by side, because the second is only meaningful against the first:
@@ -480,13 +486,20 @@ mod tests {
 
     #[test]
     fn relative_refuses_paths_outside_the_root() {
-        assert_eq!(
-            relative(Path::new("/tmp"), Path::new("/tmp/a/b")),
-            Some("a/b".to_string())
-        );
-        assert_eq!(
-            relative(Path::new("/tmp/a"), Path::new("/etc/passwd")),
-            None
-        );
+        // Directories that exist, rather than the literals `/tmp` and `/tmp/a/b` this used to
+        // use. `relative` canonicalises both sides and `canonical` falls back to the path as
+        // written when it cannot resolve one, so a root that exists *and is a symlink* paired
+        // with a child that does not exist gives two answers in different spellings and no
+        // containment at all. That is every path under `/tmp` on macOS, where `/tmp` is a
+        // symlink to `/private/tmp` — so this asserted `Some("a/b")` on Linux and `None`
+        // there, about a function that was behaving identically on both.
+        //
+        // Not a product bug: `locate`, the only caller, passes a real file and a root that
+        // `discover` has already canonicalised. The contract worth pinning is containment.
+        let dir = scratch("relative");
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        assert_eq!(relative(&dir, &dir.join("a/b")), Some("a/b".to_string()));
+        assert_eq!(relative(&dir.join("a"), Path::new("/etc/passwd")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
