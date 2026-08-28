@@ -666,9 +666,15 @@ jobs:
           # artefacts and assembles a page from them, and `gh` otherwise reads the target
           # repository off a git remote — which here is `fatal: not a git repository`, a
           # message about the *working directory* for a command whose problem is that it does
-          # not know what to publish to. `GITHUB_REPOSITORY` rather than a `${{ }}`
+          # not know what to publish to. `GITHUB_REPOSITORY` rather than an Actions
           # interpolation: it is owner/repo from the runner itself, and it never reaches the
           # shell as source text.
+          #
+          # (And spelling that interpolation syntax here, even inside a shell comment, is
+          # itself a workflow-level syntax error: a `run:` block is a string Actions expands
+          # before bash ever runs it, so an empty pair of braces in it is "an expression was
+          # expected" against a line number in the block. The YAML comment in `prepare` that
+          # does spell it survives only because YAML comments never reach Actions at all.)
           args=(release create "$tag"
                 --repo "$GITHUB_REPOSITORY"
                 --title "cide ${{ needs.prepare.outputs.version }}"

@@ -4328,13 +4328,16 @@ mod tests {
             .iter()
             .find(|s| s.args.first().map(String::as_str) == Some("tauri"))
             .expect("an appimage plan builds through cargo tauri");
-        let configs: Vec<&String> = tauri
-            .args
-            .iter()
-            .skip_while(|a| *a != "--config")
-            .filter(|a| *a != "--config")
-            .take(2)
-            .collect();
+        // The value after each `--config`, and only that. Reading "every argument after the
+        // first --config" instead counts `--bundles` as a configuration — which is 2 on a host
+        // that needs no mapping and passes on a host that does, so the first version of this
+        // test was green here and red on CI for a reason that had nothing to do with the code
+        // it was testing.
+        let configs = config_args(&tauri.args);
+        assert_eq!(
+            configs.first().map(|c| c.as_str()),
+            Some(bundle_conf_arg().as_str())
+        );
         match webkit_helper_plan() {
             None => assert_eq!(configs.len(), 1, "no mapping needed: {:?}", tauri.args),
             Some(_) => {
@@ -4347,6 +4350,38 @@ mod tests {
                 );
             }
         }
+
+        // Both shapes, on any host: the branch this machine does not take is the one CI takes.
+        let flat = [
+            "tauri",
+            "build",
+            "--config",
+            "base.json",
+            "--bundles",
+            "appimage,deb",
+        ]
+        .map(String::from);
+        assert_eq!(config_args(&flat), vec!["base.json"]);
+        let mapped = [
+            "tauri",
+            "build",
+            "--config",
+            "base.json",
+            "--config",
+            "{json}",
+            "--bundles",
+            "appimage",
+        ]
+        .map(String::from);
+        assert_eq!(config_args(&mapped), vec!["base.json", "{json}"]);
+    }
+
+    /// The value of every `--config` in an argument list.
+    fn config_args(args: &[String]) -> Vec<&String> {
+        args.windows(2)
+            .filter(|pair| pair[0] == "--config")
+            .map(|pair| &pair[1])
+            .collect()
     }
 
     #[test]

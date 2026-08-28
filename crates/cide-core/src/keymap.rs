@@ -3231,12 +3231,39 @@ mod tests {
     /// second and reports a conflict on the third; one that dropped the `when` passes all
     /// three for the unconditional bindings and fails for the scoped ones, which is why this
     /// walks the whole table rather than a hand-picked binding.
+    ///
+    /// Run against **both** platform layers, from whichever host is running the test. It was
+    /// written against `resolve`, which injects the host's layer, and compared the result with
+    /// raw `defaults()` — two different layerings, which agree on Linux and cannot on macOS,
+    /// where the platform layer rewrites every ctrl chord to meta (ctrl+p and friends are
+    /// system text navigation there, and shadowing them would make every text field in the app
+    /// behave unlike every other Mac app). So it passed on every machine cide is developed on
+    /// and failed the first time a Mac ran it, reporting `alt+meta+k` against `ctrl+alt+k` —
+    /// a difference in the test's own arithmetic, described as the product touching a scope it
+    /// had not touched. `resolve_layers` takes the layer as an argument precisely so this does
+    /// not have to be discovered on a Mac.
     #[test]
     fn every_default_binding_can_be_moved_without_leaving_the_old_one_behind() {
+        for macos in [false, true] {
+            every_default_moves_cleanly_under(&platform_layer(macos), macos);
+        }
+    }
+
+    fn every_default_moves_cleanly_under(platform: &[Binding], macos: bool) {
+        // The same layering with no user edit in it: the only honest baseline for "the sibling
+        // row is where it shipped", because what shipped depends on the platform layer too.
+        let shipped_here = resolve_layers(platform, &[]);
         for binding in defaults() {
             let mut user = Vec::new();
             let target = "ctrl+alt+shift+meta+F9";
-            apply_edit(
+            // `apply_edit_layered`, not `apply_edit`: the edit's removal lines are computed
+            // against what is *standing* under the user's file, so an edit made against the
+            // host's layer and then resolved against another one suppresses chords nothing
+            // has and leaves the ones it does. That mismatch reads exactly like a product
+            // bug — "rebinding pane.split.right leaves alt+meta+right live on macOS" — and it
+            // is the reason this seam exists.
+            apply_edit_layered(
+                platform,
                 &mut user,
                 &KeymapEdit::Rebind {
                     command: binding.command.clone(),
@@ -3245,7 +3272,7 @@ mod tests {
                 },
             );
 
-            let resolved = resolve(&user);
+            let resolved = resolve_layers(platform, &user);
             // Scoped to the (command, `when`) row the edit named, which is the identity every
             // `KeymapEdit` carries: since the Alt+Arrow round, `pane.navigate.up`/`.down` each
             // stand on two rows with *different* clauses (`ctrl+alt+k` unscoped, `alt+up` as
@@ -3259,7 +3286,7 @@ mod tests {
             assert_eq!(
                 keys,
                 [normalize_key(target)],
-                "{} ({:?}) should answer to one chord after a rebind",
+                "{} ({:?}) should answer to one chord after a rebind (macos={macos})",
                 binding.command,
                 binding.when
             );
@@ -3269,14 +3296,14 @@ mod tests {
                 .filter(|r| r.command == binding.command && r.when != binding.when)
                 .map(|r| r.key.clone())
                 .collect();
-            let shipped: Vec<String> = defaults()
+            let shipped: Vec<String> = shipped_here
                 .iter()
                 .filter(|o| o.command == binding.command && o.when != binding.when)
-                .map(|o| normalize_key(&o.key))
+                .map(|o| o.key.clone())
                 .collect();
             assert_eq!(
                 siblings, shipped,
-                "rebinding {} ({:?}) touched the command's other scope",
+                "rebinding {} ({:?}) touched the command's other scope (macos={macos})",
                 binding.command, binding.when
             );
             assert_eq!(
@@ -3285,10 +3312,14 @@ mod tests {
                 "rebinding {} manufactured a conflict",
                 binding.command
             );
-            let (_, diags) = resolve_with_diagnostics(&user);
+            // Layered too, and for the same reason as the edit above: a removal line written
+            // against the macOS layer names a chord the Linux layer never had, and asking the
+            // host's resolution about it reports `RemovalMatchedNothing` — a diagnostic about
+            // the test's own mixture of layers rather than about the file.
+            let (_, diags) = resolve_layers_reporting(platform, &user);
             assert!(
                 diags.is_empty(),
-                "rebinding {} wrote a removal that matched nothing: {diags:?}",
+                "rebinding {} wrote a removal that matched nothing (macos={macos}): {diags:?}",
                 binding.command
             );
 
