@@ -55,12 +55,60 @@ try {
       '--rootDir', join(UI, 'src'),
       join(UI, 'src', 'ext', 'viewModel.ts'),
       join(UI, 'src', 'ext', 'protocol.ts'),
+      join(UI, 'src', 'ext', 'assetUrl.ts'),
     ],
     { cwd: UI, stdio: 'inherit' },
   )
 
   const view = require(join(out, 'ext', 'viewModel.js'))
   const protocol = require(join(out, 'ext', 'protocol.js'))
+  const assetUrl = require(join(out, 'ext', 'assetUrl.js'))
+
+  // --- an extension's asset URL is spelled the way its platform serves the scheme --------------
+
+  /*
+   * The one assertion here that is about a machine nobody develops on.
+   *
+   * Tauri's `convertFileSrc` branches on `osName === 'windows' || osName === 'android'` and on
+   * nothing else (`tauri-2.11.5/scripts/core.js`), so macOS is served `<scheme>://localhost/…`
+   * exactly as Linux is. cide shipped with macOS on the *other* side of that branch, and the
+   * result was invisible from here and total there: every extension with a worker — yaml,
+   * graphql, protobuf, all at once — died at `its worker could not be loaded from
+   * http://cide-ext.localhost/…`, because nothing serves that origin on a Mac.
+   *
+   * A user agent per platform, driven through the real function, is the only way that arm is ever
+   * executed on the machine the checks run on.
+   */
+  const AGENTS = {
+    linux: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    mac: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    windows: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+    android: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+  }
+  for (const [platform, expected] of [
+    ['linux', 'cide-ext://localhost/m/yaml/main.js'],
+    ['mac', 'cide-ext://localhost/m/yaml/main.js'],
+    ['windows', 'http://cide-ext.localhost/m/yaml/main.js'],
+    ['android', 'http://cide-ext.localhost/m/yaml/main.js'],
+  ]) {
+    eq(
+      assetUrl.extAssetUrlFor(AGENTS[platform], 'm', 'yaml', 'main.js'),
+      expected,
+      `an extension's worker URL on ${platform} — the spelling Tauri actually serves there, and `
+        + `the whole difference between a panel that loads and one that says its worker could not`,
+    )
+  }
+  eq(
+    assetUrl.extAssetUrlFor('', 'm', 'yaml', '/main.js'),
+    'cide-ext://localhost/m/yaml/main.js',
+    'a leading slash on the manifest\'s `main` is absorbed rather than doubled, and an agent that '
+      + 'says nothing gets the majority spelling',
+  )
+  ok(
+    readFileSync(join(UI, 'src', 'ext', 'assetUrl.ts'), 'utf8').includes(`'${assetUrl.EXT_SCHEME}'`),
+    'the scheme is one string here and `cide_ext::assets::SCHEME` in Rust — a rename on one side '
+      + 'is a handler registered for a scheme nothing requests',
+  )
 
   // --- every body kind has a renderer, and every renderer a kind -----------------------------
 

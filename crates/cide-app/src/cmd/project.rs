@@ -465,8 +465,36 @@ pub async fn project_pick(
 pub(crate) struct PickerSpec {
     pub title: &'static str,
     /// The confirm button's label. GTK only; the plugin has no equivalent.
+    ///
+    /// `allow(dead_code)` off the GTK arm rather than a `cfg` on the field: the struct is
+    /// deliberately one type across both arms (see above), and the shared constructor sets
+    /// this on every platform — a `cfg`-ed field would have to be `cfg`-ed at construction
+    /// too, which is exactly the fork this type exists to prevent. The lint is right that
+    /// nothing reads it on macOS, and it is `-D warnings` there.
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )),
+        allow(dead_code)
+    )]
     pub accept: &'static str,
     pub folders: bool,
+    /// Read by the GTK arm's `set_select_multiple`; the plugin's multi-select is chosen by
+    /// which plugin call is made, so it has no field to receive this. Same rule as `accept`.
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )),
+        allow(dead_code)
+    )]
     pub multiple: bool,
     pub filter: Option<(&'static str, &'static [&'static str])>,
 }

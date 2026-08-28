@@ -348,6 +348,16 @@ pub fn has_marker(markers: &[&str], root: &Path) -> bool {
 
 /// Every file named by `markers` at or within [`MARKER_DEPTH`] of `root`, shallowest first.
 ///
+/// A marker is an exact file name (`Cargo.toml`) or, since M34, `*.ext` — *any* file with that
+/// extension. The second form exists because a manifest name is not evidence every project can
+/// give: a plain HTML+JS folder — `index.html`, `app.js`, `styles.css`, the first project
+/// anybody tests a web extension on — has no `package.json` and never will, so a
+/// `typescript-language-server` gated on manifests alone was simply never started there. The
+/// alternative of an empty marker list would start a Node process in every Rust workspace;
+/// `*.js` starts it exactly where there is a file for it to read. Only `*.ext` is understood —
+/// not globs — because the matcher's cost is one `extension()` comparison per directory entry
+/// and a real glob language would invite patterns the walk cannot honour cheaply.
+///
 /// The walk stops descending as soon as it finds a marker *in a directory*, because the thing
 /// below a `Cargo.toml` is that project's own members and a workspace's members share its
 /// lockfile — resolving each of them separately would run `cargo metadata` once per crate in
@@ -357,13 +367,49 @@ pub fn has_marker(markers: &[&str], root: &Path) -> bool {
 /// contains thousands of vendored `Cargo.toml`s, and treating one as evidence would start an
 /// indexer for a project that has none of its own.
 pub fn find_markers(markers: &[&str], root: &Path) -> Vec<PathBuf> {
-    fn search(markers: &[&str], dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let (extensions, names): (Vec<&str>, Vec<&str>) =
+        markers.iter().partition(|m| m.starts_with("*."));
+    let extensions: Vec<&str> = extensions
+        .into_iter()
+        .filter_map(|m| m.strip_prefix("*."))
+        .filter(|ext| !ext.is_empty())
+        .collect();
+
+    fn search(
+        names: &[&str],
+        extensions: &[&str],
+        dir: &Path,
+        depth: usize,
+        out: &mut Vec<PathBuf>,
+    ) {
         let mut found = false;
-        for marker in markers {
+        for marker in names {
             let candidate = dir.join(marker);
             if candidate.is_file() {
                 out.push(candidate);
                 found = true;
+            }
+        }
+        // The extension form lists the directory, which the exact form never has to — gated on
+        // the form being used at all, so a `Cargo.toml` probe costs what it always cost.
+        if !extensions.is_empty()
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            let mut matched: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                            extensions.iter().any(|ext| e.eq_ignore_ascii_case(ext))
+                        })
+                })
+                .collect();
+            // Sorted for the same reason the child walk is: the answer must not reshuffle.
+            matched.sort();
+            if !matched.is_empty() {
+                found = true;
+                out.append(&mut matched);
             }
         }
         if found || depth == 0 {
@@ -388,12 +434,12 @@ pub fn find_markers(markers: &[&str], root: &Path) -> Vec<PathBuf> {
             .collect();
         children.sort();
         for child in children {
-            search(markers, &child, depth - 1, out);
+            search(names, extensions, &child, depth - 1, out);
         }
     }
 
     let mut out = Vec::new();
-    search(markers, root, MARKER_DEPTH, &mut out);
+    search(&names, &extensions, root, MARKER_DEPTH, &mut out);
     out
 }
 
@@ -830,6 +876,37 @@ mod tests {
             [dir.join("backend/go.mod")]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_extension_marker_finds_a_plain_js_folder_a_manifest_name_never_could() {
+        // The project that surfaced this: `index.html`, `app.js`, `styles.css`, no
+        // `package.json` and never going to have one — so a typescript-language-server gated
+        // on manifest names alone was simply never started there.
+        let dir = temp("ext-marker");
+        std::fs::write(dir.join("index.html"), "<!doctype html>\n").expect("write");
+        std::fs::write(dir.join("app.js"), "const x = 1;\n").expect("write");
+        assert!(has_marker(&["package.json", "*.js", "*.ts"], &dir));
+        assert!(!has_marker(&["package.json"], &dir));
+        assert_eq!(find_markers(&["*.js"], &dir), [dir.join("app.js")]);
+
+        // One level down too, same as an exact name — and never inside `node_modules`, where
+        // every JS project on earth has thousands of `.js` files that are not its own.
+        let nested = temp("ext-marker-nested");
+        std::fs::create_dir_all(nested.join("src")).expect("mkdir");
+        std::fs::write(nested.join("src/main.ts"), "export {};\n").expect("write");
+        assert!(has_marker(&["*.ts"], &nested));
+        let vendored = temp("ext-marker-vendored");
+        std::fs::create_dir_all(vendored.join("node_modules/pkg")).expect("mkdir");
+        std::fs::write(vendored.join("node_modules/pkg/index.js"), ";\n").expect("write");
+        assert!(!has_marker(&["*.js"], &vendored));
+
+        // `*.` alone names no extension and matches nothing rather than everything.
+        assert!(!has_marker(&["*."], &dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&nested);
+        let _ = std::fs::remove_dir_all(&vendored);
     }
 
     #[test]

@@ -1,13 +1,14 @@
 //! The jail behind `cide-ext://`.
 //!
-//! The webview asks for `cide-ext://<marketplace>.<extension>/<path>` and gets bytes back. That
+//! The webview asks for `cide-ext://localhost/<marketplace>/<extension>/<path>` and gets bytes
+//! back. That
 //! is the one place in cide where a URL from the renderer chooses a file on disk, so it is the one
 //! place a path-traversal bug would be a real one.
 //!
 //! # Three checks, and the last one is the one that works
 //!
-//! 1. The host is split into a marketplace and an extension id, and both must be
-//!    [`crate::manifest::is_safe_segment`] — which forbids `.` and `/` outright, so no host can
+//! 1. The first two path segments are a marketplace and an extension id, and both must be
+//!    [`crate::manifest::is_safe_segment`] — which forbids `.` and `/` outright, so no request can
 //!    name a directory that is not an installed extension's.
 //! 2. The path is resolved with [`crate::manifest::safe_relative`], which refuses `..`, an
 //!    absolute path and a backslash **on the string**, before any filesystem call. That matters
@@ -48,10 +49,14 @@ pub enum AssetError {
 /// # Why the identity is in the path and not the host
 ///
 /// `cide-ext://<marketplace>.<extension>/main.js` is the obvious spelling and it is not portable.
-/// Tauri serves a custom scheme as `<scheme>://localhost/…` on Linux and Android, and as
-/// `http://<scheme>.localhost/…` on macOS and Windows — the *host* is the scheme's own name on
-/// three of the four, so an identity put there survives only on Linux, which is the one platform
-/// this would have been tested on. In the path it is the same string everywhere.
+/// Tauri serves a custom scheme as `<scheme>://localhost/…` on macOS, iOS and Linux, and as
+/// `http://<scheme>.localhost/…` on Windows and Android — so on the second pair the *host* is the
+/// scheme's own name and an identity put there is simply gone, on the platforms this would not
+/// have been tested on. In the path it is the same string everywhere.
+///
+/// `ui/src/ext/assetUrl.ts` is the other end of that split and states it in the same words;
+/// `check:ext` drives it with one user agent per platform, because getting the *boundary* wrong —
+/// macOS put on the Windows side — is a bug no Linux machine can see and every Mac hits at once.
 ///
 /// Both segments must be [`is_safe_segment`], which forbids `.` and `/` outright, so no request
 /// can name a directory that is not an installed extension's — the first of this module's three

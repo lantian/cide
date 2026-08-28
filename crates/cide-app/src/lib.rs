@@ -230,7 +230,8 @@ pub fn run() {
     }
 
     let mut builder = tauri::Builder::default()
-        // `cide-ext://<marketplace>.<extension>/<path>`. Registered here rather than in `setup`
+        // `cide-ext://localhost/<marketplace>/<extension>/<path>`. Registered here rather than
+        // in `setup`
         // because a scheme handler has to exist before the first webview is created — a window
         // that opened first would have a renderer for which the scheme does not resolve, and the
         // failure shows as a worker that never loads rather than as anything about registration.

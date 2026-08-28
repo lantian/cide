@@ -7,10 +7,13 @@
 //!
 //! # The shape of the URL
 //!
-//! `cide-ext://<marketplace>.<extension>/<path>`. The host is the identity pair, because an
-//! extension id alone is not unique — two marketplaces may each ship a `sql`. Both halves are
-//! `cide_ext::manifest::is_safe_segment`, which forbids `.` and `/` outright, so the split is
-//! unambiguous and no host can name a directory that is not an installed extension's.
+//! `cide-ext://localhost/<marketplace>/<extension>/<path>` — and `http://cide-ext.localhost/…`
+//! with the same path on Windows and Android, which is why the identity pair is in the path and
+//! not the host (`cide_ext::assets::split_path` argues it, `ui/src/ext/assetUrl.ts` builds it).
+//! The pair and not the extension id alone, because an id is not unique — two marketplaces may
+//! each ship a `sql`. Both halves are `cide_ext::manifest::is_safe_segment`, which forbids `.`
+//! and `/` outright, so the split is unambiguous and no request can name a directory that is not
+//! an installed extension's.
 //!
 //! # Why not the asset protocol
 //!

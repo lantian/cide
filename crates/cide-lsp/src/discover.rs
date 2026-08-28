@@ -220,11 +220,28 @@ impl Server {
     /// The `languageId` its documents carry.
     ///
     /// The first of its `language_ids`, for the callers that send one document and need one word.
-    /// A server driving several languages — which nothing does yet and a manifest may — gets the
-    /// right answer from [`Self::owns_language`] instead.
+    /// A caller that knows which document it is labelling must use [`Self::language_id_for`]
+    /// instead — for a server driving several languages, the first id is the wrong label for
+    /// every document but one.
     #[must_use]
     pub fn language_id(self) -> String {
         self.def().language_ids.first().cloned().unwrap_or_default()
+    }
+
+    /// The `languageId` to put on one document: the document's own resolved language when this
+    /// server owns it, the first declared id otherwise — the pre-M34 behaviour, and the honest
+    /// fallback for a caller that could not resolve the document at all.
+    ///
+    /// The didOpen label is what picks the dialect parser inside a multi-language server: one
+    /// declaring `["css", "scss", "less"]` must see an SCSS document labelled `scss`, or
+    /// `vscode-css-language-server` parses it as plain CSS and reports every nested rule as an
+    /// error.
+    #[must_use]
+    pub fn language_id_for(self, document_language: Option<&str>) -> String {
+        match document_language {
+            Some(id) if self.owns_language(id) => id.to_string(),
+            _ => self.language_id(),
+        }
     }
 
     #[must_use]
@@ -247,7 +264,10 @@ impl Server {
     ///
     /// An **empty** list means *any root*, which is right for a server that analyses single files
     /// — `sqls` has no manifest to look for — and would be wrong for anything that resolves a
-    /// dependency graph. Neither builtin uses it; both name a manifest.
+    /// dependency graph. Neither builtin uses it; both name a manifest. A `*.ext` entry matches
+    /// any file with that extension (`toolchain::find_markers` is the matcher and carries the
+    /// argument): the form for a server whose projects may have no manifest at all, like
+    /// `typescript-language-server` over a plain HTML+JS folder.
     fn project_markers(self) -> Vec<String> {
         self.def().project_markers
     }
@@ -300,6 +320,12 @@ pub enum Provenance {
     Bundled,
     /// The user's own installation, from `PATH` — how every server resolved before M25.
     SystemPath,
+    /// A directory an extension's `extraPathHints` named, or a Node version-manager directory
+    /// (`cide_core::node_dirs`) — where `npm -g` puts a server on a machine whose shell rc,
+    /// not its desktop launcher, put that directory on `PATH`. The user's own installation
+    /// still, never cide's build, so `config.rs`'s `Bundled | Override` gate leaves it
+    /// unconfigured exactly like [`Self::SystemPath`].
+    HintDir,
 }
 
 /// One way to run a server. [`locate`] returns them best-first.
@@ -307,12 +333,24 @@ pub enum Provenance {
 pub struct Candidate {
     pub path: PathBuf,
     pub provenance: Provenance,
+    /// Directories this binary's process must have on its `PATH` beyond what every child
+    /// already gets: empty for Override/Bundled/SystemPath — byte-identical behaviour to
+    /// before the hint rung existed — and, for a [`Provenance::HintDir`] candidate, the
+    /// directory the binary was found in plus the directory `node` lives in when `PATH`
+    /// reaches none. The latter because an npm server is a `#!/usr/bin/env node` script:
+    /// `execve` succeeds and the shebang dies with `env: node: No such file or directory`
+    /// (`child_env::prepare_command_with`'s documented failure). This field is what makes the
+    /// marketplace README's "appended to the child's PATH" sentence about `extraPathHints`
+    /// true.
+    pub child_path_dirs: Vec<PathBuf>,
 }
 
 /// Every way this server's binary can be run, best first — or the sentence for why none can.
 ///
-/// The ladder: env override (wins alone), the bundled sidecar, `PATH`. `choice` is the user's
-/// say over the middle rung — [`ServerBinaryChoice::System`] skips it, nothing else changes —
+/// The ladder: env override (wins alone), the bundled sidecar, `PATH`, then the hint
+/// directories — the manifest's `extraPathHints` and the Node installation directories, for
+/// the npm-installed servers a desktop launch's `PATH` never reaches. `choice` is the user's
+/// say over the bundled rung — [`ServerBinaryChoice::System`] skips it, nothing else changes —
 /// and the override outranks the setting because it exists precisely for testing a build the
 /// setting does not know about.
 ///
@@ -330,6 +368,7 @@ pub fn locate(
 ) -> Result<Vec<Candidate>, String> {
     let binary = server.binary();
     let bundled_row = BUNDLED.iter().find(|(name, _, _)| *name == binary);
+    let dirs = hint_dirs(server);
     let probes = Probes {
         override_env: bundled_row.and_then(|(_, _, env)| {
             let value = PathBuf::from(std::env::var_os(env)?);
@@ -342,6 +381,18 @@ pub fn locate(
         bundled: bundled_row
             .and_then(|(_, sidecar, _)| cide_core::toolchain::sibling_binary(sidecar)),
         system: which(&binary),
+        hints: dirs
+            .iter()
+            .map(|dir| dir.join(&binary))
+            .filter(|file| cide_core::toolchain::is_executable(file))
+            .collect(),
+        node_dir: match which("node") {
+            Some(_) => None,
+            None => dirs
+                .iter()
+                .find(|dir| cide_core::toolchain::is_executable(&dir.join("node")))
+                .cloned(),
+        },
     };
     let candidates = match ladder(probes, choice) {
         Ok(candidates) => candidates,
@@ -354,8 +405,12 @@ pub fn locate(
             ));
         }
         Err(Refusal::NothingFound) => {
+            // `cide-spec`'s launcher clause, for the same reason: a user who installed the
+            // server in a terminal must hear why this app cannot see it.
             return Err(format!(
-                "{binary} is not on PATH. Install it with `{}`.{}",
+                "{binary} is not on PATH, nor in any Node installation directory cide \
+                 searched. Install it with `{}`. A cide started from a desktop launcher has \
+                 a different PATH from one started in a terminal.{}",
                 server.install_hint(),
                 extra_paths_hint(server),
             ));
@@ -380,6 +435,14 @@ struct Probes {
     bundled: Option<PathBuf>,
     /// `PATH`, via [`which`].
     system: Option<PathBuf>,
+    /// Executable `binary` files found in hint directories, best first: the extension's own
+    /// `extraPathHints` (`~`-expanded), then the Node installation directories from
+    /// `cide_core::node_dirs`. Full paths to the files, not the directories, so the ladder
+    /// stays a function of facts already probed.
+    hints: Vec<PathBuf>,
+    /// Where `node` lives when `which("node")` answered nothing — the interpreter an npm
+    /// script's shebang needs. `None` when the child's `PATH` already reaches one.
+    node_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -405,6 +468,7 @@ fn ladder(
             Ok(path) => Ok(vec![Candidate {
                 path,
                 provenance: Provenance::Override,
+                child_path_dirs: Vec::new(),
             }]),
             Err(value) => Err(Refusal::BrokenOverride(value)),
         };
@@ -416,12 +480,37 @@ fn ladder(
         candidates.push(Candidate {
             path,
             provenance: Provenance::Bundled,
+            child_path_dirs: Vec::new(),
         });
     }
     if let Some(path) = probes.system {
         candidates.push(Candidate {
             path,
             provenance: Provenance::SystemPath,
+            child_path_dirs: Vec::new(),
+        });
+    }
+    // The hint rung, after PATH: a user-managed PATH install wins over anything a manifest
+    // guessed at, and a hint that yields nothing simply contributes no candidate. Deliberately
+    // *not* the override's refuse-when-broken rule — a hint is a manifest author's guess about
+    // somebody else's machine, the override is a developer's instruction about their own.
+    // `ServerBinaryChoice::System` does not skip this rung either: its documented meaning is
+    // "skip the bundled build, nothing else changes", and a hint-dir binary is the user's own
+    // installation.
+    for path in probes.hints {
+        let mut child_path_dirs = Vec::new();
+        if let Some(parent) = path.parent() {
+            child_path_dirs.push(parent.to_path_buf());
+        }
+        if let Some(node_dir) = probes.node_dir.as_ref()
+            && !child_path_dirs.contains(node_dir)
+        {
+            child_path_dirs.push(node_dir.clone());
+        }
+        candidates.push(Candidate {
+            path,
+            provenance: Provenance::HintDir,
+            child_path_dirs,
         });
     }
     if candidates.is_empty() {
@@ -452,21 +541,47 @@ pub fn find(server: Server, roots: &[PathBuf]) -> Found {
     }
 }
 
-/// Only mentioned when the toolchain's own directory exists but is not on `PATH`, because that is
-/// the one case where the user's next question is "but I have it installed".
+/// Every directory the hint rung searches, best first: the manifest's own `extraPathHints`,
+/// then the Node installation directories.
+///
+/// The Node directories are probed for **every** server, not just ones whose manifest wrote
+/// hints — an extension cannot spell nvm's versioned `~/.nvm/versions/node/v22.x/bin` path,
+/// and the whole rung exists for the desktop launch whose `PATH` no shell rc widened. The
+/// override and bundled rungs still outrank everything here, so the two shipped servers
+/// cannot be shadowed by a Node directory.
+fn hint_dirs(server: Server) -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> = server
+        .def()
+        .extra_path_hints
+        .iter()
+        .filter_map(|hint| expand_hint(hint, home.as_deref()))
+        .collect();
+    for dir in cide_core::node_dirs::enumerate() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// `~` and nothing else, matching `cide_ext::market::expand`: a hint out of a manifest that
+/// could name `$ANYTHING` would mean a different directory on the next machine, and the same
+/// expansion decides both where cide searches and where it tells the user it searched.
+fn expand_hint(hint: &str, home: Option<&Path>) -> Option<PathBuf> {
+    match hint.strip_prefix("~/") {
+        Some(rest) => Some(home?.join(rest)),
+        None => Some(PathBuf::from(hint)),
+    }
+}
+
+/// Only mentioned when a hint directory holds the file and the ladder still found nothing —
+/// which, now that executable hits are candidates in their own right, means a binary cide
+/// could not execute. That is the one case where the user's next question is "but I have it
+/// installed", so the sentence names the directory.
 fn extra_paths_hint(server: Server) -> String {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return String::new();
-    };
     let binary = server.binary();
-    for hint in server.def().extra_path_hints {
-        // `~` and nothing else, matching `cide_ext::market::expand`: a hint out of a manifest that
-        // could name `$ANYTHING` would mean a different directory on the next machine, and this
-        // one is used to tell the user where cide looked.
-        let dir = match hint.strip_prefix("~/") {
-            Some(rest) => home.join(rest),
-            None => PathBuf::from(&hint),
-        };
+    for dir in hint_dirs(server) {
         if dir.join(&binary).is_file() {
             return format!(
                 " (found in {} — cide searched there too, so this build could not execute it)",
@@ -618,6 +733,8 @@ mod tests {
                 .map(|verdict| verdict.map(PathBuf::from).map_err(PathBuf::from)),
             bundled: bundled.map(PathBuf::from),
             system: system.map(PathBuf::from),
+            hints: Vec::new(),
+            node_dir: None,
         }
     }
 
@@ -735,6 +852,107 @@ mod tests {
             cide_ipc::settings::ServerBinaryChoice::Builtin,
         );
         assert!(matches!(refusal, Err(Refusal::NothingFound)));
+    }
+
+    // --- the hint rung ------------------------------------------------------------------
+    //
+    // The rung that exists for npm-installed servers: a desktop launch's PATH reaches no
+    // Node directory, so the manifest's `extraPathHints` and `cide_core::node_dirs` are
+    // searched after everything else. A hint never refuses — with no hits anywhere the
+    // refusal is `NothingFound`, exactly as before the rung existed. Deliberate asymmetry
+    // with `a_broken_override_refuses_rather_than_falling_through`: a hint is a manifest
+    // author's guess about somebody else's machine, the override is a developer's
+    // instruction about their own.
+
+    #[test]
+    fn path_beats_a_hint_and_the_hint_stays_on_the_ladder() {
+        let mut p = probed(None, None, Some("/usr/bin/typescript-language-server"));
+        p.hints = vec![PathBuf::from(
+            "/home/u/.nvm/versions/node/v22.0.0/bin/typescript-language-server",
+        )];
+        let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::Builtin).expect("resolved");
+        assert_eq!(
+            shape(&got),
+            vec![
+                (
+                    Provenance::SystemPath,
+                    "/usr/bin/typescript-language-server"
+                ),
+                (
+                    Provenance::HintDir,
+                    "/home/u/.nvm/versions/node/v22.0.0/bin/typescript-language-server",
+                ),
+            ],
+            "a user-managed PATH install wins over a manifest's guess, and the hint stays a \
+             fallback for a PATH build that dies before its handshake"
+        );
+        assert!(
+            got[0].child_path_dirs.is_empty(),
+            "a PATH binary gets the PATH every child gets — byte-identical to before the rung"
+        );
+    }
+
+    #[test]
+    fn a_hint_candidate_carries_the_directory_it_was_found_in() {
+        // The half the whole rung exists for: the binary is a `#!/usr/bin/env node` script,
+        // and without its own directory (and node's) on the child's PATH, execve succeeds
+        // and the shebang dies with `env: node: No such file or directory`.
+        let mut p = probed(None, None, None);
+        p.hints = vec![PathBuf::from("/home/u/.npm-global/bin/svelteserver")];
+        p.node_dir = Some(PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin"));
+        let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::Builtin).expect("resolved");
+        assert_eq!(
+            got[0].child_path_dirs,
+            vec![
+                PathBuf::from("/home/u/.npm-global/bin"),
+                PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin"),
+            ]
+        );
+
+        // When the hint directory *is* node's directory, it is not listed twice.
+        let mut p = probed(None, None, None);
+        p.hints = vec![PathBuf::from(
+            "/home/u/.nvm/versions/node/v22.0.0/bin/svelteserver",
+        )];
+        p.node_dir = Some(PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin"));
+        let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::Builtin).expect("resolved");
+        assert_eq!(
+            got[0].child_path_dirs,
+            vec![PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin")]
+        );
+    }
+
+    #[test]
+    fn a_hint_resolves_alone_and_the_system_choice_does_not_skip_it() {
+        // `ServerBinaryChoice::System`'s documented meaning is "skip the bundled build,
+        // nothing else changes" — and a hint-dir binary is the user's own installation, so
+        // it stays reachable under that choice.
+        let mut p = probed(None, Some("/app/cide-x"), None);
+        p.hints = vec![PathBuf::from("/home/u/.npm-global/bin/x")];
+        let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::System).expect("resolved");
+        assert_eq!(
+            shape(&got),
+            vec![(Provenance::HintDir, "/home/u/.npm-global/bin/x")]
+        );
+    }
+
+    #[test]
+    fn the_override_still_wins_alone_over_hints() {
+        let mut p = probed(Some(Ok("/fork/ra")), None, None);
+        p.hints = vec![PathBuf::from("/home/u/.npm-global/bin/ra")];
+        let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::Builtin).expect("resolved");
+        assert_eq!(shape(&got), vec![(Provenance::Override, "/fork/ra")]);
+        assert!(got[0].child_path_dirs.is_empty());
+    }
+
+    #[test]
+    fn a_documents_own_language_labels_it_and_an_unowned_one_falls_back() {
+        // The didOpen label picks the dialect parser inside a multi-language server; a
+        // language the server never declared must not be sent as a label, and a caller that
+        // could not resolve the document gets the first-declared id — the old behaviour.
+        assert_eq!(Server::RUST_ANALYZER.language_id_for(Some("rust")), "rust");
+        assert_eq!(Server::RUST_ANALYZER.language_id_for(Some("go")), "rust");
+        assert_eq!(Server::RUST_ANALYZER.language_id_for(None), "rust");
     }
 
     #[test]

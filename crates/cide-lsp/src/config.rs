@@ -227,6 +227,14 @@ mod tests {
         // rust-analyzer's keys.
         assert!(!wants_options(Server::GOPLS, Provenance::Bundled));
         assert!(!wants_options(Server::GOPLS, Provenance::SystemPath));
+        // A hint-dir binary is the user's own installation, exactly like SystemPath: stock
+        // handshake, no env lane. Pinned so the `matches!` gates cannot quietly widen when
+        // somebody adds the variant to the wrong side.
+        assert!(!wants_options(Server::RUST_ANALYZER, Provenance::HintDir));
+        assert!(
+            extra_env(Server::GOPLS, Provenance::HintDir, Tuning::default()).is_empty(),
+            "an npm-dir binary must get byte-for-byte the environment a PATH one gets"
+        );
     }
 
     #[test]

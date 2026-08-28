@@ -5440,6 +5440,112 @@ What is **not** verified:
 - Nothing has been driven through the **GUI**: a role written by the orchestrator appearing in
   the Agents panel of a second window is the emission path above, unobserved.
 
+## The web languages, and the rung that finds an npm server (M34), and what is not verified
+
+Before this, a `.html`, `.css`, `.vue` or `.svelte` file opened as Plain Text, and builtin
+JavaScript/TypeScript was syntax-only — Ctrl+Alt+F answered *No formatter for TypeScript*,
+because no server claimed the `typescript` id. The fix is one marketplace extension plus two
+cide-side repairs the extension exposed.
+
+**The `web` extension** (`../cide-marketplace/extensions/web`) is the marketplace's first purely
+declarative one: no `main.js`, `process:spawn` only. Seven contributed languages — html, css,
+scss, less, vue, svelte, xml — and five servers, two of which bind **builtin** ids:
+`typescript-language-server` to `typescript` and `vscode-json-language-server` to `json`. That
+asymmetry is the design: the builtin TS and JSON grammars are hook-based and better than
+anything the rule form can express, so the extension deliberately re-declares neither, and the
+richer-when-installed experience comes entirely through the LSP road `cmd::format` already
+resolves (filter → server that claims the language → builtin). Markdown fences follow for free —
+`fenceTokens` picks a grammar by extension, so ```` ```html ```` colours in the preview the
+moment the extension claims `.html`. Grammar warts are documented in the extension's README
+rather than hidden: a stateless lexer paints `a:hover`'s `a` property-coloured, `<script>`
+bodies get the host language's rules (cide has no nested grammars), and `.sass` is unclaimed on
+purpose.
+
+**The hint rung** (`cide_lsp::discover`). Every one of those servers is an npm-installed
+`#!/usr/bin/env node` script, and the discovery ladder searched `PATH` plus `~/.cargo/bin` and
+`~/go/bin` — so a desktop-launched cide could not find them, and the marketplace README's claim
+that `extraPathHints` dirs are "appended to the child's PATH" was simply false. cide had already
+solved this exact problem once, for `openspec`: the Node-directory enumeration moved from
+`cide-spec` into **`cide_core::node_dirs`** (same extraction, same reason as `which`'s), and
+`locate` now probes the manifest's `extraPathHints` (~-expanded) plus those directories after
+`PATH` misses. A hit rides the ladder as `Provenance::HintDir` — configured like `SystemPath`,
+which the config gate's new negative assertion pins — and carries `child_path_dirs`: the
+directory the binary was found in, plus the one `node` lives in when `PATH` reaches none,
+handed to `child_env::prepare_command_with` at the spawn. Without that second half the failure
+is the documented one: `execve` succeeds and the shebang dies with `env: node: No such file or
+directory` from a process cide never mentions. Precedence is pinned by ladder tests: the
+override still wins alone, `PATH` beats a hint, a hint that yields nothing **never refuses**
+(a hint is a manifest author's guess about somebody else's machine; the override is a
+developer's instruction about their own), and `ServerBinaryChoice::System` does not skip the
+rung.
+
+**The didOpen label** (`Server::language_id_for`). `notify_document` sent every document the
+server's *first* `languageId`, which no server with one language could ever notice —
+`vscode-css-language-server` declares `["css", "scss", "less"]` and picks its dialect parser
+from that label, so an SCSS document labelled `css` would earn an error on every nested rule.
+The document's own resolved language now labels it when the server owns that language; the
+first-declared id stays the fallback for a caller that could not resolve the document.
+
+Two smaller repairs in the same change: the manifest's *"claims a languageId this extension
+does not contribute"* warning now counts the builtins as known (it fired on exactly the two
+bindings that are the extension's point), and `cide-ext`'s marketplace test grew the positive
+assertion that a `main`-less extension installs and contributes — the shape the format always
+promised was first-class and nothing exercised.
+
+What is **not** verified:
+
+- **The whole feature on a display.** `cargo test -p cide-ext --test marketplace` runs the real
+  connect → install → resolve road against the sibling checkout, and a real
+  `typescript-language-server` reaches Ready under
+  `cargo test -p cide-lsp --test real_npm_server -- --ignored` — but no window has drawn a
+  `.vue` file, no Ctrl+Alt+F has formatted a `.ts` buffer through the newly bound server, and
+  the Extensions panel has not been watched installing `web`.
+- **The desktop-launch case itself.** The rung exists for a `PATH` with no node on it, and that
+  is precisely what a test process cannot arrange (`set_var` is unsafe; the parent's `PATH` is
+  what `locate` reads). The manual check is `PATH=/usr/bin:/bin ./run.sh` with an nvm-only
+  node, then a `tsconfig.json` project reaching Ready.
+- **The css server on three dialects live.** `language_id_for` is unit- and registry-tested;
+  no real `vscode-css-language-server` has been sent an `scss` document and had its
+  diagnostics inspected. Multi-languageId routing is exercised nowhere else in the
+  marketplace.
+- **`vscode-json-language-server`'s usefulness without `provideFormatter`.** It may format
+  nothing under cide's empty initialization options; diagnostics and completion are the case
+  for keeping it, and dropping it is a one-line manifest edit if live use shows it inert.
+- **Vue is syntax-only by decision, not verification**: `vue-language-server` hard-requires
+  `initializationOptions.typescript.tsdk`, and cide sends none to servers it did not ship. An
+  `initializationOptions` field on `LanguageServerDef` is the follow-up that would change the
+  decision.
+
+**Corrected the same day, by the first live test.** Go-to-definition in a plain HTML+JS folder —
+`index.html`, `app.js`, `styles.css` — did nothing, and the reason was the marker gate working
+exactly as written: `typescript-language-server`'s `projectMarkers` named `tsconfig.json`,
+`jsconfig.json` and `package.json`, and the first project anybody tests a web extension on has
+none of them and never will. An empty marker list was the wrong repair — it would start a Node
+process in every Rust workspace, which is the cost the gate exists to refuse — so
+`toolchain::find_markers` learned a second marker form: `*.ext` matches any file with that
+extension (depth-2 walk unchanged, `node_modules/` still skipped, `*.` matches nothing rather
+than everything), and web 0.1.1 adds `*.js`/`*.ts` and friends to the TS server's markers. The
+server now starts exactly where there is a file for it to read.
+
+The second live failure was not cide's at all, and nothing anywhere named it: with the server
+running, Go to Declaration answered *No declaration found* for everything. `npm install -g
+typescript` now installs **TypeScript 7** — the native Go port, which ships no `tsserver.js` —
+and `typescript-language-server` (6.0.0 included) can only drive the JS tsserver, so it falls
+back to a stub reporting `$/typescriptVersion 1.0.0 (bundled)` and answers `null` to every
+request. No error reaches any surface; the driver script that pinned this is the difference
+between "cide's goto is broken" and "the toolchain under it is". Three things now name it:
+web 0.1.2's installHint says `typescript@5`, the extension README carries the why, and —
+because a hint is only read before installing — **`Session` now reads `$/typescriptVersion`**:
+a major below 2 is the stub, and the server's Problems-panel row becomes the remedy sentence
+instead of a `Ready` that is a lie, sticky against later progress
+(`a_stub_typescript_version_turns_the_row_into_the_remedy_and_stays_there`). One server's
+vocabulary hardcoded in the client, deliberately: the alternative was every future user of the
+most popular language server on earth debugging a silent nothing. Two smaller facts from the
+same session: typescript-language-server *corrects* a `.js` document labelled `typescript` to
+`javascript` on its own (logged, harmless — cide's one `typescript` id spanning four dialects
+costs nothing here), and with TypeScript 5.9 pinned the loose-file definition resolves
+first try.
+
 ## Opening a file a pane printed, including one outside the project
 
 Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the

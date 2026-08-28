@@ -401,7 +401,16 @@ impl ProjectDiagnostics {
         path: &std::path::Path,
         message: impl Fn(&cide_lsp::Session, String, &str) -> cide_lsp::Effect,
     ) {
-        let Some(server) = server_for(path) else {
+        // Resolved here rather than through `server_for`, which finds the same server and
+        // discards the language on the way — and the language is needed twice: `by_language`
+        // routes to the server, and `language_id_for` labels the document. Not
+        // `server.language_id()`: the didOpen label picks the dialect parser inside a
+        // multi-language server, and a css server handed an SCSS document labelled `css`
+        // reports every nested rule as an error.
+        let Some(language) = language_of(path) else {
+            return;
+        };
+        let Some(server) = cide_lsp::discover::by_language(&language) else {
             return;
         };
         let uri = cide_lsp::convert::path_to_uri(path);
@@ -413,9 +422,11 @@ impl ProjectDiagnostics {
             // throwaway one is enough to shape the message. Threading the live session out of
             // the pump thread would mean a lock around the whole protocol conversation.
             let (session, _) = cide_lsp::Session::new(&self.roots, server);
-            if let cide_lsp::Effect::Send(value) =
-                message(&session, uri.clone(), &server.language_id())
-            {
+            if let cide_lsp::Effect::Send(value) = message(
+                &session,
+                uri.clone(),
+                &server.language_id_for(Some(&language)),
+            ) {
                 handle.send(value);
             }
         }

@@ -113,6 +113,18 @@ pub struct Session {
     /// `workspace/didChangeConfiguration`, and two different answers would be two different
     /// servers depending on when it asked.
     init_options: Option<Value>,
+    /// A fact the server announced that makes every future answer empty, as the sentence the
+    /// panel should print instead of `Ready` — or `None` for a server that has said no such
+    /// thing, which is all of them but one.
+    ///
+    /// The one: `typescript-language-server` with npm's `typescript` 7 installed. The native
+    /// (Go) port ships no `tsserver.js`, which is the only engine that server can drive, so it
+    /// falls back to an internal stub, reports `$/typescriptVersion` `1.0.0 (bundled)`, and
+    /// answers `null` to every request for the rest of its life — no error on stderr, no
+    /// `window/showMessage`, nothing. A user sees Go to Declaration answer *No declaration
+    /// found* on everything and has no thread to pull. This field is that thread: sticky, so a
+    /// later `$/progress` cannot flip the row back to a `Ready` that is a lie.
+    health: Option<String>,
 }
 
 /// What a server said about completion — see [`Session::completion_support`].
@@ -157,6 +169,7 @@ impl Session {
             last_status: None,
             capabilities: Value::Null,
             init_options,
+            health: None,
         };
         let request = json!({
             "jsonrpc": "2.0",
@@ -287,6 +300,33 @@ impl Session {
             ("window/logMessage", None) | ("window/showMessage", None) => {
                 if let Some(text) = params.get("message").and_then(Value::as_str) {
                     tracing::debug!(target: "cide::lsp", %text, "server message");
+                }
+            }
+            // typescript-language-server's own vocabulary, and the only signal it gives for a
+            // failure mode nothing else reports (see `Session::health`): with npm's
+            // `typescript` 7 — the native port, no `tsserver.js` — it falls back to a stub
+            // announcing version `1.0.0`. No real TypeScript has reported a 1.x here since the
+            // LSP existed, so a major below 2 *is* the stub. A healthy announcement
+            // (`5.9.3 (workspace)`) is read and dropped.
+            ("$/typescriptVersion", None) => {
+                let version = params
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let major: u64 = version
+                    .split('.')
+                    .next()
+                    .and_then(|part| part.parse().ok())
+                    .unwrap_or(0);
+                if !version.is_empty() && major < 2 {
+                    self.health = Some(format!(
+                        "typescript-language-server found no usable TypeScript — it fell back \
+                         to its own stub (reported {version}) and will answer nothing. npm's \
+                         `typescript` package is the native port since 7.0 and ships no \
+                         tsserver.js, the only engine this server can drive. Install \
+                         `npm install -g typescript@5` and reopen the project.",
+                    ));
+                    self.push_status(&mut effects);
                 }
             }
             _ => {}
@@ -478,6 +518,16 @@ impl Session {
     }
 
     fn status(&self) -> SourceStatus {
+        // A server-announced health fact outranks everything below: the process is up, the
+        // handshake completed, and every answer will still be empty — `Ready` would be the row
+        // lying to the one user who needs it to tell the truth. `Unavailable` is the honest
+        // word by this module's own rule: it is for something the user might fix, and the
+        // sentence names the fix.
+        if let Some(reason) = &self.health {
+            return SourceStatus::Unavailable {
+                reason: reason.clone(),
+            };
+        }
         // Ready needs *both*: the handshake done, and nothing in flight. See the module docs for
         // why "a diagnostic has arrived" is not part of it.
         if self.phase == Phase::Running && self.progress.is_empty() {
@@ -1436,6 +1486,52 @@ mod tests {
             "params": { "token": "t", "value": { "kind": "end" } },
         }));
         assert_eq!(status(&effects), Some(SourceStatus::Ready));
+    }
+
+    #[test]
+    fn a_stub_typescript_version_turns_the_row_into_the_remedy_and_stays_there() {
+        // The failure nothing else reports (see `Session::health`): npm's `typescript` 7 is
+        // the native port with no tsserver.js, typescript-language-server falls back to a stub
+        // announcing 1.0.0, and every request answers `null` for ever — no stderr, no
+        // showMessage, just a Ready row over a server that finds nothing. The row must carry
+        // the remedy instead.
+        let mut session = running();
+        let effects = session.on_message(&json!({
+            "jsonrpc": "2.0", "method": "$/typescriptVersion",
+            "params": { "version": "1.0.0", "source": "bundled" },
+        }));
+        let SourceStatus::Unavailable { reason } = status(&effects).expect("status") else {
+            panic!("{effects:?}");
+        };
+        assert!(reason.contains("typescript@5"), "{reason}");
+        assert!(reason.contains("1.0.0"), "{reason}");
+
+        // Sticky: a later progress cycle must not flip the row back to a Ready that is a lie.
+        session.on_message(&json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "t", "value": { "kind": "begin", "title": "Indexing" } },
+        }));
+        let effects = session.on_message(&json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "t", "value": { "kind": "end" } },
+        }));
+        assert_eq!(
+            status(&effects),
+            None,
+            "the status never left Unavailable, so nothing new is emitted: {effects:?}"
+        );
+        assert!(matches!(session.status(), SourceStatus::Unavailable { .. }));
+    }
+
+    #[test]
+    fn a_healthy_typescript_version_changes_nothing() {
+        let mut session = running();
+        let effects = session.on_message(&json!({
+            "jsonrpc": "2.0", "method": "$/typescriptVersion",
+            "params": { "version": "5.9.3", "source": "workspace" },
+        }));
+        assert_eq!(status(&effects), None, "{effects:?}");
+        assert_eq!(session.status(), SourceStatus::Ready);
     }
 
     #[test]

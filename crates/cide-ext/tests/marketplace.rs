@@ -85,7 +85,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
     let ids: Vec<&str> = market.entries.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(
         ids,
-        vec!["sql", "yaml", "proto", "graphql", "showcase"],
+        vec!["sql", "yaml", "proto", "graphql", "web", "showcase"],
         "every extension the index lists was read"
     );
     assert!(
@@ -102,7 +102,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             entry.unavailable
         );
     }
-    for id in ["sql", "yaml", "proto", "graphql"] {
+    for id in ["sql", "yaml", "proto", "graphql", "web"] {
         let entry = market
             .entries
             .iter()
@@ -144,7 +144,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
 
     // --- install all --------------------------------------------------------------------------
     let mut snapshot = snapshot;
-    for id in ["sql", "yaml", "proto", "graphql", "showcase"] {
+    for id in ["sql", "yaml", "proto", "graphql", "web", "showcase"] {
         let reference = cide_ipc::ext::ExtensionRef {
             marketplace: market.id.clone(),
             extension: cide_ipc::ids::ExtensionId(id.into()),
@@ -158,7 +158,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             .clone();
         snapshot = store.install(&reference, &granted).expect("install");
     }
-    assert_eq!(snapshot.extensions.len(), 5);
+    assert_eq!(snapshot.extensions.len(), 6);
     for installed in &snapshot.extensions {
         assert!(installed.enabled);
         assert!(
@@ -167,18 +167,28 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             installed.id,
             installed.unavailable
         );
-        assert_eq!(
-            installed.main.as_deref(),
-            Some("main.js"),
-            "{} ships a worker, and the manifest's own entry is what reaches the frontend rather \
-             than a hard-coded name",
-            installed.id
-        );
-        assert!(
-            installed.path.join("main.js").is_file(),
-            "the worker was copied, not linked — a symlink into the clone would let a refresh \
-             change code under a running app"
-        );
+        if installed.id.extension.0 == "web" {
+            // The marketplace's first *declarative* extension: no worker, contributions only.
+            // A positive assertion rather than a skip, because "main is None and it still
+            // contributes" is exactly the shape the manifest format promises is first-class.
+            assert_eq!(
+                installed.main, None,
+                "web ships no worker — languages and servers are data"
+            );
+        } else {
+            assert_eq!(
+                installed.main.as_deref(),
+                Some("main.js"),
+                "{} ships a worker, and the manifest's own entry is what reaches the frontend \
+                 rather than a hard-coded name",
+                installed.id
+            );
+            assert!(
+                installed.path.join("main.js").is_file(),
+                "the worker was copied, not linked — a symlink into the clone would let a \
+                 refresh change code under a running app"
+            );
+        }
         assert!(
             !installed.path.join(".git").exists(),
             "and `.git` was not copied with it"
@@ -210,8 +220,13 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
         );
     }
     // The complement of the supersede loop: a language cide never shipped displaces nothing, and
-    // saying so is what keeps the panel's `was builtin` badge meaning something.
-    for id in ["proto", "graphql"] {
+    // saying so is what keeps the panel's `was builtin` badge meaning something. The seven web
+    // languages belong here *by design*: `web` deliberately re-declares neither `typescript`
+    // nor `json` — the builtin grammars are hook-based and better than the rule form — and a
+    // `supersedes` appearing on any of these would mean it started displacing a builtin.
+    for id in [
+        "proto", "graphql", "html", "css", "scss", "less", "vue", "svelte", "xml",
+    ] {
         let binding = resolved
             .languages
             .iter()
@@ -236,7 +251,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             .filter(|b| b.source == cide_ipc::ext::ContributionSource::Builtin)
             .count()
             >= 9,
-        "installing four language extensions displaced only the two languages with builtins"
+        "installing five language extensions displaced only the two languages with builtins"
     );
 
     let servers: Vec<&str> = resolved
@@ -253,6 +268,39 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             && servers.contains(&"graphql-lsp"),
         "every contributed server reached the registry — proto's two share one languageId, \
          which is first-installed-wins, not a conflict: {servers:?}"
+    );
+    // `web`'s five, and the two that matter most bind *builtin* language ids: that a server
+    // may enrich a language its extension does not contribute is how JS/TS and JSON get an
+    // LSP at all without displacing the builtin grammars.
+    for binary in [
+        "typescript-language-server",
+        "vscode-html-language-server",
+        "vscode-css-language-server",
+        "vscode-json-language-server",
+        "svelteserver",
+    ] {
+        assert!(servers.contains(&binary), "{binary} missing: {servers:?}");
+    }
+    let ts_server = resolved
+        .servers
+        .iter()
+        .find(|s| s.def.binary == "typescript-language-server")
+        .expect("typescript-language-server");
+    assert_eq!(
+        ts_server.def.language_ids,
+        vec!["typescript".to_string()],
+        "bound to the builtin id — the whole point of the web extension's server half"
+    );
+    let css_server = resolved
+        .servers
+        .iter()
+        .find(|s| s.def.binary == "vscode-css-language-server")
+        .expect("vscode-css-language-server");
+    assert_eq!(
+        css_server.def.language_ids,
+        vec!["css".to_string(), "scss".to_string(), "less".to_string()],
+        "one binary, three dialects — the multi-languageId shape `language_id_for` labels \
+         documents for"
     );
     let yaml_server = resolved
         .servers
@@ -347,7 +395,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
 
     // --- uninstalling removes the files ------------------------------------------------------
     let snapshot = store.uninstall(&sql_ref).expect("uninstall");
-    assert_eq!(snapshot.extensions.len(), 4);
+    assert_eq!(snapshot.extensions.len(), 5);
     assert!(
         !cide_ext::install_path(&market.id, &cide_ipc::ids::ExtensionId("sql".into())).exists(),
         "and the directory this crate created is the directory it removed"

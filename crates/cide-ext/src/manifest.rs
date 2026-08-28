@@ -858,12 +858,17 @@ fn validate_contributions(path: &Path, manifest: &mut Manifest) {
         ok
     });
 
-    let known: BTreeSet<&str> = manifest
+    // The languages this manifest contributes, plus cide's own builtins: a server bound to
+    // `typescript` or `json` is the *point* of an extension that enriches a builtin language
+    // with an LSP, and warning "it will only run if something else does" about a language
+    // cide itself supplies would be a permanent falsehood on every install.
+    let mut known: BTreeSet<String> = manifest
         .contributes
         .languages
         .iter()
-        .map(|l| l.id.as_str())
+        .map(|l| l.id.clone())
         .collect();
+    known.extend(cide_ipc::lang::builtins().into_iter().map(|l| l.id));
     let problems = &mut manifest.problems;
     manifest.contributes.language_servers.retain(|server| {
         if server.binary.is_empty() || server.binary.contains('/') || server.binary.contains('\\') {
@@ -1227,6 +1232,50 @@ mod tests {
                 .problems
                 .iter()
                 .any(|p| p.message.contains("process:spawn"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server may enrich a *builtin* language — that is how JS/TS gets an LSP at all, since
+    /// re-declaring `typescript` would displace the builtin grammar. The warning exists for a
+    /// language nothing supplies, and a builtin id is supplied by cide itself.
+    #[test]
+    fn a_server_for_a_builtin_language_earns_no_warning_and_an_unknown_one_still_does() {
+        let dir = scratch("builtin-server");
+        plant(
+            &dir,
+            r#"{
+              "id": "web", "capabilities": ["process:spawn"],
+              "contributes": { "languageServers": [
+                { "binary": "typescript-language-server", "args": ["--stdio"],
+                  "languageIds": ["typescript"],
+                  "projectKind": "TypeScript project",
+                  "installHint": "npm i -g typescript-language-server typescript" },
+                { "binary": "imaginary-ls", "languageIds": ["imaginary"],
+                  "projectKind": "any", "installHint": "-" } ] }
+            }"#,
+        );
+        let manifest = read_manifest(&dir).expect("loads");
+        assert_eq!(
+            manifest.contributes.language_servers.len(),
+            2,
+            "both are declared; ownership of the language decides warnings, not registration"
+        );
+        assert!(
+            !manifest
+                .problems
+                .iter()
+                .any(|p| p.message.contains("typescript")),
+            "a builtin id is supplied by cide itself, and \"it will only run if something \
+             else does\" would be a permanent falsehood: {:?}",
+            manifest.problems
+        );
+        assert!(
+            manifest
+                .problems
+                .iter()
+                .any(|p| p.message.contains("`imaginary`")),
+            "the warning still fires for a language nothing supplies"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

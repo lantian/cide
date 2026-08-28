@@ -1027,6 +1027,7 @@ fn build_command(
     args: &[String],
     cwd: &std::path::Path,
     extra_env: &[(String, String)],
+    path_dirs: &[PathBuf],
 ) -> Command {
     let mut command = Command::new(binary);
     command
@@ -1046,7 +1047,13 @@ fn build_command(
     // `rust-analyzer` proxy with no reachable toolchain exits and reads as `the language server
     // stopped`. `prepare_command` now appends `cide_core::toolchain::extra_dirs` — the same
     // directories `discover::find` searched — so the server searches the list cide searched.
-    cide_core::child_env::prepare_command(&mut command);
+    //
+    // `path_dirs` is the M34 half of the same rule, for the hint rung: the binary was found
+    // somewhere no child's PATH reaches (an nvm directory, `~/.npm-global/bin`), and it is a
+    // `#!/usr/bin/env node` script whose shebang dies with `env: node: No such file or
+    // directory` unless its own directory — and node's — rides along. This line is what makes
+    // the marketplace README's sentence about `extraPathHints` reaching the child's PATH true.
+    cide_core::child_env::prepare_command_with(&mut command, path_dirs);
     // cide's per-server variables (`config::extra_env` — provenance-gated, like the init
     // options) go after `prepare_command`, the same last-writer-wins ordering rule its own
     // PATH pass follows: what cide states deliberately must not be undone by the scrub.
@@ -1077,6 +1084,7 @@ fn run_once(
         &server.args(),
         &cwd,
         &crate::config::extra_env(server, candidate.provenance, tuning),
+        &candidate.child_path_dirs,
     );
 
     let mut child: Child = command.spawn().map_err(|e| Failure {
@@ -1544,6 +1552,7 @@ mod tests {
                 vec![Candidate {
                     path: PathBuf::from("/nonexistent/never-spawned"),
                     provenance: crate::discover::Provenance::SystemPath,
+                    child_path_dirs: Vec::new(),
                 }],
                 Vec::new(),
                 crate::config::Tuning::default(),
@@ -1711,6 +1720,7 @@ mod tests {
             &["--stdio".to_string()],
             std::path::Path::new("/repo"),
             &[],
+            &[],
         );
         let args: Vec<_> = flagged.get_args().map(|a| a.to_os_string()).collect();
         assert_eq!(args, ["--stdio"]);
@@ -1724,6 +1734,7 @@ mod tests {
             std::path::Path::new("/usr/bin/rust-analyzer"),
             &[],
             std::path::Path::new("/repo"),
+            &[],
             &[],
         );
         assert_eq!(bare.get_args().count(), 0);
@@ -1739,12 +1750,39 @@ mod tests {
             &[],
             std::path::Path::new("/repo"),
             &[("GOPLSCACHE".to_owned(), "/cache/cide/gopls".to_owned())],
+            &[],
         );
         let stated = command
             .get_envs()
             .find(|(name, _)| *name == std::ffi::OsStr::new("GOPLSCACHE"))
             .and_then(|(_, value)| value);
         assert_eq!(stated, Some(std::ffi::OsStr::new("/cache/cide/gopls")));
+    }
+
+    #[test]
+    fn a_hint_candidates_directories_reach_the_childs_path() {
+        // The end of the hint rung: `discover::ladder` put the found-in directory (and node's)
+        // on the candidate, and this is the line that makes them real. Without it the spawn
+        // succeeds and the `#!/usr/bin/env node` shebang dies with `env: node: No such file
+        // or directory` — from a process cide never mentions.
+        let hint_dir = std::path::PathBuf::from("/cide-test/never-on-a-real-path/bin");
+        let command = build_command(
+            std::path::Path::new("/cide-test/never-on-a-real-path/bin/svelteserver"),
+            &["--stdio".to_string()],
+            std::path::Path::new("/repo"),
+            &[],
+            std::slice::from_ref(&hint_dir),
+        );
+        let path = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("the child is always given a PATH");
+        let appended = std::env::split_paths(path).any(|dir| dir == hint_dir);
+        assert!(
+            appended,
+            "the directory the binary was found in must be on the child's PATH: {path:?}"
+        );
     }
 
     #[test]
@@ -1895,10 +1933,12 @@ mod tests {
             Candidate {
                 path: broken,
                 provenance: crate::discover::Provenance::Bundled,
+                child_path_dirs: Vec::new(),
             },
             Candidate {
                 path: real,
                 provenance: crate::discover::Provenance::SystemPath,
+                child_path_dirs: Vec::new(),
             },
         ];
 

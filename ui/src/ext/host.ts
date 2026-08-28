@@ -52,7 +52,7 @@ interface Live {
   settings: string
 }
 
-/** Keyed by `<marketplace>.<extension>` — the same pair `cide-ext://` uses as a host. */
+/** Keyed by `<marketplace>.<extension>` — the same pair `cide-ext://` puts in its path. */
 const LIVE = new Map<string, Live>()
 
 /** Views for extensions that could not start, so a panel draws the reason rather than a spinner. */

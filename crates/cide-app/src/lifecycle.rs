@@ -559,9 +559,26 @@ fn arm_exit_watchdog() {
 /// up for 80 ms is a worse artefact than the thing it was announcing. A freeze is not perceived
 /// as one until a few hundred milliseconds have passed either, so nothing is lost by waiting:
 /// the notice appears exactly when the wait starts to be noticed.
+///
+/// Behind the platform `cfg` because only the GTK arm reads it, and `-D warnings` on a Mac is
+/// what noticed. Same rule the module below states for its imports.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
 const NOTICE_DELAY: Duration = Duration::from_millis(250);
 
 /// How often the notice repaints the line the teardown is on.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
 const NOTICE_TICK: Duration = Duration::from_millis(120);
 
 /// What the user sees while cide is closing.
@@ -616,6 +633,19 @@ mod notice {
     }
 
     /// The current step, or a neutral line before the first [`say`].
+    ///
+    /// `test` is in the `cfg` alongside the GTK targets, and it is not a convenience: the GTK
+    /// tick is the only caller in a shipped build, while `say`'s own tests assert through this
+    /// on every platform. Without it the function is dead code on a Mac and missing from the
+    /// test that needs it.
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
     pub fn current() -> String {
         let line = LINE.lock().unwrap_or_else(|e| e.into_inner());
         if line.is_empty() {

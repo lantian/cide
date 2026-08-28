@@ -3862,6 +3862,7 @@ export const agentDefs = {
 // is contiguous is a feature whose seam is greppable.
 // ---------------------------------------------------------------------------------------
 
+import { extAssetUrlFor } from '@/ext/assetUrl'
 import type {
   Capability,
   Diagnostic,
@@ -3996,25 +3997,16 @@ export const extEvents = {
  * The URL an installed extension's file is served from.
  *
  * A scheme registered in `cide-app`, jailed to the installed directory and refused outright for a
- * disabled extension. Built here rather than in the worker host, so the one place a path out of a
- * manifest becomes a URL is the file that owns the seam.
+ * disabled extension. Exported from here rather than from the worker host, so the one place a path
+ * out of a manifest becomes a URL is the file that owns the seam.
  *
- * # Two spellings, one on each side of a platform split
- *
- * Tauri serves a custom scheme as `<scheme>://localhost/…` on Linux and Android and as
- * `http://<scheme>.localhost/…` on macOS and Windows. The *host* is therefore not ours to use, and
- * the identity pair lives in the path — see `cide_ext::assets::split_path`, which says the same
- * from the other end.
- *
- * Detected the way `@tauri-apps/api`'s own `convertFileSrc` does, off the user agent, because the
- * platform plugin's answer is asynchronous and this is called while a worker is being constructed.
+ * The *spelling* is a platform split and lives in `ext/assetUrl.ts`, which is import-free so that
+ * `check:ext` can drive it with one user agent per platform. This file cannot be compiled
+ * standalone, and an untested platform arm here is precisely what broke every extension on macOS.
  */
 export function extAssetUrl(id: ExtensionRef, path: string): string {
-  const clean = path.replace(/^\/+/, '')
-  const tail = `${id.marketplace}/${id.extension}/${clean}`
   const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent
-  const windowsOrMac = /Windows|Macintosh|Mac OS X/.test(ua)
-  return windowsOrMac ? `http://cide-ext.localhost/${tail}` : `cide-ext://localhost/${tail}`
+  return extAssetUrlFor(ua, id.marketplace, id.extension, path)
 }
 
 /* ==========================================================================================

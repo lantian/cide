@@ -29,6 +29,9 @@ pub mod handshake;
 pub mod image;
 pub mod keymap;
 pub mod layout;
+/// Node package managers' global-binary directories: where `npm -g` puts a thing on a machine
+/// whose shell rc, not its desktop launcher, put that directory on `PATH`.
+pub mod node_dirs;
 pub mod notes;
 pub mod persist;
 /// Process ancestry: whose child a pid is. The join key when a `claude` is not the process

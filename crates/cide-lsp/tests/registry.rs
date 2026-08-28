@@ -113,4 +113,23 @@ fn the_table_is_append_only_and_falls_back_to_the_builtins() {
     install(wanted);
     assert_eq!(sqls.args(), vec!["--config".to_string()]);
     assert_eq!(sqls.binary(), "sqls");
+
+    // A multi-language server labels each document with the document's own language, never
+    // its first-declared one — the didOpen label is what picks the dialect parser, and a css
+    // server handed an SCSS document labelled `css` reports every nested rule as an error.
+    // Needs a registry `install`, so it lives in this process rather than the unit tests.
+    let mut css = def("vscode-css-language-server");
+    css.language_ids = vec!["css".into(), "scss".into(), "less".into()];
+    let mut wanted = cide_ipc::lang::builtin_servers();
+    wanted.push(css);
+    let handles = install(wanted);
+    let css = handles[2];
+    assert_eq!(css.language_id_for(Some("scss")), "scss");
+    assert_eq!(css.language_id_for(Some("less")), "less");
+    assert_eq!(
+        css.language_id_for(Some("sass")),
+        "css",
+        "a language the server never declared falls back to the first-declared id"
+    );
+    assert_eq!(css.language_id_for(None), "css");
 }

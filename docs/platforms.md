@@ -514,6 +514,45 @@ carries a timeout, a cancel path and a user-facing *resolving shell environment 
 because that hangs in the field. It is the principled next step if a report names a directory the
 static list cannot reach, and it should arrive with a timeout and a log line rather than silently.
 
+## Every extension was dead on macOS, and the reason was four words in a comment
+
+Reported from a Mac: the yaml, graphql and protobuf panels each drew *its worker could not be
+loaded from `http://code-ext.localhost/…`*. Three extensions at once is not three bugs; it is one
+URL, and it was the platform split in `extAssetUrl`.
+
+Tauri serves a custom scheme two ways, and the boundary is **Windows and Android on one side,
+everything else on the other**:
+
+* Windows, Android — `http://<scheme>.localhost/<path>`
+* macOS, iOS, Linux — `<scheme>://localhost/<path>`
+
+That is the whole rule, and both ends of Tauri state it: the injected `convertFileSrc` in
+`tauri-2.11.5/scripts/core.js` branches on `osName === 'windows' || osName === 'android'` and on
+nothing else, and `App::register_uri_scheme_protocol`'s doc comment says it in prose. cide's
+`cmd/file.rs` had it right for `asset://`. `extAssetUrl` had it as *"Linux and Android"* versus
+*"macOS and Windows"* — one platform on the wrong side, matched by a
+`/Windows|Macintosh|Mac OS X/` test that did what the comment said.
+
+So on a Mac every extension asked for an origin nothing serves, the module fetch 404'd, and a
+module worker that fails to *load* fires a plain `Event` rather than an `ErrorEvent` — no
+`message`, no `filename` — which is why the panel could only name the URL. `host.ts`'s
+`describeError` was already written for exactly that and is the reason the report arrived with the
+wrong URL in it rather than as `YAML: undefined`; it is the second time that decision paid.
+
+**Why nothing caught it.** The failing arm is unreachable from the machine cide is developed on,
+the check suite never ran it, and the two documented safety nets miss it by construction: the
+Darwin type-check compiles `cfg(target_os = "macos")` arms and this is a *runtime* string
+comparison in TypeScript, and the `macos` CI job builds but does not launch. It is the same shape
+as the shell-launcher `PATH` bugs above — correct on Linux, total elsewhere, silent in between.
+
+**What holds it now.** The spelling moved to `ui/src/ext/assetUrl.ts`, import-free so that
+`scripts/check-ext.mjs` compiles it standalone and drives `extAssetUrlFor` with one user agent per
+platform — Linux, macOS, Windows, Android — asserting the URL each gets. Putting macOS back on the
+Windows side fails the check on a Linux machine, which is the only property that matters here.
+`cide_ext::assets::split_path` states the same rule from the Rust end, and states it as the reason
+the identity pair rides in the path: on two of the four platforms the host is the scheme's own
+name, so an identity put there survives only where nobody would have tested it.
+
 ## Packaging, and the half that money buys
 
 `cargo xtask package` grew `--app` and `--dmg`, a `crates/cide-app/tauri.macos.conf.json`
