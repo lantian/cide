@@ -134,6 +134,11 @@ pub fn settings_set(
     {
         registry.restart_everywhere(&app, cide_ipc::DiagnosticSourceId::for_server("gopls"));
     }
+    // The JSON-log toggle, which reaches running shells for the same reason as the threshold
+    // below — and needs no comparison and no registry walk to do it: every shell's renderer
+    // reads this one flag per line. Unconditional because storing the value it already holds
+    // costs an atomic store on a settings write.
+    crate::lifecycle::set_json_logs(settings.terminal.json_logs);
     // The job threshold reaches sessions that are already running, and it has to: a session
     // outlives every pane, tab and window — most shells are spawned once per app run — so a
     // value baked in at spawn would leave the settings row doing nothing visible until the

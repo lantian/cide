@@ -168,7 +168,14 @@ function window(
 
 // --- grouping ---------------------------------------------------------------------------------
 
-interface Edit {
+/**
+ * One changed block, as ranges into the two line arrays. Zero-based, end-exclusive.
+ *
+ * Exported since M35, for `editor/changeModel.ts` — the gutter's change markers classify a
+ * `diffLines` result into added/modified/deleted and need the shape to say so. Exporting a type
+ * adds no import, which is what keeps this file compilable on its own; see the header.
+ */
+export interface Edit {
   aFrom: number
   aTo: number
   bFrom: number

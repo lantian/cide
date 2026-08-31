@@ -502,6 +502,12 @@ pub struct InstalledExtension {
     /// Whether the user has it switched on. A disabled extension keeps its row, its manifest and
     /// its installed files; nothing of it reaches the registry.
     pub enabled: bool,
+    /// Whether its sidebar panels are drawn on the activity rail. (M31)
+    ///
+    /// Orthogonal to [`Self::enabled`] on purpose — see `cide_ext::config::Installed::rail_icon`,
+    /// which is the stored half and carries the argument. An extension with no sidebar panel is
+    /// unaffected by this whatever it says, and the Settings row is not drawn for one.
+    pub rail_icon: bool,
     /// The marketplace commit this copy was taken at. What an update compares against.
     pub commit: String,
     pub capabilities: Vec<Capability>,
@@ -693,4 +699,35 @@ pub struct InstallRequest {
     /// being drawn and the button being pressed, and the user would have approved a different
     /// extension from the one that installed.
     pub granted: Vec<Capability>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An extension reference accepts the two fields it declares and **refuses** a third.
+    ///
+    /// `deny_unknown_fields` is deliberate, and this test exists because of what it costs on
+    /// the other side of the wire. `InstalledExtension` structurally satisfies TypeScript's
+    /// `ExtensionRef` — it has both fields and a dozen more — and excess-property checking
+    /// applies only to object literals, so handing the whole installed row to a command
+    /// compiles cleanly and is rejected here at run time, with serde's own words reaching the
+    /// user as `unknown field \`name\`, expected \`marketplace\` or \`extension\``. That shipped:
+    /// the "Show on activity rail" toggle and every extension setting beside it. The fix is
+    /// `extRef` in `ui/src/ipc/client.ts`, which narrows at the seam so no caller can get it
+    /// wrong; `check:ext` asserts every command that names an extension goes through it.
+    #[test]
+    fn an_extension_reference_refuses_a_field_it_did_not_declare() {
+        let narrowed = r#"{"marketplace":"m","extension":"e"}"#;
+        let parsed: ExtensionRef = serde_json::from_str(narrowed).expect("the pair is the ref");
+        assert_eq!(parsed.marketplace.as_str(), "m");
+
+        let whole_row = r#"{"marketplace":"m","extension":"e","name":"Thing","version":"1.0.0"}"#;
+        let refused = serde_json::from_str::<ExtensionRef>(whole_row)
+            .expect_err("a superset must not be silently accepted");
+        assert!(
+            refused.to_string().contains("unknown field `name`"),
+            "{refused}"
+        );
+    }
 }

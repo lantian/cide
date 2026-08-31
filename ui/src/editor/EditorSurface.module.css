@@ -212,7 +212,18 @@
    * number sideways when the user switched from a `.md` tab to a `.rs` one, which is exactly the
    * flicker the 70px above exists to prevent.
    */
-  min-width: calc(70px + var(--fold-col));
+  /*
+   * The change column's width, named once so the two reservations and the column itself cannot
+   * drift. (M35)
+   *
+   * `ch` and not px, for `--fold-col`'s reason: it resolves against this element's own font — the
+   * code scale times 0.88, set below — so the strip follows `editor.fontSize` instead of becoming
+   * a sliver in a 20px buffer. The *bar* is narrower than the cell (`border-left` below) so it
+   * reads as IDEA's thin stripe, while the click target stays the full column: a 3px target is
+   * one nobody can hit.
+   */
+  --change-col: 1ch;
+  min-width: calc(70px + var(--fold-col) + var(--change-col));
   background: var(--tk-bg);
   color: var(--tk-gutter);
   border-right: none;
@@ -381,7 +392,7 @@
  */
 
 .body :global(.cm-gutters:has(.cm-blame)) {
-  min-width: calc(70px + var(--fold-col) + 22ch + 16px);
+  min-width: calc(70px + var(--fold-col) + var(--change-col) + 22ch + 16px);
 }
 
 .body :global(.cm-blame) {
@@ -501,6 +512,116 @@
  * read as one surface.
  */
 .body :global(.cm-tooltip.cm-blame-popup) {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  box-shadow: var(--shadow-1);
+  color: var(--text);
+}
+
+/* --- the change column, against HEAD (M35) -------------------------------------------- */
+
+/*
+ * Fixed, not `flex: 1` — `.cm-lineNumbers` takes the slack, so a column that shared it would take
+ * its width out of the numbers' share and shift every line number sideways. The reservation above
+ * grows by exactly this much, and it grows **unconditionally**, unlike the blame column's
+ * `:has()`: whether a particular file differs from HEAD changes with every keystroke, so a
+ * conditional reservation would move the numbers the instant somebody typed into a clean file.
+ * That is the flicker the fold column's comment already rejects, arriving many times a minute
+ * instead of once per tab switch.
+ */
+.body :global(.cm-cide-changes) {
+  flex: none;
+  width: var(--change-col);
+}
+
+/*
+ * **The cell is the containing block, and it has to be this element and not the column.**
+ *
+ * The deletion caret below is `position: absolute`, so it resolves against the nearest positioned
+ * ancestor. With `position: relative` on `.cm-cide-changes` — the whole column — every caret in
+ * the file stacks in the top-left corner of the gutter instead of sitting on its own line: they
+ * are all drawn, all in one place, off screen for any line that is scrolled past. Nothing throws
+ * and nothing is missing from the DOM, so the only symptom is a deletion that appears to paint
+ * no marker at all. It shipped that way for exactly one screenshot.
+ */
+.body :global(.cm-cide-changes .cm-gutterElement) {
+  position: relative;
+}
+
+/*
+ * The bar, and the three classes are not decoration.
+ *
+ * `highlightActiveLineGutter()` puts `cm-activeLineGutter` on **every** gutter element of the
+ * caret's line, and its rule paints `var(--tk-sel)` — so the caret's own line, which is the line
+ * the marker is most wanted on, would lose its bar the moment you typed into it. These rules are
+ * (0,3,0) against that rule's (0,2,0), which is what makes them win *regardless of source order*.
+ * Relying on the cascade tie-break would make a later reordering of this file a silent
+ * regression, which is the argument `.cm-blame-touched` above already makes.
+ *
+ * The colours are derived from the palette with `color-mix` rather than added to `tokens.css` —
+ * the precedent the `.cm-blame-age-N` ramp sets, and both themes come free from it. Deliberately
+ * **not** `--diff-add-bg`/`--diff-del-bg`: those are 10–12% washes designed to sit behind text in
+ * the diff pane, and as a hairline strip they are invisible. Reusing them is the instinct that
+ * ships an inert feature.
+ */
+.body :global(.cm-cide-changes .cm-gutterElement.cm-change-add) {
+  border-left: 0.5ch solid color-mix(in srgb, var(--green) 70%, transparent);
+  cursor: pointer;
+}
+
+.body :global(.cm-cide-changes .cm-gutterElement.cm-change-mod) {
+  border-left: 0.5ch solid color-mix(in srgb, var(--blue) 70%, transparent);
+  cursor: pointer;
+}
+
+/*
+ * A deletion has no line of its own, so its marker anchors on the line *below* the removed text
+ * and draws a triangle straddling the boundary between the two — which is where the lines were.
+ *
+ * Absolutely positioned, so it contributes nothing to layout: a gutter element's height is set
+ * from the text line beside it, and a marker that added height would slide the column out of step
+ * with the buffer for the rest of the file. `content: ''` with borders rather than a glyph, so
+ * there is no `font-size` here for `check:ui-scale` to catch — and `em`, so the caret grows with
+ * the editor scale the way `--fold-col` does.
+ *
+ * Full-strength `--red`: a 5px triangle at 70% disappears, which is not the same trade as a bar
+ * running the height of a line.
+ */
+.body :global(.cm-cide-changes .cm-gutterElement.cm-change-del) {
+  cursor: pointer;
+}
+
+.body :global(.cm-cide-changes .cm-gutterElement.cm-change-del)::before {
+  border-bottom: 0.3em solid transparent;
+  border-left: 0.5em solid var(--red);
+  border-top: 0.3em solid transparent;
+  content: '';
+  height: 0;
+  left: 0;
+  position: absolute;
+  top: 0;
+  transform: translateY(-50%);
+  width: 0;
+}
+
+/*
+ * A deletion past the last line has no line below it to sit above, so it anchors on the last line
+ * and draws on the bottom edge instead. A separate class and not a computed offset, because
+ * forgetting the case is a marker that is silently dropped: the text removed from the end of a
+ * file is exactly the text nothing else on screen mentions.
+ */
+.body :global(.cm-cide-changes .cm-gutterElement.cm-change-del-end)::before {
+  bottom: 0;
+  top: auto;
+  transform: translateY(50%);
+}
+
+/*
+ * The change card's frame — CodeMirror's own `.cm-tooltip` wrapper, styled from the same tokens
+ * as the blame card above so the two cards a gutter can produce read as one surface.
+ */
+.body :global(.cm-tooltip.cm-change-popup) {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--r-3);

@@ -1,0 +1,96 @@
+/*
+ * The log-line viewer. Scrim and card come from `OverlayCard`; this styles only what sits
+ * inside, on `ConfirmDestructive.module.css`'s measurements — the cards in this app are one
+ * gesture in several places and must not drift apart.
+ *
+ * Type comes from the `--fs-ui-*` ladder and nowhere else. A bare `font-size: 13px` is a label
+ * that silently stops following the UI font size, and it looks right at the default, which is
+ * where it would be written.
+ */
+
+.dialog {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.title {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.button {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-13);
+  line-height: 1;
+  padding: 7px 13px;
+  border-radius: var(--r-2);
+  border: 1px solid var(--border);
+  background: var(--chrome-hi);
+  color: var(--text);
+  cursor: default;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out);
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--dim);
+  color: var(--text-hi);
+}
+
+.button:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.button:disabled {
+  color: var(--faint);
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 18px 16px;
+}
+
+.note {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-13);
+  color: var(--dim);
+}
+
+/*
+ * `pre`, and the scroll is on `.body`: JSON is indented text, so re-wrapping it destroys the
+ * one thing the indentation was for, and a long string value must scroll rather than widen the
+ * card past the viewport.
+ */
+.json {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-code);
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre;
+}

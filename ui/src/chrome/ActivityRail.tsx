@@ -11,10 +11,12 @@
  * and measure the result. The git count is subscribed in `App.tsx` and passed down for that
  * reason and no other.
  */
-import { Fragment } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import { badgeLabel, badgeText } from '@/sidebar/GitPanel/model'
 import { groupDigits } from '@/overlays/format'
 import { Icon, type IconName, type IconSize } from '@/icons/Icon'
+import { useContextMenu } from '@/menus'
+import { railFit, railOverflowHint } from './railOverflow'
 import type { ActivityView } from './sidebarView'
 import styles from './ActivityRail.module.css'
 
@@ -269,6 +271,21 @@ export interface ActivityRailProps {
    * the developer running the audit has installed.
    */
   extra?: readonly RailItem[] | undefined
+  /**
+   * Contributed panels the user has taken *off* the rail in Settings. (M31)
+   *
+   * Never drawn as buttons, and always listed in the `···` menu — which is the whole reason
+   * they are a prop here rather than simply being filtered out of [`extra`] and forgotten.
+   * Dropping them would make the setting a one-way door: a rail button is the only route into
+   * a contributed panel, so "hide the icon" would silently mean "you can never open this
+   * again", and the way back would be a Settings page the user has no reason to connect with
+   * a panel that has vanished.
+   *
+   * So `···` means *panels not in the strip*, whichever reason put them there — the window is
+   * too short, or the user asked. One control, one sentence, and the setting stays a
+   * preference about the icon strip instead of a destructive act.
+   */
+  extraHidden?: readonly RailItem[] | undefined
 }
 
 export function ActivityRail({
@@ -283,6 +300,7 @@ export function ActivityRail({
   toolWindowOpen,
   onToggleToolWindow,
   extra,
+  extraHidden,
 }: ActivityRailProps) {
   /*
    * The builtins, with the contributed buttons spliced in ahead of the spacer.
@@ -296,6 +314,103 @@ export function ActivityRail({
       ? ITEMS
       : [...ITEMS.slice(0, SPACER_AT), ...extra, ...ITEMS.slice(SPACER_AT)]
   const spacerAt = items.findIndex((item) => item.bottom === true)
+
+  /*
+   * How many of the top buttons fit, and the menu for the ones that do not. (M31)
+   *
+   * The arithmetic is `railOverflow.railFit`, which is a function of the container and of two
+   * CSS lengths and nothing else — see its header for why measured boxes would be a feedback
+   * loop here where they are the only honest input on the tab strip.
+   *
+   * The lengths are read off the DOM rather than written as `32` and `4` in this file. They are
+   * declared in `ActivityRail.module.css`, whose comments tune them (32px "from 28", the gap is
+   * `--sp-2`), and a second copy here would be a rail that miscounts by a slot the first time
+   * anybody retunes the stylesheet — silently, and only on a short window, which is the one
+   * place nobody looks.
+   */
+  const railEl = useRef<HTMLDivElement | null>(null)
+  const [shown, setShown] = useState<number>(spacerAt)
+  const flexible = spacerAt
+  // Settings and whatever else sits after the spacer, plus the tool-window toggle below the
+  // tablist. Never collapsed: the menu is reached through the rail, so a rail that could clip
+  // its own last controls could clip the way out of its own overflow.
+  const pinned = items.length - spacerAt + 1
+  const measure = useCallback(() => {
+    const box = railEl.current
+    if (box === null) return
+    const first = box.querySelector<HTMLElement>('[data-audit="railIcon"]')
+    if (first === null) return
+    const style = window.getComputedStyle(box)
+    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+    const gap = parseFloat(style.rowGap)
+    const next = railFit({
+      available: box.clientHeight - (Number.isFinite(padding) ? padding : 0),
+      item: first.offsetHeight,
+      gap: Number.isFinite(gap) ? gap : 0,
+      flexible,
+      pinned,
+    })
+    // Identity is already a primitive here, but the guard still matters: the effect below runs
+    // on every commit with no dependency array, and an unconditional `setShown` would be a
+    // state write per render — a loop that shows up only as the app pinning a core.
+    setShown((prev) => (prev === next ? prev : next))
+  }, [flexible, pinned])
+
+  /*
+   * Trigger 1: every commit, after paint. No dependency array, for `TabStrip`'s reason — the
+   * things that change the answer are not enumerable (a contributed panel arrives, `--ui-scale`
+   * moves the header and status bar, the window is tiled) and a dependency array is how this
+   * goes stale. Stale is worse than absent: it lists a panel that is on screen, or hides while
+   * three are not.
+   *
+   * `useEffect` and not `useLayoutEffect`, also for `TabStrip`'s reason: a layout effect reads
+   * geometry while the commit that triggered it has just dirtied style across the document, so
+   * it forces a full synchronous layout of the window on every render. After paint the same
+   * reads cost nothing, at the price of the control updating one painted frame late.
+   */
+  useEffect(measure)
+
+  // Trigger 2: the rail changing size without re-rendering — the window resized, a detached
+  // window tiled, the status bar growing under `--ui-scale`. None of those is a commit here.
+  useEffect(() => {
+    const box = railEl.current
+    if (box === null || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(measure)
+    observer.observe(box)
+    return () => observer.disconnect()
+  }, [measure])
+
+  const hidden = [
+    ...items.slice(Math.min(shown, flexible), flexible),
+    ...(extraHidden ?? []),
+  ]
+  const overflowAnchor = useRef<HTMLButtonElement | null>(null)
+  /*
+   * `items` is called at open time, so the list is built from the measurement as it stands when
+   * the user presses rather than from whatever was true at the last render — `TabStrip`'s
+   * overflow menu makes the same point.
+   *
+   * Reusing `useContextMenu` rather than writing a popup brings the keyboard model, the
+   * dismiss-on-scroll/resize/blur handling and `placeMenu`'s edge flipping with it, and it
+   * portals to the app root so no `overflow: hidden` ancestor can clip it — which matters here
+   * more than anywhere, because the ancestor that clips this rail is the reason the control
+   * exists.
+   */
+  const overflow = useContextMenu({
+    label: 'Panels not in view',
+    items: () =>
+      hidden.map((item) => ({
+        // Prefixed for `overflowEntries`' reason: a bare view id would read as though the entry
+        // *were* the panel rather than a way to reach it.
+        id: `rail-overflow:${item.id}`,
+        label: item.label,
+        ...(onSelect
+          ? { run: () => onSelect(item.id) }
+          : // `chrome/layoutAudit.ts` renders a handler-free rail; a live-looking row that does
+            // nothing on click is the failure the menu model exists to make unrepresentable.
+            { disabled: true }),
+      })),
+  })
   /*
    * Keyed by view id so the loop stays layout-only; more entries land here, not in JSX.
    *
@@ -359,7 +474,12 @@ export function ActivityRail({
   }
 
   return (
-    <div className={styles.rail} data-audit="rail" role="group" aria-label="Activity">
+    <div
+      ref={railEl}
+      className={styles.rail}
+      data-audit="rail"
+      role="group"
+      aria-label="Activity">
       {/*
        * `display: contents`, so the tab buttons and the spacer are still direct flex children of
        * `.rail`: the 42px width, the 8px padding, the 2px gap and the chrome audit's
@@ -378,7 +498,15 @@ export function ActivityRail({
         aria-orientation="vertical"
         aria-label="Sidebar panels"
       >
+      {/*
+       * The buttons that fit, plus everything from the spacer down. `shown` only ever bites
+       * into the flexible run above the spacer — see `pinned` in `railFit`.
+       */}
       {items.map((item, i) => {
+        // Collapsed into the overflow menu below. Only the flexible run above the spacer is
+        // ever dropped; `railFit`'s `pinned` is what keeps Settings and the tool-window toggle
+        // out of it, so the way *out* of an overfull rail can never itself be clipped.
+        if (i >= shown && i < flexible) return null
         const selected = item.id === active
         const badge = badges[item.id]
         const busyHere = item.id === 'problems' && busy === true
@@ -437,6 +565,52 @@ export function ActivityRail({
       })}
       </div>
       {/*
+       * The way into whatever did not fit. (M31)
+       *
+       * Drawn only when something is actually hidden, so a rail with room is unchanged — which
+       * is what keeps `CIDE_AUDIT=1`'s measurements (taken at a forced 1440×900) exactly as
+       * they were.
+       *
+       * # Why it sits here and not next to the buttons it stands for
+       *
+       * Because the tablist above must own nothing but tabs, which is the rule that put the
+       * tool-window toggle out here in the first place and it is not weaker for this control:
+       * a `<button>` that opens a menu is not a tab, and one sitting inside a `tablist` tells a
+       * screen reader that the panel list contains something that cannot be selected. The
+       * spacer that pushes Settings to the foot lives *inside* the tablist (it has to — the
+       * wrapper is `display: contents`, so its children are the rail's own flex items, in
+       * order), so anything rendered after the wrapper necessarily lands at the bottom.
+       *
+       * That is also where it reads best: the foot of the rail is where the controls that are
+       * always present already live, and it is where a reader looks when the list above them
+       * has visibly run out of room.
+       */}
+      {hidden.length > 0 && (
+        <button
+          type="button"
+          ref={overflowAnchor}
+          className={styles.item}
+          data-audit="railIcon"
+          data-audit-role="railOverflow"
+          // The count lives in the name and never on the glyph — a label that grew a digit
+          // would change this control's height, which changes what fits, which changes the
+          // digit. `railOverflow.railOverflowHint` is the shared wording.
+          title={railOverflowHint(hidden.length)}
+          aria-label={railOverflowHint(hidden.length)}
+          aria-haspopup="menu"
+          aria-expanded={overflow.isOpen}
+          onClick={() => {
+            const el = overflowAnchor.current
+            if (el !== null) overflow.openFor(el)
+          }}
+        >
+          {/* Already in the vendored set, so this adds no mark — `check:ui-icons` keeps
+              that set closed in both directions. The ellipsis is the "there is more here"
+              mark the rest of the app already uses. */}
+          <Icon name="ellipsis" size={RAIL_ICON} />
+        </button>
+      )}
+      {/*
        * The git tool window's toggle. Renders after the wrapper, so it is the bottom-most item in
        * the rail — the spacer that pushes ⚙ down lives inside the tablist, and anything after the
        * wrapper falls below it.
@@ -465,6 +639,7 @@ export function ActivityRail({
             ⚙'s 14×14, which is the report this change answers. */}
         <Icon name="panel-bottom" size={RAIL_ICON} />
       </button>
+      {overflow.menu}
     </div>
   )
 }

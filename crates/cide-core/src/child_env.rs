@@ -403,14 +403,18 @@ fn under(entry: &str, root: &str) -> bool {
 
 /// The `PATH` a child should be given, or `None` to leave the inherited one alone.
 ///
-/// The impure wrapper: reads this process's `PATH` and [`crate::toolchain::extra_dirs`], and
-/// hands both to [`child_path_in`]. `scrub` must be the [`bundle_scrub`] the same spawn is about
-/// to apply — see [`child_path_in`] for why that is not optional.
+/// The impure wrapper: reads this process's `PATH` and [`crate::toolchain::discovered_dirs`],
+/// and hands both to [`child_path_in`]. `scrub` must be the [`bundle_scrub`] the same spawn is
+/// about to apply — see [`child_path_in`] for why that is not optional.
+///
+/// `discovered_dirs` rather than `extra_dirs` since M35: the list now has a second source (what
+/// the user's login shell reported, see [`crate::login_path`]) and `search_paths` reads the same
+/// function, which is what keeps find-it and give-it one list.
 pub fn child_path(scrub: &[EnvChange]) -> Option<EnvChange> {
     child_path_in(
         scrub,
         std::env::var_os("PATH").as_deref(),
-        crate::toolchain::extra_dirs(),
+        &crate::toolchain::discovered_dirs(),
     )
 }
 
@@ -475,7 +479,7 @@ pub fn prepare_command(command: &mut Command) {
     prepare_command_with(command, &[]);
 }
 
-/// [`crate::toolchain::extra_dirs`] with a caller's own directories appended.
+/// [`crate::toolchain::discovered_dirs`] with a caller's own directories appended.
 ///
 /// Pure, and separate from [`prepare_command_with`], so the append-and-dedup rule is a thing a
 /// test can state: the impure half reads the process environment and mutates a [`Command`], and
@@ -516,9 +520,30 @@ fn dirs_with(base: &[std::path::PathBuf], extra: &[std::path::PathBuf]) -> Vec<s
 /// nothing here can shadow a directory the user arranged themselves.
 pub fn prepare_command_with(command: &mut Command, extra: &[std::path::PathBuf]) {
     let scrub = bundle_scrub();
-    let dirs = dirs_with(crate::toolchain::extra_dirs(), extra);
+    let dirs = dirs_with(&crate::toolchain::discovered_dirs(), extra);
     let path = child_path_in(&scrub, std::env::var_os("PATH").as_deref(), &dirs);
     for (name, value) in scrub.into_iter().chain(path) {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+}
+
+/// [`prepare_command`] with the `PATH` pass **skipped** — the bundle scrub and nothing else.
+///
+/// Exactly one caller, and it is the one child in the workspace whose whole purpose is to
+/// disagree with cide about `PATH`: [`crate::login_path`]'s probe, which asks the user's login
+/// shell what *it* thinks `PATH` is. Handing that child cide's augmented list would make the
+/// answer partly cide's own, and — the reason this is a separate function rather than a
+/// judgement call at the call site — the augmented list is built from
+/// [`crate::toolchain::discovered_dirs`], which consults the very probe that is running, so the
+/// ordinary path is a wait on a result that cannot arrive.
+///
+/// The scrub still applies, because it is about a bundle's `LD_LIBRARY_PATH` and `PYTHONHOME`
+/// and those poison a shell exactly as they poison anything else (ADR 0007).
+fn prepare_command_scrub_only(command: &mut Command) {
+    for (name, value) in bundle_scrub() {
         match value {
             Some(value) => command.env(name, value),
             None => command.env_remove(name),
@@ -602,15 +627,41 @@ pub fn run_filter(
 /// the honest answer for both and neither call site should have to write it. See
 /// [`prepare_command_with`] for the rule and for the shebang failure it prevents.
 pub fn run_filter_with(
-    mut command: Command,
+    command: Command,
     stdin: Option<&[u8]>,
     deadline: std::time::Duration,
     extra_path: &[std::path::PathBuf],
 ) -> Result<Filtered, FilterError> {
+    run_filter_inner(command, stdin, deadline, Some(extra_path))
+}
+
+/// [`run_filter`] for the one child that must **not** be handed cide's `PATH`.
+///
+/// See [`prepare_command_scrub_only`], which carries the argument. Everything else — the three
+/// threads, the deadline, [`arm`] — is identical, which is why this is a wrapper and not a
+/// second copy: the deadlock the copy would eventually get wrong does not throw, it hangs.
+pub fn run_filter_bare(
+    command: Command,
+    stdin: Option<&[u8]>,
+    deadline: std::time::Duration,
+) -> Result<Filtered, FilterError> {
+    run_filter_inner(command, stdin, deadline, None)
+}
+
+/// `extra_path` of `None` means "skip the `PATH` pass entirely" — see [`run_filter_bare`].
+fn run_filter_inner(
+    mut command: Command,
+    stdin: Option<&[u8]>,
+    deadline: std::time::Duration,
+    extra_path: Option<&[std::path::PathBuf]>,
+) -> Result<Filtered, FilterError> {
     use std::io::{Read, Write};
     use std::process::Stdio;
 
-    prepare_command_with(&mut command, extra_path);
+    match extra_path {
+        Some(extra) => prepare_command_with(&mut command, extra),
+        None => prepare_command_scrub_only(&mut command),
+    }
     arm(&mut command);
     command
         .stdin(if stdin.is_some() {

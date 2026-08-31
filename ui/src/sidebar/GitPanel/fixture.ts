@@ -30,6 +30,7 @@ import type {
   RepoChanges,
   ShelfRow,
 } from './types'
+import { fileRowId } from './model'
 
 export type GitStoryName = 'mock' | 'guard' | 'multi' | 'empty' | 'conflict'
 
@@ -273,14 +274,55 @@ export const SHELF_FIXTURE: readonly ShelfRow[] = [
 export interface GitStory {
   status: ChangesTree
   shelf: readonly ShelfRow[]
+  /**
+   * The file rows this story opens with ticked. (M31)
+   *
+   * A story is *a panel somebody has already been working in*, so it names its own ticks.
+   * They used to come from `model.ts::defaultSelection`, which ticked the active changelist
+   * for every panel — and when that default was removed (a commit is opt-in now; the report
+   * was *"git tree commits everything when commiting"*) the stories went with it, and
+   * `check:render` lost every `true` and `mixed` box it was asserting on.
+   *
+   * The rule did not need to be *kept*, it needed to move: "the active changelist is ticked"
+   * is a perfectly good description of a fixture and a bad description of a product default.
+   * Living here it exercises the tri-state climb through directory and group rows without
+   * putting a single tick in front of a real user.
+   */
+  ticks: readonly string[]
+}
+
+/**
+ * The active changelist's files, as row ids — what a story ticks.
+ *
+ * Deliberately a copy of the rule `defaultSelection` used to apply, and deliberately *not* a
+ * re-export of it: bringing that function back is exactly what `check:git` now asserts nobody
+ * has done. Only the id *spelling* is shared, through `fileRowId`, because two spellings of a
+ * row id is a fixture that ticks rows the panel cannot find — silent, and it would read as a
+ * rendering bug.
+ *
+ * Flat over `repos`: a submodule is its own `RepoChanges` entry on the wire, and the nesting
+ * `RepoView.children` shows is built by `normalizeStatus` afterwards.
+ */
+function activeTicks(status: ChangesTree): string[] {
+  const out: string[] = []
+  for (const repo of status.repos) {
+    const hasActive = repo.changelists.some((list) => list.active)
+    for (const list of repo.changelists) {
+      if (hasActive && !list.active) continue
+      for (const change of list.changes) out.push(fileRowId(repo.repo.id, change.path))
+    }
+  }
+  return out
 }
 
 const STORIES: Record<GitStoryName, GitStory> = {
-  mock: { status: MOCK_STATUS, shelf: SHELF_FIXTURE },
-  guard: { status: GUARD_STATUS, shelf: SHELF_FIXTURE },
-  multi: { status: MULTI_STATUS, shelf: SHELF_FIXTURE },
-  empty: { status: EMPTY_STATUS, shelf: [] },
-  conflict: { status: CONFLICT_STATUS, shelf: [] },
+  mock: { status: MOCK_STATUS, shelf: SHELF_FIXTURE, ticks: activeTicks(MOCK_STATUS) },
+  guard: { status: GUARD_STATUS, shelf: SHELF_FIXTURE, ticks: activeTicks(GUARD_STATUS) },
+  multi: { status: MULTI_STATUS, shelf: SHELF_FIXTURE, ticks: activeTicks(MULTI_STATUS) },
+  empty: { status: EMPTY_STATUS, shelf: [], ticks: [] },
+  // Nothing ticked: a conflicted path cannot be committed at all, so a story that ticked one
+  // would be describing a state the panel must never reach.
+  conflict: { status: CONFLICT_STATUS, shelf: [], ticks: [] },
 }
 
 /**

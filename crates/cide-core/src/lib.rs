@@ -27,8 +27,10 @@ pub mod format;
 pub mod handshake;
 /// Images: what a file is, from its own bytes. The sibling of [`document`], never its pixels.
 pub mod image;
+pub mod jsonlog;
 pub mod keymap;
 pub mod layout;
+pub mod login_path;
 /// Node package managers' global-binary directories: where `npm -g` puts a thing on a machine
 /// whose shell rc, not its desktop launcher, put that directory on `PATH`.
 pub mod node_dirs;
@@ -42,6 +44,7 @@ pub mod proxy;
 /// Editor colour schemes: importing a VS Code theme, and the imported ones on disk.
 pub mod scheme;
 pub mod scratch;
+pub mod shell;
 pub mod toolchain;
 pub mod toolwindow;
 pub mod workspace;

@@ -19,6 +19,9 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { notify } from '@/chrome/notices'
+import { showLogDetail } from '@/chrome/logDetailStore'
+import { paneSession } from '@/ipc/client'
+import { parseLogLink } from './logLink'
 import { terminalKeyGate } from '@/keys/gate'
 import {
   terminalClipboardAction,
@@ -235,7 +238,26 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
      * resolves them against the project and opens a tab, never a URL.
      */
     linkHandler: {
+      /*
+       * `allowNonHttpProtocols` is on so that `cide-log:` reaches this function at all — with
+       * it at its default of `false`, `OscLinkProvider` drops every non-http URI before a
+       * handler is ever asked, which is what used to make the note below the whole story.
+       *
+       * Turning it on does not widen what cide *opens*, because this handler opens nothing it
+       * does not recognise: `file:` and `javascript:` from a program's own OSC 8 sequence land
+       * in the same refusal `https:` does. xterm never navigates on its own once a
+       * `linkHandler` is installed — it calls this — so the decision stays here, in one place,
+       * where it can be read.
+       */
+      allowNonHttpProtocols: true,
       activate: (_event, uri) => {
+        // A rendered JSON log line's timestamp. See `terminal/logLink.ts` for the URI and
+        // `cide_app::logring` for what is on the other end of the handle.
+        const target = parseLogLink(uri)
+        if (target !== null) {
+          showLogDetail(() => paneSession.logDetail(target.session, target.handle))
+          return
+        }
         notify(`cide does not open web links from terminal output: ${oneLine(uri)}`, {
           kind: 'warn',
           hint: 'Copy the address and open it in a browser.',

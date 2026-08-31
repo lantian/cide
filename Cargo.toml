@@ -130,6 +130,22 @@ zip = { version = "4.6.0", default-features = false, features = ["deflate-flate2
 # `miniz_oxide`, which the image decoders already build — so the whole `.vsix` road costs `zip`,
 # `arbitrary` and nothing else.
 flate2 = "1.1.9"
+# Encoding the clipboard's bitmap as a PNG, for *Paste* over the file tree and the editor. (M35)
+#
+# The whole encoder and nothing else: the clipboard hands over raw RGBA and a file has to hold
+# a format. `image` was the alternative and it is the wrong size of tool here — it is a decoder
+# and codec suite for two dozen formats, all of which this workspace already refuses to depend
+# on (`cide_core::image` sniffs bytes and never decodes; the pixels are the webview's job, see
+# `crates/cide-ipc/src/image.rs`). `png` is one format, it is what a screenshot is, and 0.18 is
+# a version already in `Cargo.lock` through the graph — so this costs the build nothing new.
+#
+# `default-features = false` drops `rayon`: a paste is one image on a thread that is already
+# blocking, and a thread pool for it would be started once and used once.
+png = { version = "0.18.1", default-features = false }
+# Naming a pasted image after the moment it was pasted, in the user's own timezone. Already in
+# the graph via `tauri-plugin-log`; `default-features = false` with `clock` and `std` is the
+# local-time conversion and nothing else — no serde, no `oldtime`, no parser.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 nucleo = "0.5.0"
 # Content search. `nucleo` is a fuzzy matcher over paths and is the wrong tool for a grep:
 # it scores a subsequence, and "every line that loosely resembles the query" is noise when

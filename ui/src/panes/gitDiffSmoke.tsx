@@ -413,6 +413,15 @@ export interface DiffDigest {
   applyLabel: string | null
   applyDisabled: boolean
   note: string | null
+  /**
+   * The sentence under *"Nothing to show on this side."*, or `null` when a diff is drawn.
+   *
+   * Exposed in M31 because nothing drove it and it was wrong: the pane stringified a tagged
+   * `GitError` with `String(e)` and rendered `[object Object]` here, on the commonest path
+   * there is — committing a file whose diff is open. A prop no digest reads is a prop no
+   * check can be wrong about.
+   */
+  reason: string | null
   /** The `from → to` the read-only header names, or `null` in the staging arm. */
   revisions: string | null
   /** Whether the side switcher is drawn. Must be false for a diff of two commits. */
@@ -745,6 +754,7 @@ function digest(
     applyLabel: apply?.[2] ?? null,
     applyDisabled: apply?.[1]?.includes('disabled') ?? false,
     note: /data-audit="gitDiffNote"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
+    reason: /data-audit="gitDiffWhy"[^>]*>([^<]*)</.exec(html)?.[1]?.trim() ?? null,
     revisions:
       /data-audit="gitDiffRevisions"[^>]*>([\s\S]*?)<\/span>/
         .exec(html)?.[1]
@@ -830,6 +840,7 @@ function readOnlyDigest(
     applyLabel: apply?.[2] ?? null,
     applyDisabled: apply?.[1]?.includes('disabled') ?? false,
     note: /data-audit="gitDiffNote"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
+    reason: /data-audit="gitDiffWhy"[^>]*>([^<]*)</.exec(html)?.[1]?.trim() ?? null,
     revisions:
       /data-audit="gitDiffRevisions"[^>]*>([\s\S]*?)<\/span>/
         .exec(html)?.[1]

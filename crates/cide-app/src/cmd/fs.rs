@@ -874,14 +874,24 @@ pub(crate) fn create_entry(
     directory: bool,
 ) -> Result<PathBuf, FsError> {
     let created = ops::create_in(&fs.writable_paths(), parent, name, directory)?;
+    Ok(show_now(fs, created))
+}
 
+/// Put a just-created path into this project's index and search matcher, and answer with it.
+///
+/// The tail [`create_entry`] used to end with, split out when M35's `fs_paste_image` became
+/// the second caller. The promise is the one `fs_create_in`'s doc states — *the tree shows the
+/// row now* — and it is worth exactly one copy: the watcher will report the same create a few
+/// hundred milliseconds later, and a second implementation of the fold that got it subtly
+/// wrong would show as a row appearing twice, or not until the user clicked something.
+fn show_now(fs: &crate::files::ProjectFs, created: PathBuf) -> PathBuf {
     // A scratch is not in the index and never will be, so the fold below cannot show it: the
     // drawer is re-listed instead, which is the same "the row exists before this returns"
     // promise by the other mechanism. Returned early because the two are exclusive — a path
     // cannot be both inside a project root and inside the drawer.
     if fs.groups().is_scratch_path(&created) {
         fs.groups().relist_scratches();
-        return Ok(created);
+        return created;
     }
 
     // The same fold the watcher does, run here so the tree does not have to wait for it.
@@ -901,7 +911,75 @@ pub(crate) fn create_entry(
             item.path.to_string_lossy().into_owned(),
         ));
     }
-    Ok(created)
+    created
+}
+
+/// Write the system clipboard's image into `dest_dir` as a PNG, and put the row in the tree. (M35)
+///
+/// # The gesture
+///
+/// *Paste* over a folder in the file tree, and Ctrl+V in an editor buffer, when what is on the
+/// clipboard is a screenshot rather than text. The reported ask was to be able to "create image
+/// file in place where we pasting it", and that is what this does — no dialog, no name to type,
+/// no temporary directory in between.
+///
+/// # Why the whole round trip is in Rust
+///
+/// `crates/cide-ipc/src/image.rs` opens by stating that pixels never cross the IPC, and this
+/// obeys it in the direction nobody had needed yet. The clipboard holds a **bitmap**, not a
+/// PNG — 33 MB of RGBA for a 4K screenshot — so the alternatives were to marshal that into the
+/// webview as a JSON array of decimal numbers and encode it there, or to do what this does:
+/// read, encode and write on one blocking thread, and hand back a path. The frontend names a
+/// directory and receives a path; nothing else about the image is ever in JavaScript.
+///
+/// It also sidesteps every objection `ui/src/terminal/clipboard.ts` records against the
+/// *plugin command* `read_image`. That is the webview-facing one: it needs a capability this
+/// app deliberately does not grant, and it answers with a `ResourceId` into the window's
+/// resource table that needs `core:resources:allow-close` to free — so each call would leak a
+/// full bitmap for the life of the window. `ClipboardExt::read_image` is the Rust API behind
+/// it, is not capability-gated (capabilities gate `invoke`, not the host), and hands back an
+/// owned `Image` that drops at the end of this function. None of those three objections
+/// survives the move; the Ctrl+V decision that module documents is unchanged and this is not
+/// on that path.
+///
+/// # The refusal that must stay distinguishable
+///
+/// [`FsError::NoClipboardImage`] rather than prose: the tree's Ctrl+V reaches this whenever
+/// there is no in-app file clip, so an empty or text-only clipboard is the *ordinary* outcome
+/// and the frontend has to be able to say nothing at all. See the variant's own note.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_paste_image(
+    app: tauri::AppHandle,
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    dest_dir: PathBuf,
+) -> Result<PathBuf, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_paste_image", move || {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+
+        // The read and the encode both happen here, on the blocking pool. `read_image` is an
+        // X11/Wayland round trip on Linux and an `NSPasteboard` read on macOS, and the encode
+        // is the expensive half — neither belongs on the thread that draws the window.
+        //
+        // Any error at all is "no image": the plugin reports an empty clipboard, a clipboard
+        // holding only text, and a clipboard whose owner has gone away through the same
+        // `Err`, and the caller's question is the same in all three.
+        let image = app
+            .clipboard()
+            .read_image()
+            .map_err(|_| FsError::NoClipboardImage)?;
+        let bytes = cide_core::image::encode_png(image.rgba(), image.width(), image.height())
+            .map_err(|e| FsError::Io {
+                path: dest_dir.display().to_string(),
+                message: e.to_string(),
+            })?;
+
+        let name = cide_core::image::pasted_image_name_now();
+        let written = ops::write_new_bytes(&fs.writable_paths(), &dest_dir, &name, &bytes)?;
+        Ok(show_now(&fs, written))
+    })
+    .await?
 }
 
 /// Create a scratch file of `ext` in this project's drawer, and answer where it landed.

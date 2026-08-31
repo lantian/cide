@@ -38,11 +38,11 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { notify } from '@/chrome/notices'
+import { openPushDialog } from '@/chrome/pushRun'
 import { create } from 'zustand'
 import {
   branch as branchApi,
   events,
-  git as gitApi,
   pendingCommand,
   type BranchInfo,
   type BranchList,
@@ -62,7 +62,6 @@ import {
   checkoutNote,
   explain,
   fetchNote,
-  pushNote,
   headLabel,
   headTitle,
   kindOf,
@@ -705,16 +704,27 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   type="button"
                   className={styles.action}
                   disabled={busy || !canPush(list?.head ?? null)}
-                  onClick={() =>
-                    act(async (p, r) => {
-                      // A branch with no upstream needs one, and this is the gesture that
-                      // means "publish this branch" — the same thing `git push -u` does. It is
-                      // still the only caller that passes it, which is why it is also the only
-                      // one that can reach `pushNote`'s *Published …* arm.
-                      const publish = (list?.head.upstream ?? null) === null
-                      return pushNote(await gitApi.push(p, r, null, null, publish))
-                    })
-                  }
+                  /*
+                   * Opens the dialog rather than pushing, since M31 — the same road the palette
+                   * takes, because two routes to one gesture that disagreed about whether it
+                   * asked first is exactly the class of split M20 already paid for here (the
+                   * panel's dim note line against the palette's red box, over one rejection).
+                   *
+                   * The dialog covers the whole project and this button belongs to one
+                   * repository's popup. That is not a mismatch to fix by narrowing it: the
+                   * project is what `git.push` has always meant, the dialog names every row, and
+                   * the row for the repository whose popup this is arrives ticked like the rest.
+                   *
+                   * `--set-upstream` is no longer decided here either. It was the only caller
+                   * that passed it, worked out from `head.upstream === null`; the preview reads
+                   * the same fact off the absent remote-tracking ref, per row, and `pushPass`
+                   * sends it.
+                   */
+                  onClick={() => {
+                    if (project === null) return
+                    onDismiss()
+                    openPushDialog(project)
+                  }}
                 >
                   Push
                 </button>

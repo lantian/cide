@@ -172,7 +172,7 @@
 //! *live* TUI in the pane; this makes the transcript readable without it.
 
 use cide_ipc::RunState;
-use cide_pty::{Geometry as PtyGeometry, SpawnSpec};
+use cide_pty::{Geometry as PtyGeometry, Rendered, SpawnSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -407,49 +407,49 @@ const RESET: &str = "\x1b[0m";
 /// * the model's own text passes whole, reasoning passes dimmed and clipped;
 /// * `step_start` draws nothing, `step_finish` is one dim token count;
 /// * an event type this build has never heard of becomes a dim one-word marker rather than a
-///   screenful of JSON, and **a line that is not JSON passes verbatim** — that is the CLI's own
+///   screenful of JSON, and **a line that is not JSON is kept verbatim** — that is the CLI's own
 ///   prose (a warning, a rejected permission) and hiding it would hide the failure.
 ///
 /// Styling is bare SGR (dim/bold/cyan/red), which every theme already maps; no colour is load-
 /// bearing.
-pub fn render_event(line: &str) -> Option<String> {
+pub fn render_event(line: &str) -> Rendered {
     let Ok(Value::Object(event)) = serde_json::from_str::<Value>(line) else {
-        return Some(line.to_string());
+        return Rendered::Keep;
     };
     let Some(kind) = event.get("type").and_then(Value::as_str) else {
-        return Some(line.to_string());
+        return Rendered::Keep;
     };
     let part = event.get("part").unwrap_or(&Value::Null);
 
     match kind {
-        "step_start" => None,
+        "step_start" => Rendered::Drop,
         "step_finish" => {
             let reason = part.get("reason").and_then(Value::as_str).unwrap_or("done");
             let total = part
                 .pointer("/tokens/total")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            Some(format!("{DIM}· {reason} · {} tok{RESET}", thousands(total)))
+            Rendered::Replace(format!("{DIM}· {reason} · {} tok{RESET}", thousands(total)))
         }
         "text" => {
             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
             let text = text.trim_end();
             if text.is_empty() {
-                return None;
+                return Rendered::Drop;
             }
-            Some(format!("{BOLD}{text}{RESET}"))
+            Rendered::Replace(format!("{BOLD}{text}{RESET}"))
         }
         "reasoning" => {
             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
             let text = one_line_of(text);
             if text.is_empty() {
-                return None;
+                return Rendered::Drop;
             }
-            Some(format!("{DIM}∴ {}{RESET}", clip(&text, REASONING_BUDGET)))
+            Rendered::Replace(format!("{DIM}∴ {}{RESET}", clip(&text, REASONING_BUDGET)))
         }
-        "tool_use" => Some(render_tool(part)),
-        "error" => Some(format!("{RED}✗ {}{RESET}", one_line_of(&part.to_string()))),
-        other => Some(format!("{DIM}· {other}{RESET}")),
+        "tool_use" => Rendered::Replace(render_tool(part)),
+        "error" => Rendered::Replace(format!("{RED}✗ {}{RESET}", one_line_of(&part.to_string()))),
+        other => Rendered::Replace(format!("{DIM}· {other}{RESET}")),
     }
 }
 
@@ -883,8 +883,11 @@ mod tests {
     #[test]
     fn the_rendering_reads_as_a_transcript_and_hides_no_failure() {
         // The channel's own noise draws nothing or one dim marker.
-        assert_eq!(render_event(STEP_START), None);
-        let finish = render_event(STEP_FINISH).expect("rendered");
+        assert_eq!(render_event(STEP_START), Rendered::Drop);
+        let finish = render_event(STEP_FINISH)
+            .text()
+            .expect("rendered")
+            .to_string();
         assert!(
             finish.contains("stop") && finish.contains("5.7k tok"),
             "{finish}"
@@ -896,7 +899,7 @@ mod tests {
             r#"{{"type":"tool_use","sessionID":"s","part":{{"type":"tool","tool":"bash","state":{{"status":"completed","input":{{"command":"ls -la"}},"output":{},"title":"ls -la"}}}}}}"#,
             serde_json::to_string(big_output).unwrap()
         );
-        let rendered = render_event(&tool).expect("rendered");
+        let rendered = render_event(&tool).text().expect("rendered").to_string();
         assert!(
             rendered.contains("● bash") && rendered.contains("ls -la"),
             "{rendered}"
@@ -914,7 +917,7 @@ mod tests {
         // The rejected permission — the failure that used to be findable only in opencode's own
         // database — is red and verbatim.
         let rejected = r#"{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"bash","state":{"status":"error","input":{"command":"cat ~/.cargo/config.toml"},"error":"The user rejected permission to use this specific tool call."}}}"#;
-        let rendered = render_event(rejected).expect("rendered");
+        let rendered = render_event(rejected).text().expect("rendered").to_string();
         assert!(
             rendered.contains("✗ bash") && rendered.contains("rejected permission"),
             "{rendered}"
@@ -922,13 +925,16 @@ mod tests {
 
         // The model's words pass whole; reasoning passes dimmed and clipped.
         let text = r#"{"type":"text","sessionID":"s","part":{"type":"text","text":"The task is already in doing.\n\nChecking the build."}}"#;
-        let rendered = render_event(text).expect("rendered");
+        let rendered = render_event(text).text().expect("rendered").to_string();
         assert!(rendered.contains("Checking the build."), "{rendered}");
         let reasoning = format!(
             r#"{{"type":"reasoning","sessionID":"s","part":{{"type":"reasoning","text":{}}}}}"#,
             serde_json::to_string(&"x".repeat(500)).unwrap()
         );
-        let rendered = render_event(&reasoning).expect("rendered");
+        let rendered = render_event(&reasoning)
+            .text()
+            .expect("rendered")
+            .to_string();
         assert!(rendered.contains('…') && rendered.len() < 400, "{rendered}");
 
         // A CLI prose line — a warning, a rejection notice — passes verbatim: hiding it would
@@ -936,9 +942,14 @@ mod tests {
         // screenful of JSON.
         assert_eq!(
             render_event("! permission requested: bash (*)"),
-            Some("! permission requested: bash (*)".to_string())
+            Rendered::Keep,
+            "the CLI's own prose is kept as it arrived — rendering it back as itself would \
+             re-terminate it and lose the bytes the child actually wrote"
         );
-        let unknown = render_event(r#"{"type":"session_share","sessionID":"s"}"#).expect("marker");
+        let unknown = render_event(r#"{"type":"session_share","sessionID":"s"}"#)
+            .text()
+            .expect("marker")
+            .to_string();
         assert!(
             unknown.contains("session_share") && !unknown.contains("sessionID"),
             "{unknown}"

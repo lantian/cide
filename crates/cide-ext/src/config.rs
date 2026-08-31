@@ -83,6 +83,29 @@ pub struct Installed {
     pub commit: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Whether this extension's sidebar panels get a button on the activity rail. (M31)
+    ///
+    /// > *"i doesn't like to stuck there all extensions (especially language like YAML, Proto,
+    /// > etc)"* … *"we should be able to disable icon on left panel of installed extesions via
+    /// > settings"*
+    ///
+    /// Separate from [`Self::enabled`], and the separation is the whole feature: disabling an
+    /// extension stops its worker, drops its languages and its servers and its diagnostics. A
+    /// user who does not want YAML taking a rail slot still wants YAML *highlighted*. This
+    /// hides the button and changes nothing else.
+    ///
+    /// Per extension rather than per panel. An extension declaring two sidebar panels loses
+    /// both, which is a real limitation and an acceptable one: the setting is a row against an
+    /// extension on a page listing extensions, the report was about extensions, and one
+    /// installed extension in the marketplace has two sidebar panels — a per-panel list would
+    /// be a second identifier on the wire and a nested control in the UI to serve it.
+    ///
+    /// Defaults to **on**, so nothing an extension already contributes disappears on upgrade.
+    /// The rail's short-window problem is not solved by this and must not be: it is solved by
+    /// the overflow menu (`ui/src/chrome/railOverflow.ts`), because a rail that silently
+    /// dropped buttons to fit would be unreachable panels with a setting to blame.
+    #[serde(default = "yes")]
+    pub rail_icon: bool,
     /// What the user changed, and **only** what they changed.
     ///
     /// The differences from the manifest's defaults, never the whole resolved set. Storing every

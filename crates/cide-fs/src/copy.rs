@@ -98,7 +98,7 @@ use crate::ops;
 /// A thousand is far past any real gesture and still finite: without a cap, a directory that
 /// somehow held every candidate would spin forever inside a blocking worker, which presents as
 /// a hung paste with no error — the failure mode this whole crate keeps writing comments about.
-const MAX_CANDIDATES: u32 = 1000;
+pub(crate) const MAX_CANDIDATES: u32 = 1000;
 
 /// How many entries a merge preview reads before it stops counting and says so.
 ///

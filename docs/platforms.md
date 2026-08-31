@@ -328,15 +328,22 @@ at before choosing:
   awaiting permission gets one bounce, spent, never re-raised. `Critical` — which bounces until
   the app is activated — is the arm that would say the right thing there, and macOS is the one
   platform where that choice is the whole difference between a signal and none.
-* **The shell pane opens `/bin/bash -l`, hardcoded.** `ui/src/panes/TerminalPane.tsx`'s
-  `DEFAULT_SHELL` ignores `$SHELL` and `getpwuid`. On macOS `/bin/bash` is 3.2.57 (2007, the last
-  GPLv2 release Apple shipped) and the user's login shell since Catalina is `/bin/zsh`, so
-  `bash -l` reads `/etc/profile` and `~/.bash_profile` and the user's entire `~/.zshrc` never
-  runs — including the `eval "$(/opt/homebrew/bin/brew shellenv)"` that is how Homebrew tells
-  people to get on `PATH`, which compounds the `claude`-not-found entry above. The comment there
-  says Settings → Terminal would take it over in M11; at M16 it has not, and
-  `cide-headless/src/main.rs` reads `$SHELL` correctly, so the headless binary is more right than
-  the app.
+* ~~**The shell pane opens `/bin/bash -l`, hardcoded.**~~ **Fixed in M35**, on the report it
+  predicted: *"macos bash and claude problem — it doesn't see all PATH, for example it doesn't
+  see nvm/npm"*. The entry read: `ui/src/panes/TerminalPane.tsx`'s `DEFAULT_SHELL` ignores
+  `$SHELL` and `getpwuid`; on macOS `/bin/bash` is 3.2.57 (2007, the last GPLv2 release Apple
+  shipped) and the user's login shell since Catalina is `/bin/zsh`, so `bash -l` reads
+  `/etc/profile` and `~/.bash_profile` and the user's entire `~/.zshrc` never runs — including
+  the `eval "$(/opt/homebrew/bin/brew shellenv)"` that is how Homebrew tells people to get on
+  `PATH`. The pane now asks for *the login shell* rather than for a program: `TerminalPane` sends
+  an empty `program` and `cmd::session::session_spawn` substitutes `cide_core::shell::login_shell`
+  (`$SHELL` if executable, then `getpwuid_r`, then `/bin/zsh` on macOS and `/bin/bash` elsewhere,
+  then `/bin/sh`), with `-l`. `cide-headless` reads the same function, so there is one ladder.
+  **Still unconfirmed on a Mac**: the ladder's rungs are unit-tested over injected inputs on
+  Linux and the platform default is a `cfg!`, so what a real `.app` gets from `getpwuid_r` and
+  from launchd's `SHELL` has been reasoned about and not observed. Settings → Terminal
+  deliberately did *not* grow a field — the OS knows the answer, and a text box pre-filled with
+  it has only two reachable states.
 * **Move to trash.** `NSFileManager trashItemAtURL:` or the `trash` crate. `cide_fs::trash`
   rejected that crate *for Linux*, on reasoning that does not carry to macOS. It is wrong in
   **two** places, not one: the home case writes `~/.local/share/Trash` (already in the table
@@ -495,24 +502,58 @@ rust-analyzer stopped on that machine is still unknown** — `ServerGone` is rep
 say is the one `cide_lsp::server::start_failure_reason` writes into the log. The fix is necessary
 for it (the rustup proxy shells out) and cannot be called sufficient from here.
 
-Two gaps this leaves standing, recorded rather than quietly fixed:
+Two gaps this left standing were recorded rather than quietly fixed. **The first is closed in
+M35 and the second is not:**
 
-* The shell pane still opens `/bin/bash -l` (see the Platforms list above), which never reads
-  `~/.zshrc`. A user whose `PATH` exists only inside `eval "$(brew shellenv)"` now gets those
-  directories in cide's *children* and still not in their own shell pane.
+* ~~The shell pane still opens `/bin/bash -l`~~ — see the Platforms list above; it now opens the
+  account's own login shell.
 * `search_paths()` reads the **unscrubbed** process `PATH` while a child gets the scrubbed one, so
   under an AppImage `which()` can in principle see a binary in `$APPDIR/usr/bin` that no child
   can. Harmless today because that directory holds only cide's own binaries, and left alone
   because closing it means teaching discovery about the bundle.
 
-The option not taken was probing the user's login shell for its `PATH`, as VS Code does. It is
-strictly more accurate — it is the only way to learn a `PATH` that exists solely inside a
-`~/.zshrc` — and it loses on two counts that are not close: `cide_core::toolchain` opens by
-stating that nothing in it spawns a process, and `$SHELL -ilc 'echo $PATH'` runs the user's
-interactive rc, which can block on a prompt, an ssh-agent unlock or a slow network mount. VS Code
-carries a timeout, a cancel path and a user-facing *resolving shell environment failed* dialog
-because that hangs in the field. It is the principled next step if a report names a directory the
-static list cannot reach, and it should arrive with a timeout and a log line rather than silently.
+The option not taken was probing the user's login shell for its `PATH`, as VS Code does. It was
+described here as *"the principled next step if a report names a directory the static list cannot
+reach"* — and in M35 a report did, so **it is taken**. The argument against it stands and shaped
+the result, so it is preserved:
+
+> It is strictly more accurate — it is the only way to learn a `PATH` that exists solely inside a
+> `~/.zshrc` — and it loses on two counts that are not close: `cide_core::toolchain` opens by
+> stating that nothing in it spawns a process, and `$SHELL -ilc 'echo $PATH'` runs the user's
+> interactive rc, which can block on a prompt, an ssh-agent unlock or a slow network mount. VS
+> Code carries a timeout, a cancel path and a user-facing *resolving shell environment failed*
+> dialog because that hangs in the field. It is the principled next step if a report names a
+> directory the static list cannot reach, and it should arrive with a timeout and a log line
+> rather than silently.
+
+`cide_core::login_path` is the answer to all three objections and each is visible in its shape:
+
+* **`toolchain` still spawns nothing.** The probe is its own module. `toolchain::extra_dirs`
+  stays pure and static; a new `toolchain::discovered_dirs` composes it with what the probe
+  found, and `search_paths` and `child_env::child_path` both read *that*, which is what keeps
+  find-it and give-it one list (`the_path_a_child_searches_is_the_path_which_searched` now
+  asserts over it).
+* **The hang is bounded twice.** A four-second deadline on the child, and a three-second wait for
+  any caller that reaches `dirs()` before the answer lands — timed out, it answers empty rather
+  than waiting again, so a wedged rc costs one pause and not one per spawn. It runs once per
+  process, on its own thread, started as the first line of `cide_app::run`; `CIDE_NO_SHELL_PATH`
+  turns it off.
+* **It is not silent.** One `tracing::info!` per launch naming the shell, the elapsed time and
+  every directory added — or a `warn!` naming the failure. It is the only way anybody diagnoses
+  this: an empty answer and a perfect one look identical from a pane.
+
+Two things it deliberately does not do. The reported `PATH` is **appended**, never prepended, so
+the "append, never prepend" rule above is unbroken and nothing the probe finds can shadow a
+toolchain the user arranged. And the shell's output is read only from **between two markers** the
+probe prints, because an interactive rc file prints things — an nvm banner, a `command not found`
+warning, a `motd` — and without the markers a banner becomes a directory name and fails silently
+for ever after.
+
+Enabled on Linux as well as macOS, deliberately: a desktop-launched AppImage inherits a narrow
+`PATH` for the same reason a Finder-launched `.app` does, and it is the only platform where the
+code path can be exercised at all. Measured here on 2026-08-31 with `PATH=/usr/bin:/bin`: 430 ms,
+and it recovered nvm, pyenv, linuxbrew, sdkman and `~/go/bin` — every one of them a directory no
+static list can name.
 
 ## Every extension was dead on macOS, and the reason was four words in a comment
 

@@ -705,40 +705,45 @@ export function inRepo(id: string, repo: RepoId): boolean {
   return id.startsWith(`${repo}${SEP}`)
 }
 
-/**
- * What is ticked when the panel first paints.
+/*
+ * Nothing is ticked when the panel first paints, and there is no `defaultSelection` any more.
  *
- * The active changelist and nothing else — changelists are the truth here (ADR 0004), and
- * the acceptance test is "commit one changelist, the other is untouched". Ticking every
- * changelist by default would make that a thing the user has to undo before every commit,
- * which is the point at which people stop reading the tree.
+ * It used to return the active changelist, on IDEA's argument that "Claude edited a file,
+ * commit it" should be one click, and its comment worried that opening with nothing ticked is
+ * "a panel that opens with nothing to commit and no clue why". Both halves turned out to be
+ * wrong in practice, and the report that killed it was blunt:
  *
- * Unversioned, ignored and conflicted files are never in it: `git commit` should not sweep in
- * `target/`, and a conflicted path cannot be committed at all. With no changelist marked
- * active — which a repository in staging-area mode reports — every changelist is ticked,
- * because the alternative is a panel that opens with nothing to commit and no clue why.
+ * > *"git tree commits everything when commiting, but it should commit only selected files."*
+ *
+ * A pre-ticked panel makes every commit an act of *untick­ing* — the user has to subtract the
+ * files they did not mean, every time, and the cost of missing one is a commit that quietly
+ * carries work they had not finished. Opt-in is the safe direction: the worst case of ticking
+ * too little is a second commit, and the worst case of ticking too much is a rewrite.
+ *
+ * The "no clue why" worry is answered by a line that is already on screen — the footer renders
+ * [`summarize`]'s `nothing selected`, and [`canCommit`] draws Commit disabled — so the panel
+ * says what it is waiting for without anybody having to guess.
+ *
+ * The rule is gone rather than switched off because `noUnusedParameters` is on and a function
+ * that ignores its argument does not compile; and because a seam nothing uses is a seam that
+ * drifts. Reinstating a default means writing the rule again, deliberately, which is the right
+ * price for a change that decides what goes into somebody's commits.
  */
-export function defaultSelection(view: StatusView): Set<string> {
-  const out = new Set<string>()
-  const walk = (repo: RepoView) => {
-    const hasActive = repo.groups.some((g) => g.kind === 'changelist' && g.active)
-    for (const group of repo.groups) {
-      if (group.kind !== 'changelist') continue
-      if (hasActive && !group.active) continue
-      for (const entry of group.entries) out.add(fileRowId(repo.id, entry.path))
-    }
-    for (const child of repo.children) walk(child)
-  }
-  for (const repo of view.repos) walk(repo)
-  return out
-}
 
 /**
- * What a freshly arrived payload adds to the ticks and to the open groups.
+ * What a freshly arrived payload opens.
  *
- * A refresh must not re-tick what the user unticked or re-open what they shut, so "new" means
- * *absent from the previous payload* — which is why both `seen` sets are parameters rather
- * than something derived from `next`.
+ * A refresh must not re-open a group the user shut, so "new" means *absent from the previous
+ * payload* — which is why `seenGroups` is a parameter rather than something derived from
+ * `next`.
+ *
+ * # Why it says nothing about ticks any more
+ *
+ * It used to return a `files` list too: the ids that were new *and* in the default ticks, so a
+ * file arriving in the active changelist was ticked for you. With the ticks opt-in (see the
+ * note above `defaultExpanded`) there is no such set, and a file that appears while you are
+ * assembling a commit must not add itself to it — that is the same "commits everything"
+ * failure arriving one file at a time, and it would be harder to notice than the original.
  *
  * # Why this is a named function and not two loops inside `adopt`
  *
@@ -755,20 +760,12 @@ export function defaultSelection(view: StatusView): Set<string> {
  * when React decides to run an updater.
  */
 export interface Arrivals {
-  /** Ids of files that are new *and* belong in the default ticks. */
-  files: string[]
   /** Ids of collapsible rows that are new *and* start open. */
   groups: string[]
 }
 
-export function arrivals(
-  next: StatusView,
-  seenFiles: ReadonlySet<string>,
-  seenGroups: ReadonlySet<string>,
-): Arrivals {
-  const defaults = defaultSelection(next)
+export function arrivals(next: StatusView, seenGroups: ReadonlySet<string>): Arrivals {
   return {
-    files: allFiles(next).filter((id) => !seenFiles.has(id) && defaults.has(id)),
     groups: [...defaultExpanded(next)].filter((id) => !seenGroups.has(id)),
   }
 }

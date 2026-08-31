@@ -1183,6 +1183,66 @@ pub fn job_notify_after(settings: &cide_ipc::Settings) -> Duration {
     Duration::from_secs(u64::from(settings.terminal.job_notify_after_secs))
 }
 
+/// The URI scheme of the hyperlink a rendered log line carries.
+///
+/// Spelled once here and once in `ui/src/terminal/logLink.ts`, which parses it; `check:paths`
+/// pins the pair. It is not a real scheme and never reaches a browser: xterm hands it to
+/// cide's own `linkHandler`, which refuses every other URI it is given.
+pub const LOG_LINK_SCHEME: &str = "cide-log";
+
+/// Whether shell panes render structured log lines. See [`json_log_render`].
+///
+/// A process-global rather than a value pushed into each session, and the reason is that the
+/// two are indistinguishable here: every shell would be handed the same bool, and the flag is
+/// read on the coalescer thread once per line, where an atomic load is free and a channel
+/// round trip is not. The push `settings_set` does for the job threshold exists because that
+/// value lives *inside* `cide-pty`'s watcher; this one lives inside a closure this crate
+/// wrote, which can simply read it.
+static JSON_LOGS: AtomicBool = AtomicBool::new(true);
+
+/// Point every shell pane's renderer at the stored setting. Called at startup and on every
+/// settings write, so a shell opened before the toggle obeys it too.
+pub fn set_json_logs(on: bool) {
+    JSON_LOGS.store(on, Ordering::Relaxed);
+}
+
+/// The renderer installed on a shell pane — never on Claude, which draws its own screen and
+/// whose bytes are not lines.
+///
+/// Both halves consult the flag, and that is what makes the setting free rather than merely
+/// cheap: with the renderer answering `Keep` and the predicate answering `false`, `cide-pty`
+/// emits the original bytes with the terminator they arrived with and holds nothing, which is
+/// byte-for-byte what a session with no hook at all does. Nothing about the disabled path can
+/// drift from the absent path, because there is nothing left in it to drift.
+pub fn json_log_render(
+    session: SessionId,
+    ring: Arc<crate::logring::JsonLogRing>,
+) -> cide_pty::LineRender {
+    cide_pty::LineRender::new(Arc::new(move |line: &str| {
+        if !JSON_LOGS.load(Ordering::Relaxed) {
+            return cide_pty::Rendered::Keep;
+        }
+        // The raw line is kept *before* it is rendered and only when it renders, because the
+        // rendering is what replaces it downstream — see `logring`. The handle rides back to
+        // the pane inside the rendering as an OSC 8 hyperlink, which is the only part of this
+        // that survives being a byte stream.
+        match cide_core::jsonlog::render(line) {
+            Some(_) => {
+                let handle = ring.record(session, line);
+                let uri = format!("{LOG_LINK_SCHEME}:{session}:{handle}");
+                match cide_core::jsonlog::render_linked(line, &uri) {
+                    Some(text) => cide_pty::Rendered::Replace(text),
+                    None => cide_pty::Rendered::Keep,
+                }
+            }
+            None => cide_pty::Rendered::Keep,
+        }
+    }))
+    .holding_only(Arc::new(|tail: &str| {
+        JSON_LOGS.load(Ordering::Relaxed) && cide_core::jsonlog::could_start(tail)
+    }))
+}
+
 /// Report a shell pane's foreground jobs as session state, so a finished `make` lights the
 /// same surfaces a finished Claude turn does.
 ///
@@ -2278,6 +2338,80 @@ mod tests {
         let mut settings = cide_ipc::Settings::default();
         settings.terminal.job_notify_after_secs = 7;
         assert_eq!(job_notify_after(&settings), Duration::from_secs(7));
+    }
+
+    /// The JSON-log renderer through a real pty, which is the only place its two halves meet.
+    ///
+    /// Both assertions are about the *shell*, not the formatter — `cide_core::jsonlog` has
+    /// its own corpus. What can only break here is the pairing: a renderer installed on an
+    /// interactive child holds every unterminated line by default, and a shell's prompt has
+    /// no newline. Under that bug the second assertion below never sees `$ ` at all, and the
+    /// symptom in a pane is that nothing appears until the user presses Enter.
+    #[test]
+    fn a_shell_renders_a_log_line_and_still_shows_its_unterminated_prompt() {
+        set_json_logs(true);
+        let id = SessionId::new();
+        let ring = Arc::new(crate::logring::JsonLogRing::default());
+        let spec = cide_pty::SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg(
+                "printf '{\"time\":\"2026-08-28T19:14:59Z\",\"level\":\"error\",\
+                 \"msg\":\"conn failed\",\"port\":5432}\n'; \
+                 printf 'plain text\n'; printf '$ '; sleep 30",
+            )
+            .render(json_log_render(id, Arc::clone(&ring)));
+        let session = cide_pty::PtySession::spawn(spec).expect("spawn sh");
+
+        // The child deliberately outlives this wait. EOF flushes a held tail too, so a
+        // deadline past the child's death would pass with the bug still in place — which is
+        // exactly what an earlier version of this test did.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut screen = String::new();
+        while Instant::now() < deadline {
+            screen = String::from_utf8_lossy(&session.screen_state()).into_owned();
+            if screen.contains("$ ") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        session.kill();
+        assert!(
+            screen.contains("19:14:59") && screen.contains("ERROR") && screen.contains("port"),
+            "the log line was not rendered: {screen:?}"
+        );
+        assert!(
+            !screen.contains(r#""msg""#),
+            "the raw object is still on screen: {screen:?}"
+        );
+        assert!(
+            screen.contains("plain text"),
+            "a line that is not a log must survive untouched: {screen:?}"
+        );
+        assert!(
+            screen.contains("$ "),
+            "the prompt never arrived — an unterminated tail was held. This is the whole \
+             reason `LineRender::holding_only` exists: {screen:?}"
+        );
+
+        // The raw line was kept, and the handle the pane can click resolves to it. The mirror
+        // is deliberately not consulted for the link: `vt100` drops OSC 8 from
+        // `state_formatted`, which is why a reattached pane's existing lines are inert and why
+        // this asserts on the ring rather than on the screen.
+        let raw = ring
+            .get(id, 0)
+            .expect("the first rendered line is handle 0 of this session's ring");
+        assert!(
+            raw.contains(r#""msg":"conn failed""#) && raw.contains(r#""port":5432"#),
+            "the ring keeps the bytes the child wrote, not the rendering: {raw:?}"
+        );
+        assert_eq!(
+            ring.get(id, 99),
+            None,
+            "a handle that was never minted answers nothing"
+        );
+        // `plain text` rendered as itself and must not have taken a handle: a ring filled by
+        // every line of ordinary output would evict the log lines this exists for.
+        assert_eq!(ring.get(id, 1), None);
     }
 
     #[test]

@@ -57,6 +57,12 @@ export function ExtensionSettings(): React.JSX.Element {
         // not hypothetical: a number is clamped on the way in.
         void run(() => extApi.setSetting(id, key, value)).catch(notifyFailure)
       }}
+      onRailIcon={(id, show) => {
+        // Same road as `onChange` above and for the same reasons: one `busy`, and the answer is
+        // the whole snapshot, so the rail re-renders from what Rust stored rather than from
+        // what this component sent.
+        void run(() => extApi.setRailIcon(id, show)).catch(notifyFailure)
+      }}
     />
   )
 }
@@ -69,6 +75,36 @@ export interface ExtensionSettingsViewProps {
   readonly onChange?:
     | ((id: ExtensionRef, key: string, value: boolean | string | number) => void)
     | undefined
+  /**
+   * Show or hide an extension's button on the activity rail. (M31)
+   *
+   * A separate callback from [`onChange`] because it writes somewhere else — a first-class
+   * field on the installed row rather than a contributed setting — and because the row it
+   * draws exists for extensions that declare no settings at all.
+   */
+  readonly onRailIcon?: ((id: ExtensionRef, show: boolean) => void) | undefined
+}
+
+/**
+ * The synthetic definition behind the "Show on activity rail" row.
+ *
+ * A real [`SettingDef`] so it goes through [`SettingRow`] like every other control on this
+ * page: one renderer means the row cannot drift from its neighbours in spacing, disabled
+ * treatment or theming, and `check:ext-render` measures them all the same way. The `default`
+ * matches `cide_ext::config::Installed::rail_icon`'s.
+ *
+ * The id is namespaced under `cide.` and an extension cannot collide with it: `SettingDef::id`
+ * is validated as unique *within* an extension, and this row is never routed through
+ * `onChange`, so even a manifest that declared this exact id would write to its own key.
+ */
+const RAIL_ICON_SETTING: SettingDef = {
+  id: 'cide.railIcon',
+  label: 'Show on activity rail',
+  description:
+    'Off takes this extension\u2019s button off the left rail; the panel stays reachable from '
+    + 'the \u00b7\u00b7\u00b7 menu at the foot of it. The extension keeps running either way — '
+    + 'its languages, servers and diagnostics are unaffected.',
+  kind: { type: 'toggle', default: true },
 }
 
 /** Pure: reads no store, calls no IPC, never reads the clock. */
@@ -76,7 +112,11 @@ export function ExtensionSettingsView({
   extensions,
   busy = false,
   onChange,
+  onRailIcon,
 }: ExtensionSettingsViewProps): React.JSX.Element {
+  /** Whether an extension puts a button on the rail, and so gets the row that hides it. */
+  const onRail = (extension: InstalledExtension): boolean =>
+    extension.contributes.panels.some((panel) => panel.location === 'sidebar')
   /*
    * Only enabled extensions, and only those that declare something.
    *
@@ -85,7 +125,12 @@ export function ExtensionSettingsView({
    * behaviour of nothing that is running.
    */
   const rows = extensions.filter(
-    (extension) => extension.enabled && extension.contributes.settings.length > 0,
+    (extension) =>
+      extension.enabled
+      // A rail button is a thing to configure even for an extension that declares no settings
+      // of its own, which is exactly the case the report is about: a language extension with a
+      // document-outline panel and nothing else. (M31)
+      && (extension.contributes.settings.length > 0 || onRail(extension)),
   )
 
   if (extensions.length === 0) {
@@ -103,8 +148,8 @@ export function ExtensionSettingsView({
     return (
       <Note title="Nothing to configure">
         {extensions.length === 1 ? 'The installed extension declares' : 'The installed extensions declare'}
-        {' '}no settings. An extension adds rows here by listing them under `contributes.settings`
-        in its manifest.
+        {' '}no settings and no sidebar panel. An extension adds rows here by listing settings
+        under `contributes.settings` in its manifest, or a panel under `contributes.panels`.
       </Note>
     )
   }
@@ -114,6 +159,20 @@ export function ExtensionSettingsView({
       {rows.map((extension) => (
         <section key={`${extension.marketplace}.${extension.extension}`} className={styles.group}>
           <h3 className={styles.groupTitle}>{extension.name}</h3>
+          {/*
+           * First, above the extension's own settings: it is cide's row rather than the
+           * extension's, and it decides whether the reader can *find* the thing the rows below
+           * configure. Drawn only for an extension that actually contributes a rail button —
+           * a toggle for a button that does not exist is a control that appears to do nothing.
+           */}
+          {onRail(extension) && (
+            <SettingRow
+              setting={RAIL_ICON_SETTING}
+              value={extension.railIcon}
+              busy={busy || onRailIcon === undefined}
+              onChange={(next) => onRailIcon?.(extension, next === true)}
+            />
+          )}
           {extension.contributes.settings.map((setting) => (
             <SettingRow
               key={setting.id}

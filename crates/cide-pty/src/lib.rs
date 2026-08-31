@@ -256,11 +256,95 @@ impl Default for Geometry {
 /// runs *outside* the sink-list lock and owes no acknowledgement — which is much of why the
 /// app's stream observer moved into it.
 #[derive(Clone)]
-pub struct LineRender(pub LineRenderFn);
+pub struct LineRender {
+    render: LineRenderFn,
+    /// Whether a chunk's unterminated tail may be *held* for the next chunk to complete.
+    ///
+    /// `None` holds every tail, which is right for a stream whose every line ends in `\n` —
+    /// a `--format json` harness child — and catastrophic for an interactive shell, whose
+    /// most important output has no terminator at all: a prompt (`user@host:~$ `), a
+    /// fullscreen TUI's screen, a `\r`-only progress bar. Held, a prompt is invisible until
+    /// the user presses Enter, which reads as a hung pane.
+    ///
+    /// `Some(p)` asks the hook, once per chunk, whether the remainder could still *become* a
+    /// line it would rewrite. A `false` sends the tail out raw immediately and resyncs, so a
+    /// prompt costs nothing: a prompt does not look like the start of a JSON object.
+    partial: Option<PartialFn>,
+}
 
-/// The closure inside [`LineRender`], named so the tuple field stays legible to clippy and
-/// callers alike.
-pub type LineRenderFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// The closure inside [`LineRender`], named so the field stays legible to clippy and callers
+/// alike.
+pub type LineRenderFn = Arc<dyn Fn(&str) -> Rendered + Send + Sync>;
+
+/// [`LineRender::holding_only`]'s predicate: *could this partial line still become one you
+/// would rewrite?*
+pub type PartialFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// What [`LineRender`] decided about one line.
+///
+/// Three states rather than an `Option`, and [`Rendered::Keep`] is why. "Pass this through"
+/// used to be spelled `Some(line.to_string())`, which round-trips the *text* and loses the
+/// original bytes: the line is re-terminated `\r\n`, and a program in raw mode (`-opost`, what
+/// every fullscreen TUI sets) emits a bare `\n` meaning *down one row, same column*. Rewriting
+/// that to CRLF moves the cursor to column 0 and shifts the picture, silently and only for
+/// people running a TUI. `Keep` copies the original slice and the terminator it actually had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rendered {
+    /// Not this hook's format — emit the original bytes, terminator included, untouched.
+    Keep,
+    /// Drop the line from the display entirely.
+    Drop,
+    /// Replace it. The text may span several lines; its `\n`s become `\r\n`, since these
+    /// bytes bypass the pty's own output post-processing.
+    Replace(String),
+}
+
+impl Rendered {
+    /// The replacement text, for a caller that cares only about what a line became — a test
+    /// asserting on a rendering, rather than the splitter, which has to tell all three apart.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Rendered::Replace(text) => Some(text),
+            _ => None,
+        }
+    }
+}
+
+impl LineRender {
+    /// A renderer for a stream whose every line is newline-terminated. Holds any tail.
+    pub fn new(render: LineRenderFn) -> Self {
+        Self {
+            render,
+            partial: None,
+        }
+    }
+
+    /// A renderer safe to install on an *interactive* stream: hold a tail only while
+    /// `partial` says it could still complete into something this hook rewrites. See the
+    /// field's own comment for what holding one unconditionally does to a shell prompt.
+    pub fn holding_only(mut self, partial: PartialFn) -> Self {
+        self.partial = Some(partial);
+        self
+    }
+
+    fn line(&self, line: &str) -> Rendered {
+        (self.render)(line)
+    }
+
+    /// Whether the held remainder is worth keeping, and `true` when no predicate was given.
+    fn holds(&self, tail: &[u8]) -> bool {
+        match self.partial.as_ref() {
+            Some(partial) => partial(&String::from_utf8_lossy(tail)),
+            None => true,
+        }
+    }
+
+    /// Whether a tail that has gone quiet should be flushed. Only an interactive stream has
+    /// the problem — see [`RenderState`] — so only a renderer with a predicate answers yes.
+    fn flushes_when_idle(&self) -> bool {
+        self.partial.is_some()
+    }
+}
 
 impl std::fmt::Debug for LineRender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1300,29 +1384,53 @@ fn render_lines(state: &mut RenderState, render: &LineRender, chunk: &[u8]) -> V
     let mut start = 0;
     while let Some(offset) = state.buffer[start..].iter().position(|b| *b == b'\n') {
         let end = start + offset;
+        // Two views of the same line: `raw` is what arrived, terminator included, and is what
+        // every path that is *not* replacing the line emits, byte for byte. `line` is what the
+        // hook is shown — the terminator, and a `\r` before it, are plumbing rather than text.
+        let raw = &state.buffer[start..=end];
         let line = &state.buffer[start..end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if state.resyncing {
-            // The head of this line already went out raw; send the tail the same way, with
-            // the terminator, and resume rendering from the next line.
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
+            // The head of this line already went out raw; send the tail the same way and
+            // resume rendering from the next line.
+            out.extend_from_slice(raw);
             state.resyncing = false;
-        } else if let Some(rendered) = (render.0)(&String::from_utf8_lossy(line)) {
-            // The hook's text is display content; its own newlines need the full terminator
-            // too, for the reason in the function doc.
-            out.extend_from_slice(rendered.replace('\n', "\r\n").as_bytes());
-            out.extend_from_slice(b"\r\n");
+        } else {
+            match render.line(&String::from_utf8_lossy(line)) {
+                Rendered::Keep => out.extend_from_slice(raw),
+                Rendered::Drop => {}
+                Rendered::Replace(text) => {
+                    // The hook's text is display content; its own newlines need the full
+                    // terminator too, for the reason in the function doc.
+                    out.extend_from_slice(text.replace('\n', "\r\n").as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
         }
         start = end + 1;
     }
     state.buffer.drain(..start);
 
-    if state.buffer.len() > RENDER_LINE_CAP {
-        out.append(&mut state.buffer);
-        state.resyncing = true;
+    // What is left is an unterminated tail, and holding it is the whole hazard: for an
+    // interactive child the bytes with no newline are the prompt. Ask the hook whether they
+    // could still become a line it would rewrite, and flush them raw when they could not —
+    // or when they have grown past what any one line can be worth.
+    if !state.buffer.is_empty()
+        && (!render.holds(&state.buffer) || state.buffer.len() > RENDER_LINE_CAP)
+    {
+        flush_tail(state, &mut out);
     }
     out
+}
+
+/// Send the held partial line out raw and remember that its head has gone.
+///
+/// `resyncing` is the memory: the remainder of that line arrives later with a terminator on
+/// it, and handing *that* to the hook would be handing it half a document and calling it a
+/// line — which for a JSON renderer means a parse failure on text that was never malformed.
+fn flush_tail(state: &mut RenderState, out: &mut Vec<u8>) {
+    out.append(&mut state.buffer);
+    state.resyncing = true;
 }
 
 #[allow(clippy::too_many_arguments)] // one private call site; a params struct would name nothing
@@ -1429,6 +1537,22 @@ fn spawn_coalescer(
                         }
                     }
                     Event::Idle => {
+                        // A held partial line that has gone quiet. Only an interactive
+                        // renderer holds one speculatively (see `LineRender::partial`), and
+                        // for that shape a quarter second of silence settles the question:
+                        // nothing is going to complete these bytes, they are a prompt that
+                        // happens to begin like a document, and holding them any longer is a
+                        // pane that looks wedged. Before the flush below, so they leave in
+                        // this tick rather than waiting for the next byte the child writes.
+                        if let Some(render) = render.as_ref()
+                            && render.flushes_when_idle()
+                            && !render_state.buffer.is_empty()
+                        {
+                            let mut flushed = Vec::new();
+                            flush_tail(&mut render_state, &mut flushed);
+                            vt.lock().process(&flushed);
+                            pending.extend_from_slice(&flushed);
+                        }
                         if !pending.is_empty() {
                             broadcast(
                                 &sinks,
@@ -1895,11 +2019,11 @@ mod tests {
     /// hook may drop or multiply lines, and the cap flushes raw rather than losing bytes.
     #[test]
     fn render_lines_holds_partials_and_flushes_the_oversized_raw() {
-        let render = LineRender(Arc::new(|line: &str| {
+        let render = LineRender::new(Arc::new(|line: &str| {
             if line == "drop" {
-                return None;
+                return Rendered::Drop;
             }
-            Some(format!("<{line}>"))
+            Rendered::Replace(format!("<{line}>"))
         }));
         let mut state = RenderState::default();
 
@@ -1912,9 +2036,10 @@ mod tests {
         );
         assert_eq!(render_lines(&mut state, &render, b"rld\n"), b"<world>\r\n");
 
-        // `None` drops the line from the display; a multi-line rendering gets real terminators.
+        // `Drop` removes the line from the display; a multi-line rendering gets real
+        // terminators.
         assert_eq!(render_lines(&mut state, &render, b"drop\n"), b"");
-        let two = LineRender(Arc::new(|_: &str| Some("a\nb".into())));
+        let two = LineRender::new(Arc::new(|_: &str| Rendered::Replace("a\nb".into())));
         assert_eq!(render_lines(&mut state, &two, b"x\n"), b"a\r\nb\r\n");
 
         // Past the cap the held head goes out raw — ugly beats lost — and the tail of that
@@ -1925,7 +2050,64 @@ mod tests {
         assert!(state.resyncing);
         assert_eq!(
             render_lines(&mut state, &render, b"tail\nok\n"),
-            b"tail\r\n<ok>\r\n"
+            b"tail\n<ok>\r\n"
+        );
+    }
+
+    /// `Keep` is byte-identical to having installed no hook at all — terminator included.
+    ///
+    /// The terminator is the whole assertion. A `Keep` spelled "render the line back as
+    /// itself" would re-terminate it `\r\n`, and a program in raw mode emits a bare `\n`
+    /// meaning *down one row, same column*: turning that into CRLF walks every line of a
+    /// fullscreen TUI back to column 0. Nothing throws, nothing logs, and it happens only to
+    /// people running `vim` in a pane.
+    #[test]
+    fn a_kept_line_keeps_its_own_bytes() {
+        let render = LineRender::new(Arc::new(|_: &str| Rendered::Keep));
+        let mut state = RenderState::default();
+        for chunk in [
+            &b"bare\nlf\n"[..],
+            &b"crlf\r\n"[..],
+            &b"\x1b[2K\x1b[Ktui\n"[..],
+            &b"\r\n"[..],
+        ] {
+            assert_eq!(render_lines(&mut state, &render, chunk), chunk);
+        }
+    }
+
+    /// An unterminated tail is held only while the hook says it could still become a line.
+    ///
+    /// This is what makes the hook safe on an interactive child. A shell prompt has no
+    /// newline, and under the unconditional hold it is invisible until the user presses
+    /// Enter — a pane that takes keystrokes and shows nothing, which reads as a hang.
+    #[test]
+    fn an_uninteresting_tail_is_not_held() {
+        let render = LineRender::new(Arc::new(|line: &str| {
+            Rendered::Replace(format!("<{line}>"))
+        }))
+        .holding_only(Arc::new(|tail: &str| tail.trim_start().starts_with('{')));
+        let mut state = RenderState::default();
+
+        // The prompt leaves in the same chunk it arrived in, byte for byte.
+        assert_eq!(
+            render_lines(&mut state, &render, b"user@host:~$ "),
+            b"user@host:~$ "
+        );
+        assert!(
+            state.resyncing,
+            "its head has gone, so its line is no longer whole"
+        );
+        // What the user types then echoes back with the terminator, still raw — handing the
+        // hook the tail alone would be handing it half a line.
+        assert_eq!(render_lines(&mut state, &render, b"ls\r\n"), b"ls\r\n");
+        // And the next whole line renders again.
+        assert_eq!(render_lines(&mut state, &render, b"a\n"), b"<a>\r\n");
+
+        // A tail that *could* still complete is held, and completing it renders it whole.
+        assert_eq!(render_lines(&mut state, &render, b"{\"a\":"), b"");
+        assert_eq!(
+            render_lines(&mut state, &render, b"1}\n"),
+            b"<{\"a\":1}>\r\n"
         );
     }
 
@@ -1942,7 +2124,9 @@ mod tests {
             // this test failed with the coalescer blameless. The same beat, for the same
             // reason, as the harness-bound-run test over in `cide-app`.
             .arg("sleep 0.2; printf 'alpha\\nbeta\\n'")
-            .render(LineRender(Arc::new(|line: &str| Some(format!("[{line}]")))));
+            .render(LineRender::new(Arc::new(|line: &str| {
+                Rendered::Replace(format!("[{line}]"))
+            })));
         let session = PtySession::spawn(spec).expect("spawn sh");
 
         let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));

@@ -606,16 +606,29 @@ try {
 
   // --- defaults ------------------------------------------------------------------------
 
-  const defaults = m.defaultSelection(one)
-  eq(defaults.size, 2, 'only the active changelist is ticked on open — `fixes` is not')
+  /*
+   * There is no `defaultSelection` any more, and its absence is the assertion. (M31)
+   *
+   * It returned the active changelist, so the panel opened fully ticked and every commit was
+   * an act of unticking — reported as *"git tree commits everything when commiting, but it
+   * should commit only selected files."* Ticks are opt-in now, which makes this a *negative*
+   * check: the export must stay gone, because reinstating it silently restores the behaviour
+   * the report was about, and nothing else in this suite would notice.
+   */
   eq(
-    [...defaults].every((id) => !id.includes('notes.md') && !id.includes('target')),
-    true,
-    'unversioned and ignored files are never ticked by default',
+    m.defaultSelection,
+    undefined,
+    'no default ticks: the panel opens with nothing selected, and a commit is opt-in',
   )
   eq(
-    m.summarize(m.selectedFiles(one, defaults)),
-    '2 modified',
+    m.summarize(m.selectedFiles(one, new Set())),
+    'nothing selected',
+    'so the footer says what the panel is waiting for, which is what makes an empty panel '
+      + 'legible rather than a dead Commit button with no clue why',
+  )
+  eq(
+    m.summarize(m.selectedFiles(one, new Set([m.fileRowId(APP, 'a.rs')]))),
+    '1 modified',
     "the footer's summary counts by status and does not pluralise the adjective",
   )
   eq(m.summarize([]), 'nothing selected', 'an empty selection says so in words')
@@ -690,33 +703,31 @@ try {
    * every changelist shut and Commit disabled. A pure function is testable; a ref read at a
    * moment React chooses is not.
    */
-  const firstLoad = m.arrivals(one, new Set(), new Set())
-  eq(
-    firstLoad.files.sort(),
-    [m.fileRowId(APP, 'a.rs'), m.fileRowId(APP, 'src/b.rs')].sort(),
-    'a first payload arrives with the active changelist ticked — this is the assertion that '
-      + 'fails when the panel opens with nothing selected and a dead Commit button',
-  )
+  const firstLoad = m.arrivals(one, new Set())
   eq(
     firstLoad.groups.sort(),
     [...m.defaultExpanded(one)].sort(),
-    'and with its groups open, the ignored one excepted',
+    'a first payload arrives with its groups open, the ignored one excepted',
   )
   eq(
-    m.arrivals(one, new Set(m.allFiles(one)), m.allGroups(one)),
-    { files: [], groups: [] },
-    'a payload that brings nothing new adds nothing: a refresh must not re-tick what the user '
-      + 'unticked nor re-open what they shut, and this repaints several times a second',
+    m.arrivals(one, m.allGroups(one)),
+    { groups: [] },
+    'a payload that brings nothing new adds nothing: a refresh must not re-open what the user '
+      + 'shut, and this repaints several times a second',
   )
+  /*
+   * And it says nothing at all about ticks. (M31)
+   *
+   * `arrivals` used to return a `files` list too — the ids that were new *and* in the default
+   * ticks — so a file appearing while you assembled a commit added itself to it. That is the
+   * "commits everything" failure arriving one file at a time, and harder to catch than the
+   * original because it happens between looking at the panel and pressing Commit.
+   */
   eq(
-    m.arrivals(one, new Set([m.fileRowId(APP, 'a.rs')]), m.allGroups(one)).files,
-    [m.fileRowId(APP, 'src/b.rs')],
-    'only the genuinely new file — "Claude edited a file, commit it" is one click',
-  )
-  eq(
-    m.arrivals(one, new Set(), new Set()).files.some((id) => id.includes('notes.md')),
-    false,
-    'and never an unversioned one, however new it is',
+    Object.keys(m.arrivals(one, new Set())),
+    ['groups'],
+    'arrivals decides what opens, never what is ticked: a file that appears while a commit is '
+      + 'being assembled must not add itself to it',
   )
 
   // Ticks whose file is gone must not survive: a selection set that only ever grows ends up
@@ -746,7 +757,13 @@ try {
       + 'ticked files and a click on it does nothing',
   )
   eq(
-    m.checkState(changesCollapsed, defaults),
+    // The two files of the `Changes` list, named rather than derived from a default that no
+    // longer exists — the point here is the tri-state over a collapsed row, not what opens
+    // ticked, and nothing opens ticked any more.
+    m.checkState(
+      changesCollapsed,
+      new Set([m.fileRowId(APP, 'a.rs'), m.fileRowId(APP, 'src/b.rs')]),
+    ),
     'checked',
     'and its tri-state is computed over them',
   )
@@ -761,7 +778,10 @@ try {
     'an expanded repo whose changelists are shut still owns every file, submodule included',
   )
 
-  const units = m.commitUnits(one, defaults)
+  // The active changelist's two files, ticked by hand. This is what the user does now: the
+  // panel opens empty and the commit is exactly what they picked.
+  const ticked = new Set([m.fileRowId(APP, 'a.rs'), m.fileRowId(APP, 'src/b.rs')])
+  const units = m.commitUnits(one, ticked)
   eq(units.length, 1, 'one repo, one commit')
   eq(units[0].repo, APP, 'named by RepoId — `repo_root` resolves an id, and a path is NoSuchRepo')
   eq(
@@ -777,12 +797,12 @@ try {
     'a selection spanning changelists names none — the backend commits the paths given',
   )
   eq(
-    m.commitUnits(two, m.defaultSelection(two)).map((u) => u.repo),
+    m.commitUnits(two, new Set(m.allFiles(two))).map((u) => u.repo),
     [APP, LIB],
     'two repos are two commits, split by repo id',
   )
   eq(
-    m.commitUnits(nested, m.defaultSelection(nested)).map((u) => u.repo),
+    m.commitUnits(nested, new Set(m.allFiles(nested))).map((u) => u.repo),
     [APP, SUB],
     'and a submodule is its own commit: git has no other kind',
   )
@@ -2094,8 +2114,8 @@ try {
     'a named repository with nothing ticked is one file-less unit: the reword',
   )
   eq(
-    m.commitUnits(one, defaults, APP),
-    m.commitUnits(one, defaults, null),
+    m.commitUnits(one, new Set([m.fileRowId(APP, 'a.rs')]), APP),
+    m.commitUnits(one, new Set([m.fileRowId(APP, 'a.rs')]), null),
     'and an amend that *does* tick something is an ordinary amend — the file-less unit must not '
       + 'be added alongside real ones, or a monorepo amend would commit in a repo nobody '
       + 'selected anything in',

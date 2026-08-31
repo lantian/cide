@@ -30,8 +30,8 @@ use cide_git::{
 use cide_ipc::git::{
     BranchInfo, BranchList, ChangesTree, CheckoutMode, CheckoutOutcome, CommitOutcome,
     CommitRequest, ConflictFile, ConflictSide, ContinueOutcome, DiffSide, FetchOutcome, FileDiff,
-    GitError, MergeOutcome, MergeState, PathSelection, PullRequest, PushOutcome, RepoInfo,
-    ShelfEntry, StashEntry, TreeStatusMap,
+    GitError, MergeOutcome, MergeState, PathSelection, PullRequest, PushOutcome, PushPreview,
+    PushRequest, RepoInfo, ShelfEntry, StashEntry, TreeStatusMap,
 };
 use cide_ipc::{ProjectId, RepoId, ToolTabId};
 use tauri::State;
@@ -672,23 +672,49 @@ pub async fn git_push(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     repo: RepoId,
-    remote: Option<String>,
-    refspec: Option<String>,
-    set_upstream: bool,
+    request: PushRequest,
 ) -> Result<PushOutcome> {
     let roots = roots(&state, project)?;
     let proxy = git_proxy(&state);
     blocking(move || {
         let root = repo_root(&roots, repo)?;
-        let outcome = push::push(
-            &root,
-            remote.as_deref(),
-            refspec.as_deref(),
-            set_upstream,
-            &proxy,
-        )?;
+        let outcome = push::push(&root, &request, &proxy)?;
         let _ = refreshed(&app, &roots, project);
         Ok(outcome)
+    })
+    .await
+}
+
+/// What a push would send, for every repository in the project — the push dialog's payload.
+///
+/// The whole project in one round trip rather than one call per repository, for the reason
+/// `git_branch_list` gives: this feeds a single control, and a dialog that filled its rows one
+/// promise at a time would draw a repository list that grows while somebody is reading it.
+///
+/// A repository that cannot be read is **skipped with a warning**, not failed — `lists()`'s rule,
+/// for `lists()`'s reason: three working repositories and one on an unmounted share is still a
+/// usable dialog. A repository that can be read but has nothing to push is *not* skipped; it
+/// comes back with `PushPreview::blocked` set, because "this submodule is on a detached HEAD" is
+/// an answer and a missing row is not.
+///
+/// Reads only. No `AppHandle`, nothing broadcast, nothing written — `git_push` is what mutates.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_push_plan(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Vec<PushPreview>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let mut out = Vec::new();
+        for info in cide_git::repo::discover(&roots) {
+            match push::preview(&info) {
+                Ok(preview) => out.push(preview),
+                Err(error) => {
+                    tracing::warn!(root = %info.root.display(), %error, "skipping unreadable repository")
+                }
+            }
+        }
+        Ok(out)
     })
     .await
 }

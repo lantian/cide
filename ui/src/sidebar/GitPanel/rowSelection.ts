@@ -14,8 +14,9 @@
  *
  * Ticking is a statement about a commit. Selecting is a statement about what you are pointing
  * at. They were conflated for one release and the symptom was reported as a drag bug: `grab`
- * widened by *ticks*, and the active changelist opens fully ticked (`model.ts::defaultSelection`),
- * so dragging one file out of it silently moved every file in it. Nothing in the gesture said
+ * widened by *ticks*, and the active changelist then opened fully ticked
+ * (`model.ts::defaultSelection`, removed in M31 when ticks became opt-in), so dragging one file
+ * out of it silently moved every file in it. Nothing in the gesture said
  * so until the ghost appeared, by which point the press had happened. A real row selection is
  * the fix for that as much as it is the feature — a drag now carries what the user selected,
  * which is a set they built and can see.

@@ -94,6 +94,19 @@ pub enum FsError {
 
     #[error("the trash already holds too many files named {0}")]
     TrashFull(String),
+
+    /// *Paste* was asked for and the system clipboard holds no image. (M35)
+    ///
+    /// Its own variant rather than an [`FsError::Io`] because it is the one refusal on this
+    /// road that the frontend must **not** show. Ctrl+V in the file tree reaches
+    /// `fs_paste_image` whenever there is no in-app file clip, so this fires every time
+    /// somebody presses it with text on the clipboard, or with nothing on it at all — which is
+    /// not an error, it is the answer *nothing to paste here*, and a toast for it would fire
+    /// several times a session for no reason. A caller that asked *explicitly* — the context
+    /// menu's **Paste Image** — does show it, and that is the whole reason it has to be
+    /// distinguishable rather than prose.
+    #[error("the clipboard does not hold an image")]
+    NoClipboardImage,
 }
 
 impl FsError {

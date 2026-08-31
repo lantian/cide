@@ -55,9 +55,39 @@ export function fsMessage(error: unknown): string {
     }
   }
   // A tag with nothing readable behind it (`noIndex` has no content at all). The tag is a
-  // word, which beats `[object Object]` by the whole distance that matters.
-  if (typeof tagged.kind === 'string' && tagged.kind.length > 0) return tagged.kind
+  // word, which beats `[object Object]` by the whole distance that matters — and for the one
+  // unit variant a user meets on purpose there is a sentence instead, because "that gesture
+  // found nothing" is a thing to read and `noClipboardImage` is a thing to grep.
+  if (typeof tagged.kind === 'string' && tagged.kind.length > 0) {
+    return tagged.kind === NO_CLIPBOARD_IMAGE ? 'the clipboard does not hold an image' : tagged.kind
+  }
   return String(error)
+}
+
+/**
+ * `FsError::NoClipboardImage`'s tag. See [`isNoClipboardImage`].
+ */
+export const NO_CLIPBOARD_IMAGE = 'noClipboardImage'
+
+/**
+ * Was this rejection *there is no image on the clipboard*?
+ *
+ * The one `FsError` a caller routinely wants to **swallow**. `fs_paste_image` is reached by a
+ * bare Ctrl+V — in the tree when no file is on the in-app clipboard, in the editor when the
+ * paste event says the clipboard holds no text — so a clipboard with text on it, or an empty
+ * one, produces this several times a session and none of them is a thing that went wrong. A
+ * caller that reached the same command from a menu item the user pointed at shows it instead,
+ * which is why this is a predicate and not a silent `catch`.
+ *
+ * Matched on the tag rather than on the prose, for the reason this whole module exists: prose
+ * is not an API and `fsMessage`'s output is for people.
+ */
+export function isNoClipboardImage(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    (error as Tagged).kind === NO_CLIPBOARD_IMAGE
+  )
 }
 
 function countOf(value: unknown): number | null {

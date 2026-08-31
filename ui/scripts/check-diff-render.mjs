@@ -136,6 +136,31 @@ try {
   eq(byName.binary.selected, [], 'and nothing paints as selected in it')
 
   eq(byName.gone.rows, 0, 'a side with no diff draws no rows')
+  /*
+   * …and it says *why*, in words. (M31)
+   *
+   * The pane stringified a tagged `GitError` — `{kind, detail}`, no `message` — so this line
+   * rendered `[object Object]`, under a heading that says "Nothing to show on this side." The
+   * path is not obscure: it is what every reader sees the moment they commit a file whose diff
+   * is open. `chrome/branchModel.ts::explain` is the sanctioned unwrap and this file had never
+   * used it.
+   *
+   * The blanket assertion below is the one that matters, because there are five catch blocks
+   * in that pane and each of them can regress on its own.
+   */
+  eq(
+    byName.gone.reason,
+    'src/main.rs has no changes',
+    'a side with nothing on it renders the reason it was given, verbatim',
+  )
+  for (const d of Object.values(byName)) {
+    ok(
+      !JSON.stringify(d).includes('[object Object]'),
+      `no digest may contain "[object Object]" — ${d.name} does, which means a tagged GitError `
+        + 'reached the screen through String() instead of through `explain`',
+    )
+  }
+
   eq(
     byName.gone.selected,
     [],
@@ -1425,6 +1450,43 @@ try {
     2,
     '…from the same store, so the mode is one editor setting rather than one remembered per '
       + 'pane kind',
+  )
+
+  // --- a diff opens on its first change, and only on the way in (M31) ----------------------
+  //
+  // > *"when opening diff - it should point to line where first diff exists, currently diff
+  // > always starts from 1 line."*
+  //
+  // The seed lives in the two *wiring* components, which this fixture cannot drive — it renders
+  // the pure view with `currentChange` supplied — so the rule is pinned against the source, the
+  // way the tokenizer's absence is pinned against the bundle below. What makes it worth pinning
+  // is that the pair reads like a redundancy: one site seeds `0` and another resets to `-1`, and
+  // collapsing them either way is a silent regression. Seeding on a refetch drags the reader off
+  // the hunk they were reading whenever an agent touches the file; dropping the seed puts every
+  // diff back at line 1.
+
+  eq(
+    [...paneSrc.matchAll(/setCurrentChange\(0\)/g)].length,
+    1,
+    'the working-tree pane seeds the walk to the first change on a first fetch — `anchors[0]` '
+      + 'is the first real difference, because `changeAnchors` skips `shared` runs',
+  )
+  ok(
+    /if \(revRef\.current === null\) setCurrentChange\(0\)/.test(paneSrc),
+    '…guarded by "this pane has never had a diff in it", which is what separates opening from '
+      + 'refetching: on the way in there is no reading position to preserve',
+  )
+  ok(
+    /setCurrentChange\(openedRef\.current \? -1 : 0\)/.test(paneSrc),
+    'and the revision pane makes the same distinction with its own one-bit ref — it keeps no '
+      + '`revRef`, because two revisions diff to the same bytes for ever',
+  )
+  eq(
+    [...paneSrc.matchAll(/setCurrentChange\(-1\)/g)].length,
+    1,
+    'the reset survives, exactly once: a file that moved under an open pane goes back to '
+      + '"nothing current" rather than to its first change, because a scroll nobody asked for '
+      + 'is worse than a stepper that starts again',
   )
 
   // --- the split view's scroll sync, pinned in the pane (M25) -------------------------------

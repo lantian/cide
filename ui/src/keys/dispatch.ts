@@ -61,7 +61,7 @@ import { openBranchPopup } from '@/chrome/BranchSelector'
 // answers whether one was there to hear it, which is what makes a contributed command reportable
 // as unavailable rather than silently inert.
 import { invoke as invokeExtension } from '@/ext/host'
-import { explain, pullReport, pushReport, type RepoFetch, type RepoPush } from '@/chrome/branchModel'
+import { explain, pullReport, type RepoFetch } from '@/chrome/branchModel'
 import {
   divergenceOf,
   strategyAsk,
@@ -69,6 +69,7 @@ import {
   type RepoDivergence,
 } from '@/chrome/pullStrategyModel'
 import { requestPullStrategy } from '@/chrome/pullStrategyStore'
+import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { pasteIntoTerminal } from '@/terminal/clipboard'
@@ -1195,46 +1196,15 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         /*
          * Every repository in the project, in root order. A monorepo with submodules has
          * several and the command names none of them, so pushing "the" repo would have to pick
-         * one; pushing each is what *Push to remote* says.
+         * one; offering each is what *Push…* says.
          *
-         * # Two things this used to get wrong, both fixed in M20
-         *
-         * It was `Promise.all` with the value discarded. That is the recurring defect of this
-         * project with the sign flipped — not "implemented and nothing calls it" but "called,
-         * and the answer dropped on the floor". A user who pressed the key and got silence had
-         * the same evidence a dead key would give them. `allSettled` over the *same* promises
-         * collects the answers without disturbing the failure path, exactly as `git.pull` does
-         * one case below, and for the same two reasons: with four repositories and two
-         * failures `Promise.all` reports the first and marks the rest handled.
-         *
-         * And it had **no `.catch` at all**, so a rejection reached `Failures.tsx` as a raw
-         * `GitError` — `{kind: 'push', detail: {output: …}}`, which has no `message` field and
-         * whose `detail` is an object, so `notices.describe` fell through to `kind` and the
-         * toast read the single word `push`. `explain` is the sentence.
+         * Since M31 this opens the dialog rather than pushing. The ellipsis in the command's
+         * title is the promise, and `openPushDialog` is what keeps it — nothing leaves the
+         * machine until somebody has read the list.
          */
-        withRepos(command, (project, repos) => {
-          const attempts = repos.map((repo) => gitApi.push(project, repo.id, null, null))
-          for (const attempt of attempts) {
-            void attempt.catch((error: unknown) => {
-              throw new Error(explain(error))
-            })
-          }
-          void Promise.allSettled(attempts).then((settled) => {
-            const done: RepoPush[] = []
-            settled.forEach((result, i) => {
-              const repo = repos[i]
-              if (result.status === 'fulfilled' && repo !== undefined) {
-                done.push({ name: repo.name, outcome: result.value })
-              }
-            })
-            if (done.length === 0) return
-            // Aggregated into one notice, never one per repository: `notices.admit` collapses
-            // toasts by identical text, so five submodules all saying "already up to date"
-            // would show one toast that silently spoke for five.
-            const report = pushReport(done)
-            notify(report.text, { kind: 'ok', detail: report.detail })
-          })
-        })
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        openPushDialog(project.id)
         return
       }
 

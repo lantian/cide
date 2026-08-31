@@ -33,7 +33,9 @@ use std::path::Path;
 use cide_ipc::git::{GitError, MergeOutcome};
 use git2::{BranchType, Oid, Repository};
 
-use crate::pull::{diff_totals, settle, short_oid, taken_commits, write_orig_head};
+use crate::pull::{
+    PULL_COMMIT_CAP, diff_totals, settle, short_oid, taken_commits, write_orig_head,
+};
 use crate::{Result, Wrap, branch, repo as repo_mod, status};
 
 /// Merge `name` — a local or remote-tracking branch — into the checked-out branch.
@@ -265,7 +267,7 @@ fn report(
     let old_tree = repo.find_commit(old).wrap()?.tree().wrap()?;
     let new_tree = repo.find_commit(new).wrap()?.tree().wrap()?;
     let (files_changed, insertions, deletions) = diff_totals(repo, &old_tree, &new_tree)?;
-    let (commits, more_commits) = taken_commits(repo, source_oid, old, behind)?;
+    let (commits, more_commits) = taken_commits(repo, source_oid, old, behind, PULL_COMMIT_CAP)?;
     Ok(MergeOutcome {
         source: source.to_string(),
         branch: branch.to_string(),

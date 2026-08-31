@@ -542,6 +542,103 @@ impl PushOutcome {
     }
 }
 
+/// Everything a push needs to know beyond which repository it is about.
+///
+/// A struct rather than four loose parameters on `git_push`, for [`PullRequest`]'s reasons and
+/// with [`PullRequest`]'s rules: every field `#[serde(default)]`, so `PushRequest::default()` is
+/// the plain *"push this branch to its usual remote"* that `git_push` used to mean, and a payload
+/// written by an older build still deserialises. It grew a fourth field the moment force push
+/// existed, which is exactly the growth `CommitRequest` and `PullRequest` were shaped to absorb.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[ts(export)]
+pub struct PushRequest {
+    /// `None` is the branch's upstream remote, else `origin` — `push::default_remote`, shared
+    /// with `fetch` and `pull` so three menu items cannot disagree about which remote they mean.
+    #[ts(optional)]
+    pub remote: Option<String>,
+    /// `None` pushes the current branch to a branch of the same name.
+    #[ts(optional)]
+    pub refspec: Option<String>,
+    /// Record `branch.<name>.remote` / `.merge` — `git push --set-upstream`.
+    pub set_upstream: bool,
+    /// Overwrite the remote ref, **with a lease**: the push is refused if the remote has moved
+    /// since the last fetch. There is deliberately no plain-`--force` value on this wire — the
+    /// lease is the whole safeguard, and a boolean that could mean either would be a safeguard
+    /// one typo away from not being one.
+    pub force: bool,
+}
+
+/// Why a repository has nothing this dialog can push.
+///
+/// Three states rather than one "cannot push" boolean, because the three have different
+/// remedies and the row has to say which: commit something, get back on a branch, add a remote.
+/// A single flag would leave the dialog drawing a disabled row with no explanation, which reads
+/// as a bug in cide rather than as a state of the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PushBlock {
+    /// No commits at all yet.
+    Unborn,
+    /// Detached `HEAD`. There is no branch name to push to.
+    Detached,
+    /// The resolved remote does not exist in this repository.
+    NoRemote,
+}
+
+/// What one repository would push, read before anything is sent.
+///
+/// The dialog's whole payload, so opening it costs one round trip for the project rather than
+/// one per repository plus one per commit list.
+///
+/// # Why the counts are read here and not derived in the frontend
+///
+/// [`PushOutcome`]'s own doc makes this argument for *after* a push; this is the same argument
+/// one step earlier. [`BranchInfo::ahead`] is measured against the branch's **upstream**, which
+/// is a different question from "what would this push send" the moment the refspec names
+/// anything but the tracking branch — and it is zero for a branch that has no upstream at all,
+/// which is precisely the case the dialog most needs to describe (*publish this branch*). So the
+/// walk is done in `cide_git::push::preview`, beside the walk `push` itself does, and the two
+/// share their rules rather than agreeing by coincidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PushPreview {
+    pub repo: RepoInfo,
+    /// The same [`BranchInfo`] the status bar reads, so the dialog and the status bar cannot
+    /// disagree about what is checked out.
+    pub head: BranchInfo,
+    /// The remote this push would use — what `push::default_remote` resolved.
+    pub remote: String,
+    /// Every remote this repository has, `origin` first when it exists and the rest in name
+    /// order, because that is the one nearly every row means.
+    pub remotes: Vec<String>,
+    /// Spelled out — `refs/heads/x:refs/heads/x`. Empty when [`Self::blocked`] is set.
+    pub refspec: String,
+    /// The remote has no such branch yet, so this push publishes it and sets the upstream.
+    ///
+    /// The `old_oid == ""` distinction [`PushOutcome`] makes after the fact, made before it.
+    pub publish: bool,
+    /// What would be sent, newest first, capped — see `cide_git::push::PUSH_COMMIT_CAP`.
+    pub commits: Vec<PulledCommit>,
+    /// How many more there are beyond the cap. Zero for a complete list.
+    pub more: u32,
+    /// The remote-tracking ref holds commits the local branch does not.
+    ///
+    /// A plain push would be rejected as a non-fast-forward. This is the **only** state in which
+    /// force is an answer rather than a mistake, and the dialog says so on the row rather than
+    /// leaving the checkbox to explain itself.
+    pub diverged: bool,
+    /// This push would fork the `git` binary — `push::route` answered `Binary`. It decides how
+    /// the dialog words the lease: git's own `--force-with-lease` on that route, and cide's
+    /// comparison against the remote's advertised refs on the other.
+    pub shells_out: bool,
+    /// Set when there is nothing to push and the row must say why.
+    #[ts(optional)]
+    pub blocked: Option<PushBlock>,
+}
+
 // --- branches ---------------------------------------------------------------------------
 
 /// One branch as the selector draws it.
@@ -1386,6 +1483,24 @@ pub enum GitError {
         output: String,
     },
 
+    /// A force push was refused because the remote has moved since the last fetch.
+    ///
+    /// This is `--force-with-lease`'s refusal, and it is the whole reason cide's force push is
+    /// that flag and not `--force`. `expected` is what cide's remote-tracking ref said the
+    /// remote was at; `actual` is what the remote actually advertises. Both are short oids, and
+    /// both are in the sentence because the useful next step is `git fetch` followed by reading
+    /// the difference.
+    ///
+    /// Raised only on the libgit2 route, which has no lease of its own and where cide performs
+    /// the comparison itself. On the binary route git refuses first and its own text arrives as
+    /// [`Self::Push`] — deliberately not translated into this variant, because parsing git's
+    /// stderr to decide which error this was is exactly what `cide_git::push`'s header forbids.
+    PushLeaseStale {
+        branch: String,
+        expected: String,
+        actual: String,
+    },
+
     // --- history: the Git tool window (M18) ---
     //
     // These live in `GitError` and not in a `HistoryError` beside `cide_ipc::history`, even
@@ -1617,6 +1732,14 @@ impl std::fmt::Display for GitError {
             Self::NoRemote { name } => write!(f, "no remote named {name}"),
             Self::Fetch { output } => write!(f, "fetch failed: {output}"),
             Self::Push { output } => write!(f, "push failed: {output}"),
+            Self::PushLeaseStale {
+                branch,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{branch} moved on the remote since the last fetch: expected {expected}, found {actual}"
+            ),
             Self::NotTracked { path } => write!(f, "{path} is not tracked by git"),
             Self::NoSuchRevision { rev } => write!(f, "no such revision: {rev}"),
             Self::NoSuchCommit { rev } => write!(f, "no such commit: {rev}"),

@@ -25,6 +25,7 @@ import { projectTabEntries } from './menuModel'
 import { ProjectMenu } from './ProjectMenu'
 import { RowControls } from './RowControls'
 import { currentUserAgent, windowControlLayout } from './windowControls'
+import { toggleMaximize } from './WindowFrame'
 import { Icon } from '@/icons/Icon'
 
 import styles from './AppHeader.module.css'
@@ -367,6 +368,38 @@ interface ProjectTabItemProps {
  * empty box via `data-awaiting` on the row, and `TabStrip.module.css` records why the
  * permanent reserve this replaced was the wrong trade.
  */
+/**
+ * Double-clicking a project tab maximizes the window, exactly as double-clicking the header's
+ * empty filler does.
+ *
+ * The report was that the two behave differently, and they did: `WindowFrame`'s delegated
+ * `dblclick` listener bails unless `target.closest('[data-window-drag="true"]')` finds
+ * something, and the only element in the header carrying that attribute is `.filler` — a
+ * *sibling* of the tab strip, deliberately, because putting it on the header would turn every
+ * tab and button into a drag handle.
+ *
+ * An explicit handler rather than marking the row as a drag region. The delegated path would
+ * in fact reach `toggleMaximize` from here, but only because `tauriOwnsDoubleClick` answers
+ * `false` when a `<button>` sits between the target and the region — a rule that exists to
+ * mirror Tauri's injected `drag.js`, not to decide anything about tabs, and it should not
+ * quietly become load-bearing for this gesture. Nothing here carries
+ * `data-tauri-drag-region`, so `drag.js` never sees this double-click and there is no
+ * double-toggle to guard against.
+ *
+ * Importing `toggleMaximize` is not a hole in the "only `ipc/client.ts` touches
+ * `@tauri-apps/api`" rule: `WindowFrame.tsx` is the documented owner of window controls and
+ * already exports this for exactly this kind of caller.
+ *
+ * The close button is excluded. Its first click closes the project, so the second lands on
+ * whatever reflowed into that spot — and maximizing the window as a parting gift for closing
+ * something is not what anybody meant.
+ */
+function onTabDoubleClick(event: React.MouseEvent<HTMLDivElement>): void {
+  const target = event.target
+  if (target instanceof Element && target.closest(`.${styles.tabClose}`) !== null) return
+  void toggleMaximize()
+}
+
 function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItemProps) {
   // `tabs`/`detached` are optional on `ProjectTab` so a four-field measurement fixture still
   // satisfies it, and a header rendered from one simply has nothing waiting. `App.tsx` passes
@@ -384,6 +417,7 @@ function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItem
       data-project-id={project.id}
       data-active={active ? 'true' : 'false'}
       data-awaiting={waiting > 0 ? String(waiting) : 'false'}
+      onDoubleClick={onTabDoubleClick}
     >
       <button
         type="button"

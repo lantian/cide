@@ -68,6 +68,7 @@ import { AgentsPanel } from '@/sidebar/AgentsPanel'
 // and it holds here too — a panel that renders nothing for a frame while a chunk arrives is a
 // panel the layout measures at zero.
 import { ExtensionsPanel } from '@/sidebar/ExtensionsPanel'
+import { useInstalledExtensions } from '@/ext/extStore'
 import { ExtPanelHost } from '@/ext/ExtPanelHost'
 import type { PanelBinding } from '@/ipc/client'
 import { attachExtensions, useExtPanels } from '@/ext/extStore'
@@ -96,7 +97,9 @@ import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { OutsideOpenGate } from '@/chrome/OutsideOpenGate'
+import { LogDetailCard } from '@/chrome/LogDetailCard'
 import { PullStrategyGate } from '@/chrome/PullStrategyGate'
+import { PushDialog } from '@/chrome/PushDialog'
 import { ConflictsDialog } from '@/chrome/ConflictsDialog'
 import { requestOutsideOpen } from '@/chrome/outsideOpenStore'
 import { outsideAsk } from '@/terminal/outsideOpen'
@@ -901,16 +904,61 @@ export function App() {
    * the class of prop the memo boundary below cannot see through. The comment on *what* the
    * filter means stays at the JSX site.
    */
-  const railExtras = useMemo(
+  const installedExts = useInstalledExtensions()
+  /*
+   * Which extensions the user has told the rail to leave out. (M31)
+   *
+   * > *"i doesn't like to stuck there all extensions (especially language like YAML, Proto,
+   * > etc)"*
+   *
+   * A `Set` built once per registry change rather than a `find` inside the filter below, which
+   * would be quadratic over two lists that are both "everything installed".
+   *
+   * This is *not* the answer to the short-window problem — `chrome/railOverflow.ts` is, and it
+   * has to be: a rail that dropped buttons to fit would be unreachable panels with a setting to
+   * blame. This is the answer to a different sentence in the same report, and the two are
+   * independent. Nor is it `enabled`: hiding the button leaves the worker running, the language
+   * highlighted and the diagnostics flowing, which is the whole point for a language extension.
+   */
+  const railHidden = useMemo(
+    () =>
+      new Set(
+        installedExts
+          .filter((ext) => !ext.railIcon)
+          .map((ext) => `${ext.marketplace}\u0000${ext.extension}`),
+      ),
+    [installedExts],
+  )
+  const sidebarPanels = useMemo(
     () =>
       extPanels
         .filter((panel) => panel.def.location === 'sidebar')
         .map((panel) => ({
-          id: panel.view as ActivityView,
-          path: panel.def.icon ?? '',
-          label: panel.def.label,
+          item: {
+            id: panel.view as ActivityView,
+            path: panel.def.icon ?? '',
+            label: panel.def.label,
+          },
+          hidden: railHidden.has(
+            `${panel.extension.marketplace}\u0000${panel.extension.extension}`,
+          ),
         })),
-    [extPanels],
+    [extPanels, railHidden],
+  )
+  const railExtras = useMemo(
+    () => sidebarPanels.filter((p) => !p.hidden).map((p) => p.item),
+    [sidebarPanels],
+  )
+  /*
+   * The ones the user took off the strip. They still reach the rail — as menu entries under
+   * `···` rather than as buttons — because a rail button is the only route into a contributed
+   * panel, and a setting that removed the last route would be a one-way door with the way back
+   * on a page the user has no reason to connect with the panel that vanished. See
+   * `ActivityRail`'s `extraHidden`.
+   */
+  const railHiddenExtras = useMemo(
+    () => sidebarPanels.filter((p) => p.hidden).map((p) => p.item),
+    [sidebarPanels],
   )
 
   /*
@@ -1339,7 +1387,11 @@ export function App() {
           * half was fixing in `restorePlan`; it does not get to reappear in the same file.
           */}
         <OutsideOpenGate />
+        {/* The whole event behind a rendered JSON log line, opened by clicking its timestamp.
+            In both branches for the reason above it: a detached pane draws log lines too. */}
+        <LogDetailCard />
         <PullStrategyGate />
+        <PushDialog />
         <ConflictsDialog />
       </>
     )
@@ -1445,6 +1497,7 @@ export function App() {
              * and the manifest reader has already warned its author about exactly that.
              */
             extra={railExtras}
+            extraHidden={railHiddenExtras}
             onSelect={(next) => {
               // What a click means — the lit one toggles shut, any other switches, ⚙ has no
               // panel to hide — is `selectView`'s, in `chrome/sidebarView.ts`, along with the
@@ -1937,7 +1990,11 @@ export function App() {
         {/* The out-of-project confirmation. Also in the detached branch above — one gesture,
             two window kinds, and neither of them may be the one that asks nobody. */}
         <OutsideOpenGate />
+        {/* The whole event behind a rendered JSON log line, opened by clicking its timestamp.
+            In both branches for the reason above it: a detached pane draws log lines too. */}
+        <LogDetailCard />
         <PullStrategyGate />
+        <PushDialog />
         <ConflictsDialog />
 
         {/*

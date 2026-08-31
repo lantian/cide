@@ -18,6 +18,161 @@ For the current shape of the project see [`../README.md`](../README.md); for wha
 not exist off Linux see [`platforms.md`](platforms.md); for the decisions a refactor would
 otherwise undo see [`adr/`](adr/).
 
+## The push dialog, and force push as a lease (M36), and what is not verified
+
+`git.push` was a fire-and-forget gesture. It fanned out over every repository in the project and
+sent each one's current branch to its usual remote, with no way to see what was about to leave the
+machine and no force push anywhere in the stack — no flag on `cide_git::push`, no field on the
+wire, no `+` on a refspec produced by anything in cide. IDEA's *Push Commits* is the shape that
+was asked for: the commits, per repository, with a checkbox.
+
+### The dialog is a promise, so the preview has to be the push
+
+The whole risk in a dialog like this is that it is *internally consistent about a different push*.
+There is no visible failure: the commits are real commits, the target is a real target, and the
+button sends something else.
+
+So `push::preview` makes none of the decisions itself. It resolves the remote with the same
+`default_remote` that `push` calls — the function already shared with `fetch` and `pull` so three
+menu items cannot disagree about which remote they mean — spells the refspec the same way, and
+asks the same `route` whether the push will fork `git`. `a_preview_describes_the_push_that_would_happen`
+pins it from the other end: it previews, then pushes, then asserts the outcome's remote, refspec
+and count are the preview's.
+
+**The count is not `BranchInfo::ahead`, and that is the load-bearing part.** That number is
+measured against the branch's configured *upstream*. The dialog needs "what would this refspec
+send", which is a different question the moment they are not the same ref — and `ahead` is **zero**
+for a branch with no upstream at all, which is precisely the row a user is least sure about
+(*publish this branch*). A dialog reading it would have offered to push a branch while reporting
+that it had nothing to send. So the walk is done next to the walk `push` itself does, hiding the
+remote-tracking ref where there is one and **every** `refs/remotes/<remote>/` ref where there is
+not — the rule `unseen_by_remote` was already using for the count, extracted into `hide_remote_refs`
+so the list the dialog draws and the number the notice reports cannot come from two walks.
+
+`PULL_COMMIT_CAP` is 10 and was not reused. Ten is right for a four-line toast; this is the whole
+content of a scrollable dialog whose one job is showing the set. `PUSH_COMMIT_CAP` is 100, matching
+`REBASE_COMMIT_CAP`, with the remainder in `PushPreview::more` rather than silently dropped —
+`outgoing()` is `commits.length + more`, so a row with 140 commits says 140 and lists 100.
+
+### Three blocked states, not one
+
+A repository with nothing to push has three different reasons and three different remedies: commit
+something, check a branch out, add a remote. `PushBlock` carries which, and the row prints the
+sentence. The alternative — a `pushable: bool` and a disabled row — draws a control that does
+nothing with no explanation, which reads as a bug in cide rather than as a state of the repository,
+and all three states are about ten seconds of work to leave.
+
+They arrive as a `blocked` row rather than as an error or an omission, because the dialog draws a
+project's repositories together: one unborn submodule must not blank the row beside it, and a
+missing row is not an answer.
+
+### Force push is `--force-with-lease`, and on one route cide performs the lease itself
+
+`--force`, on a remote somebody else pushed to five minutes ago, deletes their commits and reports
+success. There is no undo cide can offer: the commits are unreachable on the remote, and for
+everyone who had already fetched them they survive only in a reflog they do not know to look in.
+So the checkbox is a lease, and `PushRequest::force` is a boolean with exactly one meaning — a
+value that could mean either would be a safeguard one typo away from not being one.
+
+The two routes get there differently, and the difference is in the dialog's wording because it is a
+statement about *which program is protecting the user*:
+
+* **The binary route** appends `--force-with-lease`, **bare**. Not `=<dst>:<oid>`, which looks
+  safer and is not: the lease has to be measured against the remote-tracking ref *at push time*,
+  and an oid captured when the dialog opened is stale the moment anything else fetches — another
+  window, a terminal pane, an agent. Pinning it to that oid would either refuse a push that is
+  fine or assert an expectation nobody read.
+* **The libgit2 route** has no lease at all. `git_push_options` carries no expectation, and the
+  only force libgit2 understands is the `+` on a refspec, which is `--force` whole. So `check_lease`
+  connects, reads what the remote actually advertises, and compares it against the remote-tracking
+  ref; a mismatch is `GitError::PushLeaseStale` with both short oids and nothing sent. That route
+  is only reached for a local or `file://` remote, where connecting is a directory read.
+
+Three states, one of which is the one that reads as harmless: both sides have the ref and they
+match (allowed), neither has it — publishing (allowed, exactly as git allows it), and **the remote
+has it and we have no tracking ref**, which is somebody creating that branch since our last fetch.
+Refused, with an empty `expected` saying we held no opinion.
+
+`a_force_push_holds_a_lease_and_refuses_when_the_remote_moved` is both halves against a real bare
+remote: a force push whose lease holds lands, then a second clone pushes, then the same force push
+is refused and the other clone's commit is still there. Commenting out the `check_lease` call makes
+that last assertion fail, which is the property worth having a test for.
+
+### One road to the dialog, because two roads to one gesture is a bug this surface already had
+
+M20 fixed *the panel's dim note line against the palette's red box* — two routes to one push
+disagreeing about whether it worked. Three surfaces now raise the dialog: the palette command, the
+branch popup's Push button, and the Git panel's *Commit and Push…*. All three call `openPushDialog`
+and every send goes through one `pushPass`, which is where the `allSettled`-over-individually-caught
+shape lives along with the aggregation `notices.admit` makes necessary — it dedupes toasts by text,
+so five submodules each answering *"already up to date"* would otherwise show one toast silently
+speaking for five.
+
+`CommitBox`'s button has said **Commit and Push…** since it was written, with a comment beside it
+saying the ellipsis is load-bearing — *this opens something rather than acting at once*. It opened
+nothing. It now opens this, over the repositories that just committed, after the refresh.
+
+`--set-upstream` stopped being decided at the call sites at the same time. It was the branch
+popup's alone, worked out from `head.upstream === null`; the preview reads the same fact off the
+absent remote-tracking ref, per row, and `pushPass` sends it. That is the M20 defect — *Commit and
+Push* failing with *no upstream* on a branch the popup's Push button published fine — made
+unrepresentable rather than fixed twice.
+
+### The dialog's own rules
+
+`ConfirmDestructive` could not draw this: its list is a flat `readonly string[]` and this is two
+levels with an answer per root. So it is `ConflictsDialog`'s shape — `OverlayCard`, head, list,
+foot, Escape on the card — and it keeps that component's rules by hand, which is the part a check
+script exists to hold:
+
+* **Cancel is focused and accented.** The dialog is opened by a keystroke, so the Enter already in
+  flight has to back out. The focus is placed in an effect keyed on the pending question and not in
+  a `ref` callback, because React runs a ref callback on every render — the callback version moves
+  focus back to Cancel when you tick the force box, and the next space dismisses the dialog.
+* **Force starts unticked on every open**, including a reopen after a dismissal. This inverts
+  `ConfirmDestructive`'s house rule of ticking its option by default, and it inverts it harder than
+  the pull dialog's *remember this choice* does: that component's rule is about an option that
+  makes an act **recoverable**, and this one makes an act irreversible on a machine that is not the
+  user's.
+* **Force is disabled unless a ticked row has diverged.** A `--force-with-lease` over a
+  fast-forward is a no-op, and a checkbox that reads the same whether it would overwrite a
+  colleague's work or do nothing at all is one people learn to tick. It is also masked per row on
+  the way out — the answer is the gesture's, the flag is each row's.
+* **The count is on the button** — `Push 2 commits`, never a bare *Push*. `ConfirmDestructive`'s
+  rule 1: the user is acting on a specific set and the size of it is the one thing they cannot
+  check afterwards.
+* `--red` appears on the Push button only while forcing, and it still means one thing.
+
+`chrome/pushModel.ts` holds every one of those sentences and is import-free so `check:push`
+compiles it standalone; `chrome/pushRun.ts` is the fan-out and lives outside `keys/dispatch.ts`
+because `dispatch.ts` imports `openBranchPopup` from the branch popup, so the popup importing the
+runner back out of it is a cycle — ESM tolerates one until somebody moves an import and gets an
+order-dependent `undefined` with nothing at the failure site naming the cause.
+
+### Not done
+
+* **No remote picker.** `PushPreview::remotes` carries every remote, `origin` first, and
+  `PushRequest::remote` is on the wire — the row draws the resolved one and does not yet let you
+  change it. A repository with two remotes pushes to the one `default_remote` picks, which is what
+  it did before.
+* **No branch renaming on the way.** The refspec is `refs/heads/x:refs/heads/x`; `targetLabel`
+  reads the destination out of it so a rename would draw correctly, and nothing produces one.
+* **No progress.** `PushOutcome` arrives whole when the invoke resolves. A large push shows the
+  panel's busy string and then a toast, with nothing in between.
+* **`PushLeaseStale` is libgit2's only.** On the binary route git refuses first and its own text
+  arrives as `GitError::Push`. Translating one into the other would mean parsing git's stderr to
+  decide which error it was, which is exactly what `cide_git::push`'s header forbids.
+
+### What is not verified
+
+**Nothing in this milestone has been confirmed on a display.** The Rust half is covered against
+real repositories — preview, the three blocked states, the publish case, divergence before and
+after a fetch, and both sides of the lease — and `check:push` drives the model standalone and greps
+the component for the four rules above. What has not been seen: the dialog rendering at all, the
+tree's collapse toggles, the checkbox column at a `--ui-scale` above 1, the scroll cap on a branch
+with eighty commits, and whether *Commit and Push…* opening a modal a moment after the commit lands
+reads as helpful or as an interruption. The last of those is the one most likely to want changing.
+
 ## Panes, tabs and the reopen stack (M15), and what is not done
 
 | key | what it does |
@@ -101,6 +256,191 @@ behaviour and not new, but Ctrl+Shift+T is a new way to reach it. The stack is n
 tab strip's right-click menu: a menu item that cannot be honestly disabled — the depth is not in the
 webview — and that silently does nothing is the surface where silence is worst, so the two routes
 are the chord and the palette.
+
+## IDEA's change markers in the editor gutter (M35), and what is not verified
+
+**A file could be modified according to git and the buffer you were typing in said nothing about
+it.** The file tree painted a status letter, the Git panel listed the file, a diff pane would show
+the hunks — and the editor, the one surface actually in front of the user, had no idea which of
+its lines were new, which had been rewritten and where something had been taken out. IDEA answers
+that in the gutter, and this is that: a green bar per added line, a blue one per rewritten line, a
+red caret where lines were removed, and a card on click carrying HEAD's text with **Revert** and
+**Copy**.
+
+### The diff runs in the webview, and that is the whole design
+
+The obvious implementation is `git_diff_file` with `DiffSide::Combined`, which already returns
+hunks with `new_lineno` on every line. It is the wrong one, for a reason that has nothing to do
+with cost: **every diff in `cide-git` reads the working tree from disk**, and the state the editor
+is in whenever this column is most wanted is *unsaved*. A gutter fed from disk is blank for the
+edit you just made and stays blank until you save — which is precisely backwards, because the
+marker's job is to tell you what you have done since the last commit.
+
+So the baseline — HEAD's blob, fetched once through `git_file_at_revision` — is diffed against the
+**live CodeMirror document**, five times a second at most, with `panes/mergeModel.ts`'s patience
+diff. That diff was written for the merge resolver and its header already justifies itself for
+running "in a webview, on a keystroke"; nothing new was needed, and no new Rust was written for
+this milestone at all. `FileDiff` would also have shipped `old_text` *and* `new_text` — up to
+2 MiB each — per open tab per refresh, for information a gutter never reads.
+
+HEAD and not the index, which is IDEA's "base revision": staging a hunk does not make its marker
+disappear. The practical half is that HEAD moves only on a commit, checkout, pull or rebase —
+exactly what `gitRefsMoved` already detects — so staging, the commonest git write there is, costs
+no refetch at all, and a refetch that returns the same blob oid writes nothing and notifies
+nobody.
+
+### Blame is the template, and the three places it is *not* is where the reading is
+
+`editor/changeBaseline.ts` is `blameStore.ts` with its machinery removed rather than copied:
+
+- **No dirty-buffer registry.** Blame sends the buffer to Rust because Rust does the attribution.
+  Here the only thing fetched is an immutable blob, so no copy of the buffer ever crosses the IPC
+  wire, however fast anybody types.
+- **No `loading` state, so nothing to strobe.** Blame needed `keepVisible` to stop its column
+  emptying on every git write. Here there is no intermediate state to flicker through.
+- **Every failure is silent.** Blame reports its reason because turning the column on is a
+  *gesture*, and a gesture that does nothing is this project's named worst failure. These markers
+  are ambient — nobody asked — so a file outside every repository, a file HEAD does not have, a
+  binary blob, a truncated one and an unborn HEAD all resolve to the same "no markers", and **no
+  error variant is inspected**. That last part is deliberate: `file_at_revision` rejects an unborn
+  HEAD with `NoSuchCommit` and a missing path with `NotTracked`, and a taxonomy that knew about
+  one of them would fall through on the other.
+
+The same subtraction happens in the extension. `blame.ts` carries a paragraph on `touched`
+overrides and a branch on `tr.isUserEvent('undo')`, both because blame cannot re-derive locally: a
+marker that survives an edit keeps another person's name over text they never wrote, *for ever*.
+This column re-derives from scratch every 120 ms, locally, for free — so there is no overlay and
+no undo branch, and an undo is just another edit. An overlay would also have been **wrong**:
+"the user typed here" is not "this differs from HEAD", and typing a line back to its committed
+text must *remove* a bar, which an additive set cannot express.
+
+### Three range sets, and the one that is never drawn
+
+`bars` is one point per changed line, because `@codemirror/view` matches a marker to a line by
+comparing the range's `from` against the line start — a single range spanning six lines paints
+one of them. `carets` is separate because **a line can carry both**: a deletion immediately
+followed by an insertion is two blocks whose markers land on the same line, and one set would
+silently drop one of them.
+
+`blocks` holds real ranges, is never rendered, and is what the card and Revert read. Mapped
+through `tr.changes` like the others, so typing inside a block grows its range and the revert
+replaces whatever is there *now* — which is the correct meaning of "put this block back", not a
+compromise. A scan over the per-line points could not do it: an insertion inside a block leaves
+its new lines unmarked until the next recompute, so the scan would stop early and revert half of
+it.
+
+### The bugs found by writing it down, the one found by looking at it, and one wrong fix
+
+**A CRLF baseline splits on `'\n'` into lines that all end `\r`.** CodeMirror normalises the
+buffer to LF at load — `lineEndings.ts` exists to put the file's own shape back on save — so every
+line of a Windows file would compare unequal and the **whole file** would paint modified. Nothing
+throws; it looks exactly like a file that really did change. `splitBaseline` splits on all three
+break shapes, and it is the headline assertion of the new check.
+
+**`highlightActiveLineGutter()` paints over the bar.** It puts `cm-activeLineGutter` on *every*
+gutter element of the caret's line, background and all — so the marker would vanish from the one
+line the user is actually editing, which is the line it is most wanted on. The bar rules are
+written three classes deep to beat it *regardless of source order*, which is the same call
+`.cm-blame-touched` already makes and for the same reason: relying on the cascade tie-break makes
+a later reordering of the stylesheet a silent regression.
+
+**A gutter's `domEventHandlers` do not stop propagation** — `@codemirror/view` installs them as a
+plain `addEventListener`, and returning `true` from one calls `preventDefault()` and never
+`stopPropagation()`. So the click that opens the card really does keep bubbling, and a dismissal
+listening one level up would close it in the same gesture: the card would never appear, reading
+as the marker simply not being clickable rather than as a bug in a dismissal rule.
+
+The first fix for that was to exclude the gutter and the card by hand, and it was **wrong about
+its own mechanism** — worth recording, because it would have left two guards and a confident
+comment explaining a danger they were not the answer to. `EditorView.domEventHandlers` attaches
+to **`contentDOM`**, and neither the gutter nor a tooltip is inside it, so the dismissal never
+sees either event and both exclusions were dead code. What keeps the card open is the attachment
+point, and the guard worth having is against somebody moving the handler to `view.dom` — which is
+what the check pins instead.
+
+**A phantom green bar on the last line of nearly every file in the repository.** `Text` keeps the
+empty line after a file's final break — `"a\nb\n"` is *three* lines to CodeMirror — while the
+baseline was split with the diff pane's rule, which drops it. That rule is correct where it lives:
+`diffRows.splitLines` and Rust's `strip_newline` are lining up against **git's** numbering, where
+a file ending in a break has no line after it. Here the comparison is against a CodeMirror
+document, so the baseline came out one line shorter than the buffer for every newline-terminated
+file — which is very nearly all of them — and the diff dutifully reported an addition at the
+bottom of each. Copying the right rule from the wrong neighbour, in other words, and the result is
+a green bar on files nobody has touched, invisible until somebody scrolls to the end. It is
+**still** invisible: the screenshots below never reached the foot of a file, and this one was
+caught by asking what `EditorState.create` actually does with a trailing newline rather than by
+looking.
+
+**Every deletion caret in the file was drawn in the same place.** The caret is an absolutely
+positioned `::before`, and the stylesheet made the *column* the positioned ancestor rather than
+the per-line cell — so all of them stacked in the gutter's top-left corner, off screen for any
+line scrolled past. Nothing throws, nothing is missing from the DOM, and the only symptom is that
+a deletion appears to paint no marker at all. **This one was found by looking at it**, which is
+the whole argument for the paragraph below: a bar and a caret can be individually correct in
+every check this repo can write and still be in the wrong place on a screen.
+
+**A deletion at the end of a file reverts one line too high.** The caret anchors on the last line,
+because there is no line below it to hang on; the *insertion point* is one past that line. Writing
+the two as the same number puts the restored text above the final line, and it looks right in
+every case where the last line happens to be blank.
+
+### Revert is a document edit, and that is why it does not ask
+
+The Git panel's *Roll back* opens `ConfirmDestructive`, because `git_rollback` writes the disk and
+nothing undoes it. This one dispatches a single transaction with `userEvent: 'revert'`, so it is
+one undo step and **Ctrl+Z puts it straight back** — asking would be ceremony over an action the
+editor can already reverse. The restored lines are joined with `'\n'` and never with the file's own
+break shape: a CRLF join would put literal `\r` characters *inside* CodeMirror lines and
+`restoreLineEndings` would then add the file's ending on top, so every reverted line would end
+`\r\r\n`.
+
+The arithmetic lives in `changeModel.revertPlan`, whose `eat` field says which surrounding line
+break a removal has to consume — the trailing one normally, the leading one at EOF where there is
+no trailing break to take. `check:change-bars` round-trips every block shape through it: sixteen
+add/delete/modify cases at the top, middle and end of a file, each asserted to reproduce HEAD
+exactly. It is the only automated defence on the one operation in this feature that can destroy
+the user's text rather than mispaint it.
+
+### What is not verified
+
+- **The three markers were confirmed on a display; nothing else was.** `run.sh` is
+  profile-scoped now, so the `dev` instance starts beside the installed one this was written
+  inside. A tracked file was edited on disk in all three ways and the instance restarted, and the
+  screenshots show: a **green** bar on the added line, a **blue** bar on the rewritten one, and
+  the **red caret** straddling the boundary where a line was removed. Two further things came out
+  of the same screenshots — the line numbers do not move when a bar appears, and a bar on the
+  **active line** survives `highlightActiveLineGutter`, which is the specificity rule above doing
+  its job.
+- **Everything reached by a pointer is unverified.** No synthetic-input tool is installed on this
+  machine, so the card was never opened: whether it flips the right way up near the foot of a
+  pane, whether `flushSync` measures it correctly, whether Revert lands the right edit and whether
+  Ctrl+Z undoes it cleanly have all been reasoned about and none of them has been *done*. Revert
+  is also the one gesture here that can destroy text, so it is the one that most needs a hand on
+  it.
+- **Nor is anything about typing.** Every screenshot was taken after a restart, against a buffer
+  read from disk. Whether 120 ms reads as live while a key is held, whether the bars follow their
+  lines through an edit above them, and whether the column keeps up during a paste are unmeasured.
+- **The foot of a file was never looked at.** The phantom-addition bug above is proven fixed by
+  the check, which compares against the line arrays a real `Text` produces, and by nothing on a
+  screen — the file used for the screenshots is 343 lines and there is no way here to scroll one.
+- The colours are unjudged: whether a `0.5ch` bar at 70% reads as IDEA's does, and whether the
+  caret is findable at an 11px gutter without knowing to look for it.
+- **The 120 ms tick has never been profiled on a large real file.** The argument is structural —
+  the gutter is viewport-windowed, the patience diff trims its common prefix and suffix first, and
+  the buffer is read with `iterLines` rather than materialised as one string — and the numbers are
+  estimates. The line cap is 50,000 and the byte gate is `HIGHLIGHT_LIMIT_BYTES`, the same flag
+  that already decides a buffer gets no grammar and no folding.
+- **A renamed file loses its markers entirely.** `locate` gives the current path and HEAD has the
+  old one, so the baseline read rejects. It fails to *no markers*, which is the safe direction,
+  and it will read as the feature being broken on exactly the file somebody has just refactored.
+- **A staged-but-uncommitted new file shows nothing**, because the baseline is HEAD and HEAD has
+  no such path. IDEA paints the whole file green. This is a choice — a wall of green is noise
+  rather than information — but it is a choice, and the first report about it will be legitimate.
+- **Two panes over one file diff twice.** Correct, since they are two independent buffers, but it
+  is two diffs per tick and nothing measures it.
+- The revert round-trip proves the *arithmetic*, over arrays. Whether `changeBars.ts`' translation
+  of that plan to offsets against a live `Text` is faithful — the clamps, the `+1` past
+  `doc.length` — is source-pinned and nothing more.
 
 ## Moving a pane between rows and columns (M31), and what is not verified
 
@@ -5546,6 +5886,163 @@ same session: typescript-language-server *corrects* a `.js` document labelled `t
 costs nothing here), and with TypeScript 5.9 pinned the loose-file definition resolves
 first try.
 
+## Four more reports from a day's use: the picker, the PATH, the tab, the paste (M35), and what is not verified
+
+Four things reported together and sharing nothing but the session. Two were controls that were
+never wired up, one was a default that is only wrong off Linux, and one was a feature this
+codebase had written down a reason not to build.
+
+**A folder picker with no way to make a folder, and GTK is why.** The report was that the Open
+project dialog does not let you create one. The first assumption — that cide had suppressed
+something — was wrong in both directions: `create-folders` is `TRUE` by default and cide never
+touches it, *and* turning it on would change nothing. `GtkFileChooserWidget`'s template does hold
+a `browse_new_folder_button`; it is `visible = FALSE` after map for a `SELECT_FOLDER` chooser, and
+the `browse_header_revealer` that contains it is never revealed. GTK3 shows that button for `SAVE`
+and `CREATE_FOLDER` and for nothing else. Measured on the machine rather than read: a PyGObject
+probe built the same dialog both ways round (`use-header-bar` true and false), mapped it, walked
+the widget tree and printed the button's visibility and every ancestor's. Both `False`.
+
+So the control has to come from cide, and it does — as an **extra widget**, a name field and a
+*Create Folder* button under the file list, gated on `spec.folders` so the theme-import picker is
+unchanged. `FileChooserNative` forwards `set_extra_widget` to its fallback dialog, which is the
+other thing that was measured rather than assumed (the button came back parented, visible and
+mapped). A row rather than a name prompt, and that is not a style preference: `FileChooserNative`
+is a `GtkNativeDialog` and not a `GtkWindow`, so nothing can be made transient *for the picker* —
+a prompt could only be parented to the app window underneath it, which on Wayland is a sibling
+free to stack below. The entry is inside the chooser, so the question does not arise. Enter in the
+field does what the button does, because a text field beside a button that ignores Enter is a
+field people press Enter in and conclude is broken, and a failure (`EEXIST`, above all) shows as
+an icon and a tooltip on the entry itself.
+
+macOS needed none of it: `rfd`'s `build_pick_folders` sets `NSOpenPanel.canCreateDirectories` to
+true by default, so the other `cfg` arm has had the button all along. One case where this silently
+does nothing is named in the code: a launch with `GTK_USE_PORTAL=1`, or inside a Flatpak, sends
+`show()` to the portal and the extra widget is not forwarded — survivable, because the portal
+dialogs carry their own *New Folder*.
+
+**Two PATH bugs wearing one report.** *"macos bash and claude problem — it doesn't see all PATH,
+for example it doesnt see nvm/npm, claude doesn't see my local `~/bin` that is added to PATH."*
+Two causes, and `docs/platforms.md` had both written down as known gaps since M17.
+
+The first is `ui/src/panes/TerminalPane.tsx`, which named `/bin/bash` as the program for every
+shell pane with a comment saying Settings would take it over "in M11". On macOS `/bin/bash` is
+3.2.57 — the 2007 GPLv2 release Apple still ships — and the login shell since Catalina is
+`/bin/zsh`, so `bash -l` reads `~/.bash_profile` and the user's entire `~/.zshrc` never runs,
+including the `nvm.sh` source line and the `brew shellenv` eval that are *the* documented ways
+those two tools get onto `PATH`. The pane now asks for **the login shell** rather than for a
+program: it sends an empty `program`, and `session_spawn` substitutes `cide_core::shell` —
+`$SHELL` if it is executable, then `getpwuid_r`, then `/bin/zsh` on macOS and `/bin/bash`
+elsewhere, then `/bin/sh` — with `-l`. `cide-headless` reads the same function, so the three
+near-misses this workspace held are one ladder. Deliberately **not** a setting: the OS knows the
+answer, and a text field pre-filled with the right value has exactly two reachable states, the
+right answer and a typo.
+
+The second is deeper and is the one `claude` hits. Every cide child gets `process PATH +
+toolchain::extra_dirs()`, and for a Finder or Dock launch the process `PATH` is launchd's
+`/usr/bin:/bin:/usr/sbin:/sbin`. `extra_dirs` answers that with directories cide can name in
+advance, and no list can name a directory that exists only inside a sentence in somebody's
+`~/.zshrc` — which is exactly what `export PATH="$HOME/bin:$PATH"` and an nvm version directory
+are. `platforms.md` had already named the fix and the two objections to it, and this milestone
+takes it because the report is precisely the trigger that document specified.
+
+`cide_core::login_path` runs the login shell once per process, on its own thread, behind a
+four-second deadline, and appends what it reports. Each objection is answered by a piece of its
+shape rather than by an assurance. **`toolchain` still spawns nothing** — the probe is its own
+module, `extra_dirs` stays pure and static, and a new `toolchain::discovered_dirs` composes the
+two; `search_paths` and `child_env::child_path` both read *that*, so find-it and give-it remain
+one list and `the_path_a_child_searches_is_the_path_which_searched` now asserts over it. **The
+hang is bounded twice** — the child's deadline, and a three-second wait for any caller that
+arrives before the answer, which on timeout answers empty rather than waiting again, so a wedged
+rc costs one pause and not one per spawn. **It is not silent** — one `info!` per launch naming the
+shell, the elapsed time and every directory added, because an empty answer and a perfect one look
+identical from a pane.
+
+Two details are load-bearing and neither is obvious. The probe cannot go through `run_filter`:
+that applies `prepare_command`, which composes `discovered_dirs`, which waits on the probe that is
+running — so `child_env` grew `run_filter_bare`, the one spawn in the workspace that keeps the
+scrub and skips the `PATH` pass, and the honest reason is that this child's whole purpose is to
+disagree with cide about `PATH`. And the shell's output is read only from **between two markers**
+the probe prints, because an interactive rc prints things: an nvm banner, a `command not found`
+warning, a `motd`. Without the markers a banner becomes a directory name, silently, for ever
+after. The negative case is in the tests, along with `set -x` echoing the command line — which is
+why the *last* marker wins.
+
+Enabled on Linux as well as macOS, and that is a testing decision as much as a correctness one: a
+desktop-launched AppImage inherits a narrow `PATH` for the same reason a Finder-launched `.app`
+does, and Linux is the only platform where the path can be exercised. Measured here with
+`PATH=/usr/bin:/bin`: 430 ms, recovering nvm, pyenv, linuxbrew, sdkman and `~/go/bin`. `~/bin` was
+also added to the static macOS list, because it is the directory the report names and it should
+not depend on a probe that is allowed to fail.
+
+**Double-clicking a project tab did nothing, and the reason is one attribute.** `WindowFrame`'s
+delegated `dblclick` listener bails unless `target.closest('[data-window-drag="true"]')` finds
+something, and the only element in the header carrying that attribute is the empty `.filler` —
+a *sibling* of the tab strip, deliberately, because putting it on the header would turn every tab
+and button into a drag handle. So the gesture worked on the empty space beside the tabs and not on
+the tabs. An explicit `onDoubleClick` on the tab row now calls the same exported `toggleMaximize`.
+Explicit rather than marking the row as a drag region: the delegated path would in fact have
+reached the same function, but only because `tauriOwnsDoubleClick` answers `false` when a
+`<button>` sits between the target and the region — a rule that exists to mirror Tauri's injected
+`drag.js` and should not quietly become load-bearing for this. The close button is excluded, since
+its first click closes the project and the second lands on whatever reflowed into that spot.
+
+**Pasting a screenshot, in the tree and in a buffer.** *"if i do PASTE action in file tree and in
+buffer image — we should be able to create image file in place where we pasting it."* There was no
+route in the workspace that writes **binary** bytes to a file — `file_write`, `fs_write_file` and
+`ops::write` all take a `String` — and no paste handler on the editor surface at all.
+
+The constraint that shaped it is `crates/cide-ipc/src/image.rs`'s opening rule: pixels never cross
+the IPC. A clipboard holds a *bitmap*, not a PNG — 33 MB of RGBA for a 4K screenshot — so
+encoding it in the webview means marshalling that through Tauri's JSON IPC twice. Instead
+`fs_paste_image` reads, encodes and writes on one blocking Rust thread and answers a path; the
+frontend names a directory and receives a string. Nothing about the image is ever in JavaScript.
+
+That also disposes of all three objections `ui/src/terminal/clipboard.ts` records against
+`read_image`, and the distinction is worth stating because that note reads as a blanket refusal.
+It is about the **plugin command**, the webview-facing one: it needs a capability this app does
+not grant, and it answers with a `ResourceId` into the window's resource table that requires
+`core:resources:allow-close` to free, so every call would leak a full bitmap for the life of the
+window. `ClipboardExt::read_image` is the *host* API behind it — capabilities gate `invoke`, not
+Rust — and hands back an owned value that drops at the end of the function. The Ctrl+V decision
+that module documents for a Claude pane is untouched and is not on this road.
+
+The buffer half needed one more decision: whether a paste is an image without decoding one. The
+answer is that the question is free — a `paste` event carries `clipboardData.types`, a list the
+browser has already assembled — so the DOM event is the detector and Rust is the reader. It also
+has to be that way round for a reason `terminal/clipboard.ts` met from the other side: the handler
+is synchronous, `preventDefault` cannot be deferred, and reading a clipboard cannot be done
+without awaiting.
+
+Four rules live in `editor/pasteImage.ts`, import-free and driven by `check:paste-image`, because
+every one of them fails invisibly. A clipboard holding an image **and text** is text — the same
+trade the terminal makes, and what keeps a copied file path pasting as a path. `relativeTo` takes
+the **document** path, not its directory, and an off-by-one `../` renders as a broken-image glyph
+with the file present on disk and nothing logged, which reads as a preview bug. A generated name
+always contains spaces, so a markdown destination is `<`-wrapped — CommonMark otherwise parses
+`![](Pasted image ….png)` as a link to `Pasted` with prose after it. And markdown gets `![]()`
+while everything else gets the bare relative path, with the alt text left **empty**: a screen
+reader reading out "Pasted image 2026-08-31 at 22.41.07" is worse than none.
+
+In the tree, Ctrl+V with an empty in-app file clipboard used to mean nothing at all; it now means
+this. `FsError::NoClipboardImage` is its own variant precisely because of that: the command is
+reached every time somebody copies text elsewhere and presses Ctrl+V here, several times a
+session, and that is not a failure. The bare chord swallows it; the context menu's *Paste Image*,
+which the user pointed at, shows it. That item is never greyed, and the reason is the one above —
+predicting whether the clipboard holds an image costs a full decode, so the refusal is cheap to
+report and expensive to foresee. The name is invented from the clock rather than typed, so a
+collision is cide's problem and not the user's: `ops::write_new_bytes` walks
+`copy::candidate_name` with `create_new(true)`, which means a pasted image collides the way a
+pasted *file* does, and there is no dialog because there is nothing to ask.
+
+**What is not verified.** None of the four was seen on a Mac, and two of them are macOS fixes:
+the shell ladder's rungs are unit-tested over injected inputs and its platform default is a
+`cfg!`, so what a real `.app` gets from `getpwuid_r` and from launchd's `SHELL` is reasoned about
+and not observed, and the `~/bin` and `path_helper` half of `extra_dirs` is still a list built
+from installer documentation. The GTK dialog was probed on this machine but the finished picker
+has not been driven by hand on a display, nor has the tab double-click, nor either paste — those
+four are the ones to try first. The PATH probe *was* run end to end here, against a deliberately
+narrowed `PATH`, and the numbers above are measured.
+
 ## Opening a file a pane printed, including one outside the project
 
 Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the
@@ -6729,6 +7226,130 @@ the real UI — `prettier` end to end is only covered by unit tests standing in 
 `cat`, `true`, `sh`). CRLF is reasoned about (the formatter never sees `\r`; `restoreLineEndings`
 runs only on save) and not tested. `check:css-prefix` fails on `EditorSurface.module.css:954` at
 this commit and did so before this work — it is not from this feature.
+
+## Four reports from a day's use: the rail, the diff, the ticks (M31), and what is not verified
+
+Four things reported together from using cide on itself, which turned out to share nothing except
+the session they were noticed in. Three were bugs with a wrong line in them; one was a default
+that had been argued for at length and was wrong anyway.
+
+**The activity rail clips, and it is not an extensions problem.** `.rail` is a flex column of
+`flex: none` items — a shrunk button breaks the measurements `chrome/layoutAudit.ts` asserts, and
+the stylesheet says so — inside an `overflow: hidden` shell, so an overfull rail clips and a
+clipped rail button is *unreachable*. That is worse here than on the tab strip, because the button
+is the only route into a contributed panel: there is no command for an `ext:` view. The
+arithmetic is the part worth recording, because it says the report was mis-framed. Ten builtin
+buttons want `10×32 + 9×4 + 16 = 372px`; the smallest window cide will open is `MIN_HEIGHT` 430,
+less a 38px header and a 26px status bar, leaving **366**. So stock cide is already six pixels
+overfull at its own minimum window size with nothing installed, and `--ui-scale` above 1 makes it
+worse rather than better — the header and status bar scale, the 32px button and the 4px gap do
+not. Capping extensions would have "fixed" the report and left the bug. `chrome/railOverflow.ts`
+is the rule, an import-free module in `tabOverflow.ts`'s shape with `check:rail-overflow`
+compiling and running it standalone, and the one thing it does that reads like a redundancy is
+count the `···` control's own slot *inside* the fit rather than adding it afterwards — the latter
+computes room for exactly the buttons that fit and then draws one more thing, which is the
+original bug with an extra step.
+
+The rail takes counts and two CSS lengths, where `clippedTabs` takes measured boxes. That is not
+inconsistency: a tab's width depends on its filename and its dirty dot, so measurement is the only
+honest input there, while a rail button is 32px whatever is in it — and taking boxes here would
+invite a feedback loop, because hiding a button changes the boxes that decide what to hide. The
+lengths are still read off the DOM rather than written as `32` and `4`, so retuning the stylesheet
+cannot leave the rail miscounting by a slot on short windows only.
+
+**Hiding an extension's icon is a setting, and it deliberately is not `enabled`.** `"i doesn't
+like to stuck there all extensions (especially language like YAML, Proto, etc)"` — and those two
+really do declare `location: "sidebar"` panels with icons, so cide cannot classify them: there is
+no signal separating a language's outline from any other contributed panel, and the user has to be
+able to say. `Installed::rail_icon` is the stored flag and `ext_set_rail_icon` the command, kept
+apart from `enabled` because disabling stops the worker, drops the languages and silences the
+diagnostics — somebody who wants YAML off the rail still wants YAML highlighted, and
+`marketplace.rs` asserts exactly that (the panel is still resolved, the assets are still served).
+The second decision is the one that took a rewrite: a hidden panel is **still listed under `···`**.
+Filtering it out of both the strip and the menu was the obvious reading of "hide" and it makes the
+setting a one-way door — the only route into the panel is gone, and the way back is a Settings
+page nobody would connect with a panel that vanished. So `···` means *panels not in the strip*,
+for both reasons, and the check pins the complement so no panel can fall into neither list.
+
+**A diff opened at line 1**, by omission rather than decision: `currentChange` starts at `-1` and
+the view's scroll effect bails on a null anchor, so the machinery to centre the first change was
+all present and nothing ever asked it to. `changeAnchors` skips `shared` runs, so `anchors[0]` is
+the first real difference. The seed is one line in each of the two wiring components and the
+interesting part is what it must *not* touch: the refetch path resets to `-1` on purpose, and its
+comment — *a scroll nobody asked for is worse than a stepper that starts again* — is right.
+Opening and being-interrupted are opposite cases and now get opposite answers, discriminated by
+`revRef.current === null`, which the pane already kept. `check:diff-render` pins the pair against
+source, because collapsing them either way is silent: one direction puts every diff back at line
+1, the other drags the reader off the hunk they were reading every time an agent touches the file.
+
+**"git tree commits everything when commiting."** The commit path was never the problem and it is
+worth saying so before somebody fixes it: `commitUnits` splits ticked ids per repo,
+`commitSelections` turns each into a `PathSelection`, and `cide_git::commit` rebuilds the index
+from exactly those, with `tests/staging.rs` pinning it. Three separate faults upstream of it, in
+the order they bite. The ticks were a plain `useState` re-seeded on every mount while the tree
+beside them came from a module-level cache — and the panel unmounts on **every rail switch** — so
+glancing at Files and coming back rebuilt the selection from `defaultSelection`. Second, and this
+is the one that matches the report's wording exactly: `adopt` pruned the ticks against *every*
+payload, including the `EMPTY` one `refresh` adopts with `authoritative: false` when the status
+walk fails. An `index.lock` held by a bash pane is enough; `pruneSelection([], prev)` reads it as
+*every file is gone* and empties the set, and the next good payload re-ticked the whole active
+changelist through `arrivals`. The guard already existed and was applied to `pruneTo` and to the
+row selection and not to the third thing pruned beside them — three pieces of user state, one
+payload, two protected. Third, the policy: `defaultSelection` ticked the active changelist, so
+every commit was an act of *unticking*, and the cost of missing one is a commit carrying work
+somebody had not finished.
+
+The default is gone rather than switched off, and `arrivals` no longer says anything about ticks —
+a file arriving mid-commit adding itself to that commit is the same failure one file at a time, and
+harder to notice. The old comment worried that an empty panel is "nothing to commit and no clue
+why"; the footer already renders `nothing selected` and Commit is already disabled, so the answer
+was on screen the whole time. `check:git` asserts the export stays **gone**, because reinstating
+it silently restores the reported behaviour and nothing else in the suite would see it. The
+stories that needed ticked rows to exercise the tri-state kept them — the rule moved into
+`fixture.ts`, where "the active changelist is ticked" is a fair description of a fixture and a bad
+description of a product default.
+
+**Committing with a diff open showed `[object Object]`.** A `GitError` is
+`#[serde(tag, content)]`, so a rejection is an object with no `message`, and the pane's
+`String(e)` printed nothing at all under a heading that said *"Nothing to show on this side."* —
+on the commonest path there is, since committing a file whose diff is open is exactly what
+produces `NoSuchChange`. `client.ts` names this hazard in prose and `branchModel::explain` is the
+sanctioned unwrap; the pane had simply never used it, at four catch sites, one of which *knew*
+about the tagged shape and stringified `detail`, which is itself an object for both refusals it
+can actually get. `explain`'s own wording for `noSuchChange` is written for the staging caller —
+a race, and a failure — so the diff pane special-cases the one tag it has better context for. The
+digest now exposes the rendered `reason`, which nothing drove before, and every story is scanned
+for `[object Object]`.
+
+**The lag has one confirmed cause and one measured-but-unfixed one.** Every open `EditorPane`
+subscribed to `cide://git-status` and did a full `fileApi.read` on each — and `TabContent` keeps
+every tab of the project mounted, which is what makes tab switching free. The old comment said "a
+read is cheap", which is true of one read and was the wrong unit: the cost is *(open editors) ×
+(mutations per commit)* round trips, each carrying a whole file body. Both bounds are borrowed
+rather than invented — a **throttle** and not a restarting debounce, on `gitStatusStore.ts`'s
+argument that a debounce can be starved by a steady stream of writes, and a hidden tab defers to
+its next reveal, which is `GitDiffPane`'s rule and the reason `onScreen` exists on the component
+at all. Correctness is unchanged: still an unconditional read-and-compare on every git mutation,
+just once per burst and only where somebody can see it. Separately, `setCollapsed(new Set(...))`
+ran on every fetch including the many that return byte-identical diffs, which both re-collapsed
+hunks the reader had opened and churned `model` identity into a full re-measure — three geometry
+effects each walking every row for `offsetTop`, a forced synchronous layout over thousands of
+nodes. It is now gated on the diff having actually moved.
+
+**What is not verified.** None of it has been seen on a display. `./run.sh` was not driven, so
+the `···` control has never been clicked, the overflow menu has never been opened, no window was
+resized to the point of clipping, no extension icon was hidden through the real Settings page, no
+diff was watched scrolling to its first change, and no commit was made from the panel. Every
+claim here rests on the check suite, the Rust tests and reading. The lag work in particular is
+**unmeasured**: the fan-out was counted by reading the subscribers, not by instrumenting a real
+commit, so how much of *"cide starts to lag"* the editor throttle actually removes is unknown —
+the plan called for measuring first and that step was not performed. The multi-repo half of the
+broadcast is untouched: a commit still emits one whole-tree `cide://git-status` per repository, and
+coalescing those was scoped out rather than done. `RevisionDiffPane` keeps the ungated
+`setCollapsed`, because it has no rev to compare and already treats every refetch as a new diff.
+And `use_staging_area`, or a repo mid-merge, still makes `cide_git::commit` commit the whole index
+and ignore the ticks entirely with nothing in the panel saying so — a real trap, found while
+reading this, and left alone as a different report.
 
 ## The look and feel (M23), and what is not verified
 

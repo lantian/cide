@@ -408,7 +408,7 @@ export function refusalOf(error: unknown): Refusal | null {
  * ref in `branch`, so the sentence names the branch being merged rather than the one you are
  * standing on.
  */
-export type GitOp = 'checkout' | 'pull' | 'merge'
+export type GitOp = 'checkout' | 'pull' | 'merge' | 'push'
 
 /**
  * A list of paths in a sentence: `src/main.rs and src/lib.rs`, `a, b and 4 more`.
@@ -531,12 +531,18 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
     case 'stagesGone':
       return `${name('path')} cannot be un-resolved: resolving a path is what removes the conflicting versions, and git keeps no copy.`
     case 'noUpstream':
-      return `${name('branch')} has no upstream branch to pull from`
+      // The op decides the preposition, because the two gestures want opposite fixes: a pull
+      // needs an upstream to read from, and a push *creates* one. Telling somebody who pressed
+      // Push that their branch has nothing "to pull from" sends them looking for a setting when
+      // the answer is the button they just pressed, with `--set-upstream` on it.
+      return op === 'push'
+        ? `${name('branch')} has no upstream branch yet — push it once to publish it`
+        : `${name('branch')} has no upstream branch to pull from`
     case 'detachedHead':
       // Not "has no upstream", which is what this used to be folded into. A detached HEAD is
       // not a branch missing a setting; `git branch --set-upstream-to` cannot help, and the
       // sentence has to point at the fix that can.
-      return `HEAD is detached at ${name('head')} — check out a branch before pulling`
+      return `HEAD is detached at ${name('head')} — check out a branch before ${op === 'push' ? 'pushing' : 'pulling'}`
     case 'noRemote':
       return `This repository has no remote named ${name('name')} — add one with \`git remote add\``
     case 'operationInProgress':
@@ -549,6 +555,11 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
       return `Fetch failed: ${name('output').trim()}`
     case 'push':
       return `Push failed: ${name('output').trim()}`
+    case 'pushLeaseStale':
+      // The lease's refusal, and the one refusal in this table whose *point* is that the user
+      // does not yet know what they would be overwriting. So it names both oids and sends them
+      // to fetch: the next step is reading the difference, not retrying with a bigger hammer.
+      return `${name('branch')} moved on the remote since your last fetch — it was at ${name('expected') || 'nothing you had seen'} and is now at ${name('actual')}. Fetch and look at what arrived before forcing over it.`
     case 'notARepository':
       return `${name('path')} is not inside a git repository`
 

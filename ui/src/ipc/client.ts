@@ -35,6 +35,7 @@ import type {
   KeymapEdit,
   KeymapEditResult,
   KeymapReport,
+  LogLineDetail,
   ResolvedBinding,
   FileDoc,
   ImageDoc,
@@ -81,6 +82,8 @@ import type {
   LineRef,
   PathSelection,
   PushOutcome,
+  PushPreview,
+  PushRequest,
   RepoId,
   RepoInfo,
   ShelfEntry,
@@ -1584,13 +1587,17 @@ export const git = {
    * turns them into a sentence, and they are read from the object database before the push
    * rather than parsed out of git's output, which on the binary route is the remote server's.
    */
-  push: (
-    project: ProjectId,
-    repo: RepoId,
-    remote: string | null = null,
-    refspec: string | null = null,
-    setUpstream = false,
-  ) => invoke<PushOutcome>('git_push', { project, repo, remote, refspec, setUpstream }),
+  push: (project: ProjectId, repo: RepoId, request: PushRequest = { setUpstream: false, force: false }) =>
+    invoke<PushOutcome>('git_push', { project, repo, request }),
+
+  /**
+   * What a push would send, for every repository in the project — the push dialog's payload.
+   *
+   * Reads only; nothing is sent and nothing is written. A repository that cannot be opened is
+   * absent from the answer rather than failing it, and one that has nothing to push is *present*
+   * with `blocked` set — see `PushPreview`.
+   */
+  pushPlan: (project: ProjectId) => invoke<PushPreview[]>('git_push_plan', { project }),
 
   /** The "reload" half of the guard bar: accept the index as it now stands. */
   adoptIndex: (project: ProjectId, repo: RepoId) =>
@@ -1904,6 +1911,17 @@ export function isDegraded(name: string): boolean {
  * a caller outside a pane is not broken by this. New pane callers use these.
  */
 export const paneSession = {
+  /**
+   * The whole event behind one rendered JSON log line, by the handle its hyperlink carries.
+   *
+   * `null` when the line has aged out of the session's ring — a couple of thousand lines deep,
+   * per session — which the card reports as *no longer kept* rather than as a failure. The
+   * pretty-printing is Rust's, deliberately: a detached pane is a separate JavaScript realm,
+   * and two realms formatting the same event are two answers to one question.
+   */
+  logDetail: (session: string, handle: number) =>
+    invoke<LogLineDetail | null>('session_log_detail', { session, handle }),
+
   /**
    * Attach this pane's sink, and receive the screen it should start from.
    *
@@ -2643,6 +2661,29 @@ export const fsClipboard = {
       mode,
       decisions: [...decisions],
     }),
+
+  /**
+   * Write whatever image is on the **system** clipboard into `destDir`, as a PNG.
+   *
+   * The other paste. `paste` above moves files between two places on disk; this one turns a
+   * screenshot into a file that did not exist, named after the moment it was pasted
+   * (`Pasted image 2026-08-31 at 22.41.07.png`) and de-duplicated with the same ` copy` suffix
+   * a pasted file gets. Answers the path it wrote, so the caller can select the row or insert
+   * a link to it without building the same string a second time.
+   *
+   * **No pixels cross this call in either direction.** The clipboard is read, encoded and
+   * written entirely in Rust — see `cmd::fs::fs_paste_image`, which also explains why the
+   * plugin's webview-facing `read_image` (a `ResourceId` into this window's resource table,
+   * behind a capability this app does not grant) is not what is used.
+   *
+   * **Rejects with `NoClipboardImage` whenever there is no image**, including the entirely
+   * ordinary cases of a clipboard holding text or holding nothing. A caller that reached here
+   * from a bare Ctrl+V must swallow that one silently; a caller that reached here from a menu
+   * item the user pointed at should show it. Everything else — a full disk, a folder that has
+   * been deleted since the tree drew it — is a real failure and reads as one.
+   */
+  pasteImage: (projectId: ProjectId, destDir: string) =>
+    invoke<string>('fs_paste_image', { project: projectId, destDir }),
 }
 
 /**
@@ -3880,6 +3921,26 @@ import type {
  * registry, and a panel that re-asked would draw "not installed" for a frame beside a `.sql` file
  * that has already changed colour.
  */
+/**
+ * Narrow anything that identifies an extension down to the two fields the wire accepts.
+ *
+ * `cide_ipc::ExtensionRef` is `#[serde(deny_unknown_fields)]`, so a payload carrying one extra
+ * key is not ignored — it is *rejected*, and the whole command fails with
+ * `unknown field \`name\`, expected \`marketplace\` or \`extension\``. That is a rejection the
+ * user meets as a settings toggle that springs back with an error about serde.
+ *
+ * TypeScript cannot catch the caller that causes it. An `InstalledExtension` *structurally
+ * satisfies* `ExtensionRef` — it has both fields, plus `name`, `version` and the rest — and
+ * excess-property checking only ever applies to object literals written at the call site, never
+ * to a variable passed along. So `onRailIcon(extension, …)` with the whole installed row
+ * type-checked, compiled, shipped, and failed at the border. Doing the narrowing here rather
+ * than at each call site is the fix that cannot be forgotten by the next caller.
+ */
+const extRef = (id: ExtensionRef): ExtensionRef => ({
+  marketplace: id.marketplace,
+  extension: id.extension,
+})
+
 export const ext = {
   /** Everything the Extensions panel draws. */
   snapshot: () => invoke<ExtensionSnapshot>('ext_snapshot'),
@@ -3919,15 +3980,23 @@ export const ext = {
    * pressed, and the user would have approved a different extension from the one that installed.
    */
   install: (id: ExtensionRef, granted: readonly Capability[]) =>
-    invoke<ExtensionSnapshot>('ext_install', { req: { ...id, granted } }),
+    invoke<ExtensionSnapshot>('ext_install', { req: { ...extRef(id), granted } }),
 
   /** Remove an installed extension. Its marketplace stays connected. */
   uninstall: (extension: ExtensionRef) =>
-    invoke<ExtensionSnapshot>('ext_uninstall', { extension }),
+    invoke<ExtensionSnapshot>('ext_uninstall', { extension: extRef(extension) }),
 
   /** Switch one on or off. A disabled extension keeps its row, its files and its reason. */
   setEnabled: (extension: ExtensionRef, enabled: boolean) =>
-    invoke<ExtensionSnapshot>('ext_set_enabled', { extension, enabled }),
+    invoke<ExtensionSnapshot>('ext_set_enabled', { extension: extRef(extension), enabled }),
+  /**
+   * Show or hide an extension's button on the activity rail, without disabling the extension.
+   *
+   * Its own command and not a second argument to `setEnabled`, because the two mean different
+   * things and one of them stops a worker — see `cide_ext::config::Installed::rail_icon`.
+   */
+  setRailIcon: (extension: ExtensionRef, railIcon: boolean) =>
+    invoke<ExtensionSnapshot>('ext_set_rail_icon', { extension: extRef(extension), railIcon }),
 
   /**
    * Fold an extension's findings for one file into the project's diagnostics.
@@ -3949,10 +4018,10 @@ export const ext = {
    * it for exactly that reason.
    */
   setSetting: (extension: ExtensionRef, key: string, value: boolean | string | number) =>
-    invoke<ExtensionSnapshot>('ext_set_setting', { extension, key, value }),
+    invoke<ExtensionSnapshot>('ext_set_setting', { extension: extRef(extension), key, value }),
 
   /** One extension's page: its catalog row, its installed row, and its README. */
-  page: (extension: ExtensionRef) => invoke<ExtensionPage>('ext_page', { extension }),
+  page: (extension: ExtensionRef) => invoke<ExtensionPage>('ext_page', { extension: extRef(extension) }),
 
   /**
    * Open this extension's page as a workspace tab, or activate the one it already has.
@@ -3961,7 +4030,7 @@ export const ext = {
    * arrives — `TabKind::Extension` says why at length.
    */
   openTab: (project: ProjectId, extension: ExtensionRef, name: string) =>
-    invoke<TabId>('tab_open_extension', { project, extension, name }),
+    invoke<TabId>('tab_open_extension', { project, extension: extRef(extension), name }),
 
   /**
    * Open a link from an extension's README in the user's browser.
@@ -3978,7 +4047,7 @@ export const ext = {
     absPath: string,
     items: readonly Diagnostic[],
   ) =>
-    invoke<void>('ext_publish_diagnostics', { project, extension, absPath, items }),
+    invoke<void>('ext_publish_diagnostics', { project, extension: extRef(extension), absPath, items }),
 }
 
 /**

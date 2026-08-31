@@ -1166,6 +1166,21 @@ impl Direction {
     }
 }
 
+/// One structured log line as it was written, for the pane that rendered a summary of it.
+///
+/// Both forms, because they answer different questions. `pretty` is what the card shows —
+/// indented, one field per line, which is the reason somebody opened it. `raw` is what the
+/// copy button puts on the clipboard: the bytes the program actually emitted, which is what
+/// belongs in a ticket or a grep, and reformatting those on the way out would be quietly
+/// changing somebody's evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LogLineDetail {
+    pub raw: String,
+    pub pretty: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

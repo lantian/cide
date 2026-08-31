@@ -183,6 +183,24 @@ pub async fn ext_set_enabled(
     Ok(snapshot)
 }
 
+/// Show or hide an installed extension's button on the activity rail.
+///
+/// Its own command rather than a field on [`ext_set_enabled`], because the two answer different
+/// questions and one of them stops a worker — see `cide_ext::config::Installed::rail_icon`.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn ext_set_rail_icon(
+    app: tauri::AppHandle,
+    state: State<'_, ExtState>,
+    extension: ExtensionRef,
+    rail_icon: bool,
+) -> Result<ExtensionSnapshot> {
+    let store = state.store();
+    let snapshot =
+        blocking(move || store.set_rail_icon(&extension, rail_icon).map_err(refused)).await?;
+    ext_state::publish(&app, &snapshot);
+    Ok(snapshot)
+}
+
 // ---------------------------------------------------------------------------------------
 // What a worker publishes back.
 //

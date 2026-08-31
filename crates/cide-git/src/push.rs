@@ -53,10 +53,22 @@ use std::path::Path;
 use std::process::Command;
 
 use cide_core::proxy::ProxyEnv;
-use cide_ipc::git::{GitError, PushOutcome};
-use git2::{Remote, Repository};
+use cide_ipc::git::{
+    GitError, PulledCommit, PushBlock, PushOutcome, PushPreview, PushRequest, RepoInfo,
+};
+use git2::{Direction, Oid, Remote, Repository};
 
-use crate::{Result, Wrap, repo as repo_mod, status};
+use crate::{Result, Wrap, pull, repo as repo_mod, status};
+
+/// How many commits [`preview`] lists before it starts counting instead.
+///
+/// Deliberately not [`crate::pull::PULL_COMMIT_CAP`], which is 10. That cap is right for a
+/// four-line toast; this list is the whole content of a scrollable dialog whose one job is
+/// showing the set about to leave the machine, and a branch with fifteen commits on it is
+/// ordinary. 100 matches [`crate::pull::REBASE_COMMIT_CAP`] — the other place cide decided how
+/// many commits a person may reasonably be asked to read at once — and the overflow is reported
+/// through [`PushPreview::more`] rather than silently dropped.
+pub const PUSH_COMMIT_CAP: usize = 100;
 
 /// Which mechanism a push will use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,27 +89,22 @@ pub enum Route {
 /// this crate takes no configuration and reading one would give it a dependency on the app's
 /// state for the sake of one variable list. [`ProxyEnv::default`] is "touch nothing", which
 /// is what every caller outside the app wants and what this crate did before it existed.
-pub fn push(
-    root: &Path,
-    remote: Option<&str>,
-    refspec: Option<&str>,
-    set_upstream: bool,
-    proxy: &ProxyEnv,
-) -> Result<PushOutcome> {
+pub fn push(root: &Path, request: &PushRequest, proxy: &ProxyEnv) -> Result<PushOutcome> {
     let repo = repo_mod::open(root)?;
     let branch = status::branch_info(&repo)?;
     if branch.unborn {
         return Err(GitError::Unborn);
     }
 
-    let remote_name = match remote {
+    let remote_name = match request.remote.as_deref() {
         Some(name) => name.to_string(),
         None => default_remote(&repo, &branch.upstream),
     };
-    let refspec = match refspec {
+    let refspec = match request.refspec.as_deref() {
         Some(spec) => spec.to_string(),
         None => format!("refs/heads/{0}:refs/heads/{0}", branch.head),
     };
+    let set_upstream = request.set_upstream;
 
     // Read **before** the push, and that ordering is the whole design of these three numbers.
     // Afterwards the remote-tracking ref has moved to the tip and `graph_ahead_behind` would
@@ -108,16 +115,260 @@ pub fn push(
 
     let route = route(&repo, &remote_name);
     let outcome = match route {
-        Route::Binary => push_via_binary(root, &remote_name, &refspec, set_upstream, proxy),
+        Route::Binary => push_via_binary(
+            root,
+            &remote_name,
+            &refspec,
+            set_upstream,
+            request.force,
+            proxy,
+        ),
         // No proxy is applied here, and none is needed: this arm is reached only for a local
         // or `file://` remote, and libgit2 would ignore the environment even if it were. See
         // the module docs, which cite the source for both halves.
-        Route::Libgit2 => {
-            push_via_libgit2(&repo, &remote_name, &refspec, set_upstream, &branch.head)
-        }
+        Route::Libgit2 => push_via_libgit2(
+            &repo,
+            &remote_name,
+            &refspec,
+            set_upstream,
+            request.force,
+            &branch.head,
+        ),
     };
     outcome.map(|out| PushOutcome {
         ..report.into_outcome(out)
+    })
+}
+
+/// What the remote actually has, against what our remote-tracking ref says it has.
+///
+/// The libgit2 route's `--force-with-lease`. Refuses with [`GitError::PushLeaseStale`] when the
+/// two disagree, which is the whole safeguard: a `+` refspec sent past a remote that moved
+/// deletes commits nobody in this process has ever seen.
+///
+/// # The three states, and why only one of them refuses
+///
+/// * **Both sides have the ref and they match** — the ordinary force push. Allowed.
+/// * **Neither side has it** — we are publishing a branch the remote has never had. There is
+///   nothing to overwrite, so there is nothing to lease. Allowed, exactly as `git push
+///   --force-with-lease` allows it.
+/// * **The remote has it and we have no tracking ref for it** — somebody created that branch
+///   since our last fetch, or we have never fetched. This is the case that reads as harmless and
+///   is not: it is precisely "a ref appeared that this process has not seen", which is what the
+///   lease exists to catch. Refused, with an empty `expected` saying we held no opinion.
+///
+/// A destination that is not `refs/heads/<name>` — a tag, a deletion — is left alone. Those are
+/// not reachable from the dialog, and inventing a lease for them here would be guessing at a
+/// gesture nothing in cide makes.
+fn check_lease(
+    repo: &Repository,
+    remote: &mut Remote<'_>,
+    remote_name: &str,
+    refspec: &str,
+) -> Result<()> {
+    let (_, dst) = split_refspec(refspec);
+    let Some(name) = dst.strip_prefix("refs/heads/") else {
+        return Ok(());
+    };
+
+    let tracked = repo
+        .find_reference(&format!("refs/remotes/{remote_name}/{name}"))
+        .ok()
+        .and_then(|r| r.target());
+
+    // `connect` rather than `ls_remote`-by-another-name: git2 has no standalone listing, and the
+    // connection is dropped by the `disconnect` below before the push opens its own.
+    remote.connect(Direction::Push).wrap()?;
+    let advertised = remote
+        .list()
+        .wrap()
+        .map(|heads| {
+            heads
+                .iter()
+                .find(|head| head.name() == dst)
+                .map(|head| head.oid())
+        })
+        // The listing borrows the connection, so the answer is copied out before it closes.
+        .inspect_err(|_| {
+            let _ = remote.disconnect();
+        })?;
+    let _ = remote.disconnect();
+
+    match (tracked, advertised) {
+        (_, None) => Ok(()),
+        (Some(ours), Some(theirs)) if ours == theirs => Ok(()),
+        (ours, Some(theirs)) => Err(GitError::PushLeaseStale {
+            branch: name.to_string(),
+            expected: ours.map(short_oid).unwrap_or_default(),
+            actual: short_oid(theirs),
+        }),
+    }
+}
+
+/// `src:dst`, or one name meaning both, with any leading `+` stripped from the source.
+fn split_refspec(refspec: &str) -> (&str, &str) {
+    match refspec.split_once(':') {
+        Some((src, dst)) => (src.trim_start_matches('+'), dst),
+        None => {
+            let one = refspec.trim_start_matches('+');
+            (one, one)
+        }
+    }
+}
+
+/// Hide every remote-tracking ref of `remote` from `walk`.
+///
+/// The rule shared by [`unseen_by_remote`] and [`preview`]: a branch cut from `main` an hour ago
+/// is the three commits the remote does not have, not the four thousand reachable from its tip.
+/// That is also what git itself sends. Two copies of this would be a dialog listing one set and
+/// a notice counting another.
+fn hide_remote_refs(repo: &Repository, walk: &mut git2::Revwalk<'_>, remote: &str) {
+    let prefix = format!("refs/remotes/{remote}/");
+    if let Ok(refs) = repo.references() {
+        for reference in refs.flatten() {
+            let Ok(name) = reference.name() else { continue };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(oid) = reference.target() {
+                let _ = walk.hide(oid);
+            }
+        }
+    }
+}
+
+/// The commits reachable from `tip` that no branch of `remote` already has, newest first.
+///
+/// [`crate::pull::taken_commits`]'s answer for the case it cannot express: there is no single
+/// `hidden` oid and therefore no `graph_ahead_behind` to take the total from, so the overflow is
+/// counted by continuing the walk rather than by arithmetic. Capped at [`PUSH_COMMIT_CAP`].
+fn unseen_commits(repo: &Repository, tip: Oid, remote: &str) -> Result<(Vec<PulledCommit>, u32)> {
+    let mut walk = repo.revwalk().wrap()?;
+    walk.push(tip).wrap()?;
+    hide_remote_refs(repo, &mut walk, remote);
+
+    let mut commits = Vec::new();
+    let mut more = 0u32;
+    for oid in walk {
+        let oid = oid.wrap()?;
+        if commits.len() >= PUSH_COMMIT_CAP {
+            more = more.saturating_add(1);
+            continue;
+        }
+        commits.push(pull::summarise(&repo.find_commit(oid).wrap()?));
+    }
+    Ok((commits, more))
+}
+
+/// Every remote this repository has, `origin` first and the rest in name order.
+///
+/// Ordered rather than left in libgit2's order because it is drawn in a picker: `origin` is what
+/// nearly every row means, and a list whose first entry moves between repositories is one the
+/// user has to read every time.
+fn remote_names(repo: &Repository) -> Vec<String> {
+    let Ok(names) = repo.remotes() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for name in names.iter() {
+        if let Ok(Some(name)) = name {
+            out.push(name.to_string());
+        }
+    }
+    out.sort_by(|a: &String, b: &String| {
+        (a != "origin", a.as_str()).cmp(&(b != "origin", b.as_str()))
+    });
+    out
+}
+
+/// What a push from `info` would send, without sending anything.
+///
+/// The push dialog's whole payload for one repository. It answers with a [`PushPreview`] in every
+/// case it can — including the three it cannot push at all, which arrive as
+/// [`PushPreview::blocked`] rather than as an error, because the dialog draws a project's
+/// repositories together and one unborn submodule must not blank the row beside it.
+///
+/// Every decision here is [`push`]'s, made by the same code: [`default_remote`] picks the remote,
+/// the refspec is spelled the same way, and [`route`] answers whether the lease will be git's or
+/// cide's. A preview that resolved any of those independently would be describing a different
+/// push from the one the button performs.
+pub fn preview(info: &RepoInfo) -> Result<PushPreview> {
+    let repo = repo_mod::open(&info.root)?;
+    let head = status::branch_info(&repo)?;
+    let remotes = remote_names(&repo);
+    let remote_name = default_remote(&repo, &head.upstream);
+
+    let blocked = |reason: PushBlock| PushPreview {
+        repo: info.clone(),
+        head: head.clone(),
+        remote: remote_name.clone(),
+        remotes: remotes.clone(),
+        refspec: String::new(),
+        publish: false,
+        commits: Vec::new(),
+        more: 0,
+        diverged: false,
+        shells_out: false,
+        blocked: Some(reason),
+    };
+
+    if head.unborn {
+        return Ok(blocked(PushBlock::Unborn));
+    }
+    if head.detached {
+        return Ok(blocked(PushBlock::Detached));
+    }
+    if repo.find_remote(&remote_name).is_err() {
+        return Ok(blocked(PushBlock::NoRemote));
+    }
+
+    let Some(local) = repo
+        .revparse_single(&format!("refs/heads/{}", head.head))
+        .ok()
+        .and_then(|o| o.peel_to_commit().ok())
+        .map(|c| c.id())
+    else {
+        // `branch_info` said born and attached, so this is a repository that changed under us
+        // between the two reads. Nothing to push is the honest answer, and it is the same answer
+        // an unborn one gives.
+        return Ok(blocked(PushBlock::Unborn));
+    };
+
+    let tracking = repo
+        .find_reference(&format!("refs/remotes/{}/{}", remote_name, head.head))
+        .ok()
+        .and_then(|r| r.target());
+
+    let (commits, more, publish, diverged) = match tracking {
+        Some(old) => {
+            let (ahead, behind) = repo.graph_ahead_behind(local, old).unwrap_or((0, 0));
+            let (commits, more) =
+                pull::taken_commits(&repo, local, old, ahead as u32, PUSH_COMMIT_CAP)?;
+            // Measured against the **remote-tracking ref**, not `BranchInfo::behind`, which is
+            // measured against the configured upstream. They are usually the same ref and the
+            // times they are not are exactly the times this flag decides whether a force push is
+            // offered — a branch pushed to a remote it does not track, say.
+            (commits, more, false, behind > 0)
+        }
+        None => {
+            let (commits, more) = unseen_commits(&repo, local, &remote_name)?;
+            // Nothing on the remote to be behind of. `git push` fast-forwards from nothing.
+            (commits, more, true, false)
+        }
+    };
+
+    Ok(PushPreview {
+        repo: info.clone(),
+        head: head.clone(),
+        remote: remote_name.clone(),
+        remotes,
+        refspec: format!("refs/heads/{0}:refs/heads/{0}", head.head),
+        publish,
+        commits,
+        more,
+        diverged,
+        shells_out: route(&repo, &remote_name) == Route::Binary,
+        blocked: None,
     })
 }
 
@@ -148,15 +399,8 @@ impl PushReport {
 }
 
 fn ahead_of_remote(repo: &Repository, remote: &str, refspec: &str) -> PushReport {
-    // `src:dst`, or one name meaning both. A leading `+` is `--force`, which changes nothing
-    // about what is being counted.
-    let (src, dst) = match refspec.split_once(':') {
-        Some((src, dst)) => (src.trim_start_matches('+'), dst),
-        None => {
-            let one = refspec.trim_start_matches('+');
-            (one, one)
-        }
-    };
+    // A leading `+` is a force push, which changes nothing about what is being counted.
+    let (src, dst) = split_refspec(refspec);
     // A deletion pushes an empty source. Nothing to count and nothing to name.
     let Some(name) = dst.strip_prefix("refs/heads/") else {
         return PushReport::default();
@@ -209,18 +453,7 @@ fn unseen_by_remote(repo: &Repository, tip: git2::Oid, remote: &str) -> u32 {
     if walk.push(tip).is_err() {
         return 0;
     }
-    let prefix = format!("refs/remotes/{remote}/");
-    if let Ok(refs) = repo.references() {
-        for reference in refs.flatten() {
-            let Ok(name) = reference.name() else { continue };
-            if !name.starts_with(&prefix) {
-                continue;
-            }
-            if let Some(oid) = reference.target() {
-                let _ = walk.hide(oid);
-            }
-        }
-    }
+    hide_remote_refs(repo, &mut walk, remote);
     walk.count() as u32
 }
 
@@ -293,6 +526,7 @@ fn push_via_binary(
     remote: &str,
     refspec: &str,
     set_upstream: bool,
+    force: bool,
     proxy: &ProxyEnv,
 ) -> Result<PushOutcome> {
     let mut command = Command::new("git");
@@ -313,6 +547,23 @@ fn push_via_binary(
     command.env("GIT_TERMINAL_PROMPT", "0");
     if set_upstream {
         command.arg("--set-upstream");
+    }
+    /*
+     * `--force-with-lease`, bare, and never `--force`.
+     *
+     * Bare rather than `--force-with-lease=<dst>:<oid>`, which is the form that looks safer and
+     * is not. The lease has to be measured against the remote-tracking ref **at push time**: an
+     * oid captured when the dialog opened is stale the moment anything else fetches — another
+     * cide window, a terminal pane, an agent — and pinning the lease to it would either refuse a
+     * push that is fine or, worse, assert an expectation the user never actually read.
+     *
+     * git's own default is exactly this reading, and it comes with git's own caveat: the lease
+     * is only as good as the last fetch, so a `git fetch` run by something that was not looking
+     * at the remote ref can still make it vacuous. cide does not try to improve on that — it
+     * would mean parsing or second-guessing git, which this module's header forbids.
+     */
+    if force {
+        command.arg("--force-with-lease");
     }
     command.arg(remote).arg(refspec);
     // Porcelain output on stdout, human messages on stderr. Both are shown, because the
@@ -349,9 +600,32 @@ fn push_via_libgit2(
     remote_name: &str,
     refspec: &str,
     set_upstream: bool,
+    force: bool,
     branch: &str,
 ) -> Result<PushOutcome> {
     let mut remote: Remote<'_> = repo.find_remote(remote_name).wrap()?;
+    /*
+     * The lease, performed rather than delegated.
+     *
+     * libgit2 has no `--force-with-lease`: `git_push_options` carries no expectation at all, and
+     * the only force it understands is the `+` on a refspec, which is `--force` whole. So the
+     * check is done here — connect, read what the remote actually advertises, and compare it
+     * against what our remote-tracking ref claims it was at. A mismatch means somebody pushed
+     * since our last fetch and the `+` would delete their work, so nothing is sent.
+     *
+     * This route is reached only for a local or `file://` remote (see [`route`]), where the
+     * connection is a directory read and the extra round trip costs nothing. On the binary route
+     * git does the same comparison itself and refuses first; the two must agree, which is why
+     * this is a lease and not a plain force with a warning in the dialog.
+     */
+    if force {
+        check_lease(repo, &mut remote, remote_name, refspec)?;
+    }
+    let refspec: &str = &if force {
+        format!("+{}", refspec.trim_start_matches('+'))
+    } else {
+        refspec.to_string()
+    };
     let mut messages = String::new();
     /*
      * Per-ref rejections, which `Remote::push` does **not** report as an error. (M20)

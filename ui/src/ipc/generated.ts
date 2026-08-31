@@ -3322,7 +3322,7 @@ export type Geometry = { cols: number, rows: number, cellWidth: number, cellHeig
  * is not an error the user should see as a failure — it is the guard bar, and the UI needs
  * to tell it apart from a genuine libgit2 failure without matching on prose.
  */
-export type GitError = { "kind": "notARepository", "detail": { path: string, } } | { "kind": "noSuchRepo", "detail": { repo: RepoId, } } | { "kind": "bare", "detail": { path: string, } } | { "kind": "noSuchProject", "detail": { project: string, } } | { "kind": "indexChangedExternally", "detail": { expected: string, actual: string, } } | { "kind": "staleSelection", "detail": { path: string, } } | { "kind": "partialRefused", "detail": { path: string, reason: PartialRefusal, } } | { "kind": "noSuchChange", "detail": { path: string, } } | { "kind": "pathIgnored", "detail": { path: string, } } | { "kind": "nestedRepository", "detail": { path: string, } } | { "kind": "patchRejected", "detail": { detail: string, patch: string, } } | { "kind": "conflicted", "detail": { paths: Array<string>, } } | { "kind": "operationInProgress", "detail": { operation: string, } } | { "kind": "nothingToCommit" } | { "kind": "unborn" } | { "kind": "noSuchChangelist", "detail": { id: string, } } | { "kind": "defaultChangelist" } | { "kind": "duplicateChangelist", "detail": { name: string, } } | { "kind": "noSuchShelf", "detail": { id: string, } } | { "kind": "noSuchStash", "detail": { index: number, } } | { "kind": "noSuchBranch", "detail": { name: string, } } | { "kind": "branchExists", "detail": { name: string, } } | { "kind": "invalidBranchName", "detail": { name: string, } } | { "kind": "branchNotMerged", "detail": { name: string, } } | { "kind": "branchIsCurrent", "detail": { name: string, } } | { "kind": "checkoutWouldOverwrite", "detail": { branch: string, paths: Array<string>, } } | { "kind": "notFastForward", "detail": { branch: string, ahead: number, behind: number, } } | { "kind": "pullNeedsStrategy", "detail": Divergence } | { "kind": "rebaseWouldDropMerges", "detail": { branch: string, commits: Array<PulledCommit>, } } | { "kind": "rebaseTooLong", "detail": { branch: string, ahead: number, limit: number, } } | { "kind": "unrelatedHistories", "detail": { branch: string, upstream: string, } } | { "kind": "notConflicted", "detail": { path: string, } } | { "kind": "stagesGone", "detail": { path: string, } } | { "kind": "noUpstream", "detail": { branch: string, } } | { "kind": "detachedHead", "detail": { head: string, } } | { "kind": "noRemote", "detail": { name: string, } } | { "kind": "fetch", "detail": { output: string, } } | { "kind": "push", "detail": { output: string, } } | { "kind": "notTracked", "detail": { path: string, } } | { "kind": "noSuchRevision", "detail": { rev: string, } } | { "kind": "noSuchCommit", "detail": { rev: string, } } | { "kind": "fileTooLarge", "detail": { path: string, bytes: bigint, limit: bigint, } } | { "kind": "notHead", "detail": { oid: string, head: string, } } | { "kind": "replayWouldConflict", "detail": { op: ReplayOp, oid: string, paths: Array<string>, } } | { "kind": "mergeNeedsMainline", "detail": { oid: string, parents: Array<PulledCommit>, } } | { "kind": "notAMerge", "detail": { oid: string, } } | { "kind": "emptyReplay", "detail": { op: ReplayOp, oid: string, } } | { "kind": "tagExists", "detail": { name: string, oid: string, } } | { "kind": "invalidTagName", "detail": { name: string, } } | { "kind": "badRevspec", "detail": { spec: string, detail: string, } } | { "kind": "notACommit", "detail": { spec: string, kind: string, } } | { "kind": "ambiguousRev", "detail": { spec: string, } } | { "kind": "staleLogCursor" } | { "kind": "io", "detail": { detail: string, } } | { "kind": "git", "detail": { detail: string, } } | { "kind": "sidecar", "detail": { path: string, detail: string, } };
+export type GitError = { "kind": "notARepository", "detail": { path: string, } } | { "kind": "noSuchRepo", "detail": { repo: RepoId, } } | { "kind": "bare", "detail": { path: string, } } | { "kind": "noSuchProject", "detail": { project: string, } } | { "kind": "indexChangedExternally", "detail": { expected: string, actual: string, } } | { "kind": "staleSelection", "detail": { path: string, } } | { "kind": "partialRefused", "detail": { path: string, reason: PartialRefusal, } } | { "kind": "noSuchChange", "detail": { path: string, } } | { "kind": "pathIgnored", "detail": { path: string, } } | { "kind": "nestedRepository", "detail": { path: string, } } | { "kind": "patchRejected", "detail": { detail: string, patch: string, } } | { "kind": "conflicted", "detail": { paths: Array<string>, } } | { "kind": "operationInProgress", "detail": { operation: string, } } | { "kind": "nothingToCommit" } | { "kind": "unborn" } | { "kind": "noSuchChangelist", "detail": { id: string, } } | { "kind": "defaultChangelist" } | { "kind": "duplicateChangelist", "detail": { name: string, } } | { "kind": "noSuchShelf", "detail": { id: string, } } | { "kind": "noSuchStash", "detail": { index: number, } } | { "kind": "noSuchBranch", "detail": { name: string, } } | { "kind": "branchExists", "detail": { name: string, } } | { "kind": "invalidBranchName", "detail": { name: string, } } | { "kind": "branchNotMerged", "detail": { name: string, } } | { "kind": "branchIsCurrent", "detail": { name: string, } } | { "kind": "checkoutWouldOverwrite", "detail": { branch: string, paths: Array<string>, } } | { "kind": "notFastForward", "detail": { branch: string, ahead: number, behind: number, } } | { "kind": "pullNeedsStrategy", "detail": Divergence } | { "kind": "rebaseWouldDropMerges", "detail": { branch: string, commits: Array<PulledCommit>, } } | { "kind": "rebaseTooLong", "detail": { branch: string, ahead: number, limit: number, } } | { "kind": "unrelatedHistories", "detail": { branch: string, upstream: string, } } | { "kind": "notConflicted", "detail": { path: string, } } | { "kind": "stagesGone", "detail": { path: string, } } | { "kind": "noUpstream", "detail": { branch: string, } } | { "kind": "detachedHead", "detail": { head: string, } } | { "kind": "noRemote", "detail": { name: string, } } | { "kind": "fetch", "detail": { output: string, } } | { "kind": "push", "detail": { output: string, } } | { "kind": "pushLeaseStale", "detail": { branch: string, expected: string, actual: string, } } | { "kind": "notTracked", "detail": { path: string, } } | { "kind": "noSuchRevision", "detail": { rev: string, } } | { "kind": "noSuchCommit", "detail": { rev: string, } } | { "kind": "fileTooLarge", "detail": { path: string, bytes: bigint, limit: bigint, } } | { "kind": "notHead", "detail": { oid: string, head: string, } } | { "kind": "replayWouldConflict", "detail": { op: ReplayOp, oid: string, paths: Array<string>, } } | { "kind": "mergeNeedsMainline", "detail": { oid: string, parents: Array<PulledCommit>, } } | { "kind": "notAMerge", "detail": { oid: string, } } | { "kind": "emptyReplay", "detail": { op: ReplayOp, oid: string, } } | { "kind": "tagExists", "detail": { name: string, oid: string, } } | { "kind": "invalidTagName", "detail": { name: string, } } | { "kind": "badRevspec", "detail": { spec: string, detail: string, } } | { "kind": "notACommit", "detail": { spec: string, kind: string, } } | { "kind": "ambiguousRev", "detail": { spec: string, } } | { "kind": "staleLogCursor" } | { "kind": "io", "detail": { detail: string, } } | { "kind": "git", "detail": { detail: string, } } | { "kind": "sidecar", "detail": { path: string, detail: string, } };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -3957,6 +3957,14 @@ export type InstalledExtension = { name: string, version: string, description: s
  */
 enabled: boolean, 
 /**
+ * Whether its sidebar panels are drawn on the activity rail. (M31)
+ *
+ * Orthogonal to [`Self::enabled`] on purpose — see `cide_ext::config::Installed::rail_icon`,
+ * which is the stored half and carries the argument. An extension with no sidebar panel is
+ * unaffected by this whatever it says, and the Settings row is not drawn for one.
+ */
+railIcon: boolean, 
+/**
  * The marketplace commit this copy was taken at. What an update compares against.
  */
 commit: string, capabilities: Array<Capability>, contributes: Contributions, 
@@ -4362,6 +4370,19 @@ lanes: number,
  * the panel can show one notice instead of scanning every row to find out whether to.
  */
 overflow: boolean, } | { "kind": "off", reason: GraphOff, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * One structured log line as it was written, for the pane that rendered a summary of it.
+ *
+ * Both forms, because they answer different questions. `pretty` is what the card shows —
+ * indented, one field per line, which is the reason somebody opened it. `raw` is what the
+ * copy button puts on the clipboard: the bytes the program actually emitted, which is what
+ * belongs in a ticket or a grep, and reformatting those on the way out would be quietly
+ * changing somebody's evidence.
+ */
+export type LogLineDetail = { raw: string, pretty: string, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -5733,6 +5754,18 @@ author: string, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 /**
+ * Why a repository has nothing this dialog can push.
+ *
+ * Three states rather than one "cannot push" boolean, because the three have different
+ * remedies and the row has to say which: commit something, get back on a branch, add a remote.
+ * A single flag would leave the dialog drawing a disabled row with no explanation, which reads
+ * as a bug in cide rather than as a state of the repository.
+ */
+export type PushBlock = "unborn" | "detached" | "noRemote";
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
  * Result of `git.push`, including whatever the transport said.
  *
  * # Why the counts are here and not read out of `output`
@@ -5790,6 +5823,109 @@ oldOid: string,
  * Where it is now, short.
  */
 newOid: string, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * What one repository would push, read before anything is sent.
+ *
+ * The dialog's whole payload, so opening it costs one round trip for the project rather than
+ * one per repository plus one per commit list.
+ *
+ * # Why the counts are read here and not derived in the frontend
+ *
+ * [`PushOutcome`]'s own doc makes this argument for *after* a push; this is the same argument
+ * one step earlier. [`BranchInfo::ahead`] is measured against the branch's **upstream**, which
+ * is a different question from "what would this push send" the moment the refspec names
+ * anything but the tracking branch — and it is zero for a branch that has no upstream at all,
+ * which is precisely the case the dialog most needs to describe (*publish this branch*). So the
+ * walk is done in `cide_git::push::preview`, beside the walk `push` itself does, and the two
+ * share their rules rather than agreeing by coincidence.
+ */
+export type PushPreview = { repo: RepoInfo, 
+/**
+ * The same [`BranchInfo`] the status bar reads, so the dialog and the status bar cannot
+ * disagree about what is checked out.
+ */
+head: BranchInfo, 
+/**
+ * The remote this push would use — what `push::default_remote` resolved.
+ */
+remote: string, 
+/**
+ * Every remote this repository has, `origin` first when it exists and the rest in name
+ * order, because that is the one nearly every row means.
+ */
+remotes: Array<string>, 
+/**
+ * Spelled out — `refs/heads/x:refs/heads/x`. Empty when [`Self::blocked`] is set.
+ */
+refspec: string, 
+/**
+ * The remote has no such branch yet, so this push publishes it and sets the upstream.
+ *
+ * The `old_oid == ""` distinction [`PushOutcome`] makes after the fact, made before it.
+ */
+publish: boolean, 
+/**
+ * What would be sent, newest first, capped — see `cide_git::push::PUSH_COMMIT_CAP`.
+ */
+commits: Array<PulledCommit>, 
+/**
+ * How many more there are beyond the cap. Zero for a complete list.
+ */
+more: number, 
+/**
+ * The remote-tracking ref holds commits the local branch does not.
+ *
+ * A plain push would be rejected as a non-fast-forward. This is the **only** state in which
+ * force is an answer rather than a mistake, and the dialog says so on the row rather than
+ * leaving the checkbox to explain itself.
+ */
+diverged: boolean, 
+/**
+ * This push would fork the `git` binary — `push::route` answered `Binary`. It decides how
+ * the dialog words the lease: git's own `--force-with-lease` on that route, and cide's
+ * comparison against the remote's advertised refs on the other.
+ */
+shellsOut: boolean, 
+/**
+ * Set when there is nothing to push and the row must say why.
+ */
+blocked?: PushBlock, };
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Everything a push needs to know beyond which repository it is about.
+ *
+ * A struct rather than four loose parameters on `git_push`, for [`PullRequest`]'s reasons and
+ * with [`PullRequest`]'s rules: every field `#[serde(default)]`, so `PushRequest::default()` is
+ * the plain *"push this branch to its usual remote"* that `git_push` used to mean, and a payload
+ * written by an older build still deserialises. It grew a fourth field the moment force push
+ * existed, which is exactly the growth `CommitRequest` and `PullRequest` were shaped to absorb.
+ */
+export type PushRequest = { 
+/**
+ * `None` is the branch's upstream remote, else `origin` — `push::default_remote`, shared
+ * with `fetch` and `pull` so three menu items cannot disagree about which remote they mean.
+ */
+remote?: string, 
+/**
+ * `None` pushes the current branch to a branch of the same name.
+ */
+refspec?: string, 
+/**
+ * Record `branch.<name>.remote` / `.merge` — `git push --set-upstream`.
+ */
+setUpstream: boolean, 
+/**
+ * Overwrite the remote ref, **with a lease**: the push is refused if the remote has moved
+ * since the last fetch. There is deliberately no plain-`--force` value on this wire — the
+ * lease is the whole safeguard, and a boolean that could mean either would be a safeguard
+ * one typo away from not being one.
+ */
+force: boolean, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
@@ -8654,7 +8790,25 @@ renderer: TerminalRenderer,
  * has a `terminal` object without this member, and the container's `#[serde(default)]`
  * does not supply a member a *present* object happens not to mention.
  */
-jobNotifyAfterSecs: number, };
+jobNotifyAfterSecs: number, 
+/**
+ * Whether a shell pane rewrites structured (JSON) log lines for a person to read.
+ *
+ * On, because the state it replaces is a wall of braces nobody can skim and the
+ * detection refuses anything it is not sure of (`cide_core::jsonlog` carries the gate,
+ * and its negative corpus is the real specification). Off is a real answer, though, and
+ * this is why it is a setting rather than a constant: the rewrite happens *upstream of
+ * the screen mirror*, so a rendered line's original JSON is not in the scrollback and
+ * cannot be copied back out. Somebody who pastes log lines into a ticket wants the
+ * bytes, not the rendering.
+ *
+ * Never applies to a Claude pane — see `cmd::session`, where it is installed — and a
+ * change reaches running shells immediately rather than at the next spawn.
+ *
+ * `#[serde(default = "…")]` for [`TerminalSettings::job_notify_after_secs`]'s reason,
+ * one field up.
+ */
+jsonLogs: boolean, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 

@@ -373,6 +373,18 @@ try {
   eq(errors.fsMessage({ kind: 'noIndex' }), 'noIndex',
     'a variant with no content falls back to the tag, which is a word — that beats '
       + '[object Object] by the distance that matters')
+  // The image-paste refusal (M35). Two claims, and the second is the load-bearing one: this
+  // rejection reaches a bare Ctrl+V every time somebody presses it with text on the clipboard,
+  // so a caller has to be able to tell it apart from a real failure and say nothing.
+  eq(errors.fsMessage({ kind: 'noClipboardImage' }), 'the clipboard does not hold an image',
+    'the one unit variant a user meets on purpose reads as a sentence, not as a tag')
+  eq(errors.isNoClipboardImage({ kind: 'noClipboardImage' }), true,
+    'matched on the tag, because prose is not an API')
+  eq(errors.isNoClipboardImage({ kind: 'io', detail: { path: '/p/x', message: 'boom' } }), false,
+    'a real failure must not be swallowed by the Ctrl+V path')
+  eq(errors.isNoClipboardImage(new Error('boom')), false, 'nor a thrown Error')
+  eq(errors.isNoClipboardImage(null), false, 'nor nothing at all')
+
   eq(errors.fsMessage('plain string'), 'plain string', 'a thrown string is already a message')
   eq(errors.fsMessage(new Error('boom')), 'boom', 'and a real Error has one')
   eq(errors.fsMessage(undefined), 'undefined', 'nothing thrown is still reported as something')

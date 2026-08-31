@@ -934,7 +934,7 @@ fn build() -> Vec<Command> {
         // reason: it puts the user in front of the control that asks. The trailing "…" is this
         // table's mark for that.
         Command::new("git.commit", "Commit changes…", GIT).when("shellWindow && projectOpen"),
-        Command::new("git.push", "Push to remote", GIT).when("projectOpen"),
+        Command::new("git.push", "Push to remote…", GIT).when("projectOpen"),
         Command::new("git.refresh", "Refresh git status", GIT).when("projectOpen"),
         // Branches. The two that need a name or a choice open the branch popup
         // (`ui/src/chrome/BranchSelector.tsx`) rather than acting blind; the two network ones

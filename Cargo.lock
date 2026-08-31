@@ -670,11 +670,13 @@ name = "cide-core"
 version = "0.6.0"
 dependencies = [
  "blake3",
+ "chrono",
  "cide-ipc",
  "flate2",
  "indexmap 2.14.0",
  "libc",
  "parking_lot",
+ "png 0.18.1",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

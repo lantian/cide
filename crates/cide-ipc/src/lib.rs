@@ -54,9 +54,9 @@ pub use settings_ops::{
 pub use theme::{BUILTIN_SCHEME, ColorScheme, SCHEME_SURFACE, SCHEME_TOKENS, scheme_roles};
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, HistoryTab, LayoutNode,
-    MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry, RecentProject,
-    SettingsSection, SpecSubject, TOOL_WINDOW_MAX_HEIGHT, TOOL_WINDOW_MIN_HEIGHT, Tab, TabKind,
-    ToolWindowState, WindowRole, Workspace,
+    LogLineDetail, MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry,
+    RecentProject, SettingsSection, SpecSubject, TOOL_WINDOW_MAX_HEIGHT, TOOL_WINDOW_MIN_HEIGHT,
+    Tab, TabKind, ToolWindowState, WindowRole, Workspace,
 };
 
 // --- M8: file tree, watcher, pickers ---

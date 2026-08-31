@@ -20,6 +20,14 @@ export type InstalledExtension = { name: string, version: string, description: s
  */
 enabled: boolean, 
 /**
+ * Whether its sidebar panels are drawn on the activity rail. (M31)
+ *
+ * Orthogonal to [`Self::enabled`] on purpose — see `cide_ext::config::Installed::rail_icon`,
+ * which is the stored half and carries the argument. An extension with no sidebar panel is
+ * unaffected by this whatever it says, and the Settings row is not drawn for one.
+ */
+railIcon: boolean, 
+/**
  * The marketplace commit this copy was taken at. What an update compares against.
  */
 commit: string, capabilities: Array<Capability>, contributes: Contributions, 

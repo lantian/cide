@@ -624,6 +624,25 @@ pub async fn session_spawn(
         .map(|ws| ws.with(|w| w.settings.theme))
         .unwrap_or_default();
 
+    // **An empty `program` means "the user's login shell", and it is the frontend's only way
+    // to say so.** A webview cannot read `$SHELL`, so `TerminalPane` used to name `/bin/bash`
+    // for every shell pane — which on macOS is a 2007 bash that reads `~/.bash_profile` and
+    // never the `~/.zshrc` where nvm and `brew shellenv` live, so the pane opened a shell the
+    // user had never configured. `cide_core::shell` carries the whole argument and the ladder.
+    //
+    // Substituted here, before the spec exists, rather than in the block below that substitutes
+    // the configured `claude` binary: this one brings *arguments* with it (`-l`), and the loop
+    // that writes the frontend's arguments is on the next line.
+    //
+    // Only for an empty string. A pane that names a program gets that program, so this cannot
+    // reach a Claude pane, a test harness, or anything else that knows what it wants.
+    let (program, args) = if program.trim().is_empty() {
+        let (shell, login) = cide_core::shell::login_shell();
+        (shell.to_string_lossy().into_owned(), login)
+    } else {
+        (program, args)
+    };
+
     let mut spec = SpawnSpec::new(program, PathBuf::from(cwd)).geometry(pty_geometry(geometry));
     for a in args {
         spec = spec.arg(a);
@@ -982,6 +1001,18 @@ pub async fn session_spawn(
     // ever the starting point.
     if !is_claude {
         spec = spec.watch_jobs(job_notify_after);
+        // Structured logs, rendered for a person — and for a shell only, for a reason as
+        // firm as the one above. The Claude CLI paints a screen rather than printing lines:
+        // its bytes carry no terminator to split on, and rewriting one that happened to look
+        // like a document would corrupt the frame it belongs to. `json_log_render` is off
+        // when the setting is, and off costs nothing (see its doc), so this is installed
+        // unconditionally and the toggle reaches shells that are already open.
+        spec = spec.render(crate::lifecycle::json_log_render(
+            id,
+            app.state::<std::sync::Arc<crate::logring::JsonLogRing>>()
+                .inner()
+                .clone(),
+        ));
     }
 
     let session = blocking(move || {
@@ -1550,6 +1581,7 @@ pub fn session_resumable(app: tauri::AppHandle, cwd: String, session: SessionId)
 pub fn session_kill(
     registry: State<'_, SessionRegistry>,
     agents: State<'_, Arc<crate::agents::AgentRegistry>>,
+    logs: State<'_, Arc<crate::logring::JsonLogRing>>,
     session: SessionId,
 ) {
     if agents.owns_session(session) {
@@ -1559,6 +1591,34 @@ pub fn session_kill(
     if let Some(s) = registry.get(session) {
         s.kill();
     }
+    // The raw log lines go with the scrollback that pointed at them. Here rather than at the
+    // child's exit, which is the other candidate and the wrong one: an exited session's pane
+    // stays open and its rendered lines stay clickable. This is the moment the pane itself is
+    // going away, so nothing can ask again.
+    logs.forget(session);
+}
+
+/// The whole event behind one rendered log line.
+///
+/// The rendering in the pane is a summary — see `cide_core::jsonlog` — and the original is
+/// held only by [`crate::logring`], because the rewrite happens above the screen mirror. A
+/// handle that has aged out of the ring answers `None`, which the pane shows as *no longer
+/// kept* rather than as an error: scrolling far enough back is not a failure.
+#[tauri::command(rename_all = "camelCase")]
+pub fn session_log_detail(
+    logs: State<'_, Arc<crate::logring::JsonLogRing>>,
+    session: SessionId,
+    handle: u64,
+) -> Option<cide_ipc::LogLineDetail> {
+    let raw = logs.get(session, handle)?;
+    // Pretty-printed here rather than in the webview, so the one place that knows the bytes
+    // is the one place that formats them — and so a pane in a detached window, which has its
+    // own JavaScript realm, cannot render it differently from a docked one.
+    let pretty = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| raw.clone());
+    Some(cide_ipc::LogLineDetail { raw, pretty })
 }
 
 #[cfg(test)]

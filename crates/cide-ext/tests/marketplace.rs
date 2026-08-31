@@ -393,6 +393,55 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
          hidden\" rather than \"it is not running\""
     );
 
+    // --- hiding a rail icon is not disabling anything (M31) -----------------------------------
+    //
+    // > *"we should be able to disable icon on left panel of installed extesions via settings"*
+    //
+    // The whole value of the flag is that it is *not* `enabled`. A user who does not want YAML
+    // taking a rail slot still wants YAML highlighted, so this must leave the contribution
+    // registry untouched — the panel is still resolved, the language is still the extension's,
+    // the assets are still served — and change one boolean the rail reads. Folding it into
+    // `set_enabled` would have been the obvious shortcut and it would have silently stopped a
+    // worker; this asserts it did not.
+    let yaml_ref = cide_ipc::ext::ExtensionRef {
+        marketplace: market.id.clone(),
+        extension: cide_ipc::ids::ExtensionId("yaml".into()),
+    };
+    let before = store.snapshot().resolved.panels.len();
+    let snapshot = store
+        .set_rail_icon(&yaml_ref, false)
+        .expect("hide the rail icon");
+    let yaml = snapshot
+        .extensions
+        .iter()
+        .find(|e| e.id.extension.0 == "yaml")
+        .expect("yaml is still installed");
+    assert!(!yaml.rail_icon, "the flag is what moved");
+    assert!(
+        yaml.enabled,
+        "and the extension is still enabled — hiding a button must not stop a worker"
+    );
+    assert_eq!(
+        snapshot.resolved.panels.len(),
+        before,
+        "the panel is still contributed: the rail is what stops drawing it, and the panel stays \
+         reachable from the overflow menu and the palette"
+    );
+    assert!(
+        store.asset_root(&yaml_ref).is_some(),
+        "and it still serves its files, unlike a disabled one"
+    );
+    let snapshot = store.set_rail_icon(&yaml_ref, true).expect("show it again");
+    assert!(
+        snapshot
+            .extensions
+            .iter()
+            .find(|e| e.id.extension.0 == "yaml")
+            .expect("yaml")
+            .rail_icon,
+        "and the flag goes back, so this is a toggle and not a one-way door"
+    );
+
     // --- uninstalling removes the files ------------------------------------------------------
     let snapshot = store.uninstall(&sql_ref).expect("uninstall");
     assert_eq!(snapshot.extensions.len(), 5);

@@ -140,12 +140,15 @@ export interface TerminalPaneProps {
 const pending = new Map<string, Promise<string>>()
 
 /**
- * The login shell to spawn.
+ * What a shell pane asks for as its program: nothing, meaning *the user's login shell*.
  *
- * `$SHELL` is not readable from a webview, so this is the portable default rather than the
- * user's own choice; Settings → Terminal takes it over in M11.
+ * A webview cannot read `$SHELL`, and this file used to answer that by naming `/bin/bash`
+ * outright — which on macOS is a shell nobody configures (see `cide_core::shell` for the whole
+ * report), so the pane ran without the user's `~/.zshrc` and therefore without nvm or
+ * Homebrew on its `PATH`. The decision belongs where the fork is; `session_spawn` reads an
+ * empty program as this request and supplies the login flag with it.
  */
-const DEFAULT_SHELL = '/bin/bash'
+const LOGIN_SHELL = ''
 
 /**
  * What a pane of each kind runs. A diff pane has no process at all.
@@ -179,7 +182,7 @@ function specFor(
     }
     case 'shell': {
       const prior = restore !== undefined ? (pane.session ?? undefined) : undefined
-      return { program: DEFAULT_SHELL, args: ['-l'], cwd, project, resume: prior }
+      return { program: LOGIN_SHELL, args: [], cwd, project, resume: prior }
     }
     default:
       return null

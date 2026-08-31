@@ -1,0 +1,101 @@
+/*
+ * The change card. (M35)
+ *
+ * Styled from the same tokens as `BlamePopup.module.css` beside it, so the two cards a gutter can
+ * produce read as one surface. The chrome around it — border, shadow, and the reset of
+ * CodeMirror's own `.cm-tooltip` ground — is in `EditorSurface.module.css`, because the element
+ * carrying `.cm-tooltip` is created by the library and is this one's parent.
+ */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Wide enough for a normal line of code without wrapping, and capped so a minified line does
+     not become a card the width of the window. */
+  max-width: 560px;
+  min-width: 220px;
+  padding: 8px 10px;
+}
+
+.head {
+  color: var(--text-hi);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  font-weight: var(--w-bold);
+}
+
+/*
+ * The original lines.
+ *
+ * Capped and scrollable rather than unbounded: `POPUP_MAX_LINES` already trims the list to 40,
+ * and 40 rows of code is still taller than a short pane. A card taller than its editor is
+ * positioned by CodeMirror against a viewport it does not fit in, and the buttons at its foot go
+ * off screen — which is the one part of this card that has to be reachable.
+ */
+.body {
+  display: flex;
+  flex-direction: column;
+  margin-top: 4px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+/*
+ * One line, in the code face.
+ *
+ * Mono because these are lines of the user's file and the card exists to be compared against the
+ * buffer behind it; a proportional rendering of code that is about to be pasted back is a
+ * different-looking thing from what would land. The family is stated rather than inherited from
+ * `.cm-gutters`' mono — `check:theme`'s family sweep exists for the day the tooltip stops being a
+ * descendant of the gutter.
+ *
+ * `pre` and not `pre-wrap`: leading indentation is what makes a line recognisable, and a wrapped
+ * continuation with no indent reads as a second line that HEAD did not have. The overflow scrolls
+ * instead, which is the same call `.body`'s vertical cap makes.
+ */
+.row {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.more {
+  color: var(--faint);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11);
+  margin-top: 2px;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.action {
+  background: var(--chrome);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11);
+  padding: 3px 8px;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.action:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.action:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}

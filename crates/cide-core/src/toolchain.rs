@@ -138,6 +138,11 @@ fn extra_dirs_in(home: Option<&Path>, etc: Option<&Path>) -> Vec<PathBuf> {
     }
     if let Some(home) = home {
         push_unique(&mut dirs, home.join(".local/bin"));
+        // `~/bin` beside it, because it is the directory the M35 report names — *"claude
+        // doesn't see my local ~/bin that is added to PATH"* — and because the login-shell
+        // probe that also finds it (`crate::login_path`) is allowed to fail. A name in a static
+        // list costs one `stat` per lookup and works on a machine whose rc file hangs.
+        push_unique(&mut dirs, home.join("bin"));
     }
     for dir in [
         "/opt/homebrew/bin",
@@ -212,16 +217,38 @@ pub fn path_helper_dirs(etc: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// `PATH`, plus every directory in [`extra_dirs`] it does not already contain.
+/// [`extra_dirs`] — the list cide can name in advance — followed by whatever the user's login
+/// shell turned out to have that this process does not.
+///
+/// **This is the list, and the one-list invariant is stated over this function.** The header
+/// above says the directories cide searches to *find* a binary and the directories it gives that
+/// binary's process are the same directories; [`search_paths`] and
+/// [`crate::child_env::child_path`] both read this, which is what makes that true now that
+/// there are two sources rather than one.
+///
+/// [`crate::login_path::dirs`] is empty in every process that did not call
+/// `login_path::warm` — every test, `cide-headless`, `cide-hook` — so this is `extra_dirs`
+/// verbatim everywhere except the app. It allocates where `extra_dirs` returns a borrow,
+/// because the second half is not `'static`: the probe answers after the first caller may
+/// already have asked.
+pub fn discovered_dirs() -> Vec<PathBuf> {
+    let mut dirs = extra_dirs().to_vec();
+    for dir in crate::login_path::dirs() {
+        push_unique(&mut dirs, dir);
+    }
+    dirs
+}
+
+/// `PATH`, plus every directory in [`discovered_dirs`] it does not already contain.
 ///
 /// Hand-rolled rather than a `which` crate for a dozen lines.
 pub fn search_paths() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    for extra in extra_dirs() {
-        if !dirs.contains(extra) {
-            dirs.push(extra.clone());
+    for extra in discovered_dirs() {
+        if !dirs.contains(&extra) {
+            dirs.push(extra);
         }
     }
     dirs
@@ -722,17 +749,23 @@ mod tests {
         assert_eq!(child(Some("/usr/bin"), &["/opt/a:b"]), None);
     }
 
-    /// The anti-drift assertion, and the reason [`extra_dirs`] is one list rather than two.
+    /// The anti-drift assertion, and the reason [`discovered_dirs`] is one list rather than two.
     ///
     /// `which` searches [`search_paths`]; a child searches the `PATH` [`child_path_from`] built.
     /// If those two ever name different directories, cide is back to the compounding failure
     /// `docs/platforms.md` records: `claude_cli::resolve` says yes about a directory the child cannot
     /// see, and a refusal that named a remedy becomes an opaque `ENOENT` from `execvp` three
     /// processes down. Making it structural rather than a convention is the whole design.
+    ///
+    /// Asserted over `discovered_dirs` since M35, which is the point of that function existing:
+    /// the list grew a second source (`login_path`, what the user's login shell reported) and a
+    /// half-applied second source is the same drift with a longer fuse. In this test process
+    /// `login_path::dirs` is empty — nothing calls `warm` outside the app — so what runs here is
+    /// the composition, not the probe.
     #[test]
     fn the_path_a_child_searches_is_the_path_which_searched() {
         let current = std::env::var_os("PATH");
-        let built = child_path_from(current.as_deref(), extra_dirs()).or(current);
+        let built = child_path_from(current.as_deref(), &discovered_dirs()).or(current);
         let searched: Vec<PathBuf> = built
             .as_deref()
             .map(|path| std::env::split_paths(path).collect())
@@ -835,6 +868,10 @@ mod tests {
                 // Then the floor. `/usr/local/bin` and `/usr/local/go/bin` came from the files
                 // above and must not appear a second time.
                 "/Users/u/.local/bin",
+                // The directory the M35 report named. `~/bin` is a `PATH` entry a person
+                // writes into an rc file, so it is also the one `login_path` finds — this is
+                // the answer for a machine whose rc file the probe could not read.
+                "/Users/u/bin",
                 "/opt/homebrew/bin",
                 "/opt/homebrew/sbin",
                 "/usr/local/sbin",

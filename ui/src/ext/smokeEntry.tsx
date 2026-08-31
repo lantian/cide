@@ -257,6 +257,9 @@ stories.push({
 const SHOWCASE: InstalledExtension = {
   marketplace: 'cide-marketplace',
   extension: 'showcase',
+  // On, which is what a newly installed extension gets and the state the rail row is drawn
+  // from — the fixture's job is the ordinary case.
+  railIcon: true,
   name: 'Showcase',
   version: '0.1.0',
   description: '',

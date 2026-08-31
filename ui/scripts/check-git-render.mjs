@@ -100,8 +100,8 @@ try {
    * attributes together. Both are pinned here, from both ends.
    *
    * `selectedRows` is 0 on a panel that has just painted, and that is the assertion, not an
-   * accident of the fixture: `defaultSelection` *ticks* the active changelist so that "Claude
-   * edited a file, commit it" is one click, and `rows` above shows those ticks as `true`. The
+   * accident of the fixture: the story names its own ticks (`fixture.ts::activeTicks` — the
+   * product itself opens with none since M31), and `rows` above shows those ticks as `true`. The
    * row selection starts empty regardless, because selecting rows nobody pointed at is what
    * made the drag carry a whole changelist when the user grabbed one file out of it. A
    * non-zero count here means the two concepts have been wired back together.
@@ -110,9 +110,9 @@ try {
   eq(
     byName.mock.selectedRows,
     0,
-    'and nothing is selected on a freshly painted panel, while its checkboxes are already '
-      + 'ticked — the ticks are what a commit takes, the selection is what a gesture is about, '
-      + 'and this is the one place the gap between them is visible',
+    'and nothing is selected on a panel whose checkboxes this story has ticked — the ticks '
+      + 'are what a commit takes, the selection is what a gesture is about, and this is the '
+      + 'one place the gap between them is visible',
   )
   eq(byName.mock.summary, '2 modified', "the mock's footer, verbatim")
   eq(byName.mock.guard, null, 'no guard bar unless the index actually moved')

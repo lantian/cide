@@ -23,8 +23,11 @@
  * at length and the argument was wrong in a way worth keeping on the record. It ran: this
  * panel has no row selection, inventing one changes what every click means, so use the one
  * multi-row concept that exists. The trap it came with was written down and shipped anyway:
- * the active changelist opens *fully ticked* (`model.ts::defaultSelection`), so dragging one
- * file out of it moved every file in it. That is not a rough edge, it is the feature doing
+ * the active changelist opened *fully ticked* (`model.ts::defaultSelection`, removed in M31
+ * when ticks became opt-in), so dragging one file out of it moved every file in it. The
+ * default is gone and the argument is not: ticks are still the wrong set to widen a drag by,
+ * because a user who has ticked five files for a commit is not pointing at five files. That is
+ * not a rough edge, it is the feature doing
  * something the user did not ask for, and it was reported as one. A tick is a statement about
  * a commit; a drag is a statement about what you are pointing at. `rowSelection.ts` is the
  * third concept, the click meanings are all in it, and `check:git` executes them.

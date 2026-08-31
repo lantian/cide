@@ -177,6 +177,77 @@ pub fn create_in(roots: &[PathBuf], parent: &Path, name: &str, directory: bool) 
     Ok(target)
 }
 
+/// Write `bytes` into `parent` under `name`, or the nearest free variation of it. (M35)
+///
+/// The one route in this workspace that writes **binary** contents to a file. Everything else —
+/// `write`, `cmd::file::file_write`, `cmd::fs::fs_write_file` — takes a `String`, deliberately,
+/// because everything else is a document. This exists for the pasted-image road and takes
+/// bytes because a PNG is not text.
+///
+/// # Never clobbers, and never fails on a name that is taken
+///
+/// `create_in` refuses when the target exists, which is right for a name the user *typed* —
+/// they meant that name and want to know it is taken. A paste has no typed name: cide invented
+/// it from the clock, so a collision is cide's problem and not the user's, and the answer is
+/// the next candidate rather than a refusal. [`crate::copy::candidate_name`] is that sequence,
+/// reused rather than reinvented so a pasted image collides the way a pasted *file* does —
+/// `Pasted image … copy.png` — and there is one vocabulary for it in the product.
+///
+/// `create_new(true)` on every attempt, so the loop is safe against a second writer taking the
+/// name between the check and the write. `copy::MAX_CANDIDATES` is the give-up point, shared
+/// with the paste road for the same reason the naming is: a directory holding that many
+/// same-second pastes is a directory something else is wrong with.
+///
+/// No atomic temp-and-rename, unlike [`write`]: that dance exists to protect the *previous*
+/// contents of a file being overwritten, and this function by construction never overwrites
+/// anything. What it can leave behind on a failed write is a partial new file under a name
+/// nothing referenced a moment ago, which is removed on the way out.
+pub fn write_new_bytes(
+    roots: &[PathBuf],
+    parent: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    use std::io::Write;
+
+    check_within(roots, parent)?;
+    check_name(name)?;
+    if !parent.is_dir() {
+        return Err(FsError::Io {
+            path: parent.display().to_string(),
+            message: "is no longer a directory — it may have been deleted or renamed".to_string(),
+        });
+    }
+
+    for attempt in 0..crate::copy::MAX_CANDIDATES {
+        let target = parent.join(crate::copy::candidate_name(name, attempt, false));
+        // The containment check on the joined path, for `create_in`'s reason: `check_name` has
+        // already refused every component that could climb out, so this can only fire on a bug
+        // in the two lines above it.
+        check_within(roots, &target)?;
+
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(FsError::io(&target, err)),
+        };
+        if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            // The name was free a moment ago and is now a partial file nothing has heard of.
+            // Leaving it would put a broken image in the user's tree as the visible result of
+            // a paste that reported a failure.
+            drop(file);
+            let _ = std::fs::remove_file(&target);
+            return Err(FsError::io(&target, err));
+        }
+        return Ok(target);
+    }
+    Err(FsError::Exists(parent.join(name).display().to_string()))
+}
+
 /// Create an empty file, or a directory. Never clobbers.
 pub fn create(path: &Path, directory: bool) -> Result<()> {
     if path.exists() {
@@ -529,5 +600,53 @@ mod tests {
         let file = dir.join("blob.bin");
         std::fs::write(&file, [0xff, 0xfe, 0x00, 0x01]).unwrap();
         assert!(matches!(read_to_string(&file), Err(FsError::NotUtf8(_))));
+    }
+
+    /// The paste road's naming rule: an invented name that is taken yields the *next* one
+    /// rather than a refusal, and it is the same vocabulary a pasted file gets.
+    #[test]
+    fn writing_bytes_under_a_taken_name_takes_the_next_one() {
+        let dir = scratch("ops-write-bytes");
+        let roots = vec![dir.path().to_path_buf()];
+
+        let first = write_new_bytes(&roots, dir.path(), "shot.png", b"\x89PNG").unwrap();
+        assert_eq!(first, dir.join("shot.png"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"\x89PNG");
+
+        let second = write_new_bytes(&roots, dir.path(), "shot.png", b"two").unwrap();
+        assert_eq!(
+            second,
+            dir.join("shot copy.png"),
+            "the suffix goes before the extension, as it does for a pasted file"
+        );
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"\x89PNG",
+            "the first file was not clobbered"
+        );
+
+        let third = write_new_bytes(&roots, dir.path(), "shot.png", b"three").unwrap();
+        assert_eq!(third, dir.join("shot copy 2.png"));
+    }
+
+    /// The same containment and name rules every other create obeys. A caller that reached
+    /// this with a separator in the name would be writing outside the folder the user pasted
+    /// into, silently.
+    #[test]
+    fn writing_bytes_obeys_the_name_and_root_rules() {
+        let dir = scratch("ops-write-bytes-refusals");
+        let roots = vec![dir.path().to_path_buf()];
+
+        assert!(matches!(
+            write_new_bytes(&roots, dir.path(), "sub/a.png", b"x"),
+            Err(FsError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            write_new_bytes(&roots, Path::new("/tmp"), "a.png", b"x"),
+            Err(FsError::OutsideProject(_))
+        ));
+        // A directory that has gone away since the tree was drawn. `create_dir_all` would put
+        // it back, which is the behaviour `create_in` refuses for the same reason.
+        assert!(write_new_bytes(&roots, &dir.join("gone"), "a.png", b"x").is_err());
     }
 }

@@ -103,10 +103,12 @@ fn emit(text: &str) {
 /// Spawns `program` on a PTY and streams its output to stdout until it exits.
 fn run(args: &[String]) {
     let mut args = args.iter();
+    // The same answer `cmd::session::session_spawn` gives a shell pane — one ladder for the
+    // whole workspace, so this binary cannot quietly be more (or less) right than the app.
     let program = args
         .next()
         .cloned()
-        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+        .unwrap_or_else(|| cide_core::shell::shell().to_string_lossy().into_owned());
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
     let mut spec = SpawnSpec::new(&program, cwd)

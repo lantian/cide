@@ -381,6 +381,16 @@ interface FileTreeStore {
    * rule the single-click change established, applied to creation.
    */
   commitDraft: (name: string) => Promise<string | null>
+  /**
+   * Refresh, find the row for a path that was just created, and select it.
+   *
+   * The tail `commitDraft` used to end with, split out when M35's *paste an image* became the
+   * second gesture that creates a file the user did not name. Answers the path when it has a
+   * row and `null` when the project's ignore rules keep it out of the tree — which is a thing
+   * the caller has to say out loud, because a selection pointing at a path with no row is a
+   * highlight nobody can see.
+   */
+  selectCreated: (created: string) => Promise<string | null>
 }
 
 /**
@@ -981,6 +991,12 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // The editor goes before the refresh, not after: the row it was standing in for now
     // exists, and leaving both on screen for the length of a round trip draws the file twice.
     set({ draft: null })
+    return await get().selectCreated(created)
+  },
+
+  async selectCreated(created) {
+    const project = get().project
+    if (project === null) return null
     await get().refresh()
     if (get().project !== project) return null
 

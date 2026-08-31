@@ -47,7 +47,7 @@ import { useCodeMenu } from './codeMenu'
 import { lineEditKeymap } from './editorKeys'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
-import { foldSpecFor, languageName, loadLanguage } from './languages'
+import { foldSpecFor, languageIdFor, languageName, loadLanguage } from './languages'
 import {
   foldAllRanges,
   foldEffectsFor,
@@ -89,6 +89,11 @@ import { completionExtensions } from './completion'
  */
 const LINT_GUTTER = lintGutter()
 import { blameExtension, setBlame } from './blame'
+import { CHANGE_BARS, setChangeBaseline } from './changeBars'
+import { onImagePaste } from './pasteImage'
+import { fsClipboard } from '@/ipc/client'
+import { isNoClipboardImage } from '@/sidebar/fsError'
+import { notifyFailure } from '@/chrome/notices'
 import type { BlameMarker } from './blameModel'
 import { useSendToClaude } from './useSendToClaude'
 import styles from './EditorSurface.module.css'
@@ -403,6 +408,26 @@ export interface EditorSurfaceProps {
   /** Whether the column is showing. The gutter's compartment holds the extension only while true. */
   blameOn?: boolean | undefined
   /**
+   * HEAD's copy of this file, one string per line, for the change column. (M35)
+   *
+   * Fetched by `panes/EditorPane.tsx` through `editor/changeBaseline.ts` and passed **in**, for
+   * the reason [`blame`] is: that store reaches `client.ts`, and importing it here would make
+   * every editor — the fixtures and the diff panes included — transitively depend on the wire.
+   *
+   * `null` is *no answer*, and it is the answer for a file in no repository, a file HEAD does not
+   * have, a binary or truncated blob and an unborn HEAD. It paints nothing. An **empty array** is
+   * a real answer — HEAD's copy of this file is empty — and every line of the buffer is an
+   * addition.
+   *
+   * The array must be identity-stable across unrelated store writes, which `baselineFor`
+   * guarantees: the effect below pushes it into CodeMirror, and a fresh array per render would
+   * rebuild every `RangeSet` in the window whenever any other file's baseline landed.
+   *
+   * **Not a dependency of the build effect**, for the same reason as [`blame`]. `check:change-bars`
+   * asserts the name is absent from that array.
+   */
+  baseline?: readonly string[] | null | undefined
+  /**
    * A gutter cell, or the card's *Show in log*, was clicked. The argument is a full oid.
    *
    * Optional, and absent in a fixture and in a diff pane: an editor with no host to answer this
@@ -499,6 +524,7 @@ export function EditorSurface({
   onScreen = true,
   blame = null,
   blameOn = false,
+  baseline = null,
   onShowCommit,
   onAnnotateParent,
   onShowHistory,
@@ -596,6 +622,23 @@ export function EditorSurface({
   blameRef.current = blame
   const blameOnRef = useRef(blameOn)
   blameOnRef.current = blameOn
+  /*
+   * HEAD's lines for the change column, in a ref for exactly the reason the blame ones are: the
+   * build effect is keyed `[path, reloadKey]` and must not learn about this. It is read once at
+   * construction so a view rebuilt by a `reloadKey` bump comes back with its markers already on,
+   * and the effect further down handles every later change. (M35)
+   */
+  const baselineRef = useRef(baseline)
+  baselineRef.current = baseline
+  /**
+   * Whether the buffer this view was built over is past `HIGHLIGHT_LIMIT_BYTES`.
+   *
+   * Written by the build effect, which is the only place the verdict is reached, and read by the
+   * baseline effect below — which would otherwise have to re-measure the whole document on every
+   * push. One answer to "what does an oversize buffer do", which is the argument `foldExtensions`
+   * already makes for living under the same flag.
+   */
+  const oversizeRef = useRef(false)
   const showCommitCb = useRef(onShowCommit)
   showCommitCb.current = onShowCommit
   const annotateParentCb = useRef(onAnnotateParent)
@@ -756,6 +799,7 @@ export function EditorSurface({
 
     const source = doc
     const oversize = exceedsBytes(source, HIGHLIGHT_LIMIT_BYTES)
+    oversizeRef.current = oversize
     // `endings` is memoized on the same `doc` this effect captured, so reusing it here is
     // the same answer for one scan instead of two — and it keeps the readout and the bytes
     // that get written from ever disagreeing about what the file was.
@@ -1018,6 +1062,69 @@ export function EditorSurface({
        * would answer this one's Ctrl+hover from the other's cache. See the prop.
        */
       ctrlLink(project, identity),
+      /*
+       * Ctrl+V with a screenshot on the clipboard: write it beside this document and type a
+       * reference to it. (M35)
+       *
+       * The reported ask was *"if i do PASTE action in file tree and in buffer image — we
+       * should be able to create image file in place where we pasting it"*. Every rule is in
+       * `pasteImage.ts`, which is import-free and driven by `check:paste-image`; what is here
+       * is the wiring, and it is deliberately three decisions long.
+       *
+       * **The event decides, and Rust reads.** `clipboardData.types` is a list the browser has
+       * already assembled — free to read, decodes nothing — so this handler can answer
+       * synchronously, which it must: `preventDefault` cannot be deferred, and reading a
+       * clipboard cannot be done without awaiting. `ui/src/terminal/clipboard.ts` reached the
+       * same constraint from the other side and its note is worth reading before changing this.
+       *
+       * **Nothing about the image is ever in JavaScript.** `fs_paste_image` reads, encodes and
+       * writes in one blocking Rust call and answers a path, which is
+       * `crates/cide-ipc/src/image.rs`'s rule (pixels do not cross the IPC) applied to the one
+       * direction that had never needed it.
+       *
+       * **Text still pastes as text.** A clipboard holding both an image and text is text here,
+       * so a copied path, a copied file and an ordinary Ctrl+V are all untouched — only a
+       * clipboard holding an image *alone* is claimed, which is what every screenshot tool
+       * produces and nothing else does.
+       *
+       * `project` may be undefined for a surface with no project (a standalone buffer in a
+       * fixture); there is no command to call then, so the paste falls through.
+       */
+      EditorView.domEventHandlers({
+        paste(event, view) {
+          if (project === undefined) return false
+          const types = event.clipboardData === null ? [] : [...event.clipboardData.types]
+          const verdict = onImagePaste(
+            {
+              docPath: path,
+              languageId: languageIdFor(path),
+              readOnly,
+              write: (dir) =>
+                fsClipboard.pasteImage(project, dir).catch((error: unknown) => {
+                  // "No image after all" is the ordinary answer — the `types` list said there
+                  // was one, and a clipboard can change between the event and this call — so it
+                  // is silent. Everything else is a real failure the user has to see: a full
+                  // disk, or a directory deleted since the buffer was opened.
+                  if (!isNoClipboardImage(error)) notifyFailure(error)
+                  return null
+                }),
+              insert: (text) => {
+                view.dispatch(
+                  view.state.replaceSelection(text),
+                  // `input.paste`, the same user event `editor/codeMenu.tsx`'s Paste stamps.
+                  // It is what puts the insertion on the undo stack as one paste rather than
+                  // as a typed run, so Ctrl+Z takes the whole reference out in one press.
+                  { userEvent: 'input.paste', scrollIntoView: true },
+                )
+              },
+            },
+            types,
+          )
+          if (verdict !== 'claimed') return false
+          event.preventDefault()
+          return true
+        },
+      }),
       syntaxHighlighting(cideHighlightStyle),
       findExtensions(),
       minimap(),
@@ -1254,6 +1361,23 @@ export function EditorSurface({
         foldExtensions(foldSpecFor(path)),
       )
     }
+    /*
+     * The change column, against HEAD. (M35)
+     *
+     * **Last, so the strip sits against the text**, which is where IDEA draws it: gutters lay out
+     * in extension order, so this lands to the right of the fold chevrons and the line numbers,
+     * with `blameSlot`'s column still furthest left. `check:change-bars` pins the position.
+     *
+     * **Outside the `!oversize` block**, unlike folding, and the difference is deliberate: the
+     * column's *width* is reserved unconditionally in the stylesheet, so the extension has to be
+     * present in every buffer or the geometry would depend on file size. An oversize buffer
+     * simply never gets a baseline dispatched to it, so the column is there and empty.
+     *
+     * No compartment and no memo: `CHANGE_BARS` is one value for the process, because nothing
+     * toggles this column and it captures no host callback. `changeBars.ts`'s header has the
+     * argument, and it is the one thing about this extension that reads differently from blame.
+     */
+    shared.push(CHANGE_BARS)
     if (readOnly) {
       shared.push(
         EditorState.readOnly.of(true),
@@ -1353,6 +1477,17 @@ export function EditorSurface({
      */
     if (blameOnRef.current === true) {
       view.dispatch({ effects: setBlame.of(blameRef.current ?? []) })
+    }
+    /*
+     * And the change column's baseline, for the same reason and the same failure. (M35)
+     *
+     * A `reloadKey` bump builds a new view whose `changeState` field is empty, and the effect
+     * below is keyed on `baseline`, which did not change — so a reloaded file would come back
+     * with no markers until the user's next commit. `oversizeRef` gates it here as well as
+     * there, so a buffer that is too large to highlight is also too large to diff.
+     */
+    if (!oversize && baselineRef.current !== null) {
+      view.dispatch({ effects: setChangeBaseline.of(baselineRef.current) })
     }
     // Hand the awaitable save outward, so a close confirmation can offer *Save and close*.
     // Cleared in the cleanup below: a handle to a destroyed view would write from a buffer
@@ -1967,6 +2102,35 @@ export function EditorSurface({
       console.error('[cide] could not paint the blame column', error)
     }
   }, [blame, blameOn, blameExt])
+
+  /*
+   * Hand the change column HEAD's copy of this file. (M35)
+   *
+   * One dispatch and no compartment, which is the whole difference from the effect above: the
+   * column is always mounted, so there is no *is this gutter here* question to answer and no
+   * clear-on-off trap. `null` is the clear — a file that has left its repository, or a commit
+   * that made HEAD unreadable — and it empties the field rather than leaving markers standing
+   * against a baseline nothing holds any more.
+   *
+   * The recompute is the extension's own throttle, so nothing here reads the buffer: this effect
+   * fires when the *baseline* changes, which is on open and on a ref move, and typing is
+   * `changeBars.ts`'s business.
+   *
+   * `baseline` appears here and **nowhere near** the build effect's `[path, reloadKey]`.
+   */
+  useEffect(() => {
+    const view = viewRef.current
+    if (view === null) return
+    // Wrapped for the reason the two dispatches above are: no error boundary stands between an
+    // effect and the React root, and an exception out of `dispatch` unmounts the window.
+    try {
+      view.dispatch({
+        effects: setChangeBaseline.of(oversizeRef.current ? null : baseline),
+      })
+    } catch (error) {
+      console.error('[cide] could not paint the change column', error)
+    }
+  }, [baseline])
 
   /*
    * No breadcrumb bar. `crates › cide-core › src › lib.rs · Rust · UTF-8 · LF · Ln 7, Col 48`

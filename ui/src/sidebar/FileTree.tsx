@@ -77,7 +77,7 @@ import {
   pendingNote,
   type ClipMode,
 } from './clipboardModel'
-import { fsMessage } from './fsError'
+import { fsMessage, isNoClipboardImage } from './fsError'
 import { ConfirmDestructive, type ConfirmState } from '@/chrome/ConfirmDestructive'
 import { PasteConfirm } from '@/chrome/PasteConfirm'
 import {
@@ -93,6 +93,7 @@ import {
 import {
   diag,
   fs as fsApi,
+  fsClipboard,
   fsReveal,
   isDegraded,
   type ProjectId,
@@ -663,6 +664,62 @@ export function FileTree({
   )
 
   /**
+   * Write the system clipboard's image into `target` as a PNG, and select the new row. (M35)
+   *
+   * The *other* paste, and it is a different gesture wearing the same keystroke: `runPaste`
+   * moves files that are already on disk, and this one turns a screenshot into a file that did
+   * not exist. They cannot both act, so Ctrl+V asks this one only when the in-app file
+   * clipboard is empty — see the key handler — and the context menu offers it as its own item.
+   *
+   * `announce` is what separates the two callers. From a bare Ctrl+V, "there is no image on the
+   * clipboard" is not a failure and must say nothing at all: that is the outcome every time
+   * somebody copies text somewhere else and presses Ctrl+V here, several times a session. From
+   * the menu item the user pointed at the word *Paste Image*, so silence would read as a broken
+   * control. `isNoClipboardImage` is the tag test, in `fsError.ts`.
+   *
+   * No collision dialog, unlike `startTransfer`: the name is cide's invention rather than the
+   * user's, so a taken one is cide's problem and `ops::write_new_bytes` takes the next
+   * candidate. There is nothing to ask about.
+   */
+  const pasteImage = useCallback(
+    (target: NewEntryTarget | null, announce: boolean) => {
+      if (project === null) return
+      if (target === null) {
+        if (announce) setProblem('There is nowhere to paste into.')
+        return
+      }
+      // The same one-at-a-time flag `startTransfer` uses, and for a weaker version of the same
+      // reason: a held Ctrl+V would otherwise write one file per repeat, each with a name a
+      // second apart, and the user asked for one screenshot.
+      if (pasting.current) return
+      pasting.current = true
+      setProblem(null)
+      setNote(null)
+      void fsClipboard
+        .pasteImage(project, target.parent)
+        .then(async (written) => {
+          pasting.current = false
+          const shown = await useFileTree.getState().selectCreated(written)
+          if (shown === null) {
+            // Written, but the project's ignore rules keep it out of the tree. Said out loud,
+            // because a paste that reports success and shows no row reads as a paste that did
+            // nothing — and the file is really there, which is the part worth knowing.
+            setNote(`Pasted to ${written}, which this project's filters keep out of the tree.`)
+          }
+        })
+        .catch((error: unknown) => {
+          pasting.current = false
+          if (isNoClipboardImage(error)) {
+            if (announce) setProblem('The clipboard does not hold an image.')
+            return
+          }
+          fail('Paste')(error)
+        })
+    },
+    [fail, project],
+  )
+
+  /**
    * Drop `sources` into `destDir` — the drag's landing.
    *
    * Called by `useTreeDrag` only for a `move` verdict, so every refusal in `treeDrag.ts` has
@@ -1201,7 +1258,19 @@ export function FileTree({
             )
           } else {
             const anchor = row === undefined ? null : { path: row.path, isDir: row.kind === 'dir' }
-            runPaste(pasteTargetFor(anchor, roots))
+            const target = pasteTargetFor(anchor, roots)
+            // **Two pastes share this chord, and which one runs is decided by the in-app
+            // clipboard alone.** With files on it, Ctrl+V means those files and nothing else
+            // may claim the keystroke. With nothing on it, Ctrl+V used to mean *nothing at
+            // all* — the branch simply refused — and that is the gap M35 fills: the system
+            // clipboard may be holding a screenshot, and pasting it here is what the user
+            // asked for.
+            //
+            // Never announced from here. Most presses with an empty file clipboard are somebody
+            // who copied text somewhere else, and a toast for each of those would be noise on a
+            // keystroke people use constantly. The menu item is the loud way in.
+            if (clipNow() === null) pasteImage(target, false)
+            else runPaste(target)
           }
           e.preventDefault()
           return
@@ -1406,6 +1475,7 @@ export function FileTree({
       cursor,
       draft,
       moveTo,
+      pasteImage,
       project,
       renaming,
       reported,
@@ -1682,11 +1752,36 @@ export function FileTree({
         label: pasteLabel(clipNow(), target_),
         ...(refusal === null ? { run: () => runPaste(target_) } : { disabledReason: refusal }),
       }
+      /*
+       * *Paste Image* — the system clipboard's screenshot, written here as a PNG. (M35)
+       *
+       * Its own item rather than a mode of *Paste* above, because the two act on two different
+       * clipboards and the label has to say which: *Paste* with files on the in-app clipboard
+       * names them, and folding an image into it would make one item whose meaning depends on
+       * state the menu is not showing.
+       *
+       * Always offered, never greyed, and that is deliberate. Whether the system clipboard
+       * holds an image is not knowable without *decoding* it — `read_image` is the decode, not
+       * a probe (`ui/src/terminal/clipboard.ts` carries that argument) — so a `disabledReason`
+       * here would cost a full bitmap read every time this menu opens, on a menu that opens on
+       * every right-click in the tree. The refusal is cheap to *report* and expensive to
+       * *predict*, so it is reported: `announce` is true on this path.
+       *
+       * `fillRefusal` gates it for the same reason it gates *Paste* — a dependency source or
+       * the scratch drawer under the pointer is not somewhere to create a file.
+       */
+      const pasteImageItem: MenuEntry = {
+        id: 'paste-image',
+        label: 'Paste Image',
+        ...(fillRefusal === null
+          ? { run: () => pasteImage(target_, true) }
+          : { disabledReason: fillRefusal }),
+      }
 
       // Right-clicking the empty space under the last row offers the three items above and
       // nothing else. An empty box at the pointer says "this surface is broken";
       // `useContextMenu` declines on `[]`, which is still the answer for a project-less panel.
-      if (row === null) return [...create, { kind: 'separator' }, paste]
+      if (row === null) return [...create, { kind: 'separator' }, paste, pasteImageItem]
 
       const store = useFileTree.getState()
       const at = store.indexOf(row.path)
@@ -1811,6 +1906,7 @@ export function FileTree({
           run: () => takeClip('copy', scope),
         },
         paste,
+        pasteImageItem,
         { kind: 'separator' },
         {
           // The one verb here that is about a *place* rather than a set of files. A file

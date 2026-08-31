@@ -12,7 +12,8 @@ use std::collections::BTreeSet;
 use cide_git::diff::{self, DiffRequest};
 use cide_git::{changelist, commit, patch, push, repo as repo_mod, shelf, stage, stash, status};
 use cide_ipc::git::{
-    CommitRequest, DiffSide, GitError, LineRef, PartialRefusal, PathSelection, Selection,
+    CommitRequest, DiffSide, GitError, LineRef, PartialRefusal, PathSelection, PushBlock,
+    PushRequest, Selection,
 };
 use support::{Rng, TempRepo, binary_blob};
 
@@ -1273,7 +1274,15 @@ fn a_local_remote_is_pushed_by_libgit2_and_https_is_shelled_out() {
     assert_eq!(push::route(&git_repo, "origin"), push::Route::Libgit2);
     drop(git_repo);
 
-    let outcome = push::push(&repo.root, None, None, true, &untouched()).expect("push");
+    let outcome = push::push(
+        &repo.root,
+        &PushRequest {
+            set_upstream: true,
+            ..PushRequest::default()
+        },
+        &untouched(),
+    )
+    .expect("push");
     assert!(!outcome.shelled_out);
     let remote_log = std::process::Command::new("git")
         .arg("--git-dir")
@@ -1774,9 +1783,7 @@ fn a_rejected_push_is_an_error_and_not_a_silent_success() {
 
     let outcome = cide_git::push::push(
         &work.root,
-        None,
-        None,
-        false,
+        &PushRequest::default(),
         &cide_core::proxy::ProxyEnv::default(),
     );
     let Err(cide_ipc::git::GitError::Push { output }) = outcome else {
@@ -1800,6 +1807,328 @@ fn a_rejected_push_is_an_error_and_not_a_silent_success() {
         !origin.root.join("c.txt").exists(),
         "nothing of the refused push landed"
     );
+}
+
+/// `preview` describes the push that `push` would then perform — including the one it cannot.
+///
+/// The dialog is a promise about what is going to happen, and there are exactly two ways for it
+/// to be a lie: it lists the wrong commits, or it names a target the push does not use. Both are
+/// pinned here against a real repository, because both are silent — a preview that resolved the
+/// remote or the refspec independently would draw a dialog that is internally consistent and
+/// describes a different push from the one the button makes.
+#[test]
+fn a_preview_describes_the_push_that_would_happen() {
+    let origin = bare_origin("preview");
+    let work = clone_of_bare(&origin.path, "preview-work");
+    work.write("b.txt", b"mine\n");
+    work.commit_all("mine one");
+    work.write("c.txt", b"mine too\n");
+    work.commit_all("mine two");
+
+    let info = one_repo(&work);
+    let preview = push::preview(&info).expect("preview");
+
+    assert_eq!(preview.blocked, None);
+    assert_eq!(preview.remote, "origin");
+    assert_eq!(preview.remotes, vec!["origin".to_string()]);
+    assert_eq!(preview.refspec, "refs/heads/main:refs/heads/main");
+    assert!(!preview.publish, "main already exists on the remote");
+    assert!(!preview.diverged, "the remote has not moved");
+    assert_eq!(preview.more, 0);
+    // Newest first, and *only* the commits the remote does not have — not the whole history.
+    let summaries: Vec<&str> = preview.commits.iter().map(|c| c.summary.as_str()).collect();
+    assert_eq!(summaries, vec!["mine two", "mine one"]);
+    assert!(
+        preview.commits.iter().all(|c| c.short_oid.len() == 8),
+        "short oids are eight hex digits, the width every other one in this crate uses"
+    );
+
+    // And the push it described is the push that happens.
+    let outcome = push::push(&work.root, &PushRequest::default(), &untouched()).expect("push");
+    assert_eq!(outcome.refspec, preview.refspec);
+    assert_eq!(outcome.remote, preview.remote);
+    assert_eq!(outcome.pushed as usize, preview.commits.len());
+}
+
+/// A branch the remote has never seen previews as a **publish**, and counts only its own commits.
+///
+/// The case `BranchInfo::ahead` cannot answer: there is no upstream, so that number is zero, and
+/// a dialog reading it would offer to push a branch while saying it had nothing to send. The
+/// count here is "commits no branch of this remote has", which is what `git push` itself sends —
+/// a branch cut from `main` an hour ago is its own commits, not the whole history behind it.
+#[test]
+fn a_branch_the_remote_has_never_seen_previews_as_a_publish() {
+    let origin = bare_origin("publish");
+    let work = clone_of_bare(&origin.path, "publish-work");
+    work.git(&["checkout", "-q", "-b", "feature"]);
+    work.write("f.txt", b"feature\n");
+    work.commit_all("the feature");
+
+    let preview = push::preview(&one_repo(&work)).expect("preview");
+    assert!(preview.publish, "no remote-tracking ref for `feature`");
+    assert_eq!(preview.refspec, "refs/heads/feature:refs/heads/feature");
+    assert_eq!(
+        preview.head.upstream, None,
+        "and BranchInfo agrees there is no upstream, which is why its `ahead` is useless here"
+    );
+    assert_eq!(preview.head.ahead, 0, "the number a dialog must NOT read");
+    let summaries: Vec<&str> = preview.commits.iter().map(|c| c.summary.as_str()).collect();
+    assert_eq!(
+        summaries,
+        vec!["the feature"],
+        "only what the remote lacks — `first` is on origin/main and must not be counted"
+    );
+}
+
+/// The three states that cannot push each say which one they are.
+#[test]
+fn the_three_blocked_states_are_told_apart() {
+    let empty = support::TempRepo::new("blocked-unborn");
+    assert_eq!(
+        push::preview(&one_repo(&empty)).expect("preview").blocked,
+        Some(PushBlock::Unborn),
+        "a repository with no commits"
+    );
+
+    let lone = support::TempRepo::new("blocked-no-remote");
+    lone.write("a.txt", b"one\n");
+    lone.commit_all("first");
+    assert_eq!(
+        push::preview(&one_repo(&lone)).expect("preview").blocked,
+        Some(PushBlock::NoRemote),
+        "a repository with commits and nowhere to send them"
+    );
+
+    let origin = bare_origin("blocked-detached");
+    let work = clone_of_bare(&origin.path, "blocked-detached-work");
+    work.git(&["checkout", "-q", "--detach"]);
+    assert_eq!(
+        push::preview(&one_repo(&work)).expect("preview").blocked,
+        Some(PushBlock::Detached),
+        "a detached HEAD has no branch name to push to"
+    );
+
+    for preview in [
+        push::preview(&one_repo(&empty)).expect("preview"),
+        push::preview(&one_repo(&lone)).expect("preview"),
+        push::preview(&one_repo(&work)).expect("preview"),
+    ] {
+        assert!(
+            preview.commits.is_empty() && preview.refspec.is_empty(),
+            "a blocked row carries no commits and no refspec to draw"
+        );
+    }
+}
+
+/// A remote that has moved is previewed as **diverged**, which is the only state force answers.
+#[test]
+fn a_moved_remote_previews_as_diverged() {
+    let origin = bare_origin("diverged");
+    let work = clone_of_bare(&origin.path, "diverged-work");
+    let before = push::preview(&one_repo(&work)).expect("preview");
+    assert!(!before.diverged, "nothing has happened yet");
+
+    // Somebody else pushes. A second clone rather than a commit in the origin, because the
+    // origin is bare and has no working tree to commit in — which is also the only shape
+    // libgit2 will push to.
+    let other = clone_of_bare(&origin.path, "diverged-other");
+    other.write("b.txt", b"theirs\n");
+    other.commit_all("theirs");
+    other.git(&["push", "-q", "origin", "main"]);
+
+    work.write("c.txt", b"mine\n");
+    work.commit_all("mine");
+
+    // Still not diverged: this clone has not fetched, so its remote-tracking ref has not moved.
+    // That is the honest answer — the divergence is not knowable from here — and it is also why
+    // `--force-with-lease` exists at all.
+    assert!(
+        !push::preview(&one_repo(&work)).expect("preview").diverged,
+        "an unfetched clone cannot see a divergence, and must not claim to"
+    );
+
+    work.git(&["fetch", "-q", "origin"]);
+    let after = push::preview(&one_repo(&work)).expect("preview");
+    assert!(after.diverged, "and after a fetch it can");
+    assert!(!after.publish, "diverged is not published");
+}
+
+/// **Force is a lease, and the lease is what makes it safe.** Both sides of it, on one remote.
+///
+/// The whole argument for `--force-with-lease` over `--force` in one test: a force push whose
+/// remote is where this clone last saw it goes through, and the same push against a remote that
+/// moved since is refused with both oids named. Without the second half, cide's force push is a
+/// button that silently deletes whatever somebody else pushed while you were working.
+///
+/// This is the **libgit2** route (a path remote — see `push::route`), which has no lease of its
+/// own: what is pinned here is cide's own comparison, performed in `check_lease`. The binary
+/// route hands the same job to `git push --force-with-lease` and git refuses first.
+#[test]
+fn a_force_push_holds_a_lease_and_refuses_when_the_remote_moved() {
+    let origin = bare_origin("lease");
+    let work = clone_of_bare(&origin.path, "lease-work");
+    let git_repo = git2::Repository::open(&work.root).unwrap();
+    assert_eq!(
+        push::route(&git_repo, "origin"),
+        push::Route::Libgit2,
+        "a path remote takes the route with no lease of its own — which is the one under test"
+    );
+    drop(git_repo);
+
+    // A rewrite: the local branch is no longer a descendant of what the remote has, so a plain
+    // push is a non-fast-forward and only a force can land it.
+    work.git(&["reset", "-q", "--hard", "HEAD~0"]);
+    work.write("a.txt", b"rewritten\n");
+    work.git(&["add", "-A"]);
+    work.git(&["commit", "-q", "--amend", "-m", "rewritten"]);
+
+    let plain = push::push(&work.root, &PushRequest::default(), &untouched());
+    assert!(
+        matches!(plain, Err(GitError::Push { .. })),
+        "a plain push over a rewrite is refused, got {plain:?}"
+    );
+
+    let forced = push::push(
+        &work.root,
+        &PushRequest {
+            force: true,
+            ..PushRequest::default()
+        },
+        &untouched(),
+    );
+    assert!(
+        forced.is_ok(),
+        "and a force push whose lease holds goes through, got {forced:?}"
+    );
+    assert_eq!(
+        bare_head(&origin.path),
+        "rewritten",
+        "the remote took the rewrite"
+    );
+
+    // Now the remote moves behind this clone's back, and the lease must catch it.
+    let other = clone_of_bare(&origin.path, "lease-other");
+    other.write("theirs.txt", b"theirs\n");
+    other.commit_all("somebody else");
+    other.git(&["push", "-q", "origin", "main"]);
+
+    work.write("a.txt", b"rewritten again\n");
+    work.git(&["add", "-A"]);
+    work.git(&["commit", "-q", "--amend", "-m", "rewritten again"]);
+
+    let stale = push::push(
+        &work.root,
+        &PushRequest {
+            force: true,
+            ..PushRequest::default()
+        },
+        &untouched(),
+    );
+    let Err(GitError::PushLeaseStale {
+        branch,
+        expected,
+        actual,
+    }) = stale
+    else {
+        panic!("a force push past a moved remote must be refused by the lease, got {stale:?}");
+    };
+    assert_eq!(branch, "main");
+    assert_ne!(
+        expected, actual,
+        "and it names both sides of the difference"
+    );
+    assert_eq!(expected.len(), 8);
+    assert_eq!(actual.len(), 8);
+
+    // The remote still has their commit. This is the whole point: a plain `--force` would have
+    // deleted it and reported success.
+    assert_eq!(
+        bare_head(&origin.path),
+        "somebody else",
+        "nothing of the refused force push landed"
+    );
+}
+
+/// A **bare** remote with one commit on `main`, and the working clone that seeded it.
+///
+/// Bare and not a checked-out repository, because libgit2 refuses to push to one that is not:
+/// *"local push doesn't (yet) support pushing to non-bare repos"*. `support::clone_of` produces
+/// the other shape, which is right for the fetch and pull tests and useless for these — every
+/// test below actually sends.
+///
+/// The directory is named after the process and the tag so two tests running in parallel cannot
+/// share one, and it is left behind on failure exactly as `TempRepo` leaves its own.
+fn bare_origin(tag: &str) -> BareRemote {
+    // Inside a `TempRepo`'s parent rather than beside it, so the pid and the counter that keep
+    // two parallel tests apart are `TempRepo`'s and not a second scheme that could collide with
+    // it. The bare repository is a sibling directory, never a nested one — a bare repo inside a
+    // work tree is a repository cide would discover.
+    let holder = TempRepo::new(&format!("{tag}-remote"));
+    let bare = holder.root.join("origin.git");
+    let status = std::process::Command::new("git")
+        .args(["init", "-q", "--bare", "-b", "main"])
+        .arg(&bare)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let seed = TempRepo::new(&format!("{tag}-seed"));
+    seed.write("a.txt", b"one\n");
+    seed.commit_all("first");
+    seed.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+    seed.git(&["push", "-q", "origin", "main"]);
+    BareRemote {
+        path: bare,
+        _holder: holder,
+        _seed: seed,
+    }
+}
+
+/// A bare remote and everything that has to outlive it.
+///
+/// `_holder` owns the directory — its `Drop` is `TempRepo`'s, which leaves the tree behind when
+/// a test is panicking so the repository that produced a bad push can be looked at. `_seed` is
+/// the working clone that put the first commit in and is never touched again; it is held rather
+/// than dropped only so its own temp directory outlives the test that might want to read it.
+struct BareRemote {
+    path: std::path::PathBuf,
+    _holder: TempRepo,
+    _seed: TempRepo,
+}
+
+/// A fresh clone of a bare remote, on `main`, tracking `origin/main`.
+///
+/// `support::clone_of`'s three lines against a path rather than a `TempRepo`.
+fn clone_of_bare(bare: &std::path::Path, tag: &str) -> TempRepo {
+    let work = TempRepo::new(tag);
+    work.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+    work.git(&["fetch", "-q", "origin"]);
+    work.git(&["checkout", "-q", "-b", "main", "origin/main"]);
+    work
+}
+
+/// The subject of whatever `main` points at in a bare repository.
+fn bare_head(bare: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(bare)
+        .args(["log", "--format=%s", "-1", "main"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// One `RepoInfo` for a test repository, which is all `preview` needs.
+///
+/// `repo::discover` is what the command uses; going through it here would make every one of these
+/// tests also a test of discovery, and a discovery change would break them all for a reason none
+/// of them is about.
+fn one_repo(repo: &support::TempRepo) -> cide_ipc::git::RepoInfo {
+    let discovered = cide_git::repo::discover(std::slice::from_ref(&repo.root));
+    discovered
+        .into_iter()
+        .next()
+        .expect("the test repository is a repository")
 }
 
 /*

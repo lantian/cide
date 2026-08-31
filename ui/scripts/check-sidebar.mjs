@@ -697,6 +697,30 @@ try {
       'field without one takes the whole `sidebar` block down on the first launch after upgrade',
   )
 
+  // The same discipline for the terminal's stored booleans. They are not sidebar widths, but
+  // this is the one script that already reads `settings.rs` for the `#[serde(default = …)]`
+  // rule, and the rule is what matters: a stored field without one fails to deserialise on
+  // every `workspace.json` written before the field existed, taking its whole block with it.
+  ok(
+    /fn default_json_logs\(\)\s*->\s*bool\s*\{\s*true/.test(rust),
+    'terminal.jsonLogs defaults to on in Rust — the settings form draws the stored value, so ' +
+      'a default of false here would be a feature nobody ever sees switched on',
+  )
+  ok(
+    /#\[serde\(default\s*=\s*"default_json_logs"\)\]/.test(rust),
+    'and json_logs carries #[serde(default = …)]: every existing workspace.json has a present ' +
+      '`terminal` object that does not mention it, and the container default does not fill those',
+  )
+  ok(
+    /json_logs:\s*default_json_logs\(\)/.test(rust),
+    'TerminalSettings::default() uses that fn rather than a second copy of the answer',
+  )
+  ok(
+    /checked=\{terminal\.jsonLogs\}/.test(readFileSync('src/settings/sections.tsx', 'utf8')),
+    'and the Terminal settings section actually draws it — a stored setting with no control ' +
+      'is one nobody can turn off, which for this one means no way back to the raw JSON',
+  )
+
   const windowsRs = readFileSync('../crates/cide-app/src/windows.rs', 'utf8')
   const minWidth = Number(/MIN_WIDTH:\s*f64\s*=\s*([\d.]+)/.exec(windowsRs)?.[1] ?? Number.NaN)
   ok(

@@ -429,7 +429,7 @@ pub enum SessionBinding {
     /// argument for why the rendering happens once, upstream of the mirror and every sink.
     Harness {
         capture: fn(&str) -> Option<String>,
-        render: fn(&str) -> Option<String>,
+        render: fn(&str) -> cide_pty::Rendered,
     },
 }
 

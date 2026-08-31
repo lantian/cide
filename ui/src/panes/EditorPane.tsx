@@ -28,6 +28,21 @@ import {
   type ReactNode,
 } from 'react'
 import { EditorSurface, type SaveCause } from '@/editor/EditorSurface'
+
+/**
+ * How long a burst of `cide://git-status` events is held before one on-disk check runs.
+ *
+ * The same 120 ms and the same *shape* as `sidebar/gitStatusStore.ts`'s `COALESCE_MS`, and the
+ * argument for both lives there: a **throttle**, not a restarting debounce, because a debounce
+ * that restarts can be starved indefinitely by a steady stream of writes and an editor that
+ * stops noticing its file moved for as long as anything is happening is worse than one that
+ * notices 120 ms after the first event of each burst.
+ *
+ * Not imported from that module: this file has no business depending on the file-tree status
+ * store, and the number is a property of how fast a human perceives a reload rather than a
+ * contract between the two.
+ */
+const GIT_RECHECK_MS = 120
 import {
   claude as claudeApi,
   diag,
@@ -57,6 +72,13 @@ import {
   subscribe as subscribeBlame,
   toggleBlame,
 } from '@/editor/blameStore'
+import {
+  baselineFor,
+  baselineRevision,
+  openBaseline,
+  releaseBaseline,
+  subscribeBaselines,
+} from '@/editor/changeBaseline'
 import { collapseRuns } from '@/editor/blameModel'
 import { requestLogReveal } from '@/gitlog/LogTab'
 import type { FileView } from '@/editor/position'
@@ -449,6 +471,19 @@ export function EditorPane({
    * definitions and the only place they should live.
    */
   useSyncExternalStore(subscribeBlame, blameRevision, blameRevision)
+  /*
+   * And HEAD's copy of this file, for the change column. (M35)
+   *
+   * The same shape as the line above and for the same two reasons: the writers are outside React
+   * (the fs watcher's sweep), and the snapshot is the store's **revision counter** — a number.
+   * Returning the lines array from the selector would be a fresh identity per call whenever the
+   * store held nothing, which is the `check:selectors` loop that unmounts the whole root.
+   *
+   * The answer comes from `baselineFor`, which is identity-stable, so the surface's effect does
+   * not refire when some *other* file's baseline lands.
+   */
+  useSyncExternalStore(subscribeBaselines, baselineRevision, baselineRevision)
+  const baseline = project === undefined ? null : baselineFor(project as ProjectId, path)
   const blameOn = project !== undefined && isAnnotated(project as ProjectId, path)
   const blameNow = project === undefined ? null : blameState(project as ProjectId, path)
   /**
@@ -501,7 +536,15 @@ export function EditorPane({
    */
   useEffect(() => {
     mountedPanes.set(path, (mountedPanes.get(path) ?? 0) + 1)
+    /*
+     * The change column's baseline is refcounted in the store itself rather than here, because it
+     * is wanted by *every* pane over this file and not only by the last one out: a split showing
+     * one file twice asks one question about one file's HEAD. `openBaseline` fetches on the first
+     * caller and joins the rest. (M35)
+     */
+    if (project !== undefined) openBaseline(project as ProjectId, path)
     return () => {
+      if (project !== undefined) releaseBaseline(project as ProjectId, path)
       const left = (mountedPanes.get(path) ?? 1) - 1
       if (left > 0) {
         mountedPanes.set(path, left)
@@ -1042,6 +1085,25 @@ export function EditorPane({
    * never arms a timer. Stated rather than inferred: "unreachable" here is a property of two
    * other modules agreeing, and External Libraries sources are read-only by design.
    */
+  /**
+   * Whether this tab is the one in front, readable from inside a subscription.
+   *
+   * A ref rather than a dependency: `onScreen` flips on every tab switch, and rebuilding the
+   * `cide://git-status` subscription that often would drop events in the gap.
+   */
+  /** False once this pane is gone, so a read in flight cannot rebuild a dead editor. */
+  const aliveRef = useRef(true)
+  useEffect(() => {
+    aliveRef.current = true
+    return () => {
+      aliveRef.current = false
+    }
+  }, [])
+  const onScreenRef = useRef(onScreen ?? true)
+  onScreenRef.current = onScreen ?? true
+  /** Something moved while this tab was hidden; check once when it is next revealed. */
+  const [gitStale, setGitStale] = useState(false)
+
   const allowAutosave = useCallback(
     (
       reason: 'blur' | 'idle',
@@ -1099,6 +1161,30 @@ export function EditorPane({
   }, [path, read])
 
   /**
+   * Compare the file on disk against what this buffer was built from, and reload if it moved.
+   *
+   * Split out of the `cide://git-status` effect below in M31 so that the *reveal* effect can
+   * spend a deferred check with the same code. A dirty buffer is never overwritten: it raises
+   * the same conflict bar an agent's edit does, which is the one outcome here that could lose
+   * work.
+   */
+  const recheckOnDisk = useCallback(() => {
+    void fileApi
+      .read(path)
+      .then((doc) => {
+        // `aliveRef` and not a `dropped` local, because this outlives the effect that called
+        // it: the read resolves a round trip later, and by then the pane may have been closed
+        // or split away. The inline version this replaced closed over its effect's own
+        // `dropped` flag, and losing that guard would mean rebuilding an `EditorView` for a
+        // pane that no longer exists.
+        if (!aliveRef.current || doc.stamp === stampRef.current) return
+        if (dirtyRef.current) setConflict(true)
+        else read(true)
+      })
+      .catch(() => {})
+  }, [path, read])
+
+  /**
    * Follow the file across a git operation. (M20)
    *
    * The reported bug: pull a branch that changes a file you have open, and the pane goes on
@@ -1111,24 +1197,56 @@ export function EditorPane({
    * changelist move — and a `read(true)` on each of those would rebuild the `EditorView` and take
    * the user's scroll position, selection and undo history with it, several times per commit.
    * So the file is read and its **stamp compared**; only a stamp that actually moved gets the
-   * reload. A read is cheap, and the rebuild is the part that costs something.
+   * reload. The rebuild is the part that costs something.
    *
-   * A dirty buffer is never overwritten: it raises the same conflict bar an agent's edit does,
-   * which is the one outcome here that could lose work.
+   * # "A read is cheap" was the wrong unit (M31)
+   *
+   * That sentence used to end the paragraph above, and it was true of *one* read and false of
+   * what actually happens. `TabContent` keeps **every** tab of the project mounted at once —
+   * that is what makes switching tabs free — so every open editor ran this handler, and
+   * `emit::git_status` reaches every window with the whole tree on every mutation while a
+   * commit is several mutations. One commit therefore cost *(open editors) × (mutations)* IPC
+   * round trips, each carrying a whole file body back, and it was reported as exactly that:
+   *
+   * > *"when i have opened diff tab, and commiting it, tab shows bad info and cide starts to
+   * > lag"*
+   *
+   * Two bounds, both borrowed rather than invented — the pane beside this one already had to
+   * solve the same problem, and `sidebar/gitStatusStore.ts` already argued out which shape of
+   * timer to use:
+   *
+   *   * **A throttle, not a restarting debounce.** The timer is not re-armed by triggers that
+   *     arrive while it is already running, so a steady stream of writes (a `cargo watch`
+   *     loop, a formatter over a big tree) cannot starve the check indefinitely. That argument
+   *     is `gitStatusStore.ts`'s, at length, and `COALESCE_MS` is its constant.
+   *   * **A hidden tab defers instead of reading.** It records that it is stale and checks once
+   *     when it is next revealed, however many events went by — which is `GitDiffPane`'s
+   *     hidden-tab rule and is why `onScreen` exists on this component at all. A tab nobody is
+   *     looking at does not need to discover within 120 ms that its file moved; it needs to be
+   *     right when it comes back.
+   *
+   * Correctness is unchanged in both cases: the check is still an unconditional read-and-
+   * compare, still triggered by every git mutation. It simply runs once per burst, and only
+   * where somebody can see the result.
    */
   useEffect(() => {
     let unlisten: (() => void) | null = null
     let dropped = false
+    let timer: number | null = null
     void events
       .onGitStatus(() => {
-        void fileApi
-          .read(path)
-          .then((doc) => {
-            if (dropped || doc.stamp === stampRef.current) return
-            if (dirtyRef.current) setConflict(true)
-            else read(true)
-          })
-          .catch(() => {})
+        if (dropped) return
+        // Read through a ref so a tab switch does not tear this subscription down and rebuild
+        // it — the same reason `GitDiffPane` keeps its visibility in `visibleRef`.
+        if (!onScreenRef.current) {
+          setGitStale(true)
+          return
+        }
+        if (timer !== null) return
+        timer = window.setTimeout(() => {
+          timer = null
+          if (!dropped) recheckOnDisk()
+        }, GIT_RECHECK_MS)
       })
       .then((fn) => {
         if (dropped) fn()
@@ -1137,9 +1255,24 @@ export function EditorPane({
       .catch(() => {})
     return () => {
       dropped = true
+      if (timer !== null) window.clearTimeout(timer)
       unlisten?.()
     }
-  }, [path, read])
+  }, [recheckOnDisk])
+
+  /**
+   * Spend a check that was deferred while this tab was behind another one. (M31)
+   *
+   * The flag is cleared by the reveal and not by the check's outcome — a file that genuinely
+   * has not moved answers "same stamp" for as long as it stays that way, and a flag that only
+   * cleared on a *change* would re-arm on every render into a loop. `GitDiffPane`'s reveal
+   * effect states the same rule for the same reason.
+   */
+  useEffect(() => {
+    if (!onScreen || !gitStale) return
+    setGitStale(false)
+    recheckOnDisk()
+  }, [onScreen, gitStale, recheckOnDisk])
 
   if (load.kind === 'loading') {
     return <div className={styles.notice}>Opening {path}…</div>
@@ -1286,6 +1419,7 @@ export function EditorPane({
           completion={completion}
           blame={blame}
           blameOn={blameOn}
+          baseline={baseline}
           onShowCommit={onShowCommit}
           onScrollHandle={onScrollHandle}
           onFocusHandle={onFocusHandle}

@@ -204,6 +204,44 @@ try {
   )
 
   /*
+   * Every command that names an extension narrows its argument to the two fields the wire
+   * accepts, through `extRef`.
+   *
+   * `cide_ipc::ExtensionRef` is `deny_unknown_fields`, so an extra key is rejected rather than
+   * ignored, and TypeScript cannot see the mistake coming: an `InstalledExtension` structurally
+   * satisfies `ExtensionRef`, and excess-property checking applies only to literals written at
+   * the call site. Passing the whole installed row therefore compiles and then fails at the
+   * border with `unknown field \`name\``, which is what shipped — the "Show on activity rail"
+   * toggle and every extension setting on that page, all rejected, all reported as serde prose.
+   */
+  const client = readFileSync(join(UI, 'src', 'ipc', 'client.ts'), 'utf8')
+  ok(
+    /const extRef = \(id: ExtensionRef\): ExtensionRef => \(\{/.test(client),
+    'client.ts still narrows an extension reference in one place rather than trusting callers',
+  )
+  // Split the `ext` object into its methods on the two-space indent the file is written at,
+  // rather than trying to balance braces with a regex: the rule is per method, and a method
+  // that *declares* an `ExtensionRef` parameter is one that can be handed a whole installed row.
+  const extObject = client.slice(client.indexOf('export const ext = {'))
+  const methods = extObject.split(/\n  (?=[a-zA-Z]+: )/).slice(1)
+  const takesRef = methods.filter((m) => /^\w+: \([^)]*: ExtensionRef/.test(m))
+  eq(
+    takesRef.length,
+    8,
+    'the eight ext commands that name an extension — install, uninstall, setEnabled, setRailIcon, '
+      + 'setSetting, page, openTab and publishDiagnostics. Two of these were missed by the fix '
+      + 'that this check was written to guard, which is the argument for deriving the list',
+  )
+  for (const method of takesRef) {
+    const name = /^(\w+):/.exec(method)?.[1]
+    ok(
+      method.includes('extRef('),
+      `ext.${name} narrows its reference before sending it: an extra field is refused outright, `
+        + 'and the user meets that as a control that springs back under a line of serde prose',
+    )
+  }
+
+  /*
    * Settings: the four kinds, and the fact that the *page* covers every one of them.
    *
    * `SettingKind` is a Rust union and `renderSection` is a TypeScript switch, so a kind added

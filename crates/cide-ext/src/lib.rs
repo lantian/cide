@@ -335,6 +335,9 @@ impl ExtStore {
                     version,
                     commit,
                     enabled: true,
+                    // A newly installed extension shows its button. Anything else would make a
+                    // panel the user just chose to install invisible with no indication why.
+                    rail_icon: true,
                     // Empty: every setting reads as its default until the user changes one. An
                     // install that wrote today's defaults would pin them for ever — see
                     // `config::Installed::settings`.
@@ -431,6 +434,24 @@ impl ExtStore {
                 .find(|i| i.marketplace == id.marketplace && i.extension == id.extension)
                 .ok_or_else(|| ExtError::NoExtension(id.extension.clone()))?;
             row.enabled = enabled;
+            Ok(())
+        })?;
+        Ok(snapshot)
+    }
+
+    /// Show or hide an installed extension's button on the activity rail.
+    ///
+    /// Deliberately *not* folded into [`Self::set_enabled`]: hiding a rail icon must not stop a
+    /// worker, drop a language or silence a diagnostic. See
+    /// [`crate::config::Installed::rail_icon`].
+    pub fn set_rail_icon(&self, id: &ExtensionRef, rail_icon: bool) -> Result<ExtensionSnapshot> {
+        let (_, snapshot) = self.update(|config| {
+            let row = config
+                .installed
+                .iter_mut()
+                .find(|i| i.marketplace == id.marketplace && i.extension == id.extension)
+                .ok_or_else(|| ExtError::NoExtension(id.extension.clone()))?;
+            row.rail_icon = rail_icon;
             Ok(())
         })?;
         Ok(snapshot)
@@ -629,6 +650,7 @@ fn scan(config: &ExtConfig) -> Scan {
                     version: read.version,
                     description: read.description,
                     enabled: row.enabled,
+                    rail_icon: row.rail_icon,
                     commit: row.commit.clone(),
                     capabilities: granted,
                     contributes: read.contributes,
@@ -656,6 +678,9 @@ fn scan(config: &ExtConfig) -> Scan {
                     version: row.version.clone(),
                     description: String::new(),
                     enabled: false,
+                    // Whatever the config says: the row is here so the user can see what to
+                    // reinstall, and their rail choice should survive the reinstall.
+                    rail_icon: row.rail_icon,
                     commit: row.commit.clone(),
                     capabilities: row.granted_caps(),
                     contributes: Default::default(),

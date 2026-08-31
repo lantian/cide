@@ -260,6 +260,96 @@ fn not_an_image(path: &Path) -> String {
     }
 }
 
+/// The name a pasted image gets, from the moment it was pasted.
+///
+/// `Pasted image 2026-08-31 at 22.41.07.png` — the shape Obsidian and macOS's own screenshots
+/// use, and it is chosen for two properties rather than for looking familiar. It sorts
+/// chronologically in a file tree, and it is unique in practice at one-second resolution, so
+/// the collision suffix `cide_fs::copy::candidate_name` appends is a fallback rather than the
+/// normal case. Dots between the time components because a colon is a path separator on one of
+/// the platforms this workspace targets and is quietly rewritten by several tools on the others.
+///
+/// Local time, not UTC: the name is a thing a person reads to find the screenshot they took a
+/// minute ago, and "a minute ago" is a local statement.
+///
+/// A parameter rather than reading the clock, so the format is testable — a function that reads
+/// `Local::now` can only be asserted against itself.
+pub fn pasted_image_name(at: chrono::DateTime<chrono::Local>) -> String {
+    format!("{}.png", at.format("Pasted image %Y-%m-%d at %H.%M.%S"))
+}
+
+/// The name for an image pasted **now**.
+pub fn pasted_image_name_now() -> String {
+    pasted_image_name(chrono::Local::now())
+}
+
+/// Encode raw RGBA into a PNG.
+///
+/// # Why this exists at all, given the module above never decodes
+///
+/// This module's whole discipline is that cide does not touch pixels — it sniffs a header and
+/// hands the file to the webview down the asset protocol (`crates/cide-ipc/src/image.rs` states
+/// it at length). Pasting is the one direction where that cannot hold: a system clipboard does
+/// not hold a PNG, it holds a bitmap, and `tauri-plugin-clipboard-manager` hands over raw RGBA.
+/// Something has to turn that into a file, and every other candidate is worse — encoding in the
+/// webview means the bytes cross the IPC twice, and storing the RGBA raw means writing a file
+/// nothing on the machine can open.
+///
+/// So: encode, here, on the way to disk, and once. Nothing decodes.
+///
+/// Eight-bit RGBA in, because that is what the clipboard plugin produces on every platform it
+/// supports. `Adaptive` filtering because a screenshot is the overwhelming case and large flat
+/// regions are what it is for; the default compression, because a paste is interactive and the
+/// difference between `Default` and `Best` on a 4K screenshot is seconds against single-digit
+/// percent.
+pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    // A zero dimension is a valid `u32` and not a valid image: `png` would happily write a
+    // header for it and produce a file every viewer refuses. Caught here so the refusal names
+    // the clipboard rather than the file.
+    if width == 0 || height == 0 {
+        return Err(CoreError::Io(format!(
+            "the clipboard image is {width}×{height}, which is not an image"
+        )));
+    }
+    // The length check is the one that matters, and it is not paranoia: `png` writes exactly
+    // `width * height * 4` bytes out of the slice it is given and panics if the slice is
+    // shorter. A panic in a release build of this workspace is `panic = "abort"` — the process
+    // goes away — so a clipboard that reported a size it did not deliver would take the whole
+    // app down on a paste.
+    let expected = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            CoreError::Io(format!(
+                "the clipboard image is {width}×{height}, which is too large"
+            ))
+        })?;
+    if rgba.len() as u64 != expected {
+        return Err(CoreError::Io(format!(
+            "the clipboard image says {width}×{height} but carries {} bytes, not {expected}",
+            rgba.len()
+        )));
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_filter(png::Filter::Adaptive);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| CoreError::Io(format!("could not encode the clipboard image: {e}")))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| CoreError::Io(format!("could not encode the clipboard image: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| CoreError::Io(format!("could not encode the clipboard image: {e}")))?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +560,52 @@ mod tests {
                 .expect_err("refuses")
                 .to_string()
                 .contains("not a regular file")
+        );
+    }
+
+    /// The round trip the paste road depends on: what `encode_png` writes is a thing this
+    /// module's own sniffer calls a PNG. Two independent halves of the same feature, checked
+    /// against each other rather than against a fixture nobody would notice going stale.
+    #[test]
+    fn what_the_encoder_writes_is_a_png_to_the_sniffer() {
+        let rgba = vec![0u8; 2 * 3 * 4];
+        let png = encode_png(&rgba, 2, 3).expect("encodes");
+        assert_eq!(sniff(&png), Some(ImageFormat::Png));
+    }
+
+    /// The refusal that stops a process dying. `png` panics when its buffer is short, and this
+    /// workspace aborts on panic — so a clipboard that misreports its size would take the app
+    /// down rather than fail a paste.
+    #[test]
+    fn a_buffer_that_does_not_match_the_stated_size_is_refused_rather_than_written() {
+        let short = vec![0u8; 4];
+        let refusal = encode_png(&short, 10, 10).expect_err("refuses").to_string();
+        assert!(
+            refusal.contains("400"),
+            "names the size it wanted: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_zero_dimension_is_not_an_image() {
+        assert!(encode_png(&[], 0, 4).is_err());
+        assert!(encode_png(&[], 4, 0).is_err());
+    }
+
+    /// The name has to sort chronologically in a file tree and survive being a path component
+    /// on every platform, which is what rules out a colon.
+    #[test]
+    fn a_pasted_image_is_named_after_the_moment_it_was_pasted() {
+        use chrono::TimeZone;
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 8, 31, 22, 41, 7)
+            .single()
+            .expect("a real local time");
+        let name = pasted_image_name(at);
+        assert_eq!(name, "Pasted image 2026-08-31 at 22.41.07.png");
+        assert!(
+            !name.contains(':'),
+            "a colon is a separator on Windows: {name}"
         );
     }
 }

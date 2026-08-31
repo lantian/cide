@@ -580,6 +580,28 @@ pub struct TerminalSettings {
     /// does not supply a member a *present* object happens not to mention.
     #[serde(default = "default_job_notify_after_secs")]
     pub job_notify_after_secs: u32,
+    /// Whether a shell pane rewrites structured (JSON) log lines for a person to read.
+    ///
+    /// On, because the state it replaces is a wall of braces nobody can skim and the
+    /// detection refuses anything it is not sure of (`cide_core::jsonlog` carries the gate,
+    /// and its negative corpus is the real specification). Off is a real answer, though, and
+    /// this is why it is a setting rather than a constant: the rewrite happens *upstream of
+    /// the screen mirror*, so a rendered line's original JSON is not in the scrollback and
+    /// cannot be copied back out. Somebody who pastes log lines into a ticket wants the
+    /// bytes, not the rendering.
+    ///
+    /// Never applies to a Claude pane — see `cmd::session`, where it is installed — and a
+    /// change reaches running shells immediately rather than at the next spawn.
+    ///
+    /// `#[serde(default = "…")]` for [`TerminalSettings::job_notify_after_secs`]'s reason,
+    /// one field up.
+    #[serde(default = "default_json_logs")]
+    pub json_logs: bool,
+}
+
+/// `serde(default)` for [`TerminalSettings::json_logs`]: on.
+fn default_json_logs() -> bool {
+    true
 }
 
 /// `serde(default)` for [`TerminalSettings::job_notify_after_secs`]: two minutes.
@@ -599,6 +621,7 @@ impl Default for TerminalSettings {
             scrollback: 5_000,
             renderer: TerminalRenderer::default(),
             job_notify_after_secs: default_job_notify_after_secs(),
+            json_logs: default_json_logs(),
         }
     }
 }

@@ -105,6 +105,7 @@ import { noteRepoRoots, repoRoot, touchesFile } from '@/sidebar/GitPanel/repoRoo
 // about whether an index-only burst counts. See the `onFsChanged` subscription below.
 import { gitRefsMoved } from '@/gitlog/logModel'
 import { blameFor, blameRefusal, type BlameLookup } from './diffBlame'
+import { explain, kindOf } from '@/chrome/branchModel'
 import {
   columnRows,
   hunkSegments,
@@ -1178,7 +1179,9 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
           ) : (
             <>
               <div>Nothing to show on this side.</div>
-              <div className={styles.noticeWhy}>{reason}</div>
+              <div className={styles.noticeWhy} data-audit="gitDiffWhy">
+                {reason}
+              </div>
             </>
           )}
         </div>
@@ -2008,12 +2011,14 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
         // faults: a file added in this diff is `NotTracked` at HEAD, and a generated one is
         // `FileTooLarge`. The toggle stays pressed, as the editor's does, so the note explains a
         // state the user asked for instead of a button that undid itself.
-        const detail =
-          typeof e === 'object' && e !== null && 'detail' in e
-            ? String((e as { detail: unknown }).detail)
-            : e instanceof Error
-              ? e.message
-              : String(e)
+        //
+        // This *knew* about the tagged shape and still printed `[object Object]`, which is why
+        // it is now `explain` rather than a second hand-rolled unwrap: it reached for `detail`
+        // and stringified it, and `detail` is itself an object — `{path}` for `notTracked`,
+        // `{path, bytes, limit}` for `fileTooLarge`. Both of those are exactly the cases this
+        // comment says are the common ones, so the one refusal a reader was likely to meet was
+        // the one it could not describe.
+        const detail = explain(e)
         setNote(`No blame for this file — ${detail}`)
         void diag.log(`git diff pane: blame ${path} failed: ${detail}`)
       })
@@ -2069,20 +2074,96 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
           // scroll nobody asked for is worse than a stepper that starts again.
           setCurrentChange(-1)
         }
+        /*
+         * A diff **opens on its first change**, and only on the way in. (M31)
+         *
+         * > *"when opening diff - it should point to line where first diff exists, currently
+         * > diff always starts from 1 line."*
+         *
+         * Nothing scrolled before, by omission rather than by decision: `currentChange` starts
+         * at `-1` ("nothing walked yet"), and the scroll effect in the view bails on a null
+         * anchor, so every diff opened at the top of the file and the reader either scrolled
+         * or pressed the stepper to get to the point. `changeAnchors` skips `shared` runs, so
+         * `anchors[0]` *is* the first real difference, and the effect already centres it.
+         *
+         * `revRef.current === null` is the discriminator and it is the exact one: this is a
+         * first fetch for this pane, so there is no reading position to preserve. That is what
+         * separates it from the refetch a few lines up, whose comment argues — correctly, and
+         * this must not undo it — that moving the reader after the file changed underneath
+         * them is worse than leaving the stepper where it was. Opening and being interrupted
+         * are opposite cases and they now get opposite answers.
+         *
+         * Safe when there is nothing to jump to: the view clamps with
+         * `Math.min(currentChange, anchors.length - 1)`, so a diff with no anchors clamps
+         * straight back to `-1` and nothing scrolls.
+         */
+        if (revRef.current === null) setCurrentChange(0)
+        /*
+         * Whether this answer is a *different diff* from the one already on screen. (M31)
+         *
+         * Computed before `revRef` is advanced, and it is the condition the collapse below
+         * needs. Most fetches are not a new diff at all: `bump` re-reads on every git mutation
+         * in the project, so staging a neighbouring file, or committing one, re-fetches this
+         * pane and gets back the identical bytes.
+         */
+        const moved = revRef.current !== fresh.rev
         revRef.current = fresh.rev
-        // The collapse-by-default guard is the *fallback's*; the whole-file view bounds its
-        // rows by folding gaps instead, and pre-collapsed hunks there would fight it.
-        if (wholeFileSegments(fresh.hunks, fresh.newText) === null) {
+        /*
+         * The collapse-by-default guard is the *fallback's*; the whole-file view bounds its
+         * rows by folding gaps instead, and pre-collapsed hunks there would fight it.
+         *
+         * Gated on `moved`, which it was not before, and the ungated version had two faults
+         * that shared one cause — it ran on *every* fetch, including the many that bring back
+         * a byte-identical diff:
+         *
+         *   * **It re-collapsed hunks the reader had opened.** On any diff past
+         *     `COLLAPSE_ABOVE`, expanding a hunk and then staging anything else in the project
+         *     folded it up again, with no gesture in between that could explain it.
+         *   * **It cost a full re-measure each time.** `new Set(...)` is a fresh identity even
+         *     when it holds the same numbers, so `collapsed` changed, `model` was recomputed,
+         *     and the three geometry effects re-ran — each walking every row in both columns
+         *     reading `offsetTop`, which is a forced synchronous layout over thousands of
+         *     nodes. That is a real part of *"cide starts to lag"* while committing with a
+         *     large diff open, and nothing about it was visible on screen.
+         *
+         * A diff that genuinely moved still collapses, which is the behaviour this is for: the
+         * hunk indices are new, so what the reader had opened is not addressable any more —
+         * the same argument `expandedGaps` is cleared under, a few lines up.
+         */
+        if (moved && wholeFileSegments(fresh.hunks, fresh.newText) === null) {
           const rows = fresh.hunks.reduce((n, hunk) => n + hunk.lines.length, 0)
           if (rows > COLLAPSE_ABOVE) setCollapsed(new Set(fresh.hunks.map((h) => h.index)))
         }
       })
       .catch((e: unknown) => {
         if (disposed) return
-        const detail = e instanceof Error ? e.message : String(e)
-        // `NoSuchChange` is the ordinary end of a diff's life: the change was committed,
-        // reverted or staged away. Not a dialog — the side simply has nothing to show, and
-        // the switcher above is still there to look at another one.
+        /*
+         * The refusal, as a sentence. (M31)
+         *
+         * This read `e instanceof Error ? e.message : String(e)` and printed **`[object
+         * Object]`** on the commonest path there is. A `GitError` is a tagged enum on the wire
+         * — `#[serde(tag = "kind", content = "detail")]` — so a rejection is a plain object
+         * with no `message`, and `String()` of one says nothing at all. `client.ts` names this
+         * exact hazard and `chrome/branchModel.ts::explain` is the sanctioned answer; this file
+         * had simply never used it. What the reader saw after committing a file whose diff was
+         * open was a notice headed *"Nothing to show on this side."* over `[object Object]`,
+         * and the `diag.log` line beside it recorded the same non-answer.
+         *
+         * `noSuchChange` is then special-cased, because `explain`'s wording for it is written
+         * for the *staging* caller — "it changed again while that was in flight. Refresh and
+         * try once more" — which is a sentence about a race, and describes a failure. Here it
+         * is not a failure and there is nothing to retry: the file genuinely has nothing left
+         * on this side, and by far the likeliest reason is that the reader just committed it.
+         * The pane knows which of the two it is and `explain` cannot, so the context supplies
+         * the sentence and the tag stays shared.
+         */
+        const detail =
+          kindOf(e) === 'noSuchChange'
+            ? `${path} has no changes on this side any more — it may have just been committed.`
+            : explain(e)
+        // The ordinary end of a diff's life: the change was committed, reverted or staged
+        // away. Not a dialog — the side simply has nothing to show, and the switcher above is
+        // still there to look at another one.
         setDiff(null)
         setReason(detail)
         void diag.log(`git diff pane: ${path} on ${side} failed: ${detail}`)
@@ -2231,6 +2312,10 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
     // Positions do not transfer between sides; see the module comment.
     setMarks(new Set<string>())
     setNote(null)
+    // Clearing this also re-arms the open-on-first-change seed in the fetch above, and that is
+    // wanted rather than incidental: picking the other side is a request to read a diff the
+    // reader has not seen, so it lands on its first change exactly as opening one does. The
+    // stepper's position would not transfer anyway — the two sides have different anchors.
     revRef.current = null
     setSide(next)
   }, [])
@@ -2243,7 +2328,10 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
       setMarks(new Set<string>())
       setNonce((n) => n + 1)
     } catch (e: unknown) {
-      const detail = e instanceof Error ? e.message : String(e)
+      // `explain`, not `String(e)`: every refusal here is a tagged `GitError`, so the old
+      // spelling turned the two sentences below into `[object Object]` — and these are the two
+      // that most need reading, because they are about work that was *not* applied.
+      const detail = explain(e)
       // Every refusal lands here, and the two that matter read plainly: `staleSelection`
       // means the file moved and *nothing was applied*; `partialRefused` means this file can
       // only go through the index whole.
@@ -2423,6 +2511,15 @@ export function RevisionDiffPane({
   const [expandedGaps, setExpandedGaps] = useState<ReadonlySet<number>>(() => new Set<number>())
   /** Which change the iterator is on, or `-1` for none yet. See `GitDiffViewCommon`. */
   const [currentChange, setCurrentChange] = useState(-1)
+  /**
+   * Whether this pane has ever had a diff in it.
+   *
+   * `GitDiff` gets this fact for free from `revRef`, which it keeps for the staleness check;
+   * this arm has no such ref because two revisions diff to the same bytes for ever and there
+   * is nothing here to go stale. So the one bit is kept on its own: it is what tells opening
+   * the pane apart from refetching it, and those two want opposite scroll behaviour.
+   */
+  const openedRef = useRef(false)
   /** Bumped to re-run the fetch. Only a moving side can bump it — see the module note above. */
   const [nonce, setNonce] = useState(0)
   /** One line under the header. On this arm it only ever carries a blame refusal. */
@@ -2446,8 +2543,12 @@ export function RevisionDiffPane({
         setDiff(fresh)
         setReason(null)
         setExpandedGaps(new Set<number>())
-        // The walk too: change 3 of the new diff is not the edit the reader was on.
-        setCurrentChange(-1)
+        // The walk: on the way *in* it lands on the first change, for the reason `GitDiff`'s
+        // fetch states at length — a diff that opens at line 1 makes the reader hunt for the
+        // point of it. On a refetch it goes back to "nothing current" instead, because change
+        // 3 of the new diff is not the edit the reader was on.
+        setCurrentChange(openedRef.current ? -1 : 0)
+        openedRef.current = true
         // Fallback only, as in `GitDiff`: the whole-file view folds gaps instead.
         if (wholeFileSegments(fresh.hunks, fresh.newText) === null) {
           const rows = fresh.hunks.reduce((n, hunk) => n + hunk.lines.length, 0)
@@ -2456,7 +2557,12 @@ export function RevisionDiffPane({
       })
       .catch((e: unknown) => {
         if (disposed) return
-        const detail = e instanceof Error ? e.message : String(e)
+        // `explain` for the same reason `GitDiff`'s fetch gives at length: a `GitError` has no
+        // `message`, so this printed `[object Object]` under the notice. No `noSuchChange`
+        // special case here — on a *revision* diff that tag means the commit did not touch the
+        // path, which is a statement about history rather than about something the reader just
+        // did, and `explain`'s wording is right for it.
+        const detail = explain(e)
         // The ordinary ends of a revision diff's life: the file did not exist at one of the
         // revisions, or the oid no longer resolves because the branch was rebased under the
         // tab. Not a dialog — the pane says what it knows and stays put.
@@ -2557,12 +2663,10 @@ export function RevisionDiffPane({
       .catch((e: unknown) => {
         if (disposed) return
         setBlameFile(null)
-        const detail =
-          typeof e === 'object' && e !== null && 'detail' in e
-            ? String((e as { detail: unknown }).detail)
-            : e instanceof Error
-              ? e.message
-              : String(e)
+        // The same unwrap-that-did-not-unwrap as the working-tree arm above: `detail` is an
+        // object for every refusal this can actually get, so stringifying it printed
+        // `[object Object]`.
+        const detail = explain(e)
         setNote(`No blame for this file — ${detail}`)
         void diag.log(`revision diff pane: blame ${path} failed: ${detail}`)
       })

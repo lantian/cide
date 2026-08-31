@@ -3349,11 +3349,15 @@ try {
      * that much — and every line number shifts left the moment a file gains its first diagnostic.
      */
     ok(
-      /\.cm-gutters\)[^}]*min-width:\s*calc\(70px \+ var\(--fold-col\)\)/.test(css),
-      'the gutter reserves room for the marker — 70px for the numbers plus the lint column, and '
-        + 'since M19 the fold column on top of it. `.cm-lineNumbers` is `flex: 1` of this '
-        + 'reservation, so a gutter added beside it takes its width OUT of the numbers\' share '
-        + 'and every line number shifts left the moment the new column appears',
+      /\.cm-gutters\)[^}]*min-width:\s*calc\(70px \+ var\(--fold-col\) \+ var\(--change-col\)\)/.test(
+        css,
+      ),
+      'the gutter reserves room for the marker — 70px for the numbers plus the lint column, '
+        + 'since M19 the fold column on top of it, and since M35 the change column too. '
+        + '`.cm-lineNumbers` is `flex: 1` of this reservation, so a gutter added beside it takes '
+        + 'its width OUT of the numbers\' share and every line number shifts left the moment the '
+        + 'new column appears — which for the change column is the moment somebody types their '
+        + 'first character into a clean file',
     )
     ok(
       /--fold-col:\s*2ch/.test(css) && /\.cm-foldGutter\)[^}]*width:\s*var\(--fold-col\)/.test(css),
@@ -3362,11 +3366,12 @@ try {
         + 'reasoning the blame column\'s `22ch` is written with',
     )
     ok(
-      /\.cm-gutters:has\(\.cm-blame\)\)[^}]*min-width:\s*calc\(70px \+ var\(--fold-col\) \+ 22ch/.test(
+      /\.cm-gutters:has\(\.cm-blame\)\)[^}]*min-width:\s*calc\(70px \+ var\(--fold-col\) \+ var\(--change-col\) \+ 22ch/.test(
         css,
       ),
-      '…and the annotated reservation carries it too, or turning blame on in a folded buffer '
-        + 'takes the fold column back out of the numbers',
+      '…and the annotated reservation carries BOTH of them too, or turning blame on in a folded '
+        + 'buffer takes the fold column — or, since M35, the change column — back out of the '
+        + 'numbers',
     )
     ok(/\.cm-lint-marker\)[^}]*width:\s*14px/.test(css), 'and the marker is a fixed 14px')
     ok(

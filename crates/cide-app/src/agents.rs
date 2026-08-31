@@ -2555,7 +2555,7 @@ impl AgentRegistry {
         run: RunId,
         session: SessionId,
         capture: fn(&str) -> Option<String>,
-        render: fn(&str) -> Option<String>,
+        render: fn(&str) -> cide_pty::Rendered,
     ) -> cide_pty::LineRender {
         let registry = Arc::clone(self);
         let app = app.cloned();
@@ -2568,7 +2568,7 @@ impl AgentRegistry {
             run_logs_dir().join(format!("{run}.log")),
             RUN_LOG_CAP,
         ));
-        cide_pty::LineRender(Arc::new(move |line: &str| {
+        cide_pty::LineRender::new(Arc::new(move |line: &str| {
             log.lock().append(line);
             if !captured.load(Ordering::Acquire)
                 && let Some(harness_session) = capture(line)
@@ -4347,8 +4347,8 @@ mod tests {
     /// harness, and writes the answer down once.
     /// A pass-through display for [`AgentRegistry::stream_hook`] in tests: what is under test
     /// is the raw channel, and the real renderer has tests of its own in `cide-agents`.
-    fn test_render(line: &str) -> Option<String> {
-        Some(line.to_string())
+    fn test_render(_line: &str) -> cide_pty::Rendered {
+        cide_pty::Rendered::Keep
     }
 
     fn test_capture(line: &str) -> Option<String> {

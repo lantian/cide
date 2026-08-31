@@ -255,8 +255,10 @@ pub fn pull_with(
         .or_else(|| fallback.strategy());
 
     let Some(strategy) = strategy else {
-        let (incoming, more_incoming) = taken_commits(&repo, remote_oid, local_oid, behind as u32)?;
-        let (local, more_local) = taken_commits(&repo, local_oid, remote_oid, ahead as u32)?;
+        let (incoming, more_incoming) =
+            taken_commits(&repo, remote_oid, local_oid, behind as u32, PULL_COMMIT_CAP)?;
+        let (local, more_local) =
+            taken_commits(&repo, local_oid, remote_oid, ahead as u32, PULL_COMMIT_CAP)?;
         return Err(GitError::PullNeedsStrategy(Box::new(Divergence {
             branch: head.head,
             remote: remote_name,
@@ -496,27 +498,40 @@ pub(crate) fn taken_commits(
     tip: Oid,
     hidden: Oid,
     total: u32,
+    cap: usize,
 ) -> Result<(Vec<PulledCommit>, u32)> {
     let mut walk = repo.revwalk().wrap()?;
     walk.push(tip).wrap()?;
     walk.hide(hidden).wrap()?;
 
     let mut commits = Vec::new();
-    for oid in walk.take(PULL_COMMIT_CAP) {
+    for oid in walk.take(cap) {
         let oid = oid.wrap()?;
         let commit = repo.find_commit(oid).wrap()?;
-        // Both refuse non-UTF-8 bytes rather than mangling them, and an empty string is the
-        // honest rendering of that: the alternative is mojibake in a toast, and the short oid
-        // beside it is still enough to run `git show`.
-        let author = commit.author();
-        commits.push(PulledCommit {
-            short_oid: short_oid(oid),
-            summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
-            author: author.name().unwrap_or("").to_string(),
-        });
+        commits.push(summarise(&commit));
     }
     let more = total.saturating_sub(commits.len() as u32);
     Ok((commits, more))
+}
+
+/// One commit as the three lines a chooser shows.
+///
+/// `pub(crate)` because [`crate::push::preview`] lists a set this walk cannot produce — the
+/// commits no branch of a remote has, which is a revwalk with many `hide`s and no second
+/// endpoint to measure a total against — and the two lists appear side by side in the same
+/// dialogs. Two copies of "how do you render a commit into three fields" is how one of them
+/// quietly starts showing an email where the other shows a name.
+///
+/// Both accessors refuse non-UTF-8 bytes rather than mangling them, and an empty string is the
+/// honest rendering of that: the alternative is mojibake in a toast, and the short oid beside it
+/// is still enough to run `git show`.
+pub(crate) fn summarise(commit: &git2::Commit<'_>) -> PulledCommit {
+    let author = commit.author();
+    PulledCommit {
+        short_oid: short_oid(commit.id()),
+        summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
+        author: author.name().unwrap_or("").to_string(),
+    }
 }
 
 /// Eight hex digits, the width every other short oid in this crate uses.
@@ -836,7 +851,7 @@ fn integrated(
         .and_then(|b| b.upstream().ok())
         .and_then(|u| u.get().target())
         .unwrap_or(new);
-    let (commits, more_commits) = taken_commits(repo, upstream_tip, old, behind)?;
+    let (commits, more_commits) = taken_commits(repo, upstream_tip, old, behind, PULL_COMMIT_CAP)?;
     Ok(Integrated {
         old_oid: old,
         new_oid: new,

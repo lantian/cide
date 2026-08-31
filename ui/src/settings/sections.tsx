@@ -637,6 +637,15 @@ function Terminal({ settings, patch }: SectionProps) {
         />
       </Group>
 
+      <Group title="Output">
+        <ToggleRow
+          label="Render JSON log lines"
+          hint="A shell pane that prints structured logs — one JSON object per line — shows them as time, level, message and fields instead of raw braces. Only lines that carry two of those three are touched; a minified file or a jq result prints exactly as it always did. The rendering replaces the line in the scrollback, so turn this off when you need to copy the original JSON back out."
+          checked={terminal.jsonLogs}
+          onChange={(jsonLogs) => set({ jsonLogs })}
+        />
+      </Group>
+
       <Group title="Notifications">
         <Row
           label="Announce a job after (seconds)"

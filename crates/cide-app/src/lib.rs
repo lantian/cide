@@ -40,6 +40,7 @@ pub mod hooks;
 pub mod ide;
 pub mod libraries;
 pub mod lifecycle;
+pub mod logring;
 pub mod lsp;
 pub mod notes;
 pub mod positions_state;
@@ -201,6 +202,21 @@ fn log_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 /// to notice. This makes it stop the build instead.
 #[deny(unused_variables)]
 pub fn run() {
+    // **Ask the user's login shell what it thinks `PATH` is, now, in the background.**
+    //
+    // First line of the launch and off the main thread, because the answer is wanted by the
+    // first child cide forks and the question can take seconds — an interactive rc file is
+    // arbitrary code. `cide_core::login_path` carries the whole argument: what a desktop launch
+    // inherits instead, why no static list can name a directory that exists only inside a
+    // `~/.zshrc`, the deadline, and the marker protocol that stops a chatty rc file
+    // contributing its banner as a directory.
+    //
+    // This is the **only** call to `warm` in the workspace, and that is the design: every other
+    // binary here — `cide-headless`, `cide-hook`, every test — never starts a probe, so
+    // `login_path::dirs` answers empty immediately for them and their children's `PATH` is
+    // composed exactly as it was before M35.
+    cide_core::login_path::warm();
+
     // The audit compares against a mock stated at 1440x900, and this plugin restores
     // whatever size the window was last left at — quietly measuring some other viewport and
     // still reporting PASS. A diagnostic run starts from the stated geometry instead.
@@ -276,6 +292,8 @@ pub fn run() {
     };
 
     builder = builder.manage(SessionRegistry::default());
+    // The raw text behind rendered log lines, one bounded ring per session. See `logring`.
+    builder = builder.manage(std::sync::Arc::new(logring::JsonLogRing::default()));
     // Empty until a project asks to be indexed; managed from the start so that a `fs.*`
     // command arriving before any `fs.index` answers `NoIndex` rather than failing to
     // resolve its state.
@@ -403,6 +421,7 @@ pub fn run() {
             cmd::git::git_rollback,
             cmd::git::git_commit,
             cmd::git::git_push,
+            cmd::git::git_push_plan,
             cmd::git::git_adopt_index,
             cmd::git::git_set_use_staging_area,
             cmd::git::git_changelist_create,
@@ -489,6 +508,7 @@ pub fn run() {
             cmd::session::session_has_exited,
             cmd::session::session_list,
             cmd::session::session_kill,
+            cmd::session::session_log_detail,
             cmd::session::session_resumable,
             cmd::settings::settings_get,
             cmd::settings::settings_set,
@@ -531,6 +551,7 @@ pub fn run() {
             cmd::fs::fs_write_file,
             cmd::fs::fs_create,
             cmd::fs::fs_create_in,
+            cmd::fs::fs_paste_image,
             cmd::fs::fs_scratch_new,
             cmd::fs::fs_notes_ensure,
             cmd::fs::fs_writable_roots,
@@ -618,6 +639,7 @@ pub fn run() {
             cmd::ext::ext_install,
             cmd::ext::ext_uninstall,
             cmd::ext::ext_set_enabled,
+            cmd::ext::ext_set_rail_icon,
             cmd::ext::ext_set_setting,
             cmd::ext::ext_publish_diagnostics,
             cmd::ext::ext_page,
@@ -698,6 +720,15 @@ pub fn run() {
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());
+
+            // Before any pane can spawn a shell. The renderer's flag defaults to on, so
+            // without this a profile that had turned it off would render the first lines of
+            // every shell it opened before the user next touched the settings form — the
+            // one write `settings_set` cannot do, because it only ever sees a change.
+            lifecycle::set_json_logs(
+                app.state::<WorkspaceState>()
+                    .with(|ws| ws.settings.terminal.json_logs),
+            );
 
             // Warm the `claude --version` cache off the main thread, against the binary the
             // restored workspace names, so the first window's bootstrap is a lookup rather

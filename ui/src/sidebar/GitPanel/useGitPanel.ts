@@ -62,8 +62,9 @@ import {
   type RepoId,
 } from '@/ipc/client'
 import { noteChangeCount } from '@/chrome/gitCountStore'
-import { explain, pushReport, type RepoPush } from '@/chrome/branchModel'
+import { explain } from '@/chrome/branchModel'
 import { notify } from '@/chrome/notices'
+import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { requestFocus } from '@/chrome/focusRequests'
 import {
@@ -95,7 +96,6 @@ import {
   changelistsOf,
   commitUnits,
   defaultExpanded,
-  defaultSelection,
   findChangelistId,
   flatFiles,
   groupOf,
@@ -166,6 +166,40 @@ const EMPTY: StatusView = { repos: [] }
  */
 const lastStatus = new Map<ProjectId, StatusView>()
 const lastMerges = new Map<ProjectId, Record<string, MergeState>>()
+
+/**
+ * The ticks each project's panel last held, per window. (M31)
+ *
+ * Module scope for the same reason the two maps above are, and it fixes a bug they made
+ * possible. The panel unmounts on every rail switch, so `selected` — a plain `useState` — was
+ * re-seeded from scratch on every remount while the *tree* beside it was served from cache.
+ * Glancing at Files and coming back therefore threw away a commit the user had spent a dozen
+ * clicks assembling, and before the ticks became opt-in it did something worse: the re-seed
+ * ran `defaultSelection`, so everything the user had unticked came **back**, and the next
+ * Commit swept it all in. That is the report this exists for —
+ *
+ * > *"git tree commits everything when commiting, but it should commit only selected files."*
+ *
+ * — and it is worth being exact that opt-in ticks alone would not have fixed it. They change
+ * which way the loss goes (a silently *emptied* selection rather than a silently refilled
+ * one), not whether a rail switch loses it. Both halves are needed.
+ *
+ * Not persisted to disk, deliberately, and per window for the reason `lastStatus` is: a
+ * selection is a sentence about a commit somebody is composing *now*. Surviving a rail switch
+ * is the whole requirement; surviving a restart would resurrect a half-built commit against a
+ * tree that has since moved.
+ */
+const lastTicks = new Map<ProjectId, ReadonlySet<string>>()
+
+/**
+ * The empty tick set, as one instance.
+ *
+ * A fresh `new Set()` in the `useState` initializer would be a new identity on every mount,
+ * which `picked`/`carried` and every memo downstream of them would then have to re-derive for
+ * a panel that is showing nothing. One frozen-by-convention value, the same shape
+ * `GitDiffPane`'s `NO_MARKS` uses and for the same reason.
+ */
+const EMPTY_TICKS: ReadonlySet<string> = new Set<string>()
 
 /**
  * The repository's name, or `''` when there is only one and naming it would be noise.
@@ -575,7 +609,20 @@ export function useGitPanel(
 
   const [view, setView] = useState<StatusView>(initial)
   const [shelf, setShelf] = useState<readonly ShelfRow[]>(() => story?.shelf ?? [])
-  const [selected, setSelected] = useState<ReadonlySet<string>>(() => defaultSelection(initial))
+  /*
+   * Nothing ticked, unless this window was already holding ticks for this project.
+   *
+   * `initial` is deliberately not consulted: there is no default any more (see
+   * `model.ts`, where `defaultSelection` used to be), so the only thing that can put a tick
+   * here is the user, and the only reason to start non-empty is that they already did it and
+   * the panel merely unmounted underneath them. A story window starts empty whatever the
+   * cache holds — a fixture must not inherit a live window's half-composed commit.
+   */
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => {
+    // A story names its own ticks — it is a panel somebody has already been working in.
+    if (story !== null) return story.ticks.length === 0 ? EMPTY_TICKS : new Set(story.ticks)
+    return (project !== null ? lastTicks.get(project) : undefined) ?? EMPTY_TICKS
+  })
   /*
    * The row selection and the cursor, both empty to begin with.
    *
@@ -614,9 +661,24 @@ export function useGitPanel(
   const [answered, setAnswered] = useState<ReadonlySet<RepoId>>(new Set())
   /** Repos where the answer was "overwrite": the next commit is sent with `force: true`. */
   const overwritten = useRef<Set<RepoId>>(new Set())
-  /** What the previous payload contained, so genuinely new rows can be treated as new. */
-  const seenFiles = useRef<Set<string>>(new Set(allFiles(initial)))
+  /** Which groups the previous payload contained, so genuinely new ones can be opened. */
   const seenGroups = useRef<Set<string>>(allGroups(initial))
+
+  /*
+   * The other half of `lastTicks`: hand the selection to the cache whenever it moves.
+   *
+   * An effect rather than a write inside every `setSelected` caller, because there are a dozen
+   * of them — toggle, Space, the changelist moves, the guard bar's Reload, the post-commit
+   * clear — and a cache updated at twelve call sites is a cache that is stale at the
+   * thirteenth. This runs after the render that changed the value, so what is cached is always
+   * what was last drawn.
+   *
+   * A story window writes nothing: its ticks are a fixture's, and leaking them into the cache
+   * would hand them to the next real panel that opens on this project.
+   */
+  useEffect(() => {
+    if (story === null && project !== null) lastTicks.set(project, selected)
+  }, [story, project, selected])
 
   const rows = useMemo(() => buildRows(view, expanded), [view, expanded])
   const picked = useMemo(() => selectedFiles(view, selected), [view, selected])
@@ -784,15 +846,34 @@ export function useGitPanel(
     // after the assignments below — and found every id already seen. Nothing was ever ticked
     // and no group was ever opened: the panel painted its rows and then sat there with every
     // changelist shut and Commit disabled. See `model.ts::arrivals`.
-    const fresh = arrivals(next, seenFiles.current, seenGroups.current)
+    const fresh = arrivals(next, seenGroups.current)
     const groups = allGroups(next)
-    seenFiles.current = new Set(live)
     seenGroups.current = groups
-    setSelected((prev) => {
-      const kept = pruneSelection(live, prev)
-      for (const id of fresh.files) kept.add(id)
-      return kept
-    })
+    /*
+     * The ticks are pruned only against a payload that is evidence. (M31)
+     *
+     * This used to run unconditionally, and that was the bug. `refresh` adopts `EMPTY` with
+     * `authoritative: false` whenever the status walk fails or there is no project — an
+     * index.lock held by a bash pane or by an agent is enough — and `pruneSelection([], prev)`
+     * reads that as *every file is gone* and returns an empty set. The user's ticks were wiped
+     * by a transient failure they never saw, and before the ticks became opt-in the next good
+     * payload then re-ticked the whole active changelist through `arrivals`, so the visible
+     * symptom was the opposite of the cause: **files the user had unticked came back**.
+     *
+     * The guard is the same one `pruneTo` above and `pruneRowSelection` below already carry,
+     * and the asymmetry between them was the whole defect — three pieces of user state pruned
+     * against one payload, two of them protected. There is no reading of "the walk failed"
+     * under which the third should have been the exception.
+     */
+    if (authoritative) {
+      setSelected((prev) => {
+        const kept = pruneSelection(live, prev)
+        // Identity is the bailout, exactly as it is for `setExpanded` below: this runs on
+        // every payload while an agent edits, and a fresh Set each time re-renders every row
+        // for a refresh that changed nothing.
+        return kept.size === prev.size ? prev : kept
+      })
+    }
     /*
      * The row selection is pruned and never *added* to, which is the difference between it and
      * the ticks one line up. A file that arrives in the active changelist is ticked, because a
@@ -1292,11 +1373,9 @@ export function useGitPanel(
       void (async () => {
         setBusy(push ? 'Committing and pushing…' : 'Committing…')
         let allOk = true
-        // Collected across the whole gesture and reported **once** at the end. Never one toast
-        // per unit: `notices.admit` dedupes by text, so two units both answering "already up to
-        // date on origin" would collapse into one toast that silently spoke for two. Same
-        // argument, same shape, as `branchModel::pullReport`.
-        const pushes: RepoPush[] = []
+        // Which repositories committed, for the push dialog raised at the end of the gesture.
+        // Ids and not outcomes: since M31 this function does not push, it *offers* to.
+        const committed: RepoId[] = []
         for (const unit of units) {
           /*
            * An unanswered guard bar stops the commit here rather than at the backend.
@@ -1357,46 +1436,9 @@ export function useGitPanel(
             allOk = false
             break
           }
-          if (push) {
-            /*
-             * `setUpstream` is the branch's own answer, not a hardcoded `false`. (M20)
-             *
-             * It was `false` here and `head.upstream === null` in the branch popup, so
-             * *Commit and Push* on a brand-new branch failed — *"no upstream"* — where the
-             * popup's Push button on the same branch succeeded. Two gestures that mean
-             * "publish this" cannot disagree about whether they do.
-             */
-            const publish = (repoOf(view, unit.repo)?.branch.upstream ?? null) === null
-            /*
-             * Caught here rather than through `guarded`, so a refused push gets a **toast** as
-             * well as the panel's note line.
-             *
-             * The note bar is the right surface for a refusal about the *commit* — it sits
-             * beside the message box the user is still holding, and it stays put while they fix
-             * it. A push is not that. It is a network round trip about work they are trying to
-             * publish, its commonest refusal is *somebody else pushed first*, and it happens
-             * seconds after a commit that succeeded — so the panel is very likely not the thing
-             * being looked at. Reporting it in one dim line meant *Commit and Push* said nothing
-             * while the palette's Push, on the same rejection, put a red box on screen: two
-             * routes to one gesture disagreeing about whether it worked.
-             */
-            let ok: Awaited<ReturnType<typeof gitApi.push>> | undefined
-            try {
-              ok = await gitApi.push(project, unit.repo, null, null, publish)
-              note('git push', null)
-            } catch (error) {
-              const detail = explain(error)
-              note('git push', `git push unavailable — ${detail}`)
-              notify(detail, {
-                kind: 'error',
-                hint: 'The commit landed; only the push was refused.',
-              })
-              void diag.log(`git panel: git push failed: ${detail}`)
-              allOk = false
-              break
-            }
-            pushes.push({ name: repoOf(view, unit.repo)?.name ?? unit.repo, outcome: ok })
-          }
+          // Which repositories the push half is about. Collected rather than pushed here — see
+          // below the loop.
+          if (push) committed.push(unit.repo)
           overwritten.current.delete(unit.repo)
         }
         setBusy(null)
@@ -1411,20 +1453,27 @@ export function useGitPanel(
           // about a commit the user has forgotten asking about.
           setAmendOf(null)
         }
-        /*
-         * The successes, which had no surface at all until now.
-         *
-         * `guarded` keeps the *refusals*, and that split is deliberate: the panel's one-line
-         * note bar is the right place for "this did not happen and here is why" — it stays put
-         * while the user fixes it — and its `undefined` return is what breaks the loop. A
-         * success is the opposite kind of thing: transient, and about a remote the panel does
-         * not otherwise draw.
-         */
-        if (pushes.length > 0) {
-          const report = pushReport(pushes)
-          notify(report.text, { kind: 'ok', detail: report.detail })
-        }
         await refresh()
+        /*
+         * The push half, which is now a **dialog** rather than a send. (M31)
+         *
+         * `CommitBox`'s button has always said *Commit and Push…* and the comment beside it has
+         * always said the ellipsis is load-bearing — *this opens something rather than acting at
+         * once*. It opened nothing. Now it opens the same dialog the palette and the branch popup
+         * raise, over the repositories that just committed, so one gesture has one meaning
+         * everywhere and nothing leaves the machine before somebody has read what would.
+         *
+         * Only after `refresh()`, and only when the commits landed: a dialog listing commits over
+         * a panel that still shows them as uncommitted is two answers to one question, and
+         * offering to push work that failed to commit is offering to push nothing.
+         *
+         * Reporting moves with it. `pushRun`'s `pushPass` toasts the aggregate on success and
+         * turns a rejection into a sentence through `Failures.tsx`, which is exactly what the
+         * inline push here was doing by hand; the extra note-bar line went with it, because the
+         * note bar's whole claim was that it sits beside the message box the user is still
+         * holding, and by then the user is looking at a modal.
+         */
+        if (allOk && committed.length > 0) openPushDialog(project, committed)
       })()
     },
     [project, units, view, diverged, message, amend, amendOf, guarded, note, refresh],
@@ -2110,9 +2159,9 @@ export function useGitPanel(
     (repo: RepoId) => {
       overwritten.current.delete(repo)
       setAnswered((prev) => new Set(prev).add(repo))
-      // "Reload" means git's view wins: forget this repo's ticks and let the next payload
-      // re-apply its defaults, exactly as if the panel had just opened on it.
-      seenFiles.current = new Set([...seenFiles.current].filter((id) => !inRepo(id, repo)))
+      // "Reload" means git's view wins: forget this repo's ticks, exactly as if the panel had
+      // just opened on it. Which is now simply *empty* for that repo — there are no defaults
+      // left to re-apply, so the `seenFiles` bookkeeping this used to reset went with them.
       setSelected((prev) => new Set([...prev].filter((id) => !inRepo(id, repo))))
       void (async () => {
         if (project === null) {

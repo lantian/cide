@@ -563,6 +563,38 @@ pub(crate) fn show_picker(
             dialog.add_filter(any);
         }
 
+        // **A folder picker that cannot make a folder is half a picker**, and GTK3 does not
+        // supply the missing half. Measured on this machine rather than assumed: the
+        // `browse_new_folder_button` in `GtkFileChooserWidget`'s template is `visible = FALSE`
+        // after map for `SELECT_FOLDER`, in *both* header-bar modes, and the
+        // `browse_header_revealer` that holds it is never revealed — GTK3 only ever shows that
+        // button for `SAVE` and `CREATE_FOLDER`. There is no property to flip
+        // (`create-folders` is already `TRUE` and governs something else), so the control has
+        // to come from here.
+        //
+        // macOS and Windows need none of this: `rfd`'s `build_pick_folders` sets
+        // `NSOpenPanel.canCreateDirectories` to true by default, so the other arm of this
+        // function already has a *New Folder* button.
+        //
+        // A row in the chooser's own extra-widget area rather than a second dialog with a name
+        // prompt, and that is not a style preference: `FileChooserNative` is a
+        // `GtkNativeDialog`, not a `GtkWindow`, so nothing here can be made transient *for the
+        // picker* — a prompt could only be parented to the app window underneath it, which on
+        // Wayland is a sibling of the chooser and free to stack below it. The entry is inside
+        // the chooser, so the question does not arise.
+        //
+        // Only for a folder picker. `scheme_import`'s file picker shares this function and has
+        // no business growing a mkdir button.
+        //
+        // The one case where this silently does nothing: a launch with `GTK_USE_PORTAL=1` (or
+        // inside a Flatpak), where `gtk_should_use_portal()` sends `show()` to
+        // org.freedesktop.portal.FileChooser and the extra widget is not forwarded. That is
+        // survivable — the portal's own dialogs (KDE's, GNOME's) all carry a *New Folder*
+        // button — which is why this is not worth refusing over.
+        if spec.folders {
+            dialog.set_extra_widget(&new_folder_row(&dialog));
+        }
+
         /*
          * One reference, held by the handler and released by it.
          *
@@ -590,6 +622,127 @@ pub(crate) fn show_picker(
         dialog.show();
     })
     .map_err(|e| CoreError::Io(format!("{}: {e}", spec.title)))
+}
+
+/// The *New Folder* control [`show_picker`] adds to a folder chooser, as one extra widget.
+///
+/// See the call site for why GTK3 makes this necessary and why it is a row rather than a
+/// prompt. The layout is the one a file manager uses — a name field and a button — packed to
+/// the end so it reads as an action on the folder currently being browsed rather than on the
+/// selection.
+///
+/// Both the button and Enter in the entry do the same thing, because a text field beside a
+/// button that ignores Enter is a field people press Enter in and conclude is broken. The
+/// entry deliberately does **not** set `activates-default`: the chooser's default response is
+/// *Open*, so that would accept the dialog on the folder the user is standing in instead of
+/// creating anything.
+///
+/// Weak references throughout. The chooser owns the extra widget, the extra widget owns these
+/// closures, and a strong clone of the chooser inside one of them is a cycle that leaks a
+/// whole dialog per pick — the same hazard the response handler above takes out by hand.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn new_folder_row(chooser: &gtk::FileChooserNative) -> gtk::Box {
+    // `clone!` expands to paths rooted at a crate named `glib`, which this workspace does not
+    // depend on directly — `gtk` re-exports the one it was built against, and that is the only
+    // one whose types these objects are.
+    use gtk::glib;
+    use gtk::prelude::*;
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("New folder name"));
+    entry.set_width_chars(20);
+    let create = gtk::Button::with_label("Create Folder");
+    // Nothing to create until something is typed, and a button that refuses silently is worse
+    // than one that is visibly not ready yet.
+    create.set_sensitive(false);
+
+    row.pack_end(&create, false, false, 0);
+    row.pack_end(&entry, false, false, 0);
+
+    entry.connect_changed({
+        let create = create.clone();
+        move |entry| create.set_sensitive(!entry.text().trim().is_empty())
+    });
+    create.connect_clicked(glib::clone!(@weak chooser, @weak entry => move |_| {
+        create_folder(&chooser, &entry);
+    }));
+    entry.connect_activate(glib::clone!(@weak chooser => move |entry| {
+        create_folder(&chooser, entry);
+    }));
+
+    row.show_all();
+    row
+}
+
+/// Make the folder the entry names inside the folder the chooser is showing, and go into it.
+///
+/// `current_folder` is the *browsed* directory, not the selection — which is what every file
+/// manager's *New Folder* means, and the only reading that works when nothing is selected.
+///
+/// Navigating into the new folder afterwards is what makes one gesture out of two: for a
+/// `SelectFolder` chooser the browsed directory is also the answer, so *Create Folder* then
+/// *Open* opens the folder that was just made. It also doubles as the confirmation that
+/// anything happened at all.
+///
+/// A failure is reported **on the entry** — an icon and a tooltip — rather than through a
+/// message dialog, for the parenting reason given at the call site, and rather than through a
+/// log line nobody has open. `EEXIST` is by far the likeliest and reads perfectly well there.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn create_folder(chooser: &gtk::FileChooserNative, entry: &gtk::Entry) {
+    use gtk::prelude::*;
+
+    let complain = |message: String| {
+        entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, Some("dialog-error"));
+        entry.set_icon_tooltip_text(gtk::EntryIconPosition::Secondary, Some(&message));
+    };
+    let clear = || {
+        entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, None);
+        entry.set_icon_tooltip_text(gtk::EntryIconPosition::Secondary, None);
+    };
+    clear();
+
+    let name = entry.text().trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    // A separator here would create somewhere the user cannot see from this row, and `.`/`..`
+    // would create nothing while looking like it had. Refused as a name, which is the same
+    // rule `cide_fs::ops::check_name` applies to every other name cide accepts.
+    if name.contains('/') || name == "." || name == ".." {
+        complain(format!("{name} is not a folder name"));
+        return;
+    }
+    let Some(parent) = chooser.current_folder() else {
+        complain("there is no folder to create this in".to_string());
+        return;
+    };
+
+    let path = parent.join(&name);
+    match std::fs::create_dir(&path) {
+        Ok(()) => {
+            entry.set_text("");
+            clear();
+            if !chooser.set_current_folder(&path) {
+                // The folder exists; only the navigation failed. Worth a line because the
+                // gesture then looks like it did nothing.
+                tracing::warn!(path = %path.display(), "created the folder but could not enter it");
+            }
+        }
+        Err(error) => complain(format!("{name}: {error}")),
+    }
 }
 
 /// Windows and macOS, where the plugin parents the dialog itself and `rfd`'s backend honours
