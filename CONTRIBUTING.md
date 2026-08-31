@@ -187,7 +187,11 @@ a tarball cut from one is a false claim about a commit.
 
 Releases are `.github/workflows/release.yml`, dispatched by hand with a version: it cuts
 `release/v<version>` from master, writes that version into the four files that carry it, tags,
-builds every artefact and publishes one release with a `SHA256SUMS`.
+builds every artefact and publishes one release with a `SHA256SUMS`. **Never bump the version by
+hand for a release** — and never bump master *to* the version you are about to release, which
+fails the workflow's one-line-per-file guard with an empty diff. Once the release is published, a
+final `bump` job puts master on `<next patch>-dev` for you; `scripts/bump-version.sh` is the same
+edit by hand, for a minor bump between releases.
 
 ## Conventions
 

@@ -16,6 +16,12 @@
 # one line changed per file"): locally the tree is allowed to be dirty, so a diff-based
 # check would fail on unrelated in-progress work. The python asserts (exactly one match,
 # and the file still parses to the new version) are the safety that transfers.
+#
+# It is not local-only any more: release.yml's `bump` job runs this to put the trunk on
+# the next `-dev` version after a release. That job runs `cargo fetch --locked` first,
+# because both --offline flags below are right for a developer's warm registry and wrong
+# on a cold runner, where they report `no matching package named 'serde' found` — naming
+# a dependency that is not the problem. Keep the flags; the caller warms the cache.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

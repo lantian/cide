@@ -44,6 +44,11 @@ on:
         required: false
         default: false
         type: boolean
+      bump_base:
+        description: "After publishing, bump the base branch to the next -dev version"
+        required: false
+        default: true
+        type: boolean
 
 # One release at a time, and `cancel-in-progress` is deliberately absent — CI cancels a
 # superseded run because its answer is worthless, while a release cancelled between `git push`
@@ -690,3 +695,202 @@ jobs:
             args+=(--prerelease)
           fi
           gh "${args[@]}" dist/*
+
+  # ---------------------------------------------------------------------------------
+  # The trunk's version, after the release. `prepare` writes the release version onto
+  # `release/v<version>`, which nobody merges back — so without this job the trunk keeps
+  # whatever version was last typed into it by hand. It said 0.6.0 while v0.6.1 and
+  # v0.6.2 were published, which means every dev build, every `cide --version` and every
+  # locally packaged artefact named a version two releases old.
+  #
+  # It writes `<next patch>-dev`, and the suffix is load-bearing rather than decoration:
+  # `prepare`'s "exactly one line changed per file" guard reads a numstat of `1 1`, and a
+  # file that already holds the version being released produces no diff at all. Bump the
+  # trunk to a bare `0.6.3` and the next 0.6.3 release fails at that guard with an empty
+  # numstat — a release refused for a reason that reads like a broken regex. `-dev` also
+  # says the true thing about the tree: it is past 0.6.2 and it is not 0.6.3.
+  #
+  # After `publish` rather than inside `prepare`, and that ordering is the whole point of
+  # it being a separate job: a trunk claiming to be past a release that was never
+  # published is the one wrong state available here, and it is exactly what a failed
+  # `linux` or `macos` job would leave behind if the bump ran earlier.
+  #
+  # The push carries `github.token`, so it does NOT start a CI run — GitHub refuses to
+  # trigger workflows from pushes made with that token, which is what keeps this from
+  # being a release that queues a full CI matrix behind itself. The bump's own gates run
+  # here instead, inside scripts/bump-version.sh (`package --check`, `metadata`).
+  # ---------------------------------------------------------------------------------
+  bump:
+    name: bump ${{ inputs.base }} to the next dev version
+    runs-on: ubuntu-24.04
+    needs: [prepare, publish]
+    if: inputs.bump_base
+    steps:
+      # The branch, not the tag: this job's commit belongs on top of whatever the trunk
+      # is now, which may already be several commits past what `prepare` cut from.
+      # fetch-depth: 0 for the same reason `prepare` needs it — `package --check` inside
+      # the script reads the pinned revs and a shallow clone hides the tags.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-bump
+
+      # Skipping is a normal outcome and is reported rather than assumed: somebody who
+      # hand-bumped the trunk to 0.7.0-dev before releasing 0.6.3 meant it, and writing
+      # 0.6.4-dev over that would silently undo a decision. The comparison is on the
+      # (major, minor, patch) triple, so any suffix on either side is ignored for it.
+      - name: Work out the next dev version
+        id: next
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The value on stdout, the reasoning on stderr. Redirecting the whole script into
+          # GITHUB_OUTPUT was the first shape of this and it cannot work: that file is parsed
+          # as `key=value` lines, so an explanatory sentence in it is a step failure about a
+          # format nobody was writing.
+          next=$(python3 - <<'PY'
+          import os, re, sys
+
+          released = os.environ["VERSION"]
+
+          # The trunk's current version, read exactly the way scripts/bump-version.sh and
+          # `prepare` read it — anchored to [workspace.package], because a bare version key
+          # search finds whatever table sorts first.
+          src = open("Cargo.toml", encoding="utf-8").read()
+          m = re.search(r'\[workspace\.package\][^\[]*?\nversion = "([^"]*)"', src, re.S)
+          assert m, "no version key under [workspace.package] in Cargo.toml"
+          current = m.group(1)
+
+          def triple(v):
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", v)
+              assert m, f"{v!r} is not a semver version"
+              return tuple(int(x) for x in m.groups())
+
+          major, minor, patch = triple(released)
+          # A pre-release shipped that triple's *name* without shipping the triple, so
+          # 0.7.0-rc1 leaves the trunk working towards 0.7.0 and not towards 0.7.1.
+          if re.search(r"[-+]", released):
+              nxt = f"{major}.{minor}.{patch}-dev"
+          else:
+              nxt = f"{major}.{minor}.{patch + 1}-dev"
+
+          if current == nxt:
+              print(f"{current} is already the next dev version — nothing to bump", file=sys.stderr)
+              nxt = ""
+          elif triple(current) > (major, minor, patch):
+              print(f"the trunk is already at {current}, past the released {released} — "
+                    f"leaving it alone", file=sys.stderr)
+              nxt = ""
+          else:
+              print(f"bumping the trunk {current} -> {nxt}", file=sys.stderr)
+
+          print(nxt)
+          PY
+          )
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      # `cargo fetch` first, because scripts/bump-version.sh passes --offline to both
+      # `cargo update` and `cargo metadata`. That is right for the local use it was
+      # written for and wrong on a cold runner, where an empty ~/.cargo/registry makes
+      # cargo report `no matching package named 'serde' found` — naming a dependency that
+      # is not the problem. Fetching first is what makes the script's --offline true here
+      # rather than making the script lie about what it needs.
+      - name: Bump every file that carries the version
+        if: steps.next.outputs.next != ''
+        env:
+          NEXT: ${{ steps.next.outputs.next }}
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          scripts/bump-version.sh "$NEXT"
+
+      # The same named-paths guard `prepare` runs, and for the same reason: both edits are
+      # pattern matches over files somebody may have reformatted since. Nothing outside the
+      # six may change. The per-file `1 1` numstat is deliberately NOT repeated — the
+      # trunk's version may have any shape, so a bump from `0.6.0` to `0.6.3-dev` is one
+      # line here as it is there, but Cargo.lock's own diff is not fixed.
+      - name: Refuse anything the bump was not supposed to touch
+        if: steps.next.outputs.next != ''
+        run: |
+          set -euo pipefail
+          expected=$(printf '%s\n' \
+            Cargo.lock \
+            Cargo.toml \
+            crates/cide-app/tauri.conf.json \
+            packaging/flatpak/dev.cide.ide.desktop \
+            packaging/flatpak/dev.cide.ide.metainfo.xml \
+            packaging/flatpak/dev.cide.ide.yml \
+            ui/package.json | sort)
+          actual=$(git diff --name-only | sort)
+          unexpected=$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$expected"))
+          if [ -n "$unexpected" ]; then
+            echo "::error::the dev bump touched files it should not have:" >&2
+            printf '  %s\n' $unexpected >&2
+            git diff -- $unexpected >&2
+            exit 1
+          fi
+          git diff --stat
+
+      # A rejected push is a warning and not a failure, and that is a deliberate trade. The
+      # release is already published by the time this runs, so failing here paints a red X
+      # on a run that shipped everything it promised — and if the trunk is protected against
+      # direct pushes that X is on every release for ever, which is how a red run stops
+      # meaning anything. The warning and the job summary say what was not done and give the
+      # two commands that do it by hand.
+      - name: Commit and push
+        if: steps.next.outputs.next != ''
+        env:
+          NEXT: ${{ steps.next.outputs.next }}
+          BASE: ${{ inputs.base }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "Back to development: $NEXT
+
+          $TAG is released; this is the trunk's version until the next one is cut."
+
+          # Three attempts with a rebase between them: this job starts minutes after the
+          # release was dispatched and the trunk is a branch people push to. A rebase of one
+          # version-bump commit conflicts only in Cargo.lock, and a conflicted rebase is
+          # abandoned rather than resolved — a lockfile merged by a workflow is not something
+          # anybody reviewed.
+          pushed=
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:refs/heads/$BASE"; then
+              pushed=1
+              break
+            fi
+            echo "push rejected (attempt $attempt); rebasing onto the current $BASE"
+            git fetch origin "$BASE"
+            if ! git rebase "origin/$BASE"; then
+              git rebase --abort || true
+              echo "::warning::the bump commit conflicts with $BASE — not pushing"
+              break
+            fi
+          done
+
+          if [ -n "$pushed" ]; then
+            echo "### Trunk bumped to \`$NEXT\`" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$BASE\` now carries \`$NEXT\`, so the next release may be any version above $TAG." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::could not push the dev bump to $BASE — do it by hand"
+            {
+              echo "### The trunk was NOT bumped"
+              echo
+              echo "\`$TAG\` is published, but \`$BASE\` still carries its old version. Run:"
+              echo
+              echo '```sh'
+              echo "git switch $BASE && git pull"
+              echo "scripts/bump-version.sh $NEXT"
+              echo "git commit -am 'Back to development: $NEXT' && git push"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -774,6 +774,21 @@ which is what catches a rewrite that produced the right version and reformatted 
 it. A `json.dump` round-trip did precisely that during development — correct version, twenty
 lines of reflow, and a file list the guard had no objection to.
 
+That guard is also why **master must never be hand-bumped to the version being released**: a file
+already holding it produces no diff at all, the numstat reads empty rather than `1 1`, and the
+release is refused for a reason that reads like a broken regex. It fails before anything is
+pushed, so nothing has to be undone — but the fix is to leave the trunk alone, not to weaken the
+guard. The `bump` job at the end of the workflow is what keeps the trunk honest instead: after
+`publish`, it puts the base branch on `<next patch>-dev` through `scripts/bump-version.sh`. The
+`-dev` suffix is what makes the next release possible at all (a bare `0.6.3` would walk into the
+guard above), and running after `publish` rather than inside `prepare` is deliberate — a trunk
+claiming to be past a release that was never published is the one wrong state available here, and
+it is what a failed `linux` or `macos` job would leave behind. It skips, saying so, when the trunk
+is already ahead. A rejected push is a warning with the manual commands in the job summary and not
+a failure: the release is already out by then, and a protected trunk would otherwise paint an X on
+every release for ever. Before that job existed, master sat at `0.6.0` while `v0.6.1` and `v0.6.2`
+were published — the release branch is cut, tagged and never merged back.
+
 ## Paths stay XDG, deliberately
 
 Under a profile the leaf is `cide-<profile>`; see *`./run.sh` is a separate instance*. It is
