@@ -21,7 +21,7 @@ pub struct SessionRegistry {
     /// Live attachments, so a webview going away can drop exactly its own sink.
     attachments: DashMap<AttachmentKey, SinkId>,
     /// The highest write sequence number applied per writer. See [`Self::accept_write`].
-    applied_write: DashMap<WriterKey, u64>,
+    applied_write: DashMap<WriterKey, WriteMark>,
     /// When each live session's child was forked. See [`Self::started`].
     started: DashMap<SessionId, std::time::SystemTime>,
 }
@@ -44,8 +44,36 @@ pub struct SessionRegistry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WriterKey {
     session: SessionId,
-    /// The window label, as `tauri::Window::label`. One JS context, one counter.
+    /// The window label, as `tauri::Window::label`. One window, one page — but not one page
+    /// *for ever*, which is what [`WriteMark::epoch`] is for.
     window: String,
+}
+
+/// What one writer has had applied: how far its counter got, and which counter it was.
+///
+/// **A window label outlives the JS context it names, and the watermark must not.** The
+/// counter is a module-level `Map` in `ui/src/ipc/client.ts`, so it restarts at 1 every time
+/// the page is loaded — and the page is loaded again without the window being recreated:
+/// Vite sends a full reload whenever an edit has no HMR boundary (constant while cide is
+/// developed inside cide), and WebKit reloads a webview it has recovered. The sessions live
+/// in this process and survive all of it, watermark included, so the reloaded page's writes
+/// arrive numbered from 1 against a watermark of several hundred and **every one of them is
+/// dropped** — silently, because a duplicate is `Ok(())`. What the user sees is a terminal
+/// that paints and scrolls but cannot be typed into, for as long as it takes the new counter
+/// to climb past the old one. That was reported as "the first console is frozen".
+///
+/// So the page stamps each write with an epoch minted at module load, and a new epoch resets
+/// the watermark rather than being measured against it. The dedupe stays exact: the retry it
+/// defends against is Tauri re-sending the identical message from the page that sent it, same
+/// epoch and same number. Storing the epoch beside the watermark rather than adding it to the
+/// key is deliberate — a window has exactly one live page, so the new epoch *replaces* the
+/// old entry and nothing accumulates across a day of reloads.
+#[derive(Debug, Clone)]
+struct WriteMark {
+    /// Identifies the JS context that minted `seq`. Empty for a caller that names no epoch —
+    /// see [`SessionRegistry::accept_write`] for why that is still a legal caller.
+    epoch: String,
+    seq: u64,
 }
 
 /// A sink belonging to one pane's view of one session.
@@ -171,21 +199,46 @@ impl SessionRegistry {
     /// one writer thread. Nothing can arrive out of order, so "already seen" is decidable from
     /// one watermark instead of a window.
     ///
-    /// `None` means the caller did not number its write, and is accepted: the old wire shape
-    /// still works, with the old at-least-once behaviour. Rejecting it would break every
-    /// caller outside `ui/src/ipc/client.ts` — `cide-headless`, and anything driving the app
-    /// from a script — to protect a case they do not hit.
-    pub fn accept_write(&self, id: SessionId, window: &str, seq: Option<u64>) -> bool {
+    /// `epoch` names the JS context that minted `seq`, and a write bearing a *different* one
+    /// from the last write in this window resets the watermark instead of being compared
+    /// against it. [`WriteMark`] is where that is argued: without it a page reload — which
+    /// keeps the window and its label, and which Vite performs on any edit with no HMR
+    /// boundary — restarts the counter at 1 under a watermark in the hundreds and every
+    /// keystroke is discarded, leaving a terminal that cannot be typed into.
+    ///
+    /// `None` for either argument means the caller did not number its write, and is accepted:
+    /// the old wire shape still works, with the old at-least-once behaviour. Rejecting it
+    /// would break every caller outside `ui/src/ipc/client.ts` — `cide-headless`, and anything
+    /// driving the app from a script — to protect a case they do not hit.
+    pub fn accept_write(
+        &self,
+        id: SessionId,
+        window: &str,
+        epoch: Option<&str>,
+        seq: Option<u64>,
+    ) -> bool {
         let Some(seq) = seq else { return true };
+        let epoch = epoch.unwrap_or_default();
         let key = WriterKey {
             session: id,
             window: window.to_string(),
         };
-        let mut watermark = self.applied_write.entry(key).or_insert(0);
-        if seq <= *watermark {
+        let mut mark = self.applied_write.entry(key).or_insert_with(|| WriteMark {
+            epoch: epoch.to_string(),
+            seq: 0,
+        });
+        if mark.epoch != epoch {
+            // A different page in the same window: a counter with no relation to the one this
+            // watermark measured. Adopt it and let this write through — the page cannot be
+            // replaying anything, because it has never sent anything before.
+            mark.epoch = epoch.to_string();
+            mark.seq = seq;
+            return true;
+        }
+        if seq <= mark.seq {
             return false;
         }
-        *watermark = seq;
+        mark.seq = seq;
         true
     }
 }
@@ -319,6 +372,11 @@ mod tests {
     const SHELL: &str = "shell";
     const DETACHED: &str = "pane:4f0e6f6a-0000-4000-8000-000000000001";
 
+    /// One page load, and the same one for both windows in the tests below: the epoch is not
+    /// what those are about, and giving each window its own would let them pass with the
+    /// window taken back out of [`WriterKey`].
+    const PAGE: &str = "page-1";
+
     /// **Tearing a pane out into its own window must not eat the keystrokes typed before it.**
     ///
     /// The sequence counter lives in `ui/src/ipc/client.ts`, which is per webview: the new
@@ -336,26 +394,66 @@ mod tests {
 
         // Forty characters typed into the pane while it lived in the shell window.
         for seq in 1..=40 {
-            assert!(registry.accept_write(id, SHELL, Some(seq)));
+            assert!(registry.accept_write(id, SHELL, Some(PAGE), Some(seq)));
         }
 
         // The pane is torn out. Same session, new webview, counter back at 1.
         assert!(
-            registry.accept_write(id, DETACHED, Some(1)),
+            registry.accept_write(id, DETACHED, Some(PAGE), Some(1)),
             "the detached window's first keystroke must reach the child"
         );
-        assert!(registry.accept_write(id, DETACHED, Some(2)));
+        assert!(registry.accept_write(id, DETACHED, Some(PAGE), Some(2)));
 
         // The retry guard still works inside each window.
         assert!(
-            !registry.accept_write(id, DETACHED, Some(2)),
+            !registry.accept_write(id, DETACHED, Some(PAGE), Some(2)),
             "and only once"
         );
         assert!(
-            !registry.accept_write(id, SHELL, Some(40)),
+            !registry.accept_write(id, SHELL, Some(PAGE), Some(40)),
             "the original window's watermark is untouched by the new one"
         );
-        assert!(registry.accept_write(id, SHELL, Some(41)));
+        assert!(registry.accept_write(id, SHELL, Some(PAGE), Some(41)));
+    }
+
+    /// **Reloading the page must not eat the keystrokes typed before it.**
+    ///
+    /// The window is not recreated by a reload, so its label — the only thing that had told
+    /// two counters apart — is unchanged, while `writeSeq` in `ui/src/ipc/client.ts` is a
+    /// fresh `Map` starting at 1. The session and its watermark live in this process and
+    /// survive, so without the epoch every write from the new page is below the mark and is
+    /// dropped as a replay. Silently: a duplicate is `Ok(())`. That is a terminal that paints
+    /// and scrolls and cannot be typed into, and it was reported exactly that way — a dev
+    /// instance, where Vite full-reloads on any edit with no HMR boundary, so it happened
+    /// every few minutes.
+    ///
+    /// The counts here are the ones from that report: 722 writes numbered from 1, all dropped.
+    #[test]
+    fn a_reloaded_page_starts_its_own_count() {
+        let registry = SessionRegistry::default();
+        let id = SessionId::new();
+
+        for seq in 1..=722 {
+            assert!(registry.accept_write(id, SHELL, Some(PAGE), Some(seq)));
+        }
+
+        // Vite reloads the page. Same window, same label, same session — new module, new Map.
+        let reloaded = "page-2";
+        assert!(
+            registry.accept_write(id, SHELL, Some(reloaded), Some(1)),
+            "the reloaded page's first keystroke must reach the child"
+        );
+        assert!(registry.accept_write(id, SHELL, Some(reloaded), Some(2)));
+
+        // And the guard is still exact within the new page.
+        assert!(
+            !registry.accept_write(id, SHELL, Some(reloaded), Some(2)),
+            "a retry from the reloaded page is still applied once"
+        );
+
+        // One entry, not one per reload: a window has one live page, so the new epoch
+        // replaces the old mark rather than accumulating beside it.
+        assert_eq!(registry.applied_write.len(), 1);
     }
 
     /// Removing a session clears every window's watermark for it, not just one.
@@ -368,8 +466,8 @@ mod tests {
         let registry = SessionRegistry::default();
         let id = SessionId::new();
 
-        assert!(registry.accept_write(id, SHELL, Some(5)));
-        assert!(registry.accept_write(id, DETACHED, Some(5)));
+        assert!(registry.accept_write(id, SHELL, Some(PAGE), Some(5)));
+        assert!(registry.accept_write(id, DETACHED, Some(PAGE), Some(5)));
         assert_eq!(registry.applied_write.len(), 2);
 
         registry.remove(id);
@@ -392,15 +490,15 @@ mod tests {
         let id = SessionId::new();
 
         assert!(
-            registry.accept_write(id, SHELL, Some(1)),
+            registry.accept_write(id, SHELL, Some(PAGE), Some(1)),
             "the first write lands"
         );
         assert!(
-            !registry.accept_write(id, SHELL, Some(1)),
+            !registry.accept_write(id, SHELL, Some(PAGE), Some(1)),
             "the retry of that same write must not reach the child"
         );
         assert!(
-            registry.accept_write(id, SHELL, Some(2)),
+            registry.accept_write(id, SHELL, Some(PAGE), Some(2)),
             "the next write lands"
         );
     }
@@ -415,10 +513,10 @@ mod tests {
         let registry = SessionRegistry::default();
         let id = SessionId::new();
 
-        assert!(registry.accept_write(id, SHELL, Some(7)));
-        assert!(!registry.accept_write(id, SHELL, Some(3)));
-        assert!(!registry.accept_write(id, SHELL, Some(7)));
-        assert!(registry.accept_write(id, SHELL, Some(8)));
+        assert!(registry.accept_write(id, SHELL, Some(PAGE), Some(7)));
+        assert!(!registry.accept_write(id, SHELL, Some(PAGE), Some(3)));
+        assert!(!registry.accept_write(id, SHELL, Some(PAGE), Some(7)));
+        assert!(registry.accept_write(id, SHELL, Some(PAGE), Some(8)));
     }
 
     /// Two sessions do not share a watermark.
@@ -432,9 +530,9 @@ mod tests {
         let one = SessionId::new();
         let two = SessionId::new();
 
-        assert!(registry.accept_write(one, SHELL, Some(1)));
+        assert!(registry.accept_write(one, SHELL, Some(PAGE), Some(1)));
         assert!(
-            registry.accept_write(two, SHELL, Some(1)),
+            registry.accept_write(two, SHELL, Some(PAGE), Some(1)),
             "a different session starts its own count"
         );
     }
@@ -448,10 +546,10 @@ mod tests {
         let registry = SessionRegistry::default();
         let id = SessionId::new();
 
-        assert!(registry.accept_write(id, SHELL, None));
-        assert!(registry.accept_write(id, SHELL, None));
+        assert!(registry.accept_write(id, SHELL, None, None));
+        assert!(registry.accept_write(id, SHELL, None, None));
         // And it does not disturb a numbered stream that is also running.
-        assert!(registry.accept_write(id, SHELL, Some(1)));
-        assert!(!registry.accept_write(id, SHELL, Some(1)));
+        assert!(registry.accept_write(id, SHELL, Some(PAGE), Some(1)));
+        assert!(!registry.accept_write(id, SHELL, Some(PAGE), Some(1)));
     }
 }

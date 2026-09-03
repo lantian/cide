@@ -1254,9 +1254,21 @@ export const session = {
    * `postMessage`. At-least-once delivery for a command whose whole effect is a side effect.
    * The retry carries the same `seq`, and `session_write` drops anything it has already
    * applied, which is the only way to be sure that path cannot double a character.
+   *
+   * `epoch` says *which* counter the number is from, and without it the guard eats input.
+   * The counter restarts at 1 whenever this module is loaded, and a load is not the same
+   * event as a window being created: Vite full-reloads the page on any edit with no HMR
+   * boundary, and WebKit reloads a webview it recovers. The child, and the watermark, live
+   * in Rust and survive it — so the reloaded page's writes arrived under a watermark in the
+   * hundreds and were every one of them dropped as replays. That is the frozen console.
    */
   write: (id: SessionId, data: string) =>
-    invoke<void>('session_write', { session: id, data, seq: nextWriteSeq(id) }),
+    invoke<void>('session_write', {
+      session: id,
+      data,
+      seq: nextWriteSeq(id),
+      epoch: writerEpoch,
+    }),
 
   resize: (id: SessionId, geo: Geometry) =>
     invoke<void>('session_resize', { session: id, geometry: geo }),
@@ -2245,6 +2257,21 @@ export const onIpcDegraded = (handler: (health: IpcHealth) => void) =>
 
 /** The last sequence number handed to `session.write`, per session. */
 const writeSeq = new Map<SessionId, number>()
+
+/**
+ * Identifies this load of this module to `session_write`'s replay guard.
+ *
+ * It is minted beside `writeSeq` and shares its lifetime exactly, which is the whole content
+ * of the value: the guard needs to tell "the number after 706" from "1 again, from a counter
+ * that has never been seen", and those are indistinguishable from the number alone. Anything
+ * unique per module evaluation does — `crypto.randomUUID` is here because it is available in
+ * both the webview and the SSR passes the `check:*` scripts run, where `Math.random` would
+ * also do but a UUID reads as an identity in a log line.
+ *
+ * Not persisted, deliberately. A page that came back from a reload *must* look new to the
+ * guard; remembering the old epoch would restore the bug it exists to fix.
+ */
+const writerEpoch = crypto.randomUUID()
 
 /**
  * The next write sequence number for this session.

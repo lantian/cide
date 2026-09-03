@@ -1401,6 +1401,14 @@ pub fn session_in_alternate_screen(
 /// *n* is however much had been typed in the old one. Injected by Tauri, so it costs the wire
 /// nothing.
 ///
+/// **`epoch` is what makes the window label enough.** The label survives a page *reload* —
+/// Vite performs one on any edit with no HMR boundary, and WebKit does after recovering a
+/// webview — while the counter, a module-level `Map`, restarts at 1. Numbering that against
+/// the watermark the old page left behind discards every keystroke until the new counter
+/// climbs past it, which is a terminal that paints and scrolls and cannot be typed into. The
+/// page therefore stamps its writes with an id minted at module load, and a change of id
+/// resets the watermark. See [`SessionRegistry::accept_write`].
+///
 /// A duplicate is `Ok(())`, not an error. The caller has no repair to make — the bytes *are*
 /// in the child, delivered by the attempt this one is a replay of — and reporting a failure
 /// would put a red line in the log for the mechanism working.
@@ -1411,10 +1419,11 @@ pub fn session_write(
     session: SessionId,
     data: String,
     seq: Option<u64>,
+    epoch: Option<String>,
 ) -> Result<(), SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
-    if !registry.accept_write(session, window.label(), seq) {
-        tracing::debug!(%session, ?seq, window = window.label(), "session write: dropped a replayed frame");
+    if !registry.accept_write(session, window.label(), epoch.as_deref(), seq) {
+        tracing::debug!(%session, ?seq, ?epoch, window = window.label(), "session write: dropped a replayed frame");
         return Ok(());
     }
     s.write(data.into_bytes());
