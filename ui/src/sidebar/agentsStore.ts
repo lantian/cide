@@ -187,6 +187,25 @@ interface AgentsStore {
   refresh: () => Promise<void>
   /** Take a roster somebody else produced — a `cide://agents-changed` broadcast. */
   adopt: (project: ProjectId, roster: WireRoster) => void
+  /**
+   * Take a config somebody else wrote — Settings → Agents' project switches.
+   *
+   * # Why that screen writes through `agentsApi` and hands the answer back here
+   *
+   * Every gesture in this store acts on `get().project`, the project the sidebar is attached to.
+   * The settings screen takes its project from `useActiveProject` instead, and in a second window
+   * those two can name different projects — `focusRole`'s guard one field up exists for exactly
+   * that. A `setMaxConcurrent()` on this store would therefore have written a *tracked file into
+   * a repository the user was not looking at*, which is the one class of mistake this feature
+   * cannot make. So the write is the screen's, with its own project spelled out, and only its
+   * result comes here.
+   *
+   * Guarded on the project for `adopt`'s reason, and it is the same guard: an answer about a
+   * project this store is not showing is a number about a different repository. `cide://agents-
+   * changed` cannot replace this — it carries the roster and no config, deliberately, because it
+   * fires several times a second as runs move.
+   */
+  adoptConfig: (project: ProjectId, config: OrchestrationConfig) => void
   /** Write `enabled: true` into `.cide/config.json`, creating it. The panel's one button. */
   enable: () => Promise<void>
   /**
@@ -371,6 +390,13 @@ export const useAgents = create<AgentsStore>((set, get) => ({
      * registry does not do.
      */
     set({ roster: adaptRoster(wire) })
+  },
+
+  adoptConfig: (project, config) => {
+    // A config for a project this window is not showing. See the interface for why the settings
+    // screen writes it and this store only hears about it.
+    if (get().project !== project) return
+    set({ config })
   },
 
   enable: async () => {

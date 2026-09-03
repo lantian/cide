@@ -76,11 +76,19 @@
  * too.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { agentDefs, agents as agentsApi, type ProjectId } from '@/ipc/client'
+import {
+  agentDefs,
+  agents as agentsApi,
+  type OrchestrationConfig,
+  type ProjectId,
+} from '@/ipc/client'
+import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { useAgents } from '@/sidebar/agentsStore'
 import { useActiveProject } from '@/store/workspace'
-import { ActionButton, Group, Note, PathReadout } from './controls'
+// `Row as SettingRow`: `./agentsDraft` already exports a `Row` type — a row of the *role list* —
+// and this one is the settings-form row. Aliasing at the import keeps both names honest.
+import { ActionButton, Group, Note, NumberField, PathReadout, Row as SettingRow } from './controls'
 import {
   EFFORT_SUGGESTIONS,
   HARNESSES,
@@ -212,6 +220,31 @@ function AgentsEditor({ project }: { project: ProjectId }) {
    * while the dialog is up and can no longer draw anything.
    */
   const [pendingLeave, setPendingLeave] = useState<Selection | 'new' | 'close' | null>(null)
+
+  /**
+   * This project's `.cide/config.json` as it stands, or `null` when nobody has an answer.
+   *
+   * `null` is *"not read yet, or this build has no `agents_config_get`"* — `agents.config` goes
+   * through `pendingCommand` and answers `null` rather than rejecting — and it draws **nothing**
+   * rather than a default. A row showing `2` on a project whose file says `6` is a wrong number
+   * that looks exactly like a right one, and the user's next keystroke would write it back.
+   *
+   * Read here rather than taken from `sidebar/agentsStore.ts`, which also holds one, for this
+   * screen's freshness rule: the store loads its copy when the sidebar attaches and this file is
+   * *committed*, so a teammate's commit or a `git checkout` can move it under a running app. The
+   * store's copy is kept in step the other way round — through `adoptConfig`, after a write.
+   */
+  const [config, setConfig] = useState<OrchestrationConfig | null>(null)
+  /**
+   * Why the config could not be read, or could not be written. Drawn under the row it is about.
+   *
+   * Which of the two is carried rather than inferred: a *write* failure leaves the last good
+   * config on screen and a *read* failure leaves nothing, so a heading derived from `config`
+   * being null would be right until somebody's second gesture and wrong from then on.
+   */
+  const [configError, setConfigError] = useState<{ what: 'read' | 'write'; text: string } | null>(
+    null,
+  )
 
   const dirty = draft !== null && isDirty(saved, draft)
 
@@ -381,6 +414,67 @@ function AgentsEditor({ project }: { project: ProjectId }) {
    * listing ran.
    */
   useEffect(refresh, [refresh, rosterMark])
+
+  /*
+   * The project's own switches, on the same signal as the listing.
+   *
+   * `rosterMark` is in the deps because the two move together: the gesture that most often
+   * changes this file is the panel's *Enable subagents*, and that is also what turns the roster
+   * from `disabled` into a list of roles.
+   *
+   * `live` rather than an AbortController, because there is nothing to abort — the round trip
+   * will finish either way and all this guards is a `setState` on an unmounted component, which
+   * a project switch produces on every navigation (this screen is keyed on the project).
+   */
+  useEffect(() => {
+    let live = true
+    void agentsApi
+      .config(project)
+      .then((next) => {
+        if (!live) return
+        setConfig(next)
+        setConfigError(null)
+      })
+      .catch((error: unknown) => {
+        if (live) setConfigError({ what: 'read', text: errorText(error) })
+      })
+    return () => {
+      live = false
+    }
+  }, [project, rosterMark])
+
+  /**
+   * Write one project switch into `.cide/config.json`, creating the file if it is not there.
+   *
+   * Three things this does that the settings rows next door do not, and all three are the same
+   * fact wearing different hats — **this is a file in the user's repository**, not a `Settings`
+   * field:
+   *
+   * * It is **awaited and its failure is drawn**. `useSettings.patch` can be fire-and-forget
+   *   because a `cide://workspace-changed` snapshot follows every write and a switch whose write
+   *   failed flicks back on its own; nothing contradicts a per-project write that did not happen.
+   * * The answer is **adopted, not assumed**. `agents_config_set` clamps — `maxConcurrent` of 0
+   *   lands as 1 — so the number the field must show afterwards is the one Rust wrote, never the
+   *   one that was typed.
+   * * `errorText`, never `String(error)`: a refusal arrives as a tagged `CoreError`, so
+   *   `String()` of it is `[object Object]` and the sentence Rust composed is lost.
+   */
+  const patchConfig = useCallback(
+    (patch: { maxConcurrent: number }) => {
+      setConfigError(null)
+      void agentsApi
+        .setConfig(project, patch)
+        .then((next) => {
+          setConfig(next)
+          // The other holder of this value, kept in step rather than left to go stale. Guarded
+          // inside the store on the project, because that store follows the sidebar and this
+          // screen follows the active tab, and in a second window they can differ.
+          useAgents.getState().adoptConfig(project, next)
+        })
+        .catch((error: unknown) => setConfigError({ what: 'write', text: errorText(error) }))
+    },
+    [project],
+  )
 
   const rows = useMemo(() => rowsFor(entries ?? []), [entries])
   const taken = useMemo(
@@ -656,6 +750,71 @@ function AgentsEditor({ project }: { project: ProjectId }) {
 
   return (
     <>
+      {/*
+        * The project's own switches — the only thing on this screen that is not a role file.
+        *
+        * # Why it is drawn here at all, when `OrchestrationConfig`'s doc says this config gets no
+        * settings row
+        *
+        * That doc's rule is about `SECTIONS` and `useSettings.patch`: nothing about a *project*
+        * may ride `Workspace.settings`, so a row that looked like every other row and meant
+        * something different would be a lie about where the value lives. It then says where these
+        * switches belong instead, in as many words — "it is where the switches in *this* struct
+        * will eventually be drawn too, and when they are they will still be a per-project file
+        * write and still not a `SettingsPatch`". This is that, and it holds to both halves:
+        * `agents_config_set` writes `.cide/config.json`, the hint says so, and no patch is sent.
+        *
+        * # Nothing at all when the config is unknown
+        *
+        * `agents.config` answers `null` on a build with no such handler, and a number is exactly
+        * the kind of value that must not be guessed: `2` is also the default, so a guessed row on
+        * a project whose file says `6` is indistinguishable from a correct one — and the user's
+        * next keystroke writes the guess back over what was there.
+        */}
+      {(config !== null || configError !== null) && (
+        <Group title="This project">
+          {config !== null && (
+            <SettingRow
+              label="Concurrent runs"
+              hint={
+                'How many subagent runs may be live across this project at once, whatever a ' +
+                "role's own max-concurrent allows. Written to .cide/config.json, which your " +
+                'repository will then contain.'
+              }
+              control={
+                <NumberField
+                  label="Concurrent runs"
+                  value={config.maxConcurrent}
+                  min={1}
+                  /*
+                   * A ceiling, not a policy: the value is a `u16` and Rust only clamps the bottom
+                   * of it (0 would be a project that can never dispatch). 64 is far above any
+                   * fan-out a person means and well above anything a hand-edited file is likely
+                   * to hold — which matters, because `NumberField` commits on blur, so a maximum
+                   * *below* a hand-written number would quietly lower it the first time the field
+                   * was tabbed through.
+                   */
+                  max={64}
+                  onChange={(next) => patchConfig({ maxConcurrent: next })}
+                />
+              }
+            />
+          )}
+          {configError !== null && (
+            <Note
+              title={
+                configError.what === 'read'
+                  ? "This project's switches could not be read"
+                  : 'That switch could not be written'
+              }
+              tone="warn"
+            >
+              {configError.text}
+            </Note>
+          )}
+        </Group>
+      )}
+
       <Group title="Roles">
         <div className={styles.split}>
           <RoleList
@@ -711,10 +870,10 @@ function AgentsEditor({ project }: { project: ProjectId }) {
 
       <Note title="A role is a file">
         A role is a system prompt plus the switches a run is spawned with. It is stored as{' '}
-        <code>&lt;name&gt;.md</code> — front matter and a body — and everything on this screen
-        writes that file; nothing here is a cide setting, so none of it rides{' '}
-        <code>workspace.json</code> and none of it follows you into another project unless you
-        make it global.
+        <code>&lt;name&gt;.md</code> — front matter and a body — and everything in the list above
+        writes that file, as the row above it writes <code>.cide/config.json</code>. Nothing on
+        this screen is a cide setting, so none of it rides <code>workspace.json</code> and none of
+        it follows you into another project unless you make it global.
       </Note>
 
       {/*
