@@ -18,6 +18,80 @@ For the current shape of the project see [`../README.md`](../README.md); for wha
 not exist off Linux see [`platforms.md`](platforms.md); for the decisions a refactor would
 otherwise undo see [`adr/`](adr/).
 
+## View commits after a pull (M37), and what is not verified
+
+The pull's notice — *Fast-forwarded main 7 commits from origin · 12 files +230 −41*, ten commits
+under *Details* — ended there. IDEA's *Update Project* notification carries a *View Commits* link
+that opens the log filtered to exactly what was received, and that was the request.
+
+### The range is the toast's list, not `old..new`
+
+`FetchOutcome` gains `received`: the revspec `<pre-pull local tip>..<upstream tip>` over full oids,
+spelled in Rust by the function that fills `commits`, because it is the same walk. Not
+`old_oid..new_oid`: after a merge that range includes the merge commit cide has just made, after a
+rebase it includes the user's own replayed commits, and neither was received. Full oids because the
+log resolves a range with `revparse`, and eight characters are ambiguous in a repository the size
+of the kernel — the toast would read fine and the link would open an `AmbiguousRev` refusal.
+`tests/pull.rs` pins all three strategies against `git rev-list`, and asks `cide_git::log` itself to
+walk the range, since that is the walk the link runs. The log's Rust did not change:
+`LogRefs::Rev` took a two-dot range already.
+
+### A notice can offer something to do
+
+`Notice` gains `actions` — a label and a callback — drawn as small bordered buttons in the shape of
+the log's *Clear filters and find it*, and not as a link inside the sentence, because the sentence
+is selectable text and a control inside it would be dragged into the selection. Following one
+dismisses the toast. `admit` changed with it: a repeat with the same words used to be declined
+outright, which was right while a notice was its text and wrong for one that carries a link. Toasts
+never dismiss themselves, so a second pull half an hour later with the identical headline would
+have been dropped, and the surviving toast would have gone on offering the *first* pull's range. A
+repeat that brings a different body or any action now replaces the shown notice in place — same
+id, same position — and one that brings nothing new is still declined by returning the same array.
+
+### The log takes a parked filter, and a filter names a repository
+
+`gitlog/logRequests.ts` is the sibling of `requestLogReveal`: a parked, consume-once request with
+the same TTL, in its own module because `LogTab.tsx` imports from `keys/dispatch.ts` and dispatch is
+the producer. `LogFilter` gains `repo` — only this repository, or `null` — because a full oid is
+meaningless without the object database it lives in: under the merged scope a multi-root Log tab
+walks, every other root fails to `revparse` it and takes the page down with it. The Log tab narrows
+its scope to `applied.repo` while it is set, the branch box reads *Range abc1234..def5678* (and
+*… in app* when the project has several roots), and *Clear filters* drops it. Nothing in the bar
+sets it. `findCommitFilter` and the ref chips produce a bare full-oid `rev` too and carry the same
+latent multi-root failure; they were not changed here.
+
+### One link per repository
+
+`receivedLinks` gives one link per repository that received commits: *View commits* alone in a
+single-root project, *View commits in app* otherwise, carrying the id and not the name because two
+roots can share a basename. A single merged view of several ranges would need a `LogRefs` variant
+and would have no graph. The links are offered in the shell window only: `git.pull` runs from a
+detached window too, but the tool window is drawn by the shell window, and the parked request is a
+store in the window that parked it. The status-bar branch popup's own *Pull* reports into its note
+bar and not a toast, and got no link.
+
+### What was found and not fixed
+
+The first version of the range test committed six times inside one second, and once in a dozen
+runs the log listed four commits for a range `git rev-list` gave three: the root, which is hidden
+behind `mine`, came off the heap before `mine` did — a six-way tie ordered however the heap
+happened to — and was emitted before the walk learned it was uninteresting. git's `limit_list`
+tolerates that because it filters at output time; `cide_git::log` streams rows and cannot retract
+one. Real histories are minutes apart, and the shape that ties — a hidden tip written in the same
+second as an ancestor it hides — is a rebase's, where the rewritten commits are on the interesting
+side and not the hidden one. So the test pins its dates (`TempRepo::commit_all_at`) and the walk
+was left alone; this paragraph is so the next person who sees a range list one row too many knows
+where to look.
+
+### What is not verified
+
+**Nothing here has been seen on a display.** The Rust range is covered against `git rev-list` under
+all three strategies; `check:notices` drives `admit`'s refresh rule and pins dismiss-on-follow;
+`check:log` drives the filter model and pins the seam's wiring; `check:branches` drives the link
+derivation and the shell-window gate. What has not been seen: the buttons rendering in the toast at
+all, whether *View commits* under an open disclosure crowds the 420px card, the branch box reading a
+range, and whether the graph over a range of three commits looks like anything.
+
 ## The push dialog, and force push as a lease (M36), and what is not verified
 
 `git.push` was a fire-and-forget gesture. It fanned out over every repository in the project and

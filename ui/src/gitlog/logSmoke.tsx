@@ -79,6 +79,8 @@ export interface LogDigest {
   controls: string[]
   /** What the branch control shows — see `data-value` in `LogView.tsx`. */
   branch: string | null
+  /** …and what it *says*: the input's rendered value, which is the label when the list is shut. */
+  branchLabel: string | null
   detailFiles: number
   /** The oid on the row marked `aria-selected` — the visible half of a reveal that landed. */
   selectedOid: string | null
@@ -372,6 +374,8 @@ const digests: LogDigest[] = LOG_STORIES.map((story) => {
       (m) => m[1] ?? '',
     ),
     branch: /data-audit="logBranch"[^>]*data-value="([^"]*)"/.exec(html)?.[1] ?? null,
+    // `\svalue=`, so the greedy scan cannot settle on `data-value=` when the real one is absent.
+    branchLabel: /data-audit="logBranch"[^>]*\svalue="([^"]*)"/.exec(html)?.[1] ?? null,
     detailFiles: all(html, 'logFile', 'button').length,
     /* Directory headings, grouped and flat. The flat reading must have none — that is the
        difference between the two arrangements stated as a fact rather than as a screenshot. */

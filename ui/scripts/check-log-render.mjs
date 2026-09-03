@@ -112,6 +112,7 @@ try {
       'mock',
       'multi',
       'nested',
+      'received',
       'revealOutside',
       'revealed',
     ],
@@ -390,6 +391,25 @@ try {
     '…and a chosen branch is tagged `b:`, so a branch actually named `head` cannot silently '
       + 're-root onto HEAD',
   )
+  eq(byName.mock.branchLabel, 'Current branch', 'and reads *Current branch* for HEAD')
+  eq(
+    byName.multi.branchLabel,
+    'release/0.18',
+    '…a branch by its name and no repository, because nothing narrows the merged walk to one',
+  )
+  // *View commits* on a pull's notice. (M37)
+  eq(
+    byName.received.branch,
+    `r:${'1'.repeat(40)}..${'2'.repeat(40)}`,
+    '*View commits* re-roots the walk at the received range, as a `rev` the control round-trips',
+  )
+  eq(
+    byName.received.branchLabel,
+    `Range ${'1'.repeat(7)}..${'2'.repeat(7)} in hub-core`,
+    '…read as an abbreviated range in a named repository: with three roots, the chips on the '
+      + 'rows would otherwise be the only thing saying which one the range is in',
+  )
+  eq(byName.received.clear, true, '…and it is a filter, so *Clear filters* is the way back')
   eq(byName.mock.clear, false, 'no *Clear filters* until something is set')
   eq(byName.filtered.clear, true, 'and one as soon as something is')
   ok(

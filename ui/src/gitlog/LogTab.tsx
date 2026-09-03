@@ -168,6 +168,7 @@ import {
   type SelectMods,
 } from './logModel'
 import { ChangedFileList, LogView, RangeDetails } from './LogView'
+import { FILTER_REQUEST_TTL_MS, useFilterRequests } from './logRequests'
 import styles from './LogView.module.css'
 
 /* ------------------------------------------------------------------------------------------
@@ -627,6 +628,19 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
     () => (repo === null ? null : { kind: 'one', repo }),
     [repo],
   )
+  /*
+   * The scope a filter narrows to — `LogFilter.repo`, set by *View commits* on a pull. (M37)
+   *
+   * `applied` and not `typed`: the scope keys the fetch effect, and a scope that moved on the
+   * keystroke would start the walk the debounce exists to hold back. The History tab's own
+   * `repo` (`oneScope`) still wins — that tab is one file in one repository and no filter
+   * changes which — and the filter is refused for a History tab anyway (see the parked-filter
+   * effect below), so the two cannot disagree.
+   */
+  const pinnedScope = useMemo<LogScope | null>(
+    () => (applied.repo === null ? null : { kind: 'one', repo: applied.repo }),
+    [applied.repo],
+  )
   const mergedScope = useMemo<LogScope | null>(() => {
     if (repoKey === null || repoKey === '') return null
     const ids = repoKey.split(' ')
@@ -634,7 +648,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
     if (ids.length === 1 && first !== undefined) return { kind: 'one', repo: first }
     return { kind: 'merged', repos: ids }
   }, [repoKey])
-  const scope = oneScope ?? mergedScope
+  const scope = oneScope ?? pinnedScope ?? mergedScope
 
   // --- the debounce -------------------------------------------------------------------------
   //
@@ -1072,6 +1086,24 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
         setReveal({ kind: 'missing', oid })
       })
   }, [pending, project, path, busy, typed, applied, rows, onSelect, selectOnly])
+
+  /*
+   * A parked filter — *View commits* on a pull's notice. (M37)
+   *
+   * Simpler than the reveal above because it asks less: nothing to find on a page, only a filter
+   * to set, and the branch half of a filter applies at once. The guards it does share: this
+   * project; the Log tab and not a History tab (that tab has a repository and a path of its own,
+   * and a range from a notice means nothing there); and the request is spent *before* the TTL is
+   * checked, so a stale one is dropped rather than left for the next visit to trip over.
+   */
+  const wanted = useFilterRequests((s) => s.pending)
+  useEffect(() => {
+    if (wanted === null || wanted.project !== project) return
+    if (path !== null) return
+    useFilterRequests.getState().clear(wanted)
+    if (Date.now() - wanted.at > FILTER_REQUEST_TTL_MS) return
+    setTyped(wanted.filter)
+  }, [wanted, project, path])
 
   /**
    * *Clear filters and find it*.

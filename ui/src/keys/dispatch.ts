@@ -61,7 +61,9 @@ import { openBranchPopup } from '@/chrome/BranchSelector'
 // answers whether one was there to hear it, which is what makes a contributed command reportable
 // as unavailable rather than silently inert.
 import { invoke as invokeExtension } from '@/ext/host'
-import { explain, pullReport, type RepoFetch } from '@/chrome/branchModel'
+import { explain, pullReport, receivedLinks, type RepoFetch } from '@/chrome/branchModel'
+import { receivedFilter } from '@/gitlog/logModel'
+import { requestLogFilter } from '@/gitlog/logRequests'
 import {
   divergenceOf,
   strategyAsk,
@@ -309,7 +311,7 @@ function pullPass(
       const repo = repos[i]
       if (repo === undefined) return
       if (result.status === 'fulfilled') {
-        done.push({ name: repo.name, outcome: result.value })
+        done.push({ repo: repo.id, name: repo.name, outcome: result.value })
         if (result.value.conflicts.length > 0) stopped.push({ id: repo.id, name: repo.name })
         return
       }
@@ -321,7 +323,39 @@ function pullPass(
     // nothing on top of them would be a second surface saying less.
     if (done.length > 0) {
       const report = pullReport(done)
-      notify(report.text, { kind: 'ok', detail: report.detail })
+      /*
+       * *View commits* — IDEA's link on the same notice. (M37)
+       *
+       * Shell window only, and that is the realm rather than a preference: `git.pull` runs from
+       * a detached window too (its `when` is `projectOpen`), but the tool window the link opens
+       * is drawn by the shell window, and the request it parks is a module-level store in
+       * *this* window's JavaScript. Parked over there it would sit unread until it expired, and
+       * a link that does nothing is the failure `chrome/Failures.tsx` exists to prevent. So the
+       * detached window's notice carries the report and no link — the same predicate `git.log`
+       * refuses on.
+       *
+       * The caller opens the tool window and the seam only parks, for the reason
+       * `requestLogReveal`'s header gives and `EditorPane.onShowCommit` follows: activation can
+       * be refused and a refusal is a sentence, parking cannot fail. `activate` also opens the
+       * panel — `cide_core::toolwindow::activate` says so — so one round trip, not two.
+       */
+      const links = boot()?.role.kind === 'shell' ? receivedLinks(done) : []
+      const actions = links.map((link) => ({
+        label: link.label,
+        run: () => {
+          void toolWindowApi
+            .activate(project, null)
+            .then(() => {
+              requestLogFilter(project, receivedFilter(link.spec, link.repo))
+            })
+            .catch(notifyFailure)
+        },
+      }))
+      notify(report.text, {
+        kind: 'ok',
+        detail: report.detail,
+        actions: actions.length > 0 ? actions : undefined,
+      })
     }
 
     /*

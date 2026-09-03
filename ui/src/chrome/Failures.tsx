@@ -115,6 +115,33 @@ function Toast({ notice }: { notice: Notice }) {
       <div className={styles.body}>
         <p className={styles.text}>{notice.text}</p>
         {notice.hint !== undefined && <p className={styles.hint}>{notice.hint}</p>}
+        {notice.actions !== undefined && notice.actions.length > 0 && (
+          /*
+           * What the notice offers to do next — *View commits* under a pull's report — as a row
+           * of small buttons rather than a link inside the sentence: `.text` opts in to text
+           * selection (see the stylesheet), and a control inside it would be dragged into the
+           * selection with the words.
+           *
+           * Following one dismisses the toast. The action is the toast's continuation, and a
+           * report whose link has already been taken is noise over the surface it opened.
+           */
+          <div className={styles.actions}>
+            {notice.actions.map((action) => (
+              <button
+                key={action.label}
+                type="button"
+                className={styles.action}
+                data-audit="noticeAction"
+                onClick={() => {
+                  action.run()
+                  dismiss(notice.id)
+                }}
+              >
+                {action.label}
+              </button>
+            ))}
+          </div>
+        )}
         {notice.detail !== undefined && notice.detail !== '' && (
           /*
            * A disclosure rather than always-on text. The headline answers "did it work and by

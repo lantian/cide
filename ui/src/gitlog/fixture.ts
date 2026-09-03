@@ -58,6 +58,7 @@ import {
   isFiltered,
   logStatus,
   NO_FILTER,
+  receivedFilter,
   NO_REVEAL,
   type ComparePair,
   type LogFilter,
@@ -73,6 +74,7 @@ export type LogStoryName =
   | 'empty'
   | 'history'
   | 'multi'
+  | 'received'
   | 'failed'
   | 'loading'
   | 'detail'
@@ -499,6 +501,9 @@ export interface LogStory {
 
 const BRANCHES = ['main', 'feature/login', 'release/0.18', 'origin/main']
 
+/** `FetchOutcome::received` for the `received` story: two full oids, as Rust spells it. */
+const RECEIVED_RANGE = `${'1'.repeat(40)}..${'2'.repeat(40)}`
+
 function story(name: LogStoryName, over: Partial<LogStory> = {}): LogStory {
   return {
     name,
@@ -656,6 +661,18 @@ export const LOG_STORIES: readonly LogStory[] = [
       scanned: 10,
     }),
     filter: { ...NO_FILTER, branch: { kind: 'branch', name: 'release/0.18' } },
+  }),
+
+  /*
+   * *View commits* on a pull's notice, in a project with several roots. (M37)
+   *
+   * The filter carries the repository the range was received into, and the branch box has to say
+   * so — in a project with three roots the chips on the rows would otherwise be the only thing
+   * that did. The rows are the mock's; what this story exists to render is the bar.
+   */
+  story('received', {
+    repos: [CIDE, VENDOR, DOCS],
+    filter: receivedFilter(RECEIVED_RANGE, VENDOR_ID),
   }),
 
   // A `GitError` that reached the panel as a sentence. The string is what

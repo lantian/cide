@@ -436,6 +436,7 @@ struct Integrated {
     deletions: u32,
     commits: Vec<PulledCommit>,
     more_commits: u32,
+    received: String,
     conflicts: Vec<String>,
 }
 
@@ -453,6 +454,7 @@ impl Integrated {
             deletions: self.deletions,
             commits: self.commits,
             more_commits: self.more_commits,
+            received: self.received,
             conflicts: self.conflicts,
             ..base
         }
@@ -852,6 +854,15 @@ fn integrated(
         .and_then(|u| u.get().target())
         .unwrap_or(new);
     let (commits, more_commits) = taken_commits(repo, upstream_tip, old, behind, PULL_COMMIT_CAP)?;
+    // The same walk as a revspec, for the log to run without the cap. `old` and not `new` on the
+    // left for the reason `taken_commits` hides `old`: after a merge `new` is the merge commit
+    // and after a rebase it is the replayed tip, and `old..new` would list either as received.
+    // Full oids — `FetchOutcome::received` says why eight characters are not enough here.
+    let received = if commits.is_empty() {
+        String::new()
+    } else {
+        format!("{old}..{upstream_tip}")
+    };
     Ok(Integrated {
         old_oid: old,
         new_oid: new,
@@ -864,6 +875,7 @@ fn integrated(
         deletions,
         commits,
         more_commits,
+        received,
         conflicts,
     })
 }

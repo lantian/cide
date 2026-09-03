@@ -470,14 +470,31 @@ export interface LogFilter {
   readonly author: string
   /** Substring of the message, or an oid prefix of at least four hex digits. */
   readonly text: string
+  /**
+   * Only this repository, or `null` for every root of the project. (M37)
+   *
+   * Not a control in the bar — nothing lets a user pick it — but a fact the bar has to *show*
+   * and *Clear filters* has to drop, which is what makes it a filter rather than tab state. It
+   * exists because a `LogRefs::Rev` is meaningless without the repository it resolves in: a full
+   * oid lives in one object database, and under the merged scope a multi-root Log tab walks,
+   * every other root would fail to `revparse` it and take the whole page down with it. So the
+   * one producer of a range — *View commits* on a pull's notice — names the repository too, and
+   * `LogTab` narrows its scope to it for as long as this is set.
+   */
+  readonly repo: RepoId | null
 }
 
-/** The unfiltered state: HEAD, no author, no text. */
-export const NO_FILTER: LogFilter = { branch: { kind: 'head' }, author: '', text: '' }
+/** The unfiltered state: HEAD, no author, no text, every repository. */
+export const NO_FILTER: LogFilter = { branch: { kind: 'head' }, author: '', text: '', repo: null }
 
 /** Whether anything is set — which is what decides whether *Clear filters* is offered. */
 export function isFiltered(f: LogFilter): boolean {
-  return f.branch.kind !== 'head' || f.author.trim() !== '' || f.text.trim() !== ''
+  return (
+    f.branch.kind !== 'head' ||
+    f.author.trim() !== '' ||
+    f.text.trim() !== '' ||
+    f.repo !== null
+  )
 }
 
 /**
@@ -495,7 +512,12 @@ export function clearFilters(f: LogFilter): LogFilter {
 
 /** Whether two filters ask the same question — the guard on the debounce. */
 export function sameFilter(a: LogFilter, b: LogFilter): boolean {
-  return a.author === b.author && a.text === b.text && sameBranch(a.branch, b.branch)
+  return (
+    a.author === b.author &&
+    a.text === b.text &&
+    a.repo === b.repo &&
+    sameBranch(a.branch, b.branch)
+  )
 }
 
 /** Whether two [`LogRefs`] name the same starting point. */
@@ -779,9 +801,44 @@ export function shortenOid(spec: string): string {
   return /^[0-9a-f]{40}$/.test(spec) ? spec.slice(0, 7) : spec
 }
 
-/** What the branch control calls a re-rooted walk. */
+/** `a..b` or `a...b` with a full oid at both ends — the shape `FetchOutcome::received` has. */
+const OID_RANGE = /^([0-9a-f]{40})(\.{2,3})([0-9a-f]{40})$/
+
+/**
+ * What the branch control calls a re-rooted walk.
+ *
+ * A range of two full oids is abbreviated at both ends — `Range abc1234..def5678` — because
+ * `shortenOid` rightly leaves a revision *expression* alone, and eighty-three characters is not a
+ * label for a 130px control. Anything else is `Revision …`, as before.
+ */
 export function revLabel(spec: string): string {
+  const range = OID_RANGE.exec(spec)
+  if (range !== null) {
+    return `Range ${shortenOid(range[1] ?? '')}${range[2] ?? ''}${shortenOid(range[3] ?? '')}`
+  }
   return `Revision ${shortenOid(spec)}`
+}
+
+/**
+ * The branch control's label for what is chosen — with the repository, when the tab is narrowed
+ * to one and would otherwise not say so.
+ *
+ * `scopeName` is `null` for a single-root project, where naming it would be noise (the same
+ * count that decides `repoStripOn`), and for a filter with no `repo`. It is appended to *every*
+ * kind and not only `rev`, because the narrowing outlives the range: a user who picks a branch
+ * while it is set is looking at that branch in one repository, and a label that said only
+ * `main` would be reading the wrong scope.
+ */
+export function branchLabel(branch: LogRefs, scopeName: string | null): string {
+  const base =
+    branch.kind === 'rev'
+      ? revLabel(branch.spec)
+      : branch.kind === 'all'
+        ? 'All branches'
+        : branch.kind === 'branch'
+          ? branch.name
+          : 'Current branch'
+  return scopeName === null ? base : `${base} in ${scopeName}`
 }
 
 /**
@@ -861,7 +918,20 @@ export function revealFindable(reveal: LogReveal): boolean {
  * the backend saying the same thing about the same gesture.
  */
 export function findCommitFilter(oid: string): LogFilter {
-  return { branch: { kind: 'rev', spec: oid }, author: '', text: '' }
+  return { branch: { kind: 'rev', spec: oid }, author: '', text: '', repo: null }
+}
+
+/**
+ * *View commits* on a pull's notice: the walk re-rooted at the range the pull received, in the
+ * repository it was received into, and nothing else set. (M37)
+ *
+ * `spec` is `FetchOutcome::received` — `<pre-pull tip>..<upstream tip>` over full oids, spelled by
+ * Rust because Rust ran the walk it names — and `repo` is the one the pull answered for. The
+ * repository is not optional: see [`LogFilter::repo`] for what a bare range does to a multi-root
+ * tab.
+ */
+export function receivedFilter(spec: string, repo: RepoId): LogFilter {
+  return { branch: { kind: 'rev', spec }, author: '', text: '', repo }
 }
 
 // --- comparing two commits ---------------------------------------------------------------------

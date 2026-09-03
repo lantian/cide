@@ -2888,6 +2888,22 @@ commits: Array<PulledCommit>,
  */
 moreCommits: number, 
 /**
+ * The walk that produced [`Self::commits`], spelled as the revspec
+ * `<pre-pull local tip>..<upstream tip>` over **full** oids — what the notice's *View
+ * commits* hands the log, which then runs the same walk uncapped.
+ *
+ * Spelled here and not in the frontend, for the reason [`PushOutcome::refspec`] is: one
+ * producer, so the rows the log draws are the rows this struct's `commits` are the head of.
+ * Full oids rather than [`Self::old_oid`]'s eight characters because a range is resolved by
+ * `revparse`, and eight characters are ambiguous in a repository the size of the kernel —
+ * the toast would read fine and the link would open an `AmbiguousRev` refusal.
+ *
+ * Deliberately **not** `old_oid..new_oid`. For a merge that range includes the merge commit
+ * cide has just made, and for a rebase it includes the user's own replayed commits; neither
+ * was received. Empty for a fetch and for a pull that took nothing.
+ */
+received: string, 
+/**
  * What the pull did.
  *
  * `None` for a plain fetch **and** for a pull that had nothing to take: in both cases no

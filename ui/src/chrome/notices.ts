@@ -56,6 +56,19 @@
  */
 export type NoticeKind = 'ok' | 'warn' | 'error'
 
+/**
+ * Something the notice offers to do next — *View commits* under a pull's report. (M37)
+ *
+ * A callback rather than a command id, because the thing to do is bound to the outcome that was
+ * just reported — a range of commits in one repository — and no command name carries that.
+ * Following it dismisses the toast: the action is the toast's continuation, and a report whose
+ * link has already been taken is noise over the surface it opened.
+ */
+export interface NoticeAction {
+  label: string
+  run: () => void
+}
+
 export interface Notice {
   id: number
   kind: NoticeKind
@@ -70,6 +83,8 @@ export interface Notice {
    * remote server's own `remote:` lines.
    */
   detail?: string | undefined
+  /** What the notice offers to do next. See [`NoticeAction`]. */
+  actions?: readonly NoticeAction[] | undefined
 }
 
 /** How many are shown at once. Beyond this the oldest is dropped. */
@@ -92,8 +107,34 @@ export const MAX_SHOWN = 3
  * reader does not re-render for a duplicate.
  */
 export function admit(current: readonly Notice[], notice: Notice): readonly Notice[] {
-  if (current.some((n) => n.text === notice.text)) return current
-  return [...current, notice].slice(-MAX_SHOWN)
+  const at = current.findIndex((n) => n.text === notice.text)
+  const shown = current[at]
+  if (shown === undefined) return [...current, notice].slice(-MAX_SHOWN)
+  /*
+   * The same words, and one toast — but the *newer facts* under them. (M37)
+   *
+   * A repeat used to be declined outright, which was right while a notice was only its text. It
+   * is not right for one that carries a commit list and a link: a toast never dismisses itself,
+   * so a second pull half an hour later with the identical headline ("1 commit from origin · 1
+   * file +1") would be dropped, and the toast still on screen would go on offering *View
+   * commits* for the first pull's range — a plausible-looking wrong answer, which is worse than
+   * no toast. So a repeat that brings a different body or any action replaces the shown notice
+   * in place: same id, so React keeps the element and the open state of its disclosure; same
+   * position, so nothing in the stack moves.
+   *
+   * A repeat that brings nothing new — the retried failure this rule was written for — is still
+   * declined by returning the same array, for the reason above.
+   */
+  if (
+    shown.detail === notice.detail &&
+    shown.actions === undefined &&
+    notice.actions === undefined
+  ) {
+    return current
+  }
+  const next = current.slice()
+  next[at] = { ...notice, id: shown.id }
+  return next
 }
 
 /**
@@ -200,7 +241,12 @@ function publish(next: readonly Notice[]): void {
  */
 export function notify(
   text: string,
-  options: { kind: NoticeKind; hint?: string | undefined; detail?: string | undefined },
+  options: {
+    kind: NoticeKind
+    hint?: string | undefined
+    detail?: string | undefined
+    actions?: readonly NoticeAction[] | undefined
+  },
 ): void {
   nextId += 1
   const { kind } = options
@@ -214,6 +260,7 @@ export function notify(
       // forgot would be the one that needed it.
       hint: options.hint ?? (kind === 'error' ? hintFor(text) : undefined),
       detail: options.detail,
+      actions: options.actions,
     }),
   )
 }

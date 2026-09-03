@@ -130,6 +130,30 @@ impl TempRepo {
         self.git(&["commit", "-q", "-m", message]);
     }
 
+    /// `commit_all` with both dates pinned to `epoch` seconds.
+    ///
+    /// For a history whose *order* is under test. `cide_git::log` walks by committer time, and a
+    /// fixture that commits six times inside one wall-clock second hands the walk a six-way tie
+    /// whose order is whatever the heap says — which is how a range walk was seen to emit the
+    /// hidden side's ancestor once in a dozen runs. Real histories are seconds or minutes apart;
+    /// a test that wants to be about the walk and not about the clock says so here.
+    pub fn commit_all_at(&self, message: &str, epoch: i64) {
+        self.git(&["add", "-A"]);
+        let stamp = format!("{epoch} +0000");
+        let output = Command::new("git")
+            .current_dir(&self.root)
+            .env("GIT_AUTHOR_DATE", &stamp)
+            .env("GIT_COMMITTER_DATE", &stamp)
+            .args(["commit", "-q", "-m", message])
+            .output()
+            .unwrap_or_else(|e| panic!("running git commit: {e}"));
+        assert!(
+            output.status.success(),
+            "git commit failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// `git ls-files --stage`: mode, oid, stage and path for every index entry.
     ///
     /// This *is* the index for comparison purposes — everything else in the file is stat data

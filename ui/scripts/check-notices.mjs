@@ -106,6 +106,37 @@ try {
       + 'the same words, and two toasts would explain no more than one',
   )
 
+  // --- the same words, with newer facts under them (M37) ------------------------------------
+  //
+  // A toast never dismisses itself. A second pull half an hour after the first, with the same
+  // headline, used to be declined — and the toast still on screen went on offering *View commits*
+  // for the FIRST pull's range. Same text, one toast, but the newer body and the newer link.
+  {
+    const link = () => [{ label: 'View commits', run() {} }]
+    const first = m.admit([], { id: 1, kind: 'ok', text: 'pulled', detail: 'a1  one', actions: link() })
+    const again = m.admit(first, { id: 2, kind: 'ok', text: 'pulled', detail: 'b2  two', actions: link() })
+    eq(again.length, 1, 'a repeat that carries an action is still one toast')
+    eq(again[0].id, 1, '…keeping the id it had, so React keeps the element and its open disclosure')
+    eq(again[0].detail, 'b2  two', '…with the NEWER body under the same words')
+    ok(again[0].actions !== first[0].actions, '…and the newer link — the old one opened the old range')
+
+    const stack = m.admit(m.admit([], notice(1, 'a')), notice(2, 'b'))
+    const refreshed = m.admit(stack, { id: 3, kind: 'ok', text: 'a', actions: link() })
+    eq(refreshed.map((n) => n.text), ['a', 'b'], 'refreshed in place: nothing in the stack moves')
+    eq(refreshed[0].id, 1, 'and in place means the same id at the same position')
+
+    const bodied = m.admit([], { id: 1, kind: 'ok', text: 'same', detail: 'x' })
+    ok(
+      m.admit(bodied, { id: 2, kind: 'ok', text: 'same', detail: 'x' }) === bodied,
+      'a repeat that brings nothing new — same body, no action — is still declined by returning '
+        + 'the SAME array: the retried failure this rule was written for',
+    )
+    ok(
+      m.admit(bodied, { id: 2, kind: 'ok', text: 'same', detail: 'y' }) !== bodied,
+      'but a different body is news',
+    )
+  }
+
   eq(m.MAX_SHOWN, 3, 'three at once — beyond that the stack covers the pane it is reporting on')
   let stack = []
   for (const [i, text] of ['a', 'b', 'c', 'd', 'e'].entries()) {
@@ -231,6 +262,19 @@ try {
   eq(woken, before, 'an unsubscribed listener is not called')
   m.clearNotices()
 
+  {
+    let ran = 0
+    m.notify('with a link', {
+      kind: 'ok',
+      actions: [{ label: 'View commits', run: () => void (ran += 1) }],
+    })
+    const [linked] = m.getSnapshot()
+    eq(linked.actions.length, 1, 'notify carries the actions through to the notice')
+    linked.actions[0].run()
+    eq(ran, 1, 'as callables, bound to the outcome they were made for')
+    m.clearNotices()
+  }
+
   /* ------------------------------------------------------------------ three kinds, not two */
   //
   // The vocabulary is `ok` / `warn` / `error`, and each one reaches the screen as a different
@@ -300,9 +344,24 @@ try {
   }
   // ...and the click targets are NOT, so a drag beginning on the disclosure triangle opens it
   // rather than starting a selection.
-  for (const part of ['.summary', '.dismiss']) {
+  for (const part of ['.summary', '.dismiss', '.action']) {
     eq(rule.includes(part), false, `${part} stays unselectable — it is a control, not text`)
   }
+
+  /* ------------------------------------------------- following an action dismisses the toast */
+  //
+  // The action is the toast's continuation: *View commits* opens the log the report was about,
+  // and a report whose link has already been taken is noise over the surface it opened. Pinned on
+  // the component because the model cannot see it — `dismiss` is a store call from a click.
+  const toast = readFileSync(join(UI, 'src', 'chrome', 'Failures.tsx'), 'utf8').replace(
+    /\/\*[\s\S]*?\*\//g,
+    '',
+  )
+  ok(
+    /action\.run\(\)\s+dismiss\(notice\.id\)/.test(toast),
+    'following an action runs it and then dismisses the toast that offered it',
+  )
+  ok(toast.includes('notice.actions.map('), 'and every action is drawn, not only the first')
 
   /* --------------------------------------------------- one edge colour per kind, all distinct */
   //

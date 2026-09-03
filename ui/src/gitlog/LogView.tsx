@@ -52,6 +52,7 @@ import {
   branchFromValue,
   branchValue,
   changeCounts,
+  branchLabel,
   chipTarget,
   chipTitle,
   clearFilters,
@@ -67,7 +68,6 @@ import {
   repoStripOn,
   revealFindable,
   revealNote,
-  revLabel,
   rowTitle,
   when,
   type LogFilter,
@@ -205,6 +205,12 @@ export function LogView({
 }: LogViewProps) {
   const filtered = isFiltered(filter)
   const strip = repoStripOn(repos)
+  // The repository the filter is narrowed to, by name — only when the rows would otherwise carry
+  // chips for several, which is the same count that decides whether naming one is information or
+  // noise. `repoChipFor` is `null` for a repository the list has not caught up with, and the
+  // label then says nothing rather than a uuid.
+  const scopeName =
+    strip && filter.repo !== null ? (repoChipFor(repos, filter.repo)?.name ?? null) : null
   const refNote = missingRefNote(page, filter)
   const note = revealNote(reveal)
 
@@ -256,6 +262,7 @@ export function LogView({
           filter={filter}
           filtered={filtered}
           branches={branches}
+          scopeName={scopeName}
           busy={busy}
           onFilter={onFilter}
           onRefresh={onRefresh}
@@ -1005,10 +1012,12 @@ export function RangeDetails({
 function BranchBox({
   filter,
   branches,
+  scopeName,
   onFilter,
 }: {
   filter: LogFilter
   branches: readonly string[]
+  scopeName: string | null
   onFilter: (next: LogFilter) => void
 }) {
   const [query, setQuery] = useState('')
@@ -1016,14 +1025,7 @@ function BranchBox({
   const [highlight, setHighlight] = useState(-1)
 
   const value = branchValue(filter.branch)
-  const chosenLabel =
-    filter.branch.kind === 'rev'
-      ? revLabel(filter.branch.spec)
-      : filter.branch.kind === 'all'
-        ? 'All branches'
-        : filter.branch.kind === 'branch'
-          ? filter.branch.name
-          : 'Current branch'
+  const chosenLabel = branchLabel(filter.branch, scopeName)
 
   const rows = branchRows(branches, query, value, chosenLabel)
   const note = branchOverflowNote(branches, query)
@@ -1162,6 +1164,7 @@ function FilterBar({
   filter,
   filtered,
   branches,
+  scopeName,
   busy,
   onFilter,
   onRefresh,
@@ -1169,13 +1172,14 @@ function FilterBar({
   filter: LogFilter
   filtered: boolean
   branches: readonly string[]
+  scopeName: string | null
   busy: boolean
   onFilter: (next: LogFilter) => void
   onRefresh: () => void
 }) {
   return (
     <div className={styles.filters} data-audit="logFilters">
-      <BranchBox filter={filter} branches={branches} onFilter={onFilter} />
+      <BranchBox filter={filter} branches={branches} scopeName={scopeName} onFilter={onFilter} />
       <input
         className={styles.input}
         data-audit="logAuthor"

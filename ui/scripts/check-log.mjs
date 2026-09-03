@@ -791,16 +791,26 @@ try {
 
   // --- the filter bar ------------------------------------------------------------------------
 
-  eq(m.NO_FILTER, { branch: { kind: 'head' }, author: '', text: '' }, 'the unfiltered value')
+  eq(
+    m.NO_FILTER,
+    { branch: { kind: 'head' }, author: '', text: '', repo: null },
+    'the unfiltered value',
+  )
   eq(m.isFiltered(m.NO_FILTER), false, 'and it is not a filter')
   eq(m.isFiltered({ ...m.NO_FILTER, author: '  ' }), false, 'whitespace is not a filter either')
   eq(m.isFiltered({ ...m.NO_FILTER, text: 'fix' }), true, 'text is')
   eq(m.isFiltered({ ...m.NO_FILTER, author: 'ivan' }), true, 'an author is')
   eq(m.isFiltered({ ...m.NO_FILTER, branch: { kind: 'all' } }), true, 'and so is re-rooting the walk')
+  eq(
+    m.isFiltered({ ...m.NO_FILTER, repo: 'r1' }),
+    true,
+    'and so is narrowing to one repository — nothing in the bar sets it, so *Clear filters* '
+      + 'must be the way back or there is none (M37)',
+  )
 
   {
-    const set = { branch: { kind: 'all' }, author: 'ivan', text: 'fix' }
-    eq(m.clearFilters(set), m.NO_FILTER, 'Clear clears all three, the branch included')
+    const set = { branch: { kind: 'all' }, author: 'ivan', text: 'fix', repo: 'r1' }
+    eq(m.clearFilters(set), m.NO_FILTER, 'Clear clears all four, the branch and the repository included')
     ok(
       m.clearFilters(m.NO_FILTER) === m.NO_FILTER,
       'and clearing an already-clear bar returns the *same object*, so `LogTab`’s reference '
@@ -815,6 +825,12 @@ try {
     'two branches do not',
   )
   eq(m.sameBranch({ kind: 'head' }, { kind: 'all' }), false, 'and neither do two kinds')
+  eq(
+    m.sameFilter({ ...m.NO_FILTER, repo: 'a' }, { ...m.NO_FILTER, repo: 'b' }),
+    false,
+    'and neither do two repositories — the scope is derived from this, so a walk over the wrong '
+      + 'root would otherwise be reported as the same question',
+  )
 
   // The `<select>` round trip. A branch may legitimately be called `head` or `all`, and a bare
   // name as the option value would silently re-root onto HEAD for either of them.
@@ -1090,7 +1106,7 @@ try {
 
     eq(
       m.findCommitFilter(OID),
-      { branch: { kind: 'rev', spec: OID }, author: '', text: '' },
+      { branch: { kind: 'rev', spec: OID }, author: '', text: '', repo: null },
       'the button clears both boxes AND re-roots the walk at the commit. Clearing alone would not '
         + 'be enough and would look like it should be: the commit is below the page, not hidden by '
         + 'a filter, so an unfiltered page one still starts at HEAD and lands the user back on the '
@@ -1113,6 +1129,53 @@ try {
     )
     ok(m.revLabel(OID).includes('e5f6a71'), 'the branch control names a re-rooted walk by its short oid')
     ok(!m.revLabel(OID).includes(OID), '…and not by forty characters in a 130px control')
+
+    // --- *View commits* on a pull's notice (M37) --------------------------------------------------
+    const RANGE = `${'a'.repeat(40)}..${'b'.repeat(40)}`
+    eq(
+      m.receivedFilter(RANGE, 'r1'),
+      { branch: { kind: 'rev', spec: RANGE }, author: '', text: '', repo: 'r1' },
+      '*View commits* re-roots the walk at the pull’s range, in the pull’s repository, with '
+        + 'nothing else set. The repository is not optional: a full oid lives in one object '
+        + 'database, and a bare range under a multi-root tab’s merged scope fails every other root',
+    )
+    eq(m.isFiltered(m.receivedFilter(RANGE, 'r1')), true, '…which is a filter, so *Clear filters* is the way back to HEAD')
+    eq(
+      m.branchFromValue(m.branchValue(m.receivedFilter(RANGE, 'r1').branch)),
+      { kind: 'rev', spec: RANGE },
+      '…and it round-trips through the branch control',
+    )
+    eq(
+      m.revLabel(RANGE),
+      `Range ${'a'.repeat(7)}..${'b'.repeat(7)}`,
+      'a range of two full oids is abbreviated at BOTH ends — `shortenOid` rightly leaves an '
+        + 'expression alone, and eighty-three characters is not a label for a 130px control',
+    )
+    eq(
+      m.revLabel(`${'a'.repeat(40)}...${'b'.repeat(40)}`),
+      `Range ${'a'.repeat(7)}...${'b'.repeat(7)}`,
+      '…keeping the dots it was given: `..` and `...` are different walks',
+    )
+    eq(m.revLabel('v1.0..HEAD'), 'Revision v1.0..HEAD', 'and a range of names is a revision expression, as before')
+    eq(
+      m.branchLabel({ kind: 'rev', spec: RANGE }, null),
+      m.revLabel(RANGE),
+      'the control’s label is the range alone in a single-root project',
+    )
+    eq(
+      m.branchLabel({ kind: 'rev', spec: RANGE }, 'app'),
+      `${m.revLabel(RANGE)} in app`,
+      '…and names the repository when the tab is narrowed to one of several',
+    )
+    eq(
+      m.branchLabel({ kind: 'branch', name: 'main' }, 'app'),
+      'main in app',
+      '…on every kind, not only a range: the narrowing outlives the range, and `main` alone '
+        + 'would be reading the wrong scope',
+    )
+    eq(m.branchLabel({ kind: 'head' }, null), 'Current branch', 'the plain readings are unchanged')
+    eq(m.branchLabel({ kind: 'all' }, null), 'All branches', '…all of them')
+    eq(m.branchLabel({ kind: 'branch', name: 'feature/login' }, null), 'feature/login', '…including a branch by name')
   }
 
   // --- the wiring, over stripped source ------------------------------------------------------------
@@ -1157,6 +1220,40 @@ try {
       /export function requestLogReveal\(/.test(tab),
       'the log exports a reveal seam. Without one a blame click could only open the panel at HEAD, '
         + 'which after a click on a 2019 line reads as broken',
+    )
+
+    // *View commits* on a pull's notice. (M37)
+    const requests = stripComments(
+      readFileSync(join(UI, 'src', 'gitlog', 'logRequests.ts'), 'utf8'),
+    )
+    ok(
+      /export function requestLogFilter\(/.test(requests),
+      'and a filter seam beside the reveal one: *View commits* on a pull’s notice is a filter to '
+        + 'set, not a commit to find. In its own module because `LogTab.tsx` imports from '
+        + '`keys/dispatch.ts`, which is the producer',
+    )
+    ok(
+      /useFilterRequests\(\(s\) => s\.pending\)/.test(tab),
+      'the Log tab consumes it — the stored object itself, so `check:selectors` has nothing to say',
+    )
+    ok(
+      /setTyped\(wanted\.filter\)/.test(tab),
+      '…by setting the typed filter, so it takes the same debounce and the same fetch effect as a '
+        + 'click in the bar',
+    )
+    ok(
+      /applied\.repo === null \? null : \{ kind: 'one', repo: applied\.repo \}/.test(tab),
+      'and `LogFilter.repo` narrows the scope — from the APPLIED filter, so the scope cannot move '
+        + 'on a keystroke the debounce is holding back',
+    )
+    ok(
+      /oneScope \?\? pinnedScope \?\? mergedScope/.test(tab),
+      '…behind the History tab’s own repository, which no filter changes',
+    )
+    const dispatch = stripComments(readFileSync(join(UI, 'src', 'keys', 'dispatch.ts'), 'utf8'))
+    ok(
+      /requestLogFilter\(project, receivedFilter\(/.test(dispatch),
+      'and the pull’s notice is the producer, through `receivedFilter` and not a hand-built object',
     )
     ok(
       /requestLogReveal\(/.test(pane),

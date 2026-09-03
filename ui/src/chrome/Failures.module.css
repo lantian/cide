@@ -131,6 +131,43 @@
 }
 
 /*
+ * The way on from a report — *View commits* under a pull. (M37)
+ *
+ * The same shape as `LogView.module.css`'s `.inlineClear`, which is the other "next move beside
+ * the sentence that explains it" in this vocabulary: a small bordered button, not a link inside
+ * the sentence. `.text` opts in to selection below, and a control inside it would be dragged
+ * into the selection with the words. No transition — it is a control the user is aiming at.
+ */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 0;
+}
+
+.action {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--chrome);
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.action:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/*
  * The disclosure under a report. Collapsed it is one 11.5px word; open it is the commit list.
  *
  * `max-height` with a scroll rather than an unbounded body: ten commits at 15px is 150px,
@@ -208,9 +245,9 @@
  * copy-out away while looking correct in source. `check:css-prefix` is the gate that keeps the
  * pair together; the whole argument is written out at the root rule in `tokens.css`.
  *
- * Deliberately not on `.summary` or `.dismiss`. Those are click targets — a drag that begins on
- * the disclosure triangle should open it, not start a selection — and neither carries text worth
- * taking.
+ * Deliberately not on `.summary`, `.dismiss` or `.action`. Those are click targets — a drag that
+ * begins on the disclosure triangle should open it, not start a selection — and none of them
+ * carries text worth taking.
  */
 .text,
 .hint,

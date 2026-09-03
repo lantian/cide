@@ -24,6 +24,7 @@ mod support;
 
 use cide_git::pull;
 use cide_ipc::git::{GitError, PullDefault, PullRequest, PullStrategy};
+use cide_ipc::history::{LogCursor, LogQuery, LogRefs, LogScope, Simplify};
 use support::{TempRepo, assert_no_sequencer_state, clone_of, worktree_hash};
 
 /// `cide-git` takes no configuration, and a pull touches no proxy environment on the libgit2
@@ -863,5 +864,143 @@ fn a_refused_pull_does_not_remember_the_answer() {
     assert!(
         !found,
         "an answer that never ran must not pin the user to a strategy"
+    );
+}
+
+// --- what came down, as a range the log can walk ------------------------------------------
+
+/// `git rev-list <spec>`, as full oids, sorted — the order is git's business, the set is ours.
+fn rev_list(repo: &TempRepo, spec: &str) -> Vec<String> {
+    let mut oids: Vec<String> = repo
+        .git(&["rev-list", spec])
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    oids.sort();
+    oids
+}
+
+/// What `cide_git::log` lists for `LogRefs::Rev { spec }` over this repository, sorted the same
+/// way. This is the walk *View commits* runs, so the test asks the real one and not a revwalk of
+/// its own.
+fn log_rev(repo: &TempRepo, spec: &str) -> Vec<String> {
+    let info = cide_git::repo::discover(std::slice::from_ref(&repo.root))
+        .into_iter()
+        .next()
+        .expect("the temp repo is discoverable");
+    let query = LogQuery {
+        scope: LogScope::One { repo: info.id },
+        refs: LogRefs::Rev { spec: spec.into() },
+        cursor: LogCursor::Newest,
+        path: None,
+        follow: false,
+        simplify: Simplify::Default,
+        first_parent: false,
+        author: None,
+        text: None,
+        limit: 100,
+        scan_limit: 20_000,
+        graph: false,
+        graph_lanes: 12,
+    };
+    let page = cide_git::log::log(std::slice::from_ref(&info), &query).expect("a log page");
+    let mut oids: Vec<String> = page.commits.iter().map(|c| c.oid.clone()).collect();
+    oids.sort();
+    oids
+}
+
+#[test]
+fn received_is_the_range_the_commits_came_from_under_every_strategy() {
+    for strategy in [
+        PullStrategy::FastForward,
+        PullStrategy::Merge,
+        PullStrategy::Rebase,
+    ] {
+        let (origin, work) = pair("received");
+        // Three upstream commits, so the range is more than one row; and for the two strategies
+        // that integrate, one of ours, so there is something to merge or replay.
+        //
+        // A minute apart, and after `pair`'s root commit, because this test is about which
+        // commits the range names and not about how the walk orders a tie: six commits inside one
+        // second once made it emit the root — hidden behind `mine` — before it had popped `mine`
+        // and learned so. `docs/journal.md` (M37) records that as the walk's, not this feature's.
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs() as i64
+            + 3_600;
+        for n in 1..=3 {
+            origin.write(&format!("theirs{n}.txt"), b"theirs\n");
+            origin.commit_all_at(&format!("theirs {n}"), base + 60 * n);
+        }
+        if strategy != PullStrategy::FastForward {
+            work.write("mine.txt", b"mine\n");
+            work.commit_all_at("mine", base + 600);
+        }
+        let before = head(&work);
+
+        let outcome = pull::pull_with(
+            &work.root,
+            &request(strategy),
+            PullDefault::Ask,
+            &untouched(),
+        )
+        .expect("pull");
+        assert_eq!(outcome.strategy, Some(strategy), "{strategy:?}");
+        assert_eq!(outcome.advanced, 3, "{strategy:?}");
+
+        let upstream = work.git(&["rev-parse", "origin/main"]).trim().to_string();
+        assert_eq!(
+            outcome.received,
+            format!("{before}..{upstream}"),
+            "{strategy:?}: full oids, from the pre-pull tip to the upstream tip"
+        );
+
+        let listed = rev_list(&work, &outcome.received);
+        assert_eq!(
+            listed.len() as u32,
+            outcome.advanced,
+            "{strategy:?}: the range is what came down and nothing else"
+        );
+        if strategy != PullStrategy::FastForward {
+            // The merge commit, or the replayed `mine`: HEAD is new, and it was not received.
+            assert!(
+                !listed.contains(&head(&work)),
+                "{strategy:?}: `old..new` would have listed HEAD; `received` must not"
+            );
+        }
+        // Under the cap, so the toast's list and the range are the same commits.
+        assert_eq!(outcome.commits.len(), listed.len(), "{strategy:?}");
+        for commit in &outcome.commits {
+            assert!(
+                listed.iter().any(|oid| oid.starts_with(&commit.short_oid)),
+                "{strategy:?}: {} is in the toast but not in the range",
+                commit.short_oid
+            );
+        }
+        assert_eq!(
+            log_rev(&work, &outcome.received),
+            listed,
+            "{strategy:?}: the log walks the range to the same commits"
+        );
+    }
+}
+
+#[test]
+fn received_is_empty_when_nothing_came_down() {
+    let (_origin, work) = pair("received-empty");
+    let pulled = pull::pull(&work.root, None, &untouched()).expect("already up to date");
+    assert_eq!(pulled.advanced, 0);
+    assert_eq!(
+        pulled.received, "",
+        "a pull that took nothing names no range"
+    );
+
+    let fetched = cide_git::branch::fetch(&work.root, None, &untouched()).expect("fetch");
+    assert_eq!(
+        fetched.received, "",
+        "a fetch moves no branch, so it received nothing"
     );
 }

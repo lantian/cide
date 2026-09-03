@@ -136,6 +136,8 @@ try {
         'deletions',
         'commits',
         'moreCommits',
+        // The M37 half: the walk behind `commits` as a revspec, for *View commits* to hand the log.
+        'received',
         // The M20 half. `strategy` is what stops the notice saying "Fast-forwarded" after a
         // rebase, and `conflicts` is what makes a stopped merge a success with work attached
         // rather than a failure.
@@ -609,6 +611,7 @@ try {
     deletions: 0,
     commits: [],
     moreCommits: 0,
+    received: '',
     ...over,
   })
 
@@ -784,7 +787,9 @@ try {
 
   // --- one gesture, one answer, however many repositories ---------------------------------------
 
-  const repoFetch = (name, over = {}) => ({ name, outcome: pulled(over) })
+  // The id is derived from the name only so the fixture is short; the point of carrying it is
+  // that a real project can have two roots with one basename.
+  const repoFetch = (name, over = {}) => ({ repo: `id-${name}`, name, outcome: pulled(over) })
 
   eq(
     m.pullReport([repoFetch('app', { advanced: 2, filesChanged: 3, insertions: 9, deletions: 1 })]),
@@ -840,6 +845,47 @@ try {
     'no results is not a sentence — `dispatch.ts` never notifies for it, and this pins that '
       + 'calling it anyway cannot produce an empty toast with a bullet in it',
   )
+
+  // --- *View commits*, one per repository that received any (M37) -----------------------------
+
+  {
+    const RANGE = `${'a'.repeat(40)}..${'b'.repeat(40)}`
+    eq(
+      m.receivedLinks([repoFetch('app', { advanced: 2, received: RANGE })]),
+      [{ repo: 'id-app', label: 'View commits', spec: RANGE }],
+      'one repository: the bare label, the id and not the name, and the range passed through '
+        + 'untouched — Rust spelled it and Rust will parse it',
+    )
+    eq(
+      m
+        .receivedLinks([
+          repoFetch('app', { advanced: 2, received: RANGE }),
+          repoFetch('lib', { advanced: 1, received: RANGE }),
+          repoFetch('docs'),
+        ])
+        .map((l) => l.label),
+      ['View commits in app', 'View commits in lib'],
+      'several: one link per repository that received any, each named — "Updated 2 of 4 '
+        + 'repositories" says nothing about which two — and none for the one that took nothing',
+    )
+    eq(m.receivedLinks([repoFetch('app')]), [], 'nothing came down, nothing to view')
+
+    const dispatch = stripComments(read('../src/keys/dispatch.ts'))
+    ok(
+      /done\.push\(\{ repo: repo\.id, name: repo\.name/.test(dispatch),
+      'dispatch labels each answer with the repository’s id',
+    )
+    ok(
+      /role\.kind === 'shell' \? receivedLinks\(done\) : \[\]/.test(dispatch),
+      'and offers the links in the shell window only — the tool window is drawn there, and the '
+        + 'request the link parks lives in that window’s realm',
+    )
+    ok(
+      /actions: actions\.length > 0 \? actions : undefined/.test(dispatch),
+      'and passes no list rather than an empty one, so a detached window’s notice is not "news" '
+        + 'to `notices.admit`',
+    )
+  }
 
   // --- what a *merge* asks, and what it says afterwards (M24) ----------------------------------
 

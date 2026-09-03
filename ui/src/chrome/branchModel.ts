@@ -726,6 +726,8 @@ export interface FetchReport {
   deletions: number
   commits: readonly { shortOid: string; summary: string; author: string }[]
   moreCommits: number
+  /** `<pre-pull tip>..<upstream tip>`, full oids — the walk behind `commits`, uncapped. `''` when nothing came down. */
+  received: string
   /** What the pull actually did. Absent for a plain fetch and for a pull that took nothing. */
   strategy?: 'fastForward' | 'merge' | 'rebase' | undefined
   /** How many of your own commits a rebase replayed. */
@@ -860,6 +862,12 @@ export function fetchDetail(outcome: FetchReport): string {
 
 /** One repository's answer, labelled. */
 export interface RepoFetch {
+  /**
+   * `RepoInfo.id`. What a *View commits* link opens the log on — the id and not the name, because
+   * two roots in a monorepo can share a basename, and a link that resolved its repository by
+   * name would open somebody else's range.
+   */
+  repo: string
   /** `RepoInfo.name`. Ignored when there is only one repository. */
   name: string
   outcome: FetchReport
@@ -912,6 +920,38 @@ export function pullReport(results: readonly RepoFetch[]): { text: string; detai
     text: `Updated ${where} · ${commits(total((o) => o.advanced))}${stat}`,
     detail,
   }
+}
+
+/**
+ * The links a pull's notice offers — *View commits*, one per repository that received any. (M37)
+ *
+ * Derived here rather than in `keys/dispatch.ts` for the reason `pullReport` is: the rule is a
+ * decision that fails silently — a link on a repository that received nothing opens an empty log,
+ * a label naming no repository in a project with four is a guess — and `check-branches.mjs` drives
+ * this file, not a keystroke handler.
+ *
+ * One link per repository and not one for the project, because a range is a fact about one object
+ * database and so is the log's graph. With one repository the label is the bare *View commits*, as
+ * `pullReport`'s single-repository sentence hides the multi-root machinery; with several it names
+ * the repository, because *Updated 2 of 4 repositories* says nothing about which two.
+ */
+export interface ReceivedLink {
+  /** `RepoFetch.repo` — the id. */
+  repo: string
+  label: string
+  /** `FetchOutcome::received`, passed through untouched. */
+  spec: string
+}
+
+export function receivedLinks(results: readonly RepoFetch[]): ReceivedLink[] {
+  const alone = results.length === 1
+  return results
+    .filter((r) => r.outcome.received !== '')
+    .map((r) => ({
+      repo: r.repo,
+      label: alone ? 'View commits' : `View commits in ${r.name}`,
+      spec: r.outcome.received,
+    }))
 }
 
 // --- merge into current --------------------------------------------------------------------
