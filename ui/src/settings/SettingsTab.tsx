@@ -38,6 +38,7 @@ export interface SettingsTabProps {
 export function SettingsTab({ project, section }: SettingsTabProps) {
   const [active, setActive] = useState<SettingsSection>(section)
   const settings = useSettings()
+  const version = useWorkspace((s) => s.boot?.capabilities.version ?? null)
   const claudeVersion = useWorkspace((s) => s.boot?.capabilities.claudeVersion ?? null)
   const { patch, setTheme, setWindowMode } = useSettingsActions()
 
@@ -168,6 +169,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
               patch,
               setTheme,
               setWindowMode,
+              version,
               claudeVersion,
               cliSupport,
               openLogDir: revealLogDir,

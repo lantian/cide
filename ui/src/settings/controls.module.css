@@ -313,3 +313,13 @@
   -webkit-user-select: text;
   user-select: text;
 }
+
+/* A read-only value in a row's control slot. Mono and selectable for `.pathReadout`'s reason;
+   no margin, because it sits beside its label rather than under it. */
+.readout {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  -webkit-user-select: text;
+  user-select: text;
+}

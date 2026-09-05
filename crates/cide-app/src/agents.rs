@@ -28,15 +28,18 @@
 //! throughout. That is what makes it safe to take this lock from the hook applier thread, whose
 //! ordering guarantee is load-bearing (see [`note_hook`]).
 //!
-//! # Concurrency and the worktree are the same lock
+//! # Concurrency and the checkout are the same lock
 //!
-//! With [`Isolation::Worktree`] an agent has exactly **one** checkout — `.cide/worktrees/<agent>`
-//! on branch `cide/<agent>` — so a second concurrent run of that role would be a second process
-//! editing one checkout with nothing arbitrating between them.
-//! [`cide_agents::effective_max_concurrent`] therefore clamps a role's own `max-concurrent` to 1,
-//! and this module *records* that clamped number on the run at dispatch rather than recomputing
-//! it later: see [`LiveRun::agent_limit`]. A dispatch for a busy agent **queues**; it does not
-//! spawn.
+//! With [`cide_agents::Isolation::Worktree`] a run on a task has its own checkout —
+//! `.cide/worktrees/<role>-<task>` on branch `cide/<role>-<task>`, `cide_agents::run_checkout`
+//! being the rule — and two children in one checkout would be two processes editing one tree
+//! with nothing arbitrating between them. So the checkout is stamped on the run at dispatch
+//! ([`DispatchSpec::checkout`]) and admission holds a run whose checkout is occupied; the role's
+//! `max-concurrent` and the project's cap are recorded the same way ([`LiveRun::agent_limit`])
+//! rather than recomputed later. A run with **no task** stands in the project root and has no
+//! checkout to hold (M40): nothing serialises two of them, and nothing may wind an idle one down
+//! to reclaim a directory the user is standing in too. A dispatch for a busy agent **queues**; it
+//! does not spawn.
 //!
 //! # Slot accounting is held from dispatch, never derived from the phase
 //!
@@ -116,12 +119,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cide_agents::{Delivery, Isolation, Observation, RunPlan, SessionBinding};
+use cide_agents::{Delivery, Observation, RunPlan, SessionBinding};
 use cide_claude::HookFrame;
 use cide_core::CoreError;
 use cide_ipc::{
     AgentId, AgentRun, ClaudeSettings, Geometry, Harness, PaneRole, ProjectId, ProxySettings,
-    RunId, RunState, SessionId, SessionState, TaskId, Theme,
+    RunId, RunNotify, RunState, SessionId, SessionState, TaskId, Theme,
 };
 use cide_pty::PtySession;
 use parking_lot::Mutex;
@@ -217,6 +220,18 @@ struct LiveRun {
     /// The worktree this run stands in, recorded at dispatch for the same reason as the limits.
     /// See [`DispatchSpec::checkout`]; [`admit_a_pass`]'s checkout gate is what reads it.
     checkout: Option<String>,
+    /// Where this run's turn endings are announced, as the dispatch chose. (M40) Read at the
+    /// edge by `agent_rpc::note_run_over`, carried on the wire so the run list can show
+    /// `quiet`, and through the snapshot so a resumed run keeps its address.
+    notify: RunNotify,
+    /// The directory the child was started in — the worktree, or the root under shared
+    /// isolation — once it has been. `None` while queued: nothing has forked, so nothing can
+    /// have connected to the agent socket and asked. (M39)
+    ///
+    /// Not on [`cide_ipc::AgentRun`]: the panel has no use for an absolute path, and the one
+    /// consumer is `agent_rpc`, which resolves a relative path in `cide_task_attach` against
+    /// it. [`Self::note`] carries the same fact as a sentence for a person; this is the value.
+    cwd: Option<std::path::PathBuf>,
     /// Dispatch order. The panel's groups are ordered within themselves by this, and admission
     /// walks it so a queue is first-in-first-out across agents as well as within one.
     seq: u64,
@@ -305,10 +320,26 @@ impl LiveRun {
             state: self.state.clone(),
             task: self.task.clone(),
             started_unix_ms: self.started_unix_ms,
+            notify: self.notify.clone(),
             stale_turn: self.stale_turn,
             note: self.note.clone(),
         }
     }
+}
+
+/// One run as the agent socket sees it: who it signs as, and where it stands. (M39)
+///
+/// Not the wire [`AgentRun`] — that carries no path and must not grow one for the panel's
+/// sake — and not [`LiveRun`], which is private to this module and carries a dozen fields
+/// `agent_rpc` has no business reading. `cwd` is present by construction: see
+/// [`AgentRegistry::run_scopes_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunScope {
+    pub run: RunId,
+    pub project: ProjectId,
+    pub agent: AgentId,
+    pub label: String,
+    pub cwd: std::path::PathBuf,
 }
 
 /// Everything the command worker resolved before the queue was touched.
@@ -332,12 +363,15 @@ pub struct DispatchSpec {
     pub prompt: String,
     pub agent_limit: u16,
     pub project_limit: u16,
-    /// The worktree this run will stand in — `cide_agents::checkout_name` of (role, task) —
-    /// or `None` under shared isolation, where every run stands in the project root and
-    /// N-in-one-directory is what the setting says on its face. Stamped at dispatch for the
+    /// The worktree this run will stand in — `cide_agents::run_checkout` over (config, role,
+    /// task) — or `None` for a run that stands in the project root: shared isolation, a
+    /// `worktree: false` role, or a dispatch with no task (M40). Stamped at dispatch for the
     /// same reason the limits are: the queue must enforce the fact the project had when the
-    /// run was dispatched, without a disk read under the lock.
+    /// run was dispatched, without a disk read under the lock — and `start_child` calls the
+    /// same function at the fork, so the gate and the directory cannot disagree.
     pub checkout: Option<String>,
+    /// Where the run's turn endings are announced. (M40) See [`cide_ipc::RunNotify`].
+    pub notify: RunNotify,
 }
 
 /// One run the queue has decided to start. Produced under the lock, acted on outside it.
@@ -479,6 +513,8 @@ impl AgentRegistry {
                 agent_limit: spec.agent_limit.max(1),
                 project_limit: spec.project_limit.max(1),
                 checkout: spec.checkout,
+                notify: spec.notify,
+                cwd: None,
                 seq,
                 frozen: None,
                 stale_turn: false,
@@ -557,8 +593,9 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             // whose child may still be standing in the same checkout is on it. `Idle` does not
             // block — its parked child is wound down by `bring_up` at the moment the checkout
             // is claimed — and `Interrupted` and the terminal states hold no process at all.
-            // `None` (shared isolation) collides with nothing: N runs in one directory is what
-            // that setting says on its face.
+            // `None` collides with nothing: N runs in one directory is what shared isolation
+            // says on its face, and a run with no task (M40) stands in the project root by
+            // design — a gate on the root would be a gate on the user.
             let occupied = checkout.as_deref().is_some_and(|name| {
                 inner.runs.values().any(|other| {
                     other.run != run
@@ -595,7 +632,15 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             };
             live.continuing = false;
             let prompt = match resume.is_some() {
-                true => continuation_prompt(live.task.as_ref(), live.task_title.as_deref()),
+                true => continuation_prompt(
+                    live.task.as_ref(),
+                    live.task_title.as_deref(),
+                    // Both facts the sentence needs: whether a bridge will be attached at all,
+                    // and what this run's CLI calls the tool. `start_child` refuses a bridgeless
+                    // run outright, so the `None` arm is a belt-and-braces answer rather than a
+                    // state a user reaches.
+                    cide_hook_binary().and_then(|_| cide_agents::harness::for_kind(live.harness)),
+                ),
                 false => live.prompt.clone(),
             };
             admitted.push(Admission {
@@ -630,25 +675,56 @@ fn resume_point(live: &LiveRun) -> Option<ResumePoint> {
     }
 }
 
+/// What a queued run in a paused project says instead of nothing.
+///
+/// One sentence, naming the state and the gesture that ends it. It deliberately does *not* say
+/// "waiting for a slot": the slots may be entirely free, which is what made this state so hard to
+/// read from the panel — a paused project with two idle slots and a queued run looks like a bug in
+/// the scheduler until you know the queue is shut.
+///
+/// A const because three surfaces quote it — the panel through `AgentRun::note`, `cide_agent_runs`
+/// through `render_run`, and the tests — and a second wording of one fact reads as a second fact.
+pub(crate) const PAUSED_QUEUE_NOTE: &str =
+    "this project's agents are paused; nothing starts until Resume";
+
 /// The first line a resumed run is told. One line, for the same `\r` rule as every prompt.
 ///
 /// It does not restate the task body — the conversation being continued already holds it — but
 /// it does name the id, because a restart is exactly the moment the tracker may have moved
 /// under the run and `cide_task_get` is how it finds out.
-fn continuation_prompt(task: Option<&TaskId>, title: Option<&str>) -> String {
+///
+/// # `tools` carries the same two facts `cmd::agents::opening_prompt`'s does
+///
+/// And for the same reasons, arrived at later: this function is the *third* place cide names a
+/// tracker tool to a run, and it was the one nobody noticed. It hard-coded Claude Code's
+/// `mcp__cide__cide_task_get` — uncallable under opencode — and, unlike both preambles, it was
+/// gated on nothing at all, so a run resumed without a bridge was told to call a tool that had
+/// never been attached. `None` drops the sentence; `Some(harness)` spells it that CLI's way.
+fn continuation_prompt(
+    task: Option<&TaskId>,
+    title: Option<&str>,
+    tools: Option<&dyn cide_agents::harness::Harness>,
+) -> String {
     let title = title
         .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|title| !title.is_empty())
         .map(|title| format!(" ({title})"))
         .unwrap_or_default();
-    match task {
-        Some(id) => format!(
-            "cide restarted while you were working. Re-read task {id}{title} with \
-             mcp__cide__cide_task_get, check your worktree with git status, and continue from \
-             where the conversation left off."
+    match (task, tools) {
+        (Some(id), Some(harness)) => format!(
+            "cide restarted while you were working. Re-read task {id}{title} with {}, \
+             check your worktree with git status, and continue from \
+             where the conversation left off.",
+            harness.tool_name("cide_task_get")
         ),
-        None => "cide restarted while you were working. Check your worktree with git status \
-                 and continue from where the conversation left off."
+        // A task it cannot re-read is a task it can still be reminded of by name; the git half of
+        // the sentence is the half that does not need the bridge.
+        (Some(id), None) => format!(
+            "cide restarted while you were working. You were on task {id}{title}: check your \
+             worktree with git status and continue from where the conversation left off."
+        ),
+        (None, _) => "cide restarted while you were working. Check the tree with git status and \
+                 continue from where the conversation left off."
             .to_string(),
     }
 }
@@ -665,11 +741,38 @@ impl AgentRegistry {
         }
     }
 
-    /// Note which directory a run is working in, for the row.
+    /// Note which directory a run is working in: for the row, and for the agent socket. (M39)
     fn note_cwd(&self, run: RunId, cwd: &std::path::Path) {
         if let Some(live) = self.inner.lock().runs.get_mut(&run) {
             live.note = Some(cwd.display().to_string());
+            live.cwd = Some(cwd.to_path_buf());
         }
+    }
+
+    /// What `agent_rpc` needs to scope a connection that names one of this project's runs:
+    /// the role to sign as, and the directory a relative path is read from. (M39)
+    ///
+    /// **A run without a cwd is not in the answer.** It is queued or restored-and-not-resumed,
+    /// so no child of it exists and nothing can have connected as it; answering the project
+    /// root for it would be answering a question that cannot legitimately be asked yet, and a
+    /// connection that *did* name such a run is one nothing this process started — refused,
+    /// like an unknown run id.
+    pub fn run_scopes_for(&self, project: ProjectId) -> Vec<RunScope> {
+        let inner = self.inner.lock();
+        inner
+            .runs
+            .values()
+            .filter(|run| run.project == project)
+            .filter_map(|run| {
+                Some(RunScope {
+                    run: run.run,
+                    project: run.project,
+                    agent: run.agent.clone(),
+                    label: run.agent_label.clone(),
+                    cwd: run.cwd.clone()?,
+                })
+            })
+            .collect()
     }
 
     /// Move a run to a new state, releasing its slot if this is the transition that ends its
@@ -791,15 +894,46 @@ impl AgentRegistry {
     }
 
     /// Every run this project has, in the order the panel's groups read them.
+    ///
+    /// # Why the pause note is derived here rather than written where the pause bites
+    ///
+    /// `admit_a_pass` skips a paused project's queue with a bare `continue`, and a run held there
+    /// looked exactly like a run waiting behind its role's concurrency: `[queued]`, no reason, in
+    /// the panel and in `cide_agent_runs` alike, while the roster went on saying `ready` and
+    /// dispatch went on answering "Dispatched". A terrastrike probe sat in that state for hours
+    /// with both project slots free.
+    ///
+    /// Writing the note at that `continue` was the obvious fix and is the wrong one twice over:
+    /// `live` is borrowed immutably there, and — the real reason — a run restored from the
+    /// snapshot into a paused project has never passed through an admission pass at all, so the
+    /// note would be missing on exactly the runs a restart leaves behind. Deriving it at wire
+    /// time covers both, needs no second pass, and cannot go stale: this function already holds
+    /// the lock that owns `paused_projects`.
+    ///
+    /// It rides [`AgentRun::note`] — the DTO's existing "what the queue is waiting on" slot,
+    /// already carrying `enqueue`'s *N ahead of it* — so the panel renders it with no change at
+    /// all, and `tools::render_run` passes it through to a model for free.
     pub fn runs_for(&self, project: ProjectId) -> Vec<AgentRun> {
         let inner = self.inner.lock();
+        let paused = inner.paused_projects.contains(&project);
         let mut runs: Vec<&LiveRun> = inner
             .runs
             .values()
             .filter(|run| run.project == project)
             .collect();
         runs.sort_by_key(|run| (group_rank(&run.state), run.seq));
-        runs.iter().map(|run| run.wire()).collect()
+        runs.iter()
+            .map(|run| {
+                let mut wire = run.wire();
+                // Only `Queued`. A `Paused` run says it in its own state, and a run in any other
+                // state is not being held by the queue — overriding its note would replace a fact
+                // about *that run* with one about the project.
+                if paused && matches!(wire.state, RunState::Queued) {
+                    wire.note = Some(PAUSED_QUEUE_NOTE.to_string());
+                }
+                wire
+            })
+            .collect()
     }
 
     /// Whether the queue will start anything new for this project.
@@ -930,7 +1064,7 @@ impl AgentRegistry {
         live.session.ok_or_else(|| {
             CoreError::Io(
                 "this run has not started yet, so there is no conversation to open. A queued run \
-                 has no child — it is waiting for its role's worktree."
+                 has no child — it is waiting for a slot, or for its checkout to free."
                     .into(),
             )
         })
@@ -1839,6 +1973,10 @@ struct SavedRun {
     /// status quo of sharing a checkout, not to anything worse.
     #[serde(default)]
     checkout: Option<String>,
+    /// Where the run's turn endings are announced. (M40) `Primary` for a file from before this
+    /// field, which is what every run then had.
+    #[serde(default)]
+    notify: RunNotify,
     /// The state at quit, kept **only** for its terminal arms: a `Finished` or `Failed` run
     /// restores verbatim, because history is history — the user asked for the panel's tail to
     /// be a durable record of runs, not a per-process scratchpad. Every other state restores
@@ -2031,6 +2169,7 @@ impl AgentRegistry {
                         agent_limit: live.agent_limit,
                         project_limit: live.project_limit,
                         checkout: live.checkout.clone(),
+                        notify: live.notify.clone(),
                         state: Some(live.state.clone()),
                     })
                     .collect(),
@@ -2132,6 +2271,10 @@ impl AgentRegistry {
                     agent_limit: saved.agent_limit.max(1),
                     project_limit: saved.project_limit.max(1),
                     checkout: saved.checkout,
+                    notify: saved.notify,
+                    // A restored run has no child until it is resumed, and the resume calls
+                    // `note_cwd` like a first start does.
+                    cwd: None,
                     seq,
                     frozen: None,
                     stale_turn: false,
@@ -2318,10 +2461,35 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
 /// worktree and its `PATH` is the user's, so a bare `cide-hook` in an `--mcp-config` resolves to
 /// nothing and the CLI reports `CONNECTION_CLOSED` from a process three levels below anything
 /// cide logs.
-fn cide_hook_binary() -> Option<PathBuf> {
+///
+/// # It says so when it misses, once
+///
+/// `None` reaches `cide_agents::dispatch_refusal` and refuses the dispatch, which is the user's
+/// half of the answer. The `warn!` is the other half: it names the path that was looked for, so a
+/// log from a machine where dispatch is refused says *which* file to build rather than leaving
+/// the reader to guess where "beside the executable" resolved to. Before this, a missing hook was
+/// silent in every channel cide has.
+///
+/// The **check** runs every call and the **log** runs once. Both halves matter. Re-checking is
+/// what lets somebody build `cide-hook` into a running instance and have the next dispatch work
+/// without a relaunch — the same "re-probes on a miss" courtesy `Facts::spec_cli` extends to
+/// `openspec`. Logging once is because this is reached from `roster`, which the agents coalescer
+/// rebuilds on every change: a per-call warning would print a paragraph about a static fact of the
+/// installation every time anybody touched a task.
+pub(crate) fn cide_hook_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let hook = exe.parent()?.join("cide-hook");
-    hook.exists().then_some(hook)
+    if !hook.exists() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                path = %hook.display(),
+                "no cide-hook beside this executable; subagent runs have no task tools and are refused"
+            );
+        });
+        return None;
+    }
+    Some(hook)
 }
 
 /// What a successful start produced.
@@ -2728,23 +2896,28 @@ fn start_child(
             admission.agent
         ))
     })?;
-    if let Some(why) = cide_agents::dispatch_refusal(agent, &project.config.agents) {
+    if let Some(why) =
+        cide_agents::dispatch_refusal(agent, &project.config.agents, facts.hook_bin.as_deref())
+    {
         return Err(CoreError::Io(why));
     }
 
-    let cwd = match project.config.agents.isolation {
-        // The role's own `worktree: false` opts it out of the checkout — its runs stand in
-        // the project root, exactly as under shared isolation, which is the arm below. Read
-        // off the same fresh `project.get` as the refusal, so a flag edited mid-queue is
-        // honoured at the fork — and the stamped `checkout` the admission gate used was
-        // `None` for such a role, so nothing was serialised on a directory it never takes.
-        Isolation::Worktree if agent.def.worktree => {
-            // One worktree per (role, task): `checkout_name` composes the name and the
-            // determinism is load-bearing — a resumed run recomputes this and must land in
-            // the directory its transcript lives under. Recomputed here from the fresh
-            // config rather than read off the run, exactly as the refusal above re-reads the
-            // role: `bring_up` acts on facts as they stand at the fork.
-            let name = cide_agents::checkout_name(&admission.agent, admission.task.as_ref());
+    // Where the run stands. `run_checkout` is the one rule, shared with `plan_dispatch`'s stamp
+    // so the admission gate and this fork cannot disagree. Read off the same fresh `project.get`
+    // as the refusal, so a role's `worktree: false` flipped mid-queue is honoured at the fork —
+    // and a run with no task lands in the project root under every isolation (M40).
+    let cwd = match cide_agents::run_checkout(
+        agent,
+        &project.config.agents,
+        admission.task.as_ref(),
+    ) {
+        Some(name) => {
+            // One worktree per (role, task), and the name's determinism is load-bearing — a
+            // resumed run recomputes this and must land in the directory its transcript lives
+            // under. Recomputed here from the fresh config rather than read off the run, exactly
+            // as the refusal above re-reads the role: `bring_up` acts on facts as they stand at
+            // the fork.
+            //
             // Idempotent, and called before every dispatch rather than once per checkout: a
             // user can delete `.cide/worktrees/<name>` between two runs, and `ensure` repairs
             // a registration whose directory has gone.
@@ -2769,9 +2942,11 @@ fn start_child(
             }
             tree.path
         }
-        // Nothing separates two runs here, which is what the setting says on its face and what
-        // `agents_config_set` refuses to arrange by accident.
-        Isolation::Worktree | Isolation::Shared => facts.root.clone(),
+        // Nothing separates two runs here — shared isolation, a `worktree: false` role, a run
+        // with no task — which is what each of those says on its face (and what
+        // `agents_config_set` refuses to arrange by accident). Nothing is wound down to reclaim
+        // the root either: the user is standing in it.
+        None => facts.root.clone(),
     };
 
     let plan = RunPlan {
@@ -3104,7 +3279,20 @@ mod tests {
             agent_limit,
             project_limit,
             checkout: None,
+            notify: RunNotify::Primary,
         }
+    }
+
+    /// One run's `note` **as the wire carries it** — which is the only place the pause reason
+    /// exists. Read through `runs_for` rather than off `LiveRun`, deliberately: the note is
+    /// derived at wire time, so reaching into the registry would test a field that is never sent.
+    fn wire_note(registry: &AgentRegistry, project: ProjectId, run: RunId) -> Option<String> {
+        registry
+            .runs_for(project)
+            .into_iter()
+            .find(|wire| wire.run == run)
+            .expect("the run is still listed")
+            .note
     }
 
     fn state_of(registry: &AgentRegistry, run: RunId) -> RunState {
@@ -3162,8 +3350,9 @@ mod tests {
     /// ran one and queued the other, because the role had one checkout and the limit was
     /// clamped to protect it. Now the checkout is per task and the limit means what it says —
     /// but the *gate* has to hold everything that would still collide: a second dispatch into
-    /// the same checkout, and any dispatch with no task at all, which shares the role's base
-    /// worktree.
+    /// the same checkout, which since M40 means the same task twice (a run with no task takes
+    /// no checkout at all — `spec()`'s `checkout: None` — and `a_role_with_room_for_three`
+    /// is the test that such runs are held by nothing but the limits).
     #[test]
     fn two_tasks_parallelise_and_one_checkout_serialises() {
         let with_checkout = |project, name: Option<&str>| DispatchSpec {
@@ -3185,17 +3374,18 @@ mod tests {
         assert_eq!(state_of(&registry, first), RunState::Starting);
         assert_eq!(state_of(&registry, second), RunState::Starting);
 
-        // The same checkout, twice: the second waits for the first to *end*, not merely to
-        // start — a `Starting`/`Running` child may be standing in that directory.
+        // The same checkout, twice — one task re-dispatched while its first run is still on
+        // it: the second waits for the first to *end*, not merely to start — a
+        // `Starting`/`Running` child may be standing in that directory.
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
-        let first = registry.enqueue(with_checkout(project, Some("developer")));
-        let second = registry.enqueue(with_checkout(project, Some("developer")));
+        let first = registry.enqueue(with_checkout(project, Some("developer-t-1")));
+        let second = registry.enqueue(with_checkout(project, Some("developer-t-1")));
         assert_eq!(registry.take_admissions().len(), 1);
         assert_eq!(
             state_of(&registry, second),
             RunState::Queued,
-            "two taskless dispatches share the base worktree and must serialise"
+            "two dispatches of one task share its checkout and must serialise"
         );
         registry.set_state(None, first, RunState::Running);
         assert!(
@@ -3591,9 +3781,10 @@ mod tests {
 
     /// A role allowed several slots gets them in one pass, not one per unrelated event.
     ///
-    /// Only reachable under `Isolation::Shared` — worktree isolation clamps a role to 1 — and the
-    /// bug it pins is a single-pass scan: only the front of an agent's queue is eligible, so one
-    /// pass starts one of three and leaves the other two waiting for something else to pump.
+    /// The runs here carry no checkout — shared isolation, or (M40) dispatches with no task,
+    /// which stand in the project root and are held by nothing but the limits — and the bug it
+    /// pins is a single-pass scan: only the front of an agent's queue is eligible, so one pass
+    /// starts one of three and leaves the other two waiting for something else to pump.
     #[test]
     fn a_role_with_room_for_three_starts_three() {
         let registry = AgentRegistry::default();
@@ -3909,6 +4100,81 @@ mod tests {
             state_of(&registry, queued),
             RunState::Queued,
             "a queued run has no child to freeze, and `Paused` is not a queue position"
+        );
+    }
+
+    /// A queued run in a paused project says *why* it is queued.
+    ///
+    /// The state the terrastrike audit found and could not read from any surface cide has: a probe
+    /// run sat `[queued]` for hours with both project slots free, while the roster called its role
+    /// `ready` and dispatch had answered "Dispatched" as usual. Nothing was broken — the queue was
+    /// shut, deliberately, by a pause taken before a restart — and nothing said so.
+    #[test]
+    fn a_queued_run_in_a_paused_project_says_the_pause_is_why() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let queued = registry.enqueue(spec(project, "developer", 1, 4));
+
+        // Before the pause it is queued for the ordinary reason, and must not claim otherwise.
+        let note = wire_note(&registry, project, queued);
+        assert!(
+            !note.as_deref().unwrap_or_default().contains("paused"),
+            "an open queue says nothing about a pause: {note:?}"
+        );
+
+        registry
+            .take_freezes(project, None, None, 1_000)
+            .expect("a project may always be paused");
+
+        let note = wire_note(&registry, project, queued).expect("a held run says why");
+        assert_eq!(note, PAUSED_QUEUE_NOTE);
+        // Names the gesture that ends it, not merely the state — a note saying only "paused"
+        // leaves the reader to find the button.
+        assert!(note.contains("Resume"), "{note}");
+        // And never "waiting for a slot": the slots are free, which is exactly what made this
+        // state unreadable from the panel.
+        assert!(!note.contains("slot"), "{note}");
+    }
+
+    /// The note is derived, so a run restored from the snapshot into a paused project carries it.
+    ///
+    /// The reason it is computed in `runs_for` rather than written at `admit_a_pass`'s `continue`:
+    /// a restored run has never been through an admission pass, so a note written there would be
+    /// missing on exactly the runs a restart leaves behind — which is the population the audit was
+    /// looking at.
+    #[test]
+    fn only_queued_runs_are_relabelled_by_a_pause() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let first = registry.enqueue(spec(project, "developer", 1, 4));
+        let second = registry.enqueue(spec(project, "developer", 1, 4));
+        // The first takes the role's only slot; the second is genuinely queued behind it.
+        registry.take_admissions();
+        assert_ne!(state_of(&registry, first), RunState::Queued);
+
+        registry
+            .take_freezes(project, None, None, 1_000)
+            .expect("a project may always be paused");
+
+        // The running one keeps whatever its own note was: overriding it would replace a fact
+        // about that run with one about the project.
+        assert_ne!(
+            wire_note(&registry, project, first).as_deref(),
+            Some(PAUSED_QUEUE_NOTE),
+            "a run that is not queued is not being held by the queue"
+        );
+        assert_eq!(
+            wire_note(&registry, project, second).as_deref(),
+            Some(PAUSED_QUEUE_NOTE)
+        );
+
+        // A different project's queue is untouched — `paused_projects` is per project and the
+        // note is read from it, so this is the assertion that the two cannot bleed.
+        let other = ProjectId::new();
+        let elsewhere = registry.enqueue(spec(other, "developer", 1, 4));
+        assert_ne!(
+            wire_note(&registry, other, elsewhere).as_deref(),
+            Some(PAUSED_QUEUE_NOTE)
         );
     }
 

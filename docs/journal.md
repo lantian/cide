@@ -18,6 +18,436 @@ For the current shape of the project see [`../README.md`](../README.md); for wha
 not exist off Linux see [`platforms.md`](platforms.md); for the decisions a refactor would
 otherwise undo see [`adr/`](adr/).
 
+## Dispatch without a task, and where a run reports (M40), and what is not verified
+
+> *"Main agent can not start subagent without a task — task is a required field in the MCP tool.
+> This should not be so: the main agent should be able to start work without a task and without a
+> worktree, to test something or to check or just do a small piece of work directly. But working
+> through tasks is the main flow, and the orchestrator should follow runs through tasks, doing runs
+> without tasks only for specific cases."* — and, on the plan: *"on subagent finish it always
+> returns to the main (first) Claude panel. The orchestrator should have options: return to main,
+> return to the current Claude if it was started from another session, or do nothing — but then make
+> sure the orchestrator can always check the run's status and what it did."*
+
+Two gaps in one vocabulary, and both were shaped by decisions that were right when made.
+`cide_agent_dispatch` required a task because a task is the unit of everything a run is accounted
+by — the checkout it stands in, the branch it commits to, the comments it reports through, the chip
+the board draws — and a run with none was, in M18's words, "a run the Tasks panel cannot account
+for". Everything downstream nonetheless allowed one: `DispatchRequest.task`, `LiveRun.task`,
+`RunPlan.task` and `AgentRun.task` were all `Option`, the row drew `no task`, the nudge had a no-task
+arm. Only the schema's `required` and the trait's `&TaskId` refused, and the one thing the domain
+*did* do with such a run was give it the role's base worktree — which is exactly the home the user
+did not want for a check, a test run or a small direct edit: the result of a check is a sentence in a
+pane and nothing to merge, and the result of a small direct edit wants to be in the tree the user is
+looking at, not on a `cide/<role>` branch somebody must remember to integrate.
+
+### A run with no task stands in the project root, and one function says so
+
+`cide_agents::run_checkout(agent, config, task)` is now the rule for where a run stands — `Some`
+only for the *intersection* of worktree isolation, a role that wants a checkout, and a task to name
+it by — and both sites that used to carry the same three-arm `match` call it: `plan_dispatch`, which
+stamps the name the admission gate serialises on, and `start_child`, which recomputes it at the fork
+to `ensure` the directory. Two copies of that decision were one edit away from a run gated on a
+directory it does not take, or taking one it was never gated on. `checkout_name(role, None)` still
+answers the bare role, because `cide_agent_integrate` without a task names `cide/<role>` and work an
+older cide left there stays reachable; nothing dispatches into it any more, and since the panel
+always named a task, nothing ever did.
+
+The tool's `required` is `["agent"]`; a present-but-blank `task` is still refused as a typo (the fix
+is "name one, or create one" — not the task-less road, which nobody asks for by accident), and no
+task plus no `instructions` is refused naming both roads. Without a task, `instructions` *is* the
+brief, and that is acceptable for the one reason it was not before: the words are the calling
+session's own, not another agent's prose out of a tracker, so finding 8's fence is not what is being
+bypassed. It stays one line — `opening_prompt` flattens it — and the answer says where the run
+stands and what it will not do, because both differ from every run the caller has seen. The
+description, `cide_agents_list`'s ground sentence and the product-owner paragraph all put the two
+roads in the same order: work goes through tasks; a dispatch with no task is a quick run in the
+project root, for a check or a test or a small piece of work not worth a task, never for work whose
+result you need to read — because nothing reports back but the tree itself and the run's pane.
+
+The run has to be told too, and the place it is told is the one that was about to mislead it.
+`TRACKER_PREAMBLE` rides every run's system prompt and says: comment your plan on the task, **commit
+each coherent step**, set the task to review. A task-less run has no task and stands in the *user's*
+tree, so a run that committed each coherent step would be committing onto the user's branch beside
+their uncommitted changes. `ADHOC_PREAMBLE` is folded after the tracker paragraph — inside the same
+gate, because it is a correction *to* that paragraph — on both harnesses, and says: no task on the
+board; the directory you started in is the project's checked-out tree shared with the user, not a
+worktree of your own; do not commit, stage, stash, checkout, reset or otherwise move HEAD or the index
+unless the instruction asks for a commit; open no task and comment on none; whoever dispatched you
+reads the tree and your pane, so finish by saying plainly what you did or found. It is in the system
+prompt and not the opening line for `TRACKER_PREAMBLE`'s own reason — the opening prompt is one PTY
+line and a turn old by the time the work is done — and `harness.rs`'s parity test asserts both
+binaries tell a task-less run the same three paragraphs, from the constants and never a quoted copy.
+
+Two things follow that are correct and worth stating. Task-less runs are **not serialised** against
+each other: their stamped checkout is `None`, so the gate holds nothing, and only the role's
+`max-concurrent` and the project cap bound them — the prose says "in the project root beside you"
+rather than "one at a time", and adds "keep it clear of files you or another run are editing". And an
+idle task-less `claude` in the root is never wound down to reclaim its directory, because the wind-down
+is scoped to a checkout and the root is the user's; it parks until stopped, exactly as a
+`worktree: false` role's runs do.
+
+### Where a run's finish is announced is the dispatch's choice
+
+`deliver_nudge` typed its one line into `Project::primary_session`, full stop. That was wrong twice
+over once a second Claude pane could start a run — by assigning a role, and now by dispatching — and
+it had no way to say "announce nothing, I will poll". `cide_ipc::RunNotify` is the choice, recorded
+on the run at dispatch (`DispatchSpec`, `LiveRun`, the wire `AgentRun`, and `SavedRun` with a
+`Primary` default for files from before the field), and read at the edge by `note_run_over`:
+`Primary` is a *role*, resolved when the line is typed, because `primary_session` moves on every
+console restart and a session id captured at dispatch would name a conversation that no longer
+exists; `Session` is the pane whose connection asked, resolved by `nudge_target` to that session if it
+is alive and still a Claude pane of the project and to the primary otherwise, with a line in the log —
+the fact is not dropped for want of its first address, and a pane the user closed mid-run is exactly
+the case where the console is the next place they will look; `Silent` makes `turn_of` answer `None`
+before the coalescer ever sees a turn, while the death comment above it is written regardless,
+because that is board record and the nudge is a knock. The coalescer groups by (project, route)
+rather than by project, since one project's burst may now be owed to two panes and one line naming
+both would land in one of them about work the other is waiting on.
+
+On the tool it is `notify: here | main | none`, `here` by default: whoever asked for a run is who is
+waiting for it, which for the console is unchanged behaviour and for any other pane is the
+difference between hearing and not. `here` is the tool's own word and not a wire value, because it
+names *the session making the call*, which only the sink behind the socket knows — a model naming
+session ids would be the identity-in-the-payload shape `agent_rpc`'s header forbids. A run started by
+assigning or @mentioning a role reports to the pane that assigned it (`task_triggers::consider`
+carries the connection's session; the four Tasks-panel routes pass `Primary`, having no session to
+name). And for `none`, `cide_agent_runs` is the whole channel: its rows say `quiet` for such a run
+and, once a run has ended or handed its turn back, where to read what it did — the task's comments,
+or "its edits are in the project root" — and its description says that this list with
+`includeFinished` and the task are the only way to check on a silent run.
+
+### Every Claude pane may orchestrate
+
+M30's scope row served a second Claude pane the eight task tools and withheld the seven `cide_agent*`
+ones, on the argument that those belong to the console the product-owner paragraph was appended to.
+The hole that left was the mirror of M30's own: a second pane could already *start* a run through
+assignment and never hear about it. Once the announcement became something a dispatch chooses, the
+withholding bought nothing, and the boundary that matters — *run versus pane* — is drawn by the run
+row, which is asked first and can never fall through. So `Scope::Orchestrator` and
+`Scope::Conversation` became one `Scope::Pane { project, session, primary }`, every Claude pane of a
+project is served all fifteen tools, and the primary question is still asked first only to mark the
+console: `roster_paragraph(roles, primary)` opens with "You are the product owner" for it and "This is
+a Claude pane of a project in cide that has subagents, and you can hand work to its roles exactly as
+the project's product owner does" for every other pane, the rest byte-identical — a task's
+conversation pane opened from the Tasks panel has just been handed a task to work, and two identities
+in one prompt is a model guessing which to be. Agent-dispatches-agent stays closed by construction.
+
+### What is not verified
+
+No display has shown a task-less run standing in the root, a nudge landing in a second pane, or a
+second pane's `tools/list` carrying the seven; the `--ignored` dispatch tests spend quota and were
+not run. A snapshot written by the *old* binary holding an `Interrupted` task-less run would resume
+from the root, where its claude transcript is not filed, and fail with claude's own sentence on its
+row — accepted without a migration, because no such run can exist: the only dispatcher of task-less
+runs before this was the panel, which always named a task. The commit-onto-the-user's-branch hazard
+`ADHOC_PREAMBLE` closes still exists for a `worktree: false` role *with* a task, whose runs are told
+to commit each step in the project root; that is the role author's stated choice and is out of scope
+here. And the panel's role-level Integrate button still targets `cide/<role>`, which now only holds
+work an older cide left there — the per-task card control remains the named follow-up.
+
+## Files on a task (M39), and what is not verified
+
+> *"In tasks we should be able to add attachments — any kind of files. Attachments should be
+> able for task body and for comments. Attachments also should be able to add by agents via MCP.
+> If attachment is an image — need to show a medium size preview with ability to click on it and
+> to see a fullscreen."*
+
+The tracker carried only text. A person could not hand a run a screenshot of what was wrong, and
+a run could not hand back a rendered result except as prose describing one. Both are the ordinary
+currency of the work the tracker exists to coordinate.
+
+### The record and the bytes are two things
+
+`TaskAttachment` is metadata — name, size, a sniffed kind, who and when, a tombstone — and rides
+on `Task` and on `TaskComment` as an additive `#[serde(default)]` field, on `links`' posture and
+with no schema bump. The bytes are a file at `.cide/attachments/<task>/<attachment>/<name>`,
+committed like the rest of `.cide/` (the user's decision: a teammate who pulls the tracker should
+pull the screenshot). A directory per attachment keeps the real name on disk, which is what the
+desktop's opener chooses an application by, and lets two runs both attach `screenshot.png`.
+
+`crate::image`'s rule — pixels never cross the IPC — holds in every direction here. A file is
+named by a path and copied by Rust (`cide_tasks::attachments::import`); a thumbnail is an `<img>`
+over the asset protocol after `task_attachment_image` has re-sniffed the bytes on disk and widened
+the scope by that one file, `image_read`'s discipline jailed to the record. The stored kind is a
+hint in a hand-editable file and never decides the grant.
+
+### One road in, three gestures for a person and one for an agent
+
+Picker, clipboard and desktop drop all end in `import`, which validates every source before it
+copies any: a comment written with three screenshots lands with three or not at all, and a refused
+path leaves the tracker as it was. The picker is `show_picker`, never the dialog plugin's JS
+`open()`, for `project_pick`'s KDE reason. The clipboard is read in Rust as `fs_paste_image`
+reads it; for the composer and the New task dialog, where nothing exists to attach to yet, the
+PNG is staged under the profile's state directory and its path rides on the eventual create or
+attach, where `import` consumes it. A launch-time sweep collects staged files a day old.
+
+The desktop drop is the one new piece of plumbing. Every in-app drag in cide is pointer-based
+because Tauri's native handler swallows HTML5 drag events, and `useTreeDrag.ts` recorded "no drag
+into cide from Dolphin" as an accepted cost. What the handler takes it hands back as its own
+event, with the dropped **paths** — exactly the currency an attachment wants — so
+`fileDrop.ts` subscribes once per window, hit-tests every `[data-attach-drop]` element by
+geometry (the innermost wins, so a comment inside the card takes the file), and lights the zone
+through a string snapshot on `paneDropZone.ts`'s rule.
+
+For an agent, every write took an `attachments` array of paths: `cide_task_create` puts them
+on the body as the task is minted (a refused file takes the creation with it, so a retry cannot
+leave a fileless twin behind), `cide_task_update` adds them beside any other change, and
+`cide_task_comment` lands them with the report, so a screenshot and the words about it are one
+call. `cide_task_attach` is the same as `update`'s field and exists because it is the common
+call — `cide_task_assign`'s relationship to `assignee`. A relative path resolves
+against the **run's worktree**, which the registry now carries (`RunScope`, from the cwd
+`note_cwd` already recorded as a sentence for the panel) and which is not the project root the
+tracker lives under. `cide_task_get` lists every attachment with its absolute path, which is the
+whole reason `TaskSink::root` exists: the one thing an agent can do with a file the user attached
+is `Read` it.
+
+### The merge, and what repair must not do
+
+An attachment record is immutable except for its tombstone, so the merge rule is the comments'
+one-way one and not the links' toggle. Two places needed care. `reconcile_comment` picks a whole
+copy as the winner, and had to union the attachments across both sides afterwards, or a text edit
+on one side would silently drop a screenshot attached on the other — the row in the merge table
+is the pin. And `repair` must **drop** a malformed or duplicate attachment record and never
+re-mint it as it re-mints a task or comment id: the id is a directory name, and a re-minted record
+would leave the bytes orphaned under the old one with no symptom anywhere but a thumbnail that
+never loads.
+
+Detaching is a `TaskEdit`, the user's only, and its store arm removes the bytes after the
+tombstone lands — one road, so the MCP sink and the command cannot disagree about whether the
+file goes. Deleting a comment takes its files with it the same way.
+
+### What is not verified
+
+Nothing here was confirmed on a display. In particular:
+
+- **The desktop drop.** `getCurrentWebview().onDragDropEvent` is subscribed under `core:default`
+  and the hit test divides Tauri's physical position by `devicePixelRatio`. If the event never
+  fires in this window class, or its coordinate space is the window's rather than the webview's,
+  the failure is total silence — the picker and the clipboard still attach, and nothing says why
+  a drop did nothing. `fileDrop.ts` names this.
+- **The thumbnail and the viewer.** The asset-protocol grant and the `<img>` are `image_read`'s
+  road, which works in the image tab, but the strip's `object-fit: contain` box and the viewer's
+  z-order over the card's own scrim were designed, not seen.
+- **The clipboard on the card.** `wantsImagePaste` on the card's root paste event, with the
+  composer stopping propagation first, is the editor's own detector in a new place.
+
+The five render stories pin what a server render can: the three preview states each drawn as
+themselves, exactly the ready images as real `<img>` elements, every way in counted as a write
+control, and every older story still digesting no tile, no thumbnail and no paperclip.
+
+## Closing a project stops its sessions, and reopening it resumes them, and what is not verified
+
+> *"When I'm closing project (not the cide app) and reopening the project — claude sessions
+> aren't restored."*
+
+They were not, and the reason was two absences rather than a bug. `workspace::close_project`
+removes the project record and does nothing else — its doc says so: *"sessions are owned by the
+core, not by the project record, so nothing here kills a child process; the caller decides that
+separately"* — and the caller, `project_close`, decided nothing. So the `claude` processes of a
+closed project went on running with no pane, no window and no way to reach them short of
+quitting. Then `open_project` minted a fresh record: a console over a *new* `primary_session`.
+The conversation the user had been in was in neither `workspace.json` (which had forgotten it)
+nor on screen, and the transcript sat under `~/.claude/projects` with nothing naming it.
+Quitting and relaunching restores every session precisely because the tree survives on disk with
+its session ids in it; closing one project was the one gesture with no such record.
+
+**A closed project keeps its layout.** `persist::closed.json`, beside `recent.json` and on its
+argument — the record is worth keeping at exactly the moment `close_project` takes it out of the
+workspace — holds the whole `Project` record per primary root, most recently closed first,
+capped at `MAX_RECENT`. Not inside `recent.json`, although the identity is the same path,
+because `RecentProject` is the wire type the recents *menu* is drawn from and sixteen pane trees
+have no business riding to a dropdown; `project_forget_recent` drops the layout with the entry
+so the two files agree. `workspace::reopen_project` is the other half: the same tabs, pane ids,
+tab ids and session ids come back, the id and the dot are minted afresh (everything keyed by the
+old id was dropped at the close), the caller's roots lead and the record's follow, dirty flags
+are cleared for `persist::load`'s reason, a tab that cannot come back is dropped — a
+`ClaudeMcp` diff whose request the close cancelled, a merge resolver — with the focus order
+re-derived over the survivors, and every detached pane is docked, at its anchor when
+`can_restore` says the shape still exists and beside the console's focused pane otherwise,
+because the close pruned its window and a pane no window shows is a conversation nothing can
+reach. That "which tabs come back" predicate is now `workspace::tab_outlives_close`, shared with
+the Ctrl+Shift+T stack, which used to spell its own copy. A record that cannot be used — a
+pane id live elsewhere, a strip with no console — degrades to a plain open with a warning,
+never to a refusal.
+
+**A closed project's children are stopped**, through the same ladder the quit path runs —
+SIGHUP, SIGTERM, SIGKILL, with the graces — on a thread of their own, because the graces add up
+to 2.5 s and the command is synchronous on the GTK loop. After the IDE server is stopped, for
+`run_teardown`'s reason: a `claude` blocked on `openDiff` should hear its rejection over a live
+socket. And once a child has gone its registry entry is **removed**, which is not tidiness:
+`TerminalPane` adopts any session the registry still holds for the pane's id (`sessionIsHeld`)
+rather than spawning, so a reopened pane would otherwise attach to its dead session and show
+`— exited —` with a Resume button instead of resuming. Sessions a subagent run owns are left
+alone, for `session_kill`'s reason. The frontend's `closeProject` destroys the hosts of the
+project's panes after the snapshot, as `closePane` does, for the same adopt-the-corpse reason
+one realm over: the ledger would otherwise still name the dead session and `PaneBody` would
+read a pane that already has a child. A closed *tab*'s hosts stay parked on purpose.
+
+**The restore plan is asked per project, and a project's panes wait for it.** `app_restore_plan`
+was fetched once per window at boot, so a project reopened during the run had no entries and
+its panes spawned fresh — the second half of the report, and the half that would have survived
+fixing the first. The command now takes an optional project; `App.tsx` watches the snapshot's
+project set and asks for every project it has not planned, at boot and whenever one appears,
+and `plannedProjects` gates `TabContent` and the detached-pane branch until the answer is in —
+the same gate `restorePlan === null` used to be, one project at a time. The plan for a project
+opened fresh is what it always was: one eager `Fresh` console. For a reopened one the console
+is eager and `Resumable`, every other Claude pane is `Resumable` and eager under
+`resume_all_on_launch`, and a shell comes back with the *"previous output not retained"* line,
+because only the quit path saves screens.
+
+**`window_close` in `PerProject` mode now runs the whole close.** It called
+`workspace::close_project` on its own and skipped everything `project_close` did after the
+mutation, so a project closed through its window's × leaked its IDE server, its language
+servers and its task tracker's final write. `close_project_here` is the shared body; both
+callers reconcile the windows afterwards.
+
+**Not verified.** None of it has been confirmed on a display in this session. `reopen_project`
+and the closed-list persistence are unit-tested (`cargo test -p cide-core -- reopen closed`),
+the plan's project filter and the session list are (`cargo test -p cide-app -- lifecycle
+sessions_of`), and `close_project_here`'s ladder thread, the registry removal and the
+frontend's host teardown are checked by nothing but reading: the first is a Tauri command and
+the last two depend on a real `claude` exiting. The sub-three-second case — a project reopened
+before its ladder has finished — is known and accepted: the pane adopts the dying session,
+prints `— exited —`, and offers Resume, which works. Narrower still, the record is written
+off-thread after the close (for `remember`'s main-thread reason), so a reopen inside the few
+milliseconds of that write finds nothing and opens fresh.
+
+## Several open diff tabs make cide lag (M38), and what is not verified
+
+> *"Several opened tabs with diff (and especially diff that was gone) makes cide very laggy, not
+> responding."*
+
+There was no loop. The `stale`/reveal handshake `GitDiffPane` grew in M18 already guards the
+obvious one — a flag cleared on *outcome* rather than on reveal would re-arm on every render —
+and every `useSyncExternalStore` selector in the surface returns a primitive or a cached
+identity, which `check:selectors` exists to keep true. What there was is a multiplier, assembled
+out of four decisions that are each defensible on their own.
+
+**`TabContent` keeps every tab mounted and laid out at full size.** That is deliberate and its
+header argues for it: a `display: none` terminal measures zero and `fit()` then sends a corrupt
+size to the child. **This pane has no virtualisation**, also deliberate — `diffRows.ts` names
+find-in-page and a selection dragged across hunks. **And since M25 it draws the whole file**, not
+the hunks, below `WHOLE_FILE_COLLAPSE_ABOVE` = 5,000 lines. Each row is a `display: grid` box
+with `pre-wrap` text and a span per syntax token, so a 2,000-line file is on the order of ten
+thousand nodes, doubled in the split layout. Six open diffs leave sixty thousand of them in the
+document being laid out for the rest of the session, and **layout is global** — so the terminals
+and the editors slow down with them, which is why the report is about *cide* being laggy rather
+than about a diff being slow.
+
+The fourth is that nothing below `App.tsx`'s `WorkspaceContent` was memoised. That component's
+props are snapshot-derived, so it re-renders once per *accepted workspace mutation* — the right
+answer for the pane grid, and the wrong one here: activating a tab, focusing a pane, releasing a
+splitter and binding a session are all mutations, and each one re-reconciled every mounted diff
+tab's entire row list to produce identical output.
+
+### A tab nobody is looking at draws no rows
+
+`GitDiffView` keeps its root, its header and its footer and replaces the body with an empty box.
+The root has to stay the same element, or the `setRoot` callback ref churns and takes the
+scroll-to-current-change effect with it; only the two columns and the connector go, which
+correctly tears down the sync and connector effects and rebuilds them on reveal.
+
+The cost is that revealing a diff tab is a render rather than a repaint. That is one tab's
+render, on a component that already re-renders whole every time its file moves under it, against
+a permanent cost multiplied by tab count. What would genuinely have been lost is the reading
+position — an emptied scroller has nowhere to be scrolled to, so the browser cannot keep it — so
+it is kept explicitly in a ref written by an `onScroll` handler on each scroller, and spent in a
+layout effect on the frame the rows come back. That effect finds the scrollers through `root`
+and not through `leftCol`/`rightCol`: those are callback-ref *state*, still `null` on the pass
+that mounts them, so reading them there would have restored nothing and looked like it worked.
+
+The memos above the body — `whole`, `segments`, `model`, `anchors` — are deliberately still
+computed. They are keyed on `diff`/`collapsed`/`expandedGaps`, none of which move for a parked
+tab, so they cost nothing per event; and `navImpl.cursor()` reads `anchors.length`, so zeroing
+them would make a parked pane lie to `changeNav` about how many changes it has.
+
+### The deferral that was off
+
+`diffTabs.diffTabOnScreen` was written in M18 with the argument that *a deferral switched on by a
+prop is a deferral that is off* — the shell rendered `<GitDiffPane project spec />` with no flag,
+so the pane worked the answer out of the workspace mirror instead. That was right, and it was
+also not enough: `onScreen` starts `true` and is corrected only by the first
+`cide://workspace-changed`, so a restored workspace with six diff tabs had all six believing they
+were in front until something mutated. The shell now passes `visible={active}` — the flag
+`TabContent` was already handing the closure, and already handing `PaneBody` on the next line —
+and the mirror stays for hosts that pass nothing. It is now *only* subscribed for those hosts:
+consulting it costs a listener whose handler filters the project's whole tab list, once per pane
+per mutation, to reach an answer the prop has already given.
+
+The first fetch is deferred too, which it never was. Six restored diff tabs opened six
+`git_diff_file` calls at once, each bringing back both whole file texts and tokenizing them on
+the main thread; five of the six were for tabs behind the one in front.
+
+**`RevisionDiffPane` had no deferral at all**, and the reason it needed one is not its sibling's:
+`git_diff_revision` builds a diff of the **whole repository** and filters to one path afterwards
+— `cide_git::revision::build_diff` sets no pathspec and runs rename detection over every delta —
+and with a working-tree side it recurses untracked directories on the way. A
+commit-against-working-tree tab behind another one re-ran all of that on every git mutation in
+the project. It now defers the same way, through `revisionTabOnScreen`, which is
+`showsRevisionDiff` — written in M18 and never called until now — finally wired up.
+
+`LogTab` is the one host that has to say `visible` out loud, and it is worth recording why:
+it renders this pane in the **tool window**, which is not a tab, so a workspace tab open on the
+same four-tuple and not in front would make the mirror answer "hidden" about the thing the reader
+is looking at. `ToolWindowHost` mounts one `LogTab`, and `App` mounts `ToolWindowHost` only while
+`toolWindow.open`, so the pane existing *is* it being on screen.
+
+### Why a diff that was gone was worse
+
+It renders ten nodes, so it is not the paint. It is that it never stops paying and never produces
+anything. `git_diff_file` still ran in full before it could answer `NoSuchChange`; and each
+failure called `diag.log`, which is `diag_log` — a *non-async* `#[tauri::command]`, so a
+main-thread round trip and a file append — on every `cide://git-status` in the project, for the
+life of the tab, times however many such tabs were open. `ipc/consoleBridge.ts` had already
+written the rule this breaks: *a diagnostic for a lag report must not itself be a cause of lag*.
+Both panes now log a refusal once per distinct sentence and re-arm on a successful fetch, so a
+file that goes, comes back and goes again is still two lines.
+
+### `repo::find` stops walking submodules to answer about a root
+
+The fixed cost under all of this is in Rust and has nothing to do with diffs. Every git command
+resolves its repository through `cmd::git::repo_root` → `repo::find` → `repo::discover`, and
+`discover` calls `repo.submodules()` per root. libgit2's `git_submodule__map` allocates a fresh
+cache each call — it does not use the repository's own — and loads the whole `.git/index`
+unconditionally; where a `.gitmodules` exists it then iterates every index entry *and* walks
+every entry of the HEAD tree with no pathlist. That is paid once per git command from some fifty
+call sites, and `git_diff_file` then opens the repository a second time and parses the index a
+third.
+
+`find` now answers from `root_repos` — `Repository::discover` plus a canonicalisation per root,
+opening nothing — and falls through to the full descent only for an id no root claimed, which is
+the only place a submodule can be found. The dedupe stays in `discover`'s own loop rather than
+moving into `root_repos`, because `seen` also holds the submodules collected from earlier roots
+and is what skips a root that is itself one of them. The test asserts *equality with `discover`'s
+own answer* for every repository in a checkout that really has a submodule, rather than merely
+that something came back: two roads to one `RepoInfo` that disagreed about a field would show up
+nowhere on screen.
+
+### The connector stopped measuring what could not have changed
+
+`offsetTop` does not move when a scroller scrolls, and the split view's ribbon painter was
+re-reading it for every row of both columns on every animation frame of every scroll — a forced
+synchronous layout per frame, which on a few thousand rows is the whole frame budget. The
+measurement is now held between frames and cleared by the `ResizeObserver` that already watches
+the columns' content, which is what fires when a fold opens or a blame lands. The invariant to
+keep is stated where it lives: anything that can move a row must invalidate there.
+
+### What is not verified
+
+**None of this was confirmed on a display.** The whole change is a performance claim, and the
+only measurements behind it are static: node counts derived from the fixtures, and the libgit2
+source read to establish what `submodules()` does. Nobody has yet opened six diff tabs in a
+running cide, watched the lag go, and confirmed that switching back to a tab restores its scroll
+position rather than jumping to the top — which is the one behavioural regression this could
+have, and the one the checks cannot see.
+
+`check:diff-render` pins the rendering claim in both directions — an absent `visible` and an
+explicit `true` produce the same markup, a `false` produces zero rows and keeps the chrome — and
+was confirmed to fail when the parked branch is disabled. `check:diff` covers
+`revisionTabOnScreen`. Neither can see a scroll position, an event that did not fire, or a frame
+that was not dropped.
+
 ## View commits after a pull (M37), and what is not verified
 
 The pull's notice — *Fast-forwarded main 7 commits from origin · 12 files +230 −41*, ten commits
@@ -7424,6 +7854,85 @@ coalescing those was scoped out rather than done. `RevisionDiffPane` keeps the u
 And `use_staging_area`, or a repo mid-merge, still makes `cide_git::commit` commit the whole index
 and ignore the ticks entirely with nothing in the panel saying so — a real trap, found while
 reading this, and left alone as a different report.
+
+## Ten mute opencode runs: the bridge, the spelling, the pause, and what is not verified
+
+An audit of a day's dispatches on a downstream project (six opencode roles, a local 27B) found
+that **every opencode run dispatched after a certain hour that morning had none of cide's task
+tools** — ten of ten, against forty-four before it that all had them. The runs are the reason
+anybody knows: each one spent its first ten minutes reading `crates/cide-hook/src/main.rs` and
+`crates/cide-agents/src/tools.rs`, wrote itself a stdio MCP client into `/tmp`, and filed its
+report through that. One of them, hunting for the tools, launched a second cide and then
+`pkill`ed it. Four defects stacked up to produce it and each was silent on its own.
+
+**A missing `cide-hook` was a degrade, not a refusal.** `cide_hook_binary()` looks for the binary
+beside the running executable, and `RunPlan::hook_bin` gates both the MCP server block and the
+tracker paragraph — so `None` meant *start the run with neither*. The dispatch reported success,
+nothing was logged, and the child came up as an ordinary session that could not reach the board.
+The instance in question had been launched some way that built `cide-app` and not `cide-hook`;
+`run.sh` builds both, which is why this had never been seen. The fix is one more fact in
+`cide_agents::dispatch_refusal` — the function whose doc already explains why it is one function
+and not three — so the same sentence now refuses the dispatch, greys every role in the panel and
+prints in `cide_agents_list`, from one edit. It is checked in `plan_dispatch` *before*
+`worktree::ensure`, so a run that could not have reported leaves no checkout behind either.
+
+**cide had been writing Claude Code's tool names to both harnesses.** This is the one worth
+recording, because it was invisible for as long as it was for an uncomfortable reason. Claude Code
+namespaces an MCP server's tools as `mcp__<server>__<tool>`; opencode uses `<server>_<tool>`, so
+cide's vocabulary arrives there as `cide_cide_task_get`. Every sentence cide writes — the tracker
+preamble, the spec preamble, the opening line, the continuation line — spelled the Claude form,
+and a test asserted it *as a property of the paragraph* rather than of the CLI. The transcript
+database says the model simply guessed the mapping: 57 `cide_cide_task_get` calls and not one
+`mcp__cide__*`. A capable model covering for a wrong instruction is not a property to rely on, and
+under compaction or a smaller model it is not there. `Harness::tool_name` is now the only thing
+that may spell either form, and it is **required rather than defaulted** — `respawn_spec` earns
+its default by *refusing*, which a naming method cannot do: any default it returned would be
+silently wrong for some harness, which is precisely this bug. The prose is a template now, filled
+by `tracker_preamble`/`spec_preamble`, following the idiom `spec_preamble` already used for
+`{OPENSPEC}`.
+
+Two things fell out of looking. `continuation_prompt` — the line a run resumed after a restart is
+told — was in neither the audit nor anybody's list: it named `mcp__cide__cide_task_get` *and*,
+unlike both preambles, was gated on nothing at all, so a resumed run with no bridge was told to
+call a tool that had never been attached. And `claude.rs::mcp_config` spelled the server name
+`"cide"` by hand while `opencode.rs` held a const whose doc claimed the two were "the same string
+on purpose". They were, by luck; there is one `SERVER` now.
+
+The parity tests are the interesting casualty. Two of them asserted that both binaries hand a role
+a **byte-identical** brief, which was true and is now deliberately false. Deleting them would have
+dropped the guard against the copy-paste divergence they were written for, so they compare
+*normalised* forms — `unfill_tools` turns each harness's names back into placeholders — and then
+assert separately that the two spellings really do differ, so a regression that made `tool_name`
+answer one string everywhere cannot leave them green.
+
+**The pause was invisible.** A project's agent pause is persisted and restored, and
+`admit_a_pass` skips a paused project's queue with a bare `continue`. A queued run held there
+looked exactly like one waiting behind its role's concurrency — `[queued]`, no reason — while the
+roster said `ready` and dispatch said "Dispatched". The audited probe sat in that state for hours
+with both project slots free, and the only way anybody worked out why was by reading
+`agent-runs.json` on disk. The semantics were never in question and have not changed: a pause is
+kept, new dispatches queue behind it, and Resume thaws the frozen children before it drains the
+queue (which `resume` already did, in that order). What changed is that it says so. The reason is
+derived in `runs_for` and rides `AgentRun::note` — the DTO's existing "what the queue is waiting
+on" slot — so the panel renders it with **no frontend change at all**, and `render_run` passes it
+to a model for free. Deriving it at wire time rather than at the `continue` is not only about the
+borrow: a run restored from the snapshot into a paused project never passes through an admission
+pass, and that is exactly the population a restart leaves behind.
+
+`AgentSink` gained a `dispatching()` accessor for the three tools that speak for that queue.
+`RegistrySink::agents()` had been building a roster carrying the flag and throwing it away.
+
+**What is not verified.** Everything here is covered by unit tests, including the one that reads a
+real `OPENCODE_CONFIG_CONTENT` off a spawn spec and asserts the opencode spelling reaches it — the
+audit's own reproduction step, as a test. But **no opencode run has been dispatched against a
+built cide since the change**: the end-to-end claim, that a real 27B now finds `cide_cide_task_get`
+in its function list on the first turn instead of writing itself a client, is argued from the
+config document and not observed. The refusal path is the same: `dispatch_refusal` is tested, a
+GUI launched with `cide-hook` deleted is not. And nothing was done about the audit's fifth
+finding — a bridge that is present but cannot reach the app still reports only inside the run's
+own session, which `config_json`'s doc admits arrives "from a process three levels below anything
+cide logs". A first `tools/list` round-trip logged app-side would close it; the missing-binary
+half now has a `warn!` naming the path, which is the cheap part of it.
 
 ## The look and feel (M23), and what is not verified
 

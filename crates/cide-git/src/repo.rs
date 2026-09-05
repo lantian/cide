@@ -68,12 +68,17 @@ pub fn discover_root(path: &Path) -> Option<PathBuf> {
     repo.workdir().map(canonical)
 }
 
-/// Every repository under `roots`, roots before their submodules.
+/// The repository at each root, opening nothing and descending into no submodule.
 ///
-/// Errors are not propagated: a project with four roots, one of which is on an unmounted
-/// NFS share, still has three working repositories and a panel that shows them is more use
-/// than an error page. Anything unreadable is logged and skipped.
-pub fn discover(roots: &[PathBuf]) -> Vec<RepoInfo> {
+/// Split out of [`discover`] because it is the entire answer on the hot path, and the half that
+/// is left out is the expensive one. Descending costs a `Repository::open` plus
+/// `repo.submodules()` per root, and libgit2's `git_submodule__map` loads the whole `.git/index`
+/// unconditionally — and, where a `.gitmodules` exists, walks every entry of the HEAD tree as
+/// well. That is a fixed cost with nothing to do with the question being asked. See [`find`].
+///
+/// Deduplicated among the roots themselves, in order. [`discover`] keeps its own `seen` on top of
+/// this, which is what still skips a root already reached as an earlier root's submodule.
+fn root_repos(roots: &[PathBuf]) -> Vec<RepoInfo> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
 
@@ -85,14 +90,36 @@ pub fn discover(roots: &[PathBuf]) -> Vec<RepoInfo> {
         if !seen.insert(work.clone()) {
             continue;
         }
-        let info = RepoInfo {
+        out.push(RepoInfo {
             id: repo_id(&work),
             name: display_name(&work),
-            root: work.clone(),
+            root: work,
             parent: None,
             is_submodule: false,
-        };
+        });
+    }
+    out
+}
+
+/// Every repository under `roots`, roots before their submodules.
+///
+/// Errors are not propagated: a project with four roots, one of which is on an unmounted
+/// NFS share, still has three working repositories and a panel that shows them is more use
+/// than an error page. Anything unreadable is logged and skipped.
+pub fn discover(roots: &[PathBuf]) -> Vec<RepoInfo> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+
+    for info in root_repos(roots) {
+        // The dedupe stays **here** rather than moving into `root_repos` with the rest of the
+        // loop. `seen` also holds the submodules collected from earlier roots, so this is what
+        // skips a root that is itself a submodule of one already walked; `root_repos` knows
+        // only about the roots and would let that one through.
+        if !seen.insert(info.root.clone()) {
+            continue;
+        }
         let id = info.id;
+        let work = info.root.clone();
         out.push(info);
         if let Ok(repo) = open(&work) {
             collect_submodules(&repo, id, &mut seen, &mut out, 0);
@@ -195,7 +222,23 @@ pub fn watch_dirs(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Look one repository up by id among `roots`.
+///
+/// **Answered from the roots alone wherever it can be**, and that is not a micro-optimisation —
+/// this is the seam every git command crosses. `cmd::git::repo_root` calls it once per
+/// invocation from some fifty call sites, and routing that through [`discover`] means
+/// `repo.submodules()` per root before a diff of one file can begin: a full `.git/index` parse,
+/// plus a recursive walk of the whole HEAD tree where a `.gitmodules` exists. Several open diff
+/// tabs each re-read on every `cide://git-status`, so that fixed cost was multiplied by tabs and
+/// by events — and a diff whose change had just been committed paid all of it, on every event,
+/// to be told there was nothing there.
+///
+/// A submodule's id still falls through to the full descent, which is the only place it can be
+/// found. The extra `discover_root` per root that costs is a `Repository::discover` and a
+/// `canonicalize`, against a walk of every index entry and every tree object.
 pub fn find(roots: &[PathBuf], repo: RepoId) -> Result<RepoInfo> {
+    if let Some(info) = root_repos(roots).into_iter().find(|r| r.id == repo) {
+        return Ok(info);
+    }
     discover(roots)
         .into_iter()
         .find(|r| r.id == repo)
@@ -480,6 +523,73 @@ mod tests {
         assert_eq!(dirs.len(), 1, "{dirs:?}");
         assert!(dirs[0].ends_with("modules/sub"), "{dirs:?}");
         assert!(dirs[0].join("refs/heads").is_dir(), "{dirs:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `find` must answer the same `RepoInfo` the full descent would, by either road.
+    ///
+    /// The fast road exists because `repo_root` is on every git command's critical path, and the
+    /// hazard it introduces is that the two roads could disagree — a root answered from
+    /// `root_repos` carrying different fields from the one `discover` builds, which nothing on
+    /// screen would show. So this asserts *equality with `discover`'s own answer* rather than
+    /// merely that something came back, and it does it against a checkout that really has a
+    /// submodule, because that is the shape where skipping the descent could be wrong.
+    #[test]
+    fn find_answers_a_root_and_a_submodule_alike() {
+        let dir = scratch("find-root-and-sub");
+        let upstream = dir.join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        std::fs::write(upstream.join("lib.txt"), "lib\n").unwrap();
+        git(&upstream, &["add", "."]);
+        git(&upstream, &["commit", "-qm", "lib"]);
+
+        let super_ = dir.join("super");
+        std::fs::create_dir_all(&super_).unwrap();
+        git(&super_, &["init", "-q", "-b", "main"]);
+        std::fs::write(super_.join("a.txt"), "a\n").unwrap();
+        git(&super_, &["add", "."]);
+        git(&super_, &["commit", "-qm", "one"]);
+        git(
+            &super_,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        git(&super_, &["commit", "-qm", "add sub"]);
+
+        let roots = vec![super_.clone()];
+        let all = discover(&roots);
+        assert_eq!(all.len(), 2, "{all:?}");
+
+        for want in &all {
+            let got = find(&roots, want.id).expect("every discovered repo is findable");
+            assert_eq!(&got, want, "the two roads disagree about {:?}", want.root);
+        }
+
+        // And the descent is still the only place a submodule can be found: the fast road on its
+        // own must not answer for one.
+        let sub = all
+            .iter()
+            .find(|r| r.is_submodule)
+            .expect("the fixture has a submodule");
+        assert_eq!(sub.parent, Some(all[0].id));
+        assert!(
+            root_repos(&roots).iter().all(|r| r.id != sub.id),
+            "root_repos must not claim a submodule"
+        );
+
+        assert!(matches!(
+            find(&roots, repo_id(Path::new("/tmp/not-a-repo-cide"))),
+            Err(GitError::NoSuchRepo { .. })
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

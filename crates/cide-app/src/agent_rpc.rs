@@ -53,11 +53,13 @@
 //! | the header names | served |
 //! | --- | --- |
 //! | a run this process dispatched | the **eight** `cide_task_*` tools, scoped to that run's project, signing every comment as that run's role |
-//! | a project's `primary_session` | those eight **and** the seven `cide_agent*` tools, scoped to **that** project |
-//! | any other Claude pane of a project | those eight, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
+//! | a Claude pane of a project — its console (`primary_session`) or any other | those eight **and** the seven `cide_agent*` tools, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
 //! | anything else, or nothing | a valid `initialize` and an **empty** tool list |
 //!
-//! Never a crash, and never another project's tasks.
+//! Never a crash, and never another project's tasks. The primary-session question is still asked,
+//! and first: not to decide the tool list any more, but to mark the console as such
+//! ([`Scope::Pane::primary`]), which is what picks the opening sentence of the paragraph
+//! `cmd::session` appends and nothing else.
 //!
 //! # Why the third row exists (M30)
 //!
@@ -72,12 +74,23 @@
 //! context, and what it actually did — in a real project, and it is what sent this looking — was
 //! hand-write `.cide/tasks.json` from a guessed schema and corrupt the file.
 //!
-//! **What the row does not widen is the boundary.** The session still has to be one this process
+//! **What the row did not widen is the boundary.** The session still has to be one this process
 //! minted *and* still bound to a Claude pane, so a `claude` a user started by hand in a cide
 //! shell — which inherits `CIDE_AGENT_SOCK` from that shell but is given no `CIDE_SESSION` — has
-//! nothing to match with, exactly as before. And the seven orchestration tools stay on
-//! `primary_session` alone: agent-dispatches-agent is closed by the *run* row, which is asked
-//! first and can never fall through to this one.
+//! nothing to match with, exactly as before.
+//!
+//! # Why the two pane rows became one (M40)
+//!
+//! M30's row served a second Claude pane the task tools and withheld the seven `cide_agent*`
+//! ones, on the argument that those belong to the console the product-owner paragraph was
+//! appended to. The hole that left was the mirror of M30's: a second pane could already *start*
+//! a run — assigning or @mentioning a role starts it, through `crate::task_triggers` — and never
+//! hear about it, because the finish was announced to the console, which had not asked. Once the
+//! announcement became something a dispatch chooses ([`cide_ipc::RunNotify`], read at the edge by
+//! [`note_run_over`]), the withholding bought nothing: the boundary that matters is *run versus
+//! pane*, and the run row is asked first and can never fall through to this one. So every Claude
+//! pane of a project may dispatch, and the paragraph now reaches every one of them with an
+//! opening sentence that says which it is. Agent-dispatches-agent stays closed by construction.
 //!
 //! **The author is [`TaskAuthor::Orchestrator`], not [`TaskAuthor::User`]**, and that is a
 //! refusal rather than a label: `cide_tasks::TaskStore::edit` gates the comment edit and delete
@@ -131,9 +144,9 @@ use std::time::{Duration, Instant};
 use cide_agents::Delivery;
 use cide_agents::tools::{self, AgentSink, Integrated, TaskSink, ToolResult};
 use cide_ipc::{
-    AgentDef, AgentId, AgentRoster, AgentRun, ChangeName, DispatchRequest, Harness, PaneKind,
-    ProjectId, RunId, RunState, SessionId, SessionState, Task, TaskAuthor, TaskEdit, TaskId,
-    TaskNew,
+    AgentDef, AgentId, AgentRoster, AgentRun, AttachTarget, ChangeName, DispatchRequest, Harness,
+    PaneKind, ProjectId, RunId, RunNotify, RunState, SessionId, SessionState, Task, TaskAuthor,
+    TaskEdit, TaskId, TaskNew,
     agents::{AgentDraft, AgentSaveOutcome, AgentScope},
 };
 use cide_ipc::{Project, Workspace};
@@ -277,8 +290,19 @@ struct Hello {
 /// the connection is the whole `spawned_as` rule this module rests on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
-    /// The header named a project's `primary_session`: the product-owner session.
-    Orchestrator { project: ProjectId },
+    /// The header named a Claude pane of a project: its console (`primary` — the pane the
+    /// product-owner paragraph opens for as such) or any other Claude pane, a task's
+    /// conversation or a second console the user split off. Every tool, scoped to that project,
+    /// signing as [`TaskAuthor::Orchestrator`]. (M30 for the row; M40 for the tools.)
+    ///
+    /// `session` is the pane's own id out of the header, carried so a dispatch's `notify: here`
+    /// and an assignment's default report land in *this* pane — see [`ProjectTools::session`].
+    /// The author is fixed at the binder and is never `User` — see the module header.
+    Pane {
+        project: ProjectId,
+        session: SessionId,
+        primary: bool,
+    },
     /// The header named a run this process dispatched. The task tools, and nothing else.
     Run {
         project: ProjectId,
@@ -287,14 +311,10 @@ enum Scope {
         /// what `TaskAuthor::Agent` shows a person reading the comment log, and it must still
         /// read correctly after the role has been renamed or deleted.
         label: String,
+        /// The run's working directory — its worktree — which is what a relative path in
+        /// `cide_task_attach` is read against. From the registry, never from the child. (M39)
+        cwd: PathBuf,
     },
-    /// The header named some *other* Claude pane of a project: a task's conversation, a second
-    /// console the user split off. The task tools, scoped to that pane's project. (M30)
-    ///
-    /// Carries no author of its own, unlike [`Self::Run`]: there is no role to name, and the one
-    /// this resolves to is fixed at the binder — see the module header on why it is
-    /// `Orchestrator` and must not be `User`.
-    Conversation { project: ProjectId },
     /// The header named nothing this process can place. A valid server with no tools.
     Unscoped,
 }
@@ -333,14 +353,22 @@ struct ProjectTools {
     /// Who a comment written over this connection is from. Decided from the header, never from
     /// the payload — see the module header.
     author: TaskAuthor,
-    /// Whether this connection is the project's product owner, and therefore whether the five
-    /// `cide_agent*` tools exist for it at all.
+    /// Whether this connection is a Claude *pane* — and therefore whether the seven `cide_agent*`
+    /// tools exist for it at all. False for a run: the line this module exists to draw.
     ///
     /// A `bool` and not a second `ToolAccess` implementation, because the two differ in exactly
     /// two places — the advertised names and one `or_else` below — and a parallel type would
     /// have to re-state the store lookup, the author and the broadcast, which is where a copy
     /// would eventually diverge.
     orchestrator: bool,
+    /// The pane's own session, for a pane connection; `None` for a run. (M40) It is what
+    /// `notify: here` resolves to on a dispatch, and what a run started by an assignment made
+    /// over this connection reports back to — so the pane that asked is the pane that hears.
+    session: Option<SessionId>,
+    /// Where a relative path in an argument is read from, when the connection is a run's:
+    /// its worktree. `None` for a console pane, whose cwd is the project root — filled in as
+    /// exactly that when the sink is built, once the store (and so the root) is known. (M39)
+    cwd: Option<PathBuf>,
 }
 
 impl ToolAccess for ProjectTools {
@@ -368,13 +396,18 @@ impl ToolAccess for ProjectTools {
             author: self.author.clone(),
             changed: AtomicBool::new(false),
             mutations: Mutex::new(Vec::new()),
+            cwd: self
+                .cwd
+                .clone()
+                .unwrap_or_else(|| store.root().to_path_buf()),
         };
-        // The task family first, then — **only for the product owner** — the orchestration one.
-        // The [`RegistrySink`] is built *inside* the arm, so a run's connection never constructs
-        // one at all: "which vocabulary a caller can reach" stays a fact about which value exists
-        // on this stack frame. `cide_agent_dispatch` arriving from a run therefore falls through
-        // to the refusal below rather than to a registry — belt-and-braces, since [`call_tool`]
-        // already refused the name against `names()`.
+        // The task family first, then — **only for a pane** — the orchestration one. The
+        // [`RegistrySink`] is built *inside* the arm, so a run's connection never constructs one
+        // at all: "which vocabulary a caller can reach" stays a fact about which value exists on
+        // this stack frame. `cide_agent_dispatch` arriving from a run therefore falls through to
+        // the refusal below rather than to a registry — belt-and-braces, since [`call_tool`]
+        // already refused the name against `names()`. The `?` on the session is the same fact
+        // from the other side: a pane always has one, a run's `orchestrator` is false.
         let result = tools::dispatch(name, arguments, &sink)
             .or_else(|| {
                 if !self.orchestrator {
@@ -383,6 +416,7 @@ impl ToolAccess for ProjectTools {
                 let agents = RegistrySink {
                     app: self.app.clone(),
                     project: self.project,
+                    session: self.session?,
                 };
                 tools::dispatch_orchestration(name, arguments, &agents)
             })
@@ -397,8 +431,18 @@ impl ToolAccess for ProjectTools {
             crate::tasks_state::broadcast(&self.app, self.project, &store);
         }
         // And after the broadcast, the assignment-starts-work question — for every author, with
-        // the refusal in `autodispatch::trigger`'s author gate; see `StoreSink::mutations`.
-        crate::task_triggers::consider(&self.app, self.project, sink.mutations.into_inner());
+        // the refusal in `autodispatch::trigger`'s author gate; see `StoreSink::mutations`. A
+        // run such an edit starts reports back to *this* pane (M40): the pane that assigned is
+        // the one waiting. A run's connection has no session and cannot start one anyway.
+        let notify = self
+            .session
+            .map_or(RunNotify::Primary, |session| RunNotify::Session { session });
+        crate::task_triggers::consider(
+            &self.app,
+            self.project,
+            sink.mutations.into_inner(),
+            notify,
+        );
         result
     }
 }
@@ -447,6 +491,8 @@ struct StoreSink {
     /// filter here that somebody could later remove. Pure data, so this type stays
     /// `AppHandle`-free and constructible in the sink test above.
     mutations: Mutex<Vec<TaskMutation>>,
+    /// See [`ProjectTools::cwd`]; resolved to a value by the time a sink exists. (M39)
+    cwd: PathBuf,
 }
 
 impl TaskSink for StoreSink {
@@ -465,6 +511,7 @@ impl TaskSink for StoreSink {
         agent: Option<&AgentId>,
         change: Option<&ChangeName>,
         links: &[cide_ipc::TaskLinkSpec],
+        attachments: &[PathBuf],
     ) -> Result<Task, String> {
         let req = TaskNew {
             // Carried because the wire shape has it; the store ignores it and knows its own
@@ -490,11 +537,31 @@ impl TaskSink for StoreSink {
             } else {
                 Some(links.to_vec())
             },
+            attachments: None,
         };
         let task = self
             .store
             .create(&req, self.author.clone())
             .map_err(|error| error.to_string())?;
+        // The files, before the task is answered or the trigger sees it — `cmd::tasks::task_new`'s
+        // arrangement for the same reason: a refusal takes the task with it, so a retry does not
+        // mint a second `t-<n>` beside a first that has no files. (M39)
+        let task = if attachments.is_empty() {
+            task
+        } else {
+            match self.store.attach(
+                &task.id,
+                AttachTarget::Task,
+                attachments,
+                self.author.clone(),
+            ) {
+                Ok(with_files) => with_files,
+                Err(error) => {
+                    let _ = self.store.delete(&task.id);
+                    return Err(error.to_string());
+                }
+            }
+        };
         self.changed.store(true, Ordering::Relaxed);
         self.mutations.lock().push(TaskMutation {
             before: None,
@@ -531,6 +598,42 @@ impl TaskSink for StoreSink {
             after: task.clone(),
             author: self.author.clone(),
             assign_gesture,
+            fresh_text,
+        });
+        Ok(task)
+    }
+
+    fn root(&self) -> &Path {
+        self.store.root()
+    }
+
+    fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    fn attach(
+        &self,
+        id: &TaskId,
+        target: AttachTarget,
+        sources: &[PathBuf],
+    ) -> Result<Task, String> {
+        // A comment born with its files is prose a mention trigger may scan, exactly as a
+        // `TaskEdit::Comment` is in `edit` above.
+        let fresh_text: Vec<String> = match &target {
+            AttachTarget::NewComment { text } => vec![text.clone()],
+            _ => Vec::new(),
+        };
+        let before = self.store.get(id);
+        let task = self
+            .store
+            .attach(id, target, sources, self.author.clone())
+            .map_err(|error| error.to_string())?;
+        self.changed.store(true, Ordering::Relaxed);
+        self.mutations.lock().push(TaskMutation {
+            before,
+            after: task.clone(),
+            author: self.author.clone(),
+            assign_gesture: false,
             fresh_text,
         });
         Ok(task)
@@ -572,6 +675,10 @@ impl TaskSink for StoreSink {
 struct RegistrySink {
     app: AppHandle,
     project: ProjectId,
+    /// The calling pane's own session — what `notify: here` names. (M40) Out of the connection's
+    /// `Scope`, never out of a payload: a model naming a session id would be the
+    /// identity-in-the-payload shape the header forbids.
+    session: SessionId,
 }
 
 impl AgentSink for RegistrySink {
@@ -596,6 +703,20 @@ impl AgentSink for RegistrySink {
             .try_state::<Arc<AgentRegistry>>()
             .ok_or_else(|| gone().to_string())?;
         Ok(registry.runs_for(self.project))
+    }
+
+    /// Straight from the registry, not from the roster.
+    ///
+    /// `agents()` above builds an `AgentRoster::Ready` that carries this same flag and threw it
+    /// away, which is how the pause stayed invisible to every tool in this file. Asking the
+    /// registry is cheaper than rebuilding a roster (no disk, no role parsing) and it is the same
+    /// value — `project_roster` fills the field from `AgentRegistry::dispatching`.
+    fn dispatching(&self) -> Result<bool, String> {
+        let registry = self
+            .app
+            .try_state::<Arc<AgentRegistry>>()
+            .ok_or_else(|| gone().to_string())?;
+        Ok(registry.dispatching(self.project))
     }
 
     fn definition(&self, scope: AgentScope, name: &AgentId) -> Result<Option<AgentDraft>, String> {
@@ -660,19 +781,29 @@ impl AgentSink for RegistrySink {
     fn dispatch(
         &self,
         agent: &AgentId,
-        task: &TaskId,
+        task: Option<&TaskId>,
         instructions: Option<&str>,
+        notify: cide_agents::tools::Notify,
     ) -> Result<RunId, String> {
         let (workspace, agents, tasks) = self.dispatch_state()?;
         let request = DispatchRequest {
             project: self.project,
             agent: agent.clone(),
-            task: Some(task.clone()),
+            task: task.cloned(),
             // `prompt` is the extra line, not the task's body: the run is *pointed at* its task
             // and reads it with `cide_task_get`, so nothing multi-line ever reaches the child's
-            // terminal. `cmd::agents::opening_prompt` flattens whatever arrives here anyway,
-            // which is the belt to this braces.
+            // terminal — and for a run with no task (M40) it is the whole brief, still one line.
+            // `cmd::agents::opening_prompt` flattens whatever arrives here anyway, which is the
+            // belt to this braces.
             prompt: instructions.map(str::to_string),
+            // `here` is this connection's pane, which only this side of the socket knows. (M40)
+            notify: Some(match notify {
+                cide_agents::tools::Notify::Here => RunNotify::Session {
+                    session: self.session,
+                },
+                cide_agents::tools::Notify::Main => RunNotify::Primary,
+                cide_agents::tools::Notify::None => RunNotify::Silent,
+            }),
         };
         tauri::async_runtime::block_on(crate::cmd::agents::agents_dispatch(
             self.app.clone(),
@@ -819,18 +950,26 @@ type Binder = dyn Fn(Option<&Hello>) -> Box<dyn ToolAccess> + Send + Sync;
 fn app_binder(app: AppHandle) -> Arc<Binder> {
     Arc::new(move |hello: Option<&Hello>| -> Box<dyn ToolAccess> {
         match hello.map_or(Scope::Unscoped, |hello| resolve(&app, hello)) {
-            Scope::Orchestrator { project } => Box::new(ProjectTools {
+            Scope::Pane {
+                project, session, ..
+            } => Box::new(ProjectTools {
                 app: app.clone(),
                 project,
-                // The orchestrator *is* the project's primary session, so this is the one author
-                // it can be.
+                // The nearest honest fit for a session a person is driving in this project, and
+                // — the half that is a refusal rather than a label — never `User`, which is the
+                // author `TaskStore::edit` lets rewrite and delete somebody else's comment.
                 author: TaskAuthor::Orchestrator,
+                // Every Claude pane of the project may dispatch (M40); the line this module
+                // exists to draw is the `Run` arm below.
                 orchestrator: true,
+                session: Some(session),
+                cwd: None,
             }),
             Scope::Run {
                 project,
                 agent,
                 label,
+                cwd,
             } => Box::new(ProjectTools {
                 app: app.clone(),
                 project,
@@ -840,18 +979,8 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 author: TaskAuthor::Agent { agent, label },
                 // The line this whole module exists to draw.
                 orchestrator: false,
-            }),
-            Scope::Conversation { project } => Box::new(ProjectTools {
-                app: app.clone(),
-                project,
-                // The nearest honest fit for a session a person is driving in this project, and
-                // — the half that is a refusal rather than a label — never `User`, which is the
-                // author `TaskStore::edit` lets rewrite and delete somebody else's comment.
-                author: TaskAuthor::Orchestrator,
-                // The line this whole module exists to draw, again: the seven `cide_agent*` tools
-                // belong to the console the product-owner prompt was appended to, and to nothing
-                // else. A conversation pane assigns and comments; it does not dispatch.
-                orchestrator: false,
+                session: None,
+                cwd: Some(cwd),
             }),
             Scope::Unscoped => Box::new(NoTools),
         }
@@ -982,7 +1111,7 @@ fn resolve_run(app: &AppHandle, hello: &Hello) -> Option<Scope> {
     let projects: Vec<ProjectId> = state.with(|ws| ws.projects.keys().copied().collect());
     projects
         .into_iter()
-        .find_map(|project| run_scope_of(&registry.runs_for(project), run))
+        .find_map(|project| run_scope_of(&registry.run_scopes_for(project), run))
 }
 
 /// The pure half of [`resolve_run`]: a run id plus one project's runs gives a scope.
@@ -990,13 +1119,14 @@ fn resolve_run(app: &AppHandle, hello: &Hello) -> Option<Scope> {
 /// Split out for [`scope_of`]'s reason — this decides which project's tasks a caller can write
 /// and under whose name, and a boundary nothing can call without an `AppHandle` is a boundary
 /// nothing tests.
-fn run_scope_of(runs: &[AgentRun], run: RunId) -> Option<Scope> {
+fn run_scope_of(runs: &[crate::agents::RunScope], run: RunId) -> Option<Scope> {
     runs.iter()
         .find(|live| live.run == run)
         .map(|live| Scope::Run {
             project: live.project,
             agent: live.agent.clone(),
-            label: live.agent_label.clone(),
+            label: live.label.clone(),
+            cwd: live.cwd.clone(),
         })
 }
 
@@ -1024,14 +1154,23 @@ fn scope_of(ws: &Workspace, hello: &Hello) -> Scope {
 
     // The product owner first, and the order is not arbitrary: `primary_session` is also a
     // Claude pane of its project, so asking the wider question first would answer every console
-    // with `Conversation` and quietly take the seven orchestration tools away from the one
-    // session that is supposed to have them.
+    // as an ordinary pane. The tools are the same either way since M40; what `primary` still
+    // decides is the opening sentence of the paragraph `cmd::session` appends, and a console
+    // told it was "one of this project's panes" would be a product owner that does not know it.
     if let Some(project) = project_of_primary(ws, session) {
-        return Scope::Orchestrator { project };
+        return Scope::Pane {
+            project,
+            session,
+            primary: true,
+        };
     }
 
     match project_of_claude_pane(ws, session) {
-        Some(project) => Scope::Conversation { project },
+        Some(project) => Scope::Pane {
+            project,
+            session,
+            primary: false,
+        },
         None => Scope::Unscoped,
     }
 }
@@ -1273,8 +1412,8 @@ const TITLE_BUDGET: usize = 72;
 /// Turns that have ended and not yet been announced. One per process; see [`NudgeCoalescer`].
 static NUDGES: NudgeCoalescer = NudgeCoalescer::new();
 
-/// A subagent's turn ended — handed back, finished, or failed. Tell the project's product
-/// owner, once per burst.
+/// A subagent's turn ended — handed back, finished, or failed. Tell the pane the run's
+/// [`RunNotify`] names, once per burst — or nobody, for a run dispatched `notify: none`.
 ///
 /// # Why this is a PTY write at all
 ///
@@ -1316,6 +1455,8 @@ pub fn note_run_over(app: &AppHandle, project: ProjectId, run: RunId) {
     // The facts are read *now*, while they are still true, rather than at flush time: a run can
     // be stopped, finished or forgotten in the two seconds the burst is settling, and a line
     // composed from what the registry says afterwards would describe the wrong thing or nothing.
+    // `None` is also a run that asked for silence (M40) — the death comment above was written
+    // regardless, because that is board record and this is a knock.
     let Some(turn) = turn_of(app, project, run) else {
         return;
     };
@@ -1421,28 +1562,28 @@ pub fn note_session_ready(app: &AppHandle, state: SessionState) {
     }
 }
 
-/// Wait the burst out, then write at most one line per project.
+/// Wait the burst out, then write at most one line per (project, route).
 fn flush_nudges(app: &AppHandle) {
     loop {
         thread::sleep(NUDGE_TICK);
         let Some(due) = NUDGES.take_due() else {
             continue;
         };
-        for (project, turns) in by_project(due) {
-            deliver_nudge(app, project, turns);
+        for ((project, route), turns) in by_route(due) {
+            deliver_nudge(app, project, &route, turns);
         }
         return;
     }
 }
 
-/// Read the setting, find the product owner, check it is not mid-turn, and type the line.
+/// Read the setting, find the pane the route names, check it is not mid-turn, and type the line.
 ///
 /// Every step can decline, and each declines by doing nothing: this runs on a background thread
 /// with no user in front of it, and there is no screen on which "the nudge could not be sent"
 /// would be a useful sentence. The orchestrator is never left without the information — asking
 /// `mcp__cide__cide_agent_runs` answers the same question, and answers it as of the moment it is
 /// called.
-fn deliver_nudge(app: &AppHandle, project: ProjectId, turns: Vec<Turn>) {
+fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns: Vec<Turn>) {
     let Some(workspace) = app.try_state::<WorkspaceState>() else {
         return;
     };
@@ -1455,11 +1596,15 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, turns: Vec<Turn>) {
         return;
     }
 
-    let Some(session) = workspace.with(|ws| {
-        cide_core::workspace::project(ws, project)
-            .ok()
-            .map(|project| project.primary_session)
-    }) else {
+    // Resolved *here*, at delivery, for both arms: the primary because it moves, the named pane
+    // because it may have closed since the dispatch — and a burst that spent two seconds
+    // settling is two seconds in which either can have happened.
+    let alive = |session: SessionId| {
+        app.try_state::<SessionRegistry>()
+            .and_then(|sessions| sessions.get(session))
+            .is_some_and(|pty| !pty.has_exited())
+    };
+    let Some(session) = workspace.with(|ws| nudge_target(ws, project, route, alive)) else {
         return;
     };
 
@@ -1529,9 +1674,24 @@ fn nudge_allowed(root: &Path) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Turn {
     project: ProjectId,
+    /// Whose conversation the line goes into — copied off the run at the edge, for the reason
+    /// the label is: what the run *asked for* at dispatch, not what a later lookup would say.
+    route: NudgeRoute,
     agent_label: String,
     task: Option<TaskId>,
     outcome: TurnOutcome,
+}
+
+/// Where a turn's line is typed. (M40) [`RunNotify`] with the silent arm removed — a silent run
+/// never becomes a [`Turn`] at all, so the coalescer holds only turns that go somewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum NudgeRoute {
+    /// The project's primary pane, resolved at delivery: `Project::primary_session` moves on
+    /// every console restart, so it is a role here and a session only when the line is typed.
+    Primary,
+    /// The pane that dispatched or assigned. Falls back to the primary at delivery if it is gone
+    /// — see [`nudge_target`].
+    Session(SessionId),
 }
 
 /// How the turn ended — the difference between "read what it wrote and answer it" and "that
@@ -1556,14 +1716,29 @@ enum TurnOutcome {
 /// The outcome is read from the run's state *now*, immediately after the transition that
 /// triggered this — `Finished`/`Failed` runs are retained by the registry precisely so a late
 /// reader still finds them.
+///
+/// `None` for a run that asked for silence (M40) — said in the log, because "nothing happened"
+/// is otherwise indistinguishable from the nudge being off, and the two have different fixes.
 fn turn_of(app: &AppHandle, project: ProjectId, run: RunId) -> Option<Turn> {
     let registry = app.try_state::<Arc<AgentRegistry>>()?;
     registry
         .runs_for(project)
         .into_iter()
         .find(|live| live.run == run)
-        .map(|live| Turn {
+        .and_then(|live| {
+            let route = match live.notify {
+                RunNotify::Primary => NudgeRoute::Primary,
+                RunNotify::Session { session } => NudgeRoute::Session(session),
+                RunNotify::Silent => {
+                    tracing::debug!(%run, "the run asked for no announcement; nothing is typed");
+                    return None;
+                }
+            };
+            Some((live, route))
+        })
+        .map(|(live, route)| Turn {
             project,
+            route,
             agent_label: live.agent_label,
             task: live.task,
             outcome: match live.state {
@@ -1605,19 +1780,54 @@ fn may_be_typed_into(state: SessionState) -> bool {
     matches!(state, SessionState::Idle | SessionState::AwaitingInput)
 }
 
-/// Group a burst by project, first-seen order, so each product owner is typed at once.
-fn by_project(turns: Vec<Turn>) -> Vec<(ProjectId, Vec<Turn>)> {
-    let mut grouped: Vec<(ProjectId, Vec<Turn>)> = Vec::new();
+/// Group a burst by (project, route), first-seen order, so each pane is typed at once. (M40)
+///
+/// The route is part of the key because one project's burst may now be owed to two panes — the
+/// console and the pane that dispatched — and one line naming both would be typed into one of
+/// them about work the other is waiting on.
+fn by_route(turns: Vec<Turn>) -> Vec<((ProjectId, NudgeRoute), Vec<Turn>)> {
+    let mut grouped: Vec<((ProjectId, NudgeRoute), Vec<Turn>)> = Vec::new();
     for turn in turns {
-        match grouped
-            .iter_mut()
-            .find(|(project, _)| *project == turn.project)
-        {
+        let key = (turn.project, turn.route.clone());
+        match grouped.iter_mut().find(|(other, _)| *other == key) {
             Some((_, bucket)) => bucket.push(turn),
-            None => grouped.push((turn.project, vec![turn])),
+            None => grouped.push((key, vec![turn])),
         }
     }
     grouped
+}
+
+/// Which session a route's line is typed into, given what is still standing. (M40)
+///
+/// `Primary` is the project's `primary_session` as it is *now*. `Session` is that pane if it is
+/// alive (`alive` — the registry's answer, injected so this is testable without one) **and**
+/// still a Claude pane of this project ([`project_of_claude_pane`], the same predicate that scoped
+/// its connection); otherwise the primary, with a line in the log — the fact is not dropped for
+/// want of its first address, and a pane the user closed mid-run is exactly the case where the
+/// console is the next place they will look. `None` only when the project itself is gone.
+fn nudge_target(
+    ws: &Workspace,
+    project: ProjectId,
+    route: &NudgeRoute,
+    alive: impl Fn(SessionId) -> bool,
+) -> Option<SessionId> {
+    let primary = cide_core::workspace::project(ws, project)
+        .ok()
+        .map(|project| project.primary_session)?;
+    match route {
+        NudgeRoute::Primary => Some(primary),
+        NudgeRoute::Session(session) => {
+            if alive(*session) && project_of_claude_pane(ws, *session) == Some(project) {
+                Some(*session)
+            } else {
+                tracing::debug!(
+                    %project, %session,
+                    "the pane that dispatched is gone; announcing to the primary pane instead"
+                );
+                Some(primary)
+            }
+        }
+    }
 }
 
 /// The line itself: what happened, and where to look. **One line, always.**
@@ -1915,12 +2125,16 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_session_of_a_project_is_the_only_thing_that_scopes() {
+    fn a_claude_pane_of_a_project_is_what_scopes_and_the_console_is_marked_primary() {
         let (ws, project, primary) = workspace_with_a_project();
 
         assert_eq!(
             scope_of(&ws, &hello(Some(&primary.to_string()), None)),
-            Scope::Orchestrator { project }
+            Scope::Pane {
+                project,
+                session: primary,
+                primary: true
+            }
         );
 
         // A session bound to no pane at all — a `claude` the user started by hand in a cide
@@ -1968,16 +2182,24 @@ mod tests {
         split_into_console(&mut ws, project, PaneKind::Claude, conversation);
         assert_eq!(
             scope_of(&ws, &hello(Some(&conversation.to_string()), None)),
-            Scope::Conversation { project }
+            Scope::Pane {
+                project,
+                session: conversation,
+                primary: false
+            }
         );
 
         // The console is unmoved, and that is what the ordering inside `scope_of` buys: the
         // primary pane is *also* a Claude pane of this project, so asking the wider question
-        // first would answer every console `Conversation` and silently take the five
-        // orchestration tools off the one session that is meant to have them.
+        // first would answer every console as an ordinary pane — same tools since M40, but a
+        // product owner whose paragraph no longer tells it so.
         assert_eq!(
             scope_of(&ws, &hello(Some(&primary.to_string()), None)),
-            Scope::Orchestrator { project }
+            Scope::Pane {
+                project,
+                session: primary,
+                primary: true
+            }
         );
 
         // The pane's *kind* is part of the rule. A shell pane is given no `CIDE_SESSION`, so
@@ -2006,7 +2228,11 @@ mod tests {
 
         assert_eq!(
             scope_of(&ws, &hello(Some(&conversation.to_string()), None)),
-            Scope::Conversation { project }
+            Scope::Pane {
+                project,
+                session: conversation,
+                primary: false
+            }
         );
     }
 
@@ -2019,11 +2245,19 @@ mod tests {
 
         assert_eq!(
             scope_of(&ws, &hello(Some(&first_primary.to_string()), None)),
-            Scope::Orchestrator { project: first }
+            Scope::Pane {
+                project: first,
+                session: first_primary,
+                primary: true
+            }
         );
         assert_eq!(
             scope_of(&ws, &hello(Some(&second_primary.to_string()), None)),
-            Scope::Orchestrator { project: second }
+            Scope::Pane {
+                project: second,
+                session: second_primary,
+                primary: true
+            }
         );
         assert_ne!(first, second);
 
@@ -2033,23 +2267,21 @@ mod tests {
         split_into_console(&mut ws, second, PaneKind::Claude, in_second);
         assert_eq!(
             scope_of(&ws, &hello(Some(&in_second.to_string()), None)),
-            Scope::Conversation { project: second }
+            Scope::Pane {
+                project: second,
+                session: in_second,
+                primary: false
+            }
         );
     }
 
-    fn a_run(project: ProjectId, agent: &str) -> AgentRun {
-        AgentRun {
+    fn a_run(project: ProjectId, agent: &str) -> crate::agents::RunScope {
+        crate::agents::RunScope {
             run: RunId::new(),
-            agent: AgentId(agent.to_string()),
-            agent_label: format!("{agent} (label)"),
-            harness: cide_ipc::Harness::Claude,
             project,
-            session: Some(SessionId::new()),
-            state: cide_ipc::RunState::Running,
-            task: None,
-            started_unix_ms: 1,
-            stale_turn: false,
-            note: None,
+            agent: AgentId(agent.to_string()),
+            label: format!("{agent} (label)"),
+            cwd: PathBuf::from(format!("/repo/.cide/worktrees/{agent}")),
         }
     }
 
@@ -2066,6 +2298,9 @@ mod tests {
                 // The label comes from the registry, never from the child: a run that could name
                 // its own author could sign a comment as the user. See `TaskEdit::Comment`.
                 label: "qa (label)".into(),
+                // And so does the cwd: it is the worktree the app started the child in, which is
+                // what a relative path in `cide_task_attach` is read against. (M39)
+                cwd: PathBuf::from("/repo/.cide/worktrees/qa"),
             })
         );
 
@@ -2393,7 +2628,7 @@ mod tests {
     /// through the transport, the header line and the JSON-RPC layer, exactly as `cide-hook mcp`
     /// drives them.
     ///
-    /// Three connections, three answers: fifteen tools for the project's primary session, eight for
+    /// Three connections, three answers: sixteen tools for the project's primary session, nine for
     /// a run, none for anything else. And the enforcement half beside the advertisement: the run
     /// connection asks for `cide_agent_dispatch` by name and is answered `METHOD_NOT_FOUND`
     /// **without the call reaching the sink at all**, which is the assertion that matters — an
@@ -2438,7 +2673,7 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 15, "{names:?}");
+            assert_eq!(names.len(), 16, "{names:?}");
             assert_eq!(names, tools::tool::EVERY);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));
@@ -2461,7 +2696,7 @@ mod tests {
 
             run.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(run.recv());
-            assert_eq!(names.len(), 8, "{names:?}");
+            assert_eq!(names.len(), 9, "{names:?}");
             assert_eq!(names, tools::tool::ALL);
             for orchestration in tools::tool::ORCHESTRATION {
                 assert!(
@@ -2528,6 +2763,7 @@ mod tests {
             author: TaskAuthor::Orchestrator,
             changed: AtomicBool::new(false),
             mutations: Mutex::new(Vec::new()),
+            cwd: root.clone(),
         };
 
         assert!(sink.list().expect("list").is_empty());
@@ -2546,6 +2782,7 @@ mod tests {
                 "why",
                 Some(&AgentId("developer".into())),
                 None,
+                &[],
                 &[],
             )
             .expect("create");
@@ -2594,6 +2831,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A run attaches a file it wrote in its own worktree, by a path relative to *that*, and the
+    /// bytes land under the project root — the whole reason `TaskSink::cwd` and `root` are two
+    /// different answers. (M39)
+    #[test]
+    fn a_run_attaches_from_its_worktree_and_the_file_lands_under_the_root() {
+        let root = std::env::temp_dir().join(format!(
+            "cide-agent-attach-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree = root.join(".cide/worktrees/developer");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(
+            worktree.join("shot.png"),
+            b"\x89PNG\r\n\x1a\n0000000000000000",
+        )
+        .expect("the run's own file");
+
+        let sink = StoreSink {
+            store: Arc::new(TaskStore::open(&root)),
+            project: ProjectId::new(),
+            author: TaskAuthor::Agent {
+                agent: AgentId("developer".into()),
+                label: "Developer".into(),
+            },
+            changed: AtomicBool::new(false),
+            mutations: Mutex::new(Vec::new()),
+            cwd: worktree.clone(),
+        };
+        let made = sink
+            .create("Draw the thing", "", None, None, &[], &[])
+            .expect("create");
+
+        // A creation whose file is refused leaves no task behind — the id is spent, the row is
+        // not. Through the tool, as a model's call arrives.
+        let refused = tools::dispatch(
+            tools::tool::TASK_CREATE,
+            &json!({ "title": "With a missing file", "attachments": ["nope.png"] }),
+            &sink,
+        )
+        .expect("dispatched");
+        assert!(refused.is_error);
+        assert_eq!(
+            sink.list().unwrap().len(),
+            1,
+            "a refused creation must not leave a task with no files"
+        );
+
+        // Through the tool, so the relative path is resolved exactly as a model's call is.
+        let answer = tools::dispatch(
+            tools::tool::TASK_COMMENT,
+            &json!({ "id": made.id, "text": "here it is", "attachments": ["shot.png"] }),
+            &sink,
+        )
+        .expect("dispatched");
+        let text = answer.to_json()["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(!answer.is_error, "{text}");
+
+        let task = sink.get(&made.id).expect("get").expect("present");
+        let comment = task.comments.last().expect("the comment");
+        assert_eq!(comment.attachments.len(), 1);
+        let record = &comment.attachments[0];
+        assert_eq!(record.name, "shot.png");
+        assert_eq!(record.kind, cide_ipc::AttachmentKind::Image);
+        assert_eq!(record.added_by, sink.author);
+        let on_disk = root.join(record.relative_path(&task.id));
+        assert!(on_disk.is_file(), "{}", on_disk.display());
+        assert!(
+            !on_disk.starts_with(&worktree),
+            "the copy lives under the project root, not the run's checkout"
+        );
+        // The render names that absolute path, which is what the next `Read` needs.
+        assert!(text.contains(&on_disk.display().to_string()), "{text}");
+        // And the ledger carries the comment's prose, so a mention in it still triggers.
+        let mutations = sink.mutations.lock();
+        assert_eq!(
+            mutations.last().expect("recorded").fresh_text,
+            ["here it is"]
+        );
+        drop(mutations);
+
+        // A path that is not there refuses with the *resolved* path in the sentence, and leaves
+        // no comment behind.
+        let refused = tools::dispatch(
+            tools::tool::TASK_ATTACH,
+            &json!({ "id": made.id, "paths": ["missing.png"] }),
+            &sink,
+        )
+        .expect("dispatched");
+        let text = refused.to_json()["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(refused.is_error);
+        assert!(
+            text.contains(&worktree.join("missing.png").display().to_string()),
+            "{text}"
+        );
+        assert_eq!(sink.get(&made.id).unwrap().unwrap().attachments.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ======================================================================================
     // The product-owner loop. (M18)
     // ======================================================================================
@@ -2610,6 +2954,7 @@ mod tests {
     ) -> Turn {
         Turn {
             project,
+            route: NudgeRoute::Primary,
             agent_label: agent.to_string(),
             task: task.map(|id| TaskId(id.to_string())),
             outcome,
@@ -2878,16 +3223,76 @@ mod tests {
     #[test]
     fn a_burst_spanning_two_projects_is_one_prompt_each() {
         let (one, two) = (ProjectId::new(), ProjectId::new());
-        let grouped = by_project(vec![
+        let grouped = by_route(vec![
             turn(one, "developer", Some("t-1")),
             turn(two, "qa", Some("t-9")),
             turn(one, "artist", Some("t-2")),
         ]);
         assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[0].0, one, "first-seen order");
+        assert_eq!(grouped[0].0, (one, NudgeRoute::Primary), "first-seen order");
         assert_eq!(grouped[0].1.len(), 2);
-        assert_eq!(grouped[1].0, two);
+        assert_eq!(grouped[1].0, (two, NudgeRoute::Primary));
         assert_eq!(grouped[1].1.len(), 1);
+    }
+
+    /// (M40) One project's burst can be owed to two panes — the console and the pane that
+    /// dispatched — and each is typed once, about its own runs only. A line naming both would
+    /// land in one of them about work the other is waiting on.
+    #[test]
+    fn a_burst_spanning_two_panes_of_one_project_is_one_prompt_each() {
+        let project = ProjectId::new();
+        let pane = SessionId::new();
+        let to_pane = |agent: &str, task: &str| Turn {
+            route: NudgeRoute::Session(pane),
+            ..turn(project, agent, Some(task))
+        };
+        let grouped = by_route(vec![
+            turn(project, "developer", Some("t-1")),
+            to_pane("qa", "t-9"),
+            turn(project, "artist", Some("t-2")),
+            to_pane("qa", "t-10"),
+        ]);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, (project, NudgeRoute::Primary));
+        assert_eq!(grouped[0].1.len(), 2);
+        assert_eq!(grouped[1].0, (project, NudgeRoute::Session(pane)));
+        assert_eq!(grouped[1].1.len(), 2);
+    }
+
+    /// (M40) The pane that asked is the pane that hears — while it is still there. A route to a
+    /// session that has exited, or that is no longer a Claude pane of this project, resolves to
+    /// the primary rather than to nothing: the fact is not dropped for want of its first address.
+    #[test]
+    fn a_gone_target_pane_falls_back_to_the_primary() {
+        let (mut ws, project, primary) = workspace_with_a_project();
+        let pane = SessionId::new();
+        split_into_console(&mut ws, project, PaneKind::Claude, pane);
+
+        assert_eq!(
+            nudge_target(&ws, project, &NudgeRoute::Primary, |_| true),
+            Some(primary)
+        );
+        assert_eq!(
+            nudge_target(&ws, project, &NudgeRoute::Session(pane), |_| true),
+            Some(pane),
+            "alive and still a Claude pane of the project: it hears"
+        );
+        assert_eq!(
+            nudge_target(&ws, project, &NudgeRoute::Session(pane), |_| false),
+            Some(primary),
+            "its child has exited: the console hears instead"
+        );
+        let stranger = SessionId::new();
+        assert_eq!(
+            nudge_target(&ws, project, &NudgeRoute::Session(stranger), |_| true),
+            Some(primary),
+            "alive but not one of this project's panes: the console hears instead"
+        );
+        assert_eq!(
+            nudge_target(&ws, ProjectId::new(), &NudgeRoute::Primary, |_| true),
+            None,
+            "a project that is gone has nobody to tell"
+        );
     }
 
     /// **A busy orchestrator is not typed into.**

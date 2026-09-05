@@ -262,6 +262,17 @@ export function PathReadout({ path }: { path: string }) {
   return <div className={styles.pathReadout}>{path}</div>
 }
 
+/**
+ * A value that is read, not set, in a row's control slot — the app's own version is the first.
+ *
+ * `PathReadout`'s sibling: the same mono, the same dim, and selectable for the same reason —
+ * the point of printing a version next to the log directory is pasting it into a report — but
+ * inline, so it sits where a row's control goes rather than on a line of its own underneath.
+ */
+export function Readout({ text }: { text: string }) {
+  return <span className={styles.readout}>{text}</span>
+}
+
 export interface ActionButtonProps {
   label: string
   onClick: () => void

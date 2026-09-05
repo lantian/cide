@@ -70,6 +70,16 @@ pub mod opencode;
 pub use claude::ClaudeHarness;
 pub use opencode::OpencodeHarness;
 
+/// The name cide's MCP server is registered under, on **every** harness.
+///
+/// One string, because a role definition's tool list must not have to know which CLI is carrying
+/// it. `opencode.rs` said this first and `claude.rs::mcp_config` spelled the literal `"cide"` by
+/// hand beside it — two spellings of one fact, which is the drift this const closes.
+///
+/// It is *not* the name the model sees. What a server's tools are called in a model's function
+/// list is the harness's own convention, and the two disagree — see [`Harness::tool_name`].
+pub const SERVER: &str = "cide";
+
 /// What every role is told about the task tracker, folded into its own system prompt.
 ///
 /// # The second of the two things that keep the tracker single-writer
@@ -93,12 +103,23 @@ pub use opencode::OpencodeHarness;
 /// carry it by reference; a test on each side asserts against this constant rather than against a
 /// quoted copy, so a copy cannot pass.
 ///
-/// # Namespaced tool names, measured
+/// # Namespaced tool names, and why this is a template rather than prose
 ///
-/// `mcp__cide__cide_task_get`, never the bare `cide_task_get`. The CLI namespaces an MCP server's
-/// tools as `mcp__<server>__<tool>` — the same fact `claude.rs::mcp_config` and the roster
-/// paragraph in `cmd/session.rs` are both written against — so the bare form names nothing the
-/// model can see, and telling it to call a name that does not exist is worse than saying nothing.
+/// A bare `cide_task_get` names nothing a model can see: every CLI namespaces an MCP server's
+/// tools, so the name in the function list is always built from the server's name and the tool's.
+/// Telling a model to call a name that does not exist is worse than saying nothing.
+///
+/// **But the two CLIs build it differently, and this paragraph shipped claiming otherwise.** Claude
+/// Code spells it `mcp__<server>__<tool>`; opencode spells it `<server>_<tool>`, so cide's tools
+/// arrive there as `cide_cide_task_get`. Every sentence cide wrote used the Claude form, on both
+/// harnesses. It was invisible for as long as it was because a capable model *guessed the mapping*
+/// — a terrastrike audit counted 57 `cide_cide_task_get` calls and not one `mcp__cide__*` — which
+/// is not a property to rely on under compaction or a smaller model.
+///
+/// So the names here are `{cide_task_get}`-style placeholders and [`tracker_preamble`] fills them
+/// from [`Harness::tool_name`]. Braced placeholders rather than a substring rewrite of the bare
+/// names, because the paragraph also says *the cide_task_\* tools* as prose and a replace over
+/// bare names would mangle that sentence. The same idiom [`spec_preamble`] already uses.
 ///
 /// # Why the last sentence is the one that matters
 ///
@@ -128,16 +149,52 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
      the only writer for it: one process owns that file, so a write made behind its back is \
      either overwritten by that process's next write or merged unpredictably with it, and the \
      work in it is lost. Editing the file directly is refused, so it is not a fallback. Read with \
-     mcp__cide__cide_task_get and mcp__cide__cide_task_list; change a task's title, body or \
-     status with mcp__cide__cide_task_update, append a comment with mcp__cide__cide_task_comment, \
-     set the role a task is for with mcp__cide__cide_task_assign, and open a new one with \
-     mcp__cide__cide_task_create. Those comments are how you report back: whoever dispatched you \
+     {cide_task_get} and {cide_task_list}; change a task's title, body or \
+     status with {cide_task_update}, append a comment with {cide_task_comment}, \
+     set the role a task is for with {cide_task_assign}, and open a new one with \
+     {cide_task_create}. Those comments are how you report back: whoever dispatched you \
      reads the task, not your transcript, so a run that finishes without leaving one has reported \
      nothing, and a comment is markdown a person reads: give a report of any length structure. \
      Before you start, comment your plan on the task, and commit each coherent step of \
      the work as you finish it: a run can die mid-turn, and the plan comment plus your branch's \
      commits are the only record of how far you got. When the work is done, set the task's status to review and comment what you did \
      and where; done is the reviewer's call, not yours.";
+
+/// Every tracker tool cide's prose is allowed to name.
+///
+/// The list a template is filled from, and the list the tests iterate. A placeholder for a tool
+/// that is not here survives the fill as a literal `{...}`, which every renderer's test catches —
+/// deliberately, because a brace left in a model's instructions is a name it cannot call, which is
+/// the failure this whole mechanism exists to remove.
+pub const TRACKER_TOOLS: &[&str] = &[
+    "cide_task_get",
+    "cide_task_list",
+    "cide_task_create",
+    "cide_task_update",
+    "cide_task_comment",
+    "cide_task_assign",
+];
+
+/// [`TRACKER_PREAMBLE`] with every tool named the way `harness` presents it.
+///
+/// The one place the paragraph becomes text. Both harnesses call it rather than reading the
+/// const, so a harness whose namespacing differs cannot be told the other one's spelling — see
+/// [`Harness::tool_name`], which is required for the same reason.
+pub fn tracker_preamble(harness: &dyn Harness) -> String {
+    fill_tools(TRACKER_PREAMBLE, harness)
+}
+
+/// Replace every `{<tool>}` in `text` with the name `harness` makes of it.
+///
+/// Shared by the tracker and spec paragraphs and by the app's two prompts, so one rule about what
+/// a placeholder means covers all four.
+pub fn fill_tools(text: &str, harness: &dyn Harness) -> String {
+    let mut out = text.to_string();
+    for tool in TRACKER_TOOLS {
+        out = out.replace(&format!("{{{tool}}}"), &harness.tool_name(tool));
+    }
+    out
+}
 
 /// What a run working an OpenSpec change is told, on top of [`TRACKER_PREAMBLE`]. (M28)
 ///
@@ -163,13 +220,14 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
 /// nothing for exactly the users whose machine has it. cide has already located the binary; it
 /// hands over the path it found.
 ///
-/// The template holds `{CHANGE}` and `{OPENSPEC}`; [`spec_preamble`] fills them.
+/// The template holds `{CHANGE}`, `{OPENSPEC}` and one tracker tool placeholder;
+/// [`spec_preamble`] fills all three.
 pub const SPEC_PREAMBLE: &str = concat!(
     "This task implements the OpenSpec change {CHANGE}, whose proposal, design, task checklist and delta specs are in openspec/changes/{CHANGE}/. ",
     "Before your first edit, run `{OPENSPEC} instructions apply --change {CHANGE} --json` from the repository root: it answers with that change's context files, its schema's own apply instruction, and the checklist as data — that list is the work, in that order, and it outranks any summary of it including this one. ",
     "Tick each box off in its file as you finish that step, and commit as you go, so the checklist always says how far you got. ",
     "If implementing shows you that the proposal, the design or a delta spec was wrong, correct that file in the same commit — a spec that no longer describes the code is worse than no spec. ",
-    "When every box is ticked, set the task's status to review with mcp__cide__cide_task_update and comment what you did. ",
+    "When every box is ticked, set the task's status to review with {cide_task_update} and comment what you did. ",
     "Never run `{OPENSPEC} archive`: archiving merges the deltas into openspec/specs/, and that is the reviewer's call once your branch has been integrated.",
 );
 
@@ -194,12 +252,17 @@ const SPEC_APPLY_CLAUSE: &str = concat!(
 /// `cli` is the absolute path cide resolved, or `None` when it could not find one — in which case
 /// the bare word is used, which is still a runnable line for a user whose shell has it and is a
 /// far better answer than refusing to mention the command at all.
-pub fn spec_preamble(change: &str, cli: Option<&std::path::Path>, apply: Option<&str>) -> String {
+pub fn spec_preamble(
+    change: &str,
+    cli: Option<&std::path::Path>,
+    apply: Option<&str>,
+    harness: &dyn Harness,
+) -> String {
     let openspec = match cli {
         Some(path) => path.display().to_string(),
         None => "openspec".to_string(),
     };
-    let mut text = SPEC_PREAMBLE
+    let mut text = fill_tools(SPEC_PREAMBLE, harness)
         .replace("{CHANGE}", change)
         .replace("{OPENSPEC}", &openspec);
     // Appended rather than interpolated into the middle, so a project without the command gets
@@ -209,6 +272,29 @@ pub fn spec_preamble(change: &str, cli: Option<&std::path::Path>, apply: Option<
     }
     text
 }
+
+/// What a run dispatched **without a task** is told, on top of [`TRACKER_PREAMBLE`]. (M40)
+///
+/// # It exists to countermand one sentence of the paragraph above it
+///
+/// `TRACKER_PREAMBLE` tells every run to comment its plan on the task, to *commit each coherent
+/// step of the work*, and to set the task to review — three instructions about a task the run
+/// does not have, and one of them dangerous: a task-less run stands in the **project root**
+/// (`crate::run_checkout`'s rule), which is the tree the user is working in, and a run that
+/// committed "each coherent step" there would be committing onto the user's branch beside their
+/// own uncommitted changes. So this says, in the same durable position, what such a run may not
+/// do — commit, stage, stash, checkout, reset, anything that moves HEAD or the index — and where
+/// its result goes instead: the working tree, and its own pane. Both harnesses fold it after the
+/// tracker paragraph and only alongside it, because it is a correction *to* that paragraph; a run
+/// told nothing about the tracker needs no correction.
+///
+/// # Why the system prompt and not the opening line
+///
+/// The opening prompt is one PTY line (`cmd::agents::opening_prompt`'s `\r` rule) and is a turn
+/// old by the time the work is done; the commit rule this overrides rides the system prompt, so
+/// the override has to sit where the rule does. It names no tool, so it needs no namespacing test
+/// — `the_adhoc_preamble_stays_within_its_budget_and_names_no_tool` pins that as well as the size.
+pub const ADHOC_PREAMBLE: &str = "This run was dispatched with no task on the board. Do only what the opening instruction asks. The directory you started in is the project's own checked-out tree, which the user is working in too — not a worktree of your own — so the paragraph above about committing each step does not apply here: do not commit, stage, stash, checkout, reset or otherwise move HEAD or the index unless the instruction explicitly asks for a commit, and leave your edits in the working tree for the user to read. Do not open a task or comment on one for this work. Whoever dispatched you reads the tree and your pane, so finish by saying plainly what you did or found.";
 
 /// Everything one implementation of a CLI has to answer.
 ///
@@ -220,6 +306,27 @@ pub fn spec_preamble(change: &str, cli: Option<&std::path::Path>, apply: Option<
 pub trait Harness: Send + Sync + 'static {
     /// Which CLI this is. The registry key, and what a [`RunPlan`] is checked against.
     fn kind(&self) -> cide_ipc::Harness;
+
+    /// What this CLI calls one of cide's MCP tools in a model's function list.
+    ///
+    /// `tool` is the bare vocabulary name — `cide_task_get` — and the answer is what the model can
+    /// actually type. [`SERVER`] is the server both harnesses register; the *namespacing* around
+    /// it is per CLI and the two do not agree: Claude Code builds `mcp__<server>__<tool>`,
+    /// opencode builds `<server>_<tool>`.
+    ///
+    /// # Why this is required rather than defaulted
+    ///
+    /// [`Self::respawn_spec`] is the precedent for a defaulted method, and it earns the default by
+    /// *refusing*: its body returns an error naming the harness, so an implementation that ignores
+    /// it cannot produce a wrong answer, only an honest failure. A default here could not do that
+    /// — it would have to return some real spelling, and whichever one it returned would be
+    /// silently wrong for the other CLI.
+    ///
+    /// That is not hypothetical. cide shipped with the Claude spelling written into every sentence
+    /// it hands an agent, on both harnesses; under opencode every one of those names was
+    /// uncallable, and nothing anywhere said so. A required method makes a new harness state its
+    /// convention instead of inheriting somebody else's by omission.
+    fn tool_name(&self, tool: &str) -> String;
 
     /// The child this run would be, as a value.
     ///
@@ -310,8 +417,10 @@ pub struct RunPlan<'a> {
     pub agent: &'a LoadedAgent,
     /// The directory the child starts in.
     ///
-    /// **The agent's worktree when isolation is on**, produced by `cide_git::worktree::ensure`
-    /// before this crate was called. Taken as a path rather than derived here so that nothing in
+    /// **The (role, task) worktree when isolation is on and the run has a task**, produced by
+    /// `cide_git::worktree::ensure` before this crate was called; the project root otherwise —
+    /// `crate::run_checkout` is the rule, and a run with no task lands in the root under every
+    /// isolation (M40). Taken as a path rather than derived here so that nothing in
     /// `cide-agents` has to link git — see the module header.
     pub cwd: PathBuf,
     pub project: ProjectId,
@@ -636,7 +745,7 @@ mod tests {
     #[test]
     fn the_spec_preamble_names_the_change_the_cli_and_the_rules() {
         let cli = std::path::Path::new("/home/u/.nvm/versions/node/v22.21.0/bin/openspec");
-        let rendered = spec_preamble("m28-openspec", Some(cli), None);
+        let rendered = spec_preamble("m28-openspec", Some(cli), None, &ClaudeHarness);
 
         // **The assertion that actually catches a rename.** A renamed placeholder leaves its
         // braces in the text, and a model reading `openspec/changes/{CHANGE}/` would go looking
@@ -689,7 +798,7 @@ mod tests {
 
         // With no binary found, the bare word — still a runnable line for a user whose shell
         // has it, and a far better answer than not naming the command at all.
-        let bare = spec_preamble("x", None, None);
+        let bare = spec_preamble("x", None, None, &ClaudeHarness);
         assert!(bare.contains("`openspec instructions apply"), "{bare}");
         assert!(!bare.contains('{'), "{bare}");
 
@@ -697,7 +806,7 @@ mod tests {
         // the *line* that project answers to — `/opsx:apply` on a project set up by an older
         // CLI, which is why this is a resolved string and not a name this crate spells. It says
         // which of the two loses, for the reason the paragraph above already says it once.
-        let with_skill = spec_preamble("x", None, Some("/openspec-apply-change"));
+        let with_skill = spec_preamble("x", None, Some("/openspec-apply-change"), &ClaudeHarness);
         assert!(
             with_skill.starts_with(&bare),
             "appended, never woven in: {with_skill}"
@@ -713,7 +822,7 @@ mod tests {
         assert!(!with_skill.contains('{'), "{with_skill}");
         assert!(!with_skill.contains("  "), "{with_skill:?}");
         assert_eq!(
-            spec_preamble("x", None, Some("   ")),
+            spec_preamble("x", None, Some("   "), &ClaudeHarness),
             bare,
             "a blank line is no command at all, not a sentence naming nothing"
         );
@@ -731,26 +840,63 @@ mod tests {
         );
     }
 
-    /// Every name in the paragraph is a name the model can actually call.
+    /// Every name in the paragraph is a name the model can actually call — **on every harness**.
     ///
-    /// The tools arrive as `mcp__<server>__<tool>` — measured while `claude.rs::mcp_config` was
-    /// written, and the reason cide's server is called `cide` — so a bare `cide_task_update` in
-    /// this prose would be an instruction to call something that does not exist. The count
-    /// comparison is the assertion that matters: it fails on the *next* mention somebody adds
-    /// without the prefix, not just on the six that are here today.
+    /// This test used to assert `mcp__cide__cide_task_*` as though that were a property of the
+    /// paragraph. It is a property of *Claude Code*: opencode namespaces the same server's tools
+    /// as `cide_cide_task_get`, so on that harness every name this test was green about was
+    /// uncallable. A terrastrike audit counted 57 `cide_cide_task_get` calls against zero
+    /// `mcp__cide__*` — a capable model reverse-engineering the mapping, which is not a thing to
+    /// rely on.
+    ///
+    /// So it runs over the registry rather than over one spelling. The count comparison is still
+    /// the assertion that matters and is now stronger: it fails on the *next* mention somebody
+    /// adds without a placeholder, on whichever harness, rather than on the six that are here.
     #[test]
     fn the_tracker_preamble_names_the_tools_in_the_spelling_they_arrive_in() {
-        for verb in ["get", "list", "create", "update", "comment", "assign"] {
-            let name = format!("mcp__cide__cide_task_{verb}");
+        for harness in registry() {
+            let rendered = tracker_preamble(*harness);
+            let kind = harness.kind();
+
+            for tool in TRACKER_TOOLS {
+                let name = harness.tool_name(tool);
+                assert!(
+                    rendered.contains(&name),
+                    "{kind:?} does not name {name}: {rendered}"
+                );
+            }
+
+            // Nothing was left as a literal `{cide_task_…}`: a brace that survives the fill is a
+            // name no model can call, which is the whole failure this mechanism removes.
             assert!(
-                TRACKER_PREAMBLE.contains(&name),
-                "{name} is missing: {TRACKER_PREAMBLE}"
+                !rendered.contains('{'),
+                "{kind:?} left a placeholder unfilled: {rendered}"
+            );
+
+            // Every mention is namespaced *this harness's way*. `tool_name` is asked for the
+            // prefix rather than it being spelled here, so the two cannot drift.
+            let namespaced = harness.tool_name("cide_task_");
+            assert_eq!(
+                rendered.matches("cide_task_").count(),
+                rendered.matches(&namespaced).count(),
+                "{kind:?} has a bare mention: {rendered}"
             );
         }
-        assert_eq!(
-            TRACKER_PREAMBLE.matches("cide_task_").count(),
-            TRACKER_PREAMBLE.matches("mcp__cide__cide_task_").count(),
-            "every mention is namespaced: {TRACKER_PREAMBLE}"
+
+        // And the two spellings really are different, so the loop above is testing something. A
+        // regression that made `tool_name` answer the same string everywhere would otherwise
+        // leave every assertion here green.
+        assert_ne!(
+            ClaudeHarness.tool_name("cide_task_get"),
+            OpencodeHarness.tool_name("cide_task_get"),
+            "the harnesses namespace differently; that is why this is a trait method"
+        );
+
+        // The template itself keeps no hard-coded namespace: a name written out in full here
+        // would be right on one harness and wrong on the other, silently.
+        assert!(
+            !TRACKER_PREAMBLE.contains("mcp__"),
+            "the template names no harness's spelling: {TRACKER_PREAMBLE}"
         );
 
         // The same file the `PreToolUse` fence in `cide-hook` refuses, named the same way, because
@@ -795,11 +941,13 @@ mod tests {
     /// on one side, a JSON document in `OPENCODE_CONFIG_CONTENT` on the other — so this is the
     /// only place the property *both roles are told the same thing about who owns the tracker* is
     /// actually checked.
-    #[test]
-    fn a_role_is_told_the_same_thing_whichever_binary_runs_it() {
-        use cide_ipc::{AgentDef, AgentId};
+    const BRIEF: &str = "You are the developer agent. Finish the task.";
 
-        const BRIEF: &str = "You are the developer agent. Finish the task.";
+    /// What each binary would tell one role, as a pair: claude's one `--append-system-prompt`
+    /// value, and the inline agent's `prompt` out of opencode's configuration document. `task`
+    /// is the only knob, because the paragraphs a run is told differ on exactly that (M40).
+    fn told_by_both(task: Option<&TaskId>) -> (String, String) {
+        use cide_ipc::{AgentDef, AgentId};
 
         fn role(harness: cide_ipc::Harness) -> LoadedAgent {
             LoadedAgent {
@@ -824,15 +972,15 @@ mod tests {
             }
         }
 
-        fn plan(agent: &LoadedAgent) -> RunPlan<'_> {
+        fn plan<'a>(agent: &'a LoadedAgent, task: Option<&TaskId>) -> RunPlan<'a> {
             RunPlan {
                 run: RunId::new(),
                 session: SessionId::new(),
                 agent,
                 cwd: PathBuf::from("/repo/.cide/worktrees/developer"),
                 project: ProjectId::new(),
-                task: Some(TaskId("t-14".into())),
-                task_title: Some("Teach the parser about tabs".into()),
+                task: task.cloned(),
+                task_title: task.map(|_| "Teach the parser about tabs".into()),
                 // No change in the fixture, so every argv assertion below is about the two
                 // paragraphs a run has always had; the third has its own fixture beside it.
                 change: None,
@@ -855,7 +1003,7 @@ mod tests {
         // claude: the value of the one `--append-system-prompt` the argv carries.
         let agent = role(cide_ipc::Harness::Claude);
         let args = ClaudeHarness
-            .spawn_spec(&plan(&agent))
+            .spawn_spec(&plan(&agent, task))
             .expect("a spawnable claude plan")
             .spec
             .args;
@@ -868,7 +1016,7 @@ mod tests {
         // opencode: the inline agent's `prompt`, out of the configuration document.
         let agent = role(cide_ipc::Harness::Opencode);
         let spec = OpencodeHarness
-            .spawn_spec(&plan(&agent))
+            .spawn_spec(&plan(&agent, task))
             .expect("a spawnable opencode plan")
             .spec;
         let document = spec
@@ -884,7 +1032,88 @@ mod tests {
             .expect("the inline role has a prompt")
             .to_string();
 
-        assert_eq!(told_by_claude, told_by_opencode);
-        assert_eq!(told_by_claude, format!("{BRIEF}\n\n{TRACKER_PREAMBLE}"));
+        (told_by_claude, told_by_opencode)
+    }
+
+    /// `rendered` with every tool name turned back into the placeholder it came from.
+    ///
+    /// The inverse of [`fill_tools`], and what lets the two parity tests below go on making their
+    /// claim now that the claim has changed shape. They used to assert the two binaries produce
+    /// **byte-identical** paragraphs, which was true and is now deliberately false: the same
+    /// sentence names `mcp__cide__cide_task_get` on one CLI and `cide_cide_task_get` on the other.
+    ///
+    /// Comparing normalised forms keeps the part that was ever worth asserting — *one role gets
+    /// one brief, in one order, whichever binary carries it* — while allowing the one difference
+    /// that is the point of `tool_name`. A test that simply dropped the comparison would have
+    /// stopped defending against the copy-paste divergence `TRACKER_PREAMBLE`'s header describes.
+    fn unfill_tools(rendered: &str, harness: &dyn Harness) -> String {
+        let mut out = rendered.to_string();
+        for tool in TRACKER_TOOLS {
+            out = out.replace(&harness.tool_name(tool), &format!("{{{tool}}}"));
+        }
+        out
+    }
+
+    #[test]
+    fn a_role_is_told_the_same_thing_whichever_binary_runs_it() {
+        let (told_by_claude, told_by_opencode) = told_by_both(Some(&TaskId("t-14".into())));
+
+        // The one licensed difference: the tool names, and nothing else.
+        assert_eq!(
+            unfill_tools(&told_by_claude, &ClaudeHarness),
+            unfill_tools(&told_by_opencode, &OpencodeHarness),
+        );
+        assert_eq!(
+            unfill_tools(&told_by_claude, &ClaudeHarness),
+            format!("{BRIEF}\n\n{TRACKER_PREAMBLE}")
+        );
+
+        // And each really is in its own spelling — otherwise the normalisation above could be
+        // hiding a harness that silently inherited the other's names, which is the bug.
+        assert!(
+            told_by_claude.contains("mcp__cide__cide_task_get"),
+            "{told_by_claude}"
+        );
+        assert!(
+            told_by_opencode.contains("cide_cide_task_get"),
+            "{told_by_opencode}"
+        );
+        assert!(!told_by_opencode.contains("mcp__"), "{told_by_opencode}");
+    }
+
+    /// The task-less twin (M40): the correction to the tracker paragraph is the third paragraph,
+    /// after it, on both binaries — asserted from [`ADHOC_PREAMBLE`] itself, never a quoted copy.
+    #[test]
+    fn an_adhoc_run_is_told_the_same_thing_whichever_binary_runs_it() {
+        let (told_by_claude, told_by_opencode) = told_by_both(None);
+        assert_eq!(
+            unfill_tools(&told_by_claude, &ClaudeHarness),
+            unfill_tools(&told_by_opencode, &OpencodeHarness),
+        );
+        assert_eq!(
+            unfill_tools(&told_by_claude, &ClaudeHarness),
+            format!("{BRIEF}\n\n{TRACKER_PREAMBLE}\n\n{ADHOC_PREAMBLE}")
+        );
+    }
+
+    /// A budget ([`TRACKER_PREAMBLE`]'s rule), and the two facts the paragraph exists for: it
+    /// forbids committing in the user's tree, and it names no tool — so a run whose bridge is
+    /// absent could read it harmlessly, even though the fold gates it with the tracker paragraph.
+    #[test]
+    fn the_adhoc_preamble_stays_within_its_budget_and_names_no_tool() {
+        assert!(
+            ADHOC_PREAMBLE.len() < 800,
+            "the ad-hoc preamble has grown to {} bytes",
+            ADHOC_PREAMBLE.len()
+        );
+        assert!(ADHOC_PREAMBLE.contains("do not commit"), "{ADHOC_PREAMBLE}");
+        assert!(
+            ADHOC_PREAMBLE.contains("not a worktree"),
+            "{ADHOC_PREAMBLE}"
+        );
+        assert!(
+            !ADHOC_PREAMBLE.contains("mcp__") && !ADHOC_PREAMBLE.contains("cide_task_"),
+            "a tool named here would need the namespacing test: {ADHOC_PREAMBLE}"
+        );
     }
 }

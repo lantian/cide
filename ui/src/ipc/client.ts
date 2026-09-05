@@ -131,13 +131,19 @@ export const app = {
   workspaceRev: () => invoke<number>('workspace_rev'),
 
   /**
-   * What each pane should become on launch: resume its conversation, or start clean.
+   * What each pane should become when its project appears: resume its conversation, or
+   * start clean.
    *
    * Advice, not instruction — spawning stays with the frontend because only it knows a
    * pane's size. Only entries marked `eager` spawn without being asked; the rest wait behind
    * a resume affordance, so reopening a six-pane project does not start six agents at once.
+   *
+   * Asked per project rather than once per window: a project reopened during the run comes
+   * back out of `closed.json` with conversations to resume, and a plan read at boot has no
+   * entry for it. Omit `project` for the whole workspace.
    */
-  restorePlan: () => invoke<PaneRestore[]>('app_restore_plan'),
+  restorePlan: (project?: ProjectId) =>
+    invoke<PaneRestore[]>('app_restore_plan', { project: project ?? null }),
 
   /**
    * Resize until the webview viewport is exactly `width` x `height`.
@@ -3561,7 +3567,9 @@ export const agentRuns = {
    *
    * `request.task` is optional on the wire and the panel nonetheless always fills it — see
    * `DispatchRequest::task`'s Rust doc: a run with no task is a run the Tasks panel cannot
-   * account for.
+   * account for. The orchestrator's `cide_agent_dispatch` may omit it (M40), and such a run
+   * stands in the project root rather than a worktree. `request.notify` is left unset here,
+   * which Rust reads as the primary pane: a click has no session of its own to name.
    */
   dispatch: (request: DispatchRequest) => invoke<RunId>('agents_dispatch', { request }),
 
@@ -3745,8 +3753,9 @@ export const agentWorktree = {
   /**
    * Merge one of the role's worktree branches into the branch this project's root has checked
    * out: `cide/<agent>-<task>` when `task` names one — worktrees are per (role, task), so a
-   * task's work lives on its own branch — or `cide/<agent>`, the base branch a taskless
-   * dispatch commits to, when it does not.
+   * task's work lives on its own branch — or `cide/<agent>` when it does not: the base branch
+   * task-less dispatches committed to before M40. Since then a run with no task stands in the
+   * project root and mints no branch, so that arm only reaches work an older cide left there.
    *
    * **Not through `pendingCommand`**, like every other user gesture in this feature and unlike
    * `agents.roster`: this is a click, and a click that silently does nothing is the failure this
@@ -4361,4 +4370,78 @@ export const specConfig = {
    */
   setUp: (project: ProjectId, context: string) =>
     invoke<SpecBoard>('spec_init', { project, context }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Task attachments: files on a task's body or on a comment. (M39)
+ *
+ * Its own block at the foot, per the append-only rule, and its own object rather than seven
+ * more members of `tasks` for the same reason `taskEvents` stands beside `events`: the literal
+ * above closed at M18 and appending cannot reach inside it.
+ *
+ * **No bytes cross this seam in either direction.** A file is named by a path (picked, dropped,
+ * or staged by the clipboard command) and copied by Rust; a thumbnail is fetched by the `<img>`
+ * over the asset protocol after `image` has vouched for it — `image.read`/`image.srcUrl`'s
+ * split, jailed to the record. The clipboard is read on the Rust side for `fs_paste_image`'s
+ * three reasons, and answers `null` when it holds no image because Ctrl+V on a card is an
+ * ordinary paste of text far more often than it is a screenshot.
+ *
+ * Three of these are mutations and answer with the whole board, per `tasks`' header. Detaching
+ * is not here: it is `tasks.edit(project, task, { kind: 'detachAttachment', attachment })`, so
+ * there is one road for it and `TaskStore::edit` removes the bytes on that road.
+ * --------------------------------------------------------------------------------------- */
+import type { AttachTarget, StagedFile, TaskAttachmentId } from './generated'
+
+export const attachments = {
+  /** Attach files by path — picked, dropped, or staged — where `target` says. */
+  attach: (project: ProjectId, task: TaskId, target: AttachTarget, sources: string[]) =>
+    invoke<TaskBoard>('task_attach', { project, task, target, sources }),
+
+  /** Attach the image on the clipboard, or `null` when there is none. */
+  attachClipboard: (project: ProjectId, task: TaskId, target: AttachTarget) =>
+    invoke<TaskBoard | null>('task_attach_clipboard', { project, task, target }),
+
+  /**
+   * Write the clipboard's image somewhere it can wait for a comment or task that does not
+   * exist yet, and answer where — a path that rides on the eventual `attach`/`tasks.create`
+   * like a picked one. `null` when the clipboard holds no image.
+   */
+  stageClipboard: () => invoke<StagedFile | null>('task_attachment_stage_clipboard'),
+
+  /** The parented native picker. Empty means cancelled. */
+  pick: () => invoke<string[]>('task_pick_attachments'),
+
+  /**
+   * Vouch for an attachment as an image and grant this webview the right to load it. Build the
+   * `<img>` URL with `image.srcUrl(doc)`; rejects with a sentence for anything that is not an
+   * image on disk *now*, whatever the record says it was.
+   */
+  image: (project: ProjectId, task: TaskId, attachment: TaskAttachmentId) =>
+    invoke<ImageDoc>('task_attachment_image', { project, task, attachment }),
+
+  /** Open with the desktop's application for the file's name. */
+  open: (project: ProjectId, task: TaskId, attachment: TaskAttachmentId) =>
+    invoke<void>('task_attachment_open', { project, task, attachment }),
+
+  /** Show the attachment's directory in the file manager. */
+  reveal: (project: ProjectId, task: TaskId, attachment: TaskAttachmentId) =>
+    invoke<void>('task_attachment_reveal', { project, task, attachment }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Files dragged in from the desktop. (M39)
+ *
+ * Neither `invoke` nor `listen`, and routed through this file anyway for the reason the header
+ * gives about `convertFileSrc`: it is a seam onto Tauri, and a seam that lives in a component is
+ * a seam nobody can grep for. `getCurrentWebview().onDragDropEvent` is Tauri's own drag-drop
+ * handler handing the page what it took from it — `enter`/`over`/`drop`/`leave`, with the
+ * dropped **paths** and a physical position, and no `File` objects anywhere. The consumer is
+ * `sidebar/TasksPanel/fileDrop.ts`, which says why paths are exactly the right currency.
+ * --------------------------------------------------------------------------------------- */
+import { getCurrentWebview, type DragDropEvent } from '@tauri-apps/api/webview'
+
+export const dragDrop = {
+  /** Every drag event this webview receives, until the answer is called. */
+  onEvent: (handler: (event: DragDropEvent) => void) =>
+    getCurrentWebview().onDragDropEvent((event) => handler(event.payload)),
 }

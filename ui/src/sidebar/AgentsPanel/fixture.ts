@@ -156,6 +156,25 @@ const QUEUED = run({
   note: 'Waiting for a free worktree.',
 })
 
+/**
+ * The same queued run, carrying the note `AgentRegistry::runs_for` derives for a **paused**
+ * project — the exact string `crates/cide-app/src/agents.rs`'s `PAUSED_QUEUE_NOTE` holds.
+ *
+ * The note is the whole mechanism: Rust decides the reason a run is held and the row simply
+ * renders it, so a paused project needs no new phase, no new DTO field and no view logic. That is
+ * also what makes this fixture worth having — nothing in the frontend would fail if the reason
+ * stopped arriving, and this story is the only place that would notice.
+ */
+const QUEUED_BY_PAUSE = run({
+  run: 'r-0002',
+  agent: 'qa',
+  agentLabel: 'QA',
+  phase: 'queued',
+  task: 't-15',
+  startedMs: NOW_MS - 8_000,
+  note: "this project's agents are paused; nothing starts until Resume",
+})
+
 const PAUSED = run({
   run: 'r-0003',
   agent: 'developer',
@@ -375,6 +394,7 @@ export type AgentsStoryName =
   | 'role-running'
   | 'role-idle'
   | 'role-queued'
+  | 'project-paused-queued-run'
   | 'role-paused'
   | 'role-awaiting'
   | 'role-finished-only'
@@ -506,6 +526,18 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
    * role must refuse a dispatch with `canDispatch`'s sentence rather than a live button.
    */
   'project-paused': story({ roster: queueShut([PAUSED_QA, PAUSED]) }),
+
+  /*
+   * **A paused project with work waiting in it** — the state a terrastrike probe sat in for hours
+   * while every surface cide has called it an ordinary queue.
+   *
+   * `queueShut` plus a `queued` run, which no story combined before: `project-paused` pauses runs
+   * that had already started, and `project-paused-no-live-run` has nothing in it at all. Neither
+   * covers the case the audit found, where the queue is shut and something is waiting behind it.
+   *
+   * What the row must say is *why* it is waiting, and it says it through `note` alone.
+   */
+  'project-paused-queued-run': story({ roster: queueShut([QUEUED_BY_PAUSE]) }),
 
   /*
    * **The story the Resume control exists for, and the one a refactor will break.**

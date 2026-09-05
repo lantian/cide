@@ -74,8 +74,10 @@
  * different door.
  */
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
-import { fsReveal, type ProjectId } from '@/ipc/client'
-import { notifyFailure } from '@/chrome/notices'
+import { attachments as attachmentsApi, fsReveal, type ProjectId } from '@/ipc/client'
+import { notify, notifyFailure } from '@/chrome/notices'
+import { onFileDrop, useDropHot } from './fileDrop'
+import { basename, type StagedAttachment } from './model'
 import { useTasks } from '@/sidebar/tasksStore'
 import { useSpec } from '../specStore'
 import { useAgents } from '@/sidebar/agentsStore'
@@ -107,6 +109,36 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
   const select = useTasks((s) => s.select)
   const refresh = useTasks((s) => s.refresh)
   const beginCompose = useTasks((s) => s.beginCompose)
+
+  /*
+   * Attachments in the New task dialog. (M39) The picker and the clipboard are promises the
+   * dialog awaits and folds into the draft; a desktop drop on the dialog folds in the same way,
+   * through the store rather than through a prop, because the drop arrives from outside React.
+   */
+  const dropHot = useDropHot()
+  const pickAttachments = useCallback(async (): Promise<readonly StagedAttachment[]> => {
+    const paths = await attachmentsApi.pick()
+    return paths.map((path) => ({ path, name: basename(path), bytes: null }))
+  }, [])
+  const stageClipboard = useCallback(async (): Promise<StagedAttachment | null> => {
+    const staged = await attachmentsApi.stageClipboard()
+    if (staged === null) {
+      notify('The clipboard holds no image.', { kind: 'warn' })
+      return null
+    }
+    return { path: staged.path, name: staged.name, bytes: Number(staged.bytes) }
+  }, [])
+  useEffect(
+    () =>
+      onFileDrop((target, paths) => {
+        if (target.kind !== 'compose') return
+        const draft = useTasks.getState().compose
+        if (draft === null) return
+        const files = paths.map((path) => ({ path, name: basename(path), bytes: null }))
+        useTasks.getState().setDraft({ ...draft, attachments: [...draft.attachments, ...files] })
+      }),
+    [],
+  )
   const setDraft = useTasks((s) => s.setDraft)
   const endCompose = useTasks((s) => s.endCompose)
   const createTask = useTasks((s) => s.create)
@@ -325,6 +357,9 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
           busy={creating}
           onDraft={setDraft}
           onCancel={endCompose}
+          onPickAttachments={pickAttachments}
+          onStageClipboard={stageClipboard}
+          dropHot={dropHot}
           onCreate={(draft) => {
             guarded(
               createTask(draft).then(() => {

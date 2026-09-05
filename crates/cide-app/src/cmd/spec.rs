@@ -998,7 +998,14 @@ pub async fn spec_dispatch_to_session(
      * than a pane.
      */
     let refreshed = store.get(&task);
-    let rules = crate::cmd::agents::opening_prompt(refreshed.as_ref(), None);
+    // `ClaudeHarness` explicitly, not the dispatched role's: this line is *typed into a live
+    // Claude pane*, whose own `cide-hook mcp` server is already attached and whose tools are
+    // therefore spelled `mcp__cide__…` whatever harness the project's roles happen to name.
+    let rules = crate::cmd::agents::opening_prompt(
+        refreshed.as_ref(),
+        None,
+        Some(&cide_agents::harness::ClaudeHarness),
+    );
     let started = app
         .try_state::<crate::state::SessionRegistry>()
         .and_then(|registry| registry.started(session));

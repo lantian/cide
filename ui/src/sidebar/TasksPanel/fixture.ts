@@ -53,6 +53,9 @@ import {
   type TaskDraft,
   type TaskStatus,
   type TaskView,
+  type AttachmentPreview,
+  type AttachmentView,
+  type StagedAttachment,
 } from './model'
 import { mentionOptions, type MentionOption } from './mentionModel'
 import type { TasksPanelViewProps } from './TasksPanel'
@@ -82,6 +85,9 @@ function comment(over: Partial<CommentView> & Pick<CommentView, 'text' | 'atMs'>
     id: `c-${over.atMs}`,
     author: { kind: 'user' },
     editedMs: null,
+    // No files, which is most comments — and the value that keeps every existing story's
+    // digest byte-identical to what it was before M39.
+    attachments: [],
     ...over,
   }
 }
@@ -124,6 +130,8 @@ function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskVie
     links: [],
     agent: null,
     comments: [],
+    // No files either, the same claim for M39: a task with no attachments draws no strip.
+    attachments: [],
     history: [],
     // The user, by default, because that is what the panel's own New task button produces. The
     // stories that need the other answer say so; see `BARE`, which is the card's half of the pair
@@ -732,6 +740,78 @@ export type CardStoryName =
   | 'card-markdown'
   | 'card-linked'
   | 'card-link-adding'
+  | 'card-attachments'
+  | 'card-attachments-readonly'
+  | 'card-attach-empty'
+  | 'card-composer-staged'
+
+/* ---------------------------------------------------------------- attachment fixtures (M39) */
+
+function attachment(
+  over: Partial<AttachmentView> & Pick<AttachmentView, 'id' | 'name' | 'kind'>,
+): AttachmentView {
+  return {
+    bytes: 24_576,
+    addedBy: { kind: 'user' },
+    addedMs: NOW_MS - 300_000,
+    ...over,
+  }
+}
+
+const ATTACHED = task({
+  id: 't-23',
+  title: 'Match the mock',
+  body: 'The header is 2px too tall against the design. Screenshots attached.',
+  status: 'doing',
+  agent: 'developer',
+  attachments: [
+    attachment({ id: 'a-ready', name: 'mock.png', kind: 'image', bytes: 184_320 }),
+    attachment({ id: 'a-pending', name: 'actual.png', kind: 'image' }),
+    attachment({ id: 'a-refused', name: 'not-really.png', kind: 'image' }),
+    attachment({ id: 'a-log', name: 'build.log', kind: 'file', bytes: 1_532 }),
+  ],
+  comments: [
+    comment({
+      text: 'Fixed; the header now measures as the mock.',
+      atMs: NOW_MS - 120_000,
+      author: { kind: 'agent', agent: 'developer', label: 'Developer' },
+      attachments: [
+        attachment({
+          id: 'a-after',
+          name: 'after.png',
+          kind: 'image',
+          addedBy: { kind: 'agent', agent: 'developer', label: 'Developer' },
+          addedMs: NOW_MS - 120_000,
+        }),
+      ],
+    }),
+  ],
+})
+
+/* The URLs are what the asset protocol would hand back; a server render draws the `src` and
+   never fetches it, which is exactly the boundary the strip is meant to respect. */
+const PREVIEWS: Readonly<Record<string, AttachmentPreview>> = {
+  'a-ready': { kind: 'ready', url: 'asset://localhost/repo/.cide/attachments/t-23/a-ready/mock.png' },
+  'a-refused': { kind: 'refused', reason: 'not-really.png: the bytes are not an image' },
+  'a-after': { kind: 'ready', url: 'asset://localhost/repo/.cide/attachments/t-23/a-after/after.png' },
+}
+
+const STAGED: readonly StagedAttachment[] = [
+  { path: '/home/u/shots/Pasted image 2026-09-04 at 10.02.11.png', name: 'Pasted image 2026-09-04 at 10.02.11.png', bytes: 88_064 },
+  { path: '/home/u/notes/findings.md', name: 'findings.md', bytes: null },
+]
+
+const ATTACHMENT_HANDLERS: Partial<TaskDetailProps> = {
+  onPickAttachments: () => Promise.resolve([]),
+  onStageClipboard: () => Promise.resolve(null),
+  onAttach: () => {},
+  onAttachClipboard: () => {},
+  onDetachAttachment: () => {},
+  onOpenAttachment: () => {},
+  onRevealAttachment: () => {},
+  onViewAttachment: () => {},
+  onComposerStaged: () => {},
+}
 
 export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
   /*
@@ -1031,7 +1111,39 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
     linkAdd: { kind: 'blockedBy' },
     ...LINK_HANDLERS,
   }),
+
+  /*
+   * ------------------------------------------------------------------------ attachments (M39)
+   *
+   * Four files on the body — one image Rust has vouched for, one it is still vouching for, one
+   * it refused, and a log — and one image on a comment. The three preview states are the
+   * point: each has to look like something, and a check that only ever saw `ready` would pass
+   * a card that drew a refused thumbnail as a blank box. With every handler, so the paperclip,
+   * the per-comment Attach and the Remove are all on screen and counted as writes.
+   */
+  'card-attachments': card({
+    task: ATTACHED,
+    previews: PREVIEWS,
+    ...ATTACHMENT_HANDLERS,
+  }),
+
+  /*
+   * The same task with no handlers: a build with no attachment commands, or a board that
+   * cannot be written. The strip is still drawn — the files exist — and nothing on it writes.
+   */
+  'card-attachments-readonly': card({ task: ATTACHED, previews: PREVIEWS }),
+
+  /* A task with nothing attached, on a host that can attach: the row is one paperclip. */
+  'card-attach-empty': card({ task: T14, ...ATTACHMENT_HANDLERS }),
+
+  /* Two files picked or pasted into the composer and not yet submitted. */
+  'card-composer-staged': card({
+    task: T14,
+    composerStaged: STAGED,
+    ...ATTACHMENT_HANDLERS,
+  }),
 }
+
 
 /**
  * The compose dialog's named states — `TaskCompose`, which is `TaskComposeModal` minus the one
@@ -1059,6 +1171,7 @@ export type ComposeStoryName =
   | 'compose-busy'
   | 'compose-no-roles'
   | 'compose-linking'
+  | 'compose-attachments'
 
 /** A draft with something in every field, including a status that is not the default. */
 const FILLED_DRAFT: TaskDraft = {
@@ -1068,6 +1181,7 @@ const FILLED_DRAFT: TaskDraft = {
   body: 'The filter rejects dot-prefixed components before any gitignore matcher runs.',
   change: '',
   links: [],
+  attachments: [],
 }
 
 export const COMPOSE_STORIES: Record<ComposeStoryName, TaskComposeProps> = {
@@ -1100,6 +1214,12 @@ export const COMPOSE_STORIES: Record<ComposeStoryName, TaskComposeProps> = {
         { id: 't-16', title: 'Write check-agents', status: 'todo' },
       ],
     },
+  ),
+
+  /* Two files staged for the create, on a host that can pick. (M39) */
+  'compose-attachments': compose(
+    { ...FILLED_DRAFT, attachments: STAGED },
+    { onPickAttachments: () => Promise.resolve([]), onStageClipboard: () => Promise.resolve(null) },
   ),
 }
 

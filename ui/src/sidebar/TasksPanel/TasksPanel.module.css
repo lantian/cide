@@ -2002,3 +2002,170 @@
   width: auto;
   flex: none;
 }
+
+/*
+ * -------------------------------------------------------------------- attachments (M39)
+ *
+ * A strip of tiles under the body and under a comment. Each tile is a preview area — a medium
+ * thumbnail at its own aspect, or a paperclip for a file — over a name-and-size line and, on
+ * hover or focus, a row of actions. The strip wraps; three screenshots fit a 320px panel side by
+ * side and a wider card takes more. Blocks own no margins (the card's rule): the field's `gap`
+ * and the strip's own are the whole rhythm.
+ */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-4);
+}
+
+.attachment {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: 180px;
+  max-width: 100%;
+}
+
+.thumbButton,
+.fileTile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 120px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--chrome);
+  color: var(--dim);
+  cursor: pointer;
+  overflow: hidden;
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
+}
+
+.thumbButton:hover:not(:disabled),
+.fileTile:hover:not(:disabled) {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-1);
+}
+
+.thumbButton:focus-visible,
+.fileTile:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.thumbButton:disabled,
+.fileTile:disabled {
+  cursor: default;
+}
+
+.thumb {
+  /* Never cropped: a screenshot's edges are where the interesting thing usually is. */
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.thumbPlaceholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.thumbNote {
+  font-size: var(--fs-ui-11);
+}
+
+.attachmentMeta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  min-width: 0;
+  font-size: var(--fs-ui-12);
+}
+
+.attachmentName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.attachmentSize {
+  flex: none;
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+
+.attachmentActions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/*
+ * The chips a composer or the New task dialog draws for files not yet submitted. A chip is a
+ * pill with the name, the size when it is known, and an ✕ — one click to un-pick, which is the
+ * whole reason staging is drawn at all rather than attaching on the spot.
+ */
+.staged {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.stagedChip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 100%;
+  padding: 2px var(--sp-2) 2px var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  background: var(--chrome-hi);
+  color: var(--text);
+  font-size: var(--fs-ui-12);
+}
+
+.stagedName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stagedRemove {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.stagedRemove:hover {
+  background: var(--chrome);
+  color: var(--text);
+}
+
+/*
+ * A drop zone lit up while a file from the desktop is over it. Set by `fileDrop.ts` from
+ * Tauri's own drag events — the webview never sees an HTML5 drag — on the card, a comment, the
+ * composer and the New task dialog. A ring rather than a background, because the zone is often
+ * a block with text in it and a wash would make the text harder to read at the moment the
+ * person is deciding where to let go.
+ */
+[data-drop-hot='true'] {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}

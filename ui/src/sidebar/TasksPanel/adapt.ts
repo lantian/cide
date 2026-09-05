@@ -50,12 +50,20 @@
  */
 import type {
   Task as WireTask,
+  TaskAttachment as WireAttachment,
   TaskAuthor as WireAuthor,
   TaskBoard as WireBoard,
   TaskComment as WireComment,
   TaskStatusChange as WireStatusChange,
 } from '@/ipc/client'
-import type { Board, CommentAuthor, CommentView, StatusChangeView, TaskView } from './model'
+import type {
+  AttachmentView,
+  Board,
+  CommentAuthor,
+  CommentView,
+  StatusChangeView,
+  TaskView,
+} from './model'
 
 /**
  * `bigint` → `number`, in one place so the argument above is made once.
@@ -84,6 +92,27 @@ function author(from: WireAuthor): CommentAuthor {
   }
 }
 
+/** One file. (M39) The same `bigint` and author conversions a comment gets. */
+function attachment(from: WireAttachment): AttachmentView {
+  return {
+    id: from.id,
+    name: from.name,
+    bytes: ms(from.bytes),
+    kind: from.kind,
+    addedBy: author(from.addedBy),
+    addedMs: ms(from.addedUnixMs),
+  }
+}
+
+/**
+ * Live attachments only. (M39) Tombstones are dropped here for exactly the comments' reason
+ * below: the record stays in the file so a merge cannot resurrect a detached file, and no
+ * renderer has any use for one.
+ */
+function attachments(from: readonly WireAttachment[]): AttachmentView[] {
+  return from.filter((a) => !a.deleted).map(attachment)
+}
+
 function comment(from: WireComment): CommentView {
   return {
     id: from.id,
@@ -91,6 +120,7 @@ function comment(from: WireComment): CommentView {
     text: from.text,
     atMs: ms(from.atUnixMs),
     editedMs: from.editedAtUnixMs === null ? null : ms(from.editedAtUnixMs),
+    attachments: attachments(from.attachments),
   }
 }
 
@@ -153,6 +183,7 @@ function task(from: WireTask): TaskView {
      * where a comment used to be.
      */
     comments: from.comments.filter((c) => !c.deleted).map(comment),
+    attachments: attachments(from.attachments),
     // Who asked for it. Through the same `author` switch as a comment's, because it is the same
     // union — and a `createdBy` passed through raw would go on compiling after a variant was
     // added in Rust that this panel has never heard of.

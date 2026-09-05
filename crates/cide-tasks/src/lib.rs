@@ -56,11 +56,14 @@ use std::path::{Path, PathBuf};
 use cide_core::persist::{self, Debouncer};
 use cide_core::{CoreError, Result, document};
 use cide_ipc::{
-    ChangeName, CommentId, FileStamp, LinkType, Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit,
-    TaskFile, TaskId, TaskLink, TaskLinkSpec, TaskNew, TaskStatusChange,
+    AttachTarget, ChangeName, CommentId, FileStamp, LinkType, Task, TaskAttachment,
+    TaskAttachmentId, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskId, TaskLink,
+    TaskLinkSpec, TaskNew, TaskStatusChange,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
+
+pub mod attachments;
 
 /// Where the tracker lives inside a project, relative to its first root.
 ///
@@ -197,8 +200,64 @@ pub fn validate(file: &TaskFile) -> Result<()> {
                 )));
             }
         }
+
+        // Attachment ids are unique **within the task, across the body and every comment**:
+        // an id is a path component under the task's own directory, so two records sharing
+        // one would alias two files onto one path — a stronger claim than a duplicate comment
+        // id, which only breaks a merge key. Tombstoned records count, as with links. (M39)
+        let mut seen_attachments: Vec<&str> = Vec::new();
+        for attachment in task
+            .attachments
+            .iter()
+            .chain(task.comments.iter().flat_map(|c| c.attachments.iter()))
+        {
+            if !well_formed_attachment_id(&attachment.id) {
+                return Err(CoreError::Invariant(format!(
+                    "task {} carries an attachment whose id {:?} is not usable as a path",
+                    task.id,
+                    attachment.id.as_str()
+                )));
+            }
+            if !well_formed_attachment_name(&attachment.name) {
+                return Err(CoreError::Invariant(format!(
+                    "task {} carries an attachment whose name {:?} is not one path component",
+                    task.id, attachment.name
+                )));
+            }
+            if seen_attachments.contains(&attachment.id.as_str()) {
+                return Err(CoreError::Invariant(format!(
+                    "task {} carries two attachments with the id {}",
+                    task.id, attachment.id
+                )));
+            }
+            seen_attachments.push(attachment.id.as_str());
+        }
     }
     Ok(())
+}
+
+/// Whether an attachment id can be the directory it names. (M39)
+///
+/// [`well_formed_id`]'s alphabet — a uuid is inside it — with the same reason one level down:
+/// this string becomes a path component, and a separator or a `..` in it would put the bytes
+/// somewhere other than under the task.
+fn well_formed_attachment_id(id: &TaskAttachmentId) -> bool {
+    let text = id.as_str();
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Whether an attachment name is exactly one path component — what
+/// [`attachments::sanitize_name`] produces, restated as a check because the file is hand-editable.
+fn well_formed_attachment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !name.chars().any(char::is_control)
+        && name.trim() == name
 }
 
 /// The line [`TaskStore::create`] used to open an agent-made task's log with, before
@@ -295,6 +354,45 @@ fn repair(file: &mut TaskFile) {
             if comment.id.is_empty() {
                 comment.id =
                     TaskComment::legacy_id(&comment.author, comment.at_unix_ms, &comment.text);
+            }
+        }
+        /*
+         * An attachment record that cannot stand is **dropped, never re-minted.** (M39)
+         *
+         * The task and comment passes above re-mint or derive an id, because a task id or a
+         * comment id is only a key. An attachment id is a *directory name*: the bytes are filed
+         * under it. Re-minting the record would leave the file under the old name — an orphan
+         * with no symptom but a thumbnail that never loads, since `task_attachment_image` would
+         * look under the new one. Dropping the record leaves the bytes where they are for a
+         * person to find with `ls`, and says so in the log.
+         */
+        {
+            let task_id = task.id.clone();
+            let mut seen: Vec<String> = Vec::new();
+            let mut keep = |list: &mut Vec<TaskAttachment>| {
+                list.retain(|attachment| {
+                    if !well_formed_attachment_id(&attachment.id)
+                        || !well_formed_attachment_name(&attachment.name)
+                    {
+                        tracing::warn!(
+                            id = %task_id,
+                            attachment = %attachment.id,
+                            name = %attachment.name,
+                            "attachment record is not usable as a path; dropped it (its bytes, if any, are left on disk)"
+                        );
+                        return false;
+                    }
+                    if seen.contains(&attachment.id.0) {
+                        tracing::warn!(id = %task_id, attachment = %attachment.id, "duplicate attachment id; keeping the first");
+                        return false;
+                    }
+                    seen.push(attachment.id.0.clone());
+                    true
+                });
+            };
+            keep(&mut task.attachments);
+            for comment in &mut task.comments {
+                keep(&mut comment.attachments);
             }
         }
         /*
@@ -509,6 +607,54 @@ fn validated_change(change: Option<&ChangeName>) -> Result<Option<ChangeName>> {
 /// something you can act on. Telling them apart would let a caller probe which ids used to exist.
 fn no_such_comment(id: &CommentId) -> CoreError {
     CoreError::Io(format!("no such comment: {id}"))
+}
+
+/// [`no_such_comment`]'s shape for an attachment: absent and already-tombstoned are one answer.
+fn no_such_attachment(id: &TaskAttachmentId) -> CoreError {
+    CoreError::Io(format!("no such attachment: {id}"))
+}
+
+/// The one place a comment is built, so the append arm and the attach-with-comment arm cannot
+/// drift apart on a field. (M39)
+fn new_comment(
+    text: String,
+    attachments: Vec<TaskAttachment>,
+    author: TaskAuthor,
+    now: u64,
+) -> TaskComment {
+    TaskComment {
+        id: CommentId::new(),
+        author,
+        text,
+        // Stamped here rather than taken from the caller: a timestamp an agent supplies is one
+        // it can get wrong, and this one orders the log and decides the merge.
+        at_unix_ms: now,
+        edited_at_unix_ms: None,
+        deleted: false,
+        attachments,
+    }
+}
+
+/// One attachment record, wherever it is on the task — the body, or any comment, deleted or not.
+pub fn attachment_record<'a>(task: &'a Task, id: &TaskAttachmentId) -> Option<&'a TaskAttachment> {
+    task.attachments
+        .iter()
+        .chain(task.comments.iter().flat_map(|c| c.attachments.iter()))
+        .find(|a| a.id == *id)
+}
+
+fn attachment_record_mut<'a>(
+    task: &'a mut Task,
+    id: &TaskAttachmentId,
+) -> Option<&'a mut TaskAttachment> {
+    task.attachments
+        .iter_mut()
+        .chain(
+            task.comments
+                .iter_mut()
+                .flat_map(|c| c.attachments.iter_mut()),
+        )
+        .find(|a| a.id == *id)
 }
 
 /// The refusal an agent gets for [`TaskEdit::EditComment`] or [`TaskEdit::DeleteComment`].
@@ -874,6 +1020,7 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
     winner.comments = union_comments(&mine.comments, &theirs.comments);
     winner.history = union_history(&mine.history, &theirs.history);
     winner.links = union_links(&mine.links, &theirs.links);
+    winner.attachments = union_attachments(&mine.attachments, &theirs.attachments);
     // The creation stamp is the earlier of the two by definition: a task cannot have been created
     // twice, and if the two disagree one of them was hand-edited. The earlier is the safer read.
     winner.created_unix_ms = mine.created_unix_ms.min(theirs.created_unix_ms);
@@ -907,6 +1054,17 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
     // A link edge adopted from the loser is an update by the same argument — and here it is
     // load-bearing twice over, because an adopted edge's stamp is what wins it the *next* merge.
     if let Some(newest) = winner.links.iter().map(|l| l.at_unix_ms).max() {
+        winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
+    }
+    // An attachment adopted from the loser — on the body or on a comment — is an update by the
+    // same argument.
+    if let Some(newest) = winner
+        .attachments
+        .iter()
+        .chain(winner.comments.iter().flat_map(|c| c.attachments.iter()))
+        .map(|a| a.added_unix_ms)
+        .max()
+    {
         winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
     }
     winner
@@ -1000,6 +1158,32 @@ fn union_links(mine: &[TaskLink], theirs: &[TaskLink]) -> Vec<TaskLink> {
     out
 }
 
+/// Both sides' attachment records, resolved per id: **either side deleted ⇒ deleted, otherwise
+/// mine.** (M39)
+///
+/// [`TaskComment::deleted`]'s rule and not [`union_links`]' toggle, for the reason that doc gives
+/// for why a comment can have the simpler one: a record is never written to again under its id.
+/// There is no "re-attach the same attachment" — a person who wants the file back attaches it
+/// again and gets a new id — so a tombstone is final and no stamp needs consulting. Every other
+/// field is immutable, so when neither side deleted, the two copies are the same record and
+/// keeping mine is not a choice, only the stable convention written down.
+fn union_attachments(mine: &[TaskAttachment], theirs: &[TaskAttachment]) -> Vec<TaskAttachment> {
+    let mut out: Vec<TaskAttachment> = mine.to_vec();
+    for attachment in theirs {
+        match out.iter_mut().find(|a| a.id == attachment.id) {
+            Some(ours) => {
+                if attachment.deleted {
+                    ours.deleted = true;
+                }
+            }
+            None => out.push(attachment.clone()),
+        }
+    }
+    // Stable, on the stamp, for `union_comments`' reason.
+    out.sort_by_key(|a| a.added_unix_ms);
+    out
+}
+
 /// Two copies of one comment, resolved.
 ///
 /// # Why identity moved off the content (M21)
@@ -1019,7 +1203,14 @@ fn union_links(mine: &[TaskLink], theirs: &[TaskLink]) -> Vec<TaskLink> {
 ///    `at_unix_ms`. An edited copy therefore always beats an untouched one, whichever file it
 ///    came from, and two edits resolve by wall clock — the same authority `at_unix_ms` already
 ///    has for ordering the log.
+///
+/// Both rules pick a *whole* copy, and one field is then re-derived from both sides:
+/// `attachments`, through [`union_attachments`]. Without that, an edit to the text on one side
+/// while a screenshot was attached to the same comment on the other would drop the screenshot
+/// with nothing logged — the loser's attachment list is not a rival version of the winner's, it
+/// is a set the two sides each added to. (M39)
 fn reconcile_comment(mine: &TaskComment, theirs: &TaskComment) -> TaskComment {
+    let attachments = union_attachments(&mine.attachments, &theirs.attachments);
     if mine.deleted || theirs.deleted {
         let mut out = if mine.deleted {
             mine.clone()
@@ -1028,14 +1219,17 @@ fn reconcile_comment(mine: &TaskComment, theirs: &TaskComment) -> TaskComment {
         };
         out.deleted = true;
         out.text = String::new();
+        out.attachments = attachments;
         return out;
     }
     let stamp = |c: &TaskComment| c.edited_at_unix_ms.unwrap_or(c.at_unix_ms);
-    if stamp(theirs) > stamp(mine) {
+    let mut out = if stamp(theirs) > stamp(mine) {
         theirs.clone()
     } else {
         mine.clone()
-    }
+    };
+    out.attachments = attachments;
+    out
 }
 
 // --- layer 2: reading, repairing, and never failing -----------------------------------------
@@ -1392,6 +1586,11 @@ pub struct TaskStore {
     /// it compares unequal to any real stamp on purpose — the conservative answer is to re-read.
     stamp: Mutex<Option<FileStamp>>,
     state: Mutex<DiskState>,
+    /// The project root the file was opened under: where `.cide/attachments/` is. (M39)
+    ///
+    /// Stored, not derived by walking `path` up two parents — that would silently break the day
+    /// [`TASKS_RELATIVE`] grows a component, and nothing would say so.
+    root: PathBuf,
 }
 
 impl TaskStore {
@@ -1422,7 +1621,13 @@ impl TaskStore {
             debounce: Debouncer::new(persist::SAVE_DEBOUNCE),
             stamp: Mutex::new(stamp),
             state: Mutex::new(state),
+            root: project_root.to_path_buf(),
         }
+    }
+
+    /// The project root this tracker belongs to — the base of every attachment's path.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn path(&self) -> &Path {
@@ -1613,6 +1818,9 @@ impl TaskStore {
                 session: None,
                 links,
                 comments: Vec::new(),
+                // Files, if any, arrive through `attach` once the id exists — `cmd::tasks::task_new`
+                // makes the two one broadcast. (M39)
+                attachments: Vec::new(),
                 // Empty even when the caller named a starting status: the history records
                 // *changes*, and a task born in `Doing` did not move there — `created_by` and
                 // the status itself already carry that fact.
@@ -1640,7 +1848,20 @@ impl TaskStore {
     /// an agent could sign a comment as the user.
     pub fn edit(&self, id: &TaskId, edit: TaskEdit, author: TaskAuthor) -> Result<Task> {
         let now = persist::now_ms();
-        self.update(move |file| {
+        // Remembered outside the closure: the bytes go *after* the tombstone has landed, and
+        // outside the lock — `update`'s closure does no I/O. See `TaskEdit::DetachAttachment`.
+        let detaching = match &edit {
+            TaskEdit::DetachAttachment { attachment } => Some(attachment.clone()),
+            _ => None,
+        };
+        // A deleted comment takes its files with it: they were part of what it said, and bytes
+        // nobody can reach from the panel or from `cide_task_get` are bytes in the repository
+        // for no reason. Tombstoned in the closure, removed after it, like a detach.
+        let deleting_comment = match &edit {
+            TaskEdit::DeleteComment { id } => Some(id.clone()),
+            _ => None,
+        };
+        let task = self.update(move |file| {
             // The two link arms route through free functions over the whole file before the
             // single-task borrow below is taken: the rules they enforce — the target's
             // existence, the cycle walk, `related`'s inverse edge — live on *other* tasks.
@@ -1702,16 +1923,10 @@ impl TaskStore {
                 // **Appends.** There is no edit and no delete, here or on the wire, and that single
                 // restriction is what makes the log a channel between agents rather than a
                 // scratchpad — see `TaskComment`.
-                TaskEdit::Comment { text } => task.comments.push(TaskComment {
-                    id: CommentId::new(),
-                    author,
-                    text,
-                    // Stamped here rather than taken from the caller: a timestamp an agent supplies
-                    // is one it can get wrong, and this one orders the log and decides the merge.
-                    at_unix_ms: now,
-                    edited_at_unix_ms: None,
-                    deleted: false,
-                }),
+                TaskEdit::Comment { text } => {
+                    task.comments
+                        .push(new_comment(text, Vec::new(), author, now))
+                }
                 /*
                  * The two the **user** may do, and nobody else. (M21)
                  *
@@ -1751,6 +1966,21 @@ impl TaskStore {
                     // The tombstone persists; the words do not. See `TaskComment::deleted`.
                     comment.text = String::new();
                     comment.edited_at_unix_ms = Some(now);
+                    for attachment in &mut comment.attachments {
+                        attachment.deleted = true;
+                    }
+                }
+                // The third the user may do and nobody else, on the two arms' exact terms:
+                // an attachment is part of the record, and an agent removing one leaves a
+                // reader unable to tell what the comment was written with. (M39)
+                TaskEdit::DetachAttachment { attachment } => {
+                    if author != TaskAuthor::User {
+                        return Err(agents_may_not_rewrite());
+                    }
+                    let record = attachment_record_mut(task, &attachment)
+                        .filter(|a| !a.deleted)
+                        .ok_or_else(|| no_such_attachment(&attachment))?;
+                    record.deleted = true;
                 }
                 TaskEdit::Link { .. } | TaskEdit::Unlink { .. } => {
                     unreachable!("returned through apply_link/apply_unlink above")
@@ -1758,7 +1988,107 @@ impl TaskStore {
             }
             task.updated_unix_ms = now;
             Ok(task.clone())
-        })
+        })?;
+        if let Some(attachment) = detaching
+            && let Some(record) = attachment_record(&task, &attachment)
+        {
+            attachments::remove(&self.root, id, record);
+        }
+        if let Some(comment) = deleting_comment
+            && let Some(gone) = task.comments.iter().find(|c| c.id == comment)
+        {
+            for record in &gone.attachments {
+                attachments::remove(&self.root, id, record);
+            }
+        }
+        Ok(task)
+    }
+
+    /// Copy files under the task and record them where `target` says. (M39)
+    ///
+    /// The bytes first, the record second — a record naming a file that was never written is
+    /// worse than the reverse, which is why this is not a [`TaskEdit`] arm: `update`'s closure
+    /// does no I/O. The target is checked *before* the copy so a refusal — no such task, no such
+    /// comment — costs nothing on disk, and a refusal from the record step removes the copies.
+    ///
+    /// `author` is who attached, from the connection — [`TaskEdit::Comment`]'s rule — and, for
+    /// [`AttachTarget::NewComment`], who the comment is from.
+    pub fn attach(
+        &self,
+        id: &TaskId,
+        target: AttachTarget,
+        sources: &[PathBuf],
+        author: TaskAuthor,
+    ) -> Result<Task> {
+        self.check_target(id, &target)?;
+        let records = attachments::import(&self.root, id, sources, &author)?;
+        self.record_attachments(id, target, records, author)
+    }
+
+    /// [`Self::attach`] for bytes the caller already holds: the clipboard road, where there is
+    /// no source path and writing one only to read it back would be a temp file for nothing.
+    pub fn attach_bytes(
+        &self,
+        id: &TaskId,
+        target: AttachTarget,
+        name: &str,
+        bytes: &[u8],
+        author: TaskAuthor,
+    ) -> Result<Task> {
+        self.check_target(id, &target)?;
+        let record = attachments::import_bytes(&self.root, id, name, bytes, &author)?;
+        self.record_attachments(id, target, vec![record], author)
+    }
+
+    /// The refusals `attach` can give without touching the disk.
+    fn check_target(&self, id: &TaskId, target: &AttachTarget) -> Result<()> {
+        let guard = self.inner.lock();
+        let task = find(&guard, id).ok_or_else(|| no_such_task(id))?;
+        if let AttachTarget::Comment { id: comment } = target
+            && !task.comments.iter().any(|c| c.id == *comment && !c.deleted)
+        {
+            return Err(no_such_comment(comment));
+        }
+        Ok(())
+    }
+
+    /// The record half of `attach`: land the records, or remove their bytes and say why.
+    fn record_attachments(
+        &self,
+        id: &TaskId,
+        target: AttachTarget,
+        records: Vec<TaskAttachment>,
+        author: TaskAuthor,
+    ) -> Result<Task> {
+        let now = persist::now_ms();
+        let written = records.clone();
+        let outcome = self.update(move |file| {
+            let task = find_mut(file, id).ok_or_else(|| no_such_task(id))?;
+            match target {
+                AttachTarget::Task => task.attachments.extend(records),
+                AttachTarget::Comment { id: comment } => {
+                    let live = task
+                        .comments
+                        .iter_mut()
+                        .find(|c| c.id == comment && !c.deleted)
+                        .ok_or_else(|| no_such_comment(&comment))?;
+                    live.attachments.extend(records);
+                }
+                // A comment may be nothing but its files — "here is the screenshot" — so the
+                // text is not required to be non-empty here, unlike the MCP tool's `text`.
+                AttachTarget::NewComment { text } => {
+                    task.comments.push(new_comment(text, records, author, now));
+                }
+            }
+            task.updated_unix_ms = now;
+            Ok(task.clone())
+        });
+        if outcome.is_err() {
+            for record in &written {
+                attachments::remove(&self.root, id, record);
+            }
+        }
+        outcome
     }
 
     /// Remove a task.
@@ -2050,10 +2380,25 @@ mod tests {
             change: None,
             links: Vec::new(),
             session: None,
+            attachments: Vec::new(),
             history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1_000,
             updated_unix_ms: updated,
+        }
+    }
+
+    /// An attachment record with a fixed id, so two calls describe the *same* attachment —
+    /// which is what the union tests are about.
+    fn an_attachment(id: &str, name: &str, at: u64) -> TaskAttachment {
+        TaskAttachment {
+            id: TaskAttachmentId(id.to_string()),
+            name: name.to_string(),
+            bytes: 10,
+            kind: cide_ipc::AttachmentKind::File,
+            added_by: TaskAuthor::User,
+            added_unix_ms: at,
+            deleted: false,
         }
     }
 
@@ -2074,6 +2419,7 @@ mod tests {
             at_unix_ms: at,
             edited_at_unix_ms: None,
             deleted: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -2189,6 +2535,7 @@ mod tests {
             at_unix_ms: 42,
             edited_at_unix_ms: None,
             deleted: false,
+            attachments: Vec::new(),
         };
         let mut a = a_file(1, vec![with_comments("t-1", 1, vec![raw.clone()])]);
         let mut b = a_file(1, vec![with_comments("t-1", 1, vec![raw])]);
@@ -2233,6 +2580,7 @@ mod tests {
                     status: None,
                     change: None,
                     links: None,
+                    attachments: None,
                 },
                 TaskAuthor::User,
             )
@@ -3270,6 +3618,7 @@ mod tests {
             status: None,
             change: None,
             links: None,
+            attachments: None,
         }
     }
 
@@ -3940,5 +4289,411 @@ mod tests {
             raw.contains("\"tasks\": []"),
             "the deletion of the last task was not persisted: {raw}"
         );
+    }
+
+    // --- attachments (M39) --------------------------------------------------------------------
+
+    /// Eight bytes that `image::sniff` calls a PNG, and enough more to be a file.
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        bytes
+    }
+
+    fn write_source(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("source");
+        path
+    }
+
+    fn a_store_with_one_task(dir: &TempDir) -> (TaskStore, TaskId) {
+        let store = TaskStore::open(dir.root());
+        let task = store
+            .create(&new_task("with files"), TaskAuthor::User)
+            .expect("create");
+        (store, task.id)
+    }
+
+    /// The whole road: a copy lands under the task, its kind is sniffed, a detach tombstones the
+    /// record and removes the bytes, and the file round-trips through disk with the tombstone.
+    #[test]
+    fn an_attachment_is_copied_under_its_task_and_removed_on_detach() {
+        let dir = TempDir::new("attach");
+        let sources = dir.root().join("sources");
+        fs::create_dir_all(&sources).unwrap();
+        let png = write_source(&sources, "shot.png", &png_bytes());
+        let log = write_source(&sources, "build.log", b"error: nope\n");
+        let (store, id) = a_store_with_one_task(&dir);
+
+        let task = store
+            .attach(
+                &id,
+                AttachTarget::Task,
+                &[png.clone(), log.clone()],
+                TaskAuthor::User,
+            )
+            .expect("attach to the body");
+        assert_eq!(task.attachments.len(), 2);
+        let shot = &task.attachments[0];
+        assert_eq!(shot.name, "shot.png");
+        assert_eq!(shot.kind, cide_ipc::AttachmentKind::Image);
+        assert_eq!(shot.bytes, png_bytes().len() as u64);
+        assert_eq!(task.attachments[1].kind, cide_ipc::AttachmentKind::File);
+        let on_disk = attachments::path_of(dir.root(), &id, shot);
+        assert_eq!(fs::read(&on_disk).expect("copied"), png_bytes());
+        assert!(
+            on_disk.starts_with(dir.root().join(".cide/attachments").join(id.as_str())),
+            "{}",
+            on_disk.display()
+        );
+        // The source is a copy's source, not a move's: it is still where it was.
+        assert!(png.exists());
+
+        // A comment born with a file, and a file added to a comment that exists.
+        let author = TaskAuthor::Agent {
+            agent: cide_ipc::AgentId("developer".into()),
+            label: "Developer".into(),
+        };
+        let task = store
+            .attach(
+                &id,
+                AttachTarget::NewComment {
+                    text: "here it is".into(),
+                },
+                std::slice::from_ref(&log),
+                author.clone(),
+            )
+            .expect("attach with a new comment");
+        let comment = task.comments.last().expect("the comment landed");
+        assert_eq!(comment.text, "here it is");
+        assert_eq!(comment.author, author);
+        assert_eq!(comment.attachments.len(), 1);
+        assert_eq!(comment.attachments[0].added_by, author);
+        let task = store
+            .attach(
+                &id,
+                AttachTarget::Comment {
+                    id: comment.id.clone(),
+                },
+                std::slice::from_ref(&png),
+                TaskAuthor::User,
+            )
+            .expect("attach to an existing comment");
+        assert_eq!(task.comments.last().unwrap().attachments.len(), 2);
+        // Bytes the caller holds land the same way.
+        let task = store
+            .attach_bytes(
+                &id,
+                AttachTarget::Task,
+                "Pasted image.png",
+                &png_bytes(),
+                TaskAuthor::User,
+            )
+            .expect("attach bytes");
+        assert_eq!(task.attachments.len(), 3);
+        assert_eq!(task.attachments[2].name, "Pasted image.png");
+
+        // Agents may not detach; the user may, and the bytes go with the tombstone.
+        let refused = store.edit(
+            &id,
+            TaskEdit::DetachAttachment {
+                attachment: shot.id.clone(),
+            },
+            author,
+        );
+        assert!(refused.is_err());
+        assert!(
+            on_disk.exists(),
+            "a refused detach must not have touched the disk"
+        );
+        let task = store
+            .edit(
+                &id,
+                TaskEdit::DetachAttachment {
+                    attachment: shot.id.clone(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("the user detaches");
+        assert!(task.attachments[0].deleted);
+        assert!(!on_disk.exists(), "the bytes must go with the tombstone");
+        assert!(
+            attachments::dir(dir.root(), &id).exists(),
+            "the task's directory stays while it holds other attachments"
+        );
+        // Twice is a refusal, not a second tombstone.
+        assert!(
+            store
+                .edit(
+                    &id,
+                    TaskEdit::DetachAttachment {
+                        attachment: shot.id.clone(),
+                    },
+                    TaskAuthor::User,
+                )
+                .is_err()
+        );
+
+        // Through the disk and back: every record, tombstone included.
+        store.write_now();
+        let reopened = TaskStore::open(dir.root());
+        let back = reopened.get(&id).expect("the task is in the file");
+        assert_eq!(back.attachments, task.attachments);
+        assert_eq!(back.comments, task.comments);
+    }
+
+    /// The first refusal wins and nothing has been copied: a comment with three screenshots lands
+    /// with three or not at all, and a caller told the second path is wrong finds the tracker as
+    /// it was.
+    #[test]
+    fn a_bad_source_refuses_before_anything_is_copied() {
+        let dir = TempDir::new("attach-refuse");
+        let sources = dir.root().join("sources");
+        fs::create_dir_all(&sources).unwrap();
+        let good = write_source(&sources, "ok.txt", b"fine");
+        let missing = sources.join("gone.txt");
+        let (store, id) = a_store_with_one_task(&dir);
+
+        let error = store
+            .attach(
+                &id,
+                AttachTarget::NewComment {
+                    text: "report".into(),
+                },
+                &[good.clone(), missing.clone()],
+                TaskAuthor::User,
+            )
+            .expect_err("a missing source refuses");
+        let text = error.to_string();
+        assert!(text.contains("gone.txt"), "{text}");
+        assert!(text.contains("no such file"), "{text}");
+        assert!(
+            !dir.root().join(".cide/attachments").exists(),
+            "nothing may have been copied"
+        );
+        let task = store.get(&id).unwrap();
+        assert!(task.comments.is_empty(), "no comment may have been written");
+
+        // Over the cap, without writing 32 MiB: a sparse file reports the length the cap reads.
+        let huge = sources.join("huge.bin");
+        let file = File::create(&huge).unwrap();
+        file.set_len(attachments::MAX_ATTACHMENT_BYTES + 1).unwrap();
+        drop(file);
+        let text = store
+            .attach(&id, AttachTarget::Task, &[huge], TaskAuthor::User)
+            .expect_err("over the cap refuses")
+            .to_string();
+        assert!(text.contains("32 MiB"), "{text}");
+        assert!(text.contains("huge.bin"), "{text}");
+
+        // A directory is not a file, and an empty file is not an attachment.
+        let text = store
+            .attach(
+                &id,
+                AttachTarget::Task,
+                std::slice::from_ref(&sources),
+                TaskAuthor::User,
+            )
+            .expect_err("a directory refuses")
+            .to_string();
+        assert!(text.contains("not a regular file"), "{text}");
+        let empty = write_source(&sources, "empty", b"");
+        assert!(
+            store
+                .attach(&id, AttachTarget::Task, &[empty], TaskAuthor::User)
+                .is_err()
+        );
+        // And a target that is not there refuses before the disk is touched.
+        let text = store
+            .attach(
+                &id,
+                AttachTarget::Comment {
+                    id: CommentId("nope".into()),
+                },
+                &[good],
+                TaskAuthor::User,
+            )
+            .expect_err("no such comment")
+            .to_string();
+        assert!(text.contains("no such comment"), "{text}");
+        assert!(!dir.root().join(".cide/attachments").exists());
+    }
+
+    /// A source under the staging root is consumed — copied under the task and then gone, with
+    /// its own directory — and an ordinary source beside it is left alone.
+    #[test]
+    fn a_staged_source_is_consumed_and_an_ordinary_one_is_not() {
+        let dir = TempDir::new("attach-staged");
+        let staging = dir.root().join("staging");
+        let slot = staging.join("some-uuid");
+        fs::create_dir_all(&slot).unwrap();
+        let staged = write_source(&slot, "Pasted image.png", &png_bytes());
+        let plain = write_source(dir.root(), "plain.txt", b"kept");
+        let (store, id) = a_store_with_one_task(&dir);
+
+        let records = attachments::import_with(
+            dir.root(),
+            &id,
+            &[staged.clone(), plain.clone()],
+            &TaskAuthor::User,
+            &staging,
+        )
+        .expect("import");
+        assert_eq!(records.len(), 2);
+        assert!(!staged.exists(), "the staged file was consumed");
+        assert!(!slot.exists(), "and so was its slot directory");
+        assert!(staging.exists(), "but never the staging root itself");
+        assert!(plain.exists(), "an ordinary source is copied, not moved");
+        for record in &records {
+            assert!(attachments::path_of(dir.root(), &id, record).exists());
+        }
+        drop(store);
+    }
+
+    /// The id is a path component under the task, so it is unique across the body and every
+    /// comment — and `repair` drops rather than re-mints what breaks that, because the bytes are
+    /// filed under the old id.
+    #[test]
+    fn a_broken_attachment_record_is_refused_by_validate_and_dropped_by_repair() {
+        let mut task = a_task("t-1", "files", 100);
+        task.attachments.push(an_attachment("a-1", "one.txt", 10));
+        let mut comment = a_comment("with the same id", 20);
+        comment
+            .attachments
+            .push(an_attachment("a-1", "two.txt", 20));
+        task.comments.push(comment);
+        let file = a_file(1, vec![task.clone()]);
+        let text = validate(&file)
+            .expect_err("duplicate across body and comment")
+            .to_string();
+        assert!(text.contains("two attachments"), "{text}");
+
+        let mut repaired = file.clone();
+        repair(&mut repaired);
+        assert!(validate(&repaired).is_ok());
+        assert_eq!(
+            repaired.tasks[0].attachments.len(),
+            1,
+            "the first copy is kept"
+        );
+        assert_eq!(
+            repaired.tasks[0].attachments[0].id.as_str(),
+            "a-1",
+            "and keeps its id"
+        );
+        assert!(repaired.tasks[0].comments[0].attachments.is_empty());
+
+        // A malformed id or name is dropped, and the surviving record keeps the id it had.
+        let mut task = a_task("t-2", "files", 100);
+        task.attachments.push(an_attachment("", "no-id.txt", 10));
+        task.attachments.push(an_attachment("a-2", "../escape", 20));
+        task.attachments.push(an_attachment("a-3", "fine.txt", 30));
+        let mut file = a_file(1, vec![task]);
+        assert!(validate(&file).is_err());
+        repair(&mut file);
+        assert!(validate(&file).is_ok());
+        let kept: Vec<&str> = file.tasks[0]
+            .attachments
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(kept, ["a-3"]);
+    }
+
+    /// The merge rows for attachments: a record survives a stale side, a tombstone is final, and
+    /// a comment's attachment survives a text edit to that comment on the other side.
+    #[test]
+    fn attachments_merge_table() {
+        fn with_body(mut task: Task, attachment: TaskAttachment) -> Task {
+            task.attachments.push(attachment);
+            task
+        }
+        fn with_comment(mut task: Task, comment: TaskComment) -> Task {
+            task.comments.push(comment);
+            task
+        }
+        let cases = vec![
+            Case {
+                name: "an attachment on the stale side is adopted",
+                why: "a teammate's screenshot pulled in from git must not be discarded because \
+                      this process's copy was the newer scalar set",
+                mine: a_file(4, vec![a_task("t-1", "mine, newer", 200)]),
+                theirs: a_file(
+                    4,
+                    vec![with_body(
+                        a_task("t-1", "theirs, older", 100),
+                        an_attachment("a-1", "shot.png", 150),
+                    )],
+                ),
+                check: |out| {
+                    assert_eq!(titles(out), ["mine, newer"]);
+                    assert_eq!(out.tasks[0].attachments.len(), 1);
+                    assert!(
+                        out.tasks[0].updated_unix_ms >= 150,
+                        "an adopted attachment is an update"
+                    );
+                },
+            },
+            Case {
+                name: "a tombstone beats a stale live copy",
+                why: "a detach must survive a merge with a file written before it, or the bytes \
+                      are gone and the record says they are there",
+                mine: a_file(
+                    4,
+                    vec![with_body(a_task("t-1", "t", 100), {
+                        let mut a = an_attachment("a-1", "shot.png", 50);
+                        a.deleted = true;
+                        a
+                    })],
+                ),
+                theirs: a_file(
+                    4,
+                    vec![with_body(
+                        a_task("t-1", "t", 300),
+                        an_attachment("a-1", "shot.png", 50),
+                    )],
+                ),
+                check: |out| {
+                    assert!(out.tasks[0].attachments[0].deleted, "deleted wins");
+                },
+            },
+            Case {
+                name: "a comment's attachment survives a text edit on the other side",
+                why: "reconcile_comment picks a whole copy; without the union the winner's list \
+                      would silently drop the loser's screenshot",
+                mine: a_file(
+                    4,
+                    vec![with_comment(a_task("t-1", "t", 100), {
+                        let mut c = a_comment("report", 50);
+                        c.text = "report, corrected".into();
+                        c.edited_at_unix_ms = Some(400);
+                        c
+                    })],
+                ),
+                theirs: a_file(
+                    4,
+                    vec![with_comment(a_task("t-1", "t", 100), {
+                        let mut c = a_comment("report", 50);
+                        c.attachments.push(an_attachment("a-9", "shot.png", 300));
+                        c
+                    })],
+                ),
+                check: |out| {
+                    let comment = &out.tasks[0].comments[0];
+                    assert_eq!(comment.text, "report, corrected", "the edit wins the text");
+                    assert_eq!(comment.attachments.len(), 1, "and the attachment survives");
+                },
+            },
+        ];
+        for case in cases {
+            let out = merge(&case.mine, &case.theirs);
+            (case.check)(&out);
+            assert!(
+                validate(&out).is_ok(),
+                "{}: the merge must produce a file this build can write ({})",
+                case.name,
+                case.why
+            );
+        }
     }
 }

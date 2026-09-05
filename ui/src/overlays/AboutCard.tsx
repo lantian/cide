@@ -1,0 +1,66 @@
+/**
+ * About cide — the version this window is running, and the `claude` it will spawn.
+ *
+ * Reads `Bootstrap.capabilities` and nothing else. The version is `env!("CARGO_PKG_VERSION")`
+ * on the Rust side (`cmd/app.rs::capabilities`), so this shows the same string `cide --version`
+ * prints, spelled the same way (`cli.rs::version`) — a number pasted from here and a number
+ * pasted from a terminal must never disagree in a bug thread. The `claude` line is the raw
+ * `claude --version` output, which already names itself, with the wording Settings uses when
+ * there is none.
+ *
+ * `OverlayCard` for the ground — the same scrim, width and radius as the palette that opened
+ * it — and `CloseConfirm`'s two rules inside it: focus lands on the one button before the first
+ * paint (`ModalShell` says why: a frame in which nothing here has focus is a frame in which the
+ * next keystroke goes to the terminal underneath), and Escape is answered on a wrapper *inside*
+ * the card rather than on `document`, which would also answer for that terminal.
+ */
+import { useLayoutEffect, useRef } from 'react'
+import { OverlayCard } from './ModalShell'
+import { useWorkspace } from '@/store/workspace'
+import styles from './AboutCard.module.css'
+
+export function AboutCard({ onDismiss }: { onDismiss: () => void }) {
+  const version = useWorkspace((s) => s.boot?.capabilities.version ?? null)
+  const claude = useWorkspace((s) => s.boot?.capabilities.claudeVersion ?? null)
+  const close = useRef<HTMLButtonElement>(null)
+
+  useLayoutEffect(() => {
+    close.current?.focus()
+  }, [])
+
+  const onKeyDown = (ev: React.KeyboardEvent) => {
+    if (ev.key === 'Escape') {
+      ev.stopPropagation()
+      onDismiss()
+    }
+  }
+
+  return (
+    <OverlayCard label="About cide" onDismiss={onDismiss}>
+      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="about">
+        <div className={styles.head}>
+          <h2 className={styles.name}>cide</h2>
+          <p className={styles.version} data-audit="aboutVersion">
+            {/* `null` only before bootstrap resolves, and the host is mounted with `boot`, so
+                in practice the version is always there; the bare name is the honest fallback. */}
+            {version === null ? 'cide' : `cide ${version}`}
+          </p>
+          <p className={styles.claude} data-audit="aboutClaude">
+            {claude === null ? 'claude is not on PATH' : `claude ${claude}`}
+          </p>
+        </div>
+        <div className={styles.footer}>
+          <button
+            ref={close}
+            type="button"
+            className={styles.button}
+            onClick={onDismiss}
+            data-audit="aboutClose"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </OverlayCard>
+  )
+}

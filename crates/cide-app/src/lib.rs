@@ -12,6 +12,11 @@ pub mod caps;
 // is what makes the shutdown ladder and the orphan sweep cover runs with no second
 // implementation of either.
 pub mod agents;
+/// Arguments this binary understands, and the refusal for the ones it does not.
+///
+/// `cide --help` used to start a whole IDE; its header records what that cost. Runs in `main`,
+/// after `edit_wait::cli` and before anything touches GTK.
+pub mod cli;
 pub mod closed_tabs;
 pub mod cmd;
 /// The macOS dock icon's own menu: every open project, one click from the front.
@@ -38,6 +43,11 @@ pub mod graphics;
 pub mod groups;
 pub mod hooks;
 pub mod ide;
+/// One cide per profile: the claim, and the sentence a second one is refused with.
+///
+/// The companion to `cli` — that module closes the door second instances came through, this one
+/// stops the ones that get in anyway before they can overwrite a workspace they did not restore.
+pub mod instance;
 pub mod libraries;
 pub mod lifecycle;
 pub mod logring;
@@ -596,6 +606,14 @@ pub fn run() {
             cmd::tasks::task_new,
             cmd::tasks::task_edit,
             cmd::tasks::task_delete,
+            // M39: attachments.
+            cmd::tasks::task_attach,
+            cmd::tasks::task_attach_clipboard,
+            cmd::tasks::task_attachment_stage_clipboard,
+            cmd::tasks::task_pick_attachments,
+            cmd::tasks::task_attachment_image,
+            cmd::tasks::task_attachment_open,
+            cmd::tasks::task_attachment_reveal,
             // M28: OpenSpec.
             cmd::spec::spec_board,
             cmd::spec::spec_change,

@@ -173,6 +173,21 @@
   cursor: pointer;
 }
 
+/*
+ * What a parked tab's body is: the same box, with nothing in it. (M38)
+ *
+ * `GitDiffPane.tsx`'s `parked` branch argues why the rows go while the tab is behind another
+ * one. This keeps the header where it is and the pane the size it was, so revealing the tab is
+ * rows appearing inside a frame that is already there rather than the whole pane assembling.
+ *
+ * No `overflow: auto`: an empty scroller with the previous content's height would draw a
+ * scrollbar over nothing.
+ */
+.parked {
+  flex: 1;
+  min-height: 0;
+}
+
 .body {
   flex: 1;
   min-height: 0;

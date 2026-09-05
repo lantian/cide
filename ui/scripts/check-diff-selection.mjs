@@ -576,6 +576,77 @@ try {
       'front still answers — a `find` on the first would defer the visible tab forever',
   )
 
+  /* --- and the same question for a revision comparison ------------------------------------
+   *
+   * `RevisionDiffPane` had no deferral at all until M38, and the reason it needed one is not the
+   * reason its sibling did: `git_diff_revision` builds a diff of the **whole repository** and
+   * filters to one path afterwards, so a tab comparing a commit against the working tree was
+   * re-running that on every git mutation in the project while nobody was looking at it.
+   *
+   * Keyed on all four of `(repo, path, new, old)`, unlike the working-tree answer above, because
+   * a revision pair *is* the tab's identity — `main.rs` against its parent and `main.rs` against
+   * some other commit are two documents in two tabs.
+   */
+  const commit = (oid) => ({ kind: 'commit', oid })
+  const rev = (repo, path, next, prev) => ({
+    kind: 'diff',
+    spec: {
+      title: `${path} — diff`,
+      oldPath: path,
+      newPath: path,
+      origin: { kind: 'gitRevision', repo, path, new: next, old: prev },
+    },
+  })
+  const history = {
+    activeTab: 't-a',
+    tabs: [
+      { id: 't-a', kind: rev('r1', 'src/main.rs', commit('a1b2c3d'), commit('9f8e7d6')) },
+      { id: 't-b', kind: rev('r1', 'src/main.rs', commit('a1b2c3d'), { kind: 'parent' }) },
+      { id: 't-c', kind: rev('r1', 'src/main.rs', { kind: 'workingTree' }, commit('a1b2c3d')) },
+    ],
+  }
+
+  ok(
+    tabs.revisionTabOnScreen(history, 'r1', 'src/main.rs', commit('a1b2c3d'), commit('9f8e7d6')),
+    'the active revision tab is on screen',
+  )
+  eq(
+    tabs.revisionTabOnScreen(history, 'r1', 'src/main.rs', commit('a1b2c3d'), { kind: 'parent' }),
+    false,
+    'a second comparison of the same file, behind it, is not — the pair is the identity',
+  )
+  eq(
+    tabs.revisionTabOnScreen(history, 'r1', 'src/main.rs', { kind: 'workingTree' }, commit('a1b2c3d')),
+    false,
+    'and the working-tree comparison — the only one that can move — defers like the rest',
+  )
+  ok(
+    tabs.revisionTabOnScreen(history, 'r1', 'src/other.rs', commit('a1b2c3d'), commit('9f8e7d6')),
+    'a comparison with no tab of its own answers “on screen”: the same degradation as above',
+  )
+  ok(
+    tabs.revisionTabOnScreen(undefined, 'r1', 'src/main.rs', commit('a1b2c3d'), commit('9f8e7d6')),
+    'nor may a window that has not received a snapshot yet defer',
+  )
+  // The oid is compared, not merely the tag. Without this, every `commit` side would match every
+  // other and a history tab would report itself hidden whenever any revision tab was in front.
+  eq(
+    tabs.revisionTabOnScreen(history, 'r1', 'src/main.rs', commit('deadbee'), commit('9f8e7d6')),
+    true,
+    'a different oid is a different document, so it is not the tab behind — it is no tab at all',
+  )
+  eq(
+    tabs.showsRevisionDiff(
+      spec('r1', 'src/main.rs'),
+      'r1',
+      'src/main.rs',
+      commit('a1b2c3d'),
+      commit('9f8e7d6'),
+    ),
+    false,
+    'a working-tree diff of the same file is not a revision comparison of it',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)

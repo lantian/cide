@@ -302,6 +302,30 @@ try {
     ok(sections.includes(`case '${section}':`), `and \`${section}\` has a case`)
   }
 
+  // --- the extension page can be copied out of ------------------------------------------------
+
+  /*
+   * The app root sets `user-select: none` and every document surface opts back in. The extension
+   * page is one — a README, a description and a permission list are things a user copies into a
+   * chat or a bug report — and it draws `MarkdownPreview` directly rather than inside
+   * `MarkdownFrame`, so it gets no opt-in from the preview and has to carry its own. Without it
+   * nothing on the page is selectable and nothing says so: no error, no changed pixel, the drag
+   * just does nothing. Both spellings, because this engine drops the unprefixed one
+   * (`check:css-prefix` keeps the pair together; this only checks that the pair is there at all).
+   */
+  const extensionTab = readFileSync(join(UI, 'src', 'ext', 'ExtensionTab.module.css'), 'utf8')
+  const tabRule = /\.tab\s*\{([^}]*)\}/.exec(extensionTab)?.[1] ?? ''
+  ok(
+    /-webkit-user-select:\s*text;\s*\n\s*user-select:\s*text;/.test(tabRule),
+    'the extension page opts back in to text selection on `.tab` — without it the description, '
+      + 'the permissions and the README cannot be copied out, and nothing else would notice',
+  )
+  const actionsRule = /\.actions\s*\{([^}]*)\}/.exec(extensionTab)?.[1] ?? ''
+  ok(
+    /-webkit-user-select:\s*none;\s*\n\s*user-select:\s*none;/.test(actionsRule),
+    'and the button row opts out again, so a drag across it highlights no button label',
+  )
+
   // --- the host validates before it destructures ----------------------------------------------
 
   ok(protocol.isWorkerNote({ kind: 'view', panel: 'x', view: { body: {} } }), 'a view note passes')

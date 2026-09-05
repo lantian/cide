@@ -11,7 +11,10 @@
  *    them; turning it off is a line in `crates/cide-app/tauri.conf.json`, a file this feature
  *    does not own, and it would also disable dropping files onto the window everywhere else.
  *    A gesture that works in `pnpm dev` in a browser and does nothing in the shipped app is the
- *    worst of the two failure modes.
+ *    worst of the two failure modes. (What the handler takes it also hands back, as Tauri's
+ *    own `onDragDropEvent` with the dropped *paths* — which is how the task card accepts a
+ *    file from the desktop since M39 without touching that line. Not useful here: a changelist
+ *    drag moves rows, not files.)
  * 2. **The drop indicator is ours either way.** `dragover` reports the element under the
  *    pointer, but the tree needs the *group* that element belongs to, which is a walk over the
  *    row list — so the useful half of the native API is not used, and what remains is a

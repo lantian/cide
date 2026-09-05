@@ -25,6 +25,10 @@
  * Cost, accepted and already the stated non-goal of the clipboard (`clipboardModel.ts`'s header):
  * no drag *into* cide from Dolphin or Nautilus, and none *out*. Those need the desktop's own
  * selection flavours, which a webview cannot serve; this feature does not make that worse.
+ * (Since M39 one surface does take a desktop drop — the task card, for attachments — and it
+ * can because it wants *paths*, which Tauri's own drag-drop event hands the page after it has
+ * swallowed the HTML5 one. `sidebar/TasksPanel/fileDrop.ts` has the argument; the tree still
+ * cannot, because a drop here would mean a copy and this hook is a move.)
  *
  * # What is deliberately **not** copied from the git panel's hook
  *

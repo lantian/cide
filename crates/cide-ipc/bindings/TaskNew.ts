@@ -59,4 +59,14 @@ change?: ChangeName,
  * create-then-link would dispatch a run from a task whose `blockedBy` did not exist yet,
  * and the one interleaving the gate exists for is the one it could never see.
  */
-links?: Array<TaskLinkSpec>, };
+links?: Array<TaskLinkSpec>, 
+/**
+ * Files to attach to the body the moment the task exists. Absent means none. (M39)
+ *
+ * **Source paths**, on this machine, which `cide_tasks::attachments::import` copies under
+ * `.cide/attachments/<the new id>/`; a path under its staging directory is consumed. Here
+ * rather than as a follow-up `task_attach` for [`Self::links`]' reason in miniature: the
+ * board is broadcast once with the attachments in place instead of once without and once
+ * with, and a dropped file in the New task dialog is one gesture, not two.
+ */
+attachments?: Array<string>, };

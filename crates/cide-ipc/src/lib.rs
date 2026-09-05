@@ -103,11 +103,12 @@ pub mod tasks;
 
 pub use agents::{
     AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, OrchestrationConfig,
-    OrchestrationPatch, RunState,
+    OrchestrationPatch, RunNotify, RunState,
 };
 pub use tasks::{
-    LinkType, Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskLink, TaskLinkSpec,
-    TaskNew, TaskStatus, TaskStatusChange,
+    ATTACHMENTS_DIR, AttachTarget, AttachmentKind, LinkType, StagedFile, Task, TaskAttachment,
+    TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskLink, TaskLinkSpec, TaskNew,
+    TaskStatus, TaskStatusChange,
 };
 
 // --- M22: extensions, and the marketplaces they come from ---

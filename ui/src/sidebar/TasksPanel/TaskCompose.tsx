@@ -53,10 +53,14 @@ import {
   type LinkKind,
   type LinkTargetOption,
   type TaskDraft,
+  dropTargetKey,
+  type StagedAttachment,
 } from './model'
 import { cx } from './TaskDetail'
 import { LinkTargetInput } from './LinkTargetInput'
 import { MentionTextarea } from './MentionTextarea'
+import { StagedChips } from './AttachmentStrip'
+import { wantsImagePaste } from '@/editor/pasteImage'
 import { Icon } from '@/icons/Icon'
 
 import styles from './TasksPanel.module.css'
@@ -108,6 +112,12 @@ export interface TaskComposeProps {
   onDraft: (draft: TaskDraft) => void
   /** Create. Only ever called with a draft `draftReady` admits. */
   onCreate: (draft: TaskDraft) => void
+  /** The native picker, for files to attach the moment the task exists. (M39) */
+  onPickAttachments?: (() => Promise<readonly StagedAttachment[]>) | undefined
+  /** The clipboard's image, staged to a file so it can ride on the create like a path. */
+  onStageClipboard?: (() => Promise<StagedAttachment | null>) | undefined
+  /** The `data-attach-drop` key under a desktop drag right now, or `null`. */
+  dropHot?: string | null | undefined
   /** Discard and close. Cancel, the ✕ and Escape all arrive here; so does the scrim when clean. */
   onCancel: () => void
   /**
@@ -162,6 +172,9 @@ export function TaskCompose({
   onCreate,
   onCancel,
   busy = false,
+  onPickAttachments,
+  onStageClipboard,
+  dropHot = null,
 }: TaskComposeProps) {
   const ready = draftReady(draft)
   /*
@@ -193,6 +206,8 @@ export function TaskCompose({
       ref={card}
       className={styles.taskCard}
       data-audit="taskCompose"
+      data-attach-drop={dropTargetKey({ kind: 'compose' })}
+      data-drop-hot={dropHot === dropTargetKey({ kind: 'compose' }) ? 'true' : undefined}
       tabIndex={-1}
       onKeyDown={(event) => {
         if (event.key !== 'Escape') return
@@ -492,6 +507,18 @@ export function TaskCompose({
               tools
               value={draft.body}
               onValueChange={(body) => onDraft({ ...draft, body })}
+              onPaste={(event) => {
+                // A screenshot pasted into the body is staged for the create — there is no task
+                // to attach it to yet — and shown as a chip below. (M39)
+                if (onStageClipboard === undefined) return
+                if (!wantsImagePaste([...event.clipboardData.types])) return
+                event.preventDefault()
+                void onStageClipboard().then((staged) => {
+                  if (staged !== null) {
+                    onDraft({ ...draft, attachments: [...draft.attachments, staged] })
+                  }
+                })
+              }}
               onKeyDown={(event) => {
                 // Enter is a newline in a body, so the submit shortcut is the modified one —
                 // the card's body editor makes the same distinction. Create is on screen too: a
@@ -513,6 +540,45 @@ export function TaskCompose({
           * explicitly: a bare `<button>` inside a form defaults to `submit`, and a Cancel that
           * created the task would be the exact defect this dialog was written to remove.
           */}
+        {/*
+          * Files to attach on create. (M39) A row only when the host can pick — the dialog a
+          * build without the command draws is the dialog it always drew — and chips only when
+          * something is staged, so an empty row is one paperclip and no sentence.
+          */}
+        {onPickAttachments !== undefined && (
+          <div className={styles.field} data-audit="taskComposeRow" data-field="attachments">
+            <div className={styles.fieldHead}>
+              <span className={styles.fieldLabel}>Attachments</span>
+              <button
+                type="button"
+                className={styles.fieldEdit}
+                data-audit="taskComposeAttach"
+                data-write="true"
+                title="Attach files"
+                aria-label="Attach files to the new task"
+                onClick={() =>
+                  void onPickAttachments().then((picked) => {
+                    if (picked.length > 0) {
+                      onDraft({ ...draft, attachments: [...draft.attachments, ...picked] })
+                    }
+                  })
+                }
+              >
+                <Icon name="paperclip" size={1} />
+              </button>
+            </div>
+            <StagedChips
+              staged={draft.attachments}
+              onRemove={(path) =>
+                onDraft({
+                  ...draft,
+                  attachments: draft.attachments.filter((file) => file.path !== path),
+                })
+              }
+            />
+          </div>
+        )}
+
         <div className={styles.composeActions} data-audit="taskComposeActions">
           <button
             type="button"

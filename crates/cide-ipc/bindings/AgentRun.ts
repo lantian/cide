@@ -3,6 +3,7 @@ import type { AgentId } from "./AgentId";
 import type { Harness } from "./Harness";
 import type { ProjectId } from "./ProjectId";
 import type { RunId } from "./RunId";
+import type { RunNotify } from "./RunNotify";
 import type { RunState } from "./RunState";
 import type { SessionId } from "./SessionId";
 import type { TaskId } from "./TaskId";
@@ -48,10 +49,19 @@ session: SessionId | null, state: RunState,
  * scanning live runs for this field; see [`crate::Task::agent`], which is the role a task is
  * *for* and not a claim about the present.
  *
- * `None` is legal: an ad-hoc run dispatched by hand. The row draws `no task` in dim rather
- * than nothing, because a run nothing can account for is worth seeing.
+ * `None` is legal: an ad-hoc run — the orchestrator asking a role to check or do one small
+ * thing that is not on the board. Such a run stands in the **project root**, not in a
+ * worktree of its own (M40; `cide_agents::run_checkout` is the rule). The row draws
+ * `no task` in dim rather than nothing, because a run nothing can account for is worth
+ * seeing.
  */
 task: TaskId | null, startedUnixMs: bigint, 
+/**
+ * Where cide announces this run's turn endings — the nudge `agent_rpc::note_run_over` types
+ * into a Claude pane. Recorded at dispatch and carried on the wire so the run list can say
+ * which runs will never announce themselves. (M40)
+ */
+notify: RunNotify, 
 /**
  * The run was frozen long enough that its in-flight model request may have timed out.
  *

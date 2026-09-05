@@ -2,6 +2,7 @@
 import type { AgentId } from "./AgentId";
 import type { ChangeName } from "./ChangeName";
 import type { SessionId } from "./SessionId";
+import type { TaskAttachment } from "./TaskAttachment";
 import type { TaskAuthor } from "./TaskAuthor";
 import type { TaskComment } from "./TaskComment";
 import type { TaskId } from "./TaskId";
@@ -126,6 +127,13 @@ links: Array<TaskLink>,
  * Oldest first, which is the order the panel renders and the order an agent reads.
  */
 comments: Array<TaskComment>, 
+/**
+ * Files attached to the body, oldest first. (M39)
+ *
+ * `#[serde(default)]` and no [`TaskFile::CURRENT_SCHEMA`] bump, on [`Self::links`]' posture.
+ * Records only; the bytes are at [`TaskAttachment::relative_path`].
+ */
+attachments: Array<TaskAttachment>, 
 /**
  * Every status transition, oldest first. (M27)
  *

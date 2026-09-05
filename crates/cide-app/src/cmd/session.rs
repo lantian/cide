@@ -304,7 +304,9 @@ fn with_task_tools(
 }
 
 // ==========================================================================================
-// The roster paragraph: telling a project's primary pane that it is the product owner.
+// The roster paragraph: telling a project's Claude panes about its subagents — the console
+// that it is the product owner, every other pane that it may orchestrate as one. (M40 widened it
+// from the console alone, with `agent_rpc`'s tool scope.)
 // ==========================================================================================
 
 /// The flag that cannot coexist with the one this file adds.
@@ -376,15 +378,18 @@ fn orchestrator_paragraph(
     let state = app.try_state::<crate::workspace_state::WorkspaceState>()?;
     // One lock acquisition, and the disk read happens after it is released: `WorkspaceState::with`
     // runs under a non-reentrant lock and `load_project` below opens a directory.
-    let root = state.with(|ws| {
-        if !is_primary_console_spawn(ws, registry, project, resume, forking) {
-            return None;
-        }
-        cide_core::workspace::project(ws, project)
+    // Every Claude pane of the project gets the paragraph since M40, because every one of them
+    // is served the orchestration tools (`agent_rpc`'s scope table) and a pane with tools and no
+    // manual is the model guessing. What the console predicate still decides is the *opening
+    // sentence*: the product owner is told it is, and any other pane is told it may act as one.
+    let (root, primary) = state.with(|ws| {
+        let primary = is_primary_console_spawn(ws, registry, project, resume, forking);
+        let root = cide_core::workspace::project(ws, project)
             .ok()?
             .roots
             .first()
-            .map(|root| root.path.clone())
+            .map(|root| root.path.clone())?;
+        Some((root, primary))
     })?;
 
     // Read fresh, here, for `cide_agents`' stated reason: `.cide/*` is committed, so a teammate's
@@ -399,15 +404,21 @@ fn orchestrator_paragraph(
     }
 
     let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
-    Some(roster_paragraph(&roles))
+    Some(roster_paragraph(&roles, primary))
 }
 
-/// The paragraph itself, as a pure function of the roles.
+/// The paragraph itself, as a pure function of the roles and of which pane is being told.
 ///
 /// Split from [`orchestrator_paragraph`] so the prose — which is a contract with a language model
 /// and the only part of this that can be *wrong* rather than merely absent — is reachable from a
 /// test with no `AppHandle`, no workspace and no `.cide/` directory.
-fn roster_paragraph(roles: &[&cide_ipc::AgentDef]) -> String {
+///
+/// `primary` picks the opening sentence and nothing else (M40): the console is the product owner
+/// and is told so; any other Claude pane of the project has the same tools and is told it may act
+/// as one — without being told it *is*, because a task's conversation pane opened from the Tasks
+/// panel has just been handed a task to work, and two identities in one prompt is a model
+/// guessing which to be.
+fn roster_paragraph(roles: &[&cide_ipc::AgentDef], primary: bool) -> String {
     let roles = if roles.is_empty() {
         // Said rather than omitted: a session told it is the product owner and handed no roles
         // would call `cide_agents_list`, get an empty answer, and have no idea whether that is a
@@ -439,10 +450,18 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef]) -> String {
     // turn. Every mechanic named here is real (each has a pointer to the code that makes it
     // true); a sentence here that outlives its mechanism is a model confidently doing the wrong
     // thing, so treat this prose as code.
-    format!(
+    let opening = if primary {
         "You are the product owner for this project in cide. You do not have to do everything \
          yourself: this project has subagents, and you can decompose a goal into tasks, hand each \
-         one to a role, and check the result. {roles} That list was read when this session \
+         one to a role, and check the result."
+    } else {
+        "This is a Claude pane of a project in cide that has subagents, and you can hand work to \
+         its roles exactly as the project's product owner — its primary Claude pane — does: \
+         decompose a goal into tasks, hand each one to a role, and check the result."
+    };
+
+    format!(
+        "{opening} {roles} That list was read when this session \
          started; `mcp__cide__cide_agents_list` is the current one. A role is a markdown file at \
          `.cide/agents/<name>.md` — frontmatter `name:` and `description:` (optionally \
          `harness:`, `model:`, `tools:`, `permission-mode:`, `max-concurrent:`, and \
@@ -469,17 +488,27 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef]) -> String {
          with an assignee, or by @mentioning a role in a task's body or a comment — starts that \
          role on it automatically; `mcp__cide__cide_agent_dispatch` (a role and a task id, \
          returns a run id immediately without waiting) is only needed to re-run a role or to add \
-         a one-line extra instruction. A role runs up to its `max-concurrent` tasks at once, \
-         each task in its own worktree on branch `cide/<role>-<task>` (a dispatch with no task \
-         uses the role's base worktree, one at a time), and the project caps concurrent runs — \
-         anything past a cap queues in order, so fan out across tasks and roles freely. A run \
-         that starts moves its task to doing; when the work is done it sets the task to review \
-         and comments what it did. A run reports back only through that tracker, so read those \
-         comments, take work you accept into this branch with `mcp__cide__cide_agent_integrate` \
-         — naming the task, which picks that task's branch — and set the task done, or comment \
-         what to change and hand it back. Watch runs with \
-         `mcp__cide__cide_agent_runs`; stop one going the wrong way with \
-         `mcp__cide__cide_agent_stop`. Keep the plan in the tracker: hold the goal in one task \
+         a one-line extra instruction. Work goes through tasks; the one exception is \
+         `mcp__cide__cide_agent_dispatch` with `instructions` and **no task**, which starts a \
+         quick run in the project root — no worktree, no branch, nothing on the board, so \
+         nothing reports back but the tree itself and the run's pane: use it to check or test \
+         something, or for a small piece of work not worth a task, never for work whose result \
+         you need to read, and keep it clear of files you or another run are editing. A role \
+         runs up to its `max-concurrent` tasks at once, each task in its own worktree on branch \
+         `cide/<role>-<task>`, and the project caps concurrent runs — anything past a cap \
+         queues in order, so fan out across tasks and roles freely. A run that starts moves its \
+         task to doing; when the work is done it sets the task to review and comments what it \
+         did. A run reports back only through that tracker, so read those comments, take work \
+         you accept into this branch with `mcp__cide__cide_agent_integrate` — naming the task, \
+         which picks that task's branch — and set the task done, or comment what to change and \
+         hand it back. Watch runs with `mcp__cide__cide_agent_runs`; stop one going the wrong \
+         way with `mcp__cide__cide_agent_stop`. When a run hands its turn back or ends, cide \
+         types one line about it into a Claude pane, and `notify` on \
+         `mcp__cide__cide_agent_dispatch` says which: `here` (this pane, the default), `main` \
+         (the project's primary pane) or `none` (nothing is typed — poll \
+         `mcp__cide__cide_agent_runs` with includeFinished and read the task); a run started by \
+         assigning or @mentioning a role reports to the pane that assigned it. Keep the plan in \
+         the tracker: hold the goal in one task \
          and decompose from it, and when cide tells you a run ended, re-read that goal task and \
          the board before deciding what is next — the board, not your context, is the plan of \
          record. When you need the user, end your turn with a direct question: cide marks the \
@@ -530,10 +559,10 @@ fn one_line(text: &str) -> String {
 ///
 /// A user who splits a **new** Claude pane during the window in which the console has no live
 /// child — between a restart's kill and its respawn, or before the console has spawned at all —
-/// gets the paragraph on that pane. The cost is bounded and one-sided: the paragraph is prose,
-/// the five orchestration tools are scoped by `agent_rpc` against `Project::primary_session` and
-/// **not** by this, so such a pane is told it is the product owner and then finds it has no
-/// dispatch tool. Annoying; not dangerous, and not a second path to a dispatch.
+/// gets the product owner's opening sentence on that pane. Since M40 that is the whole cost:
+/// every Claude pane gets the paragraph and the tools, and this predicate only picks which of the
+/// two opening sentences a pane reads. A second pane briefly told it *is* the product owner is a
+/// wording slip, not a second path to anything.
 fn is_primary_console_spawn(
     ws: &cide_ipc::Workspace,
     registry: &SessionRegistry,
@@ -1656,7 +1685,7 @@ mod tests {
     fn the_roster_paragraph_names_the_roles_and_the_namespaced_tools() {
         let developer = role("developer", "Implements one task\n  end to end.");
         let qa = role("qa", "");
-        let paragraph = roster_paragraph(&[&developer, &qa]);
+        let paragraph = roster_paragraph(&[&developer, &qa], true);
         // Printed on purpose: this is prose handed to a language model, and the assertions below
         // check fragments of it. `cargo test -p cide-app roster_paragraph -- --nocapture`.
         eprintln!("{paragraph}");
@@ -1710,6 +1739,23 @@ mod tests {
         assert!(paragraph.contains("queues in order"), "{paragraph}");
         assert!(paragraph.contains("its own worktree"), "{paragraph}");
         assert!(paragraph.contains("cide/<role>-<task>"), "{paragraph}");
+        // ...the two roads (M40): a dispatch with no task stands in the project root and is the
+        // exception, said as one (`cide_agents::run_checkout`, `ADHOC_PREAMBLE`)...
+        assert!(paragraph.contains("Work goes through tasks"), "{paragraph}");
+        assert!(paragraph.contains("**no task**"), "{paragraph}");
+        assert!(paragraph.contains("project root"), "{paragraph}");
+        assert!(
+            !paragraph.contains("base worktree"),
+            "the pre-M40 posture must not be described: {paragraph}"
+        );
+        // ...and where the finish is announced (`agent_rpc::note_run_over` reads `RunNotify`)...
+        for word in ["`notify`", "`here`", "`main`", "`none`"] {
+            assert!(paragraph.contains(word), "{word} is not named: {paragraph}");
+        }
+        assert!(
+            paragraph.contains("reports to the pane that assigned it"),
+            "{paragraph}"
+        );
         // ...the done-workflow convention (`opening_prompt` / `TRACKER_PREAMBLE` teach the run's
         // half)...
         assert!(paragraph.contains("sets the task to review"), "{paragraph}");
@@ -1723,9 +1769,39 @@ mod tests {
         );
     }
 
+    /// (M40) Every Claude pane is told about the subagents, and only the opening sentence says
+    /// which pane it is: the console is the product owner, any other pane may act as one. The rest
+    /// is byte-identical, so a rule taught to one is taught to both.
+    #[test]
+    fn a_second_pane_is_told_it_may_orchestrate_and_everything_else_is_the_same() {
+        let developer = role("developer", "Implements one task end to end.");
+        let console = roster_paragraph(&[&developer], true);
+        let pane = roster_paragraph(&[&developer], false);
+
+        assert!(
+            console.starts_with("You are the product owner"),
+            "{console}"
+        );
+        assert!(pane.starts_with("This is a Claude pane"), "{pane}");
+        assert!(!pane.contains("You are the product owner"), "{pane}");
+        assert!(pane.contains("primary Claude pane"), "{pane}");
+
+        let tail = |text: &str| {
+            text["...".len()..]
+                .split_once("That list was read")
+                .map(|(_, tail)| tail.to_string())
+        };
+        assert_eq!(
+            tail(&console),
+            tail(&pane),
+            "only the opening sentence may differ"
+        );
+        assert!(tail(&pane).is_some());
+    }
+
     #[test]
     fn a_project_with_no_roles_gets_a_paragraph_that_says_so_and_names_the_file() {
-        let paragraph = roster_paragraph(&[]);
+        let paragraph = roster_paragraph(&[], true);
         assert!(paragraph.contains(".cide/agents/<name>.md"), "{paragraph}");
         assert!(paragraph.contains("nobody to dispatch to"), "{paragraph}");
     }
@@ -1781,7 +1857,7 @@ mod tests {
     #[test]
     fn the_paragraph_folds_into_the_users_own_append_system_prompt() {
         let developer = role("developer", "Implements one task end to end.");
-        let paragraph = roster_paragraph(&[&developer]);
+        let paragraph = roster_paragraph(&[&developer], true);
 
         let mut args = vec![
             "--append-system-prompt".to_string(),
@@ -2357,7 +2433,7 @@ mod tests {
     /// so a future edit that moves the paragraph out from behind the gate has to answer for it.
     #[test]
     fn the_roster_paragraph_is_only_worth_sending_with_the_tools_that_back_it() {
-        let paragraph = roster_paragraph(&[]);
+        let paragraph = roster_paragraph(&[], true);
         for tool in ["mcp__cide__cide_agents_list", "mcp__cide__cide_task_"] {
             assert!(paragraph.contains(tool), "{paragraph}");
         }

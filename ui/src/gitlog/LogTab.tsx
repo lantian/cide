@@ -2146,6 +2146,23 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
                 path={fileDiff.path}
                 next={fileDiff.next}
                 prev={fileDiff.prev}
+                /*
+                 * **Said out loud, because this is a host outside the tab stack.** (M38)
+                 *
+                 * `RevisionDiffPane` now parks its rows and defers its fetch when it is behind
+                 * another tab, and works the answer out of the workspace mirror when nobody tells
+                 * it — `diffTabs.revisionTabOnScreen`. That answer is about a *tab*, and this pane
+                 * is not one: a workspace tab open on the same four-tuple and not in front would
+                 * make the mirror say "hidden" about the thing the reader is looking at right
+                 * now, and the tool window would go blank and stop following its file.
+                 *
+                 * `true` and not a flag, because it is unconditionally true here.
+                 * `ToolWindowHost` mounts exactly one `LogTab`, and `App` mounts
+                 * `ToolWindowHost` only while `toolWindow.open` — so this pane existing *is* it
+                 * being on screen. `diffTabs.ts`' header names this as the case the prop is kept
+                 * for.
+                 */
+                visible
               />
             ) : compare === null ? (
               <Details

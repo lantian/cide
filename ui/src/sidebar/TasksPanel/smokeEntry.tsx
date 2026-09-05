@@ -163,6 +163,20 @@ export interface TasksDigest {
    */
   compose: boolean
   composeControls: number
+  /*
+   * Attachments. (M39) One entry per tile, `<kind>|<preview state>`, in the order drawn — the
+   * three preview states are what the check asserts, since each has to look like something.
+   */
+  attachments: string[]
+  /** How many real `<img>` elements the strips hold: one per `ready` image and no more. */
+  thumbnails: number
+  /** Every way in — the body's paperclip, a comment's Attach, the composer's, the dialog's. */
+  attachButtons: number
+  attachmentRemoves: number
+  /** Staged chips in a composer or the dialog. */
+  staged: number
+  /** The viewer must never be in a server render: it is the host's, not the card's. */
+  lightbox: boolean
   composeStatuses: string[]
   composeCreate: string
   composeCancel: boolean
@@ -382,6 +396,18 @@ function digest(
     times: [
       ...html.matchAll(/class="[^"]*(?:logTime|historyTime)[^"]*"[^>]*>([\s\S]*?)<\/span>/g),
     ].map((m) => text(m[1] ?? '')),
+    attachments: all(html, 'tasksAttachment').map(
+      (tile) => `${attr(tile, 'data-kind')}|${attr(tile, 'data-preview')}`,
+    ),
+    thumbnails: all(html, 'tasksAttachments').reduce((n, strip) => n + count(strip, '<img'), 0),
+    attachButtons:
+      count(html, 'data-audit="tasksAttachButton"') +
+      count(html, 'data-audit="tasksCommentAttach"') +
+      count(html, 'data-audit="tasksComposerAttach"') +
+      count(html, 'data-audit="taskComposeAttach"'),
+    attachmentRemoves: count(html, 'data-audit="tasksAttachmentRemove"'),
+    staged: count(html, 'data-audit="tasksStagedChip"'),
+    lightbox: html.includes('data-audit="attachmentLightbox"'),
     compose: html.includes('data-audit="taskCompose"'),
     composeControls: all(html, 'taskComposeRow').reduce(
       (n, row) => n + [...row.matchAll(/<(input|textarea|select)\b/g)].length,

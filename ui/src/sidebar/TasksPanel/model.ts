@@ -164,6 +164,38 @@ export function statusTone(status: TaskStatus): Tone {
 
 /* ------------------------------------------------------------------------------- the views */
 
+/**
+ * What an attachment's bytes are, coarsely. Structural restatement of `AttachmentKind`. (M39)
+ *
+ * Decided in Rust at import by sniffing the bytes, never by the extension, and a *hint*: the
+ * card asks `attachments.image` for a thumbnail on the strength of it, and Rust re-sniffs the
+ * file on disk before it grants anything. `check-agents.mjs` asserts [`ATTACHMENT_KINDS`] equals
+ * `pub enum AttachmentKind`'s variants, on `TASK_STATUSES`'s rule.
+ */
+export type AttachmentKind = 'image' | 'file'
+
+export const ATTACHMENT_KINDS: readonly AttachmentKind[] = ['image', 'file']
+
+/**
+ * One file on a task's body or on a comment. Structural restatement of `TaskAttachment`, live
+ * ones only — `adapt.ts` drops the tombstones, the comments' rule. (M39)
+ *
+ * Metadata only. The bytes are a file under `.cide/attachments/` that this module never sees:
+ * a thumbnail is an `<img>` over the asset protocol once Rust has vouched for the file, and
+ * anything else opens with the desktop's own application. Nothing here can name a path, and
+ * that is the point — `TaskMarkdown`'s "no IPC, no store" rule holds for the record too.
+ */
+export interface AttachmentView {
+  /** `TaskAttachment::id`. What a detach, a preview request and a lightbox name. */
+  id: string
+  /** The file's name as a person sees it, sanitised to one path component in Rust. */
+  name: string
+  bytes: number
+  kind: AttachmentKind
+  addedBy: CommentAuthor
+  addedMs: number
+}
+
 /** Who wrote a comment. Structural restatement of `TaskAuthor`. */
 export type CommentAuthor =
   | { kind: 'user' }
@@ -201,6 +233,8 @@ export interface CommentView {
    * with the user in the agent's place — so the mark is what keeps the log honest about it.
    */
   editedMs: number | null
+  /** Files on this comment, oldest first, live only. (M39) */
+  attachments: readonly AttachmentView[]
 }
 
 
@@ -268,6 +302,8 @@ export interface TaskView {
   links: readonly LinkView[]
   /** Oldest first on the wire; [`commentOrder`] is the defence against a file that is not. */
   comments: readonly CommentView[]
+  /** Files on the body, oldest first, live only. (M39) */
+  attachments: readonly AttachmentView[]
   /**
    * Every status transition, oldest first; [`historyOrder`] is the same defence. (M27)
    *
@@ -1722,6 +1758,15 @@ export interface TaskDraft {
    * `TaskNew::links` in `crates/cide-ipc/src/tasks.rs` carries the argument.
    */
   links: readonly LinkView[]
+  /**
+   * Files to attach the moment the task exists. (M39)
+   *
+   * Paths on this machine — picked, dropped, or a pasted screenshot Rust staged to a file —
+   * that ride on the create request as `TaskNew::attachments`, so the task is broadcast once
+   * with its files rather than once without and once with. The name is for the chip and the
+   * size is for the person; only the path crosses the seam.
+   */
+  attachments: readonly StagedAttachment[]
 }
 
 /**
@@ -1739,6 +1784,7 @@ export const EMPTY_DRAFT: TaskDraft = {
   body: '',
   change: '',
   links: [],
+  attachments: [],
 }
 
 /**
@@ -1846,4 +1892,172 @@ export function queryAfterCreate(query: string, draft: TaskDraft): string {
   const q = query.trim().toLowerCase()
   if (q === '') return query
   return hitsQuery(q, [draft.title, draft.body]) ? query : ''
+}
+
+/* -------------------------------------------------------------------- attachments (M39) */
+
+/**
+ * A file waiting to be attached: picked, dropped, or a screenshot Rust staged for the composer.
+ *
+ * `path` is the only field that crosses the seam; the other two are what the chip draws and
+ * what `formatBytes` prints, taken from the picker's answer or `StagedFile` so the chip can be
+ * drawn without asking Rust again.
+ */
+export interface StagedAttachment {
+  path: string
+  name: string
+  /** `null` for a picked file: the picker answers paths, and asking Rust for a size just to
+   *  print it on a chip is a round trip the chip does not need. A staged screenshot knows. */
+  bytes: number | null
+}
+
+/**
+ * Where an attach goes. Structural restatement of `AttachTarget`. (M39)
+ *
+ * `newComment` carries the text because a comment and its files land as one mutation — a
+ * refused file must not leave a comment behind naming files it does not have.
+ */
+export type AttachTargetView =
+  | { readonly kind: 'task' }
+  | { readonly kind: 'comment'; readonly id: string }
+  | { readonly kind: 'newComment'; readonly text: string }
+
+/**
+ * What the card knows about an attachment's thumbnail right now.
+ *
+ * Three states, all drawn — `MarkdownPreview`'s `PreviewImage` rule: a preview that is pending
+ * looks different from one Rust refused, and neither is a blank. `refused` carries the sentence,
+ * because the reader is the person who attached the file and "the file is not a PNG" is the
+ * thing they need to hear.
+ */
+export type AttachmentPreview =
+  | { readonly kind: 'pending' }
+  | { readonly kind: 'ready'; readonly url: string }
+  | { readonly kind: 'refused'; readonly reason: string }
+
+/** `12 B`, `340 KiB`, `1.5 MiB` — the same ladder `cide_task_get` prints, so a person and an
+ *  agent looking at one file read one number. */
+export function formatBytes(bytes: number): string {
+  const KIB = 1024
+  const MIB = 1024 * 1024
+  if (bytes >= MIB) return `${(bytes / MIB).toFixed(1)} MiB`
+  if (bytes >= KIB) return `${Math.floor(bytes / KIB)} KiB`
+  return `${bytes} B`
+}
+
+/** The last path component, for a picked file's chip. Either separator, for `sanitize_name`'s
+ *  reason: the path came from a desktop, and cide does not know which. */
+export function basename(path: string): string {
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  const name = cut === -1 ? path : path.slice(cut + 1)
+  return name === '' ? path : name
+}
+
+/**
+ * Every image on the task, in the order the card draws them: the body's first, then each
+ * comment's in log order. The lightbox's prev/next walk, so ←/→ follow the eye down the card.
+ */
+export function imageAttachmentsOf(task: TaskView): readonly AttachmentView[] {
+  const images = task.attachments.filter((a) => a.kind === 'image')
+  for (const comment of commentOrder(task)) {
+    for (const attachment of comment.attachments) {
+      if (attachment.kind === 'image') images.push(attachment)
+    }
+  }
+  return images
+}
+
+/**
+ * Where a dropped file goes. (M39)
+ *
+ * Spelled as a string in the DOM (`data-attach-drop`) because the hit test runs from a native
+ * drag-drop event with nothing but a point, and `document.elementFromPoint` answers with an
+ * element: the key on it is the whole of what the drop knows. [`dropTargetKey`] and
+ * [`parseDropTarget`] are the two directions, and neither can be got wrong silently because
+ * the round trip is table-tested.
+ */
+export type DropTarget =
+  | { readonly kind: 'task'; readonly task: string }
+  | { readonly kind: 'comment'; readonly task: string; readonly comment: string }
+  | { readonly kind: 'composer'; readonly task: string }
+  | { readonly kind: 'compose' }
+
+export function dropTargetKey(target: DropTarget): string {
+  switch (target.kind) {
+    case 'task':
+      return `task:${target.task}`
+    case 'comment':
+      return `comment:${target.task}:${target.comment}`
+    case 'composer':
+      return `composer:${target.task}`
+    case 'compose':
+      return 'compose'
+  }
+}
+
+export function parseDropTarget(key: string): DropTarget | null {
+  const parts = key.split(':')
+  const kind = parts[0]
+  if (kind === 'compose' && parts.length === 1) return { kind: 'compose' }
+  if (kind === 'task' && parts.length === 2 && parts[1] !== undefined && parts[1] !== '') {
+    return { kind: 'task', task: parts[1] }
+  }
+  if (kind === 'composer' && parts.length === 2 && parts[1] !== undefined && parts[1] !== '') {
+    return { kind: 'composer', task: parts[1] }
+  }
+  if (
+    kind === 'comment' &&
+    parts.length === 3 &&
+    parts[1] !== undefined &&
+    parts[1] !== '' &&
+    parts[2] !== undefined &&
+    parts[2] !== ''
+  ) {
+    return { kind: 'comment', task: parts[1], comment: parts[2] }
+  }
+  return null
+}
+
+/** One drop zone as the DOM reports it, in CSS pixels. */
+export interface DropZoneRect {
+  readonly key: string
+  readonly left: number
+  readonly top: number
+  readonly width: number
+  readonly height: number
+}
+
+/**
+ * Tauri reports a drag's position in **physical** pixels; the DOM measures in CSS pixels. One
+ * division, in one place, so the two never meet raw — a hit test in the wrong space is off by
+ * the display scale and lands the file in the zone above the one under the pointer.
+ */
+export function cssPoint(
+  physical: { readonly x: number; readonly y: number },
+  devicePixelRatio: number,
+): { readonly x: number; readonly y: number } {
+  const scale = devicePixelRatio > 0 ? devicePixelRatio : 1
+  return { x: physical.x / scale, y: physical.y / scale }
+}
+
+/**
+ * The zone under a point, or `null`. The **innermost** one when zones nest — a comment sits
+ * inside the card, and a file dropped on the comment goes to the comment — decided by area,
+ * which is what nesting means for rectangles.
+ */
+export function dropZoneAt(
+  point: { readonly x: number; readonly y: number },
+  zones: readonly DropZoneRect[],
+): string | null {
+  let best: DropZoneRect | null = null
+  for (const zone of zones) {
+    const inside =
+      point.x >= zone.left &&
+      point.x < zone.left + zone.width &&
+      point.y >= zone.top &&
+      point.y < zone.top + zone.height
+    if (!inside) continue
+    if (best === null || zone.width * zone.height < best.width * best.height) best = zone
+  }
+  return best === null ? null : best.key
 }

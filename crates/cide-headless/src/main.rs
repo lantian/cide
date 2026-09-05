@@ -44,7 +44,8 @@ usage:
   cide-headless tasks <root>              render a project's .cide/tasks.json
   cide-headless agents <root>             render its subagent roles and config
   cide-headless spec <root> [change]      render its openspec/ board, or one change in full
-  cide-headless ext                       render marketplaces, extensions and contributions";
+  cide-headless ext                       render marketplaces, extensions and contributions
+  cide-headless version                   print this binary's version";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -65,11 +66,23 @@ fn main() {
         "spec" => spec(rest),
         "ext" => ext(),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
+        "version" | "-V" | "--version" => emit(&format!("{}\n", version())),
         other => {
             eprintln!("cide-headless: unknown subcommand `{other}`");
             usage_and_exit();
         }
     }
+}
+
+/// `cide-headless 0.7.1-dev`.
+///
+/// The version is the crate's, and every workspace member inherits `[workspace.package]`'s,
+/// so this is the same number `cide --version` prints (`cide_app::cli::version`) and it moves
+/// with `scripts/bump-version.sh`. It names *this* binary rather than `cide`: the two are
+/// different executables, and a line somebody pastes into a report should say which one
+/// answered.
+fn version() -> String {
+    format!("cide-headless {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Prints usage to stderr and exits 2, the conventional "you invoked me wrongly" code.
@@ -1352,6 +1365,13 @@ mod tests {
     }
 
     #[test]
+    fn version_names_this_binary_and_the_crates_version() {
+        let v = version();
+        assert!(v.starts_with("cide-headless "), "{v}");
+        assert!(v.ends_with(env!("CARGO_PKG_VERSION")), "{v}");
+    }
+
+    #[test]
     fn every_pane_is_numbered_by_its_depth_first_position() {
         let lines = body(&fixture());
         assert!(line_with(&lines, "cide : bash").contains("2 cide : bash"));
@@ -1591,12 +1611,14 @@ mod tests {
                     at_unix_ms: 1,
                     edited_at_unix_ms: None,
                     deleted: false,
+                    attachments: Vec::new(),
                 })
                 .collect(),
             history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 2,
+            attachments: Vec::new(),
         }
     }
 

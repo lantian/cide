@@ -312,10 +312,17 @@ pub struct AgentRun {
     /// scanning live runs for this field; see [`crate::Task::agent`], which is the role a task is
     /// *for* and not a claim about the present.
     ///
-    /// `None` is legal: an ad-hoc run dispatched by hand. The row draws `no task` in dim rather
-    /// than nothing, because a run nothing can account for is worth seeing.
+    /// `None` is legal: an ad-hoc run — the orchestrator asking a role to check or do one small
+    /// thing that is not on the board. Such a run stands in the **project root**, not in a
+    /// worktree of its own (M40; `cide_agents::run_checkout` is the rule). The row draws
+    /// `no task` in dim rather than nothing, because a run nothing can account for is worth
+    /// seeing.
     pub task: Option<TaskId>,
     pub started_unix_ms: u64,
+    /// Where cide announces this run's turn endings — the nudge `agent_rpc::note_run_over` types
+    /// into a Claude pane. Recorded at dispatch and carried on the wire so the run list can say
+    /// which runs will never announce themselves. (M40)
+    pub notify: RunNotify,
     /// The run was frozen long enough that its in-flight model request may have timed out.
     ///
     /// **A field on the run, not an event**, and that is the load-bearing part. A window opened
@@ -472,20 +479,74 @@ pub struct DispatchRequest {
     pub agent: AgentId,
     /// The task this run is for.
     ///
-    /// `None` is legal and means an ad-hoc run — a user or the orchestrator asking a role to do
-    /// one thing that is not on the board. The panel's Dispatch button nonetheless **always**
-    /// fills it, because a run with no task is a run the Tasks panel cannot account for: it
-    /// draws no chip on any row, it leaves no trace once it has exited, and the record of what
-    /// the agents did that afternoon has a hole in it.
+    /// `None` is legal and means an ad-hoc run — the orchestrator asking a role to check or do
+    /// one small thing that is not on the board. Such a run **stands in the project root**: no
+    /// worktree, no `cide/<role>-…` branch, nothing to integrate (M40 — before that a task-less
+    /// run took the role's base worktree, and the user asked for exactly not that: a quick check
+    /// or a small piece of direct work has nowhere to be merged back *from*). The panel's Dispatch
+    /// button nonetheless **always** fills it, because a run with no task is a run the Tasks
+    /// panel cannot account for: it draws no chip on any row, it leaves no trace once it has
+    /// exited, and the record of what the agents did that afternoon has a hole in it. The MCP
+    /// road (`cide_agent_dispatch`) may omit it, and its own prose says when that is right.
     #[ts(optional)]
     pub task: Option<TaskId>,
-    /// Extra instruction for this run only, appended after the task body.
+    /// Extra instruction for this run only, appended after the task body — or, for a run with no
+    /// task, the whole of its brief.
     ///
     /// `None` means the task speaks for itself, which is the case the orchestrator should be
     /// aiming for: instruction that lives only in a prompt is instruction the next run of the
     /// same task never sees.
     #[ts(optional)]
     pub prompt: Option<String>,
+    /// Where the run's turn endings are announced. (M40)
+    ///
+    /// `None` reads as [`RunNotify::Primary`], which is what a request that carries no session
+    /// of its own — the panel's button, an assignment made in the Tasks panel — can honestly
+    /// ask for. A request made over the agent socket carries the connection's session instead
+    /// (`agent_rpc::RegistrySink` fills this from the `Scope`), so the pane that asked is the
+    /// pane that hears.
+    #[serde(default)]
+    #[ts(optional)]
+    pub notify: Option<RunNotify>,
+}
+
+/// Where cide announces a run's turn endings — handed back, finished, failed. (M40)
+///
+/// # Why this is recorded on the run and not looked up at the edge
+///
+/// The nudge is a line typed into somebody's conversation (`agent_rpc::note_run_over`'s header
+/// says why it is a PTY write at all), and *whose* conversation used to be a fixed answer: the
+/// project's primary pane. That was wrong twice over once a second Claude pane could start a run —
+/// by assigning a role, and since M40 by dispatching — because the pane that asked never heard,
+/// and the pane that did hear had not asked. The choice belongs to the moment of dispatch, so it
+/// is stamped there, rides the run through the snapshot, and is read at the edge.
+///
+/// # Why `Primary` is resolved late
+///
+/// `Project::primary_session` moves whenever the console pane binds a new conversation
+/// (`workspace::bind_session` rewrites it on every restart), so a *session id* captured at
+/// dispatch would name a conversation that no longer exists by the time a long run ends.
+/// `Primary` is therefore a role, resolved when the line is typed; [`Self::Session`] is the
+/// specific pane that asked, and falls back to `Primary` if that pane is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum RunNotify {
+    /// The project's primary Claude pane, whichever conversation it holds when the run ends.
+    #[default]
+    Primary,
+    /// One particular Claude pane of the project — the one whose connection dispatched or
+    /// assigned. If that session is gone or no longer a Claude pane of the project at delivery,
+    /// the primary pane hears instead: the fact is not dropped for want of its first address.
+    Session { session: SessionId },
+    /// Nothing is typed anywhere. The orchestrator that chose this polls `cide_agent_runs`
+    /// (`includeFinished: true`) and reads the task's comments; the death comment a failed run
+    /// leaves on its task is written regardless, because that is board record, not a knock.
+    Silent,
 }
 
 // ==========================================================================================
@@ -846,6 +907,7 @@ mod tests {
             },
             task: Some(TaskId("t-14".into())),
             started_unix_ms: 1_699_999_000_000,
+            notify: RunNotify::Primary,
             stale_turn: true,
             note: None,
         };

@@ -223,12 +223,28 @@ pub fn shutdown(app: &AppHandle) {
     run_teardown(app);
 }
 
+/// Drops this process's claim on the profile when the teardown ends. See [`crate::instance`].
+struct ReleaseClaim;
+
+impl Drop for ReleaseClaim {
+    fn drop(&mut self) {
+        crate::instance::release();
+    }
+}
+
 /// Every step of the teardown, in the order the steps have to happen in.
 ///
 /// Runs on the `cide-shutdown` worker for a window close or a quit from the UI, and on the
 /// calling thread for a signal or a `RunEvent::Exit`. Nothing here touches the event loop, so
 /// it is correct on either — and that is the property that lets the loop keep painting.
 fn run_teardown(app: &AppHandle) {
+    // The profile claim goes back when this function leaves, by whichever of its exits it
+    // takes — hence a guard rather than a line at the bottom, which the early return below
+    // would skip. A file left behind is not a failure (the next start finds a dead pid and
+    // takes it over), but it is a file naming a pid the kernel will one day hand to another
+    // cide, and that is the one case `instance` exists to catch. See its header.
+    let _claim = ReleaseClaim;
+
     // Unconditionally, not `flush_if_due`: waiting out a 500 ms debounce on the way to exit
     // is how the user's last change gets lost.
     //
@@ -1377,12 +1393,26 @@ fn is_abnormal(exit: &Exit) -> bool {
 // rather than a hand-written copy that would drift.
 pub use cide_ipc::{PaneRestore, SessionRestore};
 
-/// Decide what to do with every pane in the workspace.
-pub fn plan_restore(ws: &Workspace) -> Vec<PaneRestore> {
-    plan_restore_in(ws, claude_projects_dir().as_deref())
+/// Decide what to do with every pane in the workspace — or in one project of it.
+///
+/// `only` narrows the plan to one project, and it exists because a plan is no longer asked
+/// for once per process. It used to be: the frontend fetched it at boot and a pane created
+/// later had no entry, which was correct for a split — the user just asked for that pane —
+/// and wrong for a project **reopened** during the run, whose panes came back out of
+/// `persist::closed.json` holding conversations from before the close. With no entry those
+/// panes spawned fresh, which was the report: closing a project and opening it again lost its
+/// sessions. So the frontend now asks per project, the moment a project it has not planned
+/// appears in the workspace, and the answer for a project opened fresh is what it always was —
+/// one eager console, `Fresh`.
+pub fn plan_restore(ws: &Workspace, only: Option<ProjectId>) -> Vec<PaneRestore> {
+    plan_restore_in(ws, claude_projects_dir().as_deref(), only)
 }
 
-fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneRestore> {
+fn plan_restore_in(
+    ws: &Workspace,
+    projects_dir: Option<&Path>,
+    only: Option<ProjectId>,
+) -> Vec<PaneRestore> {
     let mut plan = Vec::new();
     // Read once for the whole plan: it is one bool for the launch, not a per-pane decision.
     let resume_all = ws.settings.claude.resume_all_on_launch;
@@ -1394,6 +1424,9 @@ fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneResto
     let resume_enabled = ws.settings.claude.cli.inject.resume.enabled;
 
     for (id, project) in &ws.projects {
+        if only.is_some_and(|wanted| wanted != *id) {
+            continue;
+        }
         // `validate` forbids a rootless project, but a restore plan is the wrong place to
         // discover that: skipping one project still lets every other one come back.
         let Some(root) = project.roots.first() else {
@@ -2495,7 +2528,7 @@ mod tests {
     fn every_process_bearing_pane_appears_once() {
         let root = temp_dir("panes");
         let ws = fixture(&root);
-        let plan = plan_restore_in(&ws, None);
+        let plan = plan_restore_in(&ws, None, None);
 
         assert_eq!(plan.len(), 3, "one entry per claude or shell pane");
         let mut ids: Vec<PaneId> = plan.iter().map(|e| e.pane).collect();
@@ -2504,11 +2537,53 @@ mod tests {
         assert_eq!(ids.len(), 3, "a pane must not be planned twice");
     }
 
+    /// `only` is the reopen's contract: a project opened during the run is planned on its
+    /// own, and the answer must be exactly that project's slice of the whole plan — not a
+    /// recomputation that could disagree with it, and not another project's panes.
+    #[test]
+    fn a_plan_can_be_narrowed_to_one_project() {
+        let root_a = temp_dir("only-a");
+        let root_b = temp_dir("only-b");
+        let mut ws = fixture(&root_a);
+        let b = workspace::open_project(&mut ws, vec![root_b.clone()], None).expect("open b");
+        let a = ws
+            .projects
+            .keys()
+            .copied()
+            .find(|id| *id != b)
+            .expect("the fixture project");
+
+        let whole = plan_restore_in(&ws, None, None);
+        let only_a = plan_restore_in(&ws, None, Some(a));
+        let only_b = plan_restore_in(&ws, None, Some(b));
+
+        assert_eq!(
+            only_a.len(),
+            3,
+            "a's three process-bearing panes: {only_a:?}"
+        );
+        assert!(only_a.iter().all(|e| e.project == a));
+        assert_eq!(only_b.len(), 1, "b has only its console: {only_b:?}");
+        assert!(only_b.iter().all(|e| e.project == b));
+        let mut split: Vec<&PaneRestore> = only_a.iter().chain(only_b.iter()).collect();
+        let mut all: Vec<&PaneRestore> = whole.iter().collect();
+        split.sort_by_key(|e| e.pane);
+        all.sort_by_key(|e| e.pane);
+        assert_eq!(
+            split, all,
+            "the two slices are the whole plan and nothing else"
+        );
+        assert!(
+            plan_restore_in(&ws, None, Some(ProjectId::new())).is_empty(),
+            "a project the workspace does not hold plans nothing"
+        );
+    }
+
     #[test]
     fn only_the_primary_is_eager_when_nothing_can_be_resumed() {
         let root = temp_dir("eager");
         let ws = fixture(&root);
-        let plan = plan_restore_in(&ws, None);
+        let plan = plan_restore_in(&ws, None, None);
 
         let eager: Vec<&PaneRestore> = plan.iter().filter(|e| e.eager).collect();
         let [entry] = eager.as_slice() else {
@@ -2558,7 +2633,7 @@ mod tests {
             }
         }
 
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
         let claude: Vec<&PaneRestore> =
             plan.iter().filter(|e| e.kind == PaneKind::Claude).collect();
         assert!(claude.len() >= 2, "fixture has two Claude panes");
@@ -2569,7 +2644,7 @@ mod tests {
 
         // And turning it off restores the cautious behaviour rather than merely renaming it.
         ws.settings.claude.resume_all_on_launch = false;
-        let cautious = plan_restore_in(&ws, Some(&projects_dir));
+        let cautious = plan_restore_in(&ws, Some(&projects_dir), None);
         let eager: Vec<&PaneRestore> = cautious.iter().filter(|e| e.eager).collect();
         assert_eq!(eager.len(), 1, "only the console: {eager:?}");
     }
@@ -2585,7 +2660,7 @@ mod tests {
         let projects_dir = temp_dir("resume-all-fresh-projects");
         let ws = fixture(&root);
         // No transcripts written at all.
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
         let unresumable: Vec<&PaneRestore> = plan
             .iter()
             .filter(|e| e.restore == SessionRestore::Fresh && e.kind == PaneKind::Claude)
@@ -2624,7 +2699,7 @@ mod tests {
             .primary_session;
         write_transcript(&projects_dir, &root, primary);
 
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
         let primary_entry = plan
             .iter()
             .find(|e| e.eager)
@@ -2666,7 +2741,7 @@ mod tests {
         // With the shipped configuration it is resumable, which is what makes the second half
         // of this test an assertion about the setting rather than about the fixture.
         assert!(matches!(
-            plan_restore_in(&ws, Some(&projects_dir))
+            plan_restore_in(&ws, Some(&projects_dir), None)
                 .iter()
                 .find(|e| e.eager)
                 .expect("the primary pane is planned")
@@ -2675,7 +2750,7 @@ mod tests {
         ));
 
         ws.settings.claude.cli.inject.resume.enabled = false;
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
         assert!(
             plan.iter().all(|e| e.restore == SessionRestore::Fresh),
             "a pane cide will not pass --resume for is not resumable: {plan:?}"
@@ -2720,7 +2795,7 @@ mod tests {
             }
         }
 
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
         let entry = plan
             .iter()
             .find(|e| e.eager)
@@ -2763,7 +2838,7 @@ mod tests {
         }
         let target = target.expect("the primary pane");
 
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
         let entry = plan
             .iter()
             .find(|e| e.pane == target)
@@ -2793,7 +2868,7 @@ mod tests {
             .expect("the fixture has a shell pane");
         write_transcript(&projects_dir, &root, shell_session);
 
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
         let shell = plan
             .iter()
             .find(|e| e.kind == PaneKind::Shell)
@@ -2823,7 +2898,7 @@ mod tests {
         write_transcript(&projects_dir, &root, session);
 
         let label = workspace::detach_pane(&mut ws, project, tab, pane).expect("detach the pane");
-        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
 
         let entry = plan
             .iter()
@@ -2844,7 +2919,7 @@ mod tests {
         );
         let mut cautious_ws = ws.clone();
         cautious_ws.settings.claude.resume_all_on_launch = false;
-        let cautious = plan_restore_in(&cautious_ws, Some(&projects_dir));
+        let cautious = plan_restore_in(&cautious_ws, Some(&projects_dir), None);
         let entry = cautious
             .iter()
             .find(|e| e.pane == pane)

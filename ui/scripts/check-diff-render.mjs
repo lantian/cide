@@ -80,6 +80,10 @@ try {
   // --- the claim ---------------------------------------------------------------------------
 
   for (const d of Object.values(byName)) {
+    // A parked body draws no rows at all, so it has nothing to compare — see the parked section
+    // near the end, which pairs each parked digest with an identical unparked one so the claim
+    // is still made about that fixture and that selection.
+    if (d.parked) continue
     eq(
       [...d.selected].sort(),
       d.sent,
@@ -1664,6 +1668,56 @@ try {
   ok(
     highlightCss.includes('.cide-tk-keyword'),
     '…and that stylesheet is where the class the pane writes is actually painted',
+  )
+
+  /* --- a tab behind another one draws no rows ---------------------------------------------
+   *
+   * The reported bug was *"several opened tabs with diff makes cide very laggy"*, and the reason
+   * is that `TabContent` keeps every tab mounted and **laid out at full size** — deliberately,
+   * for the terminals — while this pane draws every line of the file with no virtualisation.
+   * Six open diffs is tens of thousands of `display: grid` rows the browser lays out for the
+   * rest of the session, and layout is global, so the whole window pays it.
+   *
+   * Every part of this is silent if it breaks, in both directions: parked when it should not be
+   * is a diff that is simply blank, and *not* parked when it should be is the optimisation
+   * quietly off with nothing on screen to say so.
+   */
+  eq(
+    { ...byName.parkedOn, name: 'x' },
+    { ...byName.parkedOff, name: 'x' },
+    'an absent `visible` and an explicit `true` render the same thing — the SSR fixture, the '
+      + 'log tool window and every host outside the tab stack pass nothing',
+  )
+  ok(byName.parkedOff.rows > 0, 'and that default really draws rows, so the above is not vacuous')
+  eq(byName.parkedOff.parked, false, 'a tab in front is not parked')
+  eq(
+    [...byName.parkedOff.selected].sort(),
+    byName.parkedOff.sent,
+    'the parked pair is exempted from the loop above, so its unparked half makes the claim here',
+  )
+
+  eq(byName.parkedHidden.parked, true, 'a tab behind another one parks its body')
+  eq(
+    byName.parkedHidden.rows,
+    0,
+    'and draws not one row: that is the whole of the fix, and nothing on screen would show it '
+      + 'if the branch stopped firing',
+  )
+  eq(
+    byName.parkedHidden.count,
+    byName.parkedOff.count,
+    'the chrome stays — a parked body that took the footer with it would read as a closed tab',
+  )
+  eq(
+    byName.parkedHidden.sideControl,
+    byName.parkedOff.sideControl,
+    'and so does the side switcher, for the same reason',
+  )
+  eq(
+    byName.parkedHidden.sent,
+    byName.parkedOff.sent,
+    'and the Selection it would send is unchanged: parking is a rendering decision and never a '
+      + 'change to what would be staged. The marks are React state and come back with the rows',
   )
 
   if (failed === 0) console.log('git diff view render: ok')

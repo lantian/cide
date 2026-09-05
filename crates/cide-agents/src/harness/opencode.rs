@@ -177,16 +177,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    Delivery, Harness, HarnessError, HarnessSpawn, Observation, RunPlan, SessionBinding,
-    TRACKER_PREAMBLE,
+    ADHOC_PREAMBLE, Delivery, Harness, HarnessError, HarnessSpawn, Observation, RunPlan, SERVER,
+    SessionBinding, tracker_preamble,
 };
-
-/// The name cide's MCP server is registered under.
-///
-/// The model sees the tools namespaced by it, exactly as the claude side does, so this and
-/// `claude.rs`'s server name are the same string on purpose: a role definition's tool list must
-/// not have to know which CLI is carrying it.
-const SERVER: &str = "cide";
 
 /// The document's own contract, so a person reading a dumped configuration can look it up.
 const SCHEMA: &str = "https://opencode.ai/config.json";
@@ -198,6 +191,16 @@ pub struct OpencodeHarness;
 impl Harness for OpencodeHarness {
     fn kind(&self) -> cide_ipc::Harness {
         cide_ipc::Harness::Opencode
+    }
+
+    /// `<server>_<tool>`, so cide's vocabulary arrives as `cide_cide_task_get`.
+    ///
+    /// The doubled `cide` looks like a mistake and is not: the server is [`SERVER`] and the tool
+    /// is already `cide_task_get`, and opencode joins the two with one underscore. Renaming the
+    /// server to flatten it would break the rule [`SERVER`] exists for — one server name across
+    /// harnesses, so a role's tool list need not know which CLI is carrying it.
+    fn tool_name(&self, tool: &str) -> String {
+        format!("{SERVER}_{tool}")
     }
 
     fn spawn_spec(&self, plan: &RunPlan<'_>) -> Result<HarnessSpawn, HarnessError> {
@@ -729,14 +732,26 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
                 // Three paragraphs at most, in the same order and with the same `\n\n` join the
                 // claude side's fold produces — so one role pointed at either CLI reads the same
                 // brief. (M28 added the third.)
-                let mut prompt = format!("{}\n\n{}", def.system_prompt, TRACKER_PREAMBLE);
+                let mut prompt = format!(
+                    "{}\n\n{}",
+                    def.system_prompt,
+                    tracker_preamble(&OpencodeHarness)
+                );
                 if let Some(change) = plan.change.as_deref() {
                     prompt.push_str("\n\n");
                     prompt.push_str(&super::spec_preamble(
                         change,
                         plan.spec_cli.as_deref(),
                         plan.spec_apply.as_deref(),
+                        &OpencodeHarness,
                     ));
+                }
+                // And, for a run with no task, the correction to the tracker paragraph — last,
+                // exactly where the claude side folds it, so `harness.rs`'s parity test holds.
+                // (M40)
+                if plan.task.is_none() {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(ADHOC_PREAMBLE);
                 }
                 prompt
             }
@@ -778,6 +793,12 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tracker paragraph as *this* harness renders it — `cide_cide_task_get`, not
+    /// `mcp__cide__cide_task_get`. Derived from the one definition, never quoted.
+    fn tracker() -> String {
+        tracker_preamble(&OpencodeHarness)
+    }
 
     use crate::defs::LoadedAgent;
     use cide_claude::HookFrame;
@@ -983,6 +1004,32 @@ mod tests {
     /// the whole reason it is built with serde: a prompt is a document a human wrote, so a quote,
     /// a backslash and a newline are ordinary content rather than exotic input.
     ///
+    /// (M40) The task-less twin of the test below: the correction to the tracker paragraph is the
+    /// third paragraph of the inline agent's prompt, after the other two, so a role pointed at
+    /// either binary reads the same brief — `harness.rs`'s parity test is the cross-check.
+    #[test]
+    fn the_config_tells_an_adhoc_run_it_stands_in_the_users_tree() {
+        let agent = role();
+        let mut plan = plan_for(&agent);
+        plan.task = None;
+        plan.task_title = None;
+        let config = config_of(&spawn(&plan).spec);
+        assert_eq!(
+            config["agent"]["developer"]["prompt"],
+            json!(format!(
+                "{}\n\n{}\n\n{ADHOC_PREAMBLE}",
+                agent.def.system_prompt,
+                tracker()
+            ))
+        );
+        // No bridge, no tracker paragraph, no correction: the role's own words alone.
+        plan.hook_bin = None;
+        assert_eq!(
+            config_of(&spawn(&plan).spec)["agent"]["developer"]["prompt"],
+            json!(agent.def.system_prompt)
+        );
+    }
+
     /// cide's paragraph about the task tracker follows it, after a blank line and never before it,
     /// and the expectation is built from [`TRACKER_PREAMBLE`] rather than from a quoted copy — so
     /// a second definition of that prose cannot pass this file, which is the point of there being
@@ -996,7 +1043,7 @@ mod tests {
         let config = config_of(&spawn(&plan_for(&agent)).spec);
         assert_eq!(
             config["agent"]["developer"]["prompt"],
-            json!(format!("{prompt}\n\n{TRACKER_PREAMBLE}"))
+            json!(format!("{prompt}\n\n{}", tracker()))
         );
         assert_eq!(
             config["agent"]["developer"]["description"],
@@ -1175,10 +1222,7 @@ mod tests {
         );
         assert_eq!(
             config_of(&spawned.spec)["agent"]["developer"]["prompt"],
-            json!(format!(
-                "{}\n\n{TRACKER_PREAMBLE}",
-                plan.agent.def.system_prompt
-            ))
+            json!(format!("{}\n\n{}", plan.agent.def.system_prompt, tracker()))
         );
     }
 

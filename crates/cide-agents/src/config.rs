@@ -72,7 +72,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Isolation {
-    /// One git worktree per agent, at `.cide/worktrees/<agent>` on branch `cide/<agent>`.
+    /// One git worktree per (role, task), at `.cide/worktrees/<role>-<task>` on branch
+    /// `cide/<role>-<task>` — `crate::run_checkout` is the rule. A run dispatched with no task
+    /// stands in the project root even here (M40): a quick check or a small piece of direct
+    /// work has nowhere to be merged back *from*.
     #[default]
     Worktree,
     /// Every agent edits the project's own checkout. Nothing separates two concurrent runs.

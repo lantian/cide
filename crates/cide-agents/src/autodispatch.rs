@@ -170,6 +170,7 @@ mod tests {
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 1,
+            attachments: Vec::new(),
         }
     }
 

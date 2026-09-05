@@ -42,13 +42,16 @@
  */
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
+  type UIEvent,
 } from 'react'
 import { collapseRuns, UNCOMMITTED_BUCKET } from '@/editor/blameModel'
 import { cancelResizeSettle, whenResizeSettles } from '@/layout/resizeGesture'
@@ -127,7 +130,7 @@ import {
   type ChangeNav,
   type ChangeNavSlot,
 } from './changeNav'
-import { diffTabOnScreen } from './diffTabs'
+import { diffTabOnScreen, revisionTabOnScreen, sameSide } from './diffTabs'
 import { Icon } from '@/icons/Icon'
 
 import styles from './GitDiffPane.module.css'
@@ -569,6 +572,45 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
   const cramped = view === 'split' && !wide
 
   /*
+   * Where the reader had got to, so parking a tab does not lose their place. (M38)
+   *
+   * The rows go while the tab is behind another one — see the `parked` body below for why —
+   * and a scroller with no content has nowhere to be scrolled to, so the browser cannot keep
+   * this for us. One entry per scroller because the split layout has two and they are scrolled
+   * independently by the reader (the sync only *maps* one onto the other).
+   *
+   * A ref and not state: nothing renders from it, and a scroll event that re-rendered the whole
+   * row list would be the opposite of the point.
+   */
+  const scrollMemo = useRef({ unified: 0, old: 0, new: 0 })
+  const rememberScroll = useCallback((event: UIEvent<HTMLElement>): void => {
+    const el = event.currentTarget
+    const side = el.dataset['side']
+    scrollMemo.current[side === 'old' ? 'old' : side === 'new' ? 'new' : 'unified'] = el.scrollTop
+  }, [])
+  /*
+   * Spending it, on the frame the rows come back.
+   *
+   * Found through `root` rather than through `leftCol`/`rightCol`, and that is not a stylistic
+   * choice: those are callback-ref *state*, set during the commit that mounts the columns, so
+   * on this pass they are still `null` and a layout effect reading them would restore nothing.
+   * `root` is already set — the pane's own element is drawn whether the body is parked or not,
+   * which is also why parking does not tear down `setRoot`.
+   *
+   * Keyed on `visible` alone. A `layout` flip has its own correct answer (`currentAnchor`'s
+   * effect re-runs and re-centres the change being read), and this must not fight it.
+   */
+  useLayoutEffect(() => {
+    if (!visible || root === null) return
+    const memo = scrollMemo.current
+    for (const el of root.querySelectorAll<HTMLElement>('[data-audit="gitDiffScroller"]')) {
+      const side = el.dataset['side']
+      const want = memo[side === 'old' ? 'old' : side === 'new' ? 'new' : 'unified']
+      if (want > 0) el.scrollTop = want
+    }
+  }, [visible, root])
+
+  /*
    * Whether the tick boxes are drawn at all.
    *
    * `staging === null` withholds them from the whole revision arm: there is no index to
@@ -819,13 +861,43 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
       return tops
     }
 
+    /**
+     * The measurement, held between frames.
+     *
+     * **`offsetTop` does not move when a scroller scrolls**, and that is the whole justification:
+     * every number `topsOf` collects is a position inside the column's content, so re-reading
+     * them per frame was measuring something that could not have changed. What it cost was real
+     * — `Array.from(content.children)` plus an `offsetTop` per row is a forced synchronous layout
+     * over the whole column, twice, and this runs on every animation frame of every scroll of
+     * either side. On a diff of a few thousand rows that is the whole frame budget, and the
+     * symptom is a scrollbar that stutters rather than anything visibly wrong.
+     *
+     * `null` means "not measured yet". It is cleared by the observer below and by nothing else,
+     * which is the invariant to keep: anything that can move a row must invalidate here.
+     */
+    let geometry: { left: number[]; right: number[]; width: number; height: number } | null = null
+    const measure = (): void => {
+      const left = topsOf(leftCol)
+      const right = topsOf(rightCol)
+      geometry =
+        left === null || right === null
+          ? null
+          : {
+              left,
+              right,
+              // The connector's own box is measured here too, for the same reason: `clientWidth`
+              // is a layout read, and it changes when the pane resizes — which is exactly when
+              // the observer fires.
+              width: connector.clientWidth,
+              height: connector.clientHeight,
+            }
+    }
+
     const paint = (): void => {
       raf = 0
-      const leftTops = topsOf(leftCol)
-      const rightTops = topsOf(rightCol)
-      if (leftTops === null || rightTops === null) return
-      const width = connector.clientWidth
-      const height = connector.clientHeight
+      if (geometry === null) measure()
+      if (geometry === null) return
+      const { left: leftTops, right: rightTops, width, height } = geometry
       const shapes = connectorShapes(
         runs,
         leftTops,
@@ -855,6 +927,11 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     const schedule = (): void => {
       if (raf === 0) raf = requestAnimationFrame(paint)
     }
+    /** A size changed, so the held measurement is stale. The only thing that may clear it. */
+    const remeasure = (): void => {
+      geometry = null
+      schedule()
+    }
 
     paint()
     leftCol.addEventListener('scroll', schedule, { passive: true })
@@ -862,7 +939,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     // The columns' content, not the columns: a fold opening changes the content's height without
     // the scroller's box moving at all, and that is precisely when every ribbon below it moves.
     const observer =
-      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => schedule())
+      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => remeasure())
     for (const column of [leftCol, rightCol, connector]) {
       const target = column === connector ? connector : column.firstElementChild
       if (observer !== null && target !== null) observer.observe(target)
@@ -1549,6 +1626,10 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
         data-boxed={selectable && side === 'new' ? 'true' : 'false'}
         data-blamed={side === 'new' && blame !== null ? 'true' : 'false'}
         ref={side === 'old' ? setLeftCol : setRightCol}
+        // A React handler beside the sync effect's own `scroll` listener, rather than a third
+        // job for that listener: the effect is torn down while the tab is parked, and the last
+        // position before it was parked is exactly the thing that has to survive.
+        onScroll={rememberScroll}
       >
         <div className={styles.columnContent}>{children}</div>
       </div>
@@ -1592,7 +1673,35 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
         </p>
       )}
 
-      {layout === 'split' && split !== null ? (
+      {!visible ? (
+        /*
+         * **A tab nobody is looking at draws no rows.** (M38)
+         *
+         * `TabContent` keeps every tab of the active project mounted and hides all but one with
+         * `visibility: hidden` — deliberately, and its own header says why — which means every
+         * hidden tab is still *laid out at full size*. This pane has no virtualisation on
+         * purpose (`diffRows.ts` argues for that: find-in-page, and a selection dragged across
+         * hunks), and below `WHOLE_FILE_COLLAPSE_ABOVE` it draws every line of the file, twice
+         * in the split layout. So a 2,000-line diff is on the order of ten thousand
+         * `display: grid` rows with `pre-wrap` text, and six such tabs left sixty thousand of
+         * them in the document being laid out for the rest of the session. That is the reported
+         * *"several opened tabs with diff makes cide very laggy"*, and it is a cost the whole
+         * window pays — layout is global, so the terminals and editors slow down with it.
+         *
+         * What is given up is that revealing a diff tab is a render rather than a repaint. It is
+         * one tab's render, on a component that already re-renders whole every time its file
+         * moves under it, against a permanent cost multiplied by tab count. The reading position
+         * is the part that would genuinely be lost, so it is kept explicitly — see
+         * `scrollMemo` and the layout effect that spends it.
+         *
+         * **The memos above are deliberately still computed.** `whole`, `segments`, `model` and
+         * `anchors` are keyed on `diff`/`collapsed`/`expandedGaps`, none of which move for a
+         * hidden tab, so they cost nothing per event — and `navImpl.cursor()` reads
+         * `anchors.length`, so zeroing them would make a hidden pane lie to `changeNav` about
+         * how many changes it has.
+         */
+        <div className={styles.parked} data-audit="gitDiffParked" />
+      ) : layout === 'split' && split !== null ? (
         /*
          * Side by side: two independently scrolling columns, each drawing only its own
          * side's rows — no filler cells where the other side has a block, only a thin
@@ -1616,7 +1725,11 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
           {column('new', split.right)}
         </div>
       ) : (
-        <div className={styles.body} data-audit="gitDiffScroller">
+        <div
+          className={styles.body}
+          data-audit="gitDiffScroller"
+          onScroll={rememberScroll}
+        >
           {diff.hunks.length === 0 && (
             <p className={styles.notice}>No text changes on this side.</p>
           )}
@@ -1894,7 +2007,28 @@ interface GitDiffProps {
   visible: boolean | undefined
 }
 
-function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): ReactNode {
+/*
+ * Memoised, and this is the boundary that decides whether N open diff tabs cost N. (M38)
+ *
+ * `App.tsx`'s `WorkspaceContent` is the only memo above here, and its props are snapshot-derived
+ * — so it re-renders exactly once per *accepted workspace mutation*, which is the right answer
+ * for the pane grid and the wrong one for this. Activating a tab, focusing a pane, releasing a
+ * splitter and binding a session are all mutations, and each of them re-reconciled every mounted
+ * diff tab's entire row list: tens of thousands of elements rebuilt to produce identical output,
+ * several times a second while somebody clicks around.
+ *
+ * The memo *holds* because every prop here is a primitive — `GitDiffPane` destructures
+ * `spec.origin` above precisely so that the object off the workspace snapshot, whose identity
+ * changes on every broadcast, stops at that boundary. Keep it that way: a prop added here that is
+ * not a string, number or boolean silently reopens this.
+ */
+const GitDiff = memo(function GitDiff({
+  project,
+  repo,
+  path,
+  from,
+  visible: told,
+}: GitDiffProps): ReactNode {
   /**
    * Whether the tab drawing this diff is the one in front, worked out rather than told.
    *
@@ -2043,7 +2177,31 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
   )
   const tokens = useDiffTokens(diff)
 
+  /**
+   * The last refusal written to the log, so a diff that is gone writes one line and not one a
+   * second. See the `catch` below.
+   */
+  const loggedRef = useRef<string | null>(null)
+
   useEffect(() => {
+    /*
+     * **A tab nobody is looking at does not fetch, not even its first time.** (M38)
+     *
+     * The deferral below covers every *re*-fetch, and this covers the one it could not: the
+     * mount. A workspace restored with six diff tabs opened six `git_diff_file` calls at once,
+     * each of which pays `repo::find` — see its own comment for what that used to cost — and
+     * brings back both whole file texts, which are then tokenized whole on this thread. Five of
+     * those six were for tabs behind the one in front.
+     *
+     * `visible` is deliberately **not** in the dependency list: it moves on every tab switch,
+     * and a dependency on it would refetch a diff nobody asked to refresh every time it came
+     * back. The reveal effect below is the resume path — it bumps `nonce`, which is in the list
+     * — so the fetch happens exactly once, when the tab is first looked at.
+     */
+    if (!visible) {
+      setStale(true)
+      return
+    }
     let disposed = false
     gitApi
       .diffFile(project, repo, path, side)
@@ -2051,6 +2209,9 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
         if (disposed) return
         setDiff(fresh)
         setReason(null)
+        // Re-arms the log below: a file that goes, comes back and goes again is two events and
+        // deserves two lines. Only a refusal repeating itself is silenced.
+        loggedRef.current = null
         /*
          * A moved diff drops the selection.
          *
@@ -2166,11 +2327,35 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
         // still there to look at another one.
         setDiff(null)
         setReason(detail)
-        void diag.log(`git diff pane: ${path} on ${side} failed: ${detail}`)
+        /*
+         * **Once per distinct refusal, not once per fetch.** (M38)
+         *
+         * `diag_log` is a *non-async* `#[tauri::command]`, so every one of these is a
+         * main-thread round trip and a file append — `ipc/consoleBridge.ts` states the rule it
+         * follows from: a diagnostic for a lag report must not itself be a cause of lag. And a
+         * gone diff is the shape that breaks it, because it fails *for ever*: the tab keeps its
+         * subscriptions, so it refetches on every `cide://git-status` in the project and logs
+         * the same sentence again, for the life of the tab, times however many such tabs are
+         * open. That is exactly the "several diff tabs, especially ones whose diff is gone"
+         * report.
+         *
+         * The ref and not `reason`, because `reason` is also what the notice draws and a
+         * comparison there would couple the two: the line is about what *changed*, and the
+         * notice is about what *is*.
+         */
+        if (loggedRef.current !== detail) {
+          loggedRef.current = detail
+          void diag.log(`git diff pane: ${path} on ${side} failed: ${detail}`)
+        }
       })
     return () => {
       disposed = true
     }
+    // `visible` is read and deliberately not depended on; see the head of the effect. Listing it
+    // would be two bugs at once: hiding a tab would mark it stale (so revealing it would re-read
+    // a diff nothing had touched), and revealing one would fetch twice — once for the dependency
+    // and once for the `nonce` the reveal effect below bumps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, repo, path, side, nonce])
 
   /*
@@ -2282,22 +2467,37 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
         if (forProject === project && gitRefsMoved(change)) bump()
       }),
     )
-    // Which tab is in front is workspace state, so it arrives here the way every other piece
-    // of workspace state does. Subscribed beside the other two rather than through the store
-    // hook that already follows this event: `store/workspace` reaches xterm through
-    // `paneHosts`, and importing it here would put a terminal in the SSR bundle
-    // `check-diff-render.mjs` renders this pane's view from.
-    track(
-      events.onWorkspaceChanged((ws) => {
-        setOnScreen(diffTabOnScreen(ws.projects[project], repo, path))
-      }),
-    )
+    /*
+     * Which tab is in front is workspace state, so it arrives here the way every other piece of
+     * workspace state does. Subscribed beside the other two rather than through the store hook
+     * that already follows this event: `store/workspace` reaches xterm through `paneHosts`, and
+     * importing it here would put a terminal in the SSR bundle `check-diff-render.mjs` renders
+     * this pane's view from.
+     *
+     * **Only when nobody told us.** (M38) The shell passes `visible` now, so for every tab in
+     * the app this subscription would be a listener whose handler runs `diffTabOnScreen` — a
+     * filter over the project's whole tab list — once per pane per accepted mutation, to reach
+     * an answer the prop has already given. The mirror stays for hosts that pass nothing, which
+     * is the case `diffTabs.ts`' header is written about; it is not the road anything takes
+     * today, and it must not cost anything when it is not taken.
+     */
+    if (told === undefined) {
+      track(
+        events.onWorkspaceChanged((ws) => {
+          setOnScreen(diffTabOnScreen(ws.projects[project], repo, path))
+        }),
+      )
+    }
     return () => {
       gone = true
       if (timer !== null) window.clearTimeout(timer)
       for (const fn of unlisten) fn()
     }
-  }, [project, repo, path])
+    // `told === undefined` and not `told`: whether the mirror is consulted is a fact about the
+    // *host*, fixed for the life of this pane, while `told` itself moves on every tab switch and
+    // would tear down and rebuild all four listeners each time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, repo, path, told === undefined])
 
   // Reveal is where a deferred fetch is spent. The flag is cleared by the reveal and not by
   // the fetch's outcome: a file staged away answers `NoSuchChange` for as long as it stays
@@ -2424,7 +2624,7 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
       onDropHeld={() => clearPartial(repo, path)}
     />
   )
-}
+})
 
 // --- the revision diff (M18) --------------------------------------------------------------
 
@@ -2484,24 +2684,76 @@ export interface RevisionDiffPaneProps {
  *
  * # What it deliberately does *not* do
  *
- * **No visibility deferral and no `git-status` subscription for a frozen pair.** `GitDiff`
- * spends fifty lines on both because a working-tree diff goes stale constantly — an agent
- * writes the file, a build regenerates it, the user saves. Two commits diff to the same bytes
- * for ever, so a tab showing one is correct from its first frame until it is closed, and a
- * refetch would be a round trip that cannot change a pixel.
+ * **No `git-status` subscription for a frozen pair.** `GitDiff` spends fifty lines on
+ * invalidation because a working-tree diff goes stale constantly — an agent writes the file, a
+ * build regenerates it, the user saves. Two commits diff to the same bytes for ever, so a tab
+ * showing one is correct from its first frame until it is closed, and a refetch would be a round
+ * trip that cannot change a pixel.
  *
  * The exception is a [`RevSide::WorkingTree`] side, which is exactly why that is a variant a
  * caller can match on rather than a magic oid. When one is present the same two events are
  * subscribed, with the same 120 ms coalescing, because then the diff *is* moving.
+ *
+ * # And when it is moving, it defers exactly as `GitDiff` does (M38)
+ *
+ * This paragraph used to say there was no visibility deferral here either, and the omission was
+ * not free. `git_diff_revision` builds a diff of the **whole repository** and then filters to
+ * one path (`cide_git::revision::build_diff` sets no pathspec, and runs rename detection over
+ * every delta), and with a working-tree side it recurses untracked directories on the way. So a
+ * commit-against-working-tree tab sitting behind another one re-ran all of that on every git
+ * mutation in the project, for nothing. The machinery is `GitDiff`'s, restated rather than
+ * shared because the two panes hold different state: a `visibleRef` so the listeners are not
+ * rebuilt on every tab switch, a `stale` flag so however many events go by cost one fetch, and
+ * `diffTabs.revisionTabOnScreen` so the answer does not depend on a host remembering to pass a
+ * prop.
  */
-export function RevisionDiffPane({
+/**
+ * The `memo` comparator, because two of this pane's props are objects.
+ *
+ * `next`/`prev` are `RevSide`s off the tab's spec, so they are fresh literals on every workspace
+ * broadcast and the default shallow compare would never hold — which is the whole cost the memo
+ * is there to remove; `GitDiff`'s says what that cost is. `sameSide` and not `JSON.stringify`:
+ * `diffTabs.ts` records why, and it is the same reason here, since one side of any comparison
+ * came through serde.
+ */
+function sameRevisionQuestion(a: RevisionDiffPaneProps, b: RevisionDiffPaneProps): boolean {
+  return (
+    a.project === b.project &&
+    a.repo === b.repo &&
+    a.path === b.path &&
+    a.visible === b.visible &&
+    sameSide(a.next, b.next) &&
+    sameSide(a.prev, b.prev)
+  )
+}
+
+export const RevisionDiffPane = memo(function RevisionDiffPane({
   project,
   repo,
   path,
   next,
   prev,
-  visible = true,
+  visible: told,
 }: RevisionDiffPaneProps): ReactNode {
+  /**
+   * Whether the tab drawing this comparison is the one in front, worked out rather than told.
+   *
+   * The whole argument is `GitDiff`'s and `diffTabs.ts`' — a host's answer wins where it has
+   * one, and the workspace mirror answers where it does not, because a deferral that has to be
+   * switched on is a deferral that is off. `PaneBody` does pass the flag today; this is what
+   * keeps that from being the only thing standing between a background tab and a whole-repo
+   * diff per git event.
+   */
+  const [onScreen, setOnScreen] = useState(true)
+  const visible = told ?? onScreen
+  // The invalidation listeners are subscribed once per comparison and must not be torn down and
+  // rebuilt on every tab switch, so visibility reaches them through a ref.
+  const visibleRef = useRef(visible)
+  visibleRef.current = visible
+  /** Something invalidated this view while the tab was behind another one. */
+  const [stale, setStale] = useState(false)
+  /** The last refusal written to the log. See the `catch` below. */
+  const loggedRef = useRef<string | null>(null)
   // The shared unified/split preference. See the `view` prop below for why this pane needs it.
   const diffView = useSyncExternalStore(subscribeDiffView, getDiffView, getServerDiffView)
   const [diff, setDiff] = useState<RevisionDiff | null>(null)
@@ -2535,6 +2787,13 @@ export function RevisionDiffPane({
   const moving = next.kind === 'workingTree' || prev.kind === 'workingTree'
 
   useEffect(() => {
+    // A tab nobody is looking at does not fetch — not even its first time, and here that first
+    // time is a whole-repository diff. `visible` is read and deliberately not depended on; the
+    // reveal effect below is the resume path. `GitDiff`'s fetch states the argument in full.
+    if (!visible) {
+      setStale(true)
+      return
+    }
     let disposed = false
     gitLog
       .diff(project, repo, path, next, prev)
@@ -2542,6 +2801,8 @@ export function RevisionDiffPane({
         if (disposed) return
         setDiff(fresh)
         setReason(null)
+        // Re-arms the log below; see `GitDiff`'s success arm.
+        loggedRef.current = null
         setExpandedGaps(new Set<number>())
         // The walk: on the way *in* it lands on the first change, for the reason `GitDiff`'s
         // fetch states at length — a diff that opens at line 1 makes the reader hunt for the
@@ -2568,7 +2829,13 @@ export function RevisionDiffPane({
         // tab. Not a dialog — the pane says what it knows and stays put.
         setDiff(null)
         setReason(detail)
-        void diag.log(`revision diff pane: ${path} failed: ${detail}`)
+        // Once per distinct refusal, for the reason `GitDiff`'s catch spells out: `diag_log` is
+        // a main-thread round trip, and a refusal that repeats on every git event repeats this
+        // line with it.
+        if (loggedRef.current !== detail) {
+          loggedRef.current = detail
+          void diag.log(`revision diff pane: ${path} failed: ${detail}`)
+        }
       })
     return () => {
       disposed = true
@@ -2576,18 +2843,23 @@ export function RevisionDiffPane({
     // `next`/`prev` are object literals off the tab's spec and change identity on every
     // workspace snapshot, so they are keyed by content: the component is already remounted on a
     // real change (see `GitDiffPane`'s `key`), and depending on the objects would refetch on
-    // every unrelated broadcast.
+    // every unrelated broadcast. `visible` is read and omitted for the reason `GitDiff`'s fetch
+    // states: listing it would mark a hidden tab stale and fetch twice on every reveal.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, repo, path, JSON.stringify(next), JSON.stringify(prev), nonce])
 
   useEffect(() => {
-    if (!moving) return
     let gone = false
     let timer: number | null = null
     const unlisten: Array<() => void> = []
     const bump = () => {
       if (timer !== null) window.clearTimeout(timer)
-      timer = window.setTimeout(() => setNonce((n) => n + 1), 120)
+      // Which of the two this becomes is decided when the timer fires, not when it is set —
+      // `GitDiff`'s `bump` says why, and this is the same coalescing over the same triggers.
+      timer = window.setTimeout(() => {
+        if (visibleRef.current) setNonce((n) => n + 1)
+        else setStale(true)
+      }, 120)
     }
     const track = (p: Promise<() => void>) => {
       void p
@@ -2597,26 +2869,69 @@ export function RevisionDiffPane({
         })
         .catch((e: unknown) => diag.log(`revision diff pane: events unavailable: ${String(e)}`))
     }
-    track(
-      events.onGitStatus((forProject, tree) => {
-        noteRepoRoots(tree)
-        if (forProject === project) bump()
-      }),
-    )
-    track(
-      events.onSessionTool((_session, paths) => {
-        // The same path filter `GitDiff` uses, and load-bearing for the same reason:
-        // `cide://session-tool` reaches every window and names a session, not a project, so an
-        // unfiltered handler refetches on every tool call every agent in the app makes.
-        if (touchesFile(paths, repoRoot(repo), path)) bump()
-      }),
-    )
+    if (moving) {
+      track(
+        events.onGitStatus((forProject, tree) => {
+          noteRepoRoots(tree)
+          if (forProject === project) bump()
+        }),
+      )
+      track(
+        events.onSessionTool((_session, paths) => {
+          // The same path filter `GitDiff` uses, and load-bearing for the same reason:
+          // `cide://session-tool` reaches every window and names a session, not a project, so an
+          // unfiltered handler refetches on every tool call every agent in the app makes.
+          if (touchesFile(paths, repoRoot(repo), path)) bump()
+        }),
+      )
+    }
+    /*
+     * Subscribed whether or not the diff is moving, because this is not about invalidation: it
+     * is what tells the pane to draw its rows at all. A frozen pair never refetches and still
+     * has to know when it is behind another tab — see `GitDiffView`'s hidden-tab body.
+     *
+     * And only when nobody told us, for the reason `GitDiff`'s copy gives — with one more here:
+     * `LogTab` renders this pane in the **tool window**, which is not a tab at all, so the
+     * mirror could answer "hidden" about the thing the reader is looking at. That host says
+     * `visible` explicitly and this listener is then never created.
+     *
+     * Beside the other two rather than through `store/workspace`, again for `GitDiff`'s reason:
+     * that module reaches xterm through `paneHosts`, and this file is SSR-bundled under node by
+     * `check-diff-render.mjs`.
+     */
+    if (told === undefined) {
+      track(
+        events.onWorkspaceChanged((ws) => {
+          setOnScreen(revisionTabOnScreen(ws.projects[project], repo, path, next, prev))
+        }),
+      )
+    }
     return () => {
       gone = true
       if (timer !== null) window.clearTimeout(timer)
       for (const fn of unlisten) fn()
     }
-  }, [moving, project, repo, path])
+    // `next`/`prev` by content, as the fetch above keys them and for the same reason;
+    // `told === undefined` and not `told`, as `GitDiff`'s copy of this list explains.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    moving,
+    project,
+    repo,
+    path,
+    JSON.stringify(next),
+    JSON.stringify(prev),
+    told === undefined,
+  ])
+
+  // Reveal is where a deferred fetch is spent, and the flag is cleared by the reveal rather than
+  // by the fetch's outcome — `GitDiff`'s copy of this effect argues why the other way round is a
+  // loop.
+  useEffect(() => {
+    if (!visible || !stale) return
+    setStale(false)
+    setNonce((n) => n + 1)
+  }, [visible, stale])
 
   /*
    * The blame column, and **this arm shows it too**. (M18)
@@ -2745,4 +3060,4 @@ export function RevisionDiffPane({
       onExpandGap={(gap) => setExpandedGaps((prev_) => new Set(prev_).add(gap))}
     />
   )
-}
+}, sameRevisionQuestion)

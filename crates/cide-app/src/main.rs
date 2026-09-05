@@ -11,6 +11,23 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Then every other argument, on the same terms and for a sharper reason: before this,
+    // `cide --help` started the full IDE. This binary's path is in `$EDITOR` inside every pane,
+    // so anything probing it launched a second instance on a live profile — see `cli`'s header
+    // for the morning that cost. Above the graphics ladder because a refusal must not create a
+    // window, and below `edit_wait` because `--wait` is that module's flag.
+    if let Some(code) = cide_app::cli::cli() {
+        std::process::exit(code);
+    }
+
+    // And the second lock: whatever else starts a second cide, it stops here rather than
+    // restoring a workspace the running instance will overwrite on its way out. Also before the
+    // graphics ladder — the refusal is a sentence on stderr and no display is needed for it.
+    if let Err(holder) = cide_app::instance::acquire() {
+        eprintln!("{}", cide_app::instance::refusal(holder));
+        std::process::exit(1);
+    }
+
     // First, before anything touches GTK or the webview. These variables are read when the
     // webview is created and setting them later silently does nothing — and without them
     // the app does not start at all on a stock KDE Wayland desktop. See `graphics.rs`.

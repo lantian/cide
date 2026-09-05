@@ -58,6 +58,7 @@ use std::sync::Arc;
 
 use cide_agents::config::{self, CideConfig};
 use cide_agents::defs;
+use cide_agents::harness::Harness;
 use cide_agents::{Isolation, LoadedAgent, ProjectAgents};
 use cide_core::{CoreError, workspace};
 use cide_ipc::agents::{AgentDraft, AgentSaveOutcome, AgentScope};
@@ -127,7 +128,15 @@ pub async fn agents_roster(
     let root = project_root(&state, project)?;
     let runs = agents.runs_for(project);
     let dispatching = agents.dispatching(project);
-    blocking(move || Ok(roster(&root, runs, dispatching))).await
+    blocking(move || {
+        Ok(roster(
+            &root,
+            runs,
+            dispatching,
+            crate::agents::cide_hook_binary().as_deref(),
+        ))
+    })
+    .await
 }
 
 /// The three switches from `.cide/config.json` that the panel draws.
@@ -194,7 +203,15 @@ pub async fn agents_config_set(
         // Built after the write, from the file that is now on disk, so the roster the other
         // windows are handed and the config this call answers with cannot disagree about what
         // just happened.
-        Ok((file.agents.to_wire(), roster(&root, runs, dispatching)))
+        Ok((
+            file.agents.to_wire(),
+            roster(
+                &root,
+                runs,
+                dispatching,
+                crate::agents::cide_hook_binary().as_deref(),
+            ),
+        ))
     })
     .await?;
 
@@ -302,7 +319,12 @@ pub async fn agents_save(
         // with and the roster the other windows are handed cannot disagree about what happened.
         Ok(path) => Ok(AgentSaveOutcome::Saved {
             path,
-            roster: roster(&root, runs, dispatching),
+            roster: roster(
+                &root,
+                runs,
+                dispatching,
+                crate::agents::cide_hook_binary().as_deref(),
+            ),
         }),
         Err(defs::WriteError::Rejected(problems)) => Ok(AgentSaveOutcome::Rejected { problems }),
         // Including `Stranded`, which is a *succeeded* save whose rename could not finish. It is
@@ -352,7 +374,12 @@ pub async fn agents_delete(
     let roster = blocking(move || {
         defs::delete(&root, agent.as_str(), scope)
             .map_err(|error| CoreError::Io(error.to_string()))?;
-        Ok(roster(&root, runs, dispatching))
+        Ok(roster(
+            &root,
+            runs,
+            dispatching,
+            crate::agents::cide_hook_binary().as_deref(),
+        ))
     })
     .await?;
 
@@ -592,9 +619,11 @@ pub async fn agents_integrate(
 /// without an `AppHandle`, which is the shape every other decision in this module is kept in.
 ///
 /// `task` names which of the role's branches to merge, since worktrees went per-task: a task's
-/// work lives on `cide/<role>-<task>` and `None` targets the role's base branch — the one its
-/// taskless dispatches commit to. Composed with the same `checkout_name` a dispatch uses, so
-/// the branch integrated is by construction the branch that run committed to.
+/// work lives on `cide/<role>-<task>`, and `None` targets the role's base branch `cide/<role>` —
+/// which only holds work an older cide's task-less dispatches committed there; since M40 a run
+/// with no task stands in the project root and mints no branch. Composed with the same
+/// `checkout_name` a dispatch's worktree is named by, so the branch integrated is by
+/// construction the branch that run committed to.
 pub(crate) fn integrate_for(
     root: &Path,
     agent: &AgentId,
@@ -614,12 +643,22 @@ fn integrate(root: &Path, agent: &AgentId, task: Option<&TaskId>) -> Result<Agen
             Ok(AgentIntegration::Conflicts { paths })
         }
         // The one rewrite. See the doc comment above: git is right and its sentence names a ref
-        // the user never chose.
-        Err(cide_ipc::git::GitError::NoSuchBranch { .. }) => Err(CoreError::Io(format!(
-            "there is nothing to integrate: no branch cide/{name} exists in this project yet. \
-             A run mints it the first time it is dispatched into that checkout, and commits to \
-             it from .cide/worktrees/{name}."
-        ))),
+        // the user never chose. Two sentences, because the two cases want opposite advice: a
+        // task's branch is minted by dispatching the task, while the bare role's branch is
+        // minted by nothing any more (M40) — telling the caller to "dispatch into that checkout"
+        // there would send them to a run that stands in the project root.
+        Err(cide_ipc::git::GitError::NoSuchBranch { .. }) => Err(CoreError::Io(match task {
+            Some(_) => format!(
+                "there is nothing to integrate: no branch cide/{name} exists in this project \
+                 yet. A run mints it the first time it is dispatched on that task, and commits \
+                 to it from .cide/worktrees/{name}."
+            ),
+            None => format!(
+                "there is nothing to integrate: no branch cide/{name} exists in this project. \
+                 A run dispatched without a task works in the project root and mints no branch \
+                 — name the task whose branch you want."
+            ),
+        })),
         Err(error) => Err(CoreError::Io(error.to_string())),
     }
 }
@@ -664,9 +703,16 @@ fn plan_dispatch(
             config::CIDE_DIR
         ))
     })?;
-    // The one function a dispatch site calls: off for this project, a fault in the definition, or
-    // `bypassPermissions` the project never authorised. See `cide_agents::dispatch_refusal`.
-    if let Some(why) = cide_agents::dispatch_refusal(agent, &project.config.agents) {
+    // The one function a dispatch site calls: off for this project, no `cide-hook` to bridge the
+    // tracker, a fault in the definition, or `bypassPermissions` the project never authorised.
+    // See `cide_agents::dispatch_refusal`. This is the earliest of the three call sites and the
+    // one that matters most for the bridge: refusing here is refusing before `worktree::ensure`,
+    // so a run that could not have reported leaves no checkout behind either.
+    if let Some(why) = cide_agents::dispatch_refusal(
+        agent,
+        &project.config.agents,
+        crate::agents::cide_hook_binary().as_deref(),
+    ) {
         return Err(CoreError::Io(why));
     }
 
@@ -722,7 +768,12 @@ fn plan_dispatch(
         }
     }
 
-    let prompt = opening_prompt(task.as_ref(), request.prompt.as_deref());
+    // The bridge is established above — `dispatch_refusal` refused this dispatch if `cide-hook`
+    // was missing — so the tools *will* be attached, and the only open question is what this CLI
+    // calls them. A role naming a harness this build cannot run was refused there too, so the
+    // fallback here is unreachable; it drops the tool sentences rather than guessing a spelling.
+    let harness = cide_agents::harness::for_kind(agent.def.harness);
+    let prompt = opening_prompt(task.as_ref(), request.prompt.as_deref(), harness);
     if prompt.is_empty() {
         // Refused here as well as in `ClaudeHarness::spawn_spec`, which has the same guard for the
         // same reason: an interactive `claude` with no opening prompt starts perfectly, sits at
@@ -759,17 +810,14 @@ fn plan_dispatch(
         project_limit: project.config.agents.max_concurrent,
         // The directory this run will stand in, for the admission gate: two runs may never
         // share a checkout, and under worktree isolation the checkout is named by the
-        // (role, task) pair — so tasks parallelise and taskless dispatches serialise on the
-        // role's base worktree. `None` under shared isolation, where runs sharing the project
-        // root is the setting's stated meaning — and for a role whose file says
-        // `worktree: false`, which opted into exactly that posture for its own runs.
-        checkout: match project.config.agents.isolation {
-            Isolation::Worktree if agent.def.worktree => Some(cide_agents::checkout_name(
-                &agent.def.id,
-                request.task.as_ref(),
-            )),
-            Isolation::Worktree | Isolation::Shared => None,
-        },
+        // (role, task) pair — so tasks parallelise. `None` for a run that stands in the project
+        // root: shared isolation, a role whose file says `worktree: false`, or a dispatch with
+        // no task (M40). One function decides, and `start_child` calls the same one at the
+        // fork, so the directory gated on is the directory taken.
+        checkout: cide_agents::run_checkout(agent, &project.config.agents, request.task.as_ref()),
+        // `None` on the wire means the caller had no session to name — the panel, the Tasks
+        // panel's assignment — and the primary pane is the honest address for that.
+        notify: request.notify.clone().unwrap_or_default(),
     })
 }
 
@@ -793,7 +841,29 @@ fn plan_dispatch(
 ///
 /// The task's **title** is still named inline, because a run whose tools fail to attach should at
 /// least be able to say what it was asked to do.
-pub(crate) fn opening_prompt(task: Option<&Task>, extra: Option<&str>) -> String {
+///
+/// # `tools` decides both whether the tools are named and how they are spelled
+///
+/// `None` means no bridge: the tool sentences are dropped entirely, for the reason
+/// `cide_agents::harness::TRACKER_PREAMBLE`'s header gives about the paragraph it gates — a run
+/// told to reach for a vocabulary it cannot see has nothing to say about why the call failed.
+///
+/// `Some(harness)` spells each name the way *that CLI* presents it, through
+/// [`cide_agents::harness::Harness::tool_name`]. This line hard-coded Claude Code's
+/// `mcp__cide__…` on both harnesses; under opencode the tools arrive as `cide_cide_task_get` and
+/// every name in it was uncallable.
+///
+/// # A run with no task gets `extra` alone (M40)
+///
+/// The instruction *is* the brief there, flattened like everything else. What such a run must
+/// know about where it stands — the project root, not a worktree; no committing; no task to
+/// comment on — is `cide_agents::harness::ADHOC_PREAMBLE`'s and rides the system prompt, for
+/// `TRACKER_PREAMBLE`'s reason: this line is a turn old by the time the work is done.
+pub(crate) fn opening_prompt(
+    task: Option<&Task>,
+    extra: Option<&str>,
+    tools: Option<&dyn Harness>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(task) = task {
         // The middle sentence is P4's checkpoint discipline (the preamble carries the durable
@@ -803,16 +873,38 @@ pub(crate) fn opening_prompt(task: Option<&Task>, extra: Option<&str>) -> String
         // The closing clause is the done-workflow convention's opening half; the durable mirror
         // rides every run's system prompt in `cide_agents::harness::TRACKER_PREAMBLE`, and the
         // orchestrator's side of the loop is taught in `roster_paragraph`.
-        parts.push(format!(
-            "Work on task {} ({}). Read it with mcp__cide__cide_task_get, and record what you do \
-             with the cide_task_* tools rather than by editing the tracker file. Comment your \
-             plan on the task before you start, and commit each coherent step as you go — your \
-             branch is the record that survives if this run dies. When the work \
-             is complete, set the task's status to review with mcp__cide__cide_task_update and \
-             leave a comment summarising what you did and where.",
-            task.id,
-            one_line(&task.title)
-        ));
+        parts.push(match tools {
+            Some(harness) => format!(
+                "Work on task {} ({}). Read it with {get}, and record what you do \
+                 with the {bare} tools rather than by editing the tracker file. Comment your \
+                 plan on the task before you start, and commit each coherent step as you go — your \
+                 branch is the record that survives if this run dies. When the work \
+                 is complete, set the task's status to review with {update} and \
+                 leave a comment summarising what you did and where.",
+                task.id,
+                one_line(&task.title),
+                get = harness.tool_name("cide_task_get"),
+                update = harness.tool_name("cide_task_update"),
+                // The wildcard the sentence gestures at, in this harness's own shape — the
+                // bare `cide_task_*` that used to stand here named nothing on either CLI.
+                bare = harness.tool_name("cide_task_*"),
+            ),
+            // No bridge, so no sentence naming a tool: `TRACKER_PREAMBLE`'s rule, applied to the
+            // one line that lands in the run's first turn. Every broken run in the terrastrike
+            // audit was told to "Read it with mcp__cide__cide_task_get" and then reported some
+            // variant of *that tool is not in my function list* before going hunting.
+            //
+            // `dispatch_refusal` now refuses such a dispatch outright, so this arm should be
+            // unreachable through the panel and the MCP tool alike. It stays because a prompt is
+            // the wrong place to encode a claim about a fact it cannot see, and because the id
+            // and title still let the run say what it was asked to do.
+            None => format!(
+                "Work on task {} ({}). Commit each coherent step as you go — your branch is the \
+                 record that survives if this run dies.",
+                task.id,
+                one_line(&task.title)
+            ),
+        });
         // One clause more when the task names an OpenSpec change. (M28) Added *inside* this
         // block rather than as its own `parts.push`, so it can only ever be one more sentence in
         // a string that is already flattened — the one-line invariant this whole function exists
@@ -854,7 +946,19 @@ pub(crate) fn one_line(text: &str) -> String {
 /// In this slice every role is unavailable, so the two readings differ on every project that has
 /// one, which makes this the difference between a panel that lists the user's roles and a panel
 /// that claims they have none.
-fn roster(root: &Path, runs: Vec<cide_ipc::AgentRun>, dispatching: bool) -> AgentRoster {
+///
+/// `bridge` is the `cide-hook` path, or `None` when this build has none beside it. Threaded in
+/// rather than read here for the reason the `runs`/`dispatching` pair is: this function is
+/// otherwise a pure function of a directory, and a test drives it from a bare path with no Tauri
+/// state and no packaging. Reading `current_exe` inside it made every role in every test report
+/// the bridge fault, because a test binary has no `cide-hook` beside it — which is a true
+/// statement about the test binary and a useless one about the user's project.
+fn roster(
+    root: &Path,
+    runs: Vec<cide_ipc::AgentRun>,
+    dispatching: bool,
+    bridge: Option<&Path>,
+) -> AgentRoster {
     let project = cide_agents::load_project(root);
     report_problems(root, &project);
 
@@ -876,7 +980,7 @@ fn roster(root: &Path, runs: Vec<cide_ipc::AgentRun>, dispatching: bool) -> Agen
             .catalog
             .agents
             .iter()
-            .map(|agent| wire_def(agent, &project))
+            .map(|agent| wire_def(agent, &project, bridge))
             .collect(),
         // Both come from the registry, which is the only thing in the process that knows them —
         // and they are read *before* this function is called rather than in it, so a roster can
@@ -900,6 +1004,7 @@ pub(crate) fn project_roster(app: &AppHandle, project: ProjectId) -> Option<Agen
         &root,
         registry.runs_for(project),
         registry.dispatching(project),
+        crate::agents::cide_hook_binary().as_deref(),
     ))
 }
 
@@ -922,9 +1027,9 @@ pub(crate) fn project_roster(app: &AppHandle, project: ProjectId) -> Option<Agen
 /// wire could not carry the worktree clamp's explanatory sentence; the clamp is gone with its
 /// premise, and the panel's figure stopped being a lie the same day a user asked why their
 /// `parall = 2` role queued its second task.)
-fn wire_def(agent: &LoadedAgent, project: &ProjectAgents) -> AgentDef {
+fn wire_def(agent: &LoadedAgent, project: &ProjectAgents, bridge: Option<&Path>) -> AgentDef {
     let mut def = agent.def.clone();
-    def.unavailable = cide_agents::dispatch_refusal(agent, &project.config.agents);
+    def.unavailable = cide_agents::dispatch_refusal(agent, &project.config.agents, bridge);
     def
 }
 
@@ -1083,6 +1188,42 @@ fn problem_sentence(project: &ProjectAgents) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The harness these prompt tests are written against, and the bridge they assume.
+    ///
+    /// Claude Code, because its `mcp__cide__…` is the spelling the assertions below quote. The
+    /// opencode spelling gets its own test rather than being folded in here — the point of that
+    /// one is that the *same* function answers differently, which a shared helper would hide.
+    fn claude() -> Option<&'static dyn Harness> {
+        Some(&cide_agents::harness::ClaudeHarness)
+    }
+
+    /// A `cide-hook` that is where it should be — `cide_agents::dispatch_refusal`'s bridge
+    /// argument. A test binary has no `cide-hook` beside it, so a roster built without this would
+    /// grey every role for a reason that is true of the test and false of the user's project.
+    fn bridge() -> Option<&'static Path> {
+        Some(Path::new("/opt/cide/cide-hook"))
+    }
+
+    /// The simplest task the prompt tests can be written against.
+    fn plain_task() -> Task {
+        Task {
+            id: cide_ipc::TaskId("t-9".into()),
+            title: "wire the thing".into(),
+            body: String::new(),
+            status: cide_ipc::TaskStatus::Todo,
+            agent: None,
+            comments: Vec::new(),
+            change: None,
+            links: Vec::new(),
+            session: None,
+            history: Vec::new(),
+            created_by: cide_ipc::TaskAuthor::User,
+            created_unix_ms: 0,
+            updated_unix_ms: 0,
+            attachments: Vec::new(),
+        }
+    }
+
     /// A scratch project, built the way `cide-agents`' own tests build theirs.
     ///
     /// `std::env::temp_dir()` and the pid rather than a temp-dir crate, because this workspace has
@@ -1119,7 +1260,8 @@ mod tests {
     fn a_project_that_never_heard_of_this_is_off_and_names_the_file_enabling_writes() {
         let root = temp("never-heard");
 
-        let AgentRoster::Disabled { hint, config_path } = roster(&root, Vec::new(), true) else {
+        let AgentRoster::Disabled { hint, config_path } = roster(&root, Vec::new(), true, bridge())
+        else {
             panic!("a project with no .cide/ is off");
         };
 
@@ -1165,7 +1307,7 @@ mod tests {
             agents,
             runs,
             dispatching,
-        } = roster(&root, Vec::new(), true)
+        } = roster(&root, Vec::new(), true, bridge())
         else {
             panic!("an enabled project with roles is ready");
         };
@@ -1228,6 +1370,7 @@ mod tests {
                 agent: cide_ipc::AgentId("developer".into()),
                 task: None,
                 prompt: Some("do the thing".into()),
+                notify: None,
             },
         )
         .expect_err("a project that never enabled this refuses everything");
@@ -1266,9 +1409,10 @@ mod tests {
             created_by: cide_ipc::TaskAuthor::User,
             created_unix_ms: 0,
             updated_unix_ms: 0,
+            attachments: Vec::new(),
         };
 
-        let prompt = opening_prompt(Some(&task), Some("and\nmind the\ttabs"));
+        let prompt = opening_prompt(Some(&task), Some("and\nmind the\ttabs"), claude());
         assert!(!prompt.contains('\n'), "{prompt}");
 
         // …and with a change on it, which is one more sentence in the same flattened string.
@@ -1278,7 +1422,7 @@ mod tests {
             change: Some(cide_ipc::ChangeName("add-dark\nmode".into())),
             ..task.clone()
         };
-        let prompt_with_change = opening_prompt(Some(&with_change), None);
+        let prompt_with_change = opening_prompt(Some(&with_change), None, claude());
         assert!(!prompt_with_change.contains('\n'), "{prompt_with_change}");
         assert!(
             prompt_with_change.contains("openspec/changes/add-dark mode/"),
@@ -1309,8 +1453,84 @@ mod tests {
         assert!(prompt.contains("mind the tabs"), "{prompt}");
 
         // An ad-hoc run with neither is refused rather than started — see `plan_dispatch`.
-        assert!(opening_prompt(None, None).is_empty());
-        assert!(opening_prompt(None, Some("   ")).is_empty());
+        assert!(opening_prompt(None, None, claude()).is_empty());
+        assert!(opening_prompt(None, Some("   "), claude()).is_empty());
+        // And one with an instruction is told exactly that, flattened: the where-it-stands
+        // paragraph is the system prompt's (`ADHOC_PREAMBLE`), not this line's. (M40)
+        assert_eq!(
+            opening_prompt(None, Some(" run the tests\n and say what fails "), claude()),
+            "run the tests and say what fails"
+        );
+    }
+
+    /// The opening line spells its tools the way the run's own CLI will present them.
+    ///
+    /// This line is what lands in the run's *first turn*, and it named `mcp__cide__cide_task_get`
+    /// on both harnesses. Under opencode no such tool exists — the bridge's vocabulary arrives as
+    /// `cide_cide_task_get` — so every opencode run began by being told to call something that
+    /// was not in its function list, and the audited ones each spent their first minutes saying
+    /// so and then hunting for the real names.
+    #[test]
+    fn the_opening_line_names_the_tools_this_harness_actually_offers() {
+        let task = plain_task();
+        let opencode: Option<&dyn Harness> = Some(&cide_agents::harness::OpencodeHarness);
+
+        let by_claude = opening_prompt(Some(&task), None, claude());
+        let by_opencode = opening_prompt(Some(&task), None, opencode);
+
+        assert!(
+            by_claude.contains("mcp__cide__cide_task_get"),
+            "{by_claude}"
+        );
+        assert!(
+            by_claude.contains("mcp__cide__cide_task_update"),
+            "{by_claude}"
+        );
+
+        assert!(by_opencode.contains("cide_cide_task_get"), "{by_opencode}");
+        assert!(
+            by_opencode.contains("cide_cide_task_update"),
+            "{by_opencode}"
+        );
+        // The whole point: not one Claude-shaped name survives onto the other harness.
+        assert!(!by_opencode.contains("mcp__"), "{by_opencode}");
+
+        // The wildcard moves with the rest. A bare `cide_task_*` stood here for a long time and
+        // named nothing on either CLI, which nothing asserted on.
+        assert!(!by_claude.contains(" cide_task_*"), "{by_claude}");
+        assert!(!by_opencode.contains(" cide_task_*"), "{by_opencode}");
+
+        // Both still say the same *things*; only the names differ.
+        for prompt in [&by_claude, &by_opencode] {
+            assert!(prompt.contains("t-9"), "{prompt}");
+            assert!(prompt.contains("wire the thing"), "{prompt}");
+            assert!(prompt.contains("Comment your plan"), "{prompt}");
+            assert!(!prompt.contains('\n'), "one line, always: {prompt}");
+        }
+    }
+
+    /// With no bridge, the line names no tool at all — and still says what the run is for.
+    ///
+    /// `TRACKER_PREAMBLE`'s rule applied to the one sentence that was never gated on it. A
+    /// dispatch in this state is now refused outright by `dispatch_refusal`, so this is the
+    /// belt-and-braces arm; it is asserted because a prompt must not encode a claim about a fact
+    /// it cannot see, and because the id and title are what let such a run say what it was asked
+    /// to do.
+    #[test]
+    fn with_no_bridge_the_opening_line_names_no_tool() {
+        let task = plain_task();
+        let prompt = opening_prompt(Some(&task), Some("and hurry"), None);
+
+        assert!(!prompt.contains("cide_task_"), "{prompt}");
+        assert!(!prompt.contains("mcp__"), "{prompt}");
+        // What survives: which task, what it is called, the instruction, and the commit rule —
+        // the one piece of the discipline that needs no tracker.
+        assert!(prompt.contains("t-9"), "{prompt}");
+        assert!(prompt.contains("wire the thing"), "{prompt}");
+        assert!(prompt.contains("and hurry"), "{prompt}");
+        // Capital, because with no tracker sentence in front of it this one opens the line.
+        assert!(prompt.contains("Commit each coherent step"), "{prompt}");
+        assert!(!prompt.contains('\n'), "{prompt}");
     }
 
     /// The refusal that is the reason `Isolation` has a second variant at all: no repository means

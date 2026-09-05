@@ -177,41 +177,15 @@ fn is_file_record(record: &ClosedTab, project: ProjectId, path: &std::path::Path
 }
 
 /// Whether a tab of this kind is worth remembering. See [`ClosedTabs::push`].
+///
+/// The console is the one refusal that is *this stack's*: a project has exactly one, so a
+/// record for it would be one `reinsert_tab` away from a project with two. Every other answer
+/// is `cide_core::workspace::tab_outlives_close`, which is shared with the project-level
+/// reopen (`workspace::reopen_project`) so the two features cannot disagree about which tabs
+/// can come back — a `ClaudeMcp` diff whose request was cancelled at the close, and a merge
+/// resolver over a conflict that may no longer exist, are refused there with the reasons.
 fn remembered(kind: &TabKind) -> bool {
-    match kind {
-        TabKind::ClaudeHome => false,
-        TabKind::Diff { spec, .. } => {
-            !matches!(spec.origin, cide_ipc::DiffOrigin::ClaudeMcp { .. })
-        }
-        // A merge resolver is **not** remembered, and it is the one tab kind where "reopen the
-        // last thing I closed" is actively wrong. It is a query about a *conflict*, which is by
-        // definition transient: by the time somebody presses the reopen chord the merge may be
-        // finished, aborted, or resolved differently in a terminal, and the tab would come back
-        // as a pane saying "this is no longer conflicted". Worse, the reopen would arrive with a
-        // stale centre pane over a file that has since been committed. The panel's *Merge
-        // Conflicts* group is where a conflict is reopened from, and it reads the live state.
-        TabKind::Merge { .. } => false,
-        // A revision tab is remembered like any other document. It is a *query* — a file as one
-        // commit left it — so reopening it costs one `git_file_at_revision` and lands on exactly
-        // the same bytes, because a commit is immutable. That immutability is what makes it
-        // safer to reopen than a working-tree diff, which the arm above already remembers.
-        // An extension's page is remembered like a revision tab and for its reason: it is a
-        // *query* — one extension's README and what it contributes — and reopening it costs one
-        // read of a file that only changes when the user updates the extension. The one way it
-        // can come back stale is that the extension was uninstalled in between, and the page draws
-        // that state honestly rather than as an empty tab.
-        // An OpenSpec page is remembered for the extension page's reason: it is a *query* — one
-        // change or one capability, read fresh every time it is drawn — so reopening it costs
-        // the same two subprocesses the first open did and lands on whatever is true now. The
-        // one way it comes back changed is that the change was archived in between, which is a
-        // state the page draws honestly rather than an empty tab. (M28)
-        TabKind::ClaudeFull { .. }
-        | TabKind::File { .. }
-        | TabKind::Revision { .. }
-        | TabKind::Extension { .. }
-        | TabKind::OpenSpec { .. }
-        | TabKind::Settings { .. } => true,
-    }
+    !matches!(kind, TabKind::ClaudeHome) && cide_core::workspace::tab_outlives_close(kind)
 }
 
 #[cfg(test)]

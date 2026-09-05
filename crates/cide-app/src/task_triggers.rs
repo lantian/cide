@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use cide_agents::autodispatch;
 use cide_ipc::{
-    AgentId, DispatchRequest, ProjectId, Task, TaskAuthor, TaskEdit, TaskId, TaskStatus,
+    AgentId, DispatchRequest, ProjectId, RunNotify, Task, TaskAuthor, TaskEdit, TaskId, TaskStatus,
 };
 use tauri::{AppHandle, Manager as _};
 
@@ -86,18 +86,34 @@ pub struct TaskMutation {
 /// project or auto-dispatch is disabled, and *neither has anything to do with proposing* — a
 /// proposal is typed into a conversation, not spawned. Revealing behind those gates would have
 /// made the feature silently absent on every project that has not turned subagents on.
-pub fn consider(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMutation>) {
+///
+/// `notify` is where a run these mutations start will announce its turn endings (M40): the
+/// session whose connection made the edit, when there is one (`agent_rpc` passes its `Scope`'s),
+/// and the primary pane for an edit made in the Tasks panel, which has no session to name. It
+/// rides through to the `DispatchRequest`, so a role assigned from a second Claude pane reports
+/// back to that pane rather than to a console that never asked.
+pub fn consider(
+    app: &AppHandle,
+    project: ProjectId,
+    mutations: Vec<TaskMutation>,
+    notify: RunNotify,
+) {
     if mutations.is_empty() {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::spec_reveal::consider(&app, project, &mutations);
-        consider_blocking(&app, project, mutations);
+        consider_blocking(&app, project, mutations, notify);
     });
 }
 
-fn consider_blocking(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMutation>) {
+fn consider_blocking(
+    app: &AppHandle,
+    project: ProjectId,
+    mutations: Vec<TaskMutation>,
+    notify: RunNotify,
+) {
     let root = {
         let Some(workspace) = app.try_state::<WorkspaceState>() else {
             return;
@@ -167,7 +183,7 @@ fn consider_blocking(app: &AppHandle, project: ProjectId, mutations: Vec<TaskMut
                 );
                 continue;
             }
-            dispatch(app, project, agent, task.clone());
+            dispatch(app, project, agent, task.clone(), notify.clone());
         }
     }
 }
@@ -194,7 +210,7 @@ fn adopt(app: &AppHandle, project: ProjectId, task: &TaskId, agent: AgentId, aut
 }
 
 /// One auto-dispatch, on its own task so nothing here waits on the queue.
-fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId) {
+fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId, notify: RunNotify) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let (Some(workspace), Some(agents), Some(tasks)) = (
@@ -211,6 +227,7 @@ fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId) {
             // The run is pointed at the task and reads it with `cide_task_get`; assignment adds
             // no extra line. Anything more is `cide_agent_dispatch`'s `instructions`.
             prompt: None,
+            notify: Some(notify),
         };
         match crate::cmd::agents::agents_dispatch(app.clone(), workspace, agents, tasks, request)
             .await

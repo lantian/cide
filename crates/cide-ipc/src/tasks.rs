@@ -57,7 +57,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::ids::{AgentId, ChangeName, CommentId, ProjectId, SessionId, TaskId};
+use crate::ids::{AgentId, ChangeName, CommentId, ProjectId, SessionId, TaskAttachmentId, TaskId};
 
 /// Where a task is.
 ///
@@ -214,6 +214,14 @@ pub struct TaskComment {
     /// that did not delete.
     #[serde(default)]
     pub deleted: bool,
+    /// Files attached to this comment, oldest first. (M39)
+    ///
+    /// `#[serde(default)]` for [`Task::links`]' reason and with the same non-bump of
+    /// [`TaskFile::CURRENT_SCHEMA`]. Records are tombstoned, never removed — see
+    /// [`TaskAttachment::deleted`]. A deleted comment keeps its attachment *records* (the
+    /// tombstones have to survive the merge) but `cide_tasks` removes their bytes.
+    #[serde(default)]
+    pub attachments: Vec<TaskAttachment>,
 }
 
 impl TaskComment {
@@ -244,6 +252,122 @@ impl TaskComment {
         eat(text.as_bytes());
         CommentId(format!("legacy-{h:016x}"))
     }
+}
+
+/// The directory under a project root that holds attachment bytes, relative. (M39)
+///
+/// Here in `cide-ipc` rather than beside `cide_tasks::TASKS_RELATIVE`, because two crates need
+/// the layout and only one of them may depend on `cide-tasks`: the store writes the file, and
+/// `cide_agents::tools` prints its **absolute path** in `cide_task_get` so an agent can `Read`
+/// an image the user attached. A second spelling of the formula in `cide-agents` would be the
+/// two-copies drift this crate's header exists to prevent, so the formula lives on the record
+/// itself — [`TaskAttachment::relative_path`].
+///
+/// Committed, like the rest of `.cide/` — a screenshot a teammate attached to a task should be
+/// there when the task is. cide writes nothing to any `.gitignore` about it.
+pub const ATTACHMENTS_DIR: &str = ".cide/attachments";
+
+/// What an attachment's bytes are, coarsely: a picture the card can draw, or a file it names.
+///
+/// Decided **once, at import, by sniffing the bytes** (`cide_core::image::sniff`), never by the
+/// extension — a `.png` that is a text file would otherwise be handed to `<img>` and draw
+/// nothing. It is a hint for the panel and for the list an agent reads, and *only* that: the
+/// asset-protocol grant that lets a thumbnail load re-sniffs the file on disk every time, because
+/// a record in a committed JSON file is a claim anybody can edit and the grant is a capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AttachmentKind {
+    Image,
+    File,
+}
+
+/// One file attached to a task's body or to a comment. (M39)
+///
+/// **Metadata only.** The bytes are a file on disk at [`Self::relative_path`], copied there by
+/// `cide_tasks::attachments::import`; this record is what travels in `.cide/tasks.json`, on the
+/// wire and in an agent's `cide_task_get`. A record that carried bytes would put a screenshot
+/// through Tauri's JSON IPC as an array of decimal numbers (`crate::image`'s header) and into a
+/// file whose diffs people read.
+///
+/// Immutable once written, except for [`Self::deleted`]. There is no rename and no replace: a
+/// person who wants a different file attaches a different file, and that is what keeps the merge
+/// rule to one line — see `cide_tasks::union_attachments`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskAttachment {
+    pub id: TaskAttachmentId,
+    /// The file's name as a person sees it, and the last component of its path on disk.
+    ///
+    /// The original name, sanitised to one path component (no separators, no NUL, not empty),
+    /// kept verbatim otherwise — the OS opener picks an application by the real extension, and
+    /// a person recognises `design-v3.png`, not a uuid. Each attachment has a directory of its own
+    /// named by its id, which is what lets two attachments on one task share a name.
+    pub name: String,
+    pub bytes: u64,
+    pub kind: AttachmentKind,
+    /// Who attached it. From the connection, never from the payload — [`TaskComment`]'s rule.
+    pub added_by: TaskAuthor,
+    pub added_unix_ms: u64,
+    /// A tombstone, on [`TaskComment::deleted`]'s exact terms: one-way, kept in the vector so a
+    /// merge with a stale file cannot resurrect the record, and the merge rule is "either side
+    /// deleted ⇒ deleted". The bytes are removed when this is set; the record stays.
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+impl TaskAttachment {
+    /// Where the bytes live, relative to the project root:
+    /// `.cide/attachments/<task>/<attachment>/<name>`.
+    ///
+    /// A directory per attachment rather than a uuid-prefixed file name, so [`Self::name`] is the
+    /// real file name on disk and nothing has to be decoded to open it. The task id is a
+    /// component so `git rm -r .cide/attachments/t-17` is one gesture, and so a task's files are
+    /// listable without reading the tracker.
+    #[must_use]
+    pub fn relative_path(&self, task: &TaskId) -> PathBuf {
+        PathBuf::from(ATTACHMENTS_DIR)
+            .join(task.as_str())
+            .join(self.id.as_str())
+            .join(&self.name)
+    }
+}
+
+/// Where an attachment goes. Inbound. (M39)
+///
+/// Three shapes because there are three gestures: files dropped on the card body, files added to
+/// a comment that already exists, and files that ride along with a comment being written — the
+/// composer's "report with a screenshot", which must land as **one** mutation so a refused file
+/// never leaves a comment behind that names an attachment it does not have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind",
+    deny_unknown_fields
+)]
+#[ts(export)]
+pub enum AttachTarget {
+    Task,
+    Comment { id: CommentId },
+    NewComment { text: String },
+}
+
+/// A file cide wrote somewhere temporary on the caller's behalf, for a gesture that has no
+/// task or comment to attach to yet. Outbound. (M39)
+///
+/// The clipboard case: a screenshot pasted into the comment composer or the New task dialog has
+/// no id to be imported under, so it is staged as a file and its path rides on the eventual
+/// `task_attach`/`task_new` like a picked file would. `cide_tasks::attachments::import` consumes
+/// a staged source rather than copying it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct StagedFile {
+    pub path: PathBuf,
+    pub name: String,
+    pub bytes: u64,
 }
 
 /// One status transition, recorded where the mutation is applied. (M27)
@@ -449,6 +573,12 @@ pub struct Task {
     pub links: Vec<TaskLink>,
     /// Oldest first, which is the order the panel renders and the order an agent reads.
     pub comments: Vec<TaskComment>,
+    /// Files attached to the body, oldest first. (M39)
+    ///
+    /// `#[serde(default)]` and no [`TaskFile::CURRENT_SCHEMA`] bump, on [`Self::links`]' posture.
+    /// Records only; the bytes are at [`TaskAttachment::relative_path`].
+    #[serde(default)]
+    pub attachments: Vec<TaskAttachment>,
     /// Every status transition, oldest first. (M27)
     ///
     /// `#[serde(default)]` so every task file that already exists parses — the same posture
@@ -640,6 +770,15 @@ pub struct TaskNew {
     /// and the one interleaving the gate exists for is the one it could never see.
     #[ts(optional)]
     pub links: Option<Vec<TaskLinkSpec>>,
+    /// Files to attach to the body the moment the task exists. Absent means none. (M39)
+    ///
+    /// **Source paths**, on this machine, which `cide_tasks::attachments::import` copies under
+    /// `.cide/attachments/<the new id>/`; a path under its staging directory is consumed. Here
+    /// rather than as a follow-up `task_attach` for [`Self::links`]' reason in miniature: the
+    /// board is broadcast once with the attachments in place instead of once without and once
+    /// with, and a dropped file in the New task dialog is one gesture, not two.
+    #[ts(optional)]
+    pub attachments: Option<Vec<PathBuf>>,
 }
 
 /// One change to one task. Inbound.
@@ -763,6 +902,18 @@ pub enum TaskEdit {
     DeleteComment {
         id: CommentId,
     },
+    /// Tombstone one attachment, on the body or on any comment, and remove its bytes. **The user
+    /// only.** (M39)
+    ///
+    /// The one attachment gesture that *is* an edit: a tombstone flip fits `TaskStore::update`'s
+    /// closure exactly as `DeleteComment` does. Attaching is not a variant, because it has to
+    /// copy bytes to disk *before* a record naming them may exist, and that is I/O the closure
+    /// must not do — `TaskStore::attach` is its own method. The file removal happens after the
+    /// tombstone lands and is best effort: the record is the truth, a leftover directory is
+    /// hygiene.
+    DetachAttachment {
+        attachment: TaskAttachmentId,
+    },
 }
 
 #[cfg(test)]
@@ -794,6 +945,16 @@ mod tests {
                 at_unix_ms: 1_700_000_000_000,
                 edited_at_unix_ms: None,
                 deleted: false,
+                attachments: vec![],
+            }],
+            attachments: vec![TaskAttachment {
+                id: TaskAttachmentId("a-1".into()),
+                name: "design-v3.png".into(),
+                bytes: 12_345,
+                kind: AttachmentKind::Image,
+                added_by: TaskAuthor::User,
+                added_unix_ms: 1_700_000_000_000,
+                deleted: false,
             }],
             history: vec![TaskStatusChange {
                 from: TaskStatus::Todo,
@@ -819,6 +980,8 @@ mod tests {
             "updatedUnixMs",
             "atUnixMs",
             "blockedBy",
+            "addedBy",
+            "addedUnixMs",
         ] {
             assert!(json.contains(wire), "missing {wire} in {json}");
         }
@@ -947,5 +1110,82 @@ mod tests {
             r#"{"project":"00000000-0000-0000-0000-000000000000","title":"x","priority":1}"#,
         );
         assert!(err.is_err(), "unknown field was accepted");
+    }
+
+    /// A task from a file written before attachments existed still parses, with none. (M39)
+    ///
+    /// Re-made per field, as `a_task_written_before_links_existed_still_parses` says: the
+    /// `#[serde(default)]` is one attribute a refactor can drop with no compile error, and here
+    /// it guards two places — the task and every comment.
+    #[test]
+    fn a_task_written_before_attachments_existed_still_parses() {
+        let json = r#"{
+            "id": "t-3",
+            "title": "Write the loader",
+            "body": "",
+            "status": "todo",
+            "agent": null,
+            "comments": [{
+                "author": {"kind": "user"},
+                "text": "first",
+                "atUnixMs": 1700000000000
+            }],
+            "createdUnixMs": 1699999999000,
+            "updatedUnixMs": 1700000000000
+        }"#;
+        let task: Task =
+            serde_json::from_str(json).expect("a file this build has to be able to open");
+        assert!(task.attachments.is_empty());
+        assert!(task.comments[0].attachments.is_empty());
+    }
+
+    /// The attachment's path is the one formula both crates print and write. (M39)
+    #[test]
+    fn an_attachment_lives_under_its_task_and_its_own_id() {
+        let task = a_task();
+        let path = task.attachments[0].relative_path(&task.id);
+        assert_eq!(
+            path,
+            PathBuf::from(".cide/attachments/t-17/a-1/design-v3.png")
+        );
+        assert!(
+            path.is_relative(),
+            "joined onto a root by whoever holds one"
+        );
+    }
+
+    /// The three targets are three `kind`s, and a detach is an edit. (M39)
+    #[test]
+    fn an_attach_target_names_where_the_file_goes() {
+        let task: AttachTarget = serde_json::from_str(r#"{"kind":"task"}"#).unwrap();
+        assert_eq!(task, AttachTarget::Task);
+        let comment: AttachTarget =
+            serde_json::from_str(r#"{"kind":"comment","id":"c-1"}"#).unwrap();
+        assert_eq!(
+            comment,
+            AttachTarget::Comment {
+                id: CommentId("c-1".into())
+            }
+        );
+        let fresh: AttachTarget =
+            serde_json::from_str(r#"{"kind":"newComment","text":"with a screenshot"}"#).unwrap();
+        assert_eq!(
+            fresh,
+            AttachTarget::NewComment {
+                text: "with a screenshot".into()
+            }
+        );
+        // A comment target with no `id` is refused, not narrowed to the body — the two are
+        // different files landing in different places.
+        assert!(serde_json::from_str::<AttachTarget>(r#"{"kind":"comment"}"#).is_err());
+
+        let edit: TaskEdit =
+            serde_json::from_str(r#"{"kind":"detachAttachment","attachment":"a-1"}"#).unwrap();
+        assert_eq!(
+            edit,
+            TaskEdit::DetachAttachment {
+                attachment: TaskAttachmentId("a-1".into())
+            }
+        );
     }
 }

@@ -4,6 +4,7 @@ import type { ChangeName } from "./ChangeName";
 import type { CommentId } from "./CommentId";
 import type { LinkType } from "./LinkType";
 import type { SessionId } from "./SessionId";
+import type { TaskAttachmentId } from "./TaskAttachmentId";
 import type { TaskId } from "./TaskId";
 import type { TaskStatus } from "./TaskStatus";
 
@@ -36,4 +37,4 @@ import type { TaskStatus } from "./TaskStatus";
  * from no code path, and whose handling arm would have minted a pane showing nothing. Add it
  * with the gesture, in the same commit.
  */
-export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "setSession", session: SessionId | null, } | { "kind": "setChange", change: ChangeName | null, } | { "kind": "link", link: LinkType, target: TaskId, } | { "kind": "unlink", link: LinkType, target: TaskId, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, };
+export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "setSession", session: SessionId | null, } | { "kind": "setChange", change: ChangeName | null, } | { "kind": "link", link: LinkType, target: TaskId, } | { "kind": "unlink", link: LinkType, target: TaskId, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, } | { "kind": "detachAttachment", attachment: TaskAttachmentId, };

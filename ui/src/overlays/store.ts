@@ -51,6 +51,11 @@ export type OverlayKind =
    * uses and for the same reason.
    */
   | 'usages'
+  /**
+   * The About box (`overlays/AboutCard.tsx`): this build's version and the `claude` it spawns.
+   * Reads `Bootstrap.capabilities` off the boot the host was mounted with and asks Rust nothing.
+   */
+  | 'about'
 
 interface OverlayStore {
   open: OverlayKind | null
@@ -137,7 +142,7 @@ export function closeOverlay(): void {
  * Is the file picker the overlay showing? The `filePickerOpen` flag `when` clauses test.
  *
  * A function of its own beside [`overlayOpen`] rather than a comparison written at the call
- * site, for the reason that whole flag exists: `overlayOpen` is true for any of nine overlays,
+ * site, for the reason that whole flag exists: `overlayOpen` is true for any of ten overlays,
  * and ⌥L scoped to *that* would be swallowed by the window capture gate while the palette, the
  * symbol picker or the branch popup was up — where it means nothing and where the keystroke
  * should pass through to whatever wanted it.

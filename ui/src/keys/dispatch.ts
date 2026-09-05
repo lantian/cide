@@ -1915,6 +1915,22 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         useOverlays.getState().toggle('commands')
         return
 
+      case 'help.about': {
+        // Mirrors the command's `when` clause, because the clause gates the palette and the
+        // keyboard and never a direct call: `OverlayHost` is mounted in the shell window only
+        // and only with a project, and 'about' in the store with no host is a modal nobody can
+        // see — `overlayOpen()` true, every `!overlayOpen` binding gated off. `toggle`, like
+        // every overlay here: the palette closes before it dispatches (`App.tsx`'s
+        // `runCommand`), so from there this always opens, and a user who binds a key wants the
+        // same chord to dismiss what it opened.
+        const b = boot()
+        if (b?.role.kind !== 'shell' || activeProjectOf(b) === null) {
+          return unmet(command, 'no shell window with a project open')
+        }
+        useOverlays.getState().toggle('about')
+        return
+      }
+
       case 'theme.toggle':
         // The persisting one from `settings/useSettings`, not `useWorkspace.toggleTheme` —
         // that only sets the local flag, so the choice was lost on the next snapshot and

@@ -59,7 +59,7 @@
  * still does for the list, and `check-agents-render.mjs` greps both files for it: the seam is
  * the one neither render check mounts, and it shipped an empty-forever dropdown once already.
  */
-import { memo, useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { useTasks } from '@/sidebar/tasksStore'
 import { useWorkspace } from '@/store/workspace'
@@ -67,7 +67,17 @@ import { useAgents } from '@/sidebar/agentsStore'
 import { rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TaskDetailModal } from './TaskDetail'
 import { useSpec } from '../specStore'
-import { spec as specApi, claudeSend, file, type ChangeName } from '@/ipc/client'
+import {
+  attachments as attachmentsApi,
+  spec as specApi,
+  claudeSend,
+  file,
+  type ChangeName,
+} from '@/ipc/client'
+import { AttachmentLightbox } from './AttachmentLightbox'
+import { forgetPreview, previewsSnapshot, requestPreview, subscribePreviews } from './attachmentPreviews'
+import { onFileDrop, useDropHot } from './fileDrop'
+import { basename, imageAttachmentsOf, type StagedAttachment } from './model'
 import { useAwaiting } from '@/panes/awaiting'
 import { openTaskSession } from './openSession'
 import { errorText } from '@/ipc/errorText'
@@ -200,6 +210,19 @@ function TaskDetailHostImpl() {
   const [deleteArmed, setDeleteArmed] = useState<ArmedDelete | null>(null)
   useEffect(() => setDeleteArmed(null), [board])
 
+  /*
+   * Attachments. (M39) Three more transients, kept here for the header's reason: the open
+   * lightbox, the composer's staged files (controlled from here so a desktop drop can add to
+   * them), and the thumbnail cache's snapshot — an object, but the *same* object until an answer
+   * lands, which is what `useSyncExternalStore` needs and what `attachmentPreviews.ts` promises.
+   */
+  const [lightbox, setLightbox] = useState<string | null>(null)
+  useEffect(() => setLightbox(null), [selected])
+  const [composerStaged, setComposerStaged] = useState<readonly StagedAttachment[]>([])
+  useEffect(() => setComposerStaged([]), [selected])
+  const previews = useSyncExternalStore(subscribePreviews, previewsSnapshot, previewsSnapshot)
+  const dropHot = useDropHot()
+
   const [nowMs, setNowMs] = useState(() => Date.now())
   useEffect(() => {
     setNowMs(Date.now())
@@ -226,6 +249,45 @@ function TaskDetailHostImpl() {
    */
   const open = openTask(board, selected)
   const edit = activeEdit(board, open, editing)
+
+  // Every image on the open card is vouched for once. The cache dedupes, so re-running on each
+  // board snapshot costs a loop over the ids and nothing over the IPC.
+  useEffect(() => {
+    if (open === null || project === null) return
+    for (const image of imageAttachmentsOf(open)) requestPreview(String(project), open.id, image.id)
+  }, [open, project])
+
+  const attachTask = useTasks((s) => s.attachFiles)
+  const attachClipboard = useTasks((s) => s.attachClipboard)
+  const pickAttachments = useCallback(async (): Promise<readonly StagedAttachment[]> => {
+    const paths = await attachmentsApi.pick()
+    return paths.map((path) => ({ path, name: basename(path), bytes: null }))
+  }, [])
+  const stageClipboard = useCallback(async (): Promise<StagedAttachment | null> => {
+    const staged = await attachmentsApi.stageClipboard()
+    if (staged === null) {
+      notify('The clipboard holds no image.', { kind: 'warn' })
+      return null
+    }
+    return { path: staged.path, name: staged.name, bytes: Number(staged.bytes) }
+  }, [])
+
+  // A desktop drop on the card, a comment or the composer. The compose dialog's zone is the
+  // panel host's; every handler hears every drop and acts on its own kinds.
+  useEffect(() => {
+    if (open === null) return
+    const task = open.id
+    return onFileDrop((target, paths) => {
+      const files = paths.map((path) => ({ path, name: basename(path), bytes: null }))
+      if (target.kind === 'task' && target.task === task) {
+        guarded(attachTask(task, { kind: 'task' }, files))
+      } else if (target.kind === 'comment' && target.task === task) {
+        guarded(attachTask(task, { kind: 'comment', id: target.comment }, files))
+      } else if (target.kind === 'composer' && target.task === task) {
+        setComposerStaged((staged) => [...staged, ...files])
+      }
+    })
+  }, [open, attachTask, guarded])
 
   /*
    * The card's link chips and the picker's options, derived per render pass. (M30) Memoised on
@@ -520,6 +582,7 @@ function TaskDetailHostImpl() {
 
   if (open === null) return null
   return (
+    <>
     <TaskDetailModal
       /*
        * Keyed on the task id. Nothing in the card is uncontrolled any more except the comment
@@ -785,7 +848,15 @@ function TaskDetailHostImpl() {
       onSetStatus={(task, status) => guarded(editTask(task, { kind: 'setStatus', status }))}
       onSetAssignee={(task, agent) => guarded(editTask(task, { kind: 'assign', agent }))}
       onSetBody={(task, body) => guarded(editTask(task, { kind: 'setBody', body }))}
-      onAddComment={(task, text) => guarded(editTask(task, { kind: 'comment', text }))}
+      onAddComment={(task, text, attachments) =>
+        // Text alone is a `TaskEdit::Comment`; text with files is one `task_attach` on the
+        // `newComment` target, so the comment and its screenshots land together or not at all.
+        guarded(
+          attachments.length === 0
+            ? editTask(task, { kind: 'comment', text })
+            : attachTask(task, { kind: 'newComment', text }, attachments),
+        )
+      }
       /* The author is not sent and cannot be: `task_edit` passes `TaskAuthor::User`, decided
          by the command rather than by this payload, which is what makes the Rust guard
          unforgeable rather than merely checked. See `TaskComment`. */
@@ -795,7 +866,50 @@ function TaskDetailHostImpl() {
       onDeleteComment={(task, comment) =>
         guarded(editTask(task, { kind: 'deleteComment', id: comment }))
       }
+      /* Attachments (M39). The picker and the clipboard are promises the card awaits; every
+         mutation goes through `guarded` like the rest; the viewer is this host's state. */
+      previews={previews}
+      onPickAttachments={pickAttachments}
+      onStageClipboard={stageClipboard}
+      onAttach={(task, target, sources) => guarded(attachTask(task, target, sources))}
+      onAttachClipboard={(task, target) =>
+        guarded(
+          attachClipboard(task, target).then((attached) => {
+            if (!attached) notify('The clipboard holds no image.', { kind: 'warn' })
+          }),
+        )
+      }
+      onDetachAttachment={(task, attachment) =>
+        guarded(
+          editTask(task, { kind: 'detachAttachment', attachment }).then(() =>
+            forgetPreview(attachment),
+          ),
+        )
+      }
+      onOpenAttachment={(task, attachment) => {
+        if (project !== null) guarded(attachmentsApi.open(project, task as never, attachment))
+      }}
+      onRevealAttachment={(task, attachment) => {
+        if (project !== null) guarded(attachmentsApi.reveal(project, task as never, attachment))
+      }}
+      onViewAttachment={(_task, attachment) => setLightbox(attachment)}
+      composerStaged={composerStaged}
+      onComposerStaged={setComposerStaged}
+      dropHot={dropHot}
     />
+    {lightbox !== null && (
+      <AttachmentLightbox
+        images={imageAttachmentsOf(open)}
+        current={lightbox}
+        previews={previews}
+        onClose={() => setLightbox(null)}
+        onStep={setLightbox}
+        onOpen={(attachment) => {
+          if (project !== null) guarded(attachmentsApi.open(project, open.id as never, attachment))
+        }}
+      />
+    )}
+    </>
   )
 }
 

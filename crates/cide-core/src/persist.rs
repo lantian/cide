@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cide_ipc::{RecentProject, ViewPosition, Workspace};
+use cide_ipc::{Project, RecentProject, ViewPosition, Workspace};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{CoreError, Result};
@@ -109,6 +110,24 @@ pub fn schemes_dir() -> PathBuf {
 /// dotfiles repository.
 pub fn recent_path() -> PathBuf {
     state_dir().join("recent.json")
+}
+
+/// What a closed project looked like — its tabs, its panes and their conversations — so that
+/// reopening the directory brings it back.
+///
+/// A third file beside `workspace.json` and `recent.json`, on the argument [`recent_path`]
+/// makes one floor up and for the same moment: `close_project` takes the project out of the
+/// workspace, and that is exactly when its layout has to be kept somewhere. It is **not** in
+/// `recent.json`, although the identity is the same path, because [`RecentProject`] is a wire
+/// type the recents *menu* is drawn from — every `project_recent` would otherwise ship sixteen
+/// pane trees to a dropdown that shows sixteen names. The two files are kept consistent by
+/// `cmd::project`, which forgets a layout whenever it forgets a recent.
+///
+/// The sessions named in here are, by the time it is read, children of a process that has
+/// ended or of a project that was stopped — the point of the file is that a `SessionId` *is*
+/// the value `claude --resume` takes, so a remembered pane resumes rather than restarts.
+pub fn closed_path() -> PathBuf {
+    state_dir().join("closed.json")
 }
 
 /// Resolve one XDG base directory, appending the instance's directory name.
@@ -633,6 +652,109 @@ pub fn forget_recent(list: &mut Vec<RecentProject>, path: &Path) -> bool {
     let before = list.len();
     list.retain(|entry| entry.path != path);
     before != list.len()
+}
+
+// --- closed projects ----------------------------------------------------------------------
+
+/// One project as it stood the instant before it was closed. See [`closed_path`].
+///
+/// `project` is the whole [`Project`] record rather than a trimmed copy, because every field
+/// in it is something a reopen wants back — the tabs, the focus order, the detached panes and
+/// their anchors, the tool window, the primary session — and a curated subset is a list that
+/// has to be re-curated each time the record grows a field. What does *not* survive the round
+/// trip is decided at the other end, by `workspace::reopen_project`: the id and the dot are
+/// minted afresh, dirty flags are cleared, and a tab that cannot come back is dropped.
+///
+/// `path` is the primary root, duplicated out of `project.roots[0]` so that the list can be
+/// searched and pruned without reaching into the record — and so that a record whose roots
+/// somehow came back empty (a hand edit) is still addressable enough to be forgotten.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedProject {
+    pub path: PathBuf,
+    /// Milliseconds since the Unix epoch, at the close. Sorts the list and decides eviction.
+    pub closed_at: u64,
+    pub project: Project,
+}
+
+/// Read `closed.json`, most recently closed first.
+///
+/// Does not fail, for [`load_recent`]'s reason: this is a convenience that the next close
+/// rebuilds. What is lost with an unreadable file is a layout, and a layout that cannot be
+/// read is exactly as useful as none — the project opens with a fresh console, which is what
+/// it did before the file existed.
+pub fn load_closed(path: &Path) -> Vec<ClosedProject> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    let mut list: Vec<ClosedProject> = match serde_json::from_slice(&bytes) {
+        Ok(list) => list,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "closed projects file unusable");
+            return Vec::new();
+        }
+    };
+    sort_closed(&mut list);
+    list.truncate(MAX_RECENT);
+    list
+}
+
+/// Write `list` to `path`, atomically and privately, exactly as the recents are written.
+pub fn save_closed(path: &Path, list: &[ClosedProject]) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(list)?)
+}
+
+/// Remember `project` as it stood when it closed, as of `closed_at`.
+///
+/// Identity is the primary root, as it is for the recents: closing the same directory again
+/// replaces what was remembered, because the newer layout is by definition the one the user
+/// left. Capped at [`MAX_RECENT`] for the same reason the recents are — a project closed
+/// seventeen projects ago is one the menu no longer offers, so its layout has nobody to
+/// come back for.
+///
+/// A project with no root is refused silently: `validate` forbids one, so this is not a
+/// state a caller can reach, and a record with no identity could never be found again.
+pub fn remember_closed(list: &mut Vec<ClosedProject>, project: Project, closed_at: u64) {
+    let Some(path) = project.roots.first().map(|r| r.path.clone()) else {
+        return;
+    };
+    list.retain(|entry| entry.path != path);
+    list.insert(
+        0,
+        ClosedProject {
+            path,
+            closed_at,
+            project,
+        },
+    );
+    list.truncate(MAX_RECENT);
+}
+
+/// Take the layout remembered for `path` out of `list`, if there is one.
+///
+/// *Take*, not *get*: a layout is consumed by the open that uses it. Left in place it would
+/// describe a project that is open — pane ids that are live in `workspace.json` — and the file
+/// is only honest while every entry in it names something that is closed.
+pub fn take_closed(list: &mut Vec<ClosedProject>, path: &Path) -> Option<Project> {
+    let at = list.iter().position(|entry| entry.path == path)?;
+    Some(list.remove(at).project)
+}
+
+/// Drop `path` from `list`. Answers whether anything was removed.
+pub fn forget_closed(list: &mut Vec<ClosedProject>, path: &Path) -> bool {
+    let before = list.len();
+    list.retain(|entry| entry.path != path);
+    before != list.len()
+}
+
+/// Most recently closed first, ties broken by path — [`sort_recent`]'s rule.
+fn sort_closed(list: &mut [ClosedProject]) {
+    list.sort_by(|a, b| {
+        b.closed_at
+            .cmp(&a.closed_at)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 }
 
 // --- per-file view positions (M12) --------------------------------------------------------
@@ -2662,6 +2784,9 @@ mod tests {
         // Beside the workspace, not inside it, and not in config. See `recent_path`.
         assert_eq!(recent_path(), state_dir().join("recent.json"));
         assert_ne!(recent_path(), workspace_path());
+        // And the closed layouts beside both, in their own file. See `closed_path`.
+        assert_eq!(closed_path(), state_dir().join("closed.json"));
+        assert_ne!(closed_path(), recent_path());
     }
 
     // --- recent projects ------------------------------------------------------------------
@@ -2715,6 +2840,91 @@ mod tests {
             !list.iter().any(|e| e.path == Path::new("/p0")),
             "the cap kept the oldest and dropped a recent one",
         );
+    }
+
+    // --- closed projects ------------------------------------------------------------------
+
+    /// A project record over `path`, as `open_project` would mint it.
+    fn closed_project(path: &str) -> Project {
+        let mut ws = Workspace::default();
+        let id = crate::workspace::open_project(&mut ws, vec![PathBuf::from(path)], None)
+            .expect("open a project");
+        ws.projects
+            .shift_remove(&id)
+            .expect("the project just opened")
+    }
+
+    #[test]
+    fn a_closed_project_is_remembered_first_and_replaces_its_own_earlier_record() {
+        let mut list = Vec::new();
+        remember_closed(&mut list, closed_project("/a"), 10);
+        remember_closed(&mut list, closed_project("/b"), 20);
+        let again = closed_project("/a");
+        let newer_session = again.primary_session;
+        remember_closed(&mut list, again, 30);
+
+        assert_eq!(
+            list.iter().map(|e| e.path.as_path()).collect::<Vec<_>>(),
+            [Path::new("/a"), Path::new("/b")],
+            "closing a directory twice keeps one record, the newer one, at the front",
+        );
+        assert_eq!(
+            list[0].project.primary_session, newer_session,
+            "the record is the layout the user left last, not the first one"
+        );
+    }
+
+    #[test]
+    fn taking_a_layout_consumes_it() {
+        let mut list = Vec::new();
+        remember_closed(&mut list, closed_project("/a"), 10);
+        remember_closed(&mut list, closed_project("/b"), 20);
+
+        let taken = take_closed(&mut list, Path::new("/a")).expect("a layout for /a");
+        assert_eq!(taken.roots[0].path, PathBuf::from("/a"));
+        assert!(
+            take_closed(&mut list, Path::new("/a")).is_none(),
+            "a layout is used once: the open that took it now owns those pane ids"
+        );
+        assert_eq!(list.len(), 1, "the other record is untouched");
+        assert!(take_closed(&mut list, Path::new("/nowhere")).is_none());
+    }
+
+    #[test]
+    fn the_closed_list_is_capped_like_the_recents() {
+        let mut list = Vec::new();
+        for n in 0..(MAX_RECENT + 3) {
+            remember_closed(&mut list, closed_project(&format!("/p{n}")), n as u64);
+        }
+        assert_eq!(list.len(), MAX_RECENT);
+        assert_eq!(list[0].path, PathBuf::from(format!("/p{}", MAX_RECENT + 2)));
+        assert!(!list.iter().any(|e| e.path == Path::new("/p0")));
+    }
+
+    #[test]
+    fn a_closed_layout_survives_the_disk() {
+        let dir = TempDir::new("closed");
+        let file = dir.join("closed.json");
+        let mut list = Vec::new();
+        remember_closed(&mut list, closed_project("/a"), 10);
+        save_closed(&file, &list).expect("write");
+
+        let back = load_closed(&file);
+        assert_eq!(back, list, "the record round-trips byte for byte");
+
+        // The same non-failure contract as the recents: an unusable file is an empty list.
+        fs::write(&file, b"{not json").expect("corrupt it");
+        assert!(load_closed(&file).is_empty());
+        assert!(load_closed(&dir.join("absent.json")).is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_closed_layout_reports_whether_there_was_one() {
+        let mut list = Vec::new();
+        remember_closed(&mut list, closed_project("/a"), 10);
+        assert!(forget_closed(&mut list, Path::new("/a")));
+        assert!(!forget_closed(&mut list, Path::new("/a")));
+        assert!(list.is_empty());
     }
 
     // --- per-file view positions ----------------------------------------------------------

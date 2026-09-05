@@ -107,11 +107,17 @@ import {
   type TaskStatus,
   type TaskView,
   type Tone,
+  dropTargetKey,
+  type AttachmentPreview,
+  type AttachTargetView,
+  type StagedAttachment,
 } from './model'
 import { Icon, asIcon } from '@/icons/Icon'
 import { MentionTextarea } from './MentionTextarea'
 import { LinkTargetInput } from './LinkTargetInput'
 import { TaskMarkdown } from './TaskMarkdown'
+import { AttachmentStrip, StagedChips } from './AttachmentStrip'
+import { wantsImagePaste } from '@/editor/pasteImage'
 import { RequirementEditor } from '@/sidebar/OpenSpecPanel/RequirementEditor'
 import {
   artifactPath,
@@ -511,7 +517,14 @@ export interface TaskDetailProps {
   onSetStatus?: ((task: string, status: TaskStatus) => void) | undefined
   onSetAssignee?: ((task: string, agent: string | null) => void) | undefined
   onSetBody?: ((task: string, body: string) => void) | undefined
-  onAddComment?: ((task: string, text: string) => void) | undefined
+  /**
+   * A new comment — with, since M39, the files the composer had staged. The host lands text
+   * alone through `TaskEdit::Comment` and text-with-files through `task_attach`'s `newComment`
+   * target, so a comment and its screenshots are one mutation.
+   */
+  onAddComment?:
+    | ((task: string, text: string, attachments: readonly StagedAttachment[]) => void)
+    | undefined
   /**
    * Replace one comment's text, and remove one. (M21)
    *
@@ -537,7 +550,35 @@ export interface TaskDetailProps {
   onOpenRun?: ((run: string) => void) | undefined
   onPauseRun?: ((run: string) => void) | undefined
   onResumeRun?: ((run: string) => void) | undefined
+  /*
+   * Attachments. (M39) All optional, and every story written before M39 passes none of them, so
+   * a card handed no attachment props draws exactly what it drew — which is how the render check
+   * knows the strip appears only where a file is.
+   */
+  /** Thumbnail state by attachment id; the host's `attachmentPreviews` snapshot. */
+  previews?: Readonly<Record<string, AttachmentPreview>> | undefined
+  /** The native picker. Empty means cancelled. */
+  onPickAttachments?: (() => Promise<readonly StagedAttachment[]>) | undefined
+  /** The clipboard's image, staged to a file for the composer. `null` when it holds none. */
+  onStageClipboard?: (() => Promise<StagedAttachment | null>) | undefined
+  onAttach?:
+    | ((task: string, target: AttachTargetView, sources: readonly StagedAttachment[]) => void)
+    | undefined
+  /** The clipboard's image straight onto the body or a comment — a paste on the card. */
+  onAttachClipboard?: ((task: string, target: AttachTargetView) => void) | undefined
+  onDetachAttachment?: ((task: string, attachment: string) => void) | undefined
+  onOpenAttachment?: ((task: string, attachment: string) => void) | undefined
+  onRevealAttachment?: ((task: string, attachment: string) => void) | undefined
+  onViewAttachment?: ((task: string, attachment: string) => void) | undefined
+  /** The composer's staged files. Controlled by the host, so a drop from the desktop can add
+   *  to them from outside the card. */
+  composerStaged?: readonly StagedAttachment[] | undefined
+  onComposerStaged?: ((staged: readonly StagedAttachment[]) => void) | undefined
+  /** The `data-attach-drop` key under a desktop drag right now, or `null`. */
+  dropHot?: string | null | undefined
 }
+
+const NO_STAGED: readonly StagedAttachment[] = []
 
 /**
  * Execute one [`EditIntent`]: the write, then the new edit state, then the close.
@@ -620,9 +661,31 @@ export function TaskDetail(props: TaskDetailProps) {
     dispatchOpen,
     onDispatchOpen,
     onDispatchTo,
+    previews,
+    onPickAttachments,
+    onStageClipboard,
+    onAttach,
+    onAttachClipboard,
+    onDetachAttachment,
+    onOpenAttachment,
+    onRevealAttachment,
+    onViewAttachment,
+    composerStaged = NO_STAGED,
+    onComposerStaged,
+    dropHot = null,
   } = props
 
   const chip = agentChip(task, runs, roles)
+  // The picker-then-attach road, shared by the body's button and a comment's Attach.
+  // `undefined` when either half is missing, which is what withholds every button.
+  const pickInto =
+    onPickAttachments !== undefined && onAttach !== undefined
+      ? (target: AttachTargetView) =>
+          void onPickAttachments().then((picked) => {
+            if (picked.length > 0) onAttach(task.id, target, picked)
+          })
+      : undefined
+  const taskDropKey = dropTargetKey({ kind: 'task', task: task.id })
 
   /*
    * Which change this card is looking at, whether or not it has been read. (M28)
@@ -676,11 +739,26 @@ export function TaskDetail(props: TaskDetailProps) {
       ref={card}
       className={styles.taskCard}
       data-audit="taskCard"
+      data-attach-drop={taskDropKey}
+      data-drop-hot={dropHot === taskDropKey ? 'true' : undefined}
       tabIndex={-1}
       onKeyDown={(event) => {
         if (event.key !== 'Escape') return
         event.stopPropagation()
         run(closeCard(task, editing, 'escape'))
+      }}
+      onPaste={(event) => {
+        /*
+         * A screenshot pasted anywhere on the card attaches to the task. (M39) The composer's
+         * textarea claims its own paste first (and stops it here) so a screenshot meant for a
+         * comment is staged with the comment; everything else — the body at rest, the body
+         * editor, a comment's editor — is the task's. `wantsImagePaste` is the editor's own
+         * detector: a copied file path carries text as well and must go on pasting as text.
+         */
+        if (onAttachClipboard === undefined) return
+        if (!wantsImagePaste([...event.clipboardData.types])) return
+        event.preventDefault()
+        onAttachClipboard(task.id, { kind: 'task' })
       }}
     >
       <div className={styles.cardHead} data-audit="taskCardHead">
@@ -850,6 +928,44 @@ export function TaskDetail(props: TaskDetailProps) {
           <FieldRow field="assignee" task={task} roles={roles} editing={editing} run={run} props={props} />
         )}
         <FieldRow field="body" task={task} roles={roles} editing={editing} run={run} props={props} />
+
+        {/*
+          * Files on the body, as a section under it. (M39) Drawn when there are files, or when
+          * the host can add one — so a card that can attach shows the paperclip even on a task
+          * with nothing attached, and a read-only card (a build with no handler, a board that
+          * cannot be written) shows the strip only when there is something in it. The strip is
+          * its own component and never goes through `TaskMarkdown`: a thumbnail is an `<img>`
+          * over a URL Rust vouched for, which that renderer's no-IPC rule cannot produce.
+          */}
+        {(task.attachments.length > 0 || pickInto !== undefined) && (
+          <div className={styles.field} data-audit="taskAttachmentsField">
+            <div className={styles.fieldHead}>
+              <span className={styles.fieldLabel}>Attachments</span>
+              {pickInto !== undefined && (
+                <button
+                  type="button"
+                  className={styles.fieldEdit}
+                  data-audit="tasksAttachButton"
+                  data-write="true"
+                  title="Attach files"
+                  aria-label={`Attach files to ${task.id}`}
+                  onClick={() => pickInto({ kind: 'task' })}
+                >
+                  <Icon name="paperclip" size={1} />
+                </button>
+              )}
+            </div>
+            <AttachmentStrip
+              task={task.id}
+              attachments={task.attachments}
+              previews={previews}
+              onView={onViewAttachment}
+              onOpen={onOpenAttachment}
+              onReveal={onRevealAttachment}
+              onDetach={onDetachAttachment}
+            />
+          </div>
+        )}
 
         {/*
           * Typed links, as a **section** — deliberately not a fifth `FieldRow`. (M30)
@@ -1436,6 +1552,12 @@ export function TaskDetail(props: TaskDetailProps) {
                   className={styles.logEntry}
                   data-audit="tasksComment"
                   data-author={comment.author.kind}
+                  data-attach-drop={dropTargetKey({ kind: 'comment', task: task.id, comment: comment.id })}
+                  data-drop-hot={
+                    dropHot === dropTargetKey({ kind: 'comment', task: task.id, comment: comment.id })
+                      ? 'true'
+                      : undefined
+                  }
                   key={comment.id}
                 >
                   <div className={styles.logHead}>
@@ -1516,6 +1638,15 @@ export function TaskDetail(props: TaskDetailProps) {
                       <div className={styles.logText} data-audit="tasksCommentText">
                         <TaskMarkdown text={comment.text} />
                       </div>
+                      <AttachmentStrip
+                        task={task.id}
+                        attachments={comment.attachments}
+                        previews={previews}
+                        onView={onViewAttachment}
+                        onOpen={onOpenAttachment}
+                        onReveal={onRevealAttachment}
+                        onDetach={onDetachAttachment}
+                      />
                       {/*
                         * The two controls, on their own row under the comment rather than
                         * crammed into the head beside the timestamp. (M21)
@@ -1531,8 +1662,22 @@ export function TaskDetail(props: TaskDetailProps) {
                         * a Delete beside them would act on a comment the user is halfway
                         * through rewriting — one gesture answering two different questions.
                         */}
-                      {(onEditComment !== undefined || onDeleteComment !== undefined) && (
+                      {(onEditComment !== undefined ||
+                        onDeleteComment !== undefined ||
+                        pickInto !== undefined) && (
                         <div className={styles.logActions} data-audit="tasksCommentActions">
+                          {pickInto !== undefined && (
+                            <button
+                              type="button"
+                              className={styles.logAction}
+                              data-audit="tasksCommentAttach"
+                              data-write="true"
+                              aria-label={`Attach files to this comment on ${task.id}`}
+                              onClick={() => pickInto({ kind: 'comment', id: comment.id })}
+                            >
+                              Attach
+                            </button>
+                          )}
                           {onEditComment !== undefined && (
                             <button
                               type="button"
@@ -1573,14 +1718,21 @@ export function TaskDetail(props: TaskDetailProps) {
           <form
             className={styles.composer}
             data-audit="tasksComposer"
+            data-attach-drop={dropTargetKey({ kind: 'composer', task: task.id })}
+            data-drop-hot={
+              dropHot === dropTargetKey({ kind: 'composer', task: task.id }) ? 'true' : undefined
+            }
             onSubmit={(event) => {
               event.preventDefault()
               const form = event.currentTarget
               const text = String(new FormData(form).get('text') ?? '').trim()
               // An empty comment is not a comment. Appending one to a file the whole team reads
-              // would be a line in the log saying nothing, and the log is append-only.
-              if (text === '') return
-              onAddComment(task.id, text)
+              // would be a line in the log saying nothing, and the log is append-only. A
+              // comment that is nothing but its files — "here is the screenshot" — is not
+              // empty. (M39)
+              if (text === '' && composerStaged.length === 0) return
+              onAddComment(task.id, text, composerStaged)
+              onComposerStaged?.([])
               form.reset()
             }}
           >
@@ -1604,8 +1756,44 @@ export function TaskDetail(props: TaskDetailProps) {
               tools
               name="text"
               defaultValue=""
+              onPaste={(event) => {
+                // A screenshot pasted into the composer is staged *with* the comment rather than
+                // attached to the task at once: it belongs to the report being written. Claimed
+                // here and stopped, so the card's own paste handler does not also take it.
+                if (onStageClipboard === undefined || onComposerStaged === undefined) return
+                if (!wantsImagePaste([...event.clipboardData.types])) return
+                event.preventDefault()
+                event.stopPropagation()
+                void onStageClipboard().then((staged) => {
+                  if (staged !== null) onComposerStaged([...composerStaged, staged])
+                })
+              }}
             />
+            {onComposerStaged !== undefined && (
+              <StagedChips
+                staged={composerStaged}
+                onRemove={(path) =>
+                  onComposerStaged(composerStaged.filter((file) => file.path !== path))
+                }
+              />
+            )}
             <div className={styles.composerActions}>
+              {onPickAttachments !== undefined && onComposerStaged !== undefined && (
+                <button
+                  type="button"
+                  className={styles.action}
+                  data-audit="tasksComposerAttach"
+                  data-write="true"
+                  title="Attach files to this comment"
+                  onClick={() =>
+                    void onPickAttachments().then((picked) => {
+                      if (picked.length > 0) onComposerStaged([...composerStaged, ...picked])
+                    })
+                  }
+                >
+                  <Icon name="paperclip" size={1} /> Attach…
+                </button>
+              )}
               <button
                 type="submit"
                 className={styles.action}

@@ -412,6 +412,211 @@ pub fn reinsert_tab(
     Ok(id)
 }
 
+/// Whether a tab of this kind can come back after the thing that showed it has gone.
+///
+/// Asked twice, by two features that remember tabs for later: `cide_app::closed_tabs`, the
+/// Ctrl+Shift+T stack, and [`reopen_project`], which puts a closed project's whole strip back.
+/// One predicate rather than one per feature, because the two refusals below are facts about
+/// the *tab*, not about the gesture, and a second copy would be the one that forgot a variant.
+///
+/// * A [`TabKind::Diff`] whose origin is `ClaudeMcp` is the visible half of an agent's blocked
+///   `openDiff`. Closing whatever held it cancelled that request, so the `request_id` names
+///   nothing — the pane would mount, ask `claude_diff_content`, and get an error.
+/// * A [`TabKind::Merge`] is a query about a *conflict*, which is by definition transient: by
+///   the time it comes back the merge may be finished, aborted, or resolved differently in a
+///   terminal, and the tab would reappear saying "this is no longer conflicted" over a stale
+///   centre pane. The panel's *Merge Conflicts* group is where a conflict is reopened from,
+///   and it reads the live state.
+///
+/// Everything else is a document or a query — a file, a revision, a working-tree diff, a
+/// console, an extension's page, a settings section, an OpenSpec page — and comes back to the
+/// same bytes or to whatever is true now, both of which are honest.
+///
+/// [`TabKind::ClaudeHome`] answers `true` here and is refused by the closed-tab stack on its
+/// own account: a console cannot be *reinserted* (a project has exactly one), but it is the
+/// first thing a reopened project needs back.
+pub fn tab_outlives_close(kind: &TabKind) -> bool {
+    match kind {
+        TabKind::Diff { spec, .. } => !matches!(spec.origin, DiffOrigin::ClaudeMcp { .. }),
+        TabKind::Merge { .. } => false,
+        TabKind::ClaudeHome
+        | TabKind::ClaudeFull { .. }
+        | TabKind::File { .. }
+        | TabKind::Revision { .. }
+        | TabKind::Extension { .. }
+        | TabKind::OpenSpec { .. }
+        | TabKind::Settings { .. } => true,
+    }
+}
+
+/// Open a project over `roots` as it stood when it was last closed.
+///
+/// # Why a closed project keeps its layout
+///
+/// [`close_project`] removes the record, and [`open_project`] mints a fresh one — a console
+/// with a *new* `primary_session`. So closing a project and opening the same directory again
+/// started a new conversation in a new pane, and the one the user had been working in was
+/// gone: not in `workspace.json`, which had forgotten it, and not on screen. The report was
+/// "claude sessions aren't restored". Quitting and relaunching restores them, because the
+/// tree survives on disk with every session id in it; this makes a close-and-reopen the same
+/// gesture at the scale of one project, over `persist::closed.json`.
+///
+/// `remembered` is the [`Project`] record `close_project` took out, and this puts it back with
+/// the differences a reopen has to make:
+///
+/// * **The id and the dot are minted afresh.** Everything keyed by the old `ProjectId` — the
+///   closed-tab stack, the IDE server, the file index — was dropped at the close and
+///   reopening the same directory has always minted a new id; a caller holding the old one is
+///   holding a project that was closed. The dot is a slot in the current workspace, not a
+///   property of the directory.
+/// * **The roots are the caller's, then the record's.** The user asked to open `roots`; a
+///   second root the project had is kept because it is part of the layout being restored, but
+///   never ahead of what was asked for, and a root named twice is one root.
+/// * **Tabs that cannot come back are dropped** — [`tab_outlives_close`] — and the focus order
+///   is re-derived over the survivors, falling back to the console when the active tab was one
+///   of them. Dirty flags are cleared for the reason `persist::load` clears them: the flag
+///   describes a buffer, and the buffer did not survive the close.
+/// * **Detached panes are docked.** The close pruned their windows, and a pane that no window
+///   shows would be a conversation nothing can reach. Each goes back where its anchor says if
+///   that shape still exists — `layout::can_restore`, the same test `redock_pane` makes —
+///   and otherwise beside the console's focused pane.
+/// * **Pane, tab and session ids are kept**, and that is the whole point: a `SessionId` *is*
+///   the value `claude --resume` takes, and the launch plan (`lifecycle::plan_restore`) reads
+///   it off the pane to decide what the pane may become. A `PaneId` is a UUID, so a kept one
+///   cannot collide with one minted meanwhile; the check below refuses the case anyway rather
+///   than trusting the argument, because [`validate`] would otherwise roll the whole open back
+///   with nothing but a log line to say why.
+///
+/// A record that cannot be used — a live pane id, a strip with no console, no roots at all —
+/// degrades to a plain [`open_project`] with a warning, never to a refusal: the user asked for
+/// the directory, and a layout that cannot be restored is not a reason to withhold it.
+///
+/// Like [`open_project`], a path that is already open is activated rather than opened twice,
+/// and the record is then simply not used.
+pub fn reopen_project(
+    ws: &mut Workspace,
+    roots: Vec<PathBuf>,
+    name: Option<String>,
+    remembered: Project,
+) -> Result<ProjectId> {
+    let Some(primary_root) = roots.first().cloned() else {
+        return Err(CoreError::NoRoots);
+    };
+    if let Some(existing) = ws
+        .projects
+        .iter()
+        .find(|(_, p)| p.roots.first().is_some_and(|r| r.path == primary_root))
+        .map(|(id, _)| *id)
+    {
+        activate_project(ws, existing);
+        return Ok(existing);
+    }
+
+    let Some(mut project) = adopt_layout(ws, remembered) else {
+        tracing::warn!(
+            path = %primary_root.display(),
+            "the remembered layout cannot be reopened; opening the project fresh"
+        );
+        return open_project(ws, roots, name);
+    };
+
+    let id = ProjectId::new();
+    project.id = id;
+    project.dot = next_dot(ws);
+    project.name = name.unwrap_or_else(|| basename(&primary_root));
+    project.display_path = display_path_of(&primary_root);
+    let mut merged: Vec<ProjectRoot> = roots.into_iter().map(project_root).collect();
+    for root in project.roots.drain(..) {
+        if !merged.iter().any(|r| r.path == root.path) {
+            merged.push(root);
+        }
+    }
+    project.roots = merged;
+
+    ws.projects.insert(id, project);
+    rebuild_windows(ws);
+    bump(ws);
+    Ok(id)
+}
+
+/// The layout half of [`reopen_project`]: everything that is decided from the record alone.
+///
+/// `None` is "open fresh instead", and every arm that answers it is a state the record
+/// should not be in — a pane id that is live elsewhere, a strip that lost its console — so the
+/// caller logs rather than reports.
+fn adopt_layout(ws: &Workspace, mut project: Project) -> Option<Project> {
+    if project.roots.is_empty() {
+        return None;
+    }
+    project.tabs.retain(|t| tab_outlives_close(&t.kind));
+    if !matches!(
+        project.tabs.first().map(|t| &t.kind),
+        Some(TabKind::ClaudeHome)
+    ) {
+        return None;
+    }
+    let live = project
+        .tabs
+        .iter()
+        .flat_map(|t| t.tree.panes.keys())
+        .chain(project.detached.keys());
+    for pane in live {
+        if find_pane(ws, *pane).is_some()
+            || ws.projects.values().any(|p| p.detached.contains_key(pane))
+        {
+            return None;
+        }
+    }
+
+    for tab in &mut project.tabs {
+        if let TabKind::File { dirty, .. } = &mut tab.kind {
+            *dirty = false;
+        }
+    }
+
+    // Detached panes go back into tabs. `drain` rather than iterating, because a pane that
+    // fails to dock anywhere — a corrupt tree in the record — is dropped rather than left
+    // detached with no window to show it; `validate` forbids an anchor without its pane.
+    let detached: Vec<Pane> = project.detached.drain(..).map(|(_, pane)| pane).collect();
+    let anchors = std::mem::take(&mut project.dock_anchors);
+    for pane in detached {
+        let anchor = anchors.get(&pane.id);
+        let docked_at = anchor.and_then(|anchor| {
+            project
+                .tabs
+                .iter()
+                .position(|t| layout::can_restore(&t.tree, anchor))
+        });
+        let outcome = match (docked_at, anchor) {
+            (Some(at), Some(anchor)) => {
+                layout::insert_pane_at(&mut project.tabs[at].tree, anchor, pane)
+            }
+            _ => {
+                let console = &mut project.tabs[0].tree;
+                let target = console.focused;
+                layout::insert_pane(console, target, Axis::Row, Side::After, pane)
+            }
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(%error, "a detached pane in the remembered layout could not be docked");
+        }
+    }
+
+    // The focus order over the survivors, and the active tab from it: the most recently used
+    // survivor when the active one was dropped, which is `close_tab`'s own rule, and the
+    // console only when the order names nothing — a record written by a build before
+    // `tab_mru` existed.
+    let tabs: Vec<TabId> = project.tabs.iter().map(|t| t.id).collect();
+    project.tab_mru.retain(|id| tabs.contains(id));
+    let active = if tabs.contains(&project.active_tab) {
+        project.active_tab
+    } else {
+        project.tab_mru.first().copied().unwrap_or(tabs[0])
+    };
+    set_active(&mut project, active);
+    Some(project)
+}
+
 /// Every file tab with unsaved edits, in header order then tab order.
 ///
 /// `only` narrows to one project; `None` answers for the whole workspace, which is what the
@@ -5094,5 +5299,243 @@ mod tests {
             None,
             "a name that merely starts the same is not inside the folder",
         );
+    }
+
+    // --- reopening a closed project ------------------------------------------------------
+
+    /// Close `id` and hand back the record `persist::closed.json` would have kept.
+    fn close_and_remember(ws: &mut Workspace, id: ProjectId) -> Project {
+        let record = project(ws, id).expect("open").clone();
+        close_project(ws, id, true).expect("closes");
+        record
+    }
+
+    #[test]
+    fn reopening_a_closed_project_brings_back_its_panes_and_their_sessions() {
+        let mut ws = Workspace::default();
+        let a = open(&mut ws, "/home/dev/a");
+        let console = console_tab(&ws, a).expect("console");
+        let primary = project(&ws, a).expect("open").primary_session;
+        let extra = {
+            let t = tab_mut(&mut ws, a, console).expect("console tab");
+            let target = t.tree.focused;
+            let pane = demo_pane(PaneKind::Claude, "second : claude", true);
+            let extra = pane.session;
+            layout::split(&mut t.tree, target, Axis::Row, Side::After, pane).expect("splits");
+            extra
+        };
+        let full = open_tab(
+            &mut ws,
+            a,
+            TabKind::ClaudeFull {
+                title: "full".into(),
+            },
+            demo_pane(PaneKind::Claude, "full : claude", true),
+        )
+        .expect("a full tab");
+        let pane_ids: Vec<PaneId> = project(&ws, a)
+            .expect("open")
+            .tabs
+            .iter()
+            .flat_map(|t| t.tree.panes.keys().copied())
+            .collect();
+
+        let record = close_and_remember(&mut ws, a);
+        assert!(ws.projects.is_empty());
+
+        let b = reopen_project(&mut ws, vec![PathBuf::from("/home/dev/a")], None, record)
+            .expect("reopens");
+        let p = project(&ws, b).expect("reopened");
+        assert_ne!(b, a, "a reopen mints a new id, as an open always has");
+        assert_eq!(
+            p.primary_session, primary,
+            "the console resumes the conversation it had"
+        );
+        assert_eq!(p.tabs.len(), 2, "the full tab came back");
+        assert_eq!(p.tabs[1].id, full, "with its own tab id");
+        assert_eq!(
+            p.active_tab, full,
+            "and the strip is where the user left it"
+        );
+        let sessions: Vec<Option<SessionId>> = p.tabs[0]
+            .tree
+            .panes
+            .values()
+            .map(|pane| pane.session)
+            .collect();
+        assert!(sessions.contains(&Some(primary)));
+        assert!(
+            sessions.contains(&extra),
+            "the split pane kept its session too"
+        );
+        let mut back: Vec<PaneId> = p
+            .tabs
+            .iter()
+            .flat_map(|t| t.tree.panes.keys().copied())
+            .collect();
+        let mut expected = pane_ids;
+        back.sort();
+        expected.sort();
+        assert_eq!(back, expected, "pane ids are the ones the panes had");
+        validate(&ws).expect("the reopened workspace is valid");
+        assert!(
+            matches!(&ws.windows.values().next(), Some(WindowRole::Shell { projects, .. }) if projects.contains(&b)),
+            "the reopened project is drawn by a window"
+        );
+    }
+
+    #[test]
+    fn a_reopen_drops_what_cannot_come_back_and_clears_dirty_flags() {
+        let mut ws = Workspace::default();
+        let a = open(&mut ws, "/home/dev/a");
+        let file = open_file(&mut ws, a, "/home/dev/a/src/main.rs", true);
+        open_tab(
+            &mut ws,
+            a,
+            TabKind::Diff {
+                spec: DiffSpec {
+                    title: "agent".into(),
+                    old_path: PathBuf::from("/home/dev/a/x"),
+                    new_path: PathBuf::from("/home/dev/a/x"),
+                    origin: DiffOrigin::ClaudeMcp {
+                        request_id: "r1".into(),
+                    },
+                },
+                preview: false,
+            },
+            demo_pane(PaneKind::Editor, "agent diff", false),
+        )
+        .expect("a blocked diff tab");
+        // The diff tab is the active one when the project closes.
+        let record = close_and_remember(&mut ws, a);
+
+        let b = reopen_project(&mut ws, vec![PathBuf::from("/home/dev/a")], None, record)
+            .expect("reopens");
+        let p = project(&ws, b).expect("reopened");
+        assert_eq!(
+            p.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [p.tabs[0].id, file],
+            "the cancelled diff is gone, the file is back"
+        );
+        assert!(
+            matches!(p.tabs[1].kind, TabKind::File { dirty: false, .. }),
+            "the buffer did not survive the close, so neither does its flag"
+        );
+        assert_eq!(
+            p.active_tab, file,
+            "focus falls to the next survivor in the order"
+        );
+        assert_eq!(p.tab_mru.first(), Some(&file));
+        validate(&ws).expect("valid");
+    }
+
+    #[test]
+    fn a_reopen_docks_the_panes_that_were_detached() {
+        let mut ws = Workspace::default();
+        let a = open(&mut ws, "/home/dev/a");
+        let console = console_tab(&ws, a).expect("console");
+        let torn = {
+            let t = tab_mut(&mut ws, a, console).expect("console tab");
+            let target = t.tree.focused;
+            let pane = demo_pane(PaneKind::Claude, "torn : claude", true);
+            let id = pane.id;
+            layout::split(&mut t.tree, target, Axis::Row, Side::After, pane).expect("splits");
+            id
+        };
+        detach_pane(&mut ws, a, console, torn).expect("detaches");
+        assert!(project(&ws, a).expect("open").detached.contains_key(&torn));
+
+        let record = close_and_remember(&mut ws, a);
+        assert!(
+            ws.windows
+                .values()
+                .all(|r| matches!(r, WindowRole::Shell { .. })),
+            "the close pruned the detached window"
+        );
+
+        let b = reopen_project(&mut ws, vec![PathBuf::from("/home/dev/a")], None, record)
+            .expect("reopens");
+        let p = project(&ws, b).expect("reopened");
+        assert!(
+            p.detached.is_empty(),
+            "nothing is left detached with no window to show it"
+        );
+        assert!(p.dock_anchors.is_empty());
+        assert!(
+            p.tabs[0].tree.panes.contains_key(&torn),
+            "the pane is back in the tab it was torn out of"
+        );
+        validate(&ws).expect("valid");
+    }
+
+    #[test]
+    fn a_reopen_keeps_the_roots_it_was_asked_for_first() {
+        let mut ws = Workspace::default();
+        let a = open(&mut ws, "/home/dev/a");
+        add_root(&mut ws, a, PathBuf::from("/home/dev/lib")).expect("a second root");
+        let record = close_and_remember(&mut ws, a);
+
+        let b = reopen_project(&mut ws, vec![PathBuf::from("/home/dev/a")], None, record)
+            .expect("reopens");
+        let roots: Vec<&Path> = project(&ws, b)
+            .expect("reopened")
+            .roots
+            .iter()
+            .map(|r| r.path.as_path())
+            .collect();
+        assert_eq!(
+            roots,
+            [Path::new("/home/dev/a"), Path::new("/home/dev/lib")]
+        );
+    }
+
+    #[test]
+    fn a_layout_whose_panes_are_live_elsewhere_opens_fresh_instead() {
+        let mut ws = Workspace::default();
+        let a = open(&mut ws, "/home/dev/a");
+        // The record is taken *without* closing: every pane id in it is still live.
+        let record = project(&ws, a).expect("open").clone();
+        let b = reopen_project(&mut ws, vec![PathBuf::from("/home/dev/b")], None, record)
+            .expect("opens fresh");
+        assert_ne!(
+            project(&ws, b).expect("open").primary_session,
+            project(&ws, a).expect("open").primary_session,
+            "a fresh console, not a second pane over a's session"
+        );
+        validate(&ws).expect("valid");
+    }
+
+    #[test]
+    fn reopening_a_path_that_is_open_activates_it_and_uses_no_record() {
+        let mut ws = Workspace::default();
+        let a = open(&mut ws, "/home/dev/a");
+        let stale = project(&ws, a).expect("open").clone();
+        let again = reopen_project(&mut ws, vec![PathBuf::from("/home/dev/a")], None, stale)
+            .expect("activates");
+        assert_eq!(again, a);
+        assert_eq!(ws.projects.len(), 1);
+    }
+
+    #[test]
+    fn the_tabs_that_outlive_a_close_are_the_documents_and_the_queries() {
+        assert!(tab_outlives_close(&TabKind::ClaudeHome));
+        assert!(tab_outlives_close(&TabKind::ClaudeFull {
+            title: "t".into()
+        }));
+        assert!(tab_outlives_close(&TabKind::File {
+            path: PathBuf::from("/x"),
+            dirty: true
+        }));
+        assert!(!tab_outlives_close(&TabKind::Diff {
+            spec: DiffSpec {
+                title: "agent".into(),
+                old_path: PathBuf::from("/x"),
+                new_path: PathBuf::from("/x"),
+                origin: DiffOrigin::ClaudeMcp {
+                    request_id: "r".into()
+                },
+            },
+            preview: false,
+        }));
     }
 }

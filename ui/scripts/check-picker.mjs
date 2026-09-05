@@ -821,7 +821,7 @@ try {
   ok(
     /export function filePickerOpen/.test(store),
     'and `filePickerOpen` is derived here rather than as a comparison at the call site: ' +
-      '`overlayOpen` is true for any of nine overlays, and ⌥L scoped to that would be ' +
+      '`overlayOpen` is true for any of ten overlays, and ⌥L scoped to that would be ' +
       'swallowed in a terminal pane whenever a menu happened to be up',
   )
 
@@ -835,6 +835,26 @@ try {
   ok(
     /toggleLibraries\(\)/.test(dispatch),
     'and it flips the flag rather than opening something',
+  )
+
+  /*
+   * The About box (`help.about` → `'about'` → `AboutCard`). Three files have to agree, and
+   * `check:commands` sees only the first two: it proves the id has a `case`, not that the host
+   * ever draws the kind the case toggles — a kind the host never renders is a store holding
+   * `'about'` with nothing on screen, `overlayOpen()` true, and every `!overlayOpen` binding
+   * gated off behind a modal nobody can see.
+   */
+  const host = strip(uiFile('src/overlays/OverlayHost.tsx'))
+  ok(
+    /\| 'about'/.test(store) && /toggle\('about'\)/.test(dispatch) && /open === 'about'/.test(host),
+    "'about' is an OverlayKind, `help.about` toggles it, and the host draws it — `check:commands` " +
+      'sees the case and not the arm, so a kind the host never renders would pass it as wired',
+  )
+  ok(
+    /`cide \$\{/.test(uiFile('src/overlays/AboutCard.tsx')) &&
+      /format!\("cide \{\}"/.test(uiFile('../crates/cide-app/src/cli.rs')),
+    'the About box spells the version exactly as `cide --version` does: a number pasted from ' +
+      'the card and one pasted from a terminal must never disagree in a bug thread',
   )
 
   if (failed > 0) {

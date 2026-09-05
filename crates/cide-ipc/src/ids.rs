@@ -409,6 +409,45 @@ impl fmt::Display for CommentId {
     }
 }
 
+/// A file attached to a task or to a comment. (M39)
+///
+/// A **string** like [`CommentId`], and a fresh v4 uuid for every record, but with none of the
+/// `legacy-` story: no task file written before attachments existed carries one, so there is
+/// nothing to derive and no `Default` for a repairing loader to fill. Hence no `Default` and no
+/// `is_empty` — a `TaskAttachmentId` that reached the store is a real uuid or the record is dropped.
+///
+/// It is also a **path component**: the bytes live at
+/// `.cide/attachments/<task>/<attachment>/<name>`, and that is why `cide_tasks::repair` must never
+/// re-mint one the way it re-mints a malformed task or comment id. A comment id is only a merge
+/// key; re-minting an attachment id would leave the file on disk under the old one, orphaned with
+/// no symptom but a broken thumbnail.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(export, type = "string")]
+pub struct TaskAttachmentId(pub String);
+
+impl TaskAttachmentId {
+    // No `Default`, on purpose: the empty string is the one value that must never exist (it
+    // would be a directory name), and a `Default` that mints a fresh uuid is an allocation
+    // hiding behind a derive somebody adds to a struct that holds one.
+    #[allow(clippy::new_without_default)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TaskAttachmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl TaskId {
     pub fn as_str(&self) -> &str {
         &self.0

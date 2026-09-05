@@ -33,9 +33,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cide_core::CoreError;
-use cide_ipc::{ProjectId, TaskAuthor, TaskBoard, TaskEdit, TaskId, TaskNew};
-use cide_tasks::TaskStore;
-use tauri::State;
+use cide_ipc::{
+    AttachTarget, ImageDoc, ProjectId, StagedFile, TaskAttachmentId, TaskAuthor, TaskBoard,
+    TaskEdit, TaskId, TaskNew,
+};
+use cide_tasks::{TaskStore, attachments};
+use tauri::{Manager, State};
 
 use crate::task_triggers::{self, TaskMutation};
 use crate::tasks_state::{self, TasksStores};
@@ -117,6 +120,23 @@ pub async fn task_new(
         let assign_gesture = req.agent.is_some();
         // `TaskAuthor::User`: see the module header for why no caller may name an author.
         let task = store.create(&req, TaskAuthor::User)?;
+        // Files the New task dialog staged ride on the same request, and land before the one
+        // broadcast below — see `TaskNew::attachments`. A refusal here (a file that went away
+        // between the pick and the click) takes the task with it: the dialog stays open with
+        // the sentence, and a retry must not mint a second `t-<n>` beside a first that has no
+        // files. The id is spent either way, which `high_water_mark` says is by design. (M39)
+        let task = match req.attachments.as_deref() {
+            Some(sources) if !sources.is_empty() => {
+                match store.attach(&task.id, AttachTarget::Task, sources, TaskAuthor::User) {
+                    Ok(with_files) => with_files,
+                    Err(error) => {
+                        let _ = store.delete(&task.id);
+                        return Err(error);
+                    }
+                }
+            }
+            _ => task,
+        };
         let mutation = TaskMutation {
             before: None,
             after: task,
@@ -130,7 +150,8 @@ pub async fn task_new(
     let board = answer(&app, project, &store);
     // After `answer`: the caller's board and the other windows' broadcast never wait on the
     // trigger, which does its own disk read on the blocking pool.
-    task_triggers::consider(&app, project, vec![mutation]);
+    // From the panel, so no session to name: the primary pane hears about any run this starts.
+    task_triggers::consider(&app, project, vec![mutation], cide_ipc::RunNotify::Primary);
     Ok(board)
 }
 
@@ -181,7 +202,8 @@ pub async fn task_edit(
     })
     .await?;
     let board = answer(&app, project, &store);
-    task_triggers::consider(&app, project, vec![mutation]);
+    // From the panel, so no session to name: the primary pane hears about any run this starts.
+    task_triggers::consider(&app, project, vec![mutation], cide_ipc::RunNotify::Primary);
     Ok(board)
 }
 
@@ -207,6 +229,294 @@ pub async fn task_delete(
     })
     .await?;
     Ok(answer(&app, project, &store))
+}
+
+/*
+ * Attachments. (M39)
+ *
+ * Seven commands for one feature, and the count is the shape of the feature rather than a
+ * failure to consolidate. Three of them *add* — from paths, from the clipboard, and the
+ * clipboard staged for a comment or task that does not exist yet — and they are three because
+ * the frontend cannot hold bytes: `crates/cide-ipc/src/image.rs`'s rule, applied in the direction
+ * `fs_paste_image` first needed it. One *picks*, through the parented GTK dialog and never the
+ * plugin's JS `open()`, for `project_pick`'s reason. One *grants* — `image_read`'s scope
+ * widening, jailed to the record — and two *open*, from Rust, because a detached window's
+ * capability set has no `opener:*` and the card is drawn in every window. Detaching is not here:
+ * it is a `TaskEdit` and goes through `task_edit`, so there is one road for it.
+ *
+ * Every mutation among them answers with the whole board, per the module header, and every
+ * one is `TaskAuthor::User` for the same reason the four above are.
+ */
+
+/// Attach files by path — picked, dropped, or staged — to the body, a comment, or a new comment.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_attach(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    task: TaskId,
+    target: AttachTarget,
+    sources: Vec<PathBuf>,
+) -> Result<TaskBoard> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    let (store, mutation) = blocking(move || {
+        let store = tracker(&stores, project, root);
+        // A comment born with its files is prose a mention trigger may scan, exactly as a
+        // plain `TaskEdit::Comment` is in `task_edit`.
+        let fresh_text: Vec<String> = match &target {
+            AttachTarget::NewComment { text } => vec![text.clone()],
+            _ => Vec::new(),
+        };
+        let before = store.get(&task);
+        let after = store.attach(&task, target, &sources, TaskAuthor::User)?;
+        let mutation = TaskMutation {
+            before,
+            after,
+            author: TaskAuthor::User,
+            assign_gesture: false,
+            fresh_text,
+        };
+        Ok((store, mutation))
+    })
+    .await?;
+    let board = answer(&app, project, &store);
+    // From the panel, so no session to name: the primary pane hears about any run this starts.
+    task_triggers::consider(&app, project, vec![mutation], cide_ipc::RunNotify::Primary);
+    Ok(board)
+}
+
+/// What the clipboard holds as a PNG, or `None` when it holds no image.
+///
+/// `fs_paste_image`'s round trip, and its reasoning: the clipboard is a bitmap, the read and the
+/// encode belong on the blocking pool, and every failure of the read is one answer — an empty
+/// clipboard, a text-only one, an owner that went away — because the caller's question is the
+/// same in all three. `None` rather than an error variant, because this is reached by Ctrl+V
+/// whenever the card has focus, and an ordinary paste of text must cost the user nothing to see.
+fn clipboard_png(app: &tauri::AppHandle) -> Result<Option<(String, Vec<u8>)>> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let Ok(image) = app.clipboard().read_image() else {
+        return Ok(None);
+    };
+    let bytes = cide_core::image::encode_png(image.rgba(), image.width(), image.height())?;
+    Ok(Some((cide_core::image::pasted_image_name_now(), bytes)))
+}
+
+/// Attach the image on the clipboard, or answer `None` when there is none.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_attach_clipboard(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    task: TaskId,
+    target: AttachTarget,
+) -> Result<Option<TaskBoard>> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    let handle = app.clone();
+    let Some((store, mutation)) = blocking(move || {
+        let Some((name, bytes)) = clipboard_png(&handle)? else {
+            return Ok(None);
+        };
+        let store = tracker(&stores, project, root);
+        let fresh_text: Vec<String> = match &target {
+            AttachTarget::NewComment { text } => vec![text.clone()],
+            _ => Vec::new(),
+        };
+        let before = store.get(&task);
+        let after = store.attach_bytes(&task, target, &name, &bytes, TaskAuthor::User)?;
+        Ok(Some((
+            store,
+            TaskMutation {
+                before,
+                after,
+                author: TaskAuthor::User,
+                assign_gesture: false,
+                fresh_text,
+            },
+        )))
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    let board = answer(&app, project, &store);
+    // From the panel, so no session to name: the primary pane hears about any run this starts.
+    task_triggers::consider(&app, project, vec![mutation], cide_ipc::RunNotify::Primary);
+    Ok(Some(board))
+}
+
+/// Write the clipboard's image somewhere it can wait for the comment or task it will belong to.
+///
+/// The composer and the New task dialog paste before there is anything to attach to, so the
+/// bytes go under `cide_tasks::attachments::staging_dir()` and the path comes back as a
+/// [`StagedFile`], to ride on the eventual `task_attach`/`task_new` like a picked path would.
+/// `import` consumes it from there. `None` when the clipboard holds no image, as above.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_attachment_stage_clipboard(app: tauri::AppHandle) -> Result<Option<StagedFile>> {
+    blocking(move || {
+        let Some((name, bytes)) = clipboard_png(&app)? else {
+            return Ok(None);
+        };
+        // A directory per staged file, named by a uuid, so two pastes of identically-named
+        // screenshots in one second cannot collide, and so `import` can remove the whole slot.
+        let slot = attachments::staging_dir().join(uuid::Uuid::new_v4().to_string());
+        let path = slot.join(&name);
+        // The user's own unfinished gesture: private mode, unlike the committed copy.
+        cide_core::persist::write_atomic_with_mode(
+            &path,
+            &bytes,
+            cide_core::persist::PRIVATE_MODE,
+        )?;
+        Ok(Some(StagedFile {
+            bytes: bytes.len() as u64,
+            path,
+            name,
+        }))
+    })
+    .await
+}
+
+/// Let the user pick files to attach. Empty means cancelled, which is not an error.
+///
+/// `show_picker` and never the dialog plugin's JS `open()`: `cmd::project` records why — the
+/// plugin's dialog is not parented on Linux and opens *behind* the window on KDE Wayland.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_pick_attachments(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Vec<PathBuf>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+    crate::cmd::project::show_picker(
+        &app,
+        window,
+        crate::cmd::project::PickerSpec {
+            title: "Attach files",
+            accept: "Attach",
+            folders: false,
+            multiple: true,
+            // Any file: the feature's whole premise. A filter here would be a list of what
+            // cide thinks an attachment is, and the user knows better.
+            filter: None,
+        },
+        tx,
+    )?;
+    // Unbounded — the user is browsing — so off the runtime's worker pool: `project_pick`'s
+    // reasoning.
+    tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_default())
+        .await
+        .map_err(|e| CoreError::Io(format!("attachment picker: {e}")))
+}
+
+/// Where one attachment's bytes are, from the record — never from anything the caller typed.
+///
+/// The jail is the construction: the path is `root/.cide/attachments/<task>/<id>/<name>` from a
+/// record the store holds, so there is nothing for `openable`'s containment ladder to check.
+/// A tombstoned record answers "no such attachment", like a deleted comment.
+fn attachment_path(
+    store: &TaskStore,
+    task: &TaskId,
+    attachment: &TaskAttachmentId,
+) -> Result<PathBuf> {
+    let held = store
+        .get(task)
+        .ok_or_else(|| CoreError::NoSuchTask(task.clone()))?;
+    let record = cide_tasks::attachment_record(&held, attachment)
+        .filter(|record| !record.deleted)
+        .ok_or_else(|| CoreError::Io(format!("no such attachment: {attachment}")))?;
+    Ok(attachments::path_of(store.root(), task, record))
+}
+
+/// Vouch for an attachment as an image and let this webview load it.
+///
+/// `image_read`, jailed: the path comes from the record, the bytes are re-sniffed by
+/// `cide_core::image::read` every time — the stored `AttachmentKind` is a hint in a committed,
+/// hand-editable file, and the grant is a capability — and the scope is widened *after* every
+/// refusal, one file at a time, for the reason `image_read` gives.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_attachment_image(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    task: TaskId,
+    attachment: TaskAttachmentId,
+) -> Result<ImageDoc> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    let doc = blocking(move || {
+        let store = tracker(&stores, project, root);
+        let path = attachment_path(&store, &task, &attachment)?;
+        cide_core::image::read(&path)
+    })
+    .await?;
+    app.asset_protocol_scope()
+        .allow_file(&doc.path)
+        .map_err(|e| {
+            CoreError::Io(format!(
+                "{} could not be served to the viewer: {e}",
+                doc.path.display()
+            ))
+        })?;
+    Ok(doc)
+}
+
+/// Open an attachment with whatever the desktop associates with its name.
+///
+/// From Rust, like every opener call in this crate: the JS command is capability-gated per
+/// window and the detached-window set grants no `opener:*`, while the card is drawn in every
+/// window. The first caller in the workspace to open a *file* rather than a directory — the
+/// real name on disk, with its real extension, is what makes that meaningful.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_attachment_open(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    task: TaskId,
+    attachment: TaskAttachmentId,
+) -> Result<()> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    blocking(move || {
+        use tauri_plugin_opener::OpenerExt;
+        let store = tracker(&stores, project, root);
+        let path = attachment_path(&store, &task, &attachment)?;
+        app.opener()
+            .open_path(path.to_string_lossy(), None::<&str>)
+            .map_err(|e| CoreError::Io(format!("{}: {e}", path.display())))
+    })
+    .await
+}
+
+/// Reveal an attachment's directory in the file manager. The containing directory, for
+/// `fs_show_in_manager`'s reason: there is no portable "select this file".
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_attachment_reveal(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    task: TaskId,
+    attachment: TaskAttachmentId,
+) -> Result<()> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    blocking(move || {
+        use tauri_plugin_opener::OpenerExt;
+        let store = tracker(&stores, project, root);
+        let path = attachment_path(&store, &task, &attachment)?;
+        let dir = path
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| CoreError::Io(format!("{} has no directory", path.display())))?;
+        app.opener()
+            .open_path(dir.to_string_lossy(), None::<&str>)
+            .map_err(|e| CoreError::Io(format!("{}: {e}", dir.display())))
+    })
+    .await
 }
 
 /// Broadcast the new board and return it — the two halves of every mutation's answer.

@@ -1,4 +1,4 @@
-//! The fifteen MCP tools cide serves a `claude`: their names, their schemas, and handlers that
+//! The sixteen MCP tools cide serves a `claude`: their names, their schemas, and handlers that
 //! touch nothing. (M18)
 //!
 //! Two families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
@@ -34,12 +34,15 @@
 //!
 //! # Why the names begin with `cide_`
 //!
-//! A project's own `--mcp-config` servers are merged with cide's, and the CLI namespaces the
-//! result as `mcp__<server>__<tool>` — so these arrive at the model as
-//! `mcp__cide__cide_task_list`. The prefix is still worth having: it is what appears in a
-//! `--allowedTools` line, in a hook payload's `tool_name`, and in a transcript a user reads, and
-//! a bare `task_list` in any of those places is ambiguous the moment somebody attaches a second
-//! tracker server.
+//! A project's own MCP servers are merged with cide's, and every CLI namespaces the result — so
+//! these never arrive bare. *How* they are namespaced is the harness's own convention and the two
+//! disagree: `mcp__cide__cide_task_list` under Claude Code, `cide_cide_task_list` under opencode.
+//! [`crate::harness::Harness::tool_name`] is the only thing that may spell either, and cide's
+//! prose interpolates it rather than writing a name out.
+//!
+//! The `cide_` prefix is still worth having under both: it is what appears in a `--allowedTools`
+//! line, in a hook payload's `tool_name`, and in a transcript a user reads, and a bare `task_list`
+//! in any of those places is ambiguous the moment somebody attaches a second tracker server.
 //!
 //! # `cide_task_assign` is a subset of `cide_task_update`, on purpose
 //!
@@ -132,14 +135,15 @@
 //! fact that lets a reader — a model or a person — weigh a line, and a log of anonymous
 //! assertions is a log an agent has no way to be sceptical about.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use cide_ipc::{
-    AgentDef, AgentId, AgentRun, ChangeName, Harness, LinkType, RunId, RunState, Task, TaskAuthor,
-    TaskEdit, TaskId, TaskLinkSpec, TaskStatus,
+    AgentDef, AgentId, AgentRun, AttachTarget, AttachmentKind, ChangeName, Harness, LinkType,
+    RunId, RunNotify, RunState, Task, TaskAttachment, TaskAuthor, TaskEdit, TaskId, TaskLinkSpec,
+    TaskStatus,
     agents::{AgentDraft, AgentField, AgentScope},
 };
 
@@ -167,6 +171,9 @@ pub mod tool {
     pub const TASK_LINK: &str = "cide_task_link";
     /// Tombstone one edge, named by the same `(link, target)` pair [`TASK_GET`] shows.
     pub const TASK_UNLINK: &str = "cide_task_unlink";
+    /// Files onto a task's body, by path. The comment road is [`TASK_COMMENT`]'s
+    /// `attachments`. (M39)
+    pub const TASK_ATTACH: &str = "cide_task_attach";
 
     /// The roles this project defines, and how each one is doing. The "what agents do I have"
     /// answer, and the call a product owner makes before any of the four below.
@@ -205,6 +212,7 @@ pub mod tool {
         TASK_ASSIGN,
         TASK_LINK,
         TASK_UNLINK,
+        TASK_ATTACH,
     ];
 
     /// The orchestration vocabulary, served to a project's **primary session only**.
@@ -227,7 +235,7 @@ pub mod tool {
     ///
     /// Spelled out rather than concatenated, because a `const fn` concatenation of two slices is
     /// not expressible and a `Vec` would give up the `&'static [&'static str]` that lets a
-    /// connection's allow-list be a borrowed slice. `the_fifteen_are_the_only_fifteen` is what
+    /// connection's allow-list be a borrowed slice. `the_sixteen_are_the_only_sixteen` is what
     /// keeps the three lists from drifting — a name added to either family and forgotten here is
     /// a test failure, not a tool nobody is served.
     pub const EVERY: &[&str] = &[
@@ -239,6 +247,7 @@ pub mod tool {
         TASK_ASSIGN,
         TASK_LINK,
         TASK_UNLINK,
+        TASK_ATTACH,
         AGENTS_LIST,
         AGENT_CREATE,
         AGENT_UPDATE,
@@ -272,6 +281,32 @@ const STATUSES: &[TaskStatus] = &[
 /// The harnesses, as a slice, for [`STATUSES`]' reason: the schema's `enum` and the parser must
 /// be the same set by construction. (M33)
 const HARNESSES: &[Harness] = &[Harness::Claude, Harness::Opencode];
+
+/// Where a dispatched run's turn endings are announced, as `cide_agent_dispatch` spells it. (M40)
+///
+/// The tool's own vocabulary rather than `cide_ipc::RunNotify`, because the two differ in the one
+/// way that matters: [`Self::Here`] names *the session making the call*, which this crate never
+/// knows — only the [`AgentSink`] behind the socket does, and it is what turns `Here` into a
+/// `RunNotify::Session`. A wire value here would have the model naming session ids, which is
+/// the identity-in-the-payload shape `cide_app::agent_rpc`'s header forbids.
+///
+/// `Here` is the default: whoever asked for a run is who is waiting for it. For the project's
+/// primary pane that is unchanged behaviour; for any other Claude pane it is the difference
+/// between hearing and not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Notify {
+    /// This session — the Claude pane whose connection made the call.
+    #[default]
+    Here,
+    /// The project's primary Claude pane, whichever conversation it holds by then.
+    Main,
+    /// Nobody. The caller will poll `cide_agent_runs` and read the task.
+    None,
+}
+
+/// Every [`Notify`], in the order the schema's `enum` lists them. [`STATUSES`]' rule: the schema
+/// is built from this and the parser accepts exactly this, so they cannot disagree.
+const NOTIFIES: &[Notify] = &[Notify::Here, Notify::Main, Notify::None];
 
 /// The four scopes a definition can live in, as a slice, for [`STATUSES`]' reason. (M33)
 ///
@@ -385,6 +420,11 @@ pub trait TaskSink: Send + Sync {
     /// `links` is a parameter for the sharper version of the same interleaving (M30): a creation
     /// naming an assignee dispatches, and a `blockedBy` edge attached one call later is a gate
     /// the trigger could never have seen. An empty slice means none.
+    ///
+    /// `attachments` are source paths, already resolved against [`Self::cwd`], copied under the
+    /// new task before it is answered — `TaskNew::attachments`' reason: one task, broadcast once
+    /// with its files. A refused file takes the creation with it, so a retry does not mint a
+    /// second task beside a first that has none. (M39)
     fn create(
         &self,
         title: &str,
@@ -392,6 +432,7 @@ pub trait TaskSink: Send + Sync {
         agent: Option<&AgentId>,
         change: Option<&ChangeName>,
         links: &[TaskLinkSpec],
+        attachments: &[PathBuf],
     ) -> Result<Task, String>;
 
     /// Apply one change. The author of a [`TaskEdit::Comment`] is **not** a parameter — it is
@@ -399,6 +440,36 @@ pub trait TaskSink: Send + Sync {
     /// [`TaskEdit::Comment`]'s own doc gives: identity comes from the child's environment, never
     /// from a payload the caller composes, or an agent can sign a comment as the user.
     fn edit(&self, id: &TaskId, edit: TaskEdit) -> Result<Task, String>;
+
+    /// The project root the tracker was opened under: the base of every attachment's path.
+    /// (M39)
+    ///
+    /// Here so a render can print an **absolute** path for each attachment — the one thing an
+    /// agent can do with a file the user attached is `Read` it, and a path relative to a root it
+    /// was never told is a path it cannot read.
+    fn root(&self) -> &Path;
+
+    /// Where a relative path in an argument is read from. (M39)
+    ///
+    /// A dispatched run's working directory is its **worktree**, under `.cide/worktrees/`, and
+    /// the file it just wrote with its own tools is relative to that — not to the project root
+    /// the tracker lives under. The app knows the run's cwd and hands it through; a console
+    /// pane's sink answers the project root, which is the pane's own cwd. Absolute paths — what
+    /// a model's own tools normally report — never touch this.
+    fn cwd(&self) -> &Path;
+
+    /// Copy files under a task and record them where `target` says. (M39)
+    ///
+    /// The paths have already been resolved against [`Self::cwd`]; the store validates them —
+    /// regular file, under the cap, readable — and refuses the whole call before it copies any,
+    /// so a comment born with three screenshots lands with three or not at all. The author is
+    /// the connection's, as for [`Self::edit`].
+    fn attach(
+        &self,
+        id: &TaskId,
+        target: AttachTarget,
+        sources: &[PathBuf],
+    ) -> Result<Task, String>;
 }
 
 /// What [`tool::AGENT_INTEGRATE`] did, or refused to do.
@@ -489,15 +560,23 @@ pub trait AgentSink: Send + Sync {
     /// the product owner mid-turn — with the frozen session being the only thing that could have
     /// stopped it.
     ///
-    /// `task` is required and `instructions` is not, which is finding 8's shape: the run is
-    /// *pointed at* its task rather than handed it, so the statement of the work reaches the
+    /// With a task, `instructions` is optional and one line, which is finding 8's shape: the run
+    /// is *pointed at* its task rather than handed it, so the statement of the work reaches the
     /// model through `cide_task_get` — inside [`preamble`]'s fence — instead of sitting raw in
     /// the prompt position where another agent's prose reads as the user's own instruction.
+    /// Without a task (M40) `instructions` *is* the brief, and that is acceptable for the one
+    /// reason it was not before: the words are the calling session's own, not another agent's
+    /// prose out of a tracker. It stays one line — `cmd::agents::opening_prompt` flattens it —
+    /// and such a run stands in the project root, with `crate::run_checkout` as the rule.
+    ///
+    /// `notify` is where the run's turn endings are announced. The sink resolves
+    /// [`Notify::Here`] to the connection's own session, which only it knows.
     fn dispatch(
         &self,
         agent: &AgentId,
-        task: &TaskId,
+        task: Option<&TaskId>,
         instructions: Option<&str>,
+        notify: Notify,
     ) -> Result<RunId, String>;
 
     /// End a run. Idempotent on one that has already finished.
@@ -507,9 +586,11 @@ pub trait AgentSink: Send + Sync {
     fn stop(&self, run: RunId, reason: Option<&str>) -> Result<(), String>;
 
     /// Merge one of the role's worktree branches into the branch the project root has checked
-    /// out: `cide/<agent>-<task>` when a task is named, `cide/<agent>` — the branch its
-    /// taskless dispatches commit to — when not. Worktrees are per (role, task), so the task
-    /// is what picks the branch holding the work being taken.
+    /// out: `cide/<agent>-<task>` when a task is named, `cide/<agent>` when not — the base
+    /// branch task-less dispatches committed to before M40, when they still took a worktree.
+    /// Worktrees are per (role, task), so the task is what picks the branch holding the work
+    /// being taken; a run dispatched without a task now works in the project root and has
+    /// nothing here to integrate.
     fn integrate(&self, agent: &AgentId, task: Option<&TaskId>) -> Result<Integrated, String>;
 
     /// Now, in epoch milliseconds.
@@ -535,9 +616,25 @@ pub trait AgentSink: Send + Sync {
     /// clamp is gone (worktrees are per **task** now, so the declared number is the true one),
     /// and what the flag feeds instead is the list's *ground* sentence: where a run stands —
     /// its own `.cide/worktrees/<role>-<task>` checkout, or the shared project root — which is
-    /// what an orchestrator needs for integrate branch names and for knowing that a taskless
-    /// dispatch of a busy role serialises on the base checkout.
+    /// what an orchestrator needs for integrate branch names, and for knowing that a dispatch
+    /// with no task stands in the project root beside it (M40) rather than anywhere it could
+    /// integrate from.
     fn isolated(&self) -> Result<bool, String>;
+
+    /// Whether the queue will start anything new for this project — `false` while it is paused.
+    ///
+    /// The fact `cide_ipc::AgentRoster::Ready::dispatching` already carries to the panel, made
+    /// available to the tools that speak for the same queue. Without it `cide_agent_dispatch`
+    /// answered "Dispatched … call cide_agent_runs to see how it is getting on" for a run that
+    /// could not start, `cide_agents_list` called every role `ready`, and the only signal anywhere
+    /// was a `[queued]` with no reason.
+    ///
+    /// A `Result` like its neighbours, and for their reason: a project whose roster cannot be read
+    /// has no answer to this, and inventing `true` would put the confident sentence on the
+    /// uncertain case. There is deliberately no way to *change* it from here — see the module
+    /// header on why there is no `cide_agent_resume`; a pause is a person's gesture and a model
+    /// that could lift it could lift the one taken to stop it.
+    fn dispatching(&self) -> Result<bool, String>;
 }
 
 // --- what `tools/list` says --------------------------------------------------------------------
@@ -549,7 +646,7 @@ pub trait AgentSink: Send + Sync {
 /// `cide_ide_mcp::tools`'s rule, and its `every_advertised_tool_has_a_schema_and_a_description`
 /// has a twin below.
 ///
-/// **All fifteen, always.** The per-connection filtering is `cide_app::agent_rpc`'s
+/// **All sixteen, always.** The per-connection filtering is `cide_app::agent_rpc`'s
 /// `descriptors_for`, which keeps this order and drops what the connection may not call: one
 /// definition of each tool, and the scope decided in exactly one place.
 pub fn descriptors() -> Vec<Value> {
@@ -578,8 +675,10 @@ pub fn description(name: &str) -> &'static str {
              body and comments."
         }
         tool::TASK_GET => {
-            "Read one task in full: its body and its whole comment log, with the author of every \
-             comment."
+            "Read one task in full: its body, its attachments, and its whole comment log with \
+             the author of every comment and the files on each. Every attachment is listed with \
+             its absolute path, so a file the user attached — a screenshot, a design, a log — \
+             can be read from there."
         }
         tool::TASK_CREATE => {
             "Add a task to this project's tracker. It starts in the `todo` status. Give it a \
@@ -587,18 +686,21 @@ pub fn description(name: &str) -> &'static str {
              work is an OpenSpec change, name it in `change` — a run started on that task is \
              pointed at its proposal, design and task checklist. `links` records edges to \
              existing tasks at creation — name a `blockedBy` link here rather than adding it \
-             afterwards, so the task is never dispatchable before its blocker is known."
+             afterwards, so the task is never dispatchable before its blocker is known. \
+             `attachments` are files to put on the task's body as it is created, by path."
         }
         tool::TASK_UPDATE => {
             // Third person deliberately, here and in TASK_ASSIGN: `tool::ALL` serves these to
             // dispatched runs as well as to the product owner, and a run's own assign records
             // intent only (the author gate in `crate::autodispatch`) — a first-person "this
             // starts the agent" would be a lie to half this description's readers.
-            "Change a task's title, body, status or assigned role. Only the fields you send are \
-             changed. To record *why* something changed, add a comment as well — the tracker is \
-             read by the user and by the other agents. When subagents are enabled, an assignment \
-             made by the user or the product owner also starts that role on the task. `change` \
-             links the task to an OpenSpec change, or unlinks it when null."
+            "Change a task's title, body, status or assigned role, or add files to it. Only the \
+             fields you send are changed. To record *why* something changed, add a comment as \
+             well — the tracker is read by the user and by the other agents. When subagents are \
+             enabled, an assignment made by the user or the product owner also starts that role \
+             on the task. `change` links the task to an OpenSpec change, or unlinks it when null. \
+             `attachments` puts files on the task's body by path — the same as cide_task_attach; \
+             files already attached stay."
         }
         tool::TASK_COMMENT => {
             "Append an entry to a task's log: what you did, what you found, or why you are \
@@ -624,6 +726,16 @@ pub fn description(name: &str) -> &'static str {
         tool::TASK_UNLINK => {
             "Remove one link between two tasks. Name the same `link` kind and `target` that \
              cide_task_get shows on either task."
+        }
+        tool::TASK_ATTACH => {
+            "Attach one or more files to a task: a design you produced, a log the next run \
+             should start from, a screenshot of what you saw. `paths` are the paths your own \
+             tools report; a relative one is read from your working directory. An image is \
+             drawn as a preview on the task's card and anything else as a named file a person \
+             can open. cide_task_get lists every attachment with its absolute path, so a file \
+             the user attached can be read the same way. This is the same as the `attachments` \
+             field of cide_task_update and exists because it is the common call. To attach files \
+             to a report rather than to the task itself, use `attachments` on cide_task_comment."
         }
         tool::AGENTS_LIST => {
             "The subagent roles this project defines and can hand work to: what each one is for, \
@@ -655,21 +767,34 @@ pub fn description(name: &str) -> &'static str {
              definition that is in effect, which is the one cide_agents_list shows you."
         }
         tool::AGENT_DISPATCH => {
-            "Hand one of this project's roles a task to work on. Create the task first with \
-             cide_task_create and put the statement of the work in its body: the run is pointed \
-             at the task and reads it itself. This returns a run id **immediately** and does not \
-             wait for the run — carry on, and use cide_agent_runs to see how it is getting on. A \
-             dispatch past a role's concurrency is queued rather than refused. Not needed after \
-             an assignment — assigning a task already starts the role — so reach for this to \
-             re-run a role or to add a one-line extra instruction. `instructions` is a single \
-             line by design (it is typed into a terminal): anything longer — context, \
-             constraints, acceptance criteria — belongs in the task's body, which the run reads \
-             in full."
+            "Start one of this project's roles on some work. **The ordinary road is a task**: \
+             create it first with cide_task_create and put the statement of the work in its \
+             body — the run is pointed at the task, reads it itself, works in its own worktree \
+             and reports back through the task's comments. Not needed after an assignment \
+             (assigning a task already starts the role), so with a task this is for re-running \
+             a role or adding a one-line extra `instructions`. **The exception is a run with no \
+             task**: leave `task` out and put the whole brief in `instructions`, for a quick \
+             check, a test run, or a small piece of work not worth a task. Such a run stands in \
+             the project root beside you — no worktree, no branch, nothing to integrate, nothing \
+             on the board — so its only result is what it changed in the tree and what it said \
+             in its pane; if you need to *read* the outcome, make a task instead, and keep it \
+             clear of files you or another run are editing. Either way this returns a run id \
+             **immediately** and does not wait — carry on, and watch with cide_agent_runs. A \
+             dispatch past a role's concurrency is queued rather than refused. `instructions` \
+             is a single line by design (it is typed into a terminal): anything longer — \
+             context, constraints, acceptance criteria — belongs in a task's body. `notify` says \
+             where cide announces the run's turn endings: `here` (this pane, the default), \
+             `main` (the project's primary Claude pane) or `none` (nothing is typed anywhere — \
+             then cide_agent_runs with includeFinished, and the task's comments, are how you \
+             check on it)."
         }
         tool::AGENT_RUNS => {
             "What this project's subagents are doing: one row per run, with the task it is on, \
-             what it is doing now, and how long it has been going. Finished and failed runs are \
-             left out unless you ask for them."
+             what it is doing now, how long it has been going, and — once it has ended or handed \
+             its turn back — where to read what it did. A run dispatched with `notify: none` \
+             never announces itself (its row says `quiet`), so this list with includeFinished \
+             and the task's comments are the only way to check on it. Finished and failed runs \
+             are left out unless you ask for them."
         }
         tool::AGENT_STOP => {
             "End a run: cancel it if it is still queued, kill its child if it is working. Reach \
@@ -679,11 +804,12 @@ pub fn description(name: &str) -> &'static str {
         }
         tool::AGENT_INTEGRATE => {
             "Take a role's finished work back into the branch this project has checked out, by \
-             merging its worktree branch — `cide/<agent>-<task>` when you name the task (each \
-             task works in its own worktree, so name it whenever the work was on one), \
-             `cide/<agent>` for a run dispatched without a task. Do this once you have read \
-             what the run did. On a conflict **nothing is changed** and the conflicting paths \
-             come back, so you can hand them to a role as a new task."
+             merging its worktree branch — `cide/<agent>-<task>`, so name the task: each task \
+             works in its own worktree. A run dispatched *without* a task works in the project \
+             root and has nothing to integrate; omitting `task` merges `cide/<agent>`, which only \
+             holds work left there by an older cide. Do this once you have read what the run \
+             did. On a conflict **nothing is changed** and the conflicting paths come back, so \
+             you can hand them to a role as a new task."
         }
         // Unreachable while `descriptors` walks `ALL`, and empty rather than a placeholder: a
         // tool advertised with a made-up sentence is worse than the test failure below.
@@ -781,6 +907,14 @@ pub fn input_schema(name: &str) -> Value {
                          link here rather than in a follow-up cide_task_link, so the task is \
                          never dispatchable before its blocker is known.",
                 },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description":
+                        "Files to put on the task's body, as paths — the paths your own tools \
+                         report; a relative one is read from your working directory. Each must \
+                         be a regular file of 32 MiB or less. Absent means none.",
+                },
             },
             "required": ["title"],
         }),
@@ -815,6 +949,14 @@ pub fn input_schema(name: &str) -> Value {
                         "The OpenSpec change this task implements. Omit to leave it alone; null \
                          to unlink it.",
                 },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description":
+                        "Files to put on the task's body, as paths — the paths your own tools \
+                         report; a relative one is read from your working directory. Each must \
+                         be a regular file of 32 MiB or less. Files already on the task stay. Absent means none.",
+                },
             },
             "required": ["id"],
         }),
@@ -834,6 +976,14 @@ pub fn input_schema(name: &str) -> Value {
                          for a list, ``` for code, and one newline is one line break. A report \
                          with more than a couple of parts should use them — this is read by a \
                          person in a narrow card, not parsed.",
+                },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description":
+                        "Files to attach to this comment, as paths — the paths your own tools \
+                         report; a relative one is read from your working directory. The comment \
+                         and its files land together or not at all. Absent means none.",
                 },
             },
             "required": ["id", "text"],
@@ -874,6 +1024,23 @@ pub fn input_schema(name: &str) -> Value {
                 },
             },
             "required": ["id", "link", "target"],
+        }),
+        tool::TASK_ATTACH => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "A task id, e.g. `t-17`." },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description":
+                        "The files to attach, as paths — the paths your own tools report; a \
+                         relative one is read from your working directory. Each must be a \
+                         regular file of 32 MiB or less; the whole call is refused before any \
+                         file is copied if one is not.",
+                },
+            },
+            "required": ["id", "paths"],
         }),
         // No arguments at all. An empty `properties` rather than none, so a client that renders
         // the schema shows a call with nothing to fill in rather than a call it cannot describe.
@@ -962,19 +1129,33 @@ pub fn input_schema(name: &str) -> Value {
                 "task": {
                     "type": "string",
                     "description":
-                        "The id of the task this run is to work on, e.g. `t-17`. Required: the \
-                         run is pointed at the task and reads it with cide_task_get, so the \
-                         statement of the work belongs in the task's body rather than here.",
+                        "The id of the task this run is to work on, e.g. `t-17` — the ordinary \
+                         case. The run is pointed at the task and reads it with cide_task_get, \
+                         so the statement of the work belongs in the task's body rather than \
+                         here. Leave it out only for a quick run with no task (a check, a test, \
+                         a small direct piece of work), which then stands in the project root \
+                         and takes its whole brief from `instructions`.",
                 },
                 "instructions": {
                     "type": "string",
                     "description":
-                        "One extra sentence for this run, on top of the task. Keep it to a line \
-                         — it is typed into the run's terminal, where a newline would submit it \
-                         as a turn of its own.",
+                        "With a task: one extra sentence for this run, on top of it. Without a \
+                         task: the whole brief, and required. Keep it to a line either way — it \
+                         is typed into the run's terminal, where a newline would submit it as a \
+                         turn of its own.",
+                },
+                "notify": {
+                    "type": "string",
+                    "enum": NOTIFIES.iter().map(|n| notify_wire(*n)).collect::<Vec<_>>(),
+                    "description":
+                        "Where cide announces the run's turn endings, as one line typed into \
+                         that Claude pane when it is idle. `here` (default): this session. \
+                         `main`: the project's primary Claude pane. `none`: nothing is typed \
+                         anywhere — check with cide_agent_runs (includeFinished: true) and read \
+                         the task's comments yourself.",
                 },
             },
-            "required": ["agent", "task"],
+            "required": ["agent"],
         }),
         tool::AGENT_RUNS => json!({
             "type": "object",
@@ -1019,9 +1200,9 @@ pub fn input_schema(name: &str) -> Value {
                     "type": "string",
                     "description":
                         "The task whose branch to merge, e.g. `t-14` — a task's work lives on \
-                         `cide/<agent>-<task>` in its own worktree, so name the task whenever \
-                         the run was on one. Omit only for a run dispatched without a task, \
-                         whose work is on `cide/<agent>`.",
+                         `cide/<agent>-<task>` in its own worktree. A run dispatched without a \
+                         task works in the project root and has nothing to integrate; omit this \
+                         only to merge `cide/<agent>`, a base branch left by an older cide.",
                 },
             },
             "required": ["agent"],
@@ -1165,6 +1346,7 @@ pub fn dispatch(name: &str, arguments: &Value, sink: &dyn TaskSink) -> Option<To
         tool::TASK_ASSIGN => Some(task_assign(arguments, sink)),
         tool::TASK_LINK => Some(task_link(arguments, sink)),
         tool::TASK_UNLINK => Some(task_unlink(arguments, sink)),
+        tool::TASK_ATTACH => Some(task_attach(arguments, sink)),
         _ => None,
     }
 }
@@ -1239,7 +1421,7 @@ fn task_get(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_GET)),
     };
     match all.iter().find(|task| task.id == id) {
-        Some(task) => ToolResult::text(fenced(&render_full(task, &all))),
+        Some(task) => ToolResult::text(fenced(&render_full(task, &all, sink.root()))),
         None => ToolResult::error(no_such(&id)),
     }
 }
@@ -1289,8 +1471,19 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Ok(value) => value,
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
     };
+    let attachments = match optional_paths(arguments, "attachments", sink.cwd()) {
+        Ok(paths) => paths,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+    };
 
-    match sink.create(&title, &body, agent.as_ref(), change.as_ref(), &links) {
+    match sink.create(
+        &title,
+        &body,
+        agent.as_ref(),
+        change.as_ref(),
+        &links,
+        &attachments,
+    ) {
         Ok(task) => {
             let all = match board_for_render(tool::TASK_CREATE, sink) {
                 Ok(all) => all,
@@ -1299,7 +1492,7 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Created {}.\n{}",
                 task.id,
-                fenced(&render_full(&task, &all))
+                fenced(&render_full(&task, &all, sink.root()))
             ))
         }
         Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
@@ -1370,11 +1563,18 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         }),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
     }
+    // Files onto the body, last in the sequence: the same road as `cide_task_attach`, here
+    // because a run that has just written a file and moves the task to `review` in one breath
+    // should be able to hand the file over in the same call. (M39)
+    let attachments = match optional_paths(arguments, "attachments", sink.cwd()) {
+        Ok(paths) => paths,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+    };
 
-    if edits.is_empty() {
+    if edits.is_empty() && attachments.is_empty() {
         return ToolResult::error(format!(
-            "{}: nothing to change. Send at least one of `title`, `body`, `status`, `assignee` \
-             or `change`.",
+            "{}: nothing to change. Send at least one of `title`, `body`, `status`, `assignee`, \
+             `change` or `attachments`.",
             tool::TASK_UPDATE
         ));
     }
@@ -1394,6 +1594,12 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
         }
     }
+    if !attachments.is_empty() {
+        match sink.attach(&id, AttachTarget::Task, &attachments) {
+            Ok(task) => last = Some(task),
+            Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+        }
+    }
 
     match last {
         Some(task) => {
@@ -1404,7 +1610,7 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Updated {}.\n{}",
                 task.id,
-                fenced(&render_full(&task, &all))
+                fenced(&render_full(&task, &all, sink.root()))
             ))
         }
         // Unreachable: `edits` was checked non-empty above and the loop returns on the first
@@ -1429,8 +1635,20 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             tool::TASK_COMMENT
         ));
     }
+    let attachments = match optional_paths(arguments, "attachments", sink.cwd()) {
+        Ok(paths) => paths,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_COMMENT)),
+    };
 
-    match sink.edit(&id, TaskEdit::Comment { text }) {
+    // One call either way. With files, the comment and its attachments are one mutation in the
+    // store — `AttachTarget::NewComment`'s reason: a refused path must not leave a comment
+    // behind that names files it does not have. (M39)
+    let outcome = if attachments.is_empty() {
+        sink.edit(&id, TaskEdit::Comment { text })
+    } else {
+        sink.attach(&id, AttachTarget::NewComment { text }, &attachments)
+    };
+    match outcome {
         // The whole task comes back rather than an acknowledgement, so an agent that comments as
         // its turn ends sees what the task now says — including any comment another agent added
         // while it was working, which is the only way it would ever find out.
@@ -1442,7 +1660,7 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Commented on {}.\n{}",
                 task.id,
-                fenced(&render_full(&task, &all))
+                fenced(&render_full(&task, &all, sink.root()))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_COMMENT, &id, &why)),
@@ -1516,7 +1734,7 @@ fn task_link(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 task.id,
                 link_wire(link),
                 target,
-                fenced(&render_full(&task, &all))
+                fenced(&render_full(&task, &all, sink.root()))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_LINK, &id, &why)),
@@ -1550,7 +1768,7 @@ fn task_unlink(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 task.id,
                 link_wire(link),
                 target,
-                fenced(&render_full(&task, &all))
+                fenced(&render_full(&task, &all, sink.root()))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_UNLINK, &id, &why)),
@@ -1586,6 +1804,36 @@ fn required_edge(arguments: &Value, tool: &str) -> Result<(LinkType, TaskId), To
 ///
 /// The sink's error is a sentence rather than a tag ([`TaskSink`] says why), so the missing-task
 /// case cannot be branched on here. Naming both possibilities is honest and still actionable.
+/// `cide_task_attach`: files onto the body. (M39)
+///
+/// The comment road is `cide_task_comment`'s `attachments`; this one is for a file that belongs
+/// to the task itself — a design an agent produced, a log the next run should start from.
+fn task_attach(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
+    let id = match required_id(arguments, tool::TASK_ATTACH) {
+        Ok(id) => id,
+        Err(result) => return result,
+    };
+    let paths = match required_paths(arguments, "paths", sink.cwd()) {
+        Ok(paths) => paths,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_ATTACH)),
+    };
+    match sink.attach(&id, AttachTarget::Task, &paths) {
+        Ok(task) => {
+            let all = match board_for_render(tool::TASK_ATTACH, sink) {
+                Ok(all) => all,
+                Err(result) => return result,
+            };
+            ToolResult::text(format!(
+                "Attached {} file(s) to {}.\n{}",
+                paths.len(),
+                task.id,
+                fenced(&render_full(&task, &all, sink.root()))
+            ))
+        }
+        Err(why) => ToolResult::error(edit_failure(tool::TASK_ATTACH, &id, &why)),
+    }
+}
+
 fn edit_failure(tool: &str, id: &TaskId, why: &str) -> String {
     format!(
         "{tool}: could not change {id}: {why}. Call {} to check the id.",
@@ -1664,15 +1912,27 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
     let live = runs.iter().filter(|run| is_live(&run.state)).count();
     // Where a run stands is planning information: an orchestrator fanning a role out across
     // tasks needs to know each task gets its own checkout (and which branch to integrate),
-    // and that a task*less* dispatch of a busy role serialises on the base worktree.
+    // and that a dispatch with *no* task lands in the project root beside it (M40), with
+    // nothing to integrate and nothing keeping two such runs apart.
     let ground = if isolated {
-        " Each task runs in its own worktree (branch cide/<role>-<task>); dispatches without \
-         a task share the role's base worktree one at a time."
+        " Each task runs in its own worktree (branch cide/<role>-<task>); a dispatch without a \
+         task runs in the project root, on your branch, with nothing to integrate."
     } else {
         " Runs share the project root (isolation: shared)."
     };
+    // The queue's state, said once at the top rather than on every role: it is a fact about the
+    // project, and repeating it per row would read as a property of each role. A read failure
+    // drops the clause — the roster is still worth printing, and this is the least of what it
+    // says. Before this, a paused project's roster called every role `ready` while nothing it
+    // listed could start.
+    let queue = match sink.dispatching() {
+        Ok(false) => {
+            " This project's agents are paused: a dispatch is accepted and queued, but                        nothing starts until a person resumes them in the Agents panel."
+        }
+        Ok(true) | Err(_) => "",
+    };
     let header = format!(
-        "{} role(s) defined, {live} run(s) live.{ground}",
+        "{} role(s) defined, {live} run(s) live.{ground}{queue}",
         agents.len()
     );
 
@@ -2040,36 +2300,107 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(agent) => agent,
         Err(result) => return result,
     };
-    let task = match required_string(arguments, "task") {
+    let task = match optional_string(arguments, "task") {
         Ok(value) => value,
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
     };
-    if task.trim().is_empty() {
-        // Checked rather than passed on, because the sink's refusal for a blank id would be a
-        // sentence about a task that does not exist, and the fix is not "make that task" — it is
-        // "name one, or create one first".
+    // A task that is *present and blank* is still refused, and separately from a task that is
+    // absent: an empty string is a typo or a template left unfilled, and the fix is "name one,
+    // or create one first" — not the task-less road, which nobody asks for by accident. Checked
+    // here rather than passed on, because the sink's refusal for a blank id would be a sentence
+    // about a task that does not exist.
+    if task.as_deref().is_some_and(|task| task.trim().is_empty()) {
         return ToolResult::error(format!(
             "{}: `task` is blank. Name the task this run is to work on, or create one with {} \
-             first.",
+             first — or leave `task` out and put the whole brief in `instructions` for a quick \
+             run with no task.",
             tool::AGENT_DISPATCH,
             tool::TASK_CREATE
         ));
     }
     let instructions = match optional_string(arguments, "instructions") {
-        Ok(value) => value,
+        Ok(value) => value.filter(|text| !text.trim().is_empty()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
+    };
+    // No task and nothing to do is refused at the gesture, with both roads named: `plan_dispatch`
+    // would refuse it too ("this run has nothing to do"), but its sentence does not know which
+    // tool the caller is holding. (M40)
+    if task.is_none() && instructions.is_none() {
+        return ToolResult::error(format!(
+            "{}: name a `task` for this run — the ordinary road; create one with {} first — or, \
+             for a quick run with no task, give it a one-line `instructions`. Neither was given.",
+            tool::AGENT_DISPATCH,
+            tool::TASK_CREATE
+        ));
+    }
+    let notify = match optional_string(arguments, "notify") {
+        Ok(None) => Notify::default(),
+        Ok(Some(text)) => match notify_from_wire(&text) {
+            Some(notify) => notify,
+            None => {
+                return ToolResult::error(format!(
+                    "{}: `notify` must be one of {}, not `{}`.",
+                    tool::AGENT_DISPATCH,
+                    NOTIFIES
+                        .iter()
+                        .map(|n| format!("`{}`", notify_wire(*n)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    one_line(&text)
+                ));
+            }
+        },
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
     };
 
-    match sink.dispatch(&agent, &TaskId(task.clone()), instructions.as_deref()) {
-        // Deliberately does not claim the run has started. It has been *enqueued* — a role works
-        // in one worktree and therefore on one task at a time — and a sentence saying "started"
-        // would have a model watching for output that is minutes away.
-        Ok(run) => ToolResult::text(format!(
-            "Dispatched `{agent}` on {task}. Run {run}.\nNothing waits on it: a role works on \
-             one task at a time, so this may be queued behind work already in flight. Call {} to \
-             see how it is getting on, and read what it did in the task's comments.",
-            tool::AGENT_RUNS
-        )),
+    let task = task.map(TaskId);
+    // Said in the answer so the model knows what it agreed to; `none` in particular is a choice
+    // that only makes sense if the caller remembers having made it.
+    let announced = match notify {
+        Notify::Here => "Its turn endings will be announced here.",
+        Notify::Main => "Its turn endings will be announced in the project's primary Claude pane.",
+        Notify::None => {
+            "Nothing will announce its turn endings — poll cide_agent_runs (includeFinished: true)."
+        }
+    };
+    // Read before the dispatch so the answer can say what will actually happen to it. A failure
+    // to read it is not a failure to dispatch: the clause is dropped and the ordinary sentence
+    // stands, which is the same answer this tool gave for its whole life.
+    let held = match sink.dispatching() {
+        Ok(dispatching) => !dispatching,
+        Err(_) => false,
+    };
+    // Said *first* in the paragraph below when it applies, because it changes what every other
+    // sentence means: "call cide_agent_runs to see how it is getting on" is advice to poll a row
+    // that will not move, and a model given it polls until it gives up or invents a reason.
+    let paused = match held {
+        true => {
+            " This project's agents are paused, so it will not start — and nothing a tool here                  can call will resume it; a person does that in the Agents panel. It keeps its                  place in the queue and starts when they do."
+        }
+        false => "",
+    };
+    match sink.dispatch(&agent, task.as_ref(), instructions.as_deref(), notify) {
+        // Deliberately does not claim the run has started. It has been *enqueued* — behind the
+        // role's concurrency, or behind another run in the same checkout — and a sentence saying
+        // "started" would have a model watching for output that is minutes away.
+        Ok(run) => match task {
+            Some(task) => ToolResult::text(format!(
+                "Dispatched `{agent}` on {task}. Run {run}.\nNothing waits on it: it may be \
+                 queued behind the role's other runs. Call {} to see how it is getting on, and \
+                 read what it did in the task's comments. {announced}{paused}",
+                tool::AGENT_RUNS
+            )),
+            // The task-less road says where the run stands and what it will *not* do, because
+            // both differ from every other run the caller has seen: no worktree to integrate
+            // from, and no task for a report to land on.
+            None => ToolResult::text(format!(
+                "Dispatched `{agent}` with no task. Run {run}.\nIt stands in the project root — \
+                 no worktree, no branch, nothing to integrate — and nothing about it reaches \
+                 the board: its result is what it changes in the tree and what it says in its \
+                 pane. Nothing waits on it; call {} to see how it is getting on. {announced}{paused}",
+                tool::AGENT_RUNS
+            )),
+        },
         Err(why) => ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
     }
 }
@@ -2111,6 +2442,17 @@ fn agent_runs(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         )
     } else {
         format!("{} run(s).", matched.len())
+    };
+    // Beside the "finished runs hidden" line and for its reason: both name something about the
+    // list the rows themselves cannot say. Each queued row carries the pause in its own note
+    // (`AgentRegistry::runs_for`), but a caller looking at a list where *everything* is held
+    // should not have to infer the project's state from a repeated per-row clause.
+    let header = match sink.dispatching() {
+        Ok(false) => format!(
+            "{header} This project's agents are paused: queued runs stay queued until a person \
+             resumes them in the Agents panel.",
+        ),
+        Ok(true) | Err(_) => header,
     };
 
     let mut body = String::new();
@@ -2160,9 +2502,9 @@ fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(agent) => agent,
         Err(result) => return result,
     };
-    // Optional, because a taskless dispatch's work lives on the role's base branch — but with
-    // per-task worktrees the task is almost always the right thing to name, and the schema
-    // says so.
+    // Optional, for the base branch `cide/<agent>` an older cide's task-less dispatches committed
+    // to — a run without a task works in the project root since M40 and has nothing here to
+    // merge, so the task is the thing to name and the schema says so.
     let task = match optional_string(arguments, "task") {
         Ok(task) => task.filter(|task| !task.trim().is_empty()).map(TaskId),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_INTEGRATE)),
@@ -2215,8 +2557,8 @@ fn required_role(arguments: &Value, key: &str, tool: &str) -> Result<AgentId, To
 ///
 /// The one definition of "live" in this module, used by both the roster's per-role count and the
 /// run list's default filter. `Paused` counts as live deliberately: a frozen run still holds its
-/// role's worktree, so a caller told it was not live would dispatch into a checkout somebody
-/// else's process is sitting in.
+/// checkout (or its place in the project root), so a caller told it was not live would dispatch
+/// into a directory somebody else's process is sitting in.
 fn is_live(state: &RunState) -> bool {
     !matches!(state, RunState::Finished { .. } | RunState::Failed { .. })
 }
@@ -2239,6 +2581,24 @@ fn render_run(run: &AgentRun, now: u64) -> String {
     }
     if let Some(note) = run.note.as_deref().map(one_line).filter(|n| !n.is_empty()) {
         line.push_str(&format!(" | {note}"));
+    }
+    // A run that will never announce itself says so on its row, because the caller that chose
+    // `notify: none` is the one reading this list to find out — and a row that looked like every
+    // other would have it waiting for a knock that is not coming. (M40)
+    if run.notify == RunNotify::Silent {
+        line.push_str(" | quiet");
+    }
+    // And once there is something to read, where: the task's comments for a run on a task, the
+    // tree itself for one dispatched without — that run has no other channel, and the list is
+    // the one place the orchestrator hears that its work is in the root.
+    if matches!(
+        run.state,
+        RunState::Finished { .. } | RunState::Failed { .. } | RunState::Idle
+    ) {
+        line.push_str(&match &run.task {
+            Some(task) => format!(" | read {task}'s comments"),
+            None => " | its edits are in the project root".to_string(),
+        });
     }
     line.push('\n');
     line
@@ -2322,6 +2682,26 @@ fn harness_wire(harness: Harness) -> &'static str {
 /// The inverse, through serde for [`status_from_wire`]'s reason. (M33)
 fn harness_from_wire(text: &str) -> Option<Harness> {
     serde_json::from_value(Value::String(text.to_string())).ok()
+}
+
+/// A [`Notify`]'s spelling in `cide_agent_dispatch`'s schema, from an exhaustive match for
+/// [`status_wire`]'s reason. (M40)
+fn notify_wire(notify: Notify) -> &'static str {
+    match notify {
+        Notify::Here => "here",
+        Notify::Main => "main",
+        Notify::None => "none",
+    }
+}
+
+/// The inverse, over [`NOTIFIES`] — not serde, because `Notify` is this crate's own word and has
+/// no wire form to derive from; walking the table is what makes "accepts exactly what the schema
+/// lists" true by construction.
+fn notify_from_wire(text: &str) -> Option<Notify> {
+    NOTIFIES
+        .iter()
+        .copied()
+        .find(|notify| notify_wire(*notify) == text.trim())
 }
 
 /// A scope's wire spelling, from an exhaustive match for [`status_wire`]'s reason. (M33)
@@ -2674,6 +3054,63 @@ fn optional_links(arguments: &Value) -> Result<Vec<TaskLinkSpec>, String> {
     Ok(links)
 }
 
+/// `paths`-shaped arguments: an array of non-empty strings, each resolved against `cwd` when it
+/// is relative. (M39)
+///
+/// Resolved *here* and not in the store, because the store has no idea which process asked:
+/// `TaskSink::cwd` is the connection's fact. Existence, size and kind are the store's checks —
+/// they need the disk, and the refusal names the resolved path, so a model that passed
+/// `shot.png` from the wrong directory sees which directory that was.
+fn paths_argument(
+    arguments: &Value,
+    key: &str,
+    cwd: &Path,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`{key}` must be an array of file paths, not {}",
+            kind_of(value)
+        ));
+    };
+    let mut paths = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(format!(
+                "every entry of `{key}` must be a file path as a string, not {}",
+                kind_of(item)
+            ));
+        };
+        if text.trim().is_empty() {
+            return Err(format!("`{key}` contains an empty path"));
+        }
+        let path = Path::new(text);
+        paths.push(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        });
+    }
+    Ok(Some(paths))
+}
+
+fn required_paths(arguments: &Value, key: &str, cwd: &Path) -> Result<Vec<PathBuf>, String> {
+    match paths_argument(arguments, key, cwd)? {
+        Some(paths) if !paths.is_empty() => Ok(paths),
+        Some(_) => Err(format!("`{key}` is empty; name at least one file")),
+        None => Err(format!("`{key}` is required")),
+    }
+}
+
+fn optional_paths(arguments: &Value, key: &str, cwd: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(paths_argument(arguments, key, cwd)?.unwrap_or_default())
+}
+
 fn optional_limit(arguments: &Value) -> Result<usize, String> {
     match arguments.get("limit") {
         None | Some(Value::Null) => Ok(DEFAULT_LIST_LIMIT),
@@ -2809,8 +3246,18 @@ fn render_summary(task: &Task, all: &[Task]) -> String {
     let blocks: Vec<String> = incoming_links(all, LinkType::BlockedBy, &task.id)
         .map(|t| t.id.to_string())
         .collect();
+    // Live attachments across the body and every live comment, as one count: the list is where
+    // an agent decides whether a task is worth a `cide_task_get`, and "there is a file on this
+    // one" changes that. Absent for the ordinary task, on `change`'s token discipline. (M39)
+    let attachments = live_attachments(&task.attachments).count()
+        + task
+            .comments
+            .iter()
+            .filter(|c| !c.deleted)
+            .flat_map(|c| live_attachments(&c.attachments))
+            .count();
     format!(
-        "{} [{}] {}{}{}{} | {} | {} comment(s)\n",
+        "{} [{}] {}{}{}{}{} | {} | {} comment(s)\n",
         task.id,
         status_wire(task.status),
         match &task.agent {
@@ -2834,9 +3281,61 @@ fn render_summary(task: &Task, all: &[Task]) -> String {
         } else {
             format!(" | blocks {}", blocks.join(" "))
         },
+        if attachments == 0 {
+            String::new()
+        } else {
+            format!(" | {attachments} attachment(s)")
+        },
         one_line(&task.title),
         task.comments.len(),
     )
+}
+
+/// The attachments a reader should see — the tombstoned ones are bookkeeping for the merge.
+/// (M39)
+fn live_attachments(list: &[TaskAttachment]) -> impl Iterator<Item = &TaskAttachment> {
+    list.iter().filter(|a| !a.deleted)
+}
+
+/// One attachment, as a line an agent can act on: the name a person sees, what it is, how big,
+/// and the **absolute** path — the whole reason `TaskSink::root` exists. (M39)
+///
+/// The path is not fenced and not indented past the label: an agent copies it into a `Read`
+/// call verbatim, and a path with a leading marker is a path that does not exist.
+fn attachment_lines(list: &[TaskAttachment], task: &TaskId, root: &Path, indent: &str) -> String {
+    let mut out = String::new();
+    let live: Vec<&TaskAttachment> = live_attachments(list).collect();
+    if live.is_empty() {
+        return out;
+    }
+    out.push_str(indent);
+    out.push_str("attachments:\n");
+    for attachment in live {
+        let kind = match attachment.kind {
+            AttachmentKind::Image => "image",
+            AttachmentKind::File => "file",
+        };
+        out.push_str(&format!(
+            "{indent}- {} ({kind}, {}) at {}\n",
+            one_line(&attachment.name),
+            human_size(attachment.bytes),
+            root.join(attachment.relative_path(task)).display()
+        ));
+    }
+    out
+}
+
+/// `12 B`, `340 KiB`, `1.5 MiB`: enough for a reader deciding whether to open a file.
+fn human_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// A task's live outgoing edges — the tombstoned ones are bookkeeping for the merge, and no
@@ -2884,7 +3383,7 @@ fn link_line(label: &str, target: &TaskId, all: &[Task]) -> String {
 /// every answer, and a model has no "now" to compare one against. The information they carry that
 /// an agent can actually use — what happened after what — is already in the order: `Task::comments`
 /// is oldest first, and its doc says so.
-fn render_full(task: &Task, all: &[Task]) -> String {
+fn render_full(task: &Task, all: &[Task], root: &Path) -> String {
     let mut out = render_summary(task, all);
     /*
      * Who asked for this, on its own line. (M21)
@@ -2941,6 +3440,9 @@ fn render_full(task: &Task, all: &[Task]) -> String {
         out.push_str("  body:\n");
         out.push_str(&indented(&task.body));
     }
+    // After the body and before the log: a file on the task itself is part of the statement of
+    // the work, and an agent reads it where it reads the body. (M39)
+    out.push_str(&attachment_lines(&task.attachments, &task.id, root, "  "));
     if task.comments.is_empty() {
         out.push_str("  no comments\n");
     } else {
@@ -2950,6 +3452,12 @@ fn render_full(task: &Task, all: &[Task]) -> String {
             // assertions is one no reader can weigh. See the module header.
             out.push_str(&format!("  - from {}:\n", author_label(&comment.author)));
             out.push_str(&indented(&comment.text));
+            out.push_str(&attachment_lines(
+                &comment.attachments,
+                &task.id,
+                root,
+                "    ",
+            ));
         }
     }
     out
@@ -3032,6 +3540,31 @@ mod tests {
         }
     }
 
+    /// The records the fake mints for source paths — no disk: the name from the path, the kind
+    /// from the extension where the real store sniffs bytes. What is under test is the tools'
+    /// argument handling and the render, not the copy.
+    fn fake_records(sources: &[PathBuf]) -> Vec<TaskAttachment> {
+        sources
+            .iter()
+            .map(|path| TaskAttachment {
+                id: cide_ipc::TaskAttachmentId::new(),
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                bytes: 1234,
+                kind: if path.extension().is_some_and(|e| e == "png") {
+                    AttachmentKind::Image
+                } else {
+                    AttachmentKind::File
+                },
+                added_by: TaskAuthor::Orchestrator,
+                added_unix_ms: 3,
+                deleted: false,
+            })
+            .collect()
+    }
+
     impl TaskSink for FakeSink {
         fn list(&self) -> Result<Vec<Task>, String> {
             match &self.broken {
@@ -3054,6 +3587,7 @@ mod tests {
             agent: Option<&AgentId>,
             change: Option<&ChangeName>,
             links: &[TaskLinkSpec],
+            attachments: &[PathBuf],
         ) -> Result<Task, String> {
             if let Some(why) = &self.broken {
                 return Err(why.clone());
@@ -3084,6 +3618,7 @@ mod tests {
                 created_by: TaskAuthor::Orchestrator,
                 created_unix_ms: 1,
                 updated_unix_ms: 1,
+                attachments: fake_records(attachments),
             };
             tasks.push(task.clone());
             Ok(task)
@@ -3150,6 +3685,7 @@ mod tests {
                     at_unix_ms: 2,
                     edited_at_unix_ms: None,
                     deleted: false,
+                    attachments: Vec::new(),
                 }),
                 /*
                  * Refused here too, matching the real store. (M21)
@@ -3162,9 +3698,59 @@ mod tests {
                  * honoured an edit an agent must never make would let a future tool add the
                  * argument and pass its tests.
                  */
-                TaskEdit::EditComment { .. } | TaskEdit::DeleteComment { .. } => {
+                TaskEdit::EditComment { .. }
+                | TaskEdit::DeleteComment { .. }
+                | TaskEdit::DetachAttachment { .. } => {
                     return Err("only the user can edit or delete a comment".to_string());
                 }
+            }
+            Ok(task.clone())
+        }
+
+        fn root(&self) -> &Path {
+            Path::new("/repo")
+        }
+
+        // A run's cwd is its worktree, not the root — the case `TaskSink::cwd` exists for.
+        fn cwd(&self) -> &Path {
+            Path::new("/repo/.cide/worktrees/developer")
+        }
+
+        fn attach(
+            &self,
+            id: &TaskId,
+            target: AttachTarget,
+            sources: &[PathBuf],
+        ) -> Result<Task, String> {
+            if let Some(why) = &self.broken {
+                return Err(why.clone());
+            }
+            let mut tasks = self.tasks.lock();
+            let Some(task) = tasks.iter_mut().find(|t| &t.id == id) else {
+                return Err(format!("no task {id}"));
+            };
+            let records = fake_records(sources);
+            match target {
+                AttachTarget::Task => task.attachments.extend(records),
+                AttachTarget::Comment { id: comment } => {
+                    let Some(live) = task
+                        .comments
+                        .iter_mut()
+                        .find(|c| c.id == comment && !c.deleted)
+                    else {
+                        return Err(format!("no such comment: {comment}"));
+                    };
+                    live.attachments.extend(records);
+                }
+                AttachTarget::NewComment { text } => task.comments.push(TaskComment {
+                    id: CommentId::new(),
+                    author: TaskAuthor::Orchestrator,
+                    text,
+                    at_unix_ms: 3,
+                    edited_at_unix_ms: None,
+                    deleted: false,
+                    attachments: records,
+                }),
             }
             Ok(task.clone())
         }
@@ -3185,6 +3771,7 @@ mod tests {
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 1,
+            attachments: Vec::new(),
         }
     }
 
@@ -3275,7 +3862,7 @@ mod tests {
     }
 
     #[test]
-    fn the_eight_are_the_only_eight() {
+    fn the_nine_are_the_only_nine() {
         assert_eq!(
             tool::ALL,
             [
@@ -3291,6 +3878,9 @@ mod tests {
                 // starting anything. See the module header. (M30)
                 "cide_task_link",
                 "cide_task_unlink",
+                // Files, by path. The run-visible family because a run is the caller that
+                // most often has a file to hand back. (M39)
+                "cide_task_attach",
             ]
         );
         // Deletion belongs to the user, and it is worth a test rather than only a paragraph:
@@ -3299,8 +3889,210 @@ mod tests {
         assert!(!tool::ALL.contains(&"cide_task_delete"));
     }
 
+    // --- attachments (M39) -----------------------------------------------------------------
+
     #[test]
-    fn the_fifteen_are_the_only_fifteen() {
+    fn attach_records_the_files_and_prints_where_they_are() {
+        let sink = board();
+        let answer = call(
+            tool::TASK_ATTACH,
+            json!({ "id": "t-1", "paths": ["/tmp/shot.png", "notes.md"] }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        assert!(text.starts_with("Attached 2 file(s) to t-1."), "{text}");
+        // Each file on its own line with the absolute path under the *project root* — not the
+        // run's worktree — because that is where the store puts it and where a `Read` finds it.
+        assert!(
+            text.contains("- shot.png (image, 1 KiB) at /repo/.cide/attachments/t-1/"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- notes.md (file, 1 KiB) at /repo/.cide/attachments/t-1/"),
+            "{text}"
+        );
+        assert_eq!(
+            sink.get(&TaskId("t-1".into()))
+                .unwrap()
+                .unwrap()
+                .attachments
+                .len(),
+            2
+        );
+        // The list carries a count and never a path: `render_summary`'s token discipline.
+        let list = text_of(&call(tool::TASK_LIST, json!({}), &sink));
+        assert!(list.contains("| 2 attachment(s) |"), "{list}");
+        assert!(!list.contains("/repo/.cide"), "{list}");
+    }
+
+    /// `create` and `update` take files too: the same road as the tool, so a run that has just
+    /// written a file and moves the task in one breath hands it over in the same call.
+    #[test]
+    fn create_and_update_take_attachments_onto_the_body() {
+        let sink = board();
+        let created = call(
+            tool::TASK_CREATE,
+            json!({ "title": "Match the mock", "attachments": ["mock.png"] }),
+            &sink,
+        );
+        assert!(!created.is_error, "{}", text_of(&created));
+        let text = text_of(&created);
+        assert!(text.starts_with("Created t-4."), "{text}");
+        assert!(
+            text.contains("- mock.png (image, 1 KiB) at /repo/.cide/attachments/t-4/"),
+            "{text}"
+        );
+        assert_eq!(
+            sink.get(&TaskId("t-4".into()))
+                .unwrap()
+                .unwrap()
+                .attachments
+                .len(),
+            1
+        );
+
+        // Files alone are a change; the earlier file stays.
+        let updated = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-4", "attachments": ["/tmp/build.log"] }),
+            &sink,
+        );
+        assert!(!updated.is_error, "{}", text_of(&updated));
+        assert!(
+            text_of(&updated).starts_with("Updated t-4."),
+            "{}",
+            text_of(&updated)
+        );
+        let names: Vec<String> = sink
+            .get(&TaskId("t-4".into()))
+            .unwrap()
+            .unwrap()
+            .attachments
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        assert_eq!(names, ["mock.png", "build.log"]);
+
+        // And with a field: both land, the status first and the file after it.
+        let both = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-4", "status": "review", "attachments": ["after.png"] }),
+            &sink,
+        );
+        assert!(!both.is_error, "{}", text_of(&both));
+        let task = sink.get(&TaskId("t-4".into())).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Review);
+        assert_eq!(task.attachments.len(), 3);
+
+        // The empty-update refusal names the new field.
+        let nothing = call(tool::TASK_UPDATE, json!({ "id": "t-4" }), &sink);
+        assert!(nothing.is_error);
+        assert!(
+            text_of(&nothing).contains("`attachments`"),
+            "{}",
+            text_of(&nothing)
+        );
+    }
+
+    /// A relative path is the run's worktree's, and the tool says so by resolving it there.
+    #[test]
+    fn a_relative_path_is_read_from_the_callers_cwd() {
+        let cwd = Path::new("/repo/.cide/worktrees/developer");
+        let resolved = required_paths(
+            &json!({ "paths": ["out/shot.png", "/abs/log.txt"] }),
+            "paths",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            [
+                PathBuf::from("/repo/.cide/worktrees/developer/out/shot.png"),
+                PathBuf::from("/abs/log.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_refuses_a_missing_empty_or_malformed_path_list() {
+        let sink = board();
+        for (arguments, expect) in [
+            (json!({ "id": "t-1" }), "`paths` is required"),
+            (json!({ "id": "t-1", "paths": [] }), "is empty"),
+            (
+                json!({ "id": "t-1", "paths": "shot.png" }),
+                "must be an array",
+            ),
+            (json!({ "id": "t-1", "paths": [7] }), "as a string"),
+            (json!({ "id": "t-1", "paths": [" "] }), "empty path"),
+        ] {
+            let answer = call(tool::TASK_ATTACH, arguments.clone(), &sink);
+            assert!(answer.is_error, "{arguments}");
+            assert!(
+                text_of(&answer).contains(expect),
+                "{arguments}: {}",
+                text_of(&answer)
+            );
+        }
+        let missing = call(
+            tool::TASK_ATTACH,
+            json!({ "id": "t-99", "paths": ["/tmp/x"] }),
+            &sink,
+        );
+        assert!(missing.is_error);
+        assert!(
+            sink.get(&TaskId("t-1".into()))
+                .unwrap()
+                .unwrap()
+                .attachments
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_comment_with_attachments_lands_as_one_comment() {
+        let sink = board();
+        let answer = call(
+            tool::TASK_COMMENT,
+            json!({ "id": "t-1", "text": "see the screenshot", "attachments": ["shot.png"] }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        assert!(text.starts_with("Commented on t-1."), "{text}");
+        let task = sink.get(&TaskId("t-1".into())).unwrap().unwrap();
+        let comment = task.comments.last().unwrap();
+        assert_eq!(comment.text, "see the screenshot");
+        assert_eq!(comment.attachments.len(), 1);
+        assert_eq!(comment.attachments[0].name, "shot.png");
+        // Under the comment, one level deeper than the body's, with the absolute path.
+        assert!(
+            text.contains(
+                "    attachments:\n    - shot.png (image, 1 KiB) at /repo/.cide/attachments/t-1/"
+            ),
+            "{text}"
+        );
+        // A malformed list refuses before any comment is written.
+        let before = task.comments.len();
+        let refused = call(
+            tool::TASK_COMMENT,
+            json!({ "id": "t-1", "text": "x", "attachments": [1] }),
+            &sink,
+        );
+        assert!(refused.is_error);
+        assert_eq!(
+            sink.get(&TaskId("t-1".into()))
+                .unwrap()
+                .unwrap()
+                .comments
+                .len(),
+            before
+        );
+    }
+
+    #[test]
+    fn the_sixteen_are_the_only_sixteen() {
         assert_eq!(
             tool::ORCHESTRATION,
             [
@@ -3612,6 +4404,7 @@ mod tests {
                 at_unix_ms: 1,
                 edited_at_unix_ms: None,
                 deleted: false,
+                attachments: Vec::new(),
             },
             TaskComment {
                 id: CommentId::new(),
@@ -3623,6 +4416,7 @@ mod tests {
                 at_unix_ms: 2,
                 edited_at_unix_ms: None,
                 deleted: false,
+                attachments: Vec::new(),
             },
             TaskComment {
                 id: CommentId::new(),
@@ -3631,6 +4425,7 @@ mod tests {
                 at_unix_ms: 3,
                 edited_at_unix_ms: None,
                 deleted: false,
+                attachments: Vec::new(),
             },
         ];
         let text = text_of(&call(
@@ -3682,6 +4477,7 @@ mod tests {
             at_unix_ms: 1,
             edited_at_unix_ms: None,
             deleted: false,
+            attachments: Vec::new(),
         }];
 
         let text = text_of(&call(
@@ -3872,6 +4668,10 @@ mod tests {
 
     // --- the orchestration half ---------------------------------------------------------------
 
+    /// One dispatch as the fake sink records it: role, task (none for the task-less road), the
+    /// one-line instruction, and where its turn endings go.
+    type Dispatched = (String, Option<String>, Option<String>, Notify);
+
     /// A sink that answers from vectors and records what it was asked to do, so every handler
     /// above is reachable with no registry, no git and no `AppHandle`. The [`AgentSink`] trait
     /// object is *for* this.
@@ -3888,7 +4688,8 @@ mod tests {
         /// When set, a write fails with this sentence — the name-already-taken road, which only
         /// a directory can answer and which therefore cannot be provoked through `validate`.
         refuse_write: Option<String>,
-        dispatched: Mutex<Vec<(String, String, Option<String>)>>,
+        /// Every dispatch the handler asked for. See [`Dispatched`].
+        dispatched: Mutex<Vec<Dispatched>>,
         stopped: Mutex<Vec<(RunId, Option<String>)>>,
         integration: Integrated,
         /// When set, every call fails with this sentence — "subagents are off for this project"
@@ -3896,6 +4697,10 @@ mod tests {
         broken: Option<String>,
         now: u64,
         isolated: bool,
+        /// `false` puts the project's queue in the paused state. `Default` is `false`, so every
+        /// fixture built with `..roster()` is a *dispatching* project unless it says otherwise —
+        /// see `dispatching` below for why the field is inverted.
+        paused: bool,
     }
 
     const NOW: u64 = 1_700_000_000_000;
@@ -3904,6 +4709,14 @@ mod tests {
         fn broken(why: &str) -> Self {
             Self {
                 broken: Some(why.to_string()),
+                ..roster()
+            }
+        }
+
+        /// The same roster with its queue shut.
+        fn paused() -> Self {
+            Self {
+                paused: true,
                 ..roster()
             }
         }
@@ -3961,16 +4774,18 @@ mod tests {
         fn dispatch(
             &self,
             agent: &AgentId,
-            task: &TaskId,
+            task: Option<&TaskId>,
             instructions: Option<&str>,
+            notify: Notify,
         ) -> Result<RunId, String> {
             if let Some(why) = &self.broken {
                 return Err(why.clone());
             }
             self.dispatched.lock().push((
                 agent.as_str().to_string(),
-                task.0.clone(),
+                task.map(|task| task.0.clone()),
                 instructions.map(str::to_string),
+                notify,
             ));
             Ok(RunId::new())
         }
@@ -4002,6 +4817,16 @@ mod tests {
             match &self.broken {
                 Some(why) => Err(why.clone()),
                 None => Ok(self.isolated),
+            }
+        }
+
+        /// Stored inverted (`paused`) so the field's default is the ordinary project: a fixture
+        /// that never mentions the queue is one whose queue is open, which is what every test
+        /// written before the pause was visible assumes.
+        fn dispatching(&self) -> Result<bool, String> {
+            match &self.broken {
+                Some(why) => Err(why.clone()),
+                None => Ok(!self.paused),
             }
         }
     }
@@ -4060,6 +4885,7 @@ mod tests {
             state,
             task: task.map(|id| TaskId(id.to_string())),
             started_unix_ms: NOW - minutes_ago * 60_000,
+            notify: RunNotify::Primary,
             stale_turn: false,
             note: None,
         }
@@ -4067,6 +4893,7 @@ mod tests {
 
     fn roster() -> FakeAgents {
         FakeAgents {
+            paused: false,
             defs: vec![
                 def(
                     "developer",
@@ -4146,7 +4973,7 @@ mod tests {
     /// went per-task, is the author's own `max-concurrent` under both isolations. What changes
     /// with isolation is the *ground* sentence in the header: an orchestrator fanning a role
     /// out needs to know each task takes its own worktree (and which branch to integrate),
-    /// and that a taskless dispatch of a busy role serialises on the base checkout. The old
+    /// and that a dispatch with no task lands in the project root beside it (M40). The old
     /// clamp this test pinned ("runs up to 1 at once" under isolation) is gone with its
     /// premise.
     #[test]
@@ -4167,6 +4994,69 @@ mod tests {
         );
         assert!(text.contains("its own worktree"), "{text}");
         assert!(text.contains("cide/<role>-<task>"), "{text}");
+        assert!(
+            text.contains("without a task runs in the project root"),
+            "the task-less road is planning information too: {text}"
+        );
+        assert!(
+            !text.contains("base worktree"),
+            "the pre-M40 posture must not be described: {text}"
+        );
+    }
+
+    /// Every surface that speaks for the queue says when the queue is shut.
+    ///
+    /// The three answers a model got from a paused project before this: "Dispatched … call
+    /// cide_agent_runs to see how it is getting on" for a run that could not start, a roster
+    /// calling every role `ready`, and a `[queued]` row with no reason. A terrastrike probe sat in
+    /// exactly that state, and the audit could only work out why by reading the state file on
+    /// disk.
+    #[test]
+    fn a_paused_project_says_so_in_dispatch_the_roster_and_the_run_list() {
+        let paused = FakeAgents::paused();
+
+        let dispatched = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7" }),
+            &paused,
+        );
+        let text = text_of(&dispatched);
+        // Still a dispatch: the run is accepted and queued, which is the behaviour a person asked
+        // for when they paused. Only the claim about what happens next changes.
+        assert!(!dispatched.is_error, "{text}");
+        assert!(
+            text.starts_with("Dispatched `developer` on t-7. Run "),
+            "{text}"
+        );
+        assert!(text.contains("paused"), "{text}");
+        assert!(
+            text.contains("will not start"),
+            "say what the queue will do with it: {text}"
+        );
+        // And that no tool here can lift it — otherwise a model reads the sentence as a problem
+        // to solve and goes looking for a resume call that does not exist.
+        assert!(text.contains("a person"), "{text}");
+
+        let listed = text_of(&ask(tool::AGENTS_LIST, json!({}), &paused));
+        assert!(listed.contains("paused"), "{listed}");
+
+        let runs = text_of(&ask(tool::AGENT_RUNS, json!({}), &paused));
+        assert!(runs.contains("paused"), "{runs}");
+
+        // The same three answers on an ordinary project say nothing about a pause — which is what
+        // makes the assertions above about the pause rather than about the wording.
+        let open = roster();
+        for text in [
+            text_of(&ask(
+                tool::AGENT_DISPATCH,
+                json!({ "agent": "developer", "task": "t-7" }),
+                &open,
+            )),
+            text_of(&ask(tool::AGENTS_LIST, json!({}), &open)),
+            text_of(&ask(tool::AGENT_RUNS, json!({}), &open)),
+        ] {
+            assert!(!text.contains("paused"), "{text}");
+        }
     }
 
     #[test]
@@ -4221,19 +5111,37 @@ mod tests {
             *sink.dispatched.lock(),
             vec![(
                 "developer".to_string(),
-                "t-7".to_string(),
-                Some("keep the diff small".to_string())
+                Some("t-7".to_string()),
+                Some("keep the diff small".to_string()),
+                Notify::Here
             )]
         );
+        // The default is said back, so a caller that never thought about `notify` still knows
+        // where to expect the knock.
+        assert!(text.contains("announced here"), "{text}");
     }
 
+    /// The two roads, and the refusal between them. A role and nothing else is refused naming
+    /// both; a task that is *present and blank* is refused as a typo, not taken as the task-less
+    /// road; a blank role is refused as before. Nothing reaches the sink on any of them.
     #[test]
-    fn a_dispatch_needs_a_role_and_a_task_and_says_which_tool_makes_one() {
+    fn a_dispatch_needs_a_role_and_a_task_or_an_instruction() {
         let sink = roster();
 
-        let no_task = ask(tool::AGENT_DISPATCH, json!({ "agent": "developer" }), &sink);
-        assert!(no_task.is_error);
-        assert!(text_of(&no_task).contains("`task` is required"));
+        let nothing_to_do = ask(tool::AGENT_DISPATCH, json!({ "agent": "developer" }), &sink);
+        assert!(nothing_to_do.is_error);
+        let text = text_of(&nothing_to_do);
+        assert!(text.contains("`task`"), "{text}");
+        assert!(text.contains("`instructions`"), "{text}");
+        assert!(text.contains(tool::TASK_CREATE), "{text}");
+
+        // Whitespace is not an instruction either.
+        let blank_brief = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "instructions": "   " }),
+            &sink,
+        );
+        assert!(blank_brief.is_error, "{}", text_of(&blank_brief));
 
         let blank_task = ask(
             tool::AGENT_DISPATCH,
@@ -4260,6 +5168,97 @@ mod tests {
         );
 
         assert!(sink.dispatched.lock().is_empty(), "nothing may be enqueued");
+    }
+
+    /// The task-less road (M40): the brief is the instruction, the run stands in the project
+    /// root, and the answer says so — and says what such a run will *not* do, because every
+    /// other run the caller has seen had a worktree to integrate from and a task to report on.
+    #[test]
+    fn a_dispatch_with_no_task_stands_in_the_project_root_and_nothing_reports_back() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "instructions": "run the test suite and say what fails" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        eprintln!("{text}");
+
+        assert!(
+            text.starts_with("Dispatched `developer` with no task. Run "),
+            "{text}"
+        );
+        assert!(text.contains("project root"), "{text}");
+        assert!(text.contains("nothing to integrate"), "{text}");
+        assert!(text.contains("Nothing waits on it"), "{text}");
+        assert!(text.contains(tool::AGENT_RUNS), "{text}");
+        assert!(!text.contains("on t-"), "{text}");
+        assert!(!text.contains("task's comments"), "{text}");
+        assert!(!text.contains("started."), "{text}");
+
+        assert_eq!(
+            *sink.dispatched.lock(),
+            vec![(
+                "developer".to_string(),
+                None,
+                Some("run the test suite and say what fails".to_string()),
+                Notify::Here
+            )]
+        );
+    }
+
+    /// `notify` is where the knock goes (M40): each spelling reaches the sink as itself, is said
+    /// back in the answer, and a spelling outside the table is refused naming the table — the
+    /// schema's `enum` and this parser are one list.
+    #[test]
+    fn a_dispatch_records_where_to_announce_and_refuses_a_word_off_the_table() {
+        let sink = roster();
+        for (word, notify, said) in [
+            ("here", Notify::Here, "announced here"),
+            ("main", Notify::Main, "primary Claude pane"),
+            ("none", Notify::None, "Nothing will announce"),
+        ] {
+            let answer = ask(
+                tool::AGENT_DISPATCH,
+                json!({ "agent": "developer", "task": "t-7", "notify": word }),
+                &sink,
+            );
+            assert!(!answer.is_error, "{}", text_of(&answer));
+            assert!(
+                text_of(&answer).contains(said),
+                "{word}: {}",
+                text_of(&answer)
+            );
+            assert_eq!(sink.dispatched.lock().last().map(|d| d.3), Some(notify));
+        }
+
+        let off = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7", "notify": "everyone" }),
+            &sink,
+        );
+        assert!(off.is_error);
+        let text = text_of(&off);
+        for word in ["`here`", "`main`", "`none`", "`everyone`"] {
+            assert!(text.contains(word), "{text}");
+        }
+        assert_eq!(
+            sink.dispatched.lock().len(),
+            3,
+            "a refused notify enqueues nothing"
+        );
+
+        // The schema lists exactly what the parser takes — one table.
+        let schema = input_schema(tool::AGENT_DISPATCH);
+        assert_eq!(
+            schema["properties"]["notify"]["enum"],
+            json!(["here", "main", "none"])
+        );
+        // And `task` is no longer required, which is the whole of M40's first half. Pinned,
+        // because nothing else in this file asserts a `required` array and putting it back
+        // would pass every other test.
+        assert_eq!(schema["required"], json!(["agent"]));
     }
 
     #[test]
@@ -4877,8 +5876,9 @@ mod tests {
             fn dispatch(
                 &self,
                 _agent: &AgentId,
-                _task: &TaskId,
+                _task: Option<&TaskId>,
                 _instructions: Option<&str>,
+                _notify: Notify,
             ) -> Result<RunId, String> {
                 unreachable!("this test never dispatches")
             }
@@ -4900,6 +5900,10 @@ mod tests {
             }
 
             fn isolated(&self) -> Result<bool, String> {
+                Ok(true)
+            }
+
+            fn dispatching(&self) -> Result<bool, String> {
                 Ok(true)
             }
         }

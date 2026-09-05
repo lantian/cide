@@ -76,8 +76,11 @@ export function showsGitDiff(kind: TabKind, repo: RepoId, path: string): boolean
  * sides whose keys happened to be serialised in a different order — not a hypothetical here,
  * since one side of any comparison is built by this webview and the other arrives off
  * `workspace.json` through serde.
+ *
+ * Exported for `GitDiffPane`'s `memo` comparator, which has the same two objects to compare and
+ * would otherwise reach for the same `JSON.stringify` this exists instead of.
  */
-function sameSide(a: RevSide, b: RevSide): boolean {
+export function sameSide(a: RevSide, b: RevSide): boolean {
   if (a.kind !== b.kind) return false
   return a.kind !== 'commit' || a.oid === (b as { oid: string }).oid
 }
@@ -129,5 +132,31 @@ export function diffTabOnScreen(
 ): boolean {
   if (project === undefined) return true
   const mine = project.tabs.filter((tab) => showsGitDiff(tab.kind, repo, path))
+  return mine.length === 0 || mine.some((tab) => tab.id === project.activeTab)
+}
+
+/**
+ * The revision-diff counterpart of {@link diffTabOnScreen}.
+ *
+ * Keyed on all four of `(repo, path, new, old)`, through {@link showsRevisionDiff}, for the
+ * reason that function gives: a revision pair *is* the tab's identity, where a working-tree tab
+ * switches sides in place. Everything else — `some` over every match, and every uncertain answer
+ * being "on screen" — is `diffTabOnScreen`'s rule and the module header argues both.
+ *
+ * This is what closes the hole the module header used to name as unreachable. `RevisionDiffPane`
+ * had no deferral at all: a tab comparing a commit against the **working tree** refetched a
+ * whole-repository diff on every `cide://git-status` in the project whether anyone was looking
+ * at it or not, which with several such tabs open is the storm this pane's sibling spends fifty
+ * lines avoiding.
+ */
+export function revisionTabOnScreen(
+  project: DiffTabHost | undefined,
+  repo: RepoId,
+  path: string,
+  next: RevSide,
+  prev: RevSide,
+): boolean {
+  if (project === undefined) return true
+  const mine = project.tabs.filter((tab) => showsRevisionDiff(tab.kind, repo, path, next, prev))
   return mine.length === 0 || mine.some((tab) => tab.id === project.activeTab)
 }

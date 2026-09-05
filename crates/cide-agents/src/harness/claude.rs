@@ -97,8 +97,8 @@ use cide_ipc::{RunState, SessionState};
 use cide_pty::{Geometry as PtyGeometry, SpawnSpec};
 
 use super::{
-    Delivery, Harness, HarnessError, HarnessSpawn, Observation, RunPlan, SessionBinding,
-    TRACKER_PREAMBLE,
+    ADHOC_PREAMBLE, Delivery, Harness, HarnessError, HarnessSpawn, Observation, RunPlan, SERVER,
+    SessionBinding, tracker_preamble,
 };
 
 /// The Claude Code CLI as a harness. A unit struct: it holds nothing, and must not.
@@ -108,6 +108,12 @@ pub struct ClaudeHarness;
 impl Harness for ClaudeHarness {
     fn kind(&self) -> cide_ipc::Harness {
         cide_ipc::Harness::Claude
+    }
+
+    /// `mcp__<server>__<tool>` — the CLI's own namespacing, measured while [`mcp_config`] was
+    /// written and the reason cide's server is called [`SERVER`].
+    fn tool_name(&self, tool: &str) -> String {
+        format!("mcp__{SERVER}__{tool}")
     }
 
     fn spawn_spec(&self, plan: &RunPlan<'_>) -> Result<HarnessSpawn, HarnessError> {
@@ -325,15 +331,31 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     // Gated, so a run with no bridge is never told to call tools it does not have. See
     // `tracker` above and `TRACKER_PREAMBLE`'s own header.
     if tracker.is_some() {
-        cide_core::claude_cli::fold_append_system_prompt(&mut args, TRACKER_PREAMBLE);
+        cide_core::claude_cli::fold_append_system_prompt(
+            &mut args,
+            &tracker_preamble(&ClaudeHarness),
+        );
         // And, for a run working an OpenSpec change, one paragraph more. (M28) Gated on the same
         // `tracker`, because it names `mcp__cide__cide_task_update` — a run with no bridge must
         // not be told to call a tool it does not have.
         if let Some(change) = plan.change.as_deref() {
             cide_core::claude_cli::fold_append_system_prompt(
                 &mut args,
-                &super::spec_preamble(change, plan.spec_cli.as_deref(), plan.spec_apply.as_deref()),
+                &super::spec_preamble(
+                    change,
+                    plan.spec_cli.as_deref(),
+                    plan.spec_apply.as_deref(),
+                    &ClaudeHarness,
+                ),
             );
+        }
+        // And, for a run with no task, the paragraph that countermands the one above it. (M40)
+        // Inside the same gate on purpose: `ADHOC_PREAMBLE` is a correction *to*
+        // `TRACKER_PREAMBLE`'s commit-as-you-go rule, and a run told nothing about the tracker
+        // has nothing to be corrected on. A `change` derives from the task (`plan_dispatch`), so
+        // the two folds are never both taken; this one goes last for the opencode side's parity.
+        if plan.task.is_none() {
+            cide_core::claude_cli::fold_append_system_prompt(&mut args, ADHOC_PREAMBLE);
         }
     }
 
@@ -644,9 +666,11 @@ fn mcp_config(hook_bin: &str) -> Option<String> {
     // serde, not `format!`: a worktree path under a directory with an apostrophe or a backslash in
     // its name would otherwise produce a document the CLI parses as something else — and the
     // failure surfaces as `CONNECTION_CLOSED` from a process three levels down.
+    // `SERVER`, not a literal: this spelled `"cide"` by hand while `opencode.rs` held a const
+    // whose doc claimed the two were "the same string on purpose". They were, by luck.
     serde_json::to_string(&serde_json::json!({
         "mcpServers": {
-            "cide": {
+            SERVER: {
                 "command": hook_bin,
                 // `cide-hook mcp` is the bridge: stdio in, `$CIDE_AGENT_SOCK` out, and no
                 // knowledge of the vocabulary at all. See its module doc.
@@ -677,6 +701,15 @@ fn settings_json(hook_bin: &str, theme: cide_ipc::Theme) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tracker paragraph as *this* harness renders it.
+    ///
+    /// Still derived from the one definition rather than quoted — the rule the tests below were
+    /// written to hold — but through `tracker_preamble`, because the constant is now a template
+    /// and the tool names in it are Claude Code's only after this harness has filled them in.
+    fn tracker() -> String {
+        tracker_preamble(&ClaudeHarness)
+    }
 
     use crate::defs::LoadedAgent;
     use cide_claude::HookFrame;
@@ -836,13 +869,9 @@ mod tests {
         );
 
         let folded = value_of(&args, "--append-system-prompt");
+        assert_eq!(folded, format!("{prompt}\n\n{}", tracker()), "{folded}");
         assert_eq!(
-            folded,
-            format!("{prompt}\n\n{TRACKER_PREAMBLE}"),
-            "{folded}"
-        );
-        assert_eq!(
-            folded.matches(TRACKER_PREAMBLE).count(),
+            folded.matches(&tracker()).count(),
             1,
             "said once, not once per fold: {folded}"
         );
@@ -875,7 +904,7 @@ mod tests {
         let brief = folded
             .find("You are the developer agent.")
             .expect("the role's");
-        let ours = folded.find(TRACKER_PREAMBLE).expect("cide's");
+        let ours = folded.find(&tracker()).expect("cide's");
         assert!(theirs < brief && brief < ours, "{folded}");
     }
 
@@ -1075,6 +1104,43 @@ mod tests {
         plan.task = None;
         plan.task_title = None;
         assert_eq!(value_of(&spawn(&plan).spec.args, "-n"), "Developer");
+    }
+
+    /// (M40) A run with no task stands in the user's own tree, and `TRACKER_PREAMBLE` tells every
+    /// run to commit as it goes — so the task-less run is told, in the same durable position and
+    /// after it, that it must not. Gated with the tracker paragraph: no bridge, neither.
+    #[test]
+    fn an_adhoc_run_is_told_it_stands_in_the_users_tree_and_must_not_commit() {
+        let agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.task = None;
+        plan.task_title = None;
+
+        let args = spawn(&plan).spec.args;
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "--append-system-prompt")
+                .count(),
+            1,
+            "folded, never pushed: {args:?}"
+        );
+        let told = value_of(&args, "--append-system-prompt");
+        assert!(
+            told.ends_with(&format!("{}\n\n{ADHOC_PREAMBLE}", tracker())),
+            "{told}"
+        );
+
+        // A run on a task is told nothing of the sort.
+        let with_task = spawn(&plan_for(&agent, SessionId::new()));
+        let on_a_task = value_of(&with_task.spec.args, "--append-system-prompt");
+        assert!(!on_a_task.contains(ADHOC_PREAMBLE), "{on_a_task}");
+
+        // No bridge, no tracker paragraph — and no correction to it either.
+        plan.hook_bin = None;
+        let without_bridge = spawn(&plan);
+        let unbridged = value_of(&without_bridge.spec.args, "--append-system-prompt");
+        assert!(!unbridged.contains(&tracker()), "{unbridged}");
+        assert!(!unbridged.contains(ADHOC_PREAMBLE), "{unbridged}");
     }
 
     /// The prompt travels in the terminal, not the argv — a bare token after

@@ -37,6 +37,7 @@
  */
 import { create } from 'zustand'
 import {
+  attachments as attachmentsApi,
   tasks as tasksApi,
   type ProjectId,
   type TaskBoard as WireBoard,
@@ -53,7 +54,9 @@ import {
   changeFromDraft,
   isLinkKind,
   newerBoard,
+  type AttachTargetView,
   type Board,
+  type StagedAttachment,
   type TaskDraft,
 } from './TasksPanel/model'
 
@@ -117,6 +120,18 @@ interface TasksStore {
   create: (draft: TaskDraft) => Promise<void>
   edit: (task: TaskId, edit: TaskEdit) => Promise<void>
   remove: (task: TaskId) => Promise<void>
+  /**
+   * Files by path onto the body, a comment, or a new comment. (M39) The `edit` shape — the
+   * board comes back and is adopted — for a different command, because attaching copies bytes
+   * before it records anything and is not a `TaskEdit`.
+   */
+  attachFiles: (
+    task: TaskId,
+    target: AttachTargetView,
+    sources: readonly StagedAttachment[],
+  ) => Promise<void>
+  /** The clipboard's image, straight onto the target. Resolves `false` when it held none. */
+  attachClipboard: (task: TaskId, target: AttachTargetView) => Promise<boolean>
 }
 
 /**
@@ -276,6 +291,10 @@ export const useTasks = create<TasksStore>((set, get) => ({
     const links = draft.links.flatMap((link) =>
       isLinkKind(link.kind) ? [{ link: link.kind, target: link.target }] : [],
     )
+    // The staged files, as paths — the only field of a `StagedAttachment` that crosses the seam.
+    // On the create itself rather than as an attach afterwards, for `TaskNew::attachments`'
+    // reason: one broadcast, with the files in it. (M39)
+    const attachments = draft.attachments.map((file) => file.path)
     const req: TaskNew = {
       project,
       title: draft.title.trim(),
@@ -283,6 +302,7 @@ export const useTasks = create<TasksStore>((set, get) => ({
       ...(agent === null ? {} : { agent }),
       ...(change === null ? {} : { change: change as never }),
       ...(links.length === 0 ? {} : { links }),
+      ...(attachments.length === 0 ? {} : { attachments }),
       status: draft.status,
     }
     /*
@@ -320,6 +340,29 @@ export const useTasks = create<TasksStore>((set, get) => ({
     const wire = await tasksApi.edit(project, task, edit)
     if (get().project !== project) return
     get().adopt(project, wire)
+  },
+
+  attachFiles: async (task, target, sources) => {
+    const project = get().project
+    if (project === null) return
+    const wire = await attachmentsApi.attach(
+      project,
+      task,
+      target,
+      sources.map((file) => file.path),
+    )
+    if (get().project !== project) return
+    get().adopt(project, wire)
+  },
+
+  attachClipboard: async (task, target) => {
+    const project = get().project
+    if (project === null) return false
+    const wire = await attachmentsApi.attachClipboard(project, task, target)
+    if (wire === null) return false
+    if (get().project !== project) return true
+    get().adopt(project, wire)
+    return true
   },
 
   remove: async (task) => {

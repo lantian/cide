@@ -36,6 +36,7 @@ import {
   NumberField,
   Note,
   PathReadout,
+  Readout,
   Row,
   Segmented,
   ToggleRow,
@@ -127,6 +128,8 @@ export interface SectionProps {
   patch: (patch: SettingsPatch) => void
   setTheme: (theme: Theme) => void
   setWindowMode: (mode: WindowMode) => void
+  /** This build's own version, as bootstrap reported it; null until bootstrap resolves. */
+  version: string | null
   /** `claude --version`, or null when the binary is not on PATH. */
   claudeVersion: string | null
   /**
@@ -152,7 +155,7 @@ const RENDERERS: readonly { value: TerminalRenderer; label: string }[] = [
   { value: 'dom', label: 'DOM' },
 ]
 
-function Appearance({ settings, patch, setTheme, openLogDir, logDir }: SectionProps) {
+function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: SectionProps) {
   return (
     <>
       <Group>
@@ -204,6 +207,15 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir }: SectionPr
           down that ladder because the app will not paint is exactly who needs the log, and
           until now there was no way to reach it from inside the app at all. */}
       <Group title="Diagnostics">
+        {/* First in Diagnostics rather than in a section of its own: the person who opens the
+            log directory is the person about to file a report, and a report without a version
+            is a report that gets asked for one. The string is spelled exactly as
+            `cide --version` prints it, so the two never disagree in a bug thread. */}
+        <Row
+          label="Version"
+          hint="This build of cide. A -dev suffix is a tree built by run.sh, not a release."
+          control={<Readout text={version === null ? '…' : `cide ${version}`} />}
+        />
         <Row
           label="Log directory"
           hint="Where the app writes its own log. Opens in your file manager; the path is shown below either way."

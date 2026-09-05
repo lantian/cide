@@ -156,6 +156,17 @@ impl TasksStores {
         thread::Builder::new()
             .name("cide-tasks".into())
             .spawn(move || {
+                // Once, before the loop: a staged attachment (a screenshot pasted into a
+                // composer that was then closed) is meant to live for seconds, and one a day
+                // old belongs to nobody. Here rather than in `setup` because it is a directory
+                // walk, and this is the thread that already exists for the tracker's disk work.
+                // (M39)
+                let swept = cide_tasks::attachments::sweep_staging(std::time::Duration::from_secs(
+                    24 * 60 * 60,
+                ));
+                if swept > 0 {
+                    tracing::info!(swept, "removed stale staged attachments");
+                }
                 loop {
                     thread::sleep(POLL);
                     stores.tick(&app);

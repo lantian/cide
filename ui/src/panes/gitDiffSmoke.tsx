@@ -424,6 +424,15 @@ export interface DiffDigest {
   reason: string | null
   /** The `from → to` the read-only header names, or `null` in the staging arm. */
   revisions: string | null
+  /**
+   * Whether the body was replaced by the parked placeholder. (M38)
+   *
+   * A tab behind another one draws no rows at all — `GitDiffView`'s `parked` branch says why —
+   * and every way that can go wrong is silent. Drawn when it should not be, the diff is simply
+   * blank; *not* drawn when it should be, the whole optimisation is off and nothing looks
+   * different. So both directions are asserted, and `rows` beside this is what pins the second.
+   */
+  parked: boolean
   /** Whether the side switcher is drawn. Must be false for a diff of two commits. */
   sideControl: boolean
   /** Whether any per-line tick box is drawn. Must be false for a diff of two commits. */
@@ -706,6 +715,14 @@ function digest(
     tokens?: DiffTokens
     /** Which change the iterator is on. Absent ⇒ none, which is what a fresh diff shows. */
     currentChange?: number
+    /**
+     * Whether the tab is the one in front. Absent ⇒ the view's own default, which is `true`.
+     *
+     * Spelled as an absent prop rather than as `visible: true` for the same reason `blame` is:
+     * the absence is a state the view distinguishes, and every digest that predates M38 renders
+     * without it — so this fixture proves that an absent prop still draws.
+     */
+    visible?: boolean
   },
 ): DiffDigest {
   const html = renderToStaticMarkup(
@@ -730,6 +747,7 @@ function digest(
       // half.
       {...(blameRefusal(over.side) === null ? { onBlame: () => {} } : {})}
       {...(over.expanded === undefined ? {} : { expandedGaps: over.expanded })}
+      {...(over.visible === undefined ? {} : { visible: over.visible })}
       onExpandGap={() => {}}
       onSide={() => {}}
       onMarks={() => {}}
@@ -753,6 +771,7 @@ function digest(
     count: /data-audit="gitDiffCount"[^>]*>([\s\S]*?)<\/span>/.exec(html)?.[1]?.replace(/<[^>]*>/g, '') ?? null,
     applyLabel: apply?.[2] ?? null,
     applyDisabled: apply?.[1]?.includes('disabled') ?? false,
+    parked: html.includes('data-audit="gitDiffParked"'),
     note: /data-audit="gitDiffNote"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
     reason: /data-audit="gitDiffWhy"[^>]*>([^<]*)</.exec(html)?.[1]?.trim() ?? null,
     revisions:
@@ -839,6 +858,7 @@ function readOnlyDigest(
     count: null,
     applyLabel: apply?.[2] ?? null,
     applyDisabled: apply?.[1]?.includes('disabled') ?? false,
+    parked: html.includes('data-audit="gitDiffParked"'),
     note: /data-audit="gitDiffNote"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
     reason: /data-audit="gitDiffWhy"[^>]*>([^<]*)</.exec(html)?.[1]?.trim() ?? null,
     revisions:
@@ -1049,6 +1069,31 @@ const digests: DiffDigest[] = [
     side: 'unstaged',
     view: 'split',
     blame: BLAME,
+  }),
+
+  /*
+   * Parked and unparked, over one fixture and one selection. (M38)
+   *
+   * Three digests rather than one, because the claim has three parts and each fails silently on
+   * its own. `parkedOff` is the *baseline*: no `visible` prop at all, which is what every digest
+   * above renders with and what the SSR fixture, the log tool window and any host outside the
+   * tab stack rely on — if the default flipped, they would all quietly go blank. `parkedOn`
+   * spells the same thing explicitly and must be identical to it. `parkedHidden` is the new
+   * behaviour, and the check asserts it draws no rows *and* keeps the chrome, because a parked
+   * body that took the header and footer with it would be a tab that looks closed.
+   */
+  digest('parkedOff', new Set(['1:2']), { diff: WHOLE, side: 'unstaged', view: 'split' }),
+  digest('parkedOn', new Set(['1:2']), {
+    diff: WHOLE,
+    side: 'unstaged',
+    view: 'split',
+    visible: true,
+  }),
+  digest('parkedHidden', new Set(['1:2']), {
+    diff: WHOLE,
+    side: 'unstaged',
+    view: 'split',
+    visible: false,
   }),
 ]
 

@@ -113,16 +113,49 @@ pub fn load_project(project_root: &Path) -> ProjectAgents {
 /// safe path the short one: `if let Some(why) = dispatch_refusal(..) { return Err(why) }`.
 ///
 /// The order is the order a user can act on. "Subagents are off for this project" first, because
-/// it makes every other answer moot. Then the role's own [`cide_ipc::AgentDef::unavailable`],
-/// which the panel is already drawing. Then the dangerous-permissions gate, which is last because
-/// it is the only one that is *about this dispatch* rather than about the state of the world.
-pub fn dispatch_refusal(agent: &LoadedAgent, config: &AgentsConfig) -> Option<String> {
+/// it makes every other answer moot. Then the broken install, which applies identically to every
+/// role and which the user cannot fix from the panel. Then the role's own
+/// [`cide_ipc::AgentDef::unavailable`], which the panel is already drawing. Then the
+/// dangerous-permissions gate, which is last because it is the only one that is *about this
+/// dispatch* rather than about the state of the world.
+///
+/// # The bridge, and why a missing one refuses instead of degrading
+///
+/// `bridge` is the absolute path to `cide-hook`, or `None` when it is not beside the running
+/// executable. It is passed in rather than looked up because only `cide-app` may read
+/// `current_exe`; this crate must not learn about packaging.
+///
+/// `None` used to be a *degrade*: `RunPlan::hook_bin` gates both the MCP server block and the
+/// tracker paragraph, so the run simply started with neither, the dispatch reported success, and
+/// nothing was logged. A terrastrike audit caught ten consecutive opencode runs in that state —
+/// each one spent ten minutes reading cide's source and writing itself a stdio MCP client in
+/// `/tmp` so it could file its report, and one of them, hunting for the tools, started a second
+/// cide and then `pkill`ed it.
+///
+/// A run that cannot reach the tracker cannot report, and `TRACKER_PREAMBLE`'s own header calls
+/// that the failure the tracker exists to prevent. So it is a refusal, and it is here rather than
+/// at the spawn site so that the panel greys every role with the sentence and `cide_agents_list`
+/// prints it, instead of offering a button that fails silently three processes down.
+pub fn dispatch_refusal(
+    agent: &LoadedAgent,
+    config: &AgentsConfig,
+    bridge: Option<&std::path::Path>,
+) -> Option<String> {
     if !config.enabled {
         return Some(format!(
             "Subagents are off for this project. Turn them on in the Agents panel, which writes \
              `{}/config.json`.",
             config::CIDE_DIR
         ));
+    }
+    if bridge.is_none() {
+        return Some(
+            "cide cannot find its `cide-hook` binary beside the running executable, so a run \
+             would start with no connection to the task tracker: no `cide_task_*` tools, and no \
+             way to comment what it did. Rebuild it with `cargo build -p cide-hook`, or launch \
+             through `./run.sh`, which builds both."
+                .to_string(),
+        );
     }
     if let Some(reason) = &agent.def.unavailable {
         return Some(reason.clone());
@@ -172,26 +205,30 @@ pub fn is_dangerous(agent: &LoadedAgent) -> bool {
 /// premise changed: a run with a task now takes a worktree **per task** ([`checkout_name`]),
 /// so two tasks of one role are two checkouts and the collision the clamp guarded against no
 /// longer exists between them. What still cannot run twice is two children in *one* checkout —
-/// the same (role, task) pair, or two dispatches with no task at all, which share the role's
-/// base worktree — and that is enforced where it is now a per-checkout fact rather than a
-/// per-role number: the registry's admission holds a run whose checkout is occupied, in the
-/// queue, until it is not.
+/// the same (role, task) pair — and that is enforced where it is now a per-checkout fact rather
+/// than a per-role number: the registry's admission holds a run whose checkout is occupied, in
+/// the queue, until it is not. A dispatch with no task takes no checkout at all
+/// ([`run_checkout`], M40) and is bounded by this number and the project's alone.
 pub fn effective_max_concurrent(agent: &LoadedAgent, _config: &AgentsConfig) -> u16 {
     agent.def.max_concurrent.max(1)
 }
 
-/// The worktree a run stands in, as the name `cide_git::worktree` builds a path and branch from.
+/// The worktree a (role, task) pair stands in, as the name `cide_git::worktree` builds a path
+/// and branch from.
 ///
-/// `<role>` for a dispatch with no task; `<role>-<task-slug>` for one pointed at a task — so a
-/// role's tasks parallelise in separate checkouts (each on branch `cide/<name>`), while its
-/// taskless dispatches share the base checkout and serialise there, and a *re*-dispatch of the
-/// same task lands in the checkout holding that task's earlier work, which the first live
-/// workstream's debug notes called the one reliable recovery channel.
+/// `<role>-<task-slug>` for a run pointed at a task — so a role's tasks parallelise in separate
+/// checkouts (each on branch `cide/<name>`), and a *re*-dispatch of the same task lands in the
+/// checkout holding that task's earlier work, which the first live workstream's debug notes
+/// called the one reliable recovery channel. The bare `<role>` for `None` is **not a checkout
+/// any dispatch takes any more** (M40): a run with no task stands in the project root, decided
+/// by [`run_checkout`], which is the function a dispatch site calls. The `None` arm survives for
+/// `cide_agent_integrate` without a task, which names `cide/<role>` — the base branch task-less
+/// runs committed to before M40, and the only way work left there is still reachable.
 ///
 /// The slug is the task id forced through the worktree grammar (`[a-z0-9-]`, lowercased,
 /// anything else becomes `-`), because `.cide/tasks.json` is hand-editable and this string
 /// becomes a directory name and a ref name. A task id that sanitises to nothing falls back to
-/// the base checkout rather than minting a name from thin air. The mapping must stay
+/// the bare role name rather than minting a name from thin air. The mapping must stay
 /// **deterministic** — a resumed run recomputes its checkout from the same (role, task) pair
 /// and has to arrive at the directory its transcript lives under.
 ///
@@ -233,6 +270,41 @@ pub fn checkout_name(agent: &AgentId, task: Option<&cide_ipc::TaskId>) -> String
     format!("{base}-{slug}")
 }
 
+/// The checkout a dispatch is stamped with — and the directory its fork lands in — or `None` for
+/// a run that stands in the project root. (M40)
+///
+/// # The one rule, in one place
+///
+/// Two sites decide where a run stands, and they must agree: `cmd::agents::plan_dispatch` stamps
+/// the name the admission gate serialises on, and `agents::start_child` recomputes it at the fork
+/// to `ensure` the directory. They used to each carry the same three-arm `match`, which is one
+/// edit away from a run gated on a directory it does not take — or taking one it was never gated
+/// on, which is two children in one checkout with nothing arbitrating. Now both call this.
+///
+/// # Why a run with no task has no checkout
+///
+/// A task-less dispatch is the orchestrator asking a role to *check something*, run the tests, or
+/// do a small piece of work directly — the cases the user named when asking for the road at all.
+/// A worktree is the wrong home for those twice over: the result of a check is a sentence in the
+/// run's pane and nothing to merge; the result of a small direct edit wants to be *in the tree the
+/// user is looking at*, not on a `cide/<role>` branch somebody must remember to integrate. Before
+/// M40 such a run took the role's base worktree and serialised there; nothing ever dispatched one
+/// (the panel always names a task), so no work is stranded by the change.
+///
+/// `Shared` isolation and a role's own `worktree: false` put every run in the root exactly as
+/// before — the `Some` arm is the *intersection* of "the project isolates", "this role wants a
+/// checkout" and "there is a task to name it by".
+pub fn run_checkout(
+    agent: &LoadedAgent,
+    config: &AgentsConfig,
+    task: Option<&cide_ipc::TaskId>,
+) -> Option<String> {
+    match (config.isolation, agent.def.worktree, task) {
+        (Isolation::Worktree, true, Some(task)) => Some(checkout_name(&agent.def.id, Some(task))),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,12 +342,72 @@ mod tests {
         }
     }
 
+    /// A `cide-hook` that is where it should be.
+    ///
+    /// Every test below is about some *other* refusal, so each one needs the bridge to pass —
+    /// which is the point of it being a named helper rather than a bare `Some(...)`: a test that
+    /// meant to exercise the permissions gate and accidentally tripped the bridge gate would
+    /// still pass, on the wrong sentence.
+    fn bridge() -> Option<&'static std::path::Path> {
+        Some(std::path::Path::new("/opt/cide/cide-hook"))
+    }
+
     /// The refusal that outranks every other, because it makes them all moot.
     #[test]
     fn a_project_that_never_enabled_this_refuses_everything() {
         let agent = role(None, None);
-        let why = dispatch_refusal(&agent, &AgentsConfig::default()).expect("refused");
+        let why = dispatch_refusal(&agent, &AgentsConfig::default(), bridge()).expect("refused");
         assert!(why.contains(".cide/config.json"), "name the file: {why}");
+    }
+
+    /// A build with no `cide-hook` beside it refuses every role, and says which file is missing.
+    ///
+    /// The regression this whole argument exists for. `RunPlan::hook_bin` gates both the MCP
+    /// server block and the tracker paragraph, so `None` used to mean *start the run without
+    /// them*: the dispatch reported success and the child came up as an ordinary session with no
+    /// way to reach the board. Ten consecutive opencode runs shipped in that state before anybody
+    /// noticed, and they only noticed because the runs said so in comments they had filed through
+    /// an MCP client they wrote themselves.
+    #[test]
+    fn a_build_with_no_bridge_refuses_every_role_and_names_the_binary() {
+        let agent = role(None, None);
+        let why = dispatch_refusal(&agent, &enabled(), None).expect("refused");
+        assert!(why.contains("cide-hook"), "name the binary: {why}");
+        assert!(
+            why.contains("cargo build -p cide-hook") || why.contains("run.sh"),
+            "name the fix: {why}"
+        );
+        // Says what it costs, not just that something is missing: a sentence that named a file
+        // and stopped would leave the reader to guess whether it mattered.
+        assert!(why.contains("tracker"), "{why}");
+
+        // The same role with the bridge present is not refused for this — which is what makes the
+        // assertion above about the bridge rather than about the role.
+        assert_eq!(dispatch_refusal(&agent, &enabled(), bridge()), None);
+    }
+
+    /// "Subagents are off" still outranks it.
+    ///
+    /// The order in `dispatch_refusal` is the order a user can act on, and a project that never
+    /// switched subagents on has nothing to do with a missing binary: telling them to rebuild
+    /// `cide-hook` would send them after the wrong thing entirely.
+    #[test]
+    fn the_project_switch_outranks_a_missing_bridge() {
+        let agent = role(None, None);
+        let why = dispatch_refusal(&agent, &AgentsConfig::default(), None).expect("refused");
+        assert!(why.contains(".cide/config.json"), "{why}");
+        assert!(!why.contains("cide-hook"), "{why}");
+    }
+
+    /// And a missing bridge outranks the role's own fault, because it is true of every role.
+    ///
+    /// A user staring at a roster where every row carries a different sentence has no way to see
+    /// that one thing is wrong with all of them.
+    #[test]
+    fn a_missing_bridge_outranks_a_roles_own_fault() {
+        let agent = role(None, Some("“claude” is not on this app's PATH."));
+        let why = dispatch_refusal(&agent, &enabled(), None).expect("refused");
+        assert!(why.contains("cide-hook"), "{why}");
     }
 
     /// The role's own sentence is passed through verbatim: the panel is already drawing it, and
@@ -284,7 +416,7 @@ mod tests {
     fn an_unavailable_role_refuses_with_its_own_sentence() {
         let agent = role(None, Some("“claude” is not on this app's PATH."));
         assert_eq!(
-            dispatch_refusal(&agent, &enabled()).as_deref(),
+            dispatch_refusal(&agent, &enabled(), bridge()).as_deref(),
             Some("“claude” is not on this app's PATH.")
         );
     }
@@ -300,7 +432,7 @@ mod tests {
         // (`AgentsConfig::skip_permissions`, and its doc carries the measurement), so a role
         // that wrote the same stance down passes — refusing it would be a refusal about
         // nothing, and the gate's own comment says so.
-        assert_eq!(dispatch_refusal(&agent, &enabled()), None);
+        assert_eq!(dispatch_refusal(&agent, &enabled(), bridge()), None);
 
         // The two-acts rule bites where it means something: a project that switched skipping
         // off is exactly the project that meant to be asked.
@@ -308,7 +440,7 @@ mod tests {
             skip_permissions: false,
             ..enabled()
         };
-        let why = dispatch_refusal(&agent, &asking).expect("refused");
+        let why = dispatch_refusal(&agent, &asking, bridge()).expect("refused");
         assert!(
             why.contains("allowDangerousPermissions"),
             "the refusal has to name its own fix: {why}"
@@ -323,15 +455,15 @@ mod tests {
             allow_dangerous_permissions: true,
             ..asking
         };
-        assert_eq!(dispatch_refusal(&agent, &authorised), None);
+        assert_eq!(dispatch_refusal(&agent, &authorised, bridge()), None);
 
         // The ordinary case is untouched by the gate whichever way skipping is set.
         assert_eq!(
-            dispatch_refusal(&role(Some("acceptEdits"), None), &enabled()),
+            dispatch_refusal(&role(Some("acceptEdits"), None), &enabled(), bridge()),
             None
         );
         assert_eq!(
-            dispatch_refusal(&role(Some("acceptEdits"), None), &asking),
+            dispatch_refusal(&role(Some("acceptEdits"), None), &asking, bridge()),
             None
         );
     }
@@ -376,7 +508,7 @@ mod tests {
         assert_eq!(
             checkout_name(&role, Some(&task("///"))),
             "developer",
-            "an id that sanitises to nothing falls back to the base checkout"
+            "an id that sanitises to nothing falls back to the role's bare name"
         );
 
         // Determinism is load-bearing: a resumed run recomputes this and must land in the
@@ -391,6 +523,42 @@ mod tests {
         assert!(checkout_name(&role, Some(&long)).len() <= 64);
     }
 
+    /// Where a run stands is one decision, and this is it: the intersection of the project
+    /// isolating, the role wanting a checkout, and a task to name it by. A run with no task
+    /// stands in the project root under every isolation (M40) — the panel never dispatched one,
+    /// so the base-worktree posture it replaces stranded nothing.
+    #[test]
+    fn a_run_takes_a_checkout_only_for_a_task_under_worktree_isolation() {
+        let agent = role(None, None);
+        let config = enabled();
+        let task = cide_ipc::TaskId("t-62".to_string());
+
+        assert_eq!(
+            run_checkout(&agent, &config, Some(&task)).as_deref(),
+            Some("developer-t-62")
+        );
+        assert_eq!(
+            run_checkout(&agent, &config, None),
+            None,
+            "no task, no worktree: the run stands in the project root"
+        );
+
+        let shared = AgentsConfig {
+            isolation: Isolation::Shared,
+            ..enabled()
+        };
+        assert_eq!(run_checkout(&agent, &shared, Some(&task)), None);
+        assert_eq!(run_checkout(&agent, &shared, None), None);
+
+        let mut root_only = role(None, None);
+        root_only.def.worktree = false;
+        assert_eq!(
+            run_checkout(&root_only, &config, Some(&task)),
+            None,
+            "`worktree: false` opts the role out of the checkout for its tasks too"
+        );
+    }
+
     /// A project with no `.cide/` at all is off, whatever roles the user has defined globally.
     #[test]
     fn a_project_with_nothing_in_it_is_off() {
@@ -402,7 +570,7 @@ mod tests {
         assert!(!project.enabled());
         // Whatever the roster holds, nothing in it can be dispatched.
         for agent in &project.catalog.agents {
-            assert!(dispatch_refusal(agent, &project.config.agents).is_some());
+            assert!(dispatch_refusal(agent, &project.config.agents, bridge()).is_some());
         }
 
         let _ = std::fs::remove_dir_all(&root);

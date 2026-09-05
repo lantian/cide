@@ -338,6 +338,45 @@ try {
   }
 
   /*
+   * ===== A paused project says so on the run that is waiting. ===============================
+   *
+   * The state a terrastrike probe sat in for hours: the queue shut by a pause taken before a
+   * restart, a run queued behind it, both project slots free, and every surface cide has calling
+   * it an ordinary queue — `[queued]` with no reason, the roster saying `ready`, and the dispatch
+   * that created it having answered "Dispatched".
+   *
+   * The reason arrives entirely through `note`, derived in `AgentRegistry::runs_for` from
+   * `paused_projects`. Nothing in the frontend computes it and nothing here would break if it
+   * stopped arriving — the row would simply go back to saying nothing — so this is the only
+   * assertion in the suite that would notice.
+   */
+  {
+    const d = a('project-paused-queued-run')
+    const row = d.rows?.find((r) => r.startsWith('queued|'))
+    ok(row, 'the queued run is still on screen while the project is paused')
+    ok(
+      row?.includes('paused'),
+      'and the row says the pause is why it is waiting. Without this the panel shows a queued ' +
+        'run beside two free slots and no way to tell a shut queue from a busy one: ' +
+        `got ${JSON.stringify(row)}`,
+    )
+    ok(
+      row?.includes('Resume'),
+      'and names the gesture that ends it, rather than only the state it is in',
+    )
+
+    /*
+     * The same run in an open queue must NOT say it — otherwise the assertion above passes on a
+     * note that is always present, which is a test of nothing.
+     */
+    const open = a('role-queued')
+    ok(
+      !open.rows?.find((r) => r.startsWith('queued|'))?.includes('paused'),
+      'a run queued in a running project says nothing about a pause',
+    )
+  }
+
+  /*
    * ===== Configure: on every role row, in every state. =====================================
    *
    * The user's other sentence. It is the one control that is offered unconditionally, so the
@@ -2313,6 +2352,88 @@ try {
     for (const name of ['card', 'card-spec-ready']) {
       eq(tasks[name].deleteDanger, true, `${name}: Delete carries the danger colour unarmed`)
     }
+  }
+
+  /* == attachments (M39) ==================================================================== */
+
+  {
+    /*
+     * The strip appears only where a file is, and the stories written before M39 prove it by
+     * not changing: every one of them digests `attachments: []`, `thumbnails: 0`, and no
+     * paperclip. Stated as an assertion over the whole set rather than left to the digest
+     * comparison, so a strip that leaked onto a bare card names the story it leaked onto.
+     */
+    for (const [name, d] of Object.entries(tasks)) {
+      if (name.startsWith('card-attach') || name === 'card-composer-staged' || name === 'compose-attachments') continue
+      eq(d.attachments ?? [], [], `${name}: no attachment tiles on a story that has no files`)
+      eq(d.thumbnails ?? 0, 0, `${name}: and no <img>`)
+      eq(d.attachButtons ?? 0, 0, `${name}: and no way to attach, since the story passed no handler`)
+      eq(d.staged ?? 0, 0, `${name}: and nothing staged`)
+    }
+    for (const d of Object.values(tasks)) {
+      eq(d.lightbox, false, `${d.story}: the viewer is never in a server render — it is the host's`)
+    }
+
+    const full = t('card-attachments')
+    eq(
+      full.attachments,
+      ['image|ready', 'image|pending', 'image|refused', 'file|', 'image|ready'],
+      'five tiles in card order — the body’s four, then the comment’s one — with the three ' +
+        'preview states each drawn as itself',
+    )
+    eq(full.thumbnails, 2, 'exactly the two `ready` images are real <img> elements; a pending or ' +
+      'refused thumbnail is a placeholder with a sentence, never a broken image')
+    ok(full.text?.includes('No preview'), 'the refused image says so on the tile')
+    ok(full.text?.includes('Loading…'), 'and the pending one says that')
+    ok(full.text?.includes('180 KiB') && full.text?.includes('1 KiB'), 'sizes are printed on the same ladder cide_task_get uses')
+    eq(full.attachmentRemoves, 5, 'one Remove per tile, because the story passed onDetachAttachment — the user’s road')
+    eq(
+      full.attachButtons,
+      3,
+      'three ways in: the body’s paperclip, the comment’s Attach, the composer’s Attach…',
+    )
+    ok(
+      (full.writeControls ?? 0) >= 8,
+      `every one of those is a write control (${full.writeControls}) — counted by the marker, so ` +
+        'a new road that forgot data-write would drop this number',
+    )
+    ok(full.buttons?.includes('Open') && full.buttons?.includes('Reveal'), 'Open and Reveal are on the tile')
+    ok(!JSON.stringify(full).includes('dangerouslySetInnerHTML'), 'the strip is React elements, never an HTML string')
+
+    const ro = t('card-attachments-readonly')
+    eq(ro.attachments, full.attachments, 'the same five tiles on a host with no handlers — the files exist')
+    eq(ro.thumbnails, 2, 'and the same two thumbnails')
+    eq(ro.attachmentRemoves, 0, 'but nothing to remove')
+    eq(ro.attachButtons, 0, 'and no way to attach')
+    ok(!(ro.buttons ?? []).includes('Open'), 'and no Open — the tile itself is disabled rather than lying')
+
+    const empty = t('card-attach-empty')
+    eq(empty.attachments, [], 'a task with nothing attached draws no tile')
+    eq(
+      empty.attachButtons,
+      5,
+      'but every way in is there: the row’s paperclip, one Attach under each of the three ' +
+        'comments, and the composer’s Attach…',
+    )
+    ok(empty.text?.includes('Attachments'), 'under a label, so the paperclip is not an orphaned mark')
+
+    const staged = t('card-composer-staged')
+    eq(staged.staged, 2, 'two chips for two staged files')
+    ok(staged.text?.includes('86 KiB'), 'a staged screenshot knows its size…')
+    ok(staged.text?.includes('findings.md'), '…and a picked file shows its name without one')
+    ok(
+      (staged.buttons ?? []).filter((b) => b === '').length >= 2,
+      'each chip has an ✕ — an icon-only button — to un-pick it before it lands',
+    )
+
+    const dialog = t('compose-attachments')
+    eq(dialog.staged, 2, 'the New task dialog stages the same two chips')
+    eq(dialog.attachButtons, 1, 'behind one paperclip')
+    ok(
+      (dialog.composeControls ?? 0) === (t('compose-filled').composeControls ?? 0),
+      'and adds no form control: chips and a button are not fields',
+    )
+    eq(t('compose-filled').staged, 0, 'a dialog on a host that cannot pick draws no attachments row at all')
   }
 
   if (failed === 0) {

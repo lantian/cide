@@ -238,6 +238,14 @@ try {
     linkableTargets,
     linkTargetOptions,
     LINK_TARGET_CAP,
+    ATTACHMENT_KINDS,
+    formatBytes,
+    basename,
+    imageAttachmentsOf,
+    dropTargetKey,
+    parseDropTarget,
+    cssPoint,
+    dropZoneAt,
   } = tasks
 
   /* == 0 ============================ an optional wire field is `null`, not missing (M28) == */
@@ -2435,6 +2443,73 @@ try {
     const name = m[1]
     if (!MINE.test(name)) continue
     ok(contract.includes(name), `client.ts invokes \`${name}\`, which the contract lists`)
+  }
+
+  /* == attachments (M39) ==================================================================== */
+
+  {
+    /* The kinds, pinned the way the statuses are: a kind Rust gained and the panel has not is a
+       file the tracker can hold and the card cannot decide how to draw. */
+    const rustKinds = variants(tasksRs, 'pub enum AttachmentKind {', 'AttachmentKind')
+    ok(rustKinds.length === 2, `read ${rustKinds.length} AttachmentKind variants — the scan still matches`)
+    eq(sorted(ATTACHMENT_KINDS), sorted(rustKinds), 'ATTACHMENT_KINDS is exactly `pub enum AttachmentKind`')
+
+    /* One size ladder for a person and an agent: `cide_agents::tools::human_size` prints the
+       same three rungs, and the two must agree on a file both are looking at. */
+    eq(formatBytes(0), '0 B', 'bytes below a KiB are bytes')
+    eq(formatBytes(1023), '1023 B', 'up to and not including 1024')
+    eq(formatBytes(1024), '1 KiB', 'one KiB, whole')
+    eq(formatBytes(12 * 1024 + 900), '12 KiB', 'KiB are floored, not rounded — Rust divides')
+    eq(formatBytes(1024 * 1024), '1.0 MiB', 'MiB carry one decimal')
+    eq(formatBytes(1024 * 1024 * 1.5), '1.5 MiB', 'and it is a real decimal')
+
+    eq(basename('/home/u/shots/one.png'), 'one.png', 'a POSIX path ends in its name')
+    eq(basename('C:\\Users\\u\\one.png'), 'one.png', 'and so does a Windows one — the desktop chooses')
+    eq(basename('one.png'), 'one.png', 'a bare name is its own basename')
+    eq(basename('/ends/in/slash/'), '/ends/in/slash/', 'a path with no last component is left as typed rather than emptied')
+
+    /* The lightbox walk: the body's images, then each comment's in log order — and the log's
+       order is `commentOrder`, not the array's, so a scrambled file still walks top to bottom. */
+    const img = (id, addedMs) => ({ id, name: `${id}.png`, bytes: 1, kind: 'image', addedBy: { kind: 'user' }, addedMs })
+    const doc = (id) => ({ id, name: `${id}.log`, bytes: 1, kind: 'file', addedBy: { kind: 'user' }, addedMs: 1 })
+    const c = (id, atMs, attachments) => ({ id, author: { kind: 'user' }, text: id, atMs, editedMs: null, attachments })
+    const walked = imageAttachmentsOf({
+      id: 't-1', title: 't', body: '', status: 'todo', agent: null, change: null, session: null, links: [],
+      attachments: [img('b1', 1), doc('b2'), img('b3', 2)],
+      comments: [c('later', 200, [img('l1', 1)]), c('earlier', 100, [doc('e0'), img('e1', 1)])],
+      history: [], createdBy: { kind: 'user' }, createdMs: 0, updatedMs: 0,
+    }).map((a) => a.id)
+    eq(walked, ['b1', 'b3', 'e1', 'l1'], 'body first, then comments oldest first, files skipped')
+
+    /* The drop target's two directions round-trip, and a key nothing minted parses to nothing. */
+    for (const target of [
+      { kind: 'task', task: 't-1' },
+      { kind: 'comment', task: 't-1', comment: 'c-9' },
+      { kind: 'composer', task: 't-1' },
+      { kind: 'compose' },
+    ]) {
+      eq(parseDropTarget(dropTargetKey(target)), target, `${dropTargetKey(target)} round-trips`)
+    }
+    for (const bad of ['', 'task', 'task:', 'comment:t-1', 'comment:t-1:', 'compose:x', 'nope:t-1', 'composer:']) {
+      eq(parseDropTarget(bad), null, `\`${bad}\` is not a target`)
+    }
+
+    /* Physical to CSS pixels: one division, and a zero ratio (a webview that has not measured
+       itself yet) must not produce Infinity and a hit test that never lands. */
+    eq(cssPoint({ x: 200, y: 100 }, 2), { x: 100, y: 50 }, 'divided by the display scale')
+    eq(cssPoint({ x: 200, y: 100 }, 0), { x: 200, y: 100 }, 'a scale of zero is treated as one')
+
+    /* The innermost zone wins, so a comment inside the card takes the file rather than the card. */
+    const zones = [
+      { key: 'task:t-1', left: 0, top: 0, width: 400, height: 800 },
+      { key: 'comment:t-1:c-1', left: 20, top: 500, width: 360, height: 100 },
+      { key: 'composer:t-1', left: 20, top: 700, width: 360, height: 80 },
+    ]
+    eq(dropZoneAt({ x: 100, y: 100 }, zones), 'task:t-1', 'the card body')
+    eq(dropZoneAt({ x: 100, y: 550 }, zones), 'comment:t-1:c-1', 'the comment inside it')
+    eq(dropZoneAt({ x: 100, y: 750 }, zones), 'composer:t-1', 'the composer inside it')
+    eq(dropZoneAt({ x: 500, y: 100 }, zones), null, 'outside every zone is nowhere')
+    eq(dropZoneAt({ x: 100, y: 100 }, []), null, 'and no zones is nowhere')
   }
 
   if (failed > 0) {

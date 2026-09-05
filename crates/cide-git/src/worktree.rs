@@ -15,8 +15,10 @@
 //! checkouts really would orphan work — but the serial queue it bought was the cost a real
 //! workstream refused to pay: a role with `max-concurrent: 2` ran one task at a time and the
 //! user watched the second queue for no reason they could see. The unit that keeps both
-//! halves is the **task**: `cide_agents::checkout_name` composes `<role>-<task>` (or the bare
-//! role for a taskless dispatch), so a role's tasks parallelise in their own checkouts, the
+//! halves is the **task**: `cide_agents::checkout_name` composes `<role>-<task>` (the bare role
+//! is only the *legacy* base branch's name now — since M40 a run with no task stands in the
+//! project root and takes no checkout, `cide_agents::run_checkout` being the rule), so a role's
+//! tasks parallelise in their own checkouts, the
 //! merge unit is a task's branch — which answers exactly "which checkout holds the work" —
 //! and a re-dispatch of the same task lands where its earlier commits already are.
 //!

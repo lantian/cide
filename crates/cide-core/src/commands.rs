@@ -112,7 +112,7 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     "shellWindow",
     // Host flags: transient chrome that only the React tree knows about.
     "overlayOpen",
-    // Narrower than `overlayOpen`, which is true for any of nine overlays. A binding scoped to
+    // Narrower than `overlayOpen`, which is true for any of ten overlays. A binding scoped to
     // this one reaches the keyboard only while Ctrl+P's list has it, which is what lets ⌥L be
     // free everywhere else — including in every terminal pane in every window, where the gate
     // is a *capture* listener and would otherwise swallow it.
@@ -1286,6 +1286,20 @@ fn build() -> Vec<Command> {
         // nowhere to put it.
         Command::new("settings.open", "Open settings", VIEW).when("projectOpen"),
         Command::new("settings.keymap", "Open keyboard shortcuts", VIEW).when("projectOpen"),
+        /*
+         * The About box: `cide <version>` and the `claude --version` line beside it.
+         *
+         * `shellWindow && projectOpen`, and not the bare clause `palette.commands` carries,
+         * because the clause has to name where the card can actually appear: `App.tsx` mounts
+         * `OverlayHost` in the shell branch only, and only with a project. Toggled anywhere
+         * else the store would hold `'about'` with nothing on screen, and `overlayOpen()`
+         * would gate every `!overlayOpen` binding behind a modal nobody can see. The palette
+         * cannot reach that state — it lives in the same host — but a user's `keymap.json`
+         * binding can, which is who this clause is for.
+         */
+        Command::new("help.about", "About cide", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["version", "help", "claude"]),
         // The rail and its sidebar exist in the shell window only; a detached pane has none.
         Command::new("sidebar.files", "Show files sidebar", VIEW).when("shellWindow"),
         /*

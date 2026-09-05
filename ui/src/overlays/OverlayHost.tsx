@@ -9,6 +9,7 @@
  */
 import { useEffect } from 'react'
 import { BranchPopup } from '@/chrome/BranchSelector'
+import { AboutCard } from './AboutCard'
 import { CommandPalette } from './CommandPalette'
 import { FilePicker } from './FilePicker'
 import { GoToLine } from './GoToLine'
@@ -178,6 +179,11 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
     // are decisions this popup has no business making differently from the other three pickers.
     return <UsagesPopup onDismiss={close} onGoTo={actions.goToSymbol} />
   }
+
+  // No arm in the effect above, on `goto`'s reasoning: the card reads `capabilities` off the
+  // boot this host was mounted with and asks Rust nothing, so there is no state in which it
+  // cannot function once it is on screen.
+  if (open === 'about') return <AboutCard onDismiss={close} />
 
   return (
     <CommandPalette

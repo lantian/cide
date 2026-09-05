@@ -299,18 +299,29 @@ let indexedProjects = new Map<string, string>()
 function syncHostBudget(workspace: Workspace): void {
   const ids = new Set<string>()
   for (const project of Object.values(workspace.projects)) {
-    for (const tab of project.tabs) {
-      for (const pane of Object.values(tab.tree.panes)) {
-        if (pane.kind === 'claude' || pane.kind === 'shell') ids.add(pane.id)
-      }
-    }
-    // A pane torn out into its own window leaves its tab's tree for `project.detached`;
-    // it is exactly as alive as one still docked.
-    for (const pane of Object.values(project.detached)) {
-      if (pane.kind === 'claude' || pane.kind === 'shell') ids.add(pane.id)
-    }
+    for (const id of terminalPanesOf(project)) ids.add(id)
   }
   noteLivePanes(ids)
+}
+
+/**
+ * The ids of every pane in `project` that has a host — Claude and shell panes, docked or not.
+ *
+ * A pane torn out into its own window leaves its tab's tree for `project.detached`; it is
+ * exactly as alive as one still docked. Editors and diffs have no host to name.
+ */
+function terminalPanesOf(project: Project | undefined): string[] {
+  if (!project) return []
+  const ids: string[] = []
+  for (const tab of project.tabs) {
+    for (const pane of Object.values(tab.tree.panes)) {
+      if (pane.kind === 'claude' || pane.kind === 'shell') ids.push(pane.id)
+    }
+  }
+  for (const pane of Object.values(project.detached)) {
+    if (pane.kind === 'claude' || pane.kind === 'shell') ids.push(pane.id)
+  }
+  return ids
 }
 
 /**
@@ -905,6 +916,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
         return
       }
     }
+    // The panes this project holds, read before the close: the snapshot after it no longer
+    // names them, and their hosts are what has to go once it has happened.
+    const gone = terminalPanesOf(get().boot?.workspace.projects[id])
     // Still guarded on the way out: a buffer can go dirty between the question and the
     // answer, and the refusal is the thing that makes that race harmless.
     let rev: number | undefined
@@ -917,6 +931,25 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     )
     if (parked) return
     await synced(rev)
+
+    /*
+     * The hosts go with the project, after the snapshot and a frame — `closePane`'s order,
+     * for `closePane`'s reasons — and this is not only about leaking an xterm per pane.
+     *
+     * Rust stops a closed project's children (`cmd::project::close_project_here`) and keeps
+     * its layout so that opening the directory again brings the same panes back, with the
+     * same pane ids, to be *resumed*. A host left parked here would defeat that: the ledger
+     * still names the dead session, `paneSessionId` answers it, and `PaneBody` reads a pane
+     * that already has a child — no splash, no `--resume`, a pane attached to a session the
+     * registry has since forgotten. `destroyHost` clears the ledger's entry as well as the
+     * terminal, which is what lets the reopened pane ask the restore plan instead.
+     *
+     * A closed *tab*'s hosts stay parked on purpose (Ctrl+Shift+T re-adopts them); a closed
+     * project's do not, because its children have been stopped and there is nothing live to
+     * re-adopt.
+     */
+    await nextFrame()
+    for (const pane of gone) destroyHost(pane)
   },
   newClaudeTab: async (project) => {
     const created = await tabApi.newClaude(project)

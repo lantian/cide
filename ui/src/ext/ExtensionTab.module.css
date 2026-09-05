@@ -19,6 +19,20 @@
   flex-direction: column;
   background: var(--bg);
   overflow: hidden;
+  /*
+   * A page to read, so its text can be copied out.
+   *
+   * The app root sets `user-select: none` so window chrome does not text-select on drag, and
+   * every document surface opts back in — the markdown preview's frame, the OpenSpec page, the
+   * diff panes. This one did not, and since `MarkdownPreview` is drawn here directly rather than
+   * inside `MarkdownFrame` (whose opt-in is on the frame), nothing on the page was selectable:
+   * not the description, not the permission list, not the README. Nothing throws and nothing
+   * looks wrong; the drag simply does nothing. `check:ext` pins the opt-in.
+   *
+   * Written twice: WebKitGTK 2.52 drops the unprefixed property. See `check-css-prefix.mjs`.
+   */
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .header {
@@ -78,6 +92,9 @@
   align-items: center;
   gap: 6px;
   margin-top: 10px;
+  /* The buttons are controls, not prose: a drag across the row must not highlight "Install". */
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .primary,

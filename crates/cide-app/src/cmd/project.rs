@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use cide_core::CoreError;
 use cide_core::{persist, workspace};
 use cide_ipc::{
-    Pane, PaneId, PaneKind, PaneRole, ProjectId, RecentEntry, RecentProject, TabId, TabKind,
+    Pane, PaneId, PaneKind, PaneRole, Project, ProjectId, RecentEntry, RecentProject, SessionId,
+    TabId, TabKind,
 };
 use parking_lot::Mutex;
 use tauri::{Manager, State};
@@ -73,7 +74,19 @@ fn open_project_here(
     roots: Vec<PathBuf>,
     name: Option<String>,
 ) -> Result<ProjectId, CoreError> {
-    let id = state.update(|ws| workspace::open_project(ws, roots, name))?;
+    // What this directory looked like when it was last closed, if it was closed by cide and
+    // not reopened since. `reopen_project` puts the tabs and the conversations back; a plain
+    // `open_project` is a fresh console. The record is consumed below, after the open — see
+    // `forget_closed_layout` for why the removal is not inline here.
+    let remembered = roots.first().and_then(|root| take_closed_layout(root));
+    let primary = roots.first().cloned();
+    let id = state.update(|ws| match remembered {
+        Some(layout) => workspace::reopen_project(ws, roots, name, layout),
+        None => workspace::open_project(ws, roots, name),
+    })?;
+    if let Some(root) = primary {
+        forget_closed_layout(root);
+    }
 
     // Started here rather than lazily at first spawn, because the lockfile has to exist
     // before any `claude` in this project looks for one. `open_project` also *activates* an
@@ -196,6 +209,56 @@ fn remember(root: &Path, name: &str) {
     }
 }
 
+/// Keep a closed project's layout. Best-effort, and off the calling thread, as [`remember`] is.
+///
+/// Same lock as the recents, on the same argument: two windows closing projects in the same
+/// instant would otherwise each load the old list and the second atomic write would erase the
+/// first's record.
+fn remember_closed_layout(project: Project) {
+    drop(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = RECENT_LOCK.lock();
+        let path = persist::closed_path();
+        let mut list = persist::load_closed(&path);
+        persist::remember_closed(&mut list, project, persist::now_ms());
+        if let Err(error) = persist::save_closed(&path, &list) {
+            tracing::warn!(path = %path.display(), %error, "could not record the closed project's layout");
+        }
+    }));
+}
+
+/// The layout remembered for `root`, if any. A read, on the calling thread.
+///
+/// The read is inline because the open needs the answer before it can mutate anything, and a
+/// small file under a lock nobody holds for long is what the main thread can afford. The
+/// *removal* is not: it is a write with two `fsync`s, which is [`remember`]'s reason for being
+/// off-thread, so it is [`forget_closed_layout`], queued after the open. Between the two a
+/// second open of the same path would find the record still there and dedupe against the
+/// project that just opened, so nothing can use it twice.
+fn take_closed_layout(root: &Path) -> Option<Project> {
+    let _guard = RECENT_LOCK.lock();
+    let mut list = persist::load_closed(&persist::closed_path());
+    persist::take_closed(&mut list, root)
+}
+
+/// Drop the layout remembered for `root`, off the calling thread. Best-effort.
+///
+/// A record that survives this — the write failed, the app died first — is harmless: the next
+/// close of the directory replaces it, and an open that finds it while the project is already
+/// open dedupes by path before ever reading it. What it is not is *honest*, since the file is
+/// meant to name closed projects only, so the removal is attempted rather than skipped.
+fn forget_closed_layout(root: PathBuf) {
+    drop(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = RECENT_LOCK.lock();
+        let path = persist::closed_path();
+        let mut list = persist::load_closed(&path);
+        if persist::forget_closed(&mut list, &root)
+            && let Err(error) = persist::save_closed(&path, &list)
+        {
+            tracing::warn!(path = %path.display(), %error, "could not drop a reopened project's layout");
+        }
+    }));
+}
+
 /// Pair each remembered project with whether its directory is still there.
 ///
 /// One `is_dir` per entry, capped at [`persist::MAX_RECENT`] — sixteen stats, on the gesture
@@ -264,6 +327,22 @@ pub async fn project_forget_recent(path: Option<String>) -> Result<Vec<RecentEnt
             // the inode for no change anyone can observe.
             if changed && let Err(error) = persist::save_recent(&file, &list) {
                 tracing::warn!(path = %file.display(), %error, "could not update the recent projects");
+            }
+            // The remembered layout goes with the entry. A user removing a project from the
+            // menu — or clearing it — is saying they are done with it, and a layout kept for a
+            // directory the menu no longer offers is one nothing will ever reopen from.
+            let closed = persist::closed_path();
+            let mut layouts = persist::load_closed(&closed);
+            let dropped = match &path {
+                Some(path) => persist::forget_closed(&mut layouts, Path::new(path)),
+                None => {
+                    let had = !layouts.is_empty();
+                    layouts.clear();
+                    had
+                }
+            };
+            if dropped && let Err(error) = persist::save_closed(&closed, &layouts) {
+                tracing::warn!(path = %closed.display(), %error, "could not drop the closed project layouts");
             }
             list
         };
@@ -806,17 +885,75 @@ pub fn project_close(
     project: ProjectId,
     force: bool,
 ) -> Result<Mutated, CoreError> {
+    let out = close_project_here(&app, &state, project, force)?;
+
+    // Closing a project drops the window roles that showed parts of it. Those windows are
+    // still on screen until something takes them down, and a detached one would sit there
+    // blank with an unreachable child behind it.
+    crate::cmd::window::reconcile(&app, &state)?;
+    Ok(out)
+}
+
+/// Everything a close does except taking the windows down, on the caller's thread.
+///
+/// The body of [`project_close`], split out so that `cmd::window::window_close` — which in
+/// `PerProject` mode *is* a project close, the window being the project — runs the same
+/// close. It used to call `workspace::close_project` on its own and skip every line below the
+/// mutation: the IDE server, the language servers, the task tracker and the closed-tab
+/// records of a project closed through its window's × all outlived it. The caller
+/// reconciles the windows afterwards, because both callers do and the second one closes
+/// several projects first.
+///
+/// # A closed project keeps its layout and stops its children
+///
+/// `workspace::close_project` removes the record and nothing else — "sessions are owned by
+/// the core, not by the project record, so nothing here kills a child process; the caller
+/// decides that separately". This is the caller, and until now it decided nothing: the
+/// `claude` processes of a closed project went on running with no pane, no window and no way
+/// to reach them short of quitting, and reopening the directory minted a *new* console over a
+/// new session. The report was "claude sessions aren't restored".
+///
+/// Two things, in this order:
+///
+/// * **The record is remembered** in `persist::closed.json`, before anything is stopped, so
+///   that the next open of this directory is `workspace::reopen_project` — the same tabs, the
+///   same pane ids, the same session ids. A `SessionId` is the value `claude --resume` takes,
+///   and the launch plan (`lifecycle::plan_restore`) marks every pane whose transcript is still
+///   on disk `Resumable`. Quitting and relaunching has always restored a workspace this way;
+///   this makes closing and reopening one project the same gesture at a smaller scale.
+/// * **The children are stopped**, through the shutdown ladder and off this thread — see
+///   [`stop_closed_sessions`]. After the IDE server, for the reason `lifecycle::run_teardown`
+///   gives: a `claude` blocked on `openDiff` should hear its rejection over a socket that is
+///   still open rather than a transport error.
+pub(crate) fn close_project_here(
+    app: &tauri::AppHandle,
+    state: &WorkspaceState,
+    project: ProjectId,
+    force: bool,
+) -> Result<Mutated, CoreError> {
     // Read before the mutation: once the project is gone the diff tabs are gone with it, and
     // with them the only record of which agent turns are still blocked waiting on them.
     let blocked = app
         .try_state::<crate::ide::IdeServers>()
-        .map(|_| crate::ide::pending_request_ids(&state, project))
+        .map(|_| crate::ide::pending_request_ids(state, project))
         .unwrap_or_default();
+
+    // Likewise the record itself: the close is what makes it worth keeping, and after the
+    // close there is nothing left to read. `with`, not a second `update`, so it describes
+    // the project as it stood one instant before it went.
+    let record = state.with(|ws| workspace::project(ws, project).ok().cloned());
 
     let out = state.update(|ws| {
         workspace::close_project(ws, project, force)?;
         Ok(Mutated { rev: ws.rev })
     })?;
+
+    // Only once the close has happened: `close_project` refuses an unsaved buffer, and a
+    // layout remembered before the refusal would describe a project that is still open.
+    let sessions = record.as_ref().map(sessions_of).unwrap_or_default();
+    if let Some(record) = record {
+        remember_closed_layout(record);
+    }
 
     if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
         // Reject first, stop second. `stop` would cancel these anyway, but doing it here
@@ -830,6 +967,10 @@ pub fn project_close(
         );
         servers.stop(project);
     }
+
+    // After the IDE server, before anything slow: the ladder runs on its own thread and only
+    // its start is ordered here.
+    stop_closed_sessions(app, sessions);
 
     // And its language servers. Dropping the entry runs each one's shutdown ladder, which is
     // where a `gopls` writes the cache that keeps the *next* open fast — so a project closed and
@@ -852,11 +993,87 @@ pub fn project_close(
     app.state::<crate::closed_tabs::ClosedTabs>()
         .forget_project(project);
 
-    // Closing a project drops the window roles that showed parts of it. Those windows are
-    // still on screen until something takes them down, and a detached one would sit there
-    // blank with an unreachable child behind it.
-    crate::cmd::window::reconcile(&app, &state)?;
     Ok(out)
+}
+
+/// Every session a project's panes were showing, each once.
+///
+/// Tabs and detached panes both: a torn-out pane's child is exactly as much this project's as
+/// a docked one's. A set because two panes can show one child — `claude.mirror` — and a ladder
+/// that signalled it twice would report two sessions where there was one.
+fn sessions_of(project: &Project) -> Vec<SessionId> {
+    let mut out: Vec<SessionId> = Vec::new();
+    let panes = project
+        .tabs
+        .iter()
+        .flat_map(|t| t.tree.panes.values())
+        .chain(project.detached.values());
+    for pane in panes {
+        if let Some(session) = pane.session
+            && !out.contains(&session)
+        {
+            out.push(session);
+        }
+    }
+    out
+}
+
+/// Walk a closed project's children down the shutdown ladder, on a thread of their own.
+///
+/// The ladder is `lifecycle::stop_children` — SIGHUP, SIGTERM, SIGKILL, with the graces the
+/// quit path uses — because the reason it is a ladder applies here with more force: a `claude`
+/// asked politely finishes writing its transcript, and the transcript is what the reopen
+/// resumes from. Off the calling thread because the graces add up to 2.5 s for a child that
+/// will not go, and the caller is a synchronous command on the GTK main loop.
+///
+/// Once a child has gone it is **removed from the registry**, and that is not tidiness. The
+/// registry keeps an exited session so a pane can go on showing its last screen, and
+/// `TerminalPane` *adopts* any session the registry still holds for the pane's id
+/// (`sessionIsHeld`) rather than spawning. A reopened pane would therefore find its dead
+/// session, attach to it, and show `— exited —` over a transcript with a Resume button —
+/// instead of resuming, which is what the reopen is for. With the entry gone the pane asks
+/// the launch plan, which says `Resumable`, and spawns `claude --resume`. A child that
+/// survived even SIGKILL for the kill grace is left in place with a warning: the quit ladder
+/// will see it, and removing a handle to a running process is how one outlives the app.
+///
+/// A session a subagent run owns is not touched, for `session_kill`'s reason: runs end only
+/// through their owners, and this pane was merely a view of one.
+fn stop_closed_sessions(app: &tauri::AppHandle, sessions: Vec<SessionId>) {
+    if sessions.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("cide-project-close".into())
+        .spawn(move || {
+            let Some(registry) = app.try_state::<crate::state::SessionRegistry>() else {
+                return;
+            };
+            let agents = app.try_state::<std::sync::Arc<crate::agents::AgentRegistry>>();
+            let children: Vec<(SessionId, std::sync::Arc<cide_pty::PtySession>)> = sessions
+                .into_iter()
+                .filter(|id| !agents.as_ref().is_some_and(|a| a.owns_session(*id)))
+                .filter_map(|id| registry.get(id).map(|s| (id, s)))
+                .collect();
+            let handles: Vec<std::sync::Arc<cide_pty::PtySession>> =
+                children.iter().map(|(_, s)| s.clone()).collect();
+            crate::lifecycle::stop_children(&handles, crate::lifecycle::Ladder::default());
+            for (id, session) in children {
+                if !session.has_exited() {
+                    tracing::warn!(session = %id, "a closed project's session outlived the ladder; leaving it for the quit path");
+                    continue;
+                }
+                registry.remove(id);
+                // The raw log lines go with the session, as `session_kill` drops them: no pane
+                // can ask for them again.
+                if let Some(logs) = app.try_state::<std::sync::Arc<crate::logring::JsonLogRing>>() {
+                    logs.forget(id);
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "no thread to stop a closed project's sessions; they will be stopped on quit");
+    }
 }
 
 /// Bring a project to the front of the window that holds it.
@@ -1333,6 +1550,61 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
 mod tests {
     use super::*;
     use cide_ipc::{DiffOrigin, DiffSpec, RepoId, SettingsSection, Workspace, git::DiffSide};
+
+    /// A closed project's session list is the ladder's input, so a session shown twice — a
+    /// mirror, or a torn-out pane beside the docked one it came from — must be listed once,
+    /// and a detached pane's session must be listed at all: its window is gone with the
+    /// project, and a child nothing signals is the leak this list exists to close.
+    #[test]
+    fn sessions_of_names_each_session_once_and_the_detached_ones_too() {
+        let mut ws = Workspace::default();
+        let id = workspace::open_project(&mut ws, vec![PathBuf::from("/p")], None).expect("open");
+        let primary = workspace::project(&ws, id).expect("open").primary_session;
+        let console = workspace::console_tab(&ws, id).expect("console");
+        let shell = || Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Shell,
+            role: PaneRole::Auxiliary,
+            session: Some(SessionId::new()),
+            conversation: None,
+            conversation_since: None,
+            title: "p : bash".into(),
+        };
+        let mirror = Pane {
+            session: Some(primary),
+            ..shell()
+        };
+        let torn = shell();
+        let torn_session = torn.session.expect("a shell pane is bound at creation");
+        let torn_id = torn.id;
+        {
+            let p = ws.projects.get_mut(&id).expect("open");
+            let target = p.tabs[0].tree.focused;
+            cide_core::layout::split(
+                &mut p.tabs[0].tree,
+                target,
+                cide_ipc::Axis::Row,
+                cide_ipc::Side::After,
+                mirror,
+            )
+            .expect("split");
+            cide_core::layout::split(
+                &mut p.tabs[0].tree,
+                target,
+                cide_ipc::Axis::Col,
+                cide_ipc::Side::After,
+                torn,
+            )
+            .expect("split");
+        }
+        workspace::detach_pane(&mut ws, id, console, torn_id).expect("detach");
+
+        let mut sessions = sessions_of(workspace::project(&ws, id).expect("open"));
+        sessions.sort();
+        let mut expected = vec![primary, torn_session];
+        expected.sort();
+        assert_eq!(sessions, expected);
+    }
 
     /// This file's own source, for the two structural tests below.
     ///

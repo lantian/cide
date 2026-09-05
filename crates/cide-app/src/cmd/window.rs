@@ -283,13 +283,18 @@ pub fn window_close(
             // `close_project` drops the project's detached windows with it. Closing the
             // last one leaves the workspace naming no windows at all, `reconcile` destroys
             // the last OS window, and the runtime turns that into the quit it should be.
+            //
+            // Through `close_project_here`, not `workspace::close_project` on its own: the
+            // window *is* the project, so closing it has to do everything `project_close` does
+            // — stop the IDE server, the language servers and the children, flush the task
+            // tracker, remember the layout for the next open. It used to do only the
+            // mutation, and every one of those outlived the window. One project per shell in
+            // this mode, so a refusal — an unsaved buffer, with `force` off — refuses before
+            // anything has closed.
             WindowMode::PerProject => {
-                state.update(|ws| {
-                    for id in &projects {
-                        workspace::close_project(ws, *id, force)?;
-                    }
-                    Ok(())
-                })?;
+                for id in &projects {
+                    crate::cmd::project::close_project_here(&app, &state, *id, force)?;
+                }
                 reconcile(&app, &state)?;
             }
             // In stacked mode the shell is the application: there is exactly one, and the

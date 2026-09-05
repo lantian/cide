@@ -969,7 +969,9 @@ function RoleLine({
  * is a question the user is allowed to ask, whose answer sometimes is "nothing to do".
  *
  * **What it merges narrowed when worktrees went per-task**: this button names no task, so it
- * targets the role's *base* branch `cide/<role>` — the one its taskless dispatches commit to.
+ * targets the role's *base* branch `cide/<role>` — which since M40 only holds work an older
+ * cide's task-less dispatches left there, because a run with no task now stands in the project
+ * root and mints no branch (`cide_agents::run_checkout`).
  * A task's work lives on `cide/<role>-<task>` now, and the road to it is the orchestrator's
  * `cide_agent_integrate` with the task named; a merge control on the task's own card is the
  * named follow-up for doing it by hand. The backend's "no branch yet" refusal spells the exact

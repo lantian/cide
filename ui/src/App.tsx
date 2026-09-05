@@ -108,6 +108,7 @@ import { revealPane } from '@/editor/revealPane'
 import { jumpTo, pendingJump } from '@/editor/jump'
 import { UNKNOWN_LINE } from '@/editor/navHistory'
 import { claudeSend, specEvents } from '@/ipc/client'
+import { startFileDrop } from '@/sidebar/TasksPanel/fileDrop'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
@@ -399,26 +400,44 @@ export function App() {
    */
   const pendingClose = useCloseConfirm((s) => s.pending)
   /**
-   * The launch plan, keyed by pane.
+   * The restore plan, keyed by pane, and the projects it has been asked for.
    *
-   * Read once and never refreshed: it describes what the workspace looked like when this
-   * process started, so a pane created later has no entry and spawns immediately — which is
-   * correct, because the user just asked for it.
+   * Read once **per project** and never refreshed for that project: an entry describes what a
+   * pane's session was when its project appeared in this window, so a pane created later has
+   * no entry and spawns immediately — which is correct, because the user just asked for it.
    *
-   * **`null` means "not fetched yet", and no pane is rendered until it is not `null`.** It used
-   * to start as an empty map, which is indistinguishable from "the plan says nothing about any
-   * of these panes" — and that is a different claim with two consequences, both silent.
-   * `PaneBody` latches its Resume splash on the *first* render (the splash and the terminal are
-   * different element types in one position, so it cannot be recomputed), so a tree painted
-   * before the plan arrived spawned every restored Claude pane at once — the "reopening a
-   * six-pane project starts six agents" case the splash exists to prevent. And a pane with no
-   * entry never passes `--resume`, so the conversation comes back empty. Both depended on two
-   * unrelated mount effects resolving in the order they were declared.
+   * It used to be read once per *window*, at boot, which was the same thing while every
+   * project a window would ever show was in the workspace at boot. It stopped being the same
+   * thing when a closed project started keeping its layout (`persist::closed.json`): a project
+   * reopened during the run arrives with panes holding conversations from before the close,
+   * and with no entry those panes spawned fresh — "claude sessions aren't restored". So the
+   * effect below watches the snapshot's project set and asks Rust for the plan of every project
+   * it has not planned yet, at boot and whenever one appears.
    *
-   * A failed fetch sets an empty map rather than leaving this `null`: a plan that cannot be
-   * read costs a pane its resume, and a workspace that never renders costs the user everything.
+   * **A project's panes are not rendered until its plan is in** — `plannedProjects` is the
+   * gate, in both window kinds. The plan used to start as an empty map, which is
+   * indistinguishable from "the plan says nothing about any of these panes" — and that is a
+   * different claim with two consequences, both silent. `PaneBody` latches its Resume splash on
+   * the *first* render (the splash and the terminal are different element types in one
+   * position, so it cannot be recomputed), so a tree painted before the plan arrived spawned
+   * every restored Claude pane at once — the "reopening a six-pane project starts six agents"
+   * case the splash exists to prevent. And a pane with no entry never passes `--resume`, so the
+   * conversation comes back empty. Both depended on two unrelated effects resolving in the
+   * order they were declared, which the per-project gate no longer assumes.
+   *
+   * A failed fetch marks the project planned all the same: a plan that cannot be read costs a
+   * pane its resume, and a project that never renders costs the user everything.
    */
-  const [restorePlan, setRestorePlan] = useState<Map<string, PaneRestore> | null>(null)
+  const [restorePlan, setRestorePlan] = useState<ReadonlyMap<string, PaneRestore>>(
+    () => new Map(),
+  )
+  const [plannedProjects, setPlannedProjects] = useState<ReadonlySet<string>>(() => new Set())
+  // Projects a plan has been *requested* for, so StrictMode's double effect and a snapshot
+  // arriving mid-fetch cannot ask twice. A ref: it is bookkeeping for the effect, not a render.
+  const planRequested = useRef<Set<string>>(new Set())
+  // The snapshot's project map — a stable object per accepted mutation, which is what makes it
+  // a legal selector and a usable dependency; the ids are read inside the effect.
+  const openProjects = useWorkspace((s) => s.boot?.workspace.projects)
   const [bench, setBench] = useState<string | null>(null)
   const [benchRunning, setBenchRunning] = useState(false)
 
@@ -478,17 +497,28 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    void appApi
-      .restorePlan()
-      .then((plan) => setRestorePlan(new Map(plan.map((e) => [e.pane, e]))))
-      .catch((e) => {
-        // An empty plan, not a permanent `null`: every pane then spawns fresh, which is the
-        // same thing this window did before the plan existed. Leaving it `null` would hold the
-        // whole workspace off the screen because one optimisation could not be read.
-        setRestorePlan(new Map())
-        return diag.log(`restore plan unavailable: ${String(e)}`)
-      })
-  }, [])
+    if (!openProjects) return
+    for (const id of Object.keys(openProjects)) {
+      if (planRequested.current.has(id)) continue
+      planRequested.current.add(id)
+      void appApi
+        .restorePlan(id)
+        .then((plan) => {
+          setRestorePlan((prev) => {
+            const next = new Map(prev)
+            for (const entry of plan) next.set(entry.pane, entry)
+            return next
+          })
+        })
+        .catch((e) => {
+          // Planned without entries: every pane of this project then spawns fresh, which is
+          // the same thing this window did before the plan existed. Leaving the project
+          // unplanned would hold it off the screen because one optimisation could not be read.
+          return diag.log(`restore plan unavailable for project ${id}: ${String(e)}`)
+        })
+        .finally(() => setPlannedProjects((prev) => new Set(prev).add(id)))
+    }
+  }, [openProjects])
 
   useEffect(() => {
     void appApi.ready()
@@ -821,6 +851,18 @@ export function App() {
       void off.then((stop) => stop())
     }
   }, [adoptTasks])
+
+  /*
+   * Files dragged in from the desktop, once per window. (M39) Here rather than in the task
+   * card's host because the New task dialog is not under that host, and one subscription that
+   * hit-tests the DOM at drop time serves every zone — see `TasksPanel/fileDrop.ts`.
+   */
+  useEffect(() => {
+    const off = startFileDrop()
+    return () => {
+      void off.then((stop) => stop())
+    }
+  }, [])
 
   /*
    * OpenSpec: one board per project. (M28)
@@ -1340,11 +1382,12 @@ export function App() {
     const { project, tab: homeTab, pane } = boot.role
     const owner = boot.workspace.projects[project]
     const detachedPane = owner?.detached[pane]
-    // Nothing until the plan is in, for the reason on `restorePlan` above. This window is the
-    // one that suffered most from doing otherwise: it never received a plan at all, so a
-    // torn-out pane came back at launch, adopted a `SessionId` from the process that had
-    // written `workspace.json`, and printed `— no such session —` into a blank pane every time.
-    if (restorePlan === null) return <WindowFrame>{null}</WindowFrame>
+    // Nothing until the project's plan is in, for the reason on `restorePlan` above. This
+    // window is the one that suffered most from doing otherwise: it never received a plan at
+    // all, so a torn-out pane came back at launch, adopted a `SessionId` from the process that
+    // had written `workspace.json`, and printed `— no such session —` into a blank pane every
+    // time.
+    if (!plannedProjects.has(project)) return <WindowFrame>{null}</WindowFrame>
     if (!owner || !detachedPane) {
       // The domain no longer holds this pane — its project closed while the window was up.
       // Rendering nothing is honest; the window closes on the next snapshot.
@@ -1777,6 +1820,7 @@ export function App() {
                 tabRole={tabRole}
                 tabWindow={tabWindow}
                 restorePlan={restorePlan}
+                plannedProjects={plannedProjects}
                 runCommand={runCommand}
                 openTerminalPath={openTerminalPath}
               />
@@ -2155,9 +2199,10 @@ export function App() {
  * memo holds because every prop is either snapshot-derived (`activeProject`, `visibleTabs`,
  * `tabRole` — a new identity exactly once per accepted mutation, which is the one time the
  * grid should re-render) or pinned (`runCommand` and `openTerminalPath` are stable
- * `useCallback` wrappers, `restorePlan` is a `useState` value written once at boot,
- * `tabWindow` is a window-lifetime constant). A new prop added here must be one of those
- * two things, or it silently reopens the hole this component closes.
+ * `useCallback` wrappers, `restorePlan` and `plannedProjects` are `useState` values written
+ * once per project as its plan lands, `tabWindow` is a window-lifetime constant). A new prop
+ * added here must be one of those two things, or it silently reopens the hole this component
+ * closes.
  *
  * The store *actions* are read here rather than passed as props: zustand actions are
  * created once, so these subscriptions never fire, and everything that can go stale still
@@ -2170,6 +2215,7 @@ const WorkspaceContent = memo(function WorkspaceContent({
   tabRole,
   tabWindow,
   restorePlan,
+  plannedProjects,
   runCommand,
   openTerminalPath,
 }: {
@@ -2177,7 +2223,8 @@ const WorkspaceContent = memo(function WorkspaceContent({
   visibleTabs: readonly Tab[]
   tabRole: Extract<WindowRole, { kind: 'detachedTab' }> | null
   tabWindow: boolean
-  restorePlan: ReadonlyMap<string, PaneRestore> | null
+  restorePlan: ReadonlyMap<string, PaneRestore>
+  plannedProjects: ReadonlySet<string>
   runCommand: (command: string, args: unknown) => void
   openTerminalPath: (
     project: ProjectId,
@@ -2246,10 +2293,13 @@ const WorkspaceContent = memo(function WorkspaceContent({
                   IPC channel would be measuring the wrong thing. The chrome audit skips them
                   for a different reason — it measures chrome, and four `claude` processes are
                   a slow way to take a ruler to a status bar. */}
-              {/* `restorePlan !== null` gates the whole tree, not just the prop: a pane that
-                  renders before the plan lands latches `PaneBody`'s splash decision without it.
-                  See the note on the state itself. */}
-              {!benchMode() && !auditMode() && activeProject && restorePlan !== null && (
+              {/* `plannedProjects` gates the whole tree, not just the prop: a pane that
+                  renders before its project's plan lands latches `PaneBody`'s splash decision
+                  without it. See the note on the state itself. */}
+              {!benchMode() &&
+                !auditMode() &&
+                activeProject &&
+                plannedProjects.has(activeProject.id) && (
                 <TabContent
                   // The same filtered list the strip draws — `windows/windowTabs.ts` — and
                   // here it is the load-bearing copy: `TabContent` MOUNTS every tab it is
@@ -2411,7 +2461,23 @@ const WorkspaceContent = memo(function WorkspaceContent({
                             * beside the terminal that is waiting on it.
                             */}
                           {tab.kind.kind === 'diff' && tab.kind.spec.origin.kind === 'git' ? (
-                            <GitDiffPane project={activeProject.id} spec={tab.kind.spec} />
+                            /*
+                             * `visible` is passed, and the pane's own fallback is the safety
+                             * net rather than the mechanism. `diffTabs.diffTabOnScreen` exists
+                             * because a deferral switched on by a prop is a deferral that is
+                             * off — but it can only answer once a `cide://workspace-changed`
+                             * has arrived, and `onScreen` starts `true`, so a workspace
+                             * restored with six diff tabs had all six believing they were in
+                             * front until the first mutation. That window is where the boot
+                             * storm lived: six `git_diff_file` calls, six whole-file wires,
+                             * six tokenizes. `active` is the flag `TabContent` already hands
+                             * this closure, and the line below hands it to `PaneBody`.
+                             */
+                            <GitDiffPane
+                              project={activeProject.id}
+                              spec={tab.kind.spec}
+                              visible={active}
+                            />
                           ) : (
                           <PaneBody
                             pane={paneNode}

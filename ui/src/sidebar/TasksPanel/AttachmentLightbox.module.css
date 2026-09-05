@@ -1,0 +1,110 @@
+/*
+ * The fullscreen image viewer for a task attachment. (M39)
+ *
+ * z-index 75: above the task card's own `OverlayCard` scrim (60 — `overlays/Overlay.module.css`)
+ * and the switcher (70), below the context menu (80), so a right-click on the picture still
+ * gets its menu drawn on top. The scale is informal and lives in those three files' comments.
+ */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 75;
+  display: flex;
+  flex-direction: column;
+  /* Darker than the card scrim: a picture reads best on a near-black ground, and this one has
+     nothing behind it a person needs to keep seeing. */
+  background: rgba(0, 0, 0, 0.86);
+  color: #f2f2f2;
+}
+
+.bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  padding: var(--sp-4) var(--sp-6);
+  font-size: var(--fs-ui-13);
+}
+
+.caption {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.meta {
+  flex: none;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.action,
+.iconButton,
+.step {
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--r-2);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out);
+}
+
+.action {
+  padding: 3px 9px;
+}
+
+.iconButton,
+.step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-2);
+}
+
+.action:hover,
+.iconButton:hover,
+.step:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.action:focus-visible,
+.iconButton:focus-visible,
+.step:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+.step:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-5);
+  padding: 0 var(--sp-6) var(--sp-6);
+}
+
+.image {
+  /* The picture at its own aspect, as large as the stage allows, never cropped. */
+  max-width: calc(100vw - 2 * var(--sp-6) - 2 * 40px);
+  max-height: calc(100vh - 56px - var(--sp-6));
+  object-fit: contain;
+  box-shadow: var(--shadow-3);
+}
+
+.missing {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: var(--fs-ui-13);
+}

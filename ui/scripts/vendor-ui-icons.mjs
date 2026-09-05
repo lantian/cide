@@ -146,6 +146,10 @@ const ICONS = [
   // rather than `quote`: upstream's `quote` is a filled speech mark, and filled icons are
   // refused below by design.
   'bold', 'italic', 'code', 'link', 'heading', 'text-quote', 'list', 'list-ordered',
+  // Task attachments (M39): the Attach… buttons on the card, the composer and the New task
+  // dialog, and the chip a non-image attachment draws. `image` is the placeholder a thumbnail
+  // shows while Rust is still vouching for the file, or after it refused to.
+  'paperclip', 'image',
 ]
 
 /**
