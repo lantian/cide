@@ -396,6 +396,13 @@ export interface RunRef {
   phase: string
   /** The PTY session, so the chip's Open control has something to act on. `null` while queued. */
   session: string | null
+  /**
+   * `AgentRun::openable` — whether Open has anything to show for this run: a session the
+   * registry holds, or a conversation the real harness can be re-opened on (M42). Carried
+   * rather than derived from `session`, because a finished opencode run has none and an
+   * openable conversation.
+   */
+  openable: boolean
 }
 
 /**
@@ -471,6 +478,8 @@ export interface Chip {
   run: string | null
   /** The run's session, or `null`. `null` with a non-null `run` means the run is queued. */
   session: string | null
+  /** `RunRef::openable`, carried through so `canOpen` reads the wire's fact and not a guess. */
+  openable: boolean
 }
 
 /**
@@ -564,6 +573,7 @@ export function agentChip(
       phase: live.phase,
       run: live.run,
       session: live.session,
+      openable: live.openable,
     }
   }
 
@@ -581,10 +591,26 @@ export function agentChip(
     (run) => run.task === task.id && (run.phase === 'queued' || run.phase === 'idle'),
   )
   if (task.status === 'doing' && !engaged) {
-    return { label: assigned, lit: false, tone: 'attention', phase: null, run: null, session: null }
+    return {
+      label: assigned,
+      lit: false,
+      tone: 'attention',
+      phase: null,
+      run: null,
+      session: null,
+      openable: false,
+    }
   }
 
-  return { label: assigned, lit: false, tone: 'assigned', phase: null, run: null, session: null }
+  return {
+    label: assigned,
+    lit: false,
+    tone: 'assigned',
+    phase: null,
+    run: null,
+    session: null,
+    openable: false,
+  }
 }
 
 /* -------------------------------------------------------------------------- the group list */
@@ -1104,6 +1130,32 @@ export interface LinkChip {
 }
 
 /**
+ * One edge, resolved against a board. The one place a `LinkChip` is minted. (M40)
+ *
+ * Takes `LinkTargetOption[]` rather than `TaskView[]` — the id, the title and the status are
+ * every field the resolution reads, and a `TaskView` is structurally one of these — so the
+ * compose dialog, which has a target list and no board, mints its draft chips through the same
+ * function as the card. Two resolutions would be two answers to what a linked task is called.
+ */
+export function linkChipFor(
+  kind: string,
+  direction: LinkDirection,
+  target: string,
+  board: readonly LinkTargetOption[],
+): LinkChip {
+  const found = board.find((candidate) => candidate.id === target)
+  return {
+    kind,
+    direction,
+    label: linkLabel(kind, direction),
+    target,
+    targetTitle: found === undefined ? null : found.title,
+    targetStatus: found === undefined ? null : found.status,
+    gone: found === undefined,
+  }
+}
+
+/**
  * Every link drawn on one task's card: its own stored edges, then the **derived** incoming
  * readings. (M30)
  *
@@ -1117,18 +1169,8 @@ export interface LinkChip {
  * states of a committed, merged, hand-editable file.
  */
 export function taskLinks(task: TaskView, tasks: readonly TaskView[]): LinkChip[] {
-  const chip = (kind: string, direction: LinkDirection, target: string): LinkChip => {
-    const found = tasks.find((candidate) => candidate.id === target)
-    return {
-      kind,
-      direction,
-      label: linkLabel(kind, direction),
-      target,
-      targetTitle: found === undefined ? null : found.title,
-      targetStatus: found === undefined ? null : found.status,
-      gone: found === undefined,
-    }
-  }
+  const chip = (kind: string, direction: LinkDirection, target: string): LinkChip =>
+    linkChipFor(kind, direction, target, tasks)
 
   const out: LinkChip[] = []
   for (const link of task.links) {
@@ -1146,6 +1188,79 @@ export function taskLinks(task: TaskView, tasks: readonly TaskView[]): LinkChip[
     }
   }
   return out
+}
+
+/**
+ * The compose dialog's chips: a draft's picked links, resolved against the tasks it may offer.
+ * (M40)
+ *
+ * Outgoing only, and that is not a simplification — a task that does not exist yet cannot be
+ * the target of anything, so there is no incoming reading to derive. Through [`linkChipFor`],
+ * so a draft link and a stored one read identically: same title, same status marker, same
+ * `gone` for a target that has left the board between the pick and the render.
+ */
+export function draftLinkChips(
+  links: readonly LinkView[],
+  targets: readonly LinkTargetOption[],
+): LinkChip[] {
+  return links.map((link) => linkChipFor(link.kind, 'out', link.target, targets))
+}
+
+/** One heading and the rows under it. */
+export interface LinkGroup {
+  label: string
+  chips: readonly LinkChip[]
+}
+
+/**
+ * The chips, gathered under one heading each. (M40)
+ *
+ * Grouped by the **direction-resolved label** and not by the kind, which is the whole reason
+ * this function exists rather than a `LINK_KINDS` loop at the call site: one stored kind reads
+ * as two different facts from its two ends — `blockedBy` is *Blocked by* on the task that waits
+ * and *Blocks* on the task waited for — and those must be two headings, while `related`, whose
+ * two readings are the same words, must be one. Grouping by kind would put "this is holding me
+ * up" and "I am holding this up" under one word, which is the single most misleading thing this
+ * section is in a position to say.
+ *
+ * Order is first appearance, so the reading order is [`taskLinks`]' — stored edges in file
+ * order, then the derived readings — rather than a second ordering nobody asked for.
+ *
+ * A `Map`, never an object literal: an unrecognised kind's label is its own raw text, and that
+ * text can be `'constructor'` (see [`restText`], and [`linkTargetOptions`]' own guard).
+ */
+export function linkGroups(chips: readonly LinkChip[]): LinkGroup[] {
+  const byLabel = new Map<string, LinkChip[]>()
+  for (const chip of chips) {
+    const bucket = byLabel.get(chip.label)
+    if (bucket === undefined) byLabel.set(chip.label, [chip])
+    else bucket.push(chip)
+  }
+  return [...byLabel].map(([label, group]) => ({ label, chips: group }))
+}
+
+/**
+ * The status a link's row draws its marker from. (M40)
+ *
+ * The empty string for a target the board does not hold, which every `status*` helper already
+ * reads as *unknown* — `circle-slash`, `idle`, `Unknown` — rather than as *no state*. The cast
+ * lives here and only here: `LinkChip.targetStatus` is honestly nullable and the three helpers
+ * keep the `TaskStatus` signature every other caller passes them.
+ */
+export function linkTargetStatus(chip: LinkChip): TaskStatus {
+  return chip.targetStatus ?? ('' as TaskStatus)
+}
+
+/**
+ * The words in a link row's title cell. **Never empty, for any input** — [`linkLabel`]'s rule.
+ *
+ * Three states, and the third is why the row says it in words as well as in `data-gone`: a
+ * reference whose target has left the board is the task-leaves-the-tracker failure one edge
+ * over, and a row that merely rendered blank there would read as an untitled task.
+ */
+export function linkTargetText(chip: LinkChip): string {
+  if (chip.gone) return 'Not on the board'
+  return chip.targetTitle !== null && chip.targetTitle.trim() !== '' ? chip.targetTitle : 'Untitled'
 }
 
 /**

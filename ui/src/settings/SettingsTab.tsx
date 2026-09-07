@@ -16,9 +16,11 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import {
+  agentDefs,
   claudeTasks,
   openLogDir,
   settings as settingsApi,
+  type AgentModels,
   type ClaudeCliSupport,
   type ProjectId,
   type SettingsSection,
@@ -93,6 +95,46 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
       live = false
     }
   }, [configuredBinary, configuredInjections])
+
+  /**
+   * What `opencode models` reports, with cide's provider document injected. (M45)
+   *
+   * Refetched whenever the provider list changes — a key typed or an endpoint corrected is
+   * precisely when somebody wants to know whether it worked — and keyed on the *providers* only,
+   * so editing a pool (which changes nothing opencode can see) does not spawn a process.
+   * `recheck` is the same fetch on demand.
+   */
+  const configuredProviders = JSON.stringify(settings?.llm.providers ?? null)
+  const [opencodeModels, setOpencodeModels] = useState<AgentModels | null>(null)
+  const [modelsNonce, setModelsNonce] = useState(0)
+  useEffect(() => {
+    if (settings === undefined) return
+    let live = true
+    void agentDefs
+      .models(project, 'opencode')
+      .then((answer) => {
+        if (live) setOpencodeModels(answer)
+      })
+      // A build with no such handler, or a project that has gone away. The screen draws the
+      // un-probed state, which is the same one it starts in.
+      .catch(() => {
+        if (live) setOpencodeModels(null)
+      })
+    return () => {
+      live = false
+    }
+  }, [project, configuredProviders, modelsNonce, settings === undefined])
+  const recheckModels = useCallback(() => setModelsNonce((n) => n + 1), [])
+  /**
+   * One real turn against one model, for the Models screen's Test buttons.
+   *
+   * Not memoised on anything but `project`: it takes the model as an argument and reads nothing
+   * else, so a provider edit must not give the buttons a new identity mid-test.
+   */
+  const testModel = useCallback(
+    (model: string) => agentDefs.testModel(project, model),
+    [project],
+  )
 
   /**
    * The log directory, resolved by opening it.
@@ -174,6 +216,9 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
               cliSupport,
               openLogDir: revealLogDir,
               logDir,
+              opencodeModels,
+              recheckModels,
+              testModel,
             })
           )}
         </div>

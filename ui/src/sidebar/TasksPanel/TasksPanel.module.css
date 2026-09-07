@@ -1820,57 +1820,87 @@
 
 /* --- Typed links on the card. (M30) ----------------------------------------------------- */
 
-.linkChips {
+/*
+ * The links section's rows. (M40)
+ *
+ * A column, not the wrapping pill cloud this was in M30 — `TaskLinkList`'s header carries why.
+ * The rows reuse `.glyph`/`.taskId`/`.taskTitle`, the board row's own three cells, so a link
+ * reads like the task it points at; only the container, the heading and the row's own
+ * hover/focus treatment live here.
+ */
+.linkList {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-1);
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
 }
 
-.linkPair {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
+.linkGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   min-width: 0;
 }
 
 /*
- * A chip that navigates: the `.specChip` look on a `<button>`, because the two name the same
- * kind of fact — which other thing this task stands in relation to — and must read as one
- * family. Rounded like `.chip` rather than squared like the spec chip, because this one acts;
- * the hover lift is what says so.
+ * The reading — `Blocked by`, `Blocks` — over the rows it gathers.
+ *
+ * A rung below `.groupHead`, which is the *board's* group heading at `--fs-ui-12`: this one
+ * sits inside a card, directly under the `Links` field label, and at the same size the two
+ * competed for which was the section's name.
  */
-.linkChip {
-  appearance: none;
-  background: none;
-  cursor: pointer;
-  font-family: var(--font-mono);
+.linkGroupHead {
   font-size: var(--fs-ui-11);
-  color: var(--dim);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--r-full);
-  padding: 0 var(--sp-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 100%;
+  color: var(--faint);
+  padding: 0 4px;
 }
 
-.linkChip:hover {
+.linkRow {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  min-width: 0;
+  border-radius: var(--r-2);
+}
+
+.linkRow:hover {
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
+}
+
+/* `.rowMain`'s shape: the three cells, the pointer, and a hit area that is the whole row. */
+.linkRowMain {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--r-2);
+  background: transparent;
   color: var(--text);
-  border-color: var(--border);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  text-align: left;
 }
 
-.linkChip:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
+/* Only where it acts. The compose dialog draws the same row as a `<span>`, and a hand over
+   markup that does nothing is the dead-affordance the `<span>` arm exists to avoid. */
+button.linkRowMain {
+  cursor: pointer;
+}
+
+.linkRowMain:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 /* The target is off the board — deleted, or living on a branch not pulled yet. Marked and
    still clickable (the card it opens is the honest "no such task" state), never hidden: a
-   reference that silently vanished is the failure this panel keeps writing against. */
-.linkChipGone {
+   reference that silently vanished is the failure this panel keeps writing against. The row
+   says so in words too; this is only the colour. */
+.linkRowGone {
   color: var(--faint);
-  border-style: dashed;
 }
 
 .linkRemove {

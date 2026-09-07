@@ -94,3 +94,102 @@
   color: var(--text);
   white-space: pre;
 }
+
+/*
+ * A tool call, drawn as sections rather than as its JSON envelope. (M42) The same measurements
+ * as the JSON view — `.code` is `.json` allowed to wrap, because a command line and a build's
+ * output are prose-shaped text and a 400-character `cargo` invocation that scrolls sideways is
+ * unreadable in exactly the way the JSON view was for it.
+ */
+.heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.subtitle {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sections {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+.metaItem {
+  font-variant-numeric: tabular-nums;
+}
+
+.badgeOk,
+.badgeBad {
+  font-size: var(--fs-ui-11);
+  line-height: 1;
+  padding: 4px 7px;
+  border-radius: var(--r-2);
+  border: 1px solid var(--border);
+  color: var(--green);
+}
+
+.badgeBad {
+  color: var(--red);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sectionTitle {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.code,
+.prose {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--r-2);
+  border: 1px solid var(--border);
+  background: var(--chrome-hi);
+  font-family: var(--font-mono);
+  font-size: var(--fs-code);
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.codeBad {
+  color: var(--red);
+}
+
+.prose {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-13);
+  line-height: 1.5;
+}

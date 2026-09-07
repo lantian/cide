@@ -256,6 +256,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         explorer,
         inspections,
         git,
+        llm,
     } = patch;
 
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
@@ -314,6 +315,21 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // own toggle when it opens a file. Neither is mirrored anywhere that would go stale.
     if let Some(v) = git {
         settings.git = v;
+    }
+    // Stored verbatim, key and all, for `proxy`'s reason above: a provider that needs a key
+    // cannot be used without one and cide has no keyring. `cleaned()` is the analogue of
+    // `sidebar.clamped()` — it drops rows that cannot mean anything (a provider with no id, a
+    // pool entry with no model), so a hand-edited `workspace.json` cannot put a `""` key into
+    // the document opencode is handed. It deliberately does **not** touch `apiKey`: silently
+    // editing a credential is how a key that works in a terminal stops working in cide.
+    //
+    // No live reaction below, and that is deliberate rather than an omission.
+    // `OPENCODE_CONFIG_CONTENT` is composed at the fork and a running child's environment
+    // cannot change, so an edited provider is honoured from the *next* dispatch — the rule
+    // `project.config.agents.skip_permissions` already states beside the `RunPlan` literal.
+    // A restart here would be a restart for a value nothing running can read.
+    if let Some(v) = llm {
+        settings.llm = v.cleaned();
     }
     // The one patched field that is clamped rather than taken at face value.
     //
@@ -390,6 +406,7 @@ pub fn tab_open_settings(
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "settings".into(),
             },
         )?;

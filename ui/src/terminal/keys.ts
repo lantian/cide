@@ -104,6 +104,14 @@
  * and where a layout makes them differ anyway, the mismatch costs a copy that does not happen
  * rather than an interrupt that does not happen.
  *
+ * That last sentence was true of Latin layouts only. Under a Russian layout WebKitGTK reports
+ * `key 'с'` and `keyCode 0` for the C key, so `key` and `keyCode` were *both* wrong, together:
+ * no copy, and no interrupt either, because xterm encodes nothing for `keyCode 0`; Ctrl+V
+ * reached bash as `^V`, readline's `quoted-insert`; Ctrl+F could not open the find bar. Since
+ * `keys/latin.ts` the pair is rewritten *together* to the US spelling before `terminalKeyGate`
+ * passes the stroke down to here, so on every layout this rule and xterm still read the same
+ * pair — which is the property matching `key` was chosen for, and the reason it stays.
+ *
  * Ctrl only, with no `meta` spelling: nothing rewrites this module for macOS the way
  * `keymap::platform_layer` rewrites the keymap. A macOS port starts here.
  *

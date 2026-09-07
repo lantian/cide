@@ -248,6 +248,19 @@ arming there would kill panes seconds after they opened. What covers a PTY child
 shutdown ladder, the signal thread and `run.sh`'s reap of a previous run's orphans. The comment
 now says all of that instead of naming a call that does not exist.
 
+
+**An agent run's event FIFO (M43).** `cide_app::event_tap` makes a FIFO with `libc::mkfifo` and
+reads it non-blocking; macOS has both, and the module is `#[cfg(unix)]` with an `Unsupported`
+error on the other arm, so a platform without FIFOs runs a qwen role unobserved rather than not at
+all. Nothing about it has been run on a Mac.
+
+**A codex run's sandbox (M44).** `harness/codex.rs` maps a role's permission mode onto codex's own
+`-s <mode>`, `--approve-for-me` and `--dangerously-bypass-approvals-and-sandbox`, and the sandbox
+behind them is codex's to implement — bubblewrap on Linux, Seatbelt on macOS. cide owns nothing
+platform-specific here; what it knows is that under `workspace-write` codex re-binds `.git`
+read-only on Linux, which is why a task run's default is the bypass. Whether the macOS sandbox
+does the same to a worktree's `.git` file is unmeasured, and nothing here has been run on a Mac.
+
 ## What needs a Mac at the keyboard
 
 Everything here is a decision, not a port, and each one has a consequence somebody has to look
@@ -363,6 +376,16 @@ at before choosing:
   against inotify. ~~Expected to work; unverified.~~ **Expected to be dead under any symlinked
   path** — see the entry below, which is the one macOS finding that is a defect in the product
   rather than in a test.
+* **Option is a level-3 shift, and `keys/latin.ts` must be told so.** The non-Latin-layout
+  rewrite (M41) treats Alt alone as a chord modifier, because on Linux it is: GDK maps AltGr to
+  Mod5, not `altKey`, so `altKey` with a letter is never text. On macOS `⌥o` is how `ø` is
+  typed, and `altKey` is set for it — so `latinRewrite`'s `altIsChord` must be `false` there, or
+  a non-ASCII Latin letter typed through Option is rewritten to `Alt-o` before CodeMirror sees
+  it. The parameter exists and defaults to `true`; nothing passes `false` yet, because nothing
+  in the webview decides the platform for it. CodeMirror carries the same guard
+  (`browser.mac && event.altKey`), which is where the answer came from. macOS also reports
+  Latin `key` values for Cmd+letter under a Cyrillic layout natively, so the rewrite there is
+  mostly a no-op for the Cmd chords and matters for Ctrl ones.
 
 ## The file watcher, and why it is expected to be silent under `/tmp` and `/var`
 

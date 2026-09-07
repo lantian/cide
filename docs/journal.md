@@ -18,6 +18,477 @@ For the current shape of the project see [`../README.md`](../README.md); for wha
 not exist off Linux see [`platforms.md`](platforms.md); for the decisions a refactor would
 otherwise undo see [`adr/`](adr/).
 
+## Codex CLI as a fourth harness (M44), and what is not verified
+
+> *"Let's add codex harness support for subagents like we did for qwen"*
+
+### Measured first, against the installed 0.153.2
+
+Nothing below was remembered; every flag was probed with `--help` and every override with a
+read-only subcommand, and one probe turned out to be worth more than the rest. Codex is
+`codex-cli 0.153.2` here, a static binary the standalone installer symlinks into
+`~/.local/bin` — `toolchain::discovered_dirs` already carries that directory, so a desktop
+launch finds it.
+
+The shape was decided by two absences. The TUI has **no dual output**: `--json` exists on
+`codex exec` only, and there is no `--json-file` to read a live TUI's state off. And codex's
+hooks — Claude-shaped, `hooks` a stable feature in this build, `SessionStart` to `Stop` with the
+same payload keys — are configured only in `$CODEX_HOME/config.toml`, `.codex/config.toml` or
+`.codex/hooks.json`, behind a persisted trust hash; there is no `--settings` twin, and cide
+writes into neither a user's home configuration nor their project. So this is not qwen's
+hosting, an interactive TUI in the pane with a FIFO beside it. It is **opencode's**: one
+`codex exec --json` child per turn, one JSON event per line on stdout, the process gone when
+the turn is, and every piece of app machinery that shape needs was already there —
+`SessionBinding::Harness` for an identity that arrives on stdout, `Delivery::Respawn` for a
+follow-up that has to be a new child, `LineRender` upstream of the mirror, the `#handle` ring.
+Where codex is *better* than opencode: `codex exec resume <thread_id> <prompt>` is a real
+follow-up into the same conversation, and `codex resume <thread_id>` is the real TUI for a
+person to re-open a finished run in.
+
+What the probes measured, in the order the argv uses it. `codex exec [OPTIONS] [PROMPT]` and
+`codex exec [OPTIONS] resume [SESSION_ID] [PROMPT]`; the `resume` subcommand **rejects** `-s`,
+`-C`, `--approve-for-me` and `--add-dir`, and every one of them is **accepted at the exec root
+ahead of `resume`**, so one `assemble(plan, resume)` writes the shared options once and puts
+either the prompt or `resume <id> <prompt>` after them. `exec` has no `-a/--ask-for-approval`
+and no `--full-auto`; it never asks, and a refused action is returned to the model — so the
+definition's `permission-mode` maps onto **sandbox** flags and there is no `AwaitingPermission`
+on this harness. `-c mcp_servers.cide.command=… -c mcp_servers.cide.args=["mcp"]` reaches the
+MCP table (`codex mcp list` prints the server), and `-c mcp_servers.cide.env.CIDE_RUN=…` reaches
+the server's environment (`codex mcp get cide` prints it) — which matters because codex starts a
+stdio MCP server with a **whitelisted environment**, `DEFAULT_ENV_VARS` plus the server's own
+`env`, and not with its own. Every other harness lets `cide-hook mcp` inherit `CIDE_RUN` and
+`CIDE_AGENT_SOCK` from the child; here both are spelled into the override as well, or the
+bridge starts, scopes itself to nothing, and every tracker tool answers nothing.
+
+The probe worth more than the rest: **`codex debug prompt-input`** renders the model-visible
+prompt as JSON without calling a model. It showed that `-c developer_instructions="…"` lands as
+the **first `developer` message** the model sees — there is no `--append-system-prompt`, and
+this is the road for the role's brief — and it showed what a `-c` value is: TOML, parsed first
+and only then a literal. A bare `42` is refused (`invalid type: integer, expected a string`),
+a multi-line literal is not TOML at all, and a basic string with `\n`, `\"`, `\\` and `\t`
+decodes byte for byte. So `toml_string` encodes every string cide passes through `-c`, and the
+first of the real-CLI tests holds a brief with quotes, backslashes, a tab and two paragraphs to
+what the model is shown, byte for byte, for free.
+
+The rest: tools reach the model as `mcp__<server>__<tool>` — claude's spelling, built in
+`codex-mcp/src/tools.rs`, with a `non_prefixed_mcp_tool_names` flag under development that
+would change it; the caller **cannot** choose the thread id, so it is captured off the first
+event; the event names, exhaustive from the binary's strings, are `thread.started`,
+`thread.failed`, `turn.started`, `turn.completed`, `turn.failed`, `item.started`,
+`item.updated`, `item.completed` and `error`; `codex debug models` prints the catalog in
+0.8 s; `codex resume` takes `--include-non-interactive` because exec sessions are excluded from
+its picker by default; and sessions on disk under `~/.codex/sessions/…/rollout-*.jsonl` are
+**migrating to sqlite** (`codex migrate-rollouts`), so cide reads none of them — `transcript_of`
+answers `None` and a run's reopenability follows the captured id, as opencode's does.
+
+Then the one probe that spends: a real turn, run once. `thread.started` first, `turn.started`,
+one `agent_message` saying `pong`, `turn.completed` last, exit 0, and **nothing else on
+stdout** — the banner every other CLI prints went nowhere. `codex exec resume <id> <prompt>`
+from the same directory continued the same thread id; and from a *different* directory it did
+too, which is a fact the other harnesses do not have: a codex conversation is found by its id
+alone, and the worktree rule (`claude`'s, `qwen`'s) does not apply. `HarnessSession::cwd` is
+still where a continuation pane starts, because that is where the work is.
+
+### The design
+
+`harness/codex.rs`, and `harness/render.rs` for what it shares with opencode's rendering: the
+fixed 200-column mirror, the live marker and the cursor-up erase that assumes it never wrapped,
+`compose` and the string helpers. Two copies of the marker discipline would be the drift
+`CLAUDE.md`'s rendering row pins tests against, so the helpers moved out of `opencode.rs`
+unchanged and both harnesses import them; `RUN_COLS` keeps its old path through a re-export.
+
+The argv, numbered at the call site: `exec`; `-C <cwd>` and the spawn cwd to one directory,
+opencode's `--dir` rule, plus `--skip-git-repo-check` because a task-less run stands in the
+project root and a root need not be a repository; the sandbox tokens; `-m` and
+`-c model_reasoning_effort=` from the definition, the effort verbatim and unvalidated as
+opencode's `--variant` is; one `-c developer_instructions=` carrying the brief in every
+harness's paragraph order and under every harness's gate (the tracker, spec and ad-hoc
+paragraphs only when the bridge is attached — `harness.rs`'s parity tests now hold codex's
+brief to claude's fold); the four tracker overrides, all or none; `--color never`; then
+`--json` for a fresh child or `resume --json <thread_id>` for a follow-up; then the prompt,
+last, positional, nothing after it.
+
+The permission vocabulary, mapped or refused. `bypassPermissions` is the bypass flag;
+`acceptEdits` and `dontAsk` are both `-s workspace-write`, because on a CLI that never asks
+"edit freely, ask for the rest" and "never ask, deny what would have asked" are one policy;
+`plan` is `-s read-only`; `auto` is `--approve-for-me`, codex's own reviewer where claude has a
+classifier; `manual` is refused with `NoEquivalent`, because a headless `exec` has nobody to ask
+and every mapping would drop the one restriction the author wrote. **The project default is the
+bypass flag**, and the reason is opencode's `--auto` paragraph word for word plus one fact
+about codex: under `workspace-write` it re-binds `.git` read-only even inside the writable root,
+and a cide worktree's `.git` is a file pointing outside the root anyway, so a sandboxed run
+cannot make the commits the tracker paragraph asks every task run for. A role that names a
+sandboxed mode gets it and its task runs will not commit; that is recorded, not papered over
+with `--add-dir`, which cannot unprotect `.git`. `tools:` is dropped as opencode drops it: a
+claude allow-list has no codex counterpart and a restriction applied by halves is the failure
+that looks like success. `CODEX_API_KEY` is neither set nor removed — it outranks the ChatGPT
+login in codex's auth ladder and moves billing to API credits, the `ANTHROPIC_API_KEY` rule with
+the variable renamed.
+
+The stream. `capture` answers on `thread.started` and on nothing else, so a later event that
+carries a `thread_id` can never be the first thing captured. `observe` says `Running` for every
+`thread.started`/`turn.started`/`item.*` line and **nothing for `turn.completed`**: no line maps
+to `Idle`, run 06202dd6's rule, and the exit that follows within milliseconds is the truth. The
+rendering is one line per completed item with the handle at its end so `runLinks.ts` needs no
+change — `● shell  cargo test  #7`, `● cide_task_get  t-14`, `● edit  ~a.rs +b.rs -c.rs`, a
+failed command red with its last output line beneath, a sandbox's refusal red with *declined*
+beneath — and `item.started`/`item.updated` draw nothing *and leave the marker alone*, because
+they are the streamed progress of one item and redrawing the marker on every chunk would scroll
+a pane that is doing nothing. The app side is the opencode arm in every match: the conversation
+is the captured id, `reopenable` waits for it, `lifecycle` knows no file, the continuation pane
+is a Shell-kind pane titled `codex`. The models menu is `codex debug models` filtered to the
+catalog's `visibility: list` entries. The frontend is the four tables and the two check pins,
+plus a duplicated `'qwen' | 'qwen'` in the panel's union that nothing had caught.
+
+### What is not verified
+
+The exit code of a turn that ends in `turn.failed`, and whether SIGTERM lets codex flush the
+session — `Exit` is the truth as for opencode, and the real test prints what it saw. Whether
+the root `--json` reaches `resume` (it is written where each subcommand declares it, so the
+answer is moot). Whether `exec` in a **PTY** waits on its stdin: run as a plain child with a
+closed pipe it printed *Reading additional input from stdin…* to stderr and went on, and its
+own help says stdin is appended only when *piped* — a pane's stdin is a terminal, so the
+expectation is that it does not, but only a dispatched run shows it. Whether `--color never`
+reaches anything at all: the real turn printed no banner to merge. Whether the macOS sandbox protects a worktree's
+`.git` file as the Linux one does. And, as for every harness so far, no display has shown a
+codex run's pane at all. The hooks road — `-c hooks…` overrides plus
+`--dangerously-bypass-hook-trust`, which would make the interactive-in-pane hosting possible —
+is unmeasured and is the named upgrade path, as `opencode serve` plus `attach` is one harness
+over.
+
+## Qwen Code as a third harness (M43), and what is not verified
+
+> *"Do we support qwen harness for subagents?"* — no; then *"Plan the implementation for qwen
+> support"*, and *"Implement plan regarding qwen."*
+
+### Measured first, against the installed 0.23.0
+
+The morning's measurements decided the shape, and the one that could not be taken is named
+below. Qwen Code's surface is Claude Code's where it matters: `--session-id <uuid>` and
+`--resume <id>`, filed under `~/.qwen/projects/<cwd with non-alnum → '-'>/chats/<uuid>.jsonl` —
+claude's encoding with a `chats/` segment, so the worktree rule holds unchanged (measured: a
+session started in a pty under a scratch directory appeared exactly there, and survived a
+SIGTERM with the chat file complete); `--append-system-prompt`; an inline `--mcp-config`
+(measured: a stdio probe server was spawned at startup and asked `initialize` and `tools/list`,
+under the client name `qwen-cli-mcp-client-cide`); MCP tools named `mcp__<server>__<tool>`;
+`--allowed-tools`; `--approval-mode plan|default|auto-edit|auto|yolo`; and `-i <prompt>`, which
+runs the prompt and stays interactive (measured: the TUI painted in the pty and the process sat at
+its prompt after the turn).
+
+What it does not share is the state channel. Its hooks exist — claude's eleven event names and
+payload keys are in the bundle — but they are configured only in settings files, the user's home
+or the project's `.qwen/settings.json`, and there is no `--settings`. cide will not write into
+either. What the CLI offers instead is dual output: `--json-file <path>` writes stream-json
+events to a file or FIFO while the TUI paints on stdout (measured: `system/session_start`, `user`,
+`stream_event` and `assistant` lines arrived on a FIFO while the TUI ran; the CLI opens the FIFO
+read-write itself, its own error text says so).
+
+**Not measured:** a completed turn. The user's model endpoint (`127.0.0.1:1234`) was down, so
+every turn ended in an API error and no `result` event was seen. The `result` emitter in the
+bundle carries claude's `-p` envelope (`subtype`, `is_error`, `duration_ms`, `num_turns`,
+`usage`) and the `session_start` event's `supported_events` lists `result` for the dual mode, so
+the mapping reads it as the turn's end — pinned on the emitter's shape, not on a live turn.
+Whether the dual mode writes a `control_request`/`can_use_tool` while the TUI asks for a
+permission is the second unmeasured fact; the mapping reads it as `AwaitingPermission` if it
+comes, and a role that wants prompts is merely unobserved at that moment if it does not.
+
+### The design
+
+A qwen run is `qwen -i <prompt>` in the PTY — `claude.rs`'s "interactive pane nobody is looking
+at", with the prompt as an option value instead of a typed line, so there is no variadic flag to
+swallow it and no boot-buffer paste to peel an Enter off. Identity is `SessionBinding::Caller`,
+claude's: cide mints the uuid, resume is free, an interrupted run continues under its own id
+(`--resume` plus the continuation prompt as `-i`'s value). The role's brief is one
+`--append-system-prompt` through `fold_append_system_prompt`, the tracker paragraph and the
+OpenSpec and ad-hoc paragraphs folded behind it in `claude.rs`'s order; the tracker is the same
+inline `cide-hook mcp` server, spelled `mcp__cide__<tool>` in the brief. Follow-ups are typed into
+the TUI. The definition's `permission-mode` maps (`bypassPermissions → yolo`, `acceptEdits →
+auto-edit`, `plan`, `auto`, `manual → default`) or is refused (`dontAsk`, and any `effort`, which
+has no flag) with `HarnessError::NoEquivalent` — a restriction the author wrote that silently did
+not apply is the failure that looks like success. The IDE variables (`QWEN_CODE_IDE_SERVER_PORT`,
+`QWEN_CODE_IDE_WORKSPACE_PATH`) are removed for `claude.rs`'s `openDiff` reason.
+
+The state comes through a new piece: `HarnessSpawn::events` and `cide_app::event_tap`. The app
+mints a FIFO path beside the agent socket for every run (`RunPlan::events_path`), makes the FIFO
+only for a harness that hands the path back, and reads it on a thread of its own into
+`AgentRegistry::observe` as `Observation::Line` — exactly what an opencode child's stdout becomes
+in the stream hook, one stream over — and tees every line into the run's post-mortem log. The
+FIFO is made **before** the fork (a missing path becomes a regular file the child appends to)
+and opened **non-blocking read-only** (a blocking open waits for a writer, and a child that died
+in its first millisecond would leave the thread waiting for ever); a zero-byte read means *no
+writer*, which is the end only once the child has exited. `QwenHarness::observe` maps the lines:
+every event says the child is working, `result` hands the turn back (`Idle`),
+`control_request`/`can_use_tool` parks it, the exit ends it from any state, and nothing moves a
+paused or ended run.
+
+Open on a live qwen run is a mirror of the real TUI (claude's arm of `open_plan`); on an ended
+one it is `qwen --resume <id>` from the worktree through `continue_spec`, hosted as a Shell-kind
+pane titled `qwen` like opencode's TUI. `lifecycle::transcript_of` and `resumable_on` answer the
+transcript question per harness (`QWEN_HOME` where claude has `CLAUDE_CONFIG_DIR`), so a finished
+qwen row restored after a restart keeps its session when its chat file survives.
+
+### What is not verified
+
+A completed turn, and therefore the `result` mapping that ends one, the `Idle` it produces and
+the follow-up typed into the TUI after it — the whole queue-facing half of the harness — none of
+it has been watched, because the user's endpoint was down; the `#[ignore]`d real-CLI tests are the
+first thing to run once it is up. The permission event in dual mode. The nvm-resolved `qwen` from
+a desktop launch, argued from `discovered_dirs` and not launched from a desktop. No display has
+shown a qwen run's pane at all. And the plan's fallback — headless `-p -o stream-json` per turn,
+opencode's shape — stays a fallback only if the `result` event does not arrive in `-i` mode.
+
+## Opening a run is the real harness (M42), and what is not verified
+
+> *"Currently when I open a subagent session it opens some custom panel that has no full history of
+> the agent run. Also this panel is just a hardly concatenated log, not the session. We should open
+> the real harness on the session it is working on right now (or worked on before, if already
+> done)."* — and, on the first plan: *"Subagents can be not only Claude Code; I especially use the
+> opencode harness for subagents."*
+
+### What Open actually showed, per harness and per state
+
+**Open** on a run was `SplitIntent::Mirror` on the run's PTY session, and a run *is* a real child
+in a PTY (M18), so for a live `claude` that was the right process — but what the pane showed was
+wrong in four ways, and the report named three of them. A **live claude** run's attach snapshot was
+`reattach_state()`: one screen. Everything the run had printed before the click sat in the vt100
+mirror's scrollback and never reached the pane. A **finished claude** run's snapshot was
+`full_state()`, the mirror's scrollback walked row by row — of an Ink TUI rendered at the headless
+default 80×24, with `— exited —` under it: "a hardly concatenated log". An **opencode** run is
+`opencode run --format json`, one process per turn, and the pane showed `stream_hook`'s rendered
+*digest* of its ndjson — never opencode; and since that child exits at the end of every turn, the
+common state of an opencode run is "ended". And **after a cide restart** there was no Open at all:
+`restore_snapshot_from` dropped every finished row's session, and `canOpen` refused `interrupted`,
+while both harnesses still held the conversation on disk.
+
+The identities to re-open on were already there. A claude run's `SessionId` *is* its conversation
+id (`cide_claude::conversation`, `--resume` keeps it), and an opencode run's `ses_…` is captured
+into `LiveRun::harness_session` and is what `opencode --session <id>` takes. What every pane-side
+resume road lacked was the **directory**: both harnesses file the conversation under the run's cwd
+— the worktree, `.cide/worktrees/<role>-<task>` — and `TerminalPane` spawned everything in the
+project root, where `claude --resume` answers *no such conversation*. Worktrees survive
+`agents_integrate` (nothing calls `worktree::remove`), so the transcripts were there to be found.
+
+### One question, three answers
+
+Open asks Rust one question — `agents_run_open(project, run) -> RunOpen` — and builds the pane
+itself through the split machinery with the intent the answer names. The deleted-`agent_open_pane`
+argument (M18) is unchanged by this: a command that *answers* never builds a pane, so
+`rememberSpawnPlan` runs and the ownership flag is set from the plan, for a mirror and — the other
+way round — for a continuation, whose pane spawned the child and must end it.
+
+`AgentRegistry::open_plan`'s ladder, in order: the registry still holds a **live child** → `Mirror`
+(a claude run's real TUI mid-turn; an opencode run's rendered stream), carrying the conversation so
+the pane can re-open it later; the harness can **re-open the conversation** → `Continue` —
+`claude --resume <id>` from the run's cwd when `lifecycle::resumable` finds the transcript there,
+asked at the click rather than trusted from memory because a worktree can be deleted in between;
+`opencode --session <ses_…>` whenever the run named one, that CLI's store not being cide's to
+check; the registry still **retains the exited session** → `Mirror` of what it kept, which is what
+Open showed before and is still right for an opencode stream that is the only record; else
+`Unavailable` with the reason in the sentence — queued, never named a conversation, the `--resume`
+injection off, the transcript gone with its worktree.
+
+`Continue` spawns through the **existing** `session_spawn`, which grew `continues:
+Option<HarnessSession>` — a harness-neutral record of `{ harness, id, cwd }` — and lets the harness
+spell the command (`Harness::continue_spec`, required, not defaulted): claude answers `program:
+claude, resume: Some(id)` and cide's own resume road writes the flag, hooks, `--settings`, the MCP
+config and the configured binary exactly as for any pane; opencode answers `opencode --session
+<id>` and the shell-like path hosts it (job watch, suppressed for a fullscreen TUI). One spawn
+site, one vocabulary owner, and the frontend never learns either CLI's flag. The pane kind follows
+the harness in `pane_for` — a continued claude conversation is a Claude pane in every respect, an
+opencode TUI is a Shell-kind pane titled `opencode` — and there is deliberately still no
+`PaneKind` for an agent (M18's six-module argument stands).
+
+**The pane remembers the conversation.** `Pane::continues` is durable, and that is the whole reason
+a mirror carries a conversation it does not need yet: when a run's child ends in a pane somebody is
+reading, the exit bar's *Resume this conversation* and a restart re-open it from the run's
+directory, and `plan_restore` looks for the transcript there after a cide restart — not a fresh
+`claude` in the project root over a worktree transcript it cannot see. `TerminalPane` also learned
+that a plan which **spawns** (`resume`, `continue`) must skip the domain-session adoption: the
+registry retains an exited conversation's screen precisely so a closed pane can still paint it, and
+adopting that id would have attached the new pane to the dead screen and quietly skipped the
+`--resume` the button promised. That gap was there for `TasksPanel/openSession.ts`'s `Resume`
+already; it is closed for both.
+
+**Two harness processes on one conversation is the thing this must never cause.** `session_spawn`
+already refused a second `claude --resume` on a live id; opencode had no such guard anywhere. The
+registry now keeps `viewers` — which pane session is the real harness on which conversation, keyed
+by the id as the harness names it — written after the pane's child is up, cleared by `report_exit`
+when it is reaped. `respawn` and the interrupted-run requeue refuse a run whose conversation has a
+live viewer: a single-run Resume or Retry gets the sentence, the project scope skips the row and
+writes the sentence into its note, and a Resume pressed after the pane is closed works.
+`owns_session` stopped counting `Interrupted` as owned for the same reason: a pane's `claude
+--resume` under that very id is the pane's to close.
+
+**`AgentRun::openable` is a wire field.** `session` stopped being the whole answer — a finished
+opencode run has none and an openable conversation; a finished claude run restored after a restart
+keeps its session only when the transcript is still where the worktree filed it (one `is_file` per
+restored row, at launch, never per broadcast). `canOpen` reads it, and `interrupted` opens now.
+
+**A live attach can carry the history.** `PtySession::attach_with_snapshot` takes `history`, and
+the coalescer answers the scrollback rows in front of the reattach dump — with one `\r\n` per
+screen row between them, because `state_formatted` opens with a clear-screen that erases the
+viewport in place, and without the padding the last screenful of replayed history was wiped the
+instant it was painted. A child on the alternate screen gets the plain reattach: `vt100` keeps the
+scrollback on the normal grid, and padding the normal buffer for nothing would leave a page of
+blank rows behind the TUI. The pane asks for it only when it holds no transcript of its own
+(`attachModel.historyRequest`: never hydrated, nothing parked by eviction); a host replaying its own
+serialized buffer must not get the mirror's copy as well, or the transcript paints twice.
+
+### The opencode stream, read as a log
+
+> *"We need to do some styling to the read-only log-style console. Text is not on full width and
+> it's quite hard to understand what it is doing right now. If we could collapse tools and show
+> the whole details in a modal window by click, and style it properly…"*
+
+An opencode run's pane is the rendered `--format json` stream (M18), and the report names three
+defects in it. **Width**: a headless run's mirror was the 80-column `Geometry::default()` until a
+pane attached, and `vt100` does not reflow — `set_size` truncates rows and clears every wrap flag
+— so everything rendered before the first attach came back as 80-column fragments with hard
+breaks, and `full_state`'s row-by-row replay broke even the lines the mirror had wrapped with a
+flag. **Now**: `render_tool` drew a clipped six-line output block under every call and nothing
+marked the present. **Detail**: the whole call was nowhere a click could reach.
+
+Three changes. `SpawnSpec::fixed_size` pins a session's mirror at its spawn geometry for life —
+`PtySession::resize` becomes a no-op — and an opencode child is spawned at `RUN_COLS` (200) and
+never resized, because it prints lines and never reads the size, so the only thing a resize could
+do is the damage above; `scrollback_rows` and `full_state`'s tail join rows the mirror wrapped
+(`row_wrapped`), so a logical line reaches the pane as one line and xterm soft-wraps it at the
+width the pane actually has. The renderer is stateful now (`RenderState`, owned by the app's
+stream hook): a **tool call is one line** — `● bash  cargo test  1.2s #7`, red with the error
+verbatim beneath it for a rejected or failed call, `exit 1` for a shell command that returned
+non-zero, the tracker tools under their own names rather than the doubled `cide_cide_` prefix —
+and a **live marker** `▸ working…` sits under the last line from a `step_start` to its
+`step_finish`, erased (`\x1b[1A\r\x1b[2K`) and redrawn by every line rendered in between, so the
+last row answers "what is it doing right now" and a run whose child died mid-step shows the marker
+above `— exited —`. The `#7` is a handle into the same per-session `JsonLogRing` a shell pane's
+structured log lines use: `SessionBinding::Harness` grew `keep`, the hook records the lines it says
+yes to (tool calls, the model's text, errors), and `session_log_detail` answers for them with no
+second command. It is **plain text rather than an OSC 8 link** because `vt100` drops OSC 8 from
+every replay and a run is mostly read after the fact; `terminal/runLinks.ts` reads the token off
+the buffer, `runLinkProvider.ts` links the `● tool` prefix and the token (never the title, which
+is routinely a path the path provider must keep), and a plain click opens `LogDetailCard`, which
+now draws a tool event as input, output and error sections rather than a JSON dump.
+
+Not verified on a display: the marker's cursor-up erase is argued from the escape sequences and
+pinned on bytes, not watched in xterm; the untrimmed-row offset mapping in the link provider
+assumes a tool line is single-width text, which the glyph is in xterm's default measurement.
+
+### What is not verified
+
+No display has shown a continued pane on either harness — this landed without `./run.sh`. The
+history composition (`\r\n` padding before the dump) is argued from xterm's ED semantics and pinned
+in a cide-pty test on the byte order, not measured against xterm. The continued pane is a
+**person's** pane: for claude it runs under the pane's own system prompt and IDE port, not the
+role's brief or `--agent`; for opencode under opencode's own configuration, not the role's inline
+agent (`config_json` needs a `RunPlan`, and a pane has none) — both recorded as limitations rather
+than papered over. **A live opencode run is still the rendered stream**: `opencode attach <url>
+--session <id>` exists and `opencode run` has a `--port` flag, but the installed 1.18.27's `run`
+handler talks to an in-process server (`http://opencode.internal`) and nothing found binds a TCP
+port on `--port` outside `--interactive`, so the attach road is a measure-first follow-up. The
+`a_harness_bound_run_moves_on_its_own_output` test was observed failing once under the full suite
+and passing alone; the diff does not touch the exit path it exercises, and it looks like the race
+its own comment describes, but it was not chased.
+
+## Hotkeys under a non-Latin keyboard layout (M41), and what is not verified
+
+> *"Hotkeys not working when another language in OS is selected, but language selection should
+> not affect. CTRL-Z not working for example."*
+
+The report was about shortcuts and the key gate was not the bug, which is the first thing worth
+writing down. `keys/chords.ts` has read `KeyboardEvent.code` first since M8, for a reason that
+had nothing to do with languages — Shift turns the backtick key's `key` into `~` and the shipped
+`ctrl+shift+backquote` would never have matched — and a physical `code` is the same under every
+layout. So every binding in `cide_core::keymap` worked under Russian the whole time: Ctrl+P
+opened the picker, Alt+1 focused the pane, the spawn chords spawned.
+
+What died was everything *behind* the gate, and the reason is three lines of WebKitGTK
+(`Source/WebKit/Shared/gtk/WebKeyboardEventGtk.cpp`, read at the tag the installed 2.52.3 is
+built from). For a keyval that is not Latin, `key` is the character the layout produced
+(`gdk_keyval_to_unicode`, so `я`), `code` is the hardware keycode's name (`KeyZ`), and
+`keyCode` is the answer of a `switch` whose cases are Latin letters, digits and punctuation
+only: `default: return 0`. Chromium falls back to the hardware key's US value there; WebKit
+does not, and `navigator.keyboard.getLayoutMap` does not exist in it. Three readers depend on
+the two properties that went wrong:
+
+* **xterm** encodes Ctrl+letter and Alt+letter from `keyCode` (`Keyboard.ts`, the `default:`
+  branch: `65..90 → fromCharCode(keyCode - 64)`). With `0` it writes nothing. In a terminal pane
+  Ctrl+C did not interrupt and Ctrl+Z did not suspend; Ctrl+D, Ctrl+L, Ctrl+R, Ctrl+W were dead.
+* **CodeMirror** resolves `keyName(event)` — `event.key` — and, for a printable character with a
+  modifier held, falls back to `base[event.keyCode]`. With `я`/`0` nothing matched: undo,
+  select-all, duplicate line, toggle comment, find, all dead in an editor pane. Worse than dead
+  on Hebrew, where `KeyQ` prints `/` with a *real* `keyCode 191`, so Ctrl+Q ran toggle-comment.
+  (On a US layout CodeMirror needs that fallback for every Shift+letter chord too:
+  `Ctrl-Shift-z` is registered lowercase and `event.key` is `Z`.)
+* **cide's own focus-scoped rules** that match a chord on `ev.key`: the terminal's Ctrl+C copy,
+  Ctrl+V paste and Ctrl+F find (`terminal/keys.ts`), the file tree's clipboard chords and
+  Ctrl+R, the git log's Ctrl+D, the merge pane's undo, the OpenSpec tab's Ctrl+F. Each compared
+  `с` against `'c'`. Ctrl+V was the worst of these: unmatched, it reached bash as `^V`, which is
+  readline's `quoted-insert`, and the next keystroke was eaten.
+
+### One rewrite, upstream of everyone
+
+The alternative was to fix each reader: copy xterm's control-byte table into `xterm.ts`, put a
+`Prec.highest` keydown handler in front of every CodeMirror surface that forges a Latin event
+into `runScopeHandlers`, and teach seven `ev.key` rules to fall back to `code`. Ten sites, and
+the next `ev.key === 'f'` written would regress silently. Instead `keys/latin.ts` rewrites a
+chord keydown **in place** — `key`, `keyCode` and `which` become own data properties on the
+event, shadowing the prototype's getters, and `code` is never touched — and it runs as the first
+statement of both keyboard entry points of the gate. The window capture listener is the earliest
+point in a window, ahead of xterm's textarea listener, CodeMirror's `contentDOM` handler and
+React's root listener (which copies `nativeEvent.key` into its synthetic event), so every reader
+sees `z`/90 where the browser said `я`/0. In place rather than a synthetic twin because the
+browser's default action — native undo in a plain `<input>`, decided in the UI process from the
+GDK event — rides the original, and because the gate memoises its decision against the event
+object. Both `key` and `keyCode`, because the readers split: xterm reads one, cide's rules read
+the other, CodeMirror reads both.
+
+What is rewritten is a *chord* — Ctrl, Meta or Alt held — and nothing else. An unmodified key
+or Shift alone is text and keeps the layout's character: the sidebar's type-ahead, the terminal's
+textarea path and every text field read `key` for typing, and a rewrite there would be the
+bug in the other direction. AltGr sets none of the three flags under GDK (Mod5, not Mod1), so
+`€` and `ą` are untouched. Composition (`isComposing`, `keyCode 229`, `Process`, `Dead`) is the
+input method's, with the same exclusions as `imeFiltered`. Two rungs then decide: a `key` that
+is a single **non-ASCII** code point is rewritten unconditionally — every letter and most
+punctuation on Cyrillic, Greek, Hebrew and Arabic — and a `key` that is ASCII but *not the US
+face* of that physical key is rewritten only while typing has shown the layout to be non-Latin.
+That second rung exists because Russian's physical `/` prints `.`, so Ctrl+/ — toggle comment —
+was unreachable on the first rung alone, and Shift+digits differ (`"№;:?` against `@#$^&`); the
+latch it needs is learned from letters only, one outside the Latin script setting it and an
+ASCII one clearing it, so Turkish `ı`, Hebrew's `/` on a letter key and `№` say nothing, and a
+Latin layout — Dvorak, QWERTZ, AZERTY, where `key` is the right answer — can never set it.
+
+Two things surfaced writing the checks. The first version of the applier learned the layout from
+every pass, and both entry points see the *same* event for a terminal keystroke, so the second
+pass read its own `z` as Latin evidence and cleared the latch on every chord; the decision is now
+memoised against the event object, as the gate's is. And one listener in the app ran *ahead* of
+the gate: the OpenSpec tab registered its Ctrl+F on `window` in capture from a child effect,
+which React runs before the parent's, so with the tab active at first paint it saw `а` and on
+its next re-run saw `f`. It listens on `document` now, which runs after every window-capture
+listener whatever the registration order.
+
+`check:latin` holds the 47-entry face table to w3c-keyname's `base`/`shift` tables — resolved
+out of `@codemirror/view`'s own dependency tree, because those are the tables CodeMirror's
+fallback consults — and to xterm's control-byte arithmetic, then sweeps the whole Russian
+layout, both faces, four chords, both latch states, plus the exclusions and the applier.
+`check:keys` runs every context and all sixteen modifier sets over a dozen non-Latin rows at
+both entry points, holding the verdict to the US twin's and asserting what the event reads as
+afterwards, and holds `strokeFromEvent` invariant over every code the rewrite knows.
+
+One behaviour change is deliberate and named: Alt+letter in a terminal under Russian used to
+*type the Cyrillic letter* (xterm encoded nothing and the textarea path delivered it) and now
+sends `ESC` + the Latin letter, as Chrome, VS Code and IDEA do.
+
+### What is not verified
+
+A real Russian, Greek or Hebrew layout on a display — that a `KeyboardEvent` in this WebKitGTK
+accepts an own `key` property at all is asserted by reading the spec, not by pressing a key. The
+line to check is the input probe's (`./run.sh --input-probe`, then Ctrl+Z in a shell pane):
+`key="z" code=KeyZ keyCode=90` means the rewrite ran, `key="я" keyCode=0` means it did not. The
+stale-latch window after switching from a non-Latin layout to a Latin non-US one, before the next
+Latin letter is typed. Alt+letter in a terminal under Russian, which changed on purpose. And
+macOS, where Option is a level-3 shift and `latinRewrite`'s `altIsChord` must be `false` —
+`docs/platforms.md` carries it.
+
 ## Dispatch without a task, and where a run reports (M40), and what is not verified
 
 > *"Main agent can not start subagent without a task — task is a required field in the MCP tool.

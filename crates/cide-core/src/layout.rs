@@ -1670,6 +1670,7 @@ mod tests {
             session: Some(SessionId::new()),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "cide : claude".into(),
         }
     }
@@ -1682,6 +1683,7 @@ mod tests {
             session: Some(SessionId::new()),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "cide : bash".into(),
         }
     }
@@ -3068,6 +3070,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "workspace.rs".into(),
         };
         let e = editor.id;

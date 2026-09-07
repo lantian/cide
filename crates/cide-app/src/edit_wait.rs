@@ -648,6 +648,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "f".into(),
             },
         )

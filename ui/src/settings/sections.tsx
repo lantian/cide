@@ -25,6 +25,8 @@ import type {
   Settings,
   SettingsPatch,
   SettingsSection,
+  AgentModels,
+  LlmModelTest,
   TerminalRenderer,
   TerminalSettings,
   Theme,
@@ -52,6 +54,7 @@ import { FormattersSection } from './FormattersSection'
 import { MAX_UI_FONT_SIZE, MIN_UI_FONT_SIZE } from './fontScale'
 import { badge, handshakeNote, sentence } from './cliHandshake'
 import { ClaudeCliSection } from './ClaudeCliSection'
+import { ModelsSection } from './ModelsSection'
 import { ColorSchemeRow } from './ColorSchemeRow'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
@@ -91,6 +94,12 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     id: 'inspections',
     title: 'Inspections',
     description: 'Which analysers run, and which of their findings you see.',
+  },
+  {
+    id: 'models',
+    title: 'Models',
+    description:
+      'The providers your agents may reach, and the ordered pools a run falls down. Only opencode runs use them.',
   },
   {
     // Between Inspections and Git because that is where `SettingsSection::Agents` sits in the
@@ -142,6 +151,24 @@ export interface SectionProps {
   openLogDir: () => void
   /** The log directory once it has been resolved, so it can be shown and copied. */
   logDir: string | null
+  /**
+   * What `opencode models` reported, with cide's own provider document injected. (M45)
+   *
+   * Threaded through here rather than fetched in the section, on `cliSupport`'s precedent one
+   * field up: a section that reads the IPC surface is a section the fixture cannot drive, and
+   * `sections.tsx`'s header calls the props-less exception closed. `null` before the probe lands,
+   * and on a build with no such handler.
+   */
+  opencodeModels: AgentModels | null
+  /** Run that probe again, after a key or an endpoint changed. */
+  recheckModels: () => void
+  /**
+   * Try one `provider/model` for real, for the Models screen's Test buttons. (M45)
+   *
+   * Spends a very small amount of quota, so it is only ever wired to a button. `null` on a build
+   * with no such handler, exactly as `opencodeModels` above.
+   */
+  testModel: (model: string) => Promise<LlmModelTest | null>
 }
 
 const THEMES: readonly { value: Theme; label: string }[] = [
@@ -713,6 +740,16 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       // `SettingsPatch` or `workspace.json`. These values are declared by third-party manifests
       // and stored in `extensions.json`, so the component reads the extension store directly.
       return <ExtensionSettings />
+    case 'models':
+      return (
+        <ModelsSection
+          settings={props.settings.llm}
+          patch={props.patch}
+          models={props.opencodeModels}
+          recheckModels={props.recheckModels}
+          testModel={props.testModel}
+        />
+      )
     case 'agents':
       // No props: roles belong to a *project*, and `SectionProps` carries global settings.
       // The component takes the project from the store the way `KeymapSection` takes the

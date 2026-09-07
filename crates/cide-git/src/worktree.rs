@@ -57,6 +57,16 @@ use crate::{Result, Wrap, branch, repo as repo_mod};
 /// pattern somebody has to maintain.
 const WORKTREES_DIR: &str = ".cide/worktrees";
 
+/// Where `agent`'s checkout is — `<root>/.cide/worktrees/<agent>` — whether or not it exists.
+///
+/// The one spelling of the path, shared by [`ensure`], [`remove`] and the agent registry, which
+/// needs it for a run whose child is long gone: a conversation is filed under the directory the
+/// child started in, and re-opening it from anywhere else finds nothing. Pure, and deliberately
+/// so — the registry asks under a lock and must not open a repository there. (M42)
+pub fn path_of(root: &Path, agent: &str) -> PathBuf {
+    root.join(WORKTREES_DIR).join(agent)
+}
+
 /// The ref namespace agent branches live in. `cide/` rather than a bare name so `git branch`
 /// groups them, and so a user's own `developer` branch is never the one an agent commits to.
 const BRANCH_PREFIX: &str = "cide";
@@ -163,7 +173,7 @@ pub fn ensure(root: &Path, agent: &str) -> Result<AgentWorktree> {
     validate_agent(agent)?;
     let root = repo_mod::canonical(root);
     let repo = repo_mod::open(&root)?;
-    let path = root.join(WORKTREES_DIR).join(agent);
+    let path = path_of(&root, agent);
     let wanted_branch = branch_name(agent);
 
     if let Ok(existing) = repo.find_worktree(agent) {
@@ -248,7 +258,7 @@ pub fn remove(root: &Path, agent: &str) -> Result<()> {
     validate_agent(agent)?;
     let root = repo_mod::canonical(root);
     let repo = repo_mod::open(&root)?;
-    let path = root.join(WORKTREES_DIR).join(agent);
+    let path = path_of(&root, agent);
 
     if let Ok(existing) = repo.find_worktree(agent) {
         if repo_mod::canonical(existing.path()) != repo_mod::canonical(&path) {

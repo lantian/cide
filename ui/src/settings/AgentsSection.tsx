@@ -79,16 +79,28 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   agentDefs,
   agents as agentsApi,
+  type AgentModels,
+  type AgentOverride,
   type OrchestrationConfig,
   type ProjectId,
+  type ProjectOverrides,
 } from '@/ipc/client'
 import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { useAgents } from '@/sidebar/agentsStore'
-import { useActiveProject } from '@/store/workspace'
+import { useActiveProject, useWorkspace } from '@/store/workspace'
 // `Row as SettingRow`: `./agentsDraft` already exports a `Row` type — a row of the *role list* —
 // and this one is the settings-form row. Aliasing at the import keeps both names honest.
-import { ActionButton, Group, Note, NumberField, PathReadout, Row as SettingRow } from './controls'
+import {
+  ActionButton,
+  Group,
+  Note,
+  NumberField,
+  PathReadout,
+  Row as SettingRow,
+  Select,
+  TextField,
+} from './controls'
 import {
   EFFORT_SUGGESTIONS,
   HARNESSES,
@@ -97,6 +109,7 @@ import {
   blankDraft,
   canSave,
   closeRequest,
+  effectiveHarness,
   fileKey,
   fromWire,
   harnessLabel,
@@ -105,6 +118,7 @@ import {
   localProblems,
   modalFor,
   modalTitle,
+  modelPlaceholder,
   problemsByField,
   restoredModal,
   rowsFor,
@@ -125,6 +139,7 @@ import {
   type Problem,
   type Row,
   type Scope,
+  type HarnessName,
 } from './agentsDraft'
 import { Icon } from '@/icons/Icon'
 
@@ -244,6 +259,33 @@ function AgentsEditor({ project }: { project: ProjectId }) {
    */
   const [configError, setConfigError] = useState<{ what: 'read' | 'write'; text: string } | null>(
     null,
+  )
+
+  /**
+   * This project's **local, uncommitted** role redirections. (M45)
+   *
+   * Held beside `config` and drawn in the same group, but they are not the same kind of thing and
+   * the screen has to say so: `config` writes `.cide/config.json`, which the repository will
+   * contain and a teammate will review; this writes the profile's own
+   * `agent-overrides.json`, which nobody else ever sees. That difference is the whole reason the
+   * layer exists — see `cide_ipc::overrides`' header — and a row that did not say which was
+   * which would be the lie `OrchestrationConfig`'s doc warns about from the other direction.
+   *
+   * `null` is a build with no such handler; an *absent* file is an ordinary empty answer.
+   */
+  const [overrides, setOverrides] = useState<ProjectOverrides | null>(null)
+  const [overrideError, setOverrideError] = useState<string | null>(null)
+  /**
+   * The pools a row may name, from **global** settings.
+   *
+   * The split this whole feature rests on: a pool's providers and keys are the person's and live
+   * in `workspace.json`; which pool a role uses is the project's and lives in the override file.
+   * So the menu is drawn from one and written to the other.
+   */
+  const storedPools = useWorkspace((s) => s.boot?.workspace.settings.llm.pools ?? null)
+  const poolNames = useMemo(
+    () => (storedPools ?? []).map((pool) => pool.name).filter((name) => name !== ''),
+    [storedPools],
   )
 
   const dirty = draft !== null && isDirty(saved, draft)
@@ -443,6 +485,80 @@ function AgentsEditor({ project }: { project: ProjectId }) {
     }
   }, [project, rosterMark])
 
+  // The overrides, on the same key as the config above: a roster change can add the role a
+  // per-role row is about.
+  useEffect(() => {
+    let live = true
+    void agentDefs
+      .overrides(project)
+      .then((next) => {
+        if (!live) return
+        setOverrides(next)
+        setOverrideError(null)
+      })
+      .catch((error: unknown) => {
+        if (live) setOverrideError(errorText(error))
+      })
+    return () => {
+      live = false
+    }
+  }, [project, rosterMark])
+
+
+  /* ------------------------------------------------------- what the Model box may offer ----- */
+
+  /**
+   * Which harness the Model menu is for.
+   *
+   * `effectiveHarness` and not `draft.harness`, because that field is nullable: "project
+   * default" is a real state, so the answer needs `.cide/config.json` — which is loaded here and
+   * nowhere below. Resolved once, here, so the probe and the control cannot disagree about which
+   * CLI is being asked.
+   *
+   * A closed dialog resolves to `null` and asks nothing: this forks a process, and a settings
+   * screen nobody has opened a role on should not be running `opencode models`.
+   */
+  const modelHarness = useMemo(
+    () => (draft === null ? null : effectiveHarness(draft, config?.harness ?? null)),
+    [draft, config],
+  )
+
+  /**
+   * One answer per harness, kept for as long as the screen is open.
+   *
+   * Keyed by harness rather than held as a single value because flipping the Harness dropdown
+   * back and forth is an ordinary thing to do while deciding, and re-forking `opencode models`
+   * on every flip would be a spinner on a question already answered. The screen is keyed on the
+   * project, so a project switch remounts and drops the cache with it — which is right, since
+   * the probe runs in the project's directory.
+   */
+  const [modelAnswers, setModelAnswers] = useState<Partial<Record<HarnessName, AgentModels>>>({})
+  const [modelsPending, setModelsPending] = useState<HarnessName | null>(null)
+
+  useEffect(() => {
+    if (modelHarness === null) return
+    // The cache check is also the loop guard: this effect depends on `modelAnswers`, which it
+    // writes, so without it every answer would start the next probe.
+    if (modelAnswers[modelHarness] !== undefined) return
+    let live = true
+    setModelsPending(modelHarness)
+    // No `.catch`: `agentDefs.models` goes through `pendingCommand`, so a build without the
+    // handler resolves to `null` rather than rejecting — and `null` is a state this field draws.
+    void agentDefs.models(project, modelHarness).then((answer) => {
+      if (!live) return
+      // A `null` is cached as an empty answer *for this harness*, so a degraded build asks once
+      // and then draws a plain text box, rather than forking on every keystroke that re-renders.
+      setModelAnswers((prev) => ({
+        ...prev,
+        [modelHarness]: answer ?? { harness: modelHarness, models: [], problem: null },
+      }))
+      setModelsPending((pending) => (pending === modelHarness ? null : pending))
+    })
+    return () => {
+      live = false
+    }
+  }, [project, modelHarness, modelAnswers])
+
   /**
    * Write one project switch into `.cide/config.json`, creating the file if it is not there.
    *
@@ -459,6 +575,25 @@ function AgentsEditor({ project }: { project: ProjectId }) {
    * * `errorText`, never `String(error)`: a refusal arrives as a tagged `CoreError`, so
    *   `String()` of it is `[object Object]` and the sentence Rust composed is lost.
    */
+  /**
+   * Write the whole override table back.
+   *
+   * Whole-table rather than per row, for the command's stated reason, and **not** fire-and-forget:
+   * an override that silently failed to save is a role that runs somewhere other than where the
+   * screen says it does, which is the one failure this surface must not have.
+   */
+  const writeOverrides = useCallback(
+    (next: ProjectOverrides) => {
+      setOverrides(next)
+      setOverrideError(null)
+      void agentDefs
+        .setOverrides(project, next)
+        .then(setOverrides)
+        .catch((error: unknown) => setOverrideError(errorText(error)))
+    },
+    [project],
+  )
+
   const patchConfig = useCallback(
     (patch: { maxConcurrent: number }) => {
       setConfigError(null)
@@ -868,6 +1003,38 @@ function AgentsEditor({ project }: { project: ProjectId }) {
         )}
       </Group>
 
+      {/*
+        * The local overrides, **after** the roles rather than beside the project's switches, and
+        * that order is the argument: an override redirects a role, so it can only be read once
+        * you know what the roles are. Its own group, too, because it means the opposite of
+        * `This project` above — that one writes `.cide/config.json`, which the repository will
+        * contain and a teammate will review; this writes the profile's own file, which nobody
+        * else ever sees.
+        */}
+      {overrides !== null && (
+        <Group title="Local overrides">
+          <ProjectOverrideRows
+            overrides={overrides}
+            roles={
+              projectRoster !== null && projectRoster.kind === 'ready'
+                ? projectRoster.agents.map((def) => ({
+                    id: def.id,
+                    label: def.label,
+                    scope: def.scope,
+                  }))
+                : []
+            }
+            pools={poolNames}
+            onChange={writeOverrides}
+          />
+          {overrideError !== null && (
+            <Note title="Those overrides could not be read or written" tone="warn">
+              {overrideError}
+            </Note>
+          )}
+        </Group>
+      )}
+
       <Note title="A role is a file">
         A role is a system prompt plus the switches a run is spawned with. It is stored as{' '}
         <code>&lt;name&gt;.md</code> — front matter and a body — and everything in the list above
@@ -892,7 +1059,9 @@ function AgentsEditor({ project }: { project: ProjectId }) {
         * inside it is expensive to rebuild, and an unmount is what guarantees the focus effect
         * runs again next time.
         */}
-      {modal !== null && draft !== null && (
+      {/* `modelHarness` is null exactly when `draft` is — it is derived from it — but the two are
+          separate values, so the third condition is what tells the compiler that. */}
+      {modal !== null && draft !== null && modelHarness !== null && (
         <RoleDialog
           modal={modal}
           draft={draft}
@@ -900,6 +1069,9 @@ function AgentsEditor({ project }: { project: ProjectId }) {
           busy={busy}
           pendingLeave={pendingLeave}
           moveWarning={moveWarning}
+          modelHarness={modelHarness}
+          models={modelAnswers[modelHarness] ?? null}
+          modelsLoading={modelsPending === modelHarness}
           saveError={saveError}
           openError={openError}
           errorsFor={errorsFor}
@@ -1112,6 +1284,9 @@ function RoleDialog({
   busy,
   pendingLeave,
   moveWarning,
+  modelHarness,
+  models,
+  modelsLoading,
   saveError,
   openError,
   errorsFor,
@@ -1127,6 +1302,10 @@ function RoleDialog({
   busy: boolean
   pendingLeave: Selection | 'new' | 'close' | null
   moveWarning: string | null
+  /** Carried straight through to `RoleForm`, which documents all three. */
+  modelHarness: HarnessName
+  models: AgentModels | null
+  modelsLoading: boolean
   saveError: string | null
   /**
    * A *load* that failed, drawn here as well as beside the list.
@@ -1222,6 +1401,9 @@ function RoleDialog({
             draft={draft}
             nameRef={name}
             moveWarning={moveWarning}
+            modelHarness={modelHarness}
+            models={models}
+            modelsLoading={modelsLoading}
             errorsFor={errorsFor}
             onEdit={onEdit}
           />
@@ -1288,6 +1470,9 @@ function RoleForm({
   draft,
   nameRef,
   moveWarning,
+  modelHarness,
+  models,
+  modelsLoading,
   errorsFor,
   onEdit,
 }: {
@@ -1295,6 +1480,18 @@ function RoleForm({
   /** Where the dialog puts initial focus. See its header for why it is the name and not Cancel. */
   nameRef: React.RefObject<HTMLInputElement | null>
   moveWarning: string | null
+  /**
+   * Which harness the Model menu is for — `effectiveHarness`, resolved by the editor.
+   *
+   * Resolved *above* this component rather than here, because the answer needs the project's
+   * `.cide/config.json` default and this form deliberately knows nothing about the project. It
+   * is also what the probe is keyed on, so a second derivation here could ask for one harness
+   * and draw another.
+   */
+  modelHarness: HarnessName
+  /** What the harness offered, or `null` for "not asked yet, or this build cannot ask". */
+  models: AgentModels | null
+  modelsLoading: boolean
   errorsFor: (field: AgentFieldKey) => string[]
   onEdit: (field: AgentFieldKey, patch: Partial<Draft>) => void
 }) {
@@ -1405,7 +1602,7 @@ function RoleForm({
                   ...HARNESSES.map((harness) => ({ value: harness, label: harnessLabel(harness) })),
                 ]}
                 onChange={(value) =>
-                  onEdit('harness', { harness: value === '' ? null : (value as 'claude' | 'opencode') })
+                  onEdit('harness', { harness: value === '' ? null : (value as HarnessName) })
                 }
               />
             }
@@ -1455,17 +1652,15 @@ function RoleForm({
       <Group title="How a run is spawned">
         <Field
           label="Model"
-          hint="An alias or a full model name. Empty means the harness's own default, which is the right answer for a role that does not care."
+          hint={modelHint(modelHarness, models)}
           errors={errorsFor('model')}
           control={
-            <input
-              className={styles.input}
-              type="text"
-              spellCheck={false}
-              aria-label="Model"
-              placeholder="sonnet"
+            <ModelField
+              harness={modelHarness}
+              answer={models}
+              loading={modelsLoading}
               value={draft.model ?? ''}
-              onChange={(e) => onEdit('model', { model: e.target.value })}
+              onChange={(next) => onEdit('model', { model: next })}
             />
           }
         />
@@ -1727,6 +1922,102 @@ function Choice({
 }
 
 /**
+ * The Model box: a menu of what the harness offers, over a field that still accepts anything.
+ *
+ * # Why this is not a `<Choice>`
+ *
+ * Because `model` is deliberately **not** a closed vocabulary — `AgentDraft::model` is passed to
+ * the CLI verbatim and validated against nothing, and `check-settings-agents.mjs` asserts both
+ * halves of that. The list under this control is one machine's answer at one moment: for
+ * opencode it is `opencode models`, which knows only about providers that are configured *now*,
+ * and for Claude it is a handful of aliases that a release may add to next week. Closing the
+ * field over either would start refusing a model that works.
+ *
+ * # Why a `<select>` and not `Suggest`'s chips
+ *
+ * `Suggest` is the same idea for `effort`, where the vocabulary is three words. This one is
+ * thirteen ids on the machine it was written on and can be far more, several of them longer than
+ * the dialog is wide. Chips would wrap into a wall.
+ *
+ * # The two things drawn here that are not the value
+ *
+ * `problem` is a fact about the **machine** — `opencode` not on `PATH`, a probe that timed out —
+ * so it is a hint and never an error: nothing the user typed caused it, nothing they can type in
+ * this form fixes it, and the box below stays editable throughout. And the answer is used only
+ * when `answer.harness` matches the harness being asked about, because a probe in flight while
+ * somebody flips the Harness dropdown would otherwise paint one CLI's ids under the other's name.
+ */
+function ModelField({
+  harness,
+  answer,
+  loading,
+  value,
+  onChange,
+}: {
+  harness: HarnessName
+  answer: AgentModels | null
+  loading: boolean
+  value: string
+  onChange: (next: string) => void
+}) {
+  // The guard described above. `null` is a build that could not answer at all, which is drawn
+  // exactly like an empty list: a plain text box, which is the field that shipped before this.
+  const fresh = answer !== null && answer.harness === harness ? answer : null
+  const listed = fresh?.models ?? []
+  // A value the list does not contain still has to be *displayable*, or the select reads
+  // "default" over a box holding a model. That includes every value typed by hand, which is the
+  // case this control must not punish.
+  const options = value !== '' && !listed.includes(value) ? [value, ...listed] : listed
+  return (
+    <div className={styles.suggest}>
+      <select
+        className={styles.select}
+        aria-label="Model suggestions"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="">
+          {loading ? 'Reading the model list…' : `The ${harnessLabel(harness)} default`}
+        </option>
+        {options.map((model) => (
+          <option key={model} value={model}>
+            {model}
+          </option>
+        ))}
+      </select>
+      <input
+        className={styles.input}
+        type="text"
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        aria-label="Model"
+        placeholder={modelPlaceholder(harness)}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </div>
+  )
+}
+
+/** The sentence under the Model box, which changes with the harness and with what a probe said. */
+function modelHint(harness: HarnessName, answer: AgentModels | null): string {
+  const base =
+    harness === 'opencode'
+      ? 'An id in opencode’s own spelling, provider/model. The menu is what `opencode models` ' +
+        'reports on this machine, so it lists the providers you have configured.'
+      : harness === 'codex'
+        ? 'A model slug in Codex’s own spelling. The menu is what `codex debug models` lists on ' +
+          'this machine; a slug the catalog hides can still be typed.'
+        : 'An alias or a full model name. The menu is the aliases this build knows; a newer one ' +
+          'can still be typed.'
+  const problem = answer !== null && answer.harness === harness ? answer.problem : null
+  // Appended rather than replacing: the field is still usable and the sentence saying how to use
+  // it is still true. Only the menu is missing.
+  return problem === null ? `${base} Empty means the harness’s own default.` : `${base} ${problem}`
+}
+
+/**
  * A choice that is only a suggestion: the common values as buttons, and a text field that
  * accepts anything.
  *
@@ -1812,6 +2103,316 @@ function ToolRows({ tools, onChange }: { tools: readonly string[]; onChange: (ne
       >
         + Add tool
       </button>
+    </div>
+  )
+}
+
+
+/**
+ * The local override table for one project. (M45)
+ *
+ * # Why this is not a settings row, and says so
+ *
+ * Everything else in this group writes `.cide/config.json`, which the repository will contain and
+ * a teammate will review. This writes `agent-overrides.json` in the profile's own config
+ * directory, which nobody else ever sees — and that difference is the entire reason the layer
+ * exists. `cide_ipc::overrides`' header carries the argument: a `pool:` key in a committed role
+ * file would make a teammate's clone name a pool they do not have, on every dispatch, for ever.
+ *
+ * So the heading and the note say "not committed" in as many words. A row that looked like the
+ * one above it and meant the opposite would be the lie `OrchestrationConfig`'s doc warns about,
+ * arriving from the other direction.
+ */
+function ProjectOverrideRows({
+  overrides,
+  roles,
+  pools,
+  onChange,
+}: {
+  overrides: ProjectOverrides
+  roles: readonly { id: string; label: string; scope: string }[]
+  /** Pool names. A stable reference: derived once in a memo, not rebuilt per store read. */
+  pools: readonly string[]
+  onChange: (next: ProjectOverrides) => void
+}) {
+  const poolList = pools
+  const overridden = Object.keys(overrides.roles)
+  // The project-wide row exists only once somebody has asked for it. An override is a
+  // *redirection*, and a redirection nobody made should not be drawn as an empty form the user
+  // has to read past — the screen's default state is "this project runs what it committed".
+  const hasAll = !isEmptyOverride(overrides.all)
+  // A Claude Code role cannot be redirected: `cide_agents::defs` forces `Harness::Claude` for a
+  // `.claude/agents/` file because "a Claude Code subagent runs under Claude Code; there is no
+  // second answer". Offering it here would promise something the fork reverses in silence.
+  const eligible = roles.filter(
+    (role) =>
+      role.scope !== 'claudeProject' &&
+      role.scope !== 'claudeGlobal' &&
+      !overridden.includes(role.id),
+  )
+
+  const setAll = (next: AgentOverride) => onChange({ ...overrides, all: next })
+  const setRole = (id: string, next: AgentOverride) =>
+    onChange({ ...overrides, roles: { ...overrides.roles, [id]: next } })
+  const dropRole = (id: string) => {
+    const rest = { ...overrides.roles }
+    delete rest[id]
+    onChange({ ...overrides, roles: rest })
+  }
+
+  return (
+    <>
+      <Note title="Not committed">
+        These redirect roles on <strong>this machine only</strong>. They are stored in your
+        profile&rsquo;s <code>agent-overrides.json</code>, never in <code>.cide/</code>, so a
+        teammate cloning this repository gets each role&rsquo;s committed harness and never sees a
+        pool they do not have. Pools themselves are defined on the Models screen in Settings.
+        {poolList.length === 0 && ' You have not defined any pool yet.'}
+      </Note>
+
+      {hasAll && (
+        <OverrideFields
+          title="Every role in this project"
+          value={overrides.all}
+          pools={poolList}
+          // Removing the project-wide row is clearing it, which is the same gesture as clearing
+          // every field — so it is one button rather than a rule the user has to discover.
+          onRemove={() => setAll({})}
+          onChange={setAll}
+        />
+      )}
+
+      {overridden.map((id) => (
+        <OverrideFields
+          key={id}
+          title={id}
+          value={overrides.roles[id] ?? {}}
+          pools={poolList}
+          onChange={(next) => setRole(id, next)}
+          onRemove={() => dropRole(id)}
+          /* A role's own row REPLACES the project default rather than merging with it, which is
+             `ProjectOverrides::for_role`'s rule — a half-merge would hand a claude role a pool its
+             harness cannot use. Said here because it is not guessable from the layout. */
+          note={hasAll ? 'Replaces the project-wide row above for this role, rather than adding to it.' : undefined}
+        />
+      ))}
+
+      {!hasAll && overridden.length === 0 && (
+        <p className={styles.overrideNote}>
+          Nothing is overridden here, so every role runs what its file says.
+        </p>
+      )}
+
+      <div className={styles.overrideActions}>
+        {!hasAll && (
+          <ActionButton
+            label="Override all roles"
+            // Seeded with the harness rather than empty, so the row it opens already says
+            // something: an override with every field unset is indistinguishable from no
+            // override, and `hasAll` would read it as absent and hide the form again.
+            onClick={() => setAll({ harness: 'opencode' })}
+          />
+        )}
+        {eligible.length > 0 && (
+          <Select
+            label="Override one role"
+            value=""
+            options={[
+              { value: '', label: 'Override one role…' },
+              ...eligible.map((role) => ({ value: role.id, label: role.label || role.id })),
+            ]}
+            onChange={(id) => {
+              if (id !== '') setRole(id, { harness: 'opencode' })
+            }}
+          />
+        )}
+      </div>
+    </>
+  )
+}
+
+/**
+ * Does this override say nothing at all?
+ *
+ * The screen's "is there a project-wide row" test. It has to treat a *missing* field and a field
+ * that came back `null` alike: `AgentOverride`'s fields are `skip_serializing_if`, so an unset one
+ * is absent — but a file hand-edited, or written by a build before that annotation, can still
+ * carry nulls, and reading one as "set" would draw a form the user cannot clear.
+ */
+function isEmptyOverride(value: AgentOverride): boolean {
+  return (
+    value.harness == null &&
+    value.pool == null &&
+    value.model == null &&
+    value.effort == null &&
+    value.maxConcurrent == null
+  )
+}
+
+/**
+ * Set one field of an override, or clear it by **omitting the key**.
+ *
+ * `AgentOverride`'s fields are `#[ts(optional)]`, so they arrive as `field?: T` — and under
+ * `exactOptionalPropertyTypes` "absent" and "present but `undefined`" are different types, only
+ * the first of which serde reads back as `None`. Assigning `undefined` would compile in a laxer
+ * config and send a key whose value the backend cannot parse.
+ */
+function withField<K extends keyof AgentOverride>(
+  value: AgentOverride,
+  key: K,
+  next: NonNullable<AgentOverride[K]> | undefined,
+): AgentOverride {
+  const out: AgentOverride = { ...value }
+  if (next === undefined) {
+    delete out[key]
+  } else {
+    out[key] = next
+  }
+  return out
+}
+
+/** The five fields of one override, drawn identically for the project row and a role's own. */
+function OverrideFields({
+  title,
+  value,
+  pools,
+  onChange,
+  onRemove,
+  note,
+}: {
+  title: string
+  value: AgentOverride
+  pools: readonly string[]
+  onChange: (next: AgentOverride) => void
+  onRemove?: (() => void) | undefined
+  note?: string | undefined
+}) {
+  // `pool` and `model` are mutually exclusive — naming both would be asking for one model and a
+  // list of models at once — so one control picks the mode and setting either clears the other.
+  // `!= null`, not `!== undefined`: an unset field is absent on the wire, but a file written
+  // before `skip_serializing_if` — or hand-edited — can carry a null, and reading one as "set"
+  // is a control that cannot be returned to "leave as committed".
+  const mode = value.pool != null ? 'pool' : value.model != null ? 'model' : 'none'
+  return (
+    <div className={styles.overrideCard}>
+      <div className={styles.overrideHead}>
+        <span className={styles.overrideTitle}>{title}</span>
+        {onRemove !== undefined && (
+          <button
+            type="button"
+            className={styles.overrideRemove}
+            aria-label={`Stop overriding ${title}`}
+            onClick={onRemove}
+          >
+            <Icon name="x" size={1} />
+          </button>
+        )}
+      </div>
+      {note !== undefined && <p className={styles.overrideNote}>{note}</p>}
+
+      <SettingRow
+        label="Harness"
+        hint="Which CLI runs this here. “Leave as committed” keeps whatever the role file says."
+        control={
+          <Select
+            label="Harness"
+            value={value.harness ?? ''}
+            options={[
+              { value: '', label: 'Leave as committed' },
+              ...HARNESSES.map((h) => ({ value: h, label: harnessLabel(h) })),
+            ]}
+            onChange={(next) =>
+              onChange(withField(value, 'harness', next === '' ? undefined : (next as HarnessName)))
+            }
+          />
+        }
+      />
+
+      <SettingRow
+        label="Model choice"
+        hint={
+          'A pool falls down its list when a provider rate-limits, cannot be reached, or refuses ' +
+          'the credential. A single model does not. Only opencode runs use either.'
+        }
+        control={
+          <Select
+            label="Model choice"
+            value={mode}
+            options={[
+              { value: 'none', label: 'Leave as committed' },
+              { value: 'pool', label: 'A pool' },
+              { value: 'model', label: 'One model' },
+            ]}
+            onChange={(next) =>
+              onChange(
+                withField(
+                  withField(value, 'pool', next === 'pool' ? (value.pool ?? '') : undefined),
+                  'model',
+                  next === 'model' ? (value.model ?? '') : undefined,
+                ),
+              )
+            }
+          />
+        }
+      />
+
+      {mode === 'pool' && (
+        <SettingRow
+          label="Pool"
+          hint={
+            pools.length === 0
+              ? 'No pool is defined yet — add one on the Models screen in Settings.'
+              : 'A run starts on the first entry and only moves down when one refuses.'
+          }
+          control={
+            <Select
+              label="Pool"
+              value={value.pool ?? ''}
+              options={[
+                { value: '', label: 'Pick a pool…' },
+                ...pools.map((name) => ({ value: name, label: name })),
+              ]}
+              onChange={(pool: string) => onChange(withField(value, 'pool', pool))}
+            />
+          }
+        />
+      )}
+
+      {mode === 'model' && (
+        <TextField
+          label="Model"
+          hint="An id in opencode’s own spelling, provider/model."
+          value={value.model ?? ''}
+          placeholder="openrouter/deepseek/deepseek-chat"
+          onCommit={(model: string) => onChange(withField(value, 'model', model))}
+        />
+      )}
+
+      <TextField
+        label="Effort"
+        hint="The variant a run asks for. A pool entry that names its own wins over this."
+        value={value.effort ?? ''}
+        placeholder="leave as committed"
+        onCommit={(effort: string) =>
+          onChange(withField(value, 'effort', effort === '' ? undefined : effort))
+        }
+      />
+
+      <SettingRow
+        label="Concurrent runs of this role"
+        hint="0 leaves the role's own max-concurrent alone. Useful for more parallelism against a local model that costs nothing."
+        control={
+          <NumberField
+            label="Concurrent runs of this role"
+            value={value.maxConcurrent ?? 0}
+            min={0}
+            max={64}
+            onChange={(next) =>
+              onChange(withField(value, 'maxConcurrent', next === 0 ? undefined : next))
+            }
+          />
+        }
+      />
     </div>
   )
 }

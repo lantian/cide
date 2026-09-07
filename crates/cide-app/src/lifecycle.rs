@@ -1330,6 +1330,13 @@ fn report_exit(app: &AppHandle, id: SessionId, pid: Option<u32>, exit: &Exit) {
         hooks.forget(id);
     }
 
+    // And the registry's viewer table (M42): if this was a pane's child re-opening a run's
+    // conversation, the conversation is free again from this instant, and a Resume on the
+    // row that was refused while the pane lived must be allowed now.
+    if let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+        agents.forget_viewer(id);
+    }
+
     // And the IDE server's pid → pane table, for the same "do not answer for a corpse"
     // reason one rung sideways.
     //
@@ -1496,6 +1503,14 @@ fn entry_for(
     if !matches!(pane.kind, PaneKind::Claude | PaneKind::Shell) {
         return None;
     }
+    // A pane opened onto an agent run's conversation was started in the run's directory —
+    // its worktree — and that is where Claude Code filed the transcript (M42). The project
+    // root, which every other pane spawns in, would answer `Fresh` for it and the pane would
+    // come back as a new conversation in the wrong directory.
+    let cwd = pane
+        .continues
+        .as_ref()
+        .map_or(cwd, |conversation| conversation.cwd.as_path());
     let restore = restore_for(pane, cwd, projects_dir, resume_enabled);
     Some(PaneRestore {
         window,
@@ -1606,6 +1621,73 @@ pub fn resumable(cwd: &Path, session: SessionId, resume_enabled: bool) -> bool {
     resume_enabled && claude_projects_dir().is_some_and(|dir| transcript_exists(&dir, cwd, session))
 }
 
+/// [`resumable`] for whichever harness filed the conversation. (M43)
+///
+/// `resume_enabled` is claude's `--resume` injection switch and gates claude alone; Qwen Code
+/// takes no launch configuration from cide, so its answer is the file's. opencode's store is a
+/// database cide does not read, so it is never resumable *by this question* — its runs are
+/// continued by the harness's own `--session`, which `AgentRegistry::open_plan` asks about
+/// separately.
+pub fn resumable_on(
+    harness: cide_ipc::Harness,
+    cwd: &Path,
+    session: SessionId,
+    resume_enabled: bool,
+) -> bool {
+    match harness {
+        cide_ipc::Harness::Claude => resumable(cwd, session, resume_enabled),
+        cide_ipc::Harness::Qwen => {
+            transcript_of(harness, cwd, session).is_some_and(|path| path.is_file())
+        }
+        cide_ipc::Harness::Opencode | cide_ipc::Harness::Codex => false,
+    }
+}
+
+/// Where `harness` files `session`'s transcript when the child was started in `cwd`, or `None`
+/// for a harness whose store is not a file cide can name. (M43)
+///
+/// Both file-based harnesses use the same encoding of the directory — every non-alphanumeric
+/// character to `-` — which is why the worktree rule (a run's conversation is resumable from
+/// its worktree and nowhere else) is one rule. Qwen Code adds a `chats/` segment and relocates
+/// its home with `QWEN_HOME` where claude uses `CLAUDE_CONFIG_DIR`; both measured on 0.23.0.
+pub fn transcript_of(
+    harness: cide_ipc::Harness,
+    cwd: &Path,
+    session: SessionId,
+) -> Option<PathBuf> {
+    match harness {
+        cide_ipc::Harness::Claude => Some(
+            claude_projects_dir()?
+                .join(encode_cwd(cwd))
+                .join(format!("{session}.jsonl")),
+        ),
+        cide_ipc::Harness::Qwen => Some(
+            qwen_projects_dir()?
+                .join(encode_cwd(cwd))
+                .join("chats")
+                .join(format!("{session}.jsonl")),
+        ),
+        cide_ipc::Harness::Opencode | cide_ipc::Harness::Codex => None,
+    }
+}
+
+/// Where Qwen Code keeps its transcripts: `$QWEN_HOME/projects`, else `~/.qwen/projects`.
+fn qwen_projects_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("QWEN_HOME") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".qwen"),
+    };
+    Some(base.join("projects"))
+}
+
+/// The directory a transcript is filed under, as both CLIs spell it.
+fn encode_cwd(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 /// Whether Claude Code holds a transcript for `session`, started in `cwd`.
 ///
 /// `<projects>/<encoded cwd>/<session>.jsonl` is an **internal Claude Code implementation
@@ -1620,13 +1702,8 @@ pub fn resumable(cwd: &Path, session: SessionId, resume_enabled: bool) -> bool {
 /// different directory is one `claude --resume` will not find from this `cwd` either, so
 /// finding it here would promise a resume that cannot happen.
 fn transcript_exists(projects_dir: &Path, cwd: &Path, session: SessionId) -> bool {
-    let encoded: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
     projects_dir
-        .join(encoded)
+        .join(encode_cwd(cwd))
         .join(format!("{session}.jsonl"))
         .is_file()
 }
@@ -2483,6 +2560,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "secondary : claude".into(),
             },
         )
@@ -2499,6 +2577,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "fixture : bash".into(),
             },
         )
@@ -2522,6 +2601,72 @@ mod tests {
         let dir = projects_dir.join(encoded);
         std::fs::create_dir_all(&dir).expect("create the transcript dir");
         std::fs::write(dir.join(format!("{session}.jsonl")), b"{}\n").expect("write a transcript");
+    }
+
+    /// A pane opened onto an agent run's conversation was started in the run's worktree, and
+    /// that is where Claude Code filed the transcript — so the plan looks there, not in the
+    /// project root, and hands the pane that directory to spawn in. (M42)
+    #[test]
+    fn a_continued_pane_restores_from_its_conversations_directory() {
+        use cide_ipc::{HarnessSession, PaneRole};
+
+        let root = temp_dir("continued");
+        let projects_dir = temp_dir("projects");
+        let mut ws = fixture(&root);
+        let worktree = root.join(".cide/worktrees/developer-t-1");
+        let session = SessionId::new();
+
+        let pane_id = {
+            let project = ws.projects.values_mut().next().expect("fixture project");
+            let pane = project.tabs[0]
+                .tree
+                .panes
+                .values_mut()
+                .find(|pane| pane.kind == PaneKind::Claude && pane.role != PaneRole::Primary)
+                .expect("the secondary claude pane");
+            pane.session = Some(session);
+            pane.continues = Some(HarnessSession {
+                harness: cide_ipc::Harness::Claude,
+                id: session.to_string(),
+                cwd: worktree.clone(),
+            });
+            pane.id
+        };
+
+        // The transcript is under the worktree. Filed under the root it would be a different
+        // conversation as far as the CLI is concerned, so the plan must not find it there.
+        write_transcript(&projects_dir, &worktree, session);
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
+        let entry = plan
+            .iter()
+            .find(|entry| entry.pane == pane_id)
+            .expect("the continued pane is planned");
+        assert_eq!(entry.restore, SessionRestore::Resumable { session });
+        assert_eq!(entry.cwd, worktree, "spawned where the transcript is");
+
+        // And a transcript under the root does not count for a pane that lives elsewhere.
+        let elsewhere = SessionId::new();
+        {
+            let project = ws.projects.values_mut().next().expect("fixture project");
+            let pane = project.tabs[0].tree.panes.get_mut(&pane_id).expect("pane");
+            pane.session = Some(elsewhere);
+            pane.continues = Some(HarnessSession {
+                harness: cide_ipc::Harness::Claude,
+                id: elsewhere.to_string(),
+                cwd: worktree.clone(),
+            });
+        }
+        write_transcript(&projects_dir, &root, elsewhere);
+        let plan = plan_restore_in(&ws, Some(&projects_dir), None);
+        let entry = plan
+            .iter()
+            .find(|entry| entry.pane == pane_id)
+            .expect("the continued pane is planned");
+        assert_eq!(entry.restore, SessionRestore::Fresh);
+        assert_eq!(
+            entry.cwd, worktree,
+            "still the run's directory, for the fresh child too"
+        );
     }
 
     #[test]

@@ -341,6 +341,7 @@ pub async fn tab_open_extension(
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "extension".into(),
             },
         )

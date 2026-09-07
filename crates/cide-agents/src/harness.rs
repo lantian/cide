@@ -59,16 +59,21 @@ use std::path::PathBuf;
 
 use cide_claude::HookFrame;
 use cide_core::proxy::ProxyEnv;
-use cide_ipc::{Geometry, ProjectId, RunId, RunState, SessionId, TaskId, Theme};
+use cide_ipc::{Geometry, HarnessSession, ProjectId, RunId, RunState, SessionId, TaskId, Theme};
 use cide_pty::SpawnSpec;
 
 use crate::defs::{LoadedAgent, harness_name};
 
 pub mod claude;
+pub mod codex;
 pub mod opencode;
+pub mod qwen;
+mod render;
 
 pub use claude::ClaudeHarness;
+pub use codex::CodexHarness;
 pub use opencode::OpencodeHarness;
+pub use qwen::QwenHarness;
 
 /// The name cide's MCP server is registered under, on **every** harness.
 ///
@@ -310,9 +315,9 @@ pub trait Harness: Send + Sync + 'static {
     /// What this CLI calls one of cide's MCP tools in a model's function list.
     ///
     /// `tool` is the bare vocabulary name — `cide_task_get` — and the answer is what the model can
-    /// actually type. [`SERVER`] is the server both harnesses register; the *namespacing* around
-    /// it is per CLI and the two do not agree: Claude Code builds `mcp__<server>__<tool>`,
-    /// opencode builds `<server>_<tool>`.
+    /// actually type. [`SERVER`] is the server every harness registers; the *namespacing* around
+    /// it is per CLI and they do not agree: Claude Code, Qwen Code and Codex build
+    /// `mcp__<server>__<tool>`, opencode builds `<server>_<tool>`.
     ///
     /// # Why this is required rather than defaulted
     ///
@@ -374,6 +379,22 @@ pub trait Harness: Send + Sync + 'static {
         })
     }
 
+    /// The **real harness**, re-opened on a conversation whose run child has ended, for a
+    /// person to read and continue in a pane. (M42)
+    ///
+    /// Not a run: no role brief, no tracker preamble, no `CIDE_RUN`, no hook that reports to the
+    /// registry. The child this describes is a pane's, spawned through
+    /// `cide_app::cmd::session::session_spawn` like any pane's child, and everything that
+    /// function adds for the program named here — hooks and `--settings` for a `claude`, the
+    /// job watch for anything else — applies. What the harness owns is the *vocabulary*: which
+    /// binary, and how that binary is told which conversation, from the directory it was filed
+    /// under. The frontend never learns either CLI's flag for it.
+    ///
+    /// Required, not defaulted, on [`Self::tool_name`]'s argument: a harness that cannot re-open
+    /// a conversation must say so in its own words rather than inherit a plausible-looking
+    /// answer.
+    fn continue_spec(&self, conversation: &HarnessSession) -> Result<ContinueSpec, HarnessError>;
+
     /// What one observation means for a run currently in `current`.
     ///
     /// `None` means *nothing here says anything about the run*, which is not the same as
@@ -389,6 +410,72 @@ pub trait Harness: Send + Sync + 'static {
     ///   output lines. [`Observation::Exit`] is the exception and always answers, because it is
     ///   the only observation carrying ground truth about the child.
     fn observe(&self, current: RunState, ob: Observation<'_>) -> Option<RunState>;
+
+    /// The model ids this harness can offer the role form, in the order it names them.
+    ///
+    /// A **suggestion** set and never a closed one. `AgentDraft::model` is passed through and
+    /// validated against nothing — `check-settings-agents.mjs` asserts that in as many words —
+    /// and this changes none of it: the form draws a menu beside a text box that still accepts
+    /// anything. What it removes is the state where selecting opencode leaves a field only
+    /// somebody who has memorised `provider/model` for their own providers can fill in, so every
+    /// opencode role silently runs the provider default.
+    ///
+    /// `Err` is a **sentence for the user**, not a failure to handle: the box stays typable and
+    /// the sentence becomes its hint. There is no third state — an empty `Ok` is a harness that
+    /// genuinely has nothing to suggest.
+    ///
+    /// # Defaulted, and this one earns it by saying nothing
+    ///
+    /// [`Self::tool_name`]'s note explains when a default is dishonest: when it must return a
+    /// real answer and whichever it returns is silently wrong for somebody. An empty list is not
+    /// that — it is the honest answer for a harness nobody has taught to enumerate, and it
+    /// degrades to exactly the free-text field that exists today.
+    ///
+    /// # It forks, which nothing else on this trait does
+    ///
+    /// `spawn_spec` is pure and answers with a [`SpawnSpec`] the caller runs. This runs a child
+    /// itself and waits for it, so it must be called from a thread allowed to block — never a
+    /// Tauri command worker directly, and never with the workspace lock held.
+    ///
+    /// `cwd` is the project root, and it is not ceremony: opencode merges the project's own
+    /// `opencode.json`, so a project that configures a provider must be able to see that
+    /// provider's models. `None` means "wherever cide is", which is the honest answer when the
+    /// project's directory could not be resolved.
+    /// `llm` is the user's provider configuration, resolved by the caller for
+    /// [`RunPlan::claude`]'s reason — nothing in this crate reads a workspace. A harness with no
+    /// provider vocabulary ignores it, which is every harness but opencode.
+    ///
+    /// **opencode must be given it**, and the failure if it is not is silent and confusing: the
+    /// probe would list only the providers the user configured by hand, so cide's own providers
+    /// would be invisible in the very dialog where a model is chosen. (M45)
+    fn models(
+        &self,
+        cwd: Option<&std::path::Path>,
+        llm: &cide_ipc::LlmSettings,
+    ) -> Result<Vec<String>, String> {
+        let _ = (cwd, llm);
+        Ok(Vec::new())
+    }
+
+    /// What one output line says about this run's **provider**, as distinct from its state. (M45)
+    ///
+    /// [`Self::observe`] answers *where is this run*; this answers *did the endpoint refuse, in a
+    /// way a different endpoint might not*. The two are deliberately separate channels, and that
+    /// separation is load-bearing rather than tidy: an `error` line still moves nothing, and this
+    /// answer is a latch the caller reads at the **exit**. A diagnosis that moved the run would be
+    /// an end-of-turn declared by a line, which is run 06202dd6's bug — see `opencode`'s
+    /// `observe` for what that cost.
+    ///
+    /// # Defaulted, and this one earns its default by saying nothing
+    ///
+    /// [`Self::tool_name`]'s note explains when a default is dishonest: when it must return a real
+    /// answer and whichever it returns is silently wrong for somebody. `None` is not that. It is
+    /// the honest answer for a CLI cide has not taught to report its provider's verdict, and it
+    /// degrades to exactly the behaviour every harness had before pools existed.
+    fn diagnose(&self, line: &str) -> Option<FailoverReason> {
+        let _ = line;
+        None
+    }
 }
 
 /// Everything needed to describe one run's child, composed by the dispatch site.
@@ -465,6 +552,13 @@ pub struct RunPlan<'a> {
     pub hook_sock: Option<PathBuf>,
     /// The socket `cide-hook mcp` bridges to. `CIDE_AGENT_SOCK`.
     pub agent_sock: Option<PathBuf>,
+    /// A FIFO the app made for this run, for a harness that reports through a JSON event
+    /// file rather than through hooks — `qwen --json-file`. (M43) The app mints and creates it
+    /// before the fork for every run and reads it only when the harness hands it back in
+    /// [`HarnessSpawn::events`]; a harness with another state channel ignores it. `None` when
+    /// the app could not make one, in which case such a harness runs unobserved rather than
+    /// not at all.
+    pub events_path: Option<PathBuf>,
     /// Which way round the CLI should draw itself — see `cide_claude::settings`, which records
     /// that this is the real fix for white-on-white text rather than a palette question.
     pub theme: Theme,
@@ -485,6 +579,30 @@ pub struct RunPlan<'a> {
     /// `CLAUDE_CODE_*` switches. A subagent is a Claude child and gets the same treatment a pane
     /// does, for the same reason `terminal_child_env` is shared rather than copied.
     pub claude: cide_ipc::ClaudeSettings,
+    /// The provider configuration this child is given, resolved by the caller for
+    /// [`Self::claude`]'s reason — nothing in this crate reads a workspace. Emitted into
+    /// `OPENCODE_CONFIG_CONTENT`; inert for every other harness. (M45)
+    pub llm: cide_ipc::LlmSettings,
+    /// The pool candidate this run has settled on, or `None` when no pool applies. (M45)
+    ///
+    /// Chosen once by the caller and **carried across every respawn** — an opencode run is one
+    /// process per turn, and a plan that re-chose per turn would be a conversation answered by
+    /// different models with nothing recording which. Only a failover moves it.
+    ///
+    /// Outranks [`crate::AgentDef::model`] where it is set, and its variant outranks
+    /// [`crate::LoadedAgent::effort`]; `cide_ipc::PoolEntry::variant` carries that argument.
+    pub choice: Option<cide_ipc::PoolChoice>,
+    /// The CLI this run actually forks. (M45)
+    ///
+    /// **Not `agent.def.harness`**, and the difference is the whole of the local-override layer:
+    /// a role's file names the harness the *team* agreed on, and this names the one *this
+    /// machine* is running it under. Every `child()` below guards on this rather than on the
+    /// definition, or a redirected role would be refused by the very implementation the caller
+    /// deliberately routed it to.
+    ///
+    /// `cide_agents::overrides::resolve` is what folds the two, and it is the only thing that
+    /// may: a Claude Code subagent is pinned to `Claude` there for `defs`' stated reason.
+    pub harness: cide_ipc::Harness,
     /// [`crate::config::AgentsConfig::skip_permissions`], read fresh at this spawn.
     ///
     /// Carried on the plan rather than looked up here for the module's stated reason — nothing
@@ -492,6 +610,31 @@ pub struct RunPlan<'a> {
     /// bypassPermissions` for a `claude` run whose role names no mode of its own, `--auto` for
     /// an `opencode` run. The config field's doc carries the measured argument for the default.
     pub skip_permissions: bool,
+}
+
+/// How the real harness is put back on a conversation, as `session_spawn` wants it. (M42)
+///
+/// Deliberately **not** a [`cide_pty::SpawnSpec`]: `session_spawn` builds the spec — the
+/// environment, the hooks, the configured binary, the proxy — and does it the same way for
+/// every pane. A second spec builder here would be a second copy of the seventy lines that
+/// took three milestones to get right, drifting from the first. So this carries only what the
+/// harness knows and `session_spawn` does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinueSpec {
+    /// The program, as `session_spawn` takes it: a bare name the OS resolves at the spawn,
+    /// so a CLI that updates itself underneath a running app is found where it now is. For
+    /// `claude` it is the name `program_is_claude` recognises, which is what turns the hooks
+    /// and the `--settings` payload on.
+    pub program: String,
+    /// Arguments carrying the conversation, when the harness names it that way. Written before
+    /// anything `session_spawn` appends, so nothing here may be a variadic flag.
+    pub args: Vec<String>,
+    /// The conversation as a cide [`SessionId`], for a harness whose conversation id *is* one.
+    /// `session_spawn` hands it to `cide_claude::conversation`, which writes the `--resume`
+    /// and keeps the id — so the pane's session and the run's stay the same value, and every
+    /// record naming it goes on naming the right conversation. `None` when the identity
+    /// travels in [`Self::args`] instead.
+    pub resume: Option<SessionId>,
 }
 
 /// A child, described — plus the two things the caller cannot work out for itself.
@@ -513,6 +656,12 @@ pub struct HarnessSpawn {
     pub opening: Option<Vec<u8>>,
     /// How this run's identity becomes known. See [`SessionBinding`].
     pub binding: SessionBinding,
+    /// The JSON event file this child writes as it works, when the harness reports that way
+    /// (M43): [`RunPlan::events_path`] handed back, so the app knows to read it. Each line is
+    /// one event, fed to [`Harness::observe`] as [`Observation::Line`] exactly as an opencode
+    /// child's stdout is — the difference is only which stream carries it, and that the pane
+    /// shows the child's own TUI rather than a rendering.
+    pub events: Option<PathBuf>,
 }
 
 /// How a run's identity becomes known. **This enum is the claude/opencode difference.**
@@ -538,8 +687,32 @@ pub enum SessionBinding {
     /// argument for why the rendering happens once, upstream of the mirror and every sink.
     Harness {
         capture: fn(&str) -> Option<String>,
-        render: fn(&str) -> cide_pty::Rendered,
+        /// Whether a person may later ask for this line's **whole event** — the app keeps such
+        /// lines in its per-session ring and hands the renderer the handle it minted, which the
+        /// rendering carries back to the pane as a visible token a click can resolve. (M42) A
+        /// tool call and the model's own words are worth keeping; a step marker is not.
+        keep: fn(&str) -> bool,
+        /// One event line → display text, with the state the rendering keeps between lines
+        /// (which step the run is in, whether a live marker is on screen) and the ring handle
+        /// for a line `keep` said yes to. `Drop` draws nothing; anything unrecognised comes back
+        /// verbatim.
+        render: fn(&mut RenderState, &str, Option<u64>) -> cide_pty::Rendered,
     },
+}
+
+/// What a [`SessionBinding::Harness`] rendering remembers from one line to the next. (M42)
+///
+/// Owned by the app's stream hook, one per session, and handed to `render` by `&mut` — the
+/// function pointer itself stays stateless so the binding stays `Copy`. The two facts here are
+/// what let a line-based renderer show *what the run is doing right now*: a step that has
+/// started and not finished is a run that is thinking or running tools, so a dim marker sits
+/// under the last line for as long as that is true, and every next line begins by erasing it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RenderState {
+    /// A `step_start` has been seen and its `step_finish` has not.
+    pub in_step: bool,
+    /// The marker row is the last thing on screen, so the next rendering must erase it first.
+    pub marker: bool,
 }
 
 impl PartialEq for SessionBinding {
@@ -579,6 +752,37 @@ pub enum Delivery {
     Stdin(Vec<u8>),
     /// This CLI cannot be spoken to. Start a fresh child that continues the same conversation.
     Respawn,
+}
+
+/// Why a turn died in a way another provider might survive. (M45)
+///
+/// Deliberately three named cases and not "an error happened". A pool exists to route *around*
+/// something, and each of these is a different something a different candidate plausibly fixes;
+/// anything not on this list is a failure another candidate would repeat, and repeating it once
+/// per candidate is how a typo'd model id burns a whole pool and reports the last one's error as
+/// the cause of death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailoverReason {
+    /// Out of quota for this credential right now — HTTP 429, or a billing refusal.
+    RateLimited,
+    /// The endpoint could not be reached, or answered in a way the CLI itself calls retryable.
+    /// The local case above all: LM Studio not running, llama-server down, ollama not started.
+    Unreachable,
+    /// The provider refused the credentials — 401, 403, or the CLI's own auth error. An expired
+    /// subscription OAuth lands here, which is exactly a case another candidate survives.
+    Auth,
+}
+
+impl FailoverReason {
+    /// Three or four words for the run's row. Lower case: it is spliced into a sentence.
+    #[must_use]
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate limited",
+            Self::Unreachable => "unreachable",
+            Self::Auth => "refused the credential",
+        }
+    }
 }
 
 /// Something cide learned about a run.
@@ -632,6 +836,21 @@ pub enum HarnessError {
     /// own default agent instead — a run that looks like it worked while carrying somebody else's
     /// system prompt.
     NoConfig,
+    /// A conversation id this harness cannot re-open: an empty one, or — for `claude`, whose
+    /// ids are cide's own uuids — one that is not a uuid at all. Refused rather than passed
+    /// through, because the CLI's answer would be a pane that fails after it opened. (M42)
+    NotAConversation {
+        harness: cide_ipc::Harness,
+        id: String,
+    },
+    /// The definition asks for something this harness has no flag for — an `effort`, a
+    /// `permission-mode` with no approval-mode counterpart. Refused rather than dropped: a
+    /// role whose author wrote a restriction that silently did not apply is the failure that
+    /// looks like success. (M43)
+    NoEquivalent {
+        harness: cide_ipc::Harness,
+        what: String,
+    },
     /// A follow-up was routed as a respawn to a harness that takes follow-ups on stdin.
     ///
     /// A caller bug rather than a user one, like [`Self::WrongHarness`], and caught for the same
@@ -668,6 +887,17 @@ impl std::fmt::Display for HarnessError {
                  has, not by starting another one",
                 harness_name(*harness)
             ),
+            Self::NotAConversation { harness, id } => write!(
+                f,
+                "“{id}” is not a conversation the “{}” harness can re-open",
+                harness_name(*harness)
+            ),
+            Self::NoEquivalent { harness, what } => write!(
+                f,
+                "the “{}” harness has no equivalent of {what}; drop it from the definition or \
+                 run this role on another harness",
+                harness_name(*harness)
+            ),
         }
     }
 }
@@ -677,6 +907,8 @@ impl std::error::Error for HarnessError {}
 /// The one instance of each harness. Unit structs, so this costs nothing to hold.
 static CLAUDE: ClaudeHarness = ClaudeHarness;
 static OPENCODE: OpencodeHarness = OpencodeHarness;
+static QWEN: QwenHarness = QwenHarness;
+static CODEX: CodexHarness = CodexHarness;
 
 /// The registry itself, as a `const` rather than built in [`registry`].
 ///
@@ -684,7 +916,7 @@ static OPENCODE: OpencodeHarness = OpencodeHarness;
 /// temporary and will not compile: const-promotion does not reach through the unsizing coercion
 /// to `&dyn Harness`. A `const` gives the slice `'static` storage, which is what the signature
 /// promises.
-const REGISTRY: &[&dyn Harness] = &[&CLAUDE, &OPENCODE];
+const REGISTRY: &[&dyn Harness] = &[&CLAUDE, &OPENCODE, &QWEN, &CODEX];
 
 /// Every harness this build has.
 ///
@@ -725,8 +957,12 @@ mod tests {
         // `cide_ipc::Harness`'s variants *against* the registry, and a list read out of the thing
         // under test would pass no matter what either of them said. `Opencode` joined this line
         // and the registry in the same commit, which was the point; the next variant does too.
-        const EVERY: &[cide_ipc::Harness] =
-            &[cide_ipc::Harness::Claude, cide_ipc::Harness::Opencode];
+        const EVERY: &[cide_ipc::Harness] = &[
+            cide_ipc::Harness::Claude,
+            cide_ipc::Harness::Opencode,
+            cide_ipc::Harness::Qwen,
+            cide_ipc::Harness::Codex,
+        ];
 
         for kind in EVERY.iter().copied() {
             let harness = for_kind(kind).expect("a harness for every variant");
@@ -943,10 +1179,11 @@ mod tests {
     /// actually checked.
     const BRIEF: &str = "You are the developer agent. Finish the task.";
 
-    /// What each binary would tell one role, as a pair: claude's one `--append-system-prompt`
-    /// value, and the inline agent's `prompt` out of opencode's configuration document. `task`
-    /// is the only knob, because the paragraphs a run is told differ on exactly that (M40).
-    fn told_by_both(task: Option<&TaskId>) -> (String, String) {
+    /// What each binary would tell one role: claude's one `--append-system-prompt` value, the
+    /// inline agent's `prompt` out of opencode's configuration document, and codex's
+    /// `developer_instructions` override (M44). `task` is the only knob, because the paragraphs
+    /// a run is told differ on exactly that (M40).
+    fn told_by_all(task: Option<&TaskId>) -> (String, String, String) {
         use cide_ipc::{AgentDef, AgentId};
 
         fn role(harness: cide_ipc::Harness) -> LoadedAgent {
@@ -990,10 +1227,14 @@ mod tests {
                 hook_bin: Some(PathBuf::from("/opt/cide/cide-hook")),
                 hook_sock: Some(PathBuf::from("/run/user/1000/cide-hooks-42.sock")),
                 agent_sock: Some(PathBuf::from("/run/user/1000/cide-agents-42.sock")),
+                events_path: None,
                 theme: Theme::Dark,
                 proxy: ProxyEnv::default(),
                 geometry: Geometry::default(),
                 claude: cide_ipc::ClaudeSettings::default(),
+                llm: cide_ipc::LlmSettings::default(),
+                choice: None,
+                harness: agent.def.harness,
                 // Off in the fixture, so every argv assertion below is about what the role
                 // and the plan actually said; the skip default has tests of its own.
                 skip_permissions: false,
@@ -1032,7 +1273,11 @@ mod tests {
             .expect("the inline role has a prompt")
             .to_string();
 
-        (told_by_claude, told_by_opencode)
+        // codex: the brief the `-c developer_instructions=` override carries, before encoding.
+        let agent = role(cide_ipc::Harness::Codex);
+        let told_by_codex = codex::developer_brief(&plan(&agent, task));
+
+        (told_by_claude, told_by_opencode, told_by_codex)
     }
 
     /// `rendered` with every tool name turned back into the placeholder it came from.
@@ -1056,12 +1301,17 @@ mod tests {
 
     #[test]
     fn a_role_is_told_the_same_thing_whichever_binary_runs_it() {
-        let (told_by_claude, told_by_opencode) = told_by_both(Some(&TaskId("t-14".into())));
+        let (told_by_claude, told_by_opencode, told_by_codex) =
+            told_by_all(Some(&TaskId("t-14".into())));
 
         // The one licensed difference: the tool names, and nothing else.
         assert_eq!(
             unfill_tools(&told_by_claude, &ClaudeHarness),
             unfill_tools(&told_by_opencode, &OpencodeHarness),
+        );
+        assert_eq!(
+            unfill_tools(&told_by_claude, &ClaudeHarness),
+            unfill_tools(&told_by_codex, &CodexHarness),
         );
         assert_eq!(
             unfill_tools(&told_by_claude, &ClaudeHarness),
@@ -1079,16 +1329,24 @@ mod tests {
             "{told_by_opencode}"
         );
         assert!(!told_by_opencode.contains("mcp__"), "{told_by_opencode}");
+        assert!(
+            told_by_codex.contains("mcp__cide__cide_task_get"),
+            "{told_by_codex}"
+        );
     }
 
     /// The task-less twin (M40): the correction to the tracker paragraph is the third paragraph,
     /// after it, on both binaries — asserted from [`ADHOC_PREAMBLE`] itself, never a quoted copy.
     #[test]
     fn an_adhoc_run_is_told_the_same_thing_whichever_binary_runs_it() {
-        let (told_by_claude, told_by_opencode) = told_by_both(None);
+        let (told_by_claude, told_by_opencode, told_by_codex) = told_by_all(None);
         assert_eq!(
             unfill_tools(&told_by_claude, &ClaudeHarness),
             unfill_tools(&told_by_opencode, &OpencodeHarness),
+        );
+        assert_eq!(
+            unfill_tools(&told_by_claude, &ClaudeHarness),
+            unfill_tools(&told_by_codex, &CodexHarness),
         );
         assert_eq!(
             unfill_tools(&told_by_claude, &ClaudeHarness),

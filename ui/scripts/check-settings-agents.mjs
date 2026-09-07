@@ -172,6 +172,7 @@ try {
     blankDraft,
     canSave,
     closeRequest,
+    effectiveHarness,
     fileKey,
     focusAction,
     focusTarget,
@@ -181,6 +182,7 @@ try {
     localProblems,
     modalFor,
     modalTitle,
+    modelPlaceholder,
     problemsByField,
     restoredModal,
     rowsFor,
@@ -286,6 +288,69 @@ try {
     eq(isClosedVocabulary(field), false, `${field} is deliberately not a closed vocabulary`)
   }
   ok(EFFORT_SUGGESTIONS.length > 0, 'effort still offers the common values as suggestions')
+
+  /* ------------------------------------------- which harness the Model menu is asked about */
+
+  /*
+   * `model` stays open (above) *and* gets a menu, and the menu is per harness — which means the
+   * screen has to resolve a harness before it can ask for one. `AgentDraft.harness` cannot
+   * answer: `null` there is "project default", a real state, so the resolution needs the
+   * project's `.cide/config.json` as well.
+   *
+   * Three ways to get this wrong and all three are silent. Reading `draft.harness` directly
+   * offers Claude's aliases to a role whose project defaults to opencode. Forgetting the
+   * claude-scope override offers `provider/model` ids to a Claude Code subagent — for which
+   * `harness/claude.rs` suppresses `--model` entirely, so every one of them is a value cide has
+   * already decided never to pass. And falling through to the wrong default makes a fresh form
+   * ask about a harness the role will not run on.
+   *
+   * `effectiveHarness` mirrors `cide_agents::defs::load_from`'s own resolution, which is the
+   * only thing that makes the menu describe the run that would actually happen.
+   */
+  for (const scope of SCOPES) {
+    for (const drafted of [null, ...HARNESSES]) {
+      for (const projectDefault of [null, ...HARNESSES]) {
+        const answer = effectiveHarness({ ...blankDraft(scope), harness: drafted }, projectDefault)
+        const expected = isClaudeScope(scope) ? 'claude' : (drafted ?? projectDefault ?? 'claude')
+        eq(
+          answer,
+          expected,
+          `effectiveHarness(${scope}, draft=${drafted}, project=${projectDefault}) is ${expected}`,
+        )
+      }
+    }
+  }
+  eq(
+    effectiveHarness({ ...blankDraft('claudeProject'), harness: 'opencode' }, 'opencode'),
+    'claude',
+    'a Claude Code scope is Claude however loudly anything else says opencode — `.claude/agents/` ' +
+      'has no harness: key, and `--model` is suppressed for a subagent anyway',
+  )
+  ok(
+    HARNESSES.every((harness) => typeof modelPlaceholder(harness) === 'string'),
+    'every harness has a Model placeholder',
+  )
+  ok(
+    new Set(HARNESSES.map(modelPlaceholder)).size === HARNESSES.length,
+    'and no two harnesses share one — the field was placeholdered `sonnet` for all of them, ' +
+      'which is Claude alias vocabulary and is not a value opencode accepts, so it read as an ' +
+      'example of something that would be refused',
+  )
+  ok(
+    modelPlaceholder('opencode').includes('/'),
+    "opencode's placeholder is spelled provider/model, because that is the whole shape of its ids",
+  )
+  ok(
+    /agentDefs\s*\.?\s*\n?\s*\.?models\(/.test(sectionCode) ||
+      sectionCode.includes('agentDefs.models('),
+    'AgentsSection asks agentDefs.models() — a probe nothing calls is the listed-and-inert ' +
+      'defect one layer out, which section 7 of check-agents.mjs exists for',
+  )
+  ok(
+    !/<Choice\s+label="Model"/.test(sectionCode),
+    'Model is NOT drawn as a <Choice>: the probed list is one machine at one moment, and closing ' +
+      'the field over it would start refusing a model that works',
+  )
   eq(
     localProblems({ ...blankDraft('project'), name: 'qa', systemPrompt: 'x', effort: 'ultra' }),
     [],

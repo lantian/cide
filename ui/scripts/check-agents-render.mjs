@@ -1703,23 +1703,55 @@ try {
         linked.linkChips,
         [
           'blockedBy|out|t-14|false',
+          'blockedBy|out|t-99|true',
           'subtaskOf|out|t-16|false',
           'related|out|t-17|false',
-          'blockedBy|out|t-99|true',
           'blockedBy|in|t-41|false',
         ],
-        'five chips: the three stored kinds in order, the dangling t-99 MARKED rather than ' +
-          'hidden (a reference that silently vanished is the task-leaves-the-tracker failure, ' +
-          'one edge over), and the derived `blocks` reading from t-41’s own stored edge — ' +
-          'stored once, read from both ends',
+        'five edges: the three stored kinds, the dangling t-99 MARKED rather than hidden (a ' +
+          'reference that silently vanished is the task-leaves-the-tracker failure, one edge ' +
+          'over), and the derived `blocks` reading from t-41’s own stored edge — stored ' +
+          'once, read from both ends. In GROUPED order since M40: t-99 sits beside t-14 under ' +
+          'the reading they share, which is the one way the list moved a row the cloud drew ' +
+          'elsewhere',
+      )
+      eq(
+        linked.linkGroups,
+        ['Blocked by', 'Subtask of', 'Related to', 'Blocks'],
+        'four headings for five edges, and the load-bearing pair is the first and the last: ' +
+          'one STORED kind, `blockedBy`, reads as two different facts from its two ends, and ' +
+          'putting “this is holding me up” under the same word as “I am holding this up” ' +
+          'is the one seriously misleading thing this section could say. Grouped by the ' +
+          'direction-resolved LABEL is what keeps them apart — and `related`, whose two ' +
+          'readings are the same words, correctly one heading',
+      )
+      eq(
+        linked.linkRows,
+        [
+          't-14|doing|t-14 Add the retry bar',
+          't-99||t-99 Not on the board',
+          't-16|todo|t-16 Write check-agents',
+          't-17|done|t-17 Teach the watcher about .cide/',
+          't-41|todo|t-41 Write the release note',
+        ],
+        'and every row carries the target’s STATUS and TITLE — the whole of M40. The board ' +
+          'already resolved both (`taskLinks` fills `targetTitle` and `targetStatus`); the ' +
+          'pill cloud computed them and drew an id',
       )
       ok(
-        linked.buttons?.includes('Blocked by t-14'),
-        'a chip is a BUTTON — it navigates to its target — not a decorated span',
+        linked.buttons?.includes('t-14 Add the retry bar'),
+        'a row is a BUTTON — it navigates to its target — not a decorated span',
       )
       ok(
-        linked.buttons?.includes('Blocked by t-99 (gone)'),
-        'and the dangling one says so in words as well as in the attribute',
+        (linked.text ?? '').includes('Not on the board'),
+        'and the dangling one says so IN WORDS as well as in the attribute: a row that merely ' +
+          'rendered blank there would read as an untitled task rather than as a missing one',
+      )
+      eq(
+        linked.linkRows?.[1]?.split('|')[1],
+        '',
+        'its marker is the unknown one and not a status it does not have — `statusGlyph`’s ' +
+          'own posture over the empty string, which is `circle-slash`',
       )
       eq(
         linked.linkRemoves,

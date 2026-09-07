@@ -91,9 +91,35 @@
  * handler that called `run('navigate.back')` itself — would have been a third place where input
  * becomes a command, with its own copy of the prefix machine and its own `when` evaluation, and
  * `check-key-gate.mjs` could not have held it to the same answers.
+ *
+ * # Normalisation before resolution
+ *
+ * The gate resolves by `code`, so it never cared what layout the OS had selected. Everything
+ * *behind* it did: xterm encodes Ctrl+letter from `keyCode`, CodeMirror resolves `event.key`
+ * with a `keyCode` fallback, and this app's focus-scoped rules match `ev.key` — and under a
+ * Russian layout WebKitGTK reports `key 'я'` and `keyCode 0` for the Z key, so Ctrl+Z reached
+ * every one of them as a chord nobody had bound. `keys/latin.ts` is the fix and carries the
+ * argument; what belongs here is *where* it runs.
+ *
+ * `latiniseKeyEvent` is the first statement of both keyboard entry points, in the instance
+ * handlers rather than in `decide` or in the module-level wrappers. Not `decide`, because the
+ * mouse entry has no event to normalise and the two that do must normalise *before* anything
+ * reads the event — the window capture listener is the earliest point in a window, ahead of
+ * xterm's textarea listener, CodeMirror's `contentDOM` handler and React's root. Not the
+ * module-level `gate()`/`terminalKeyGate()`, because `check-key-gate.mjs` drives the instance
+ * handlers with plain objects, and there the rewrite is measured at both entry points for every
+ * chord in the sweep; a wrapper the sweep never calls is a rewrite the sweep never sees. What
+ * that placement does not cover is a terminal keystroke in a detached window during the tick
+ * between the terminal's construction and `useKeyGate`'s effect — `installed` is `null` there,
+ * and the keymap does not resolve in that tick either.
+ *
+ * Both entry points may see the same event, exactly as the memo above describes, and the
+ * rewrite is memoised against the object for the same reason: the second pass must neither
+ * rewrite again nor learn the layout from its own rewrite.
  */
 import { renderStroke, strokeFromEvent, type KeyStroke } from './chords'
 import { buildKeymap, type KeyBinding, type KeyContext, type Keymap } from './keymap'
+import { latiniseKeyEvent } from './latin'
 
 /**
  * How long a pending prefix survives.
@@ -150,6 +176,9 @@ const PASS: Decision = { passThrough: true, command: null, sequence: null }
  */
 export type GateEvent = KeyStroke & {
   type?: string | undefined
+  /** Read by `keys/latin.ts` only, to leave the input method's keystrokes alone. */
+  keyCode?: number | undefined
+  isComposing?: boolean | undefined
   preventDefault?: (() => void) | undefined
   stopPropagation?: (() => void) | undefined
 }
@@ -356,6 +385,8 @@ export function createKeyGate(host: KeyGateHost): KeyGate {
     reset: () => setPending(null),
 
     windowHandler(ev) {
+      // Before anything reads the event: see "Normalisation before resolution" above.
+      latiniseKeyEvent(ev)
       const decision = decide(ev)
       if (!decision.passThrough) {
         // Both, and in this order. `preventDefault` stops the browser's own default (a
@@ -398,6 +429,10 @@ export function createKeyGate(host: KeyGateHost): KeyGate {
     },
 
     terminalHandler(ev) {
+      // Usually a second pass over an event the window listener already normalised, which the
+      // memo in `latin.ts` makes a no-op; the first pass in a window whose gate the shell has
+      // not installed yet. Either way, before `decide` and before xterm reads `keyCode`.
+      latiniseKeyEvent(ev)
       const decision = decide(ev)
       // No `stopPropagation` here: by the time xterm consults this handler the event has
       // already reached its target, and xterm's own contract — return `false` and it will

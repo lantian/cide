@@ -633,3 +633,67 @@
   font-size: var(--fs-ui-12);
   color: var(--dim);
 }
+
+/*
+ * --- a local override card (M45) ---
+ *
+ * Visually a card rather than a bare run of rows, because this block means the opposite of the
+ * `.cide/config.json` row above it: that one is committed and reviewed, this one is local and
+ * private. A boundary is the cheapest way to say "different kind of thing" before the note does.
+ */
+.overrideCard {
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  padding: 4px 12px 8px;
+  margin-bottom: 10px;
+}
+
+.overrideHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 2px;
+}
+
+.overrideTitle {
+  flex: 1;
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overrideNote {
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--dim);
+  margin: 0 0 4px;
+}
+
+.overrideRemove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(22px * var(--ui-scale));
+  height: calc(22px * var(--ui-scale));
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.overrideRemove:hover {
+  color: var(--text);
+}
+
+/* The Add controls under the override list. */
+.overrideActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 0 2px;
+}

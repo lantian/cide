@@ -38,6 +38,7 @@ import {
   diag,
   session as sessionApi,
   type Geometry,
+  type HarnessSession,
   type Pane,
   type PaneRestore,
 } from '@/ipc/client'
@@ -59,6 +60,16 @@ export interface TerminalSpec {
    */
   resume?: string | undefined
   fork?: boolean | undefined
+  /**
+   * Put the real harness back on a conversation whose run child has ended. (M42)
+   *
+   * Rust overrides `program`, `args`, `cwd` and `resume` from it — the harness spells the
+   * command, the conversation carries the directory it was filed under — so a pane that has
+   * one sends `program: ''` and lets `session_spawn` decide. Read off `Pane.continues`, which
+   * is durable, so a restart and the exit bar's restart re-open the same conversation from the
+   * same place as the first mount did.
+   */
+  continues?: HarnessSession | undefined
 }
 
 export interface TerminalPaneProps {
@@ -175,6 +186,24 @@ function specFor(
   project?: string,
   restore?: PaneRestore | undefined,
 ): TerminalSpec | null {
+  /*
+   * A pane opened onto an agent run's conversation re-opens **that** conversation, whatever
+   * its kind says the program is (M42): Rust spells `claude --resume <id>` or the opencode TUI
+   * from `continues`, in the run's directory. The one case it does not is a restored Claude
+   * pane whose transcript the launch plan could not find (`Fresh`): the conversation is gone,
+   * so the pane starts a new one — still in the run's directory, which `cwd` already is —
+   * rather than asking the CLI to resume a file that is not there and failing after it opened.
+   * A Shell-kind pane (an opencode TUI) keeps its conversation through a restore regardless:
+   * `plan_restore` answers `Fresh` for every shell and cannot look inside opencode's store, so
+   * opencode's own answer is the honest one.
+   */
+  const continues = pane.continues ?? undefined
+  if (
+    continues !== undefined &&
+    !(pane.kind === 'claude' && restore !== undefined && restore.restore.kind === 'fresh')
+  ) {
+    return { program: '', args: [], cwd, project, continues }
+  }
   switch (pane.kind) {
     case 'claude': {
       const resume = restore?.restore.kind === 'resumable' ? restore.restore.session : undefined
@@ -621,10 +650,32 @@ export function TerminalPane({
        * it, put there by `pane_for`'s `Resume` arm, so the two agree by construction.
        */
       spec.resume = plan.session
+    } else if (plan?.kind === 'continue') {
+      /*
+       * The real harness on a run's conversation (M42): `claude --resume` in the run's
+       * worktree, or the opencode TUI on its `ses_…`. The same ownership as `resume` — this
+       * pane spawns the process, so it owns it and closing the pane ends it; `mirrored` stays
+       * unset — and the spec already carries the conversation, because `pane_for` wrote it
+       * into `Pane.continues` and `specFor` read it back. Nothing to set here beyond the
+       * branch existing: a plan of this kind must not fall through to the adoption below.
+       */
     } else if (plan?.kind === 'forkPrimary' && primaryRef.current) {
       spec.resume = primaryRef.current
       spec.fork = true
     }
+    /*
+     * Whether this mount is going to **spawn** the conversation the domain already names.
+     *
+     * `pane_for` writes the session into the row for a `resume` (and a `claude` `continue`)
+     * before anything exists, and the registry may still *retain* that id — an exited
+     * conversation whose pane was closed in this process keeps its last screen for exactly the
+     * reason `sessionIsHeld` adopts exited sessions. Adopting it here would attach this pane to
+     * the dead screen and skip the `--resume` the user pressed the button for: a transcript
+     * with `— exited —` under it where a live conversation was promised. So a plan that spawns
+     * skips the adoption; `session_spawn`'s own guard still refuses if the id turns out to be
+     * *live* somewhere, which is the refusal the user has to read.
+     */
+    const spawns = plan?.kind === 'resume' || plan?.kind === 'continue'
 
     /**
      * This pane's child has gone: offer a way back.
@@ -827,7 +878,7 @@ export function TerminalPane({
        * plan says and whenever it arrives. `restore` keeps the one thing only it knows: whether
        * to pass `--resume`.
        */
-      if (domainSession && !getHost(paneId).sessionId) {
+      if (domainSession && !spawns && !getHost(paneId).sessionId) {
         // `sessionIsHeld`, not `sessionIsLive`: an exited session the registry retains is a
         // transcript this pane exists to show — a finished run opened from History, a pane
         // whose child ended while it was parked. Spawning over it replaced an opencode run's

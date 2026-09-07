@@ -98,6 +98,7 @@ pub(crate) fn open_file_tab(
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title,
             },
         )
@@ -659,6 +660,7 @@ fn diff_pane(title: String) -> Pane {
         session: None,
         conversation: None,
         conversation_since: None,
+        continues: None,
         title,
     }
 }
@@ -1070,6 +1072,7 @@ fn revision_pane(title: String) -> Pane {
         session: None,
         conversation: None,
         conversation_since: None,
+        continues: None,
         title,
     }
 }
@@ -2877,6 +2880,7 @@ mod tests {
             session: Some(cide_ipc::SessionId::new()),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: title.into(),
         }
     }
@@ -2889,6 +2893,7 @@ mod tests {
             session: Some(cide_ipc::SessionId::new()),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: title.into(),
         }
     }
@@ -3109,6 +3114,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "main.rs".into(),
             },
         )

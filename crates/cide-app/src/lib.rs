@@ -27,6 +27,7 @@ pub mod dock;
 pub mod dotcide;
 pub mod edit_wait;
 pub mod emit;
+mod event_tap;
 /// The `cide-ext://` scheme: an installed extension's own files, path-jailed and read-only.
 pub mod ext_assets;
 /// The extension registry: marketplaces, installs, and the contribution set they resolve to.
@@ -644,8 +645,13 @@ pub fn run() {
             cmd::agents::agents_resume,
             cmd::agents::agents_retry_turn,
             cmd::agents::agents_ack_stale_turn,
+            cmd::agents::agents_run_open,
             cmd::agents::agents_integrate,
             cmd::agents::agents_draft,
+            cmd::agents::agents_models,
+            cmd::agents::llm_test_model,
+            cmd::agents::agent_overrides_get,
+            cmd::agents::agent_overrides_set,
             cmd::agents::agents_save,
             cmd::agents::agents_delete,
             // --- M22: extensions and their marketplaces ---
@@ -914,7 +920,18 @@ pub fn run() {
                 // workspace actually holds; before any window exists, so the first roster a
                 // panel reads already carries them and no emit is owed.
                 let agents = app.state::<std::sync::Arc<agents::AgentRegistry>>();
-                agents.restore_snapshot(|project| ws.projects.contains_key(&project));
+                agents.restore_snapshot(
+                    |project| ws.projects.contains_key(&project),
+                    // The root a finished row's conversation is filed under, for the one
+                    // filesystem check restore makes per row (M42). A rootless project fails
+                    // validation, so `None` here only ever skips a row we could not open.
+                    |project| {
+                        ws.projects
+                            .get(&project)
+                            .and_then(|p| p.roots.first().map(|root| root.path.clone()))
+                    },
+                    ws.settings.claude.cli.inject.resume.enabled,
+                );
             }
 
             restore_windows(app.handle())?;

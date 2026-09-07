@@ -1,0 +1,243 @@
+/*
+ * The Models screen: provider cards and pool editors. (M45)
+ *
+ * Every size is a `--fs-ui-*` rung and every gap a `--sp-*` step, on `check:ui-scale`'s rule —
+ * a bare `font-size: <n>px` is a label that silently stops following the UI font size.
+ */
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.cardHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.cardTitle {
+  flex: 1;
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kind {
+  font-size: var(--fs-ui-11);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  padding: 1px 5px;
+}
+
+/* Both themes define the palette colours, so these need no media query: the token carries the
+   light/dark difference, which is `.noteWarn`'s rule one file over. */
+.verdictOk {
+  font-size: var(--fs-ui-12);
+  color: var(--green);
+}
+
+.verdictBad {
+  font-size: var(--fs-ui-12);
+  color: var(--yellow);
+}
+
+.problem {
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--yellow);
+  margin-top: 4px;
+}
+
+/* --- pool entries --- */
+
+.entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.entryOrdinal {
+  width: 18px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.entryField {
+  flex: 1;
+  min-width: 0;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+}
+
+.entryField:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.iconButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(22px * var(--ui-scale));
+  height: calc(22px * var(--ui-scale));
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.iconButton:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.iconButton:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/*
+ * A row whose provider is unknown or switched off. Struck through, dimmed, and *still legible* —
+ * the entry is kept rather than deleted because the provider may be the next thing the user
+ * creates, so they have to be able to read what they typed.
+ */
+.entryDead .entryField {
+  text-decoration: line-through;
+  color: var(--dim);
+}
+
+/* --- the resolved-argv readout --- */
+
+.readout {
+  margin-top: 6px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1.7;
+  color: var(--dim);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.readoutLine {
+  display: block;
+}
+
+.readoutDead {
+  text-decoration: line-through;
+  color: var(--faint);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 0 2px;
+}
+
+.modelRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+}
+
+.modelNumber {
+  width: 74px;
+  flex: none;
+}
+
+/* --- a collapsible provider card --- */
+
+.disclosure {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chevron {
+  flex: none;
+  color: var(--dim);
+}
+
+/* --- a model id box with a picker beside it --- */
+
+.combo {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.comboPick {
+  flex: none;
+  width: calc(30px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-11);
+}
+
+.testResultOk {
+  font-size: var(--fs-ui-11);
+  color: var(--green);
+  flex: 1;
+  min-width: 0;
+}
+
+.testResultBad {
+  font-size: var(--fs-ui-11);
+  color: var(--yellow);
+  flex: 1;
+  min-width: 0;
+}
+
+.modelHead {
+  display: flex;
+  gap: 6px;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  padding: 4px 0 0;
+}
+
+.modelHeadId {
+  flex: 1;
+}
+
+.modelHeadNumber {
+  width: 74px;
+  flex: none;
+}

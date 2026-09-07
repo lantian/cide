@@ -47,6 +47,7 @@ import {
   closeCompose,
   draftReady,
   fieldLabel,
+  draftLinkChips,
   isLinkKind,
   linkLabel,
   statusLabel,
@@ -56,7 +57,7 @@ import {
   dropTargetKey,
   type StagedAttachment,
 } from './model'
-import { cx } from './TaskDetail'
+import { TaskLinkList, cx } from './TaskDetail'
 import { LinkTargetInput } from './LinkTargetInput'
 import { MentionTextarea } from './MentionTextarea'
 import { StagedChips } from './AttachmentStrip'
@@ -415,37 +416,29 @@ export function TaskCompose({
               Links
             </label>
             {draft.links.length > 0 && (
-              <div className={styles.linkChips} data-audit="taskComposeLinkChips">
-                {draft.links.map((link) => (
-                  <span className={styles.linkPair} key={`${link.kind}:${link.target}`}>
-                    <span
-                      className={styles.linkChip}
-                      data-audit="taskComposeLinkChip"
-                      data-kind={link.kind}
-                      data-target={link.target}
-                    >
-                      {linkLabel(link.kind, 'out')} {link.target}
-                    </span>
-                    <button
-                      type="button"
-                      className={styles.linkRemove}
-                      data-audit="taskComposeLinkRemove"
-                      title="Remove this link from the draft"
-                      aria-label={`Do not link ${link.target}`}
-                      onClick={() =>
-                        onDraft({
-                          ...draft,
-                          links: draft.links.filter(
-                            (kept) => kept.kind !== link.kind || kept.target !== link.target,
-                          ),
-                        })
-                      }
-                    >
-                      <Icon name="x" size={0} />
-                    </button>
-                  </span>
-                ))}
-              </div>
+              /*
+                * The same rows the card draws — `TaskLinkList`'s header carries the argument.
+                * Resolved through `draftLinkChips` against `tasks`, the very list the picker
+                * below offers, so a link named here says what it will mean before the task
+                * exists: the target's state and title, not an id to go and look up.
+                *
+                * No `onOpen`: there is nothing to navigate back from yet, and this dialog is a
+                * modal over the board it would navigate to. Every draft link is removable —
+                * both ends of a draft edge are the draft.
+                */
+              <TaskLinkList
+                chips={draftLinkChips(draft.links, tasks)}
+                auditList="taskComposeLinkChips"
+                auditRow="taskComposeLinkChip"
+                auditRemove="taskComposeLinkRemove"
+                removeFor={(chip) => () =>
+                  onDraft({
+                    ...draft,
+                    links: draft.links.filter(
+                      (kept) => kept.kind !== chip.kind || kept.target !== chip.target,
+                    ),
+                  })}
+              />
             )}
             <div className={styles.linkAdd}>
               <select

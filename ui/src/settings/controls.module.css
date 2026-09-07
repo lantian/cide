@@ -323,3 +323,54 @@
   -webkit-user-select: text;
   user-select: text;
 }
+
+/*
+ * --- a stacked text field ---
+ *
+ * Promoted here from `ClaudeCliSection` in M45, on this file's own premise: it is the settings
+ * screen's form vocabulary, and this was its third caller (`ProxySection` and `FormattersSection`
+ * each re-implement the same shape). The Models screen needed a fourth.
+ */
+.field {
+  display: block;
+  padding: 11px 0;
+}
+
+.fieldLabel {
+  display: block;
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.fieldHint {
+  display: block;
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--dim);
+  margin-top: 5px;
+}
+
+.fieldInput {
+  display: block;
+  width: 100%;
+  height: calc(26px * var(--ui-scale));
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  color: var(--text);
+  /* An id, a URL, a package name and a credential are all machine strings: mono, like every path
+     and counter in this app. */
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+}
+
+.fieldInput::placeholder {
+  color: var(--faint);
+}
+
+.fieldInput:focus {
+  outline: 0;
+  border-color: var(--accent);
+}

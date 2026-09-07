@@ -128,6 +128,7 @@ pub fn open_project(
             session: Some(primary_session),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: format!("{name} : claude"),
         }),
     };
@@ -2372,6 +2373,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         session: attached.then(SessionId::new),
         conversation: None,
         conversation_since: None,
+        continues: None,
         title: title.to_string(),
     }
 }

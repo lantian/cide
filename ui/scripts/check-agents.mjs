@@ -235,6 +235,10 @@ try {
     isLinkKind,
     linkLabel,
     taskLinks,
+    linkGroups,
+    draftLinkChips,
+    linkTargetStatus,
+    linkTargetText,
     linkableTargets,
     linkTargetOptions,
     LINK_TARGET_CAP,
@@ -293,7 +297,7 @@ try {
 
   ok(rustStatuses.length === 4, `read ${rustStatuses.length} TaskStatus variants — the scan still matches`)
   ok(rustPhases.length === 9, `read ${rustPhases.length} RunState variants — the scan still matches`)
-  ok(rustHarnesses.length === 2, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
+  ok(rustHarnesses.length === 4, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
 
   eq(
     sorted(TASK_STATUSES),
@@ -553,6 +557,10 @@ try {
     failure: null,
     staleTurn: false,
     note: null,
+    // Rust's rule, restated for the fixture: a row with a session is openable. Stated
+    // before `over` so a story can say otherwise — a finished opencode run has no session
+    // and an openable conversation.
+    openable: (over.session === undefined ? 's1' : over.session) !== null,
     ...over,
   })
 
@@ -721,6 +729,7 @@ try {
     agentLabel: 'Developer',
     phase: 'running',
     session: 's1',
+    openable: true,
     ...over,
   })
   const ROLE_LABELS = { developer: 'Developer', qa: 'QA' }
@@ -1188,9 +1197,19 @@ try {
   eq(canOpen(run({ phase: 'finished', session: 's1' })), true, 'a finished run still has its screen')
   eq(
     canOpen(run({ phase: 'interrupted', session: 's1' })),
+    true,
+    'an interrupted run opens too: its child died with the old cide, its conversation did ' +
+      'not, and Open now re-opens the real harness on it rather than mirroring a dead session',
+  )
+  eq(
+    canOpen(run({ phase: 'finished', session: null, openable: true })),
+    true,
+    'a finished opencode run has no session and an openable conversation — the wire decides',
+  )
+  eq(
+    canOpen(run({ phase: 'finished', session: null })),
     false,
-    'an interrupted run carries a session id with no process behind it — an Open would attach ' +
-      'to nothing and draw a resume splash over a row whose real affordance is Resume',
+    'and one with neither is withheld, not disabled',
   )
   eq(canPause(run({ phase: 'running' })), true, 'a running child can be frozen')
   eq(canPause(run({ phase: 'paused' })), false, 'an already-frozen one draws Resume instead')
@@ -1667,6 +1686,116 @@ try {
       'a rogue-kind edge still draws on its OWN task — labelled as its raw text, never ' +
         'vanished: the file is hand-editable and a future cide may have written it',
     )
+
+    /* ---------------------------------------------------- the rows those chips become (M40) */
+
+    /*
+     * The grouping, which is where the reading is decided.
+     *
+     * By the direction-resolved LABEL and not by the kind, and the `blockedBy` pair is the whole
+     * argument: one stored kind reads as *Blocked by* on the task that waits and *Blocks* on the
+     * task waited for, and a heading that collapsed the two would say "this is holding me up"
+     * and "I am holding this up" with one word. `related`, whose two readings are the same
+     * words, correctly stays one group.
+     */
+    {
+      const chips = taskLinks(linked, board)
+      eq(
+        linkGroups(chips).map((g) => `${g.label}|${g.chips.map((c) => c.target).join(',')}`),
+        ['Blocked by|t-2,t-99', 'Related to|t-3', 'Subtask|t-4'],
+        'grouped by the reading, in first-appearance order — so the list’s order is still ' +
+          'taskLinks’ (stored edges in file order, then the derived readings) rather than a ' +
+          'second ordering nobody asked for, with t-99 pulled up beside the row it shares a ' +
+          'heading with',
+      )
+      const bothWays = taskLinks(
+        task({ id: 't-1', links: [{ kind: 'blockedBy', target: 't-2' }] }),
+        [task({ id: 't-1', links: [] }), task({ id: 't-2', links: [{ kind: 'blockedBy', target: 't-1' }] })],
+      )
+      eq(
+        linkGroups(bothWays).map((g) => g.label),
+        ['Blocked by', 'Blocks'],
+        'the two readings of ONE kind are two headings — the assertion this function exists for',
+      )
+      eq(
+        linkGroups(taskLinks(rogue, board)).map((g) => g.label),
+        ['constructor'],
+        'and a rogue kind groups under its own raw text without touching a prototype: the ' +
+          'label is the key, and `constructor` is a label a hand-edited file can produce',
+      )
+      eq(linkGroups([]).length, 0, 'no edges, no headings')
+    }
+
+    /*
+     * What a row draws in its marker and its title cell. Both total, both never empty — a blank
+     * title cell would read as an untitled task rather than as a missing one, which is the
+     * distinction the whole `gone` flag exists to keep.
+     */
+    {
+      const chips = taskLinks(linked, board)
+      const at = (target) => chips.find((c) => c.target === target)
+      eq(linkTargetStatus(at('t-2')), 'doing', 'a row’s marker is the TARGET’s status')
+      eq(
+        linkTargetStatus(at('t-99')),
+        '',
+        'and a target off the board resolves to the empty string, which every `status*` helper ' +
+          'already reads as unknown — `circle-slash`, not a status the task does not have',
+      )
+      eq(statusGlyph(linkTargetStatus(at('t-99'))), 'circle-slash', 'stated as the glyph too')
+      eq(linkTargetText(at('t-2')), 'The loader', 'the title, where there is one')
+      eq(linkTargetText(at('t-99')), 'Not on the board', 'the plain sentence, where there is not')
+      eq(
+        linkTargetText(
+          draftLinkChips([{ kind: 'related', target: 't-6' }], [
+            { id: 't-6', title: '   ', status: 'todo' },
+          ])[0],
+        ),
+        'Untitled',
+        'and a real task with a blank title is UNTITLED and not the missing sentence — the two ' +
+          'are different facts and the row must not merge them',
+      )
+      for (const chip of chips) {
+        ok(linkTargetText(chip) !== '', `linkTargetText is never empty (${chip.target})`)
+      }
+    }
+
+    /*
+     * The compose dialog's half. Outgoing only, and that is not a simplification: a task that
+     * does not exist yet cannot be the target of anything, so there is no incoming reading to
+     * derive. Through the same `linkChipFor` as the card, so a draft link and a stored one
+     * resolve to the same title and the same marker.
+     */
+    {
+      const options = [
+        { id: 't-2', title: 'The loader', status: 'doing' },
+        { id: 't-4', title: 'The child', status: 'todo' },
+      ]
+      const draft = draftLinkChips(
+        [
+          { kind: 'blockedBy', target: 't-2' },
+          { kind: 'subtaskOf', target: 't-4' },
+          { kind: 'related', target: 't-99' },
+        ],
+        options,
+      )
+      eq(
+        draft.map((c) => `${c.label}|${c.target}|${linkTargetText(c)}|${linkTargetStatus(c)}`),
+        [
+          'Blocked by|t-2|The loader|doing',
+          'Subtask of|t-4|The child|todo',
+          'Related to|t-99|Not on the board|',
+        ],
+        'a draft link says what it will MEAN before the task exists — the target’s state and ' +
+          'title, not an id to go and look up — and a target that left the board between the ' +
+          'pick and the render is marked exactly as the card marks one',
+      )
+      eq(
+        draft.every((c) => c.direction === 'out'),
+        true,
+        'every draft chip is outgoing: there is no other end yet to read one from',
+      )
+      eq(draftLinkChips([], options).length, 0, 'no picks, no rows')
+    }
 
     const targets = linkableTargets('t-1', board)
     ok(

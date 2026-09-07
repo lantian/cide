@@ -299,3 +299,63 @@ export function ActionButton({ label, onClick, disabled }: ActionButtonProps) {
     </button>
   )
 }
+
+/**
+ * A stacked label + input + hint that commits on blur, Enter or Escape.
+ *
+ * Promoted out of `ClaudeCliSection` in M45 — this was its third caller, and this file's header
+ * says it *is* the screen's form vocabulary. Blur-commit is not a style choice: every keystroke
+ * would otherwise be an IPC round trip, a `workspace.json` rewrite and a broadcast to every
+ * window, and for a credential field a per-keystroke write of a half-typed secret.
+ *
+ * `trim` exists for exactly one caller and is the reason this is a prop rather than a constant.
+ * Trimming is right for an id, a URL and a package name, which is why it is the default. It is
+ * **wrong for a credential**: whitespace in a key is the user's to see, and silently editing one
+ * is how a key that works in a terminal stops working in cide — the rule
+ * `cide_ipc::LlmSettings::cleaned` states on the other side of the wire, where `api_key` is the
+ * one field it will not touch.
+ */
+export function TextField({
+  label,
+  hint,
+  value,
+  placeholder,
+  trim = true,
+  onCommit,
+}: {
+  label: string
+  hint?: ReactNode
+  value: string
+  placeholder?: string
+  trim?: boolean
+  onCommit: (next: string) => void
+}) {
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = (text: string) => {
+    setDraft(null)
+    const next = trim ? text.trim() : text
+    // Guarded, so tabbing through an untouched field is not a write and a broadcast.
+    if (next !== value) onCommit(next)
+  }
+  return (
+    <label className={styles.field}>
+      <span className={styles.fieldLabel}>{label}</span>
+      <input
+        className={styles.fieldInput}
+        type="text"
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        placeholder={placeholder ?? ''}
+        value={draft ?? value}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit(e.currentTarget.value)
+          else if (e.key === 'Escape') setDraft(null)
+        }}
+      />
+      {hint !== undefined && <span className={styles.fieldHint}>{hint}</span>}
+    </label>
+  )
+}

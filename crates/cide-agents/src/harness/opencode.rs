@@ -177,9 +177,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    ADHOC_PREAMBLE, Delivery, Harness, HarnessError, HarnessSpawn, Observation, RunPlan, SERVER,
-    SessionBinding, tracker_preamble,
+    ADHOC_PREAMBLE, ContinueSpec, Delivery, FailoverReason, Harness, HarnessError, HarnessSpawn,
+    Observation, RunPlan, SERVER, SessionBinding, tracker_preamble,
 };
+use cide_ipc::HarnessSession;
+
+use super::RenderState;
+use super::render::{
+    BOLD, CYAN, DIM, REASONING_BUDGET, RED, RESET, TITLE_BUDGET, absorbs, clip, compact_input,
+    compose, one_line_of, prose, thousands,
+};
+
+// Named from here since M42 — `SpawnSpec::fixed_size`'s reason is in `render.rs` now, and
+// the path stays so nothing that learned it moves.
+pub use super::render::{RUN_COLS, RUN_ROWS};
 
 /// The document's own contract, so a person reading a dumped configuration can look it up.
 const SCHEMA: &str = "https://opencode.ai/config.json";
@@ -219,6 +230,43 @@ impl Harness for OpencodeHarness {
     /// the child that answered the last one has already exited.
     fn deliver(&self, _text: &str) -> Delivery {
         Delivery::Respawn
+    }
+
+    /// The opencode **TUI** on the conversation: `opencode --session <ses_…>`, in the run's
+    /// directory. (M42)
+    ///
+    /// Not `run`. A run is `opencode run --format json`, one turn per process, rendered by
+    /// [`render_event`] into the digest a pane shows while a turn is in flight — and that digest
+    /// is exactly what the person who opened a finished run did *not* want to read. The TUI is
+    /// the harness as its author ships it: the whole conversation, opencode's own rendering, a
+    /// prompt to continue it. Measured on 1.18.27: `opencode [project]` takes `-s, --session
+    /// <id>` ("session id to continue"), and the project directory is the cwd `session_spawn`
+    /// starts it in.
+    ///
+    /// No `--agent`, no `OPENCODE_CONFIG_CONTENT`. The role's inline agent definition needs a
+    /// [`RunPlan`] to build ([`config_json`]), and the pane has none; naming the agent without
+    /// the document would make the CLI warn once and fall back to its default anyway. So the
+    /// person continues under opencode's own configuration — recorded as a limitation in the
+    /// journal rather than papered over with a config the run did not carry.
+    fn continue_spec(&self, conversation: &HarnessSession) -> Result<ContinueSpec, HarnessError> {
+        if conversation.harness != cide_ipc::Harness::Opencode {
+            return Err(HarnessError::WrongHarness {
+                plan: conversation.harness,
+                harness: cide_ipc::Harness::Opencode,
+            });
+        }
+        let id = conversation.id.trim();
+        if id.is_empty() {
+            return Err(HarnessError::NotAConversation {
+                harness: cide_ipc::Harness::Opencode,
+                id: conversation.id.clone(),
+            });
+        }
+        Ok(ContinueSpec {
+            program: crate::defs::harness_binary(cide_ipc::Harness::Opencode).to_string(),
+            args: vec!["--session".into(), id.to_string()],
+            resume: None,
+        })
     }
 
     /// The whole state machine for this harness, because the output stream is the whole channel.
@@ -306,26 +354,557 @@ impl Harness for OpencodeHarness {
             }
         }
     }
+
+    fn diagnose(&self, line: &str) -> Option<FailoverReason> {
+        failover(line)
+    }
+
+    /// `opencode models`, run for real.
+    ///
+    /// A probe and not a table, because the answer is a property of *this machine*: the list is
+    /// whatever providers the user has configured and authenticated, and on the box this was
+    /// written on it holds `lmstudio/…` and `unsloth/…` entries no compiled-in list could have
+    /// guessed. A menu of ids cide invented would be wrong in both directions at once — offering
+    /// models the user cannot reach, and omitting every one they can.
+    ///
+    /// The spelling matters and is the reason this exists: opencode wants `provider/model`, and
+    /// the form's box was placeholdered `sonnet` for Claude. Nobody types
+    /// `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` from memory, so before this the field was
+    /// unfillable in practice and every opencode role ran the provider default.
+    fn models(
+        &self,
+        cwd: Option<&std::path::Path>,
+        llm: &cide_ipc::LlmSettings,
+    ) -> Result<Vec<String>, String> {
+        let binary =
+            cide_core::toolchain::which(crate::defs::harness_binary(cide_ipc::Harness::Opencode))
+                // The *same* search `defs::installed` uses, and the same sentence when it misses: a role
+                // this build would grey as uninstalled must not also grow a second, differently worded
+                // complaint about the same absence.
+                .ok_or_else(|| {
+                    crate::defs::installed(cide_ipc::Harness::Opencode)
+                        .unwrap_or_else(|| "`opencode` could not be found".to_string())
+                })?;
+
+        let mut command = std::process::Command::new(&binary);
+        command.arg("models");
+        // Colour would put escape sequences inside the ids themselves, which would then be
+        // written into a role file and handed to `--model`. `cide_spec::cli::run` sets it for
+        // the same reason one layer over.
+        command.env("NO_COLOR", "1");
+        // The same document a run gets, so the menu describes the runs that can happen. Without
+        // it the probe sees only what the user configured by hand, and cide's own providers are
+        // invisible in the very dialog where they are chosen.
+        if let Some(document) = provider_config_content(llm) {
+            command.env("OPENCODE_CONFIG_CONTENT", document);
+        }
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+
+        // `run_filter_with` and not `Command::output`: it is the workspace's spawn chokepoint,
+        // and `prepare_command` and `arm` are applied *inside* it. `blame`'s call site had one
+        // and not the other for two milestones, which is the miss a chokepoint makes
+        // unrepresentable. The extra `PATH` entry is the binary's own directory, for
+        // `prepare_command_with`'s shebang reason — opencode ships as a compiled binary today,
+        // but a version-manager shim in front of it would not.
+        let bin_dir: Vec<std::path::PathBuf> = binary
+            .parent()
+            .map(|d| vec![d.to_path_buf()])
+            .unwrap_or_default();
+        let filtered =
+            cide_core::child_env::run_filter_with(command, None, MODELS_DEADLINE, &bin_dir)
+                .map_err(|error| describe(&error))?;
+
+        if !filtered.ok {
+            // The first non-empty line of stderr, which is where a CLI puts the sentence worth
+            // showing. The rest is a stack trace nobody reading a settings dialog can act on.
+            let detail = filtered
+                .stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty());
+            return Err(match detail {
+                Some(line) => format!("`opencode models` failed: {line}"),
+                None => "`opencode models` failed and said nothing".to_string(),
+            });
+        }
+
+        Ok(model_ids(&String::from_utf8_lossy(&filtered.stdout)))
+    }
 }
 
-/// The states no output line may move, which are [`Harness::observe`]'s two documented refusals.
+/// The `provider` member cide contributes to an opencode configuration. (M45)
 ///
-/// * **`Paused`** — the child is `SIGSTOP`ped. A line that was already in the coalescer when the
-///   signal landed must not thaw the row; only a resume clears a freeze cide asserted.
-/// * **`Finished` / `Failed`** — terminal. The last few lines of a dying child's output are read
-///   after its exit has been reaped, so without this a finished run goes back to `Running` and
-///   stays there for ever.
+/// # One producer, two callers, and that is the entire point of this function existing
 ///
-/// `Idle` is emphatically not one of them — a rule that now outlives its only producer: since
-/// the 06202dd6 fix no line maps to `Idle`, so this harness's runs never hold it. It stays
-/// un-absorbed anyway, because the rule is about recovery, not production: if a run ever *is*
-/// `Idle` (a hand-set state in a test, a variant a future slice produces), a line from its child
-/// must still be able to move it back to `Running` rather than freeze it there.
-fn absorbs(current: &RunState) -> bool {
-    matches!(
-        current,
-        RunState::Paused { .. } | RunState::Finished { .. } | RunState::Failed { .. }
-    )
+/// [`config_json`] puts it in the **run's** document; [`OpencodeHarness::models`] puts it in the
+/// **probe's**. Two documents built independently would drift, and the drift's shape is nasty and
+/// specific: a Model menu listing ids no run can use, or a run reaching a provider the menu never
+/// offered. `cide_git::push`'s preview states the rule — the preview must describe the push that
+/// happens — and `a_probe_and_a_run_carry_the_same_provider_block` keeps it true here.
+///
+/// # No `plugin` key, ever
+///
+/// opencode installs a listed plugin from npm: `~/.config/opencode/package.json` is
+/// opencode-managed and carries `@opencode-ai/plugin` with a populated `node_modules` beside it.
+/// A `plugin` array cide wrote would therefore turn pressing Dispatch into a package fetch —
+/// stalling a run's first turn, and failing outright on a machine with no network. cide does not
+/// install third-party packages as a side effect of starting a subagent. A plugin-backed provider
+/// is [`cide_ipc::LlmProvider::External`]: cide explains it and checks whether it worked, the way
+/// `cide_spec::discover` treats the `openspec` CLI, and writes nothing.
+///
+/// # Blank is omitted, never written
+///
+/// The document is deep-merged **over** the user's own `opencode.json`, key by key, with cide's
+/// last — measured. So a key cide writes wins outright: an `options.apiKey` of `""` for a provider
+/// the user also declares would blank their working key, silently, in a file cide never touched.
+/// Every field below is emitted only when it says something, which is also why a `Catalog`
+/// provider with no key emits **no block at all** rather than an empty one.
+///
+/// # Only the keys the schema declares
+///
+/// `$defs.ProviderConfig` is `additionalProperties: false` over `api, name, env, id, npm,
+/// whitelist, blacklist, options, models`. A key outside it does not degrade — it can invalidate
+/// the document, and the module header records what a rejected document costs: the run silently
+/// becomes opencode's default agent. Hence a hand-transcribed map rather than a
+/// `serde_json::to_value` of cide's own type, whose field names would follow a Rust rename
+/// straight into an invalid document.
+fn provider_members(llm: &cide_ipc::LlmSettings) -> serde_json::Map<String, Value> {
+    let mut providers = serde_json::Map::new();
+
+    for provider in &llm.providers {
+        if !provider.enabled() || provider.id().is_empty() {
+            continue;
+        }
+        // Exhaustive on purpose: a fourth kind must be a compile error here rather than a
+        // provider that silently emits nothing. See `cide_ipc::LlmProvider`'s header.
+        let described = match provider {
+            // The catalog supplies npm, baseURL and every model; cide supplies the credential —
+            // and, when it has none, nothing at all. A blank key is the *ordinary* state for a
+            // user whose shell already exports `OPENROUTER_API_KEY`, since a child inherits this
+            // process's environment wholesale.
+            cide_ipc::LlmProvider::Catalog { api_key, .. } if api_key.is_empty() => continue,
+            cide_ipc::LlmProvider::Catalog { api_key, .. } => {
+                json!({ "options": { "apiKey": api_key } })
+            }
+
+            cide_ipc::LlmProvider::Custom {
+                label,
+                npm,
+                base_url,
+                api_key,
+                models,
+                ..
+            } => {
+                let mut entry = serde_json::Map::new();
+                if !label.is_empty() {
+                    entry.insert("name".into(), json!(label));
+                }
+                if !npm.is_empty() {
+                    entry.insert("npm".into(), json!(npm));
+                }
+                let mut options = serde_json::Map::new();
+                // opencode's own capitalisation, applied here and nowhere else. cide's wire spells
+                // the field `baseUrl`; the schema declares `baseURL` under
+                // `additionalProperties: false`, so the two must not be confused.
+                if !base_url.is_empty() {
+                    options.insert("baseURL".into(), json!(base_url));
+                }
+                if !api_key.is_empty() {
+                    options.insert("apiKey".into(), json!(api_key));
+                }
+                if !options.is_empty() {
+                    entry.insert("options".into(), Value::Object(options));
+                }
+                let mut declared = serde_json::Map::new();
+                for model in models {
+                    if model.id.is_empty() {
+                        continue;
+                    }
+                    let mut described = serde_json::Map::new();
+                    if !model.label.is_empty() {
+                        described.insert("name".into(), json!(model.label));
+                    }
+                    // `limit` is **all or nothing**, and that is measured rather than assumed:
+                    // opencode 1.18.29 refuses a document carrying `limit.context` without
+                    // `limit.output` — "Configuration is invalid at OPENCODE_CONFIG_CONTENT ↳
+                    // Missing key provider.ollama.models.qwen3:8b.limit.output" — and the module
+                    // header records what a refused document costs, which is the run silently
+                    // becoming opencode's *default agent*. So a half-filled pair writes no
+                    // `limit` at all rather than an invalid one.
+                    //
+                    // Omitting the block entirely is fine: the same probe with no `limit` lists
+                    // the model. A `0` on either side means "the user gave no number", and
+                    // guessing the other half would be cide inventing a context window that
+                    // decides when opencode compacts.
+                    if model.context > 0 && model.output > 0 {
+                        described.insert(
+                            "limit".into(),
+                            json!({ "context": model.context, "output": model.output }),
+                        );
+                    }
+                    declared.insert(model.id.clone(), Value::Object(described));
+                }
+                if !declared.is_empty() {
+                    entry.insert("models".into(), Value::Object(declared));
+                }
+                Value::Object(entry)
+            }
+
+            // Nothing: not a block, not a plugin line, not a credential. See the header — and note
+            // this arm is why `LlmProvider` is an enum, so the promise is a `match` the compiler
+            // checks rather than a habit somebody has to remember.
+            cide_ipc::LlmProvider::External { .. } => continue,
+        };
+        providers.insert(provider.id().to_string(), described);
+    }
+
+    let mut out = serde_json::Map::new();
+    if !providers.is_empty() {
+        out.insert("provider".into(), Value::Object(providers));
+    }
+    out
+}
+
+/// Those members as a whole document, for a caller with no [`RunPlan`] — the model probe.
+///
+/// `None` when cide has nothing to say, which is the ordinary state of an installation that has
+/// never opened the Models screen: the probe then runs exactly as it did before this existed.
+fn provider_config_content(llm: &cide_ipc::LlmSettings) -> Option<String> {
+    let members = provider_members(llm);
+    if members.is_empty() {
+        return None;
+    }
+    let mut doc = serde_json::Map::new();
+    doc.insert("$schema".into(), json!(SCHEMA));
+    doc.extend(members);
+    serde_json::to_string(&Value::Object(doc)).ok()
+}
+
+/// Whether this line is opencode reporting a **provider** failure, and which kind. (M45)
+///
+/// # Structural, not textual, and that is the finding this function exists to record
+///
+/// The first design read the provider's prose out of `data.message`. It was wrong, and the
+/// measurement that corrected it is worth keeping. opencode's `APIError` carries `statusCode` —
+/// 429, 401, 403 — and `isRetryable`, **its own verdict**, on every instance (`@opencode-ai/sdk`'s
+/// `ApiError`, and probed against 1.18.29). So the status code answers the rate-limit and auth
+/// questions outright, and `isRetryable` answers the unreachable one for the case that carries no
+/// status code at all: a dead local endpoint, probed as
+/// `{"name":"APIError","data":{"message":"Cannot connect to API: …","isRetryable":true,
+/// "metadata":{"url":"http://127.0.0.1:1234/v1/chat/completions"}}}`.
+///
+/// # The negative is the specification, exactly as it is for `cide_core::jsonlog`
+///
+/// A bogus model id — a **typo**, which no other candidate will fix — was probed as
+/// `{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for
+/// details.","ref":"err_c19594b9"}}`, with no `isRetryable` and no status code. It must answer
+/// `None`. A classifier that failed over on it would burn every candidate in the pool, one turn
+/// each, and report the last one's failure as the run's cause of death. `UnknownError` is
+/// therefore refused **by name**, and so is every 4xx that is not one of the three below: a 404 or
+/// a 422 is a statement about the *request*, not about the endpoint's availability.
+///
+/// # The two errors that are about the turn and not the provider
+///
+/// `MessageOutputLengthError` is a context overflow and `MessageAbortedError` is somebody stopping
+/// the turn — cide's own wind-down among them. Neither is a candidate's fault and neither is fixed
+/// by trying another one; both are refused by name, explicitly rather than by falling off the end,
+/// so the refusal is a decision a reader can find.
+///
+/// # Parsed defensively, and never into a closed struct
+///
+/// The wire object carries fields the published SDK type does not declare — `metadata` was on the
+/// probed `APIError` and is in no version of `ApiError` — so this reads through `serde_json::Value`
+/// and **must never** grow `deny_unknown_fields`. A release that adds a field must widen nothing
+/// here; one that adds an error *name* falls through to `None`, which is the safe direction.
+pub fn failover(line: &str) -> Option<FailoverReason> {
+    let line = line.trim();
+    // Cheap first: this runs on the coalescer thread, the thread every byte of every session
+    // flows through, so the overwhelmingly common line must cost a substring test and not a parse.
+    if !line.starts_with('{') || !line.contains("\"type\":\"error\"") {
+        return None;
+    }
+    let event: Value = serde_json::from_str(line).ok()?;
+    // Only a top-level `error` event. A `tool_use` whose `state.status` is `error` is a *tool*
+    // failing — a rejected permission, a command that returned non-zero — and `render_event`
+    // already shows it in red. Failing a run's model over one would swap the model because a
+    // `bash` call was refused.
+    if event.get("type").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let error = event.get("error")?;
+    let name = error
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let null = Value::Null;
+    let data = error.get("data").unwrap_or(&null);
+
+    match name {
+        // opencode's own, and unambiguous: the provider rejected the credentials.
+        "ProviderAuthError" => Some(FailoverReason::Auth),
+        "APIError" => match data.get("statusCode").and_then(Value::as_u64) {
+            Some(429) => Some(FailoverReason::RateLimited),
+            // 402 is a guess and is here on purpose: a provider answering "payment required" is
+            // out of quota in every sense a pool cares about. If no provider turns out to use it,
+            // deleting this arm costs nothing.
+            Some(402) => Some(FailoverReason::RateLimited),
+            Some(401 | 403) => Some(FailoverReason::Auth),
+            // Every other explicit 4xx is a statement about the *request* — a model id that does
+            // not exist, a body the endpoint would not take — and no other candidate repairs it.
+            // Refused ahead of `isRetryable`, deliberately: the status code is the more specific
+            // fact and must win.
+            Some(400..=499) => None,
+            // A 5xx, or no code at all. `isRetryable` is opencode's own verdict and is the primary
+            // signal here — the probed connect-refused case carries it with no code.
+            _ => data
+                .get("isRetryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                .then_some(FailoverReason::Unreachable),
+        },
+        // Named rather than defaulted — see the header. A typo, a context overflow and an abort
+        // are each refused because they are each unfixable by another candidate.
+        "UnknownError" | "MessageOutputLengthError" | "MessageAbortedError" => None,
+        // A name this build has never met. `None` is the safe direction: the run ends as it always
+        // did, and its error is in the pane and in `run-logs/<run>.log`.
+        _ => None,
+    }
+}
+
+/// How long a [`test_model`] turn is given before it is killed.
+///
+/// Generously longer than [`MODELS_DEADLINE`], because this one waits on a *model*: a cold local
+/// llama-server loading weights, or a hosted provider queueing behind a rate limit, is slow in a
+/// way listing ids never is. Short enough that a wedged endpoint does not hold the dialog open
+/// for ever.
+const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The smallest prompt that still proves the round trip happened.
+///
+/// A real turn and not a handshake, because that is what the button claims. Listing a model id
+/// proves only that opencode *resolved* it — a wrong key, an endpoint that accepts connections
+/// and refuses completions, a model the provider has retired, and a plugin whose OAuth expired
+/// all list perfectly and fail on the first token.
+const TEST_PROMPT: &str = "Reply with the single word: ok";
+
+/// Whether this provider/model actually answers, run for real. (M45)
+///
+/// Costs one very small turn of the user's own quota, which is the honest price of the claim the
+/// button makes; the caller says so before spending it. `Ok(detail)` is a working model with one
+/// line worth showing, `Err(sentence)` is a whole sentence for the person looking at the dialog.
+///
+/// The provider document is the **same** one [`config_json`] gives a run, through the same
+/// [`provider_members`] — so a model that passes here is a model a run can use, and a failure here
+/// is a failure a run would have had. Testing against an independently built document would be a
+/// button that reports on a configuration nothing else uses.
+pub fn test_model(
+    cwd: Option<&std::path::Path>,
+    llm: &cide_ipc::LlmSettings,
+    model: &str,
+) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("Name a model first — there is nothing to test.".to_string());
+    }
+
+    let binary =
+        cide_core::toolchain::which(crate::defs::harness_binary(cide_ipc::Harness::Opencode))
+            .ok_or_else(|| {
+                crate::defs::installed(cide_ipc::Harness::Opencode)
+                    .unwrap_or_else(|| "`opencode` could not be found".to_string())
+            })?;
+
+    let mut command = std::process::Command::new(&binary);
+    command.arg("run");
+    command.arg("--model");
+    command.arg(model);
+    command.arg("--format");
+    command.arg("json");
+    // Last, and after every flag, for `child`'s stated reason: the message is positional and a
+    // parser reads a leading `-` as a flag.
+    command.arg(TEST_PROMPT);
+    command.env("NO_COLOR", "1");
+    if let Some(document) = provider_config_content(llm) {
+        command.env("OPENCODE_CONFIG_CONTENT", document);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+
+    let bin_dir: Vec<std::path::PathBuf> = binary
+        .parent()
+        .map(|d| vec![d.to_path_buf()])
+        .unwrap_or_default();
+    let filtered = cide_core::child_env::run_filter_with(command, None, TEST_DEADLINE, &bin_dir)
+        .map_err(|error| describe_test(&error))?;
+
+    let stdout = String::from_utf8_lossy(&filtered.stdout);
+    verdict(&stdout, filtered.ok, &filtered.stderr)
+}
+
+/// Read a finished `opencode run --format json` stream as a pass or a sentence.
+///
+/// Split out from [`test_model`] so the interesting half is a pure function a test can drive over
+/// captured output — `plan_respawn`'s "the half that happens under the lock is the half a test can
+/// drive", applied to a child instead of a lock.
+///
+/// **An `error` event outranks the exit status.** Measured on 1.18.29: a provider failure prints
+/// one `{"type":"error",…}` line and exits 1, but a turn that opencode retried internally can also
+/// carry an error line and still finish — so the *last* error seen is only fatal when nothing
+/// afterwards proved the model answered. Reading the exit code alone would call the first case a
+/// success on any CLI that exits 0 after recovering, and reading the first error alone would call
+/// the second a failure.
+fn verdict(stdout: &str, ok: bool, stderr: &str) -> Result<String, String> {
+    let mut answered = false;
+    let mut error: Option<String> = None;
+    for line in stdout.lines() {
+        let Some(event) = Event::parse(line) else {
+            continue;
+        };
+        match event.kind.as_str() {
+            // The model produced something. `step_finish` alone is not enough: a turn that died
+            // mid-step still finishes its step.
+            "text" | "tool_use" | "reasoning" => answered = true,
+            "error" => {
+                error = Some(error_sentence(line));
+                answered = false;
+            }
+            _ => {}
+        }
+    }
+
+    if answered {
+        return Ok("The model answered.".to_string());
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    if ok {
+        // Exit 0 and not one usable event. Rare, and worth its own sentence rather than a
+        // cheerful one: something ran and said nothing, which is not a working model.
+        return Err("opencode exited cleanly but the model produced nothing.".to_string());
+    }
+    let detail = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    Err(match detail {
+        Some(line) => format!("opencode failed: {line}"),
+        None => "opencode failed and said nothing.".to_string(),
+    })
+}
+
+/// The sentence inside one `{"type":"error",…}` line.
+///
+/// Parsed defensively through `Value` and never into a closed struct: the live object carries
+/// fields the published SDK type does not declare (`metadata` was on a probed `APIError`), and a
+/// release that adds one must not turn this into "an unreadable error".
+fn error_sentence(line: &str) -> String {
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return "opencode reported an error it did not describe.".to_string();
+    };
+    let error = event.get("error").unwrap_or(&Value::Null);
+    let name = error.get("name").and_then(Value::as_str).unwrap_or("error");
+    let message = error
+        .get("data")
+        .and_then(|data| data.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match message.is_empty() {
+        true => format!("{name}."),
+        false => format!("{name}: {message}"),
+    }
+}
+
+/// One sentence for a [`cide_core::child_env::FilterError`] from [`test_model`].
+///
+/// Its own wording rather than [`describe`]'s, because that one names `opencode models` in every
+/// arm and this is a different command with a different remedy — a timeout here means the *model*
+/// did not answer, not that a provider is unreachable.
+fn describe_test(error: &cide_core::child_env::FilterError) -> String {
+    use cide_core::child_env::FilterError;
+    match error {
+        FilterError::Spawn(io) => format!("`opencode run` could not be started: {io}"),
+        FilterError::Timeout => format!(
+            "The model did not answer within {}s and the attempt was stopped. A local endpoint \
+             may still be loading its weights.",
+            TEST_DEADLINE.as_secs()
+        ),
+        FilterError::Unreadable => {
+            "`opencode run` ran and its output could not be read".to_string()
+        }
+        FilterError::Wait(io) => format!("`opencode run` ran and could not be reaped: {io}"),
+    }
+}
+
+/// One sentence for a [`cide_core::child_env::FilterError`].
+///
+/// The error is tagged and not prose deliberately — its own doc says every caller phrases its
+/// own sentence — and this one is read in a settings dialog by somebody choosing a model, so it
+/// names the command rather than the machinery.
+fn describe(error: &cide_core::child_env::FilterError) -> String {
+    use cide_core::child_env::FilterError;
+    match error {
+        FilterError::Spawn(io) => format!("`opencode models` could not be started: {io}"),
+        FilterError::Timeout => {
+            "`opencode models` did not answer in time and was stopped. A configured provider may              be unreachable — the model can still be typed in below."
+                .to_string()
+        }
+        FilterError::Unreadable => "`opencode models` ran and its output could not be read".to_string(),
+        FilterError::Wait(io) => format!("`opencode models` ran and could not be reaped: {io}"),
+    }
+}
+
+/// How long `opencode models` is given before it is killed.
+///
+/// Measured at well under a second, and generous by an order of magnitude on purpose: the list
+/// is read from configured providers, one of which may be a local server that is not running.
+/// The cost of the ceiling being high is a spinner in a dialog — this never runs on the IPC
+/// thread — and the cost of it being low is a correct list thrown away on a slow machine.
+const MODELS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `provider/model` ids in `opencode models` output, in order, without repeats.
+///
+/// # Why this filters rather than trusting the lines
+///
+/// `opencode --help` prints a five-line ASCII banner above its output. `models` does not today,
+/// and the whole point of a probe is that "today" is not a guarantee: a release that grew one
+/// would put `█▀▀█ █▀▀█ …` in the dropdown as a *selectable model*, which is then written into a
+/// role file and handed to `--model`, and the failure surfaces three processes down as a
+/// provider error about a model nobody typed. The same filter absorbs a deprecation warning, a
+/// blank separator line and a trailing newline.
+///
+/// A `/` is required because that is opencode's whole spelling — an id without one is not a
+/// model, it is prose.
+fn model_ids(stdout: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_model_id(line))
+        // Order is the CLI's, which groups by provider. Sorting would scatter a provider's
+        // models through the menu and put whichever id happens to start with `a` on the row a
+        // person picks without reading.
+        .filter(|line| seen.insert(line.to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `provider/model`: two non-empty segments, the first a plain identifier.
+///
+/// The second half is deliberately permissive — `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` and
+/// `lmstudio/openai/gpt-oss-20b` are both real ids on the machine this was written on, so it
+/// carries colons and further slashes. What it may not carry is whitespace, which is what rules
+/// out every line of prose.
+fn is_model_id(line: &str) -> bool {
+    let Some((provider, rest)) = line.split_once('/') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !rest.is_empty()
+        && provider
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+        && !rest.chars().any(char::is_whitespace)
 }
 
 /// One event line, in the two fields anything here reads.
@@ -381,58 +960,64 @@ fn capture(line: &str) -> Option<String> {
 // Rendering the event stream for a person.
 // ==========================================================================================
 
-/// How much of a tool's output the pane shows before eliding. Characters, then lines.
-const OUTPUT_CHAR_BUDGET: usize = 700;
-const OUTPUT_LINE_BUDGET: usize = 6;
-
-/// How much of a reasoning fragment survives — it is texture, not record.
-const REASONING_BUDGET: usize = 240;
-
-const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
-const CYAN: &str = "\x1b[36m";
-const RED: &str = "\x1b[31m";
-const RESET: &str = "\x1b[0m";
+/// Whether a person may later ask for this line's whole event — [`SessionBinding::Harness`]'s
+/// `keep`. A tool call (its input and its whole output), the model's own words, and an error
+/// are worth a ring slot; a step marker or a reasoning fragment is not.
+pub fn keep_event(line: &str) -> bool {
+    Event::parse(line)
+        .is_some_and(|event| matches!(event.kind.as_str(), "tool_use" | "text" | "error"))
+}
 
 /// One event line, as a person should read it — [`SessionBinding::Harness`]'s `render`.
 ///
 /// The stream this rewrites is `--format json`, which is the *channel* (see the module header)
 /// and which used to reach the pane raw: opening a working run showed ndjson, one event per
 /// line, with a whole file read arriving as a single JSON document. Reported, verbatim:
-/// *"it opens strange console with json output that isn't understandable"*. The events carry
-/// everything a readable transcript needs — tool, input, output, the model's words, tokens —
-/// so this renders them and drops nothing a person acts on:
+/// *"it opens strange console with json output that isn't understandable"*. The first rendering
+/// answered that with a clipped output block under every tool call, and the second report was
+/// the other half of the same problem — *"hard to understand what it is doing right now"*, a
+/// pane full of six-line previews with no sign of which line was the present. So (M42):
 ///
-/// * a tool call is `● name title`, its output clipped to a budget (the full text is one
-///   `cide_task_get`/transcript away; the pane is a progress view, not an archive);
-/// * a rejected or failed call is red, with the error verbatim — that line *is* the answer to
-///   "why did this run die";
-/// * the model's own text passes whole, reasoning passes dimmed and clipped;
-/// * `step_start` draws nothing, `step_finish` is one dim token count;
+/// * a tool call is **one line** — `● name  title  duration #handle` — and its input and whole
+///   output are behind the handle, which the pane turns into a click that opens them in a card.
+///   A rejected or failed call is red, with the error verbatim on the next line: that line *is*
+///   the answer to "why did this run die", and it stays on screen;
+/// * **a live marker** — `▸ working…` — sits under the last line from a `step_start` to its
+///   `step_finish`, and every line rendered in between erases it and draws it again below
+///   itself. The last row of the pane therefore answers the question the report asked: a marker
+///   means the model is thinking or a tool is running, no marker means the turn is over;
+/// * the model's own text passes whole, reasoning passes dimmed and clipped, `step_finish` is one
+///   dim token count;
 /// * an event type this build has never heard of becomes a dim one-word marker rather than a
 ///   screenful of JSON, and **a line that is not JSON is kept verbatim** — that is the CLI's own
-///   prose (a warning, a rejected permission) and hiding it would hide the failure.
+///   prose (a warning, a rejected permission) and hiding it would hide the failure. Under a live
+///   marker it is re-emitted beneath the erase instead, so the marker's row accounting holds.
 ///
 /// Styling is bare SGR (dim/bold/cyan/red), which every theme already maps; no colour is load-
-/// bearing.
-pub fn render_event(line: &str) -> Rendered {
-    let Ok(Value::Object(event)) = serde_json::from_str::<Value>(line) else {
-        return Rendered::Keep;
+/// bearing. The handle token is plain text on purpose: an OSC 8 hyperlink is dropped by the
+/// mirror's replay, and a run is mostly read *after* the fact.
+pub fn render_event(state: &mut RenderState, line: &str, handle: Option<u64>) -> Rendered {
+    let Ok(Value::Object(event)) = serde_json::from_str::<Value>(line.trim()) else {
+        return prose(state, line);
     };
     let Some(kind) = event.get("type").and_then(Value::as_str) else {
-        return Rendered::Keep;
+        return prose(state, line);
     };
     let part = event.get("part").unwrap_or(&Value::Null);
 
-    match kind {
-        "step_start" => Rendered::Drop,
+    let text = match kind {
+        "step_start" => {
+            state.in_step = true;
+            None
+        }
         "step_finish" => {
+            state.in_step = false;
             let reason = part.get("reason").and_then(Value::as_str).unwrap_or("done");
             let total = part
                 .pointer("/tokens/total")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            Rendered::Replace(format!("{DIM}· {reason} · {} tok{RESET}", thousands(total)))
+            Some(format!("{DIM}· {reason} · {} tok{RESET}", thousands(total)))
         }
         "text" => {
             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
@@ -440,7 +1025,7 @@ pub fn render_event(line: &str) -> Rendered {
             if text.is_empty() {
                 return Rendered::Drop;
             }
-            Rendered::Replace(format!("{BOLD}{text}{RESET}"))
+            Some(text.to_string())
         }
         "reasoning" => {
             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
@@ -448,27 +1033,56 @@ pub fn render_event(line: &str) -> Rendered {
             if text.is_empty() {
                 return Rendered::Drop;
             }
-            Rendered::Replace(format!("{DIM}∴ {}{RESET}", clip(&text, REASONING_BUDGET)))
+            Some(format!("{DIM}∴ {}{RESET}", clip(&text, REASONING_BUDGET)))
         }
-        "tool_use" => Rendered::Replace(render_tool(part)),
-        "error" => Rendered::Replace(format!("{RED}✗ {}{RESET}", one_line_of(&part.to_string()))),
-        other => Rendered::Replace(format!("{DIM}· {other}{RESET}")),
-    }
+        "tool_use" => Some(render_tool(part, handle)),
+        // The shape the CLI actually prints for a failure is top-level — `{"type":"error",
+        // "error":{"name":"ProviderAuthError"}}` — with no `part` at all; the older reading
+        // of `part` here rendered every one of them as `✗ null`.
+        "error" => {
+            let error = event.get("error").unwrap_or(part);
+            let error = match error {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            Some(format!("{RED}✗ {}{RESET}", one_line_of(&error)))
+        }
+        other => Some(format!("{DIM}· {other}{RESET}")),
+    };
+    compose(state, text)
 }
 
-/// A tool call: what ran, on what, and a clipped view of what came back.
-fn render_tool(part: &Value) -> String {
-    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+/// A tool call on one line: the glyph, the tool, the CLI's own title, the duration, the handle.
+fn render_tool(part: &Value, handle: Option<u64>) -> String {
+    let tool = display_tool(part.get("tool").and_then(Value::as_str).unwrap_or("tool"));
     let state = part.get("state").unwrap_or(&Value::Null);
     let status = state.get("status").and_then(Value::as_str).unwrap_or("");
-
-    // The CLI's own `title` when it wrote one (for `bash` it is the command), else the input
-    // document, compact — never the output, which gets its own budgeted block below.
-    let title = match state.get("title").and_then(Value::as_str) {
-        Some(title) if !title.trim().is_empty() => title.to_string(),
-        _ => state.get("input").map(compact_input).unwrap_or_default(),
+    let input = state.get("input").unwrap_or(&Value::Null);
+    let title = match state
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        Some(title) => title.to_string(),
+        None => compact_input(input),
     };
-    let title = clip(&one_line_of(&title), 160);
+    let title = clip(&one_line_of(&title), TITLE_BUDGET);
+
+    // The dim tail: how long it took, and the handle a click resolves. The handle is last and
+    // spelled `#<n>` because `ui/src/terminal/runLinks.ts` reads it off the end of the line.
+    let mut tail: Vec<String> = Vec::new();
+    if let Some(ms) = duration_ms(state) {
+        tail.push(duration(ms));
+    }
+    if let Some(handle) = handle {
+        tail.push(format!("#{handle}"));
+    }
+    let tail = if tail.is_empty() {
+        String::new()
+    } else {
+        format!("  {DIM}{}{RESET}", tail.join(" "))
+    };
 
     if status == "error" {
         let error = state
@@ -476,76 +1090,48 @@ fn render_tool(part: &Value) -> String {
             .and_then(Value::as_str)
             .unwrap_or("failed");
         return format!(
-            "{RED}✗ {tool}{RESET} {title}\n{RED}  {}{RESET}",
+            "{RED}✗ {tool}{RESET}  {title}{tail}\n{RED}  {}{RESET}",
             one_line_of(error)
         );
     }
-
-    let mut out = format!("{CYAN}● {tool}{RESET} {title}");
-    if let Some(output) = state.get("output").and_then(Value::as_str) {
-        let preview = clip_block(output);
-        if !preview.is_empty() {
-            out.push_str(&format!("\n{DIM}{preview}{RESET}"));
-        }
-    }
-    out
+    // A shell command that returned non-zero is not an `error` to opencode, but it is the one
+    // fact about a `bash` call a reader wants without opening it.
+    let exit = state
+        .pointer("/metadata/exit")
+        .and_then(Value::as_i64)
+        .filter(|code| *code != 0)
+        .map(|code| format!("  {RED}exit {code}{RESET}"))
+        .unwrap_or_default();
+    format!("{CYAN}{BOLD}● {tool}{RESET}  {title}{exit}{tail}")
 }
 
-/// The input document with its top-level values flattened — `{"command":"ls"}` reads `ls`.
-fn compact_input(input: &Value) -> String {
-    match input {
-        Value::Object(map) => map
-            .values()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
-        other => other.to_string(),
+/// `cide_cide_task_get` reads as `cide_task_get`: opencode joins the server name and the tool
+/// name with an underscore (see [`OpencodeHarness::tool_name`]), and cide's server is called
+/// `cide`, so every tracker tool arrives doubled. The tool's own name is what a person knows.
+fn display_tool(tool: &str) -> String {
+    match tool.strip_prefix("cide_cide_") {
+        Some(rest) => format!("cide_{rest}"),
+        None => tool.to_string(),
     }
 }
 
-/// At most [`OUTPUT_LINE_BUDGET`] lines and [`OUTPUT_CHAR_BUDGET`] characters, indented, with
-/// an elision that says how much it hid.
-fn clip_block(text: &str) -> String {
-    let text = text.trim_end();
-    if text.is_empty() {
-        return String::new();
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut spent = 0;
-    for (n, line) in lines.iter().enumerate() {
-        if n >= OUTPUT_LINE_BUDGET || spent >= OUTPUT_CHAR_BUDGET {
-            out.push(format!("  … (+{} more lines)", lines.len() - n));
-            break;
-        }
-        let clipped = clip(line, OUTPUT_CHAR_BUDGET - spent);
-        spent += clipped.chars().count();
-        out.push(format!("  {clipped}"));
-    }
-    out.join("\n")
+/// `state.time.end - state.time.start`, in milliseconds, when the CLI recorded both.
+fn duration_ms(state: &Value) -> Option<u64> {
+    let start = state.pointer("/time/start").and_then(Value::as_u64)?;
+    let end = state.pointer("/time/end").and_then(Value::as_u64)?;
+    Some(end.saturating_sub(start))
 }
 
-/// `chars`, not bytes: a byte slice of UTF-8 panics on a boundary, and this crate is linked
-/// into a process built with `panic = "abort"`.
-fn clip(text: &str, budget: usize) -> String {
-    if text.chars().count() <= budget {
-        return text.to_string();
+/// `8ms`, `1.2s`, `2m05s` — three shapes, because a build and a `read` are three orders of
+/// magnitude apart and one format reads badly at one end or the other.
+fn duration(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1_000)
     }
-    let kept: String = text.chars().take(budget).collect();
-    format!("{}…", kept.trim_end())
-}
-
-/// Whitespace runs collapsed to one space — a reasoning fragment arrives with its own layout.
-fn one_line_of(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// `10454` reads `10.5k`; small counts stay exact.
-fn thousands(n: u64) -> String {
-    if n < 1_000 {
-        return n.to_string();
-    }
-    format!("{:.1}k", n as f64 / 1_000.0)
 }
 
 /// The child, fresh (`resume: None`) or continuing a conversation the harness already minted.
@@ -553,9 +1139,11 @@ fn thousands(n: u64) -> String {
 /// One function for both, so the two children differ in exactly the tokens the difference is
 /// about and cannot drift in the environment, the cwd or the configuration.
 fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, HarnessError> {
-    if plan.agent.def.harness != cide_ipc::Harness::Opencode {
+    // `plan.harness`, the *resolved* one, not the definition's: a role a local override moved onto
+    // this CLI must not be refused by it. See `RunPlan::harness`.
+    if plan.harness != cide_ipc::Harness::Opencode {
         return Err(HarnessError::WrongHarness {
-            plan: plan.agent.def.harness,
+            plan: plan.harness,
             harness: cide_ipc::Harness::Opencode,
         });
     }
@@ -584,15 +1172,36 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
     // Each of these only when the definition carried it. The CLI's defaults are the safe end of
     // both ranges, and a value invented here is a behaviour the role's author never wrote and
     // cannot find in their file.
-    if let Some(model) = &plan.agent.def.model {
+    // The pool's candidate outranks the definition's `model:` — for this run only, and only while
+    // the run is on that candidate. The role's file is untouched and goes on saying what its
+    // author wrote, which is what keeps "why is my agent doing that" answerable from a file.
+    let model = plan
+        .choice
+        .as_ref()
+        .map(|choice| choice.entry.model_flag())
+        .or_else(|| plan.agent.def.model.clone());
+    if let Some(model) = model {
         args.push("--model".into());
-        args.push(model.clone());
+        args.push(model);
     }
-    // Carried verbatim and unvalidated, for `LoadedAgent::effort`'s stated reason: the set is
-    // per-harness and per-release, and a bad value is the CLI's refusal to make, loudly.
-    if let Some(effort) = &plan.agent.effort {
+    // Same precedence one flag down, and it is load-bearing rather than tidy: each model declares
+    // its own variant set (`gpt-5.2` offers none/low/medium/high/xhigh, `gpt-5.1-codex-mini` only
+    // medium/high), so a role-level `effort` carried onto the candidate a rate limit fell over to
+    // would be refused outright by the CLI — turning a recoverable failure into a hard one at the
+    // worst possible moment. An entry that names a variant is naming *this* candidate's; the
+    // role's `effort` stands for every entry that names none.
+    //
+    // Carried verbatim and unvalidated either way, for `LoadedAgent::effort`'s stated reason: the
+    // set is per-harness and per-release, and a bad value is the CLI's refusal to make, loudly.
+    let variant = plan
+        .choice
+        .as_ref()
+        .map(|choice| choice.entry.variant.clone())
+        .filter(|variant| !variant.is_empty())
+        .or_else(|| plan.agent.effort.clone());
+    if let Some(variant) = variant {
         args.push("--variant".into());
-        args.push(effort.clone());
+        args.push(variant);
     }
 
     // The project's default for unattended children (`agents.skipPermissions`, on unless
@@ -629,12 +1238,17 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
     // written after it would be read as another word of the message.
     args.push(plan.prompt.clone());
 
-    let mut spec = SpawnSpec::new(program, plan.cwd.clone()).geometry(PtyGeometry::new(
-        plan.geometry.cols,
-        plan.geometry.rows,
-        plan.geometry.cell_width,
-        plan.geometry.cell_height,
-    ));
+    // Not `plan.geometry`, and never resized afterwards — see `RUN_COLS`. The plan's geometry
+    // is the default a headless run gets, and for a child that prints lines the pane's later
+    // measurement is exactly the resize that would damage the mirror.
+    let mut spec = SpawnSpec::new(program, plan.cwd.clone())
+        .geometry(PtyGeometry::new(
+            RUN_COLS,
+            RUN_ROWS,
+            plan.geometry.cell_width,
+            plan.geometry.cell_height,
+        ))
+        .fixed_size();
     for arg in args {
         spec = spec.arg(arg);
     }
@@ -662,8 +1276,11 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
         opening: None,
         binding: SessionBinding::Harness {
             capture,
+            keep: keep_event,
             render: render_event,
         },
+        // The stream *is* this harness's stdout; nothing is written beside it.
+        events: None,
     })
 }
 
@@ -761,7 +1378,14 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
     // Also on the command line as `--model`, which is what *this run* uses. Here as well so the
     // registered agent is self-consistent — `opencode agent list` and any other opencode process
     // that reads this definition see the model the role names rather than a provider default.
-    if let Some(model) = &def.model {
+    // The **pool's** candidate here too, or `opencode agent list` and every other process that
+    // reads this document describe an agent on a model this run is not using.
+    if let Some(model) = plan
+        .choice
+        .as_ref()
+        .map(|choice| choice.entry.model_flag())
+        .or_else(|| def.model.clone())
+    {
         role.insert("model".into(), json!(model));
     }
 
@@ -771,6 +1395,9 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
     let mut config = serde_json::Map::new();
     config.insert("$schema".into(), json!(SCHEMA));
     config.insert("agent".into(), Value::Object(agents));
+    // The user's providers, from global settings. Merged into this document rather than built
+    // beside it, so a run and the model probe cannot disagree — see `provider_members`.
+    config.extend(provider_members(&plan.llm));
 
     if let Some(hook) = &plan.hook_bin {
         let mut servers = serde_json::Map::new();
@@ -793,6 +1420,7 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::render::{ERASE_MARKER, MARKER};
 
     /// The tracker paragraph as *this* harness renders it — `cide_cide_task_get`, not
     /// `mcp__cide__cide_task_get`. Derived from the one definition, never quoted.
@@ -860,10 +1488,16 @@ mod tests {
             hook_bin: Some(PathBuf::from("/opt/cide/cide-hook")),
             hook_sock: Some(PathBuf::from("/run/user/1000/cide-hooks-42.sock")),
             agent_sock: Some(PathBuf::from("/run/user/1000/cide-agents-42.sock")),
+            events_path: None,
             theme: Theme::Dark,
             proxy: cide_core::proxy::ProxyEnv::default(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
+            // Empty in the fixture, so every existing assertion is about the document as it was
+            // before providers existed. The provider tests build their own.
+            llm: cide_ipc::LlmSettings::default(),
+            choice: None,
+            harness: agent.def.harness,
             // Off in the fixture, so every argv assertion below is about what the role
             // and the plan actually said; the skip default has tests of its own.
             skip_permissions: false,
@@ -900,81 +1534,178 @@ mod tests {
 
     /// The pane's rendering of the event stream, over the shapes a real run printed — including
     /// the two that motivated it: a whole-file `read` arriving as one JSON line, and a rejected
-    /// permission, which is the line that answers "why did this run die".
+    /// permission, which is the line that answers "why did this run die". (M42: one line per
+    /// tool call, the live marker between a step's start and its finish, the handle a click
+    /// resolves.)
     #[test]
     fn the_rendering_reads_as_a_transcript_and_hides_no_failure() {
-        // The channel's own noise draws nothing or one dim marker.
-        assert_eq!(render_event(STEP_START), Rendered::Drop);
-        let finish = render_event(STEP_FINISH)
+        let mut state = RenderState::default();
+
+        // A step starting draws the live marker and nothing else; the step finishing erases it
+        // and leaves one dim token count, with no marker under it.
+        let started = render_event(&mut state, STEP_START, None)
+            .text()
+            .expect("the marker")
+            .to_string();
+        assert!(started.contains("working"), "{started:?}");
+        assert!(state.in_step && state.marker);
+        let finish = render_event(&mut state, STEP_FINISH, None)
             .text()
             .expect("rendered")
             .to_string();
         assert!(
+            finish.starts_with(ERASE_MARKER),
+            "the marker row is erased before the next line: {finish:?}"
+        );
+        assert!(
             finish.contains("stop") && finish.contains("5.7k tok"),
             "{finish}"
         );
+        assert!(!finish.contains("working") && !state.marker && !state.in_step);
 
-        // A tool call: name, the CLI's own title, and a clipped output block.
+        // A tool call is one line: the tool, the CLI's own title, the duration, the handle —
+        // and none of its output, which is what the handle is for.
         let big_output = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8";
         let tool = format!(
-            r#"{{"type":"tool_use","sessionID":"s","part":{{"type":"tool","tool":"bash","state":{{"status":"completed","input":{{"command":"ls -la"}},"output":{},"title":"ls -la"}}}}}}"#,
+            r#"{{"type":"tool_use","sessionID":"s","part":{{"type":"tool","tool":"bash","state":{{"status":"completed","input":{{"command":"ls -la"}},"output":{},"title":"ls -la","time":{{"start":1000,"end":2200}}}}}}}}"#,
             serde_json::to_string(big_output).unwrap()
         );
-        let rendered = render_event(&tool).text().expect("rendered").to_string();
+        let rendered = render_event(&mut state, &tool, Some(7))
+            .text()
+            .expect("rendered")
+            .to_string();
         assert!(
-            rendered.contains("● bash") && rendered.contains("ls -la"),
+            rendered.contains("● bash") && rendered.contains("ls -la") && rendered.contains("1.2s"),
             "{rendered}"
         );
-        assert!(rendered.contains("line6"), "{rendered}");
         assert!(
-            !rendered.contains("line7") && rendered.contains("+2 more lines"),
-            "the clip must say what it hid: {rendered}"
+            rendered.ends_with(&format!("#7{RESET}")),
+            "the handle is the last thing on the line, for `runLinks.ts`: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\n') && !rendered.contains("line1"),
+            "a completed call is one line; its output is behind the handle: {rendered:?}"
         );
         assert!(
             !rendered.contains(r#""status""#),
             "JSON structure leaked into the display: {rendered}"
         );
 
+        // Inside a step, every rendered line erases the marker and draws it again below itself.
+        render_event(&mut state, STEP_START, None);
+        let within = render_event(&mut state, &tool, Some(8))
+            .text()
+            .expect("rendered")
+            .to_string();
+        assert!(
+            within.starts_with(ERASE_MARKER) && within.ends_with(MARKER),
+            "{within:?}"
+        );
+        assert!(state.marker);
+        // The CLI's own prose under a marker goes beneath the erase too, so the row accounting
+        // holds; with no marker on screen it is kept exactly as it arrived.
+        let prose = render_event(&mut state, "! permission requested: bash (*)", None)
+            .text()
+            .expect("re-emitted under the marker")
+            .to_string();
+        assert!(
+            prose.starts_with(ERASE_MARKER)
+                && prose.contains("permission requested")
+                && prose.ends_with(MARKER),
+            "{prose:?}"
+        );
+        render_event(&mut state, STEP_FINISH, None);
+        assert_eq!(
+            render_event(&mut state, "! permission requested: bash (*)", None),
+            Rendered::Keep,
+            "the CLI's own prose is kept as it arrived — rendering it back as itself would \
+             re-terminate it and lose the bytes the child actually wrote"
+        );
+
         // The rejected permission — the failure that used to be findable only in opencode's own
-        // database — is red and verbatim.
+        // database — is red and verbatim, on the line under the call.
         let rejected = r#"{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"bash","state":{"status":"error","input":{"command":"cat ~/.cargo/config.toml"},"error":"The user rejected permission to use this specific tool call."}}}"#;
-        let rendered = render_event(rejected).text().expect("rendered").to_string();
+        let rendered = render_event(&mut state, rejected, Some(9))
+            .text()
+            .expect("rendered")
+            .to_string();
         assert!(
             rendered.contains("✗ bash") && rendered.contains("rejected permission"),
+            "{rendered}"
+        );
+        let first = rendered.lines().next().expect("the call line");
+        assert!(first.ends_with(&format!("#9{RESET}")), "{first:?}");
+
+        // A shell command that returned non-zero says so on its line; a tracker tool reads under
+        // its own name rather than the doubled server prefix.
+        let failed = r#"{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"false"},"output":"","title":"false","metadata":{"exit":1}}}}"#;
+        let rendered = render_event(&mut state, failed, None)
+            .text()
+            .expect("rendered")
+            .to_string();
+        assert!(rendered.contains("exit 1"), "{rendered}");
+        let tracker = r#"{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"cide_cide_task_get","state":{"status":"completed","input":{"id":"t-14"},"output":"…","title":""}}}"#;
+        let rendered = render_event(&mut state, tracker, None)
+            .text()
+            .expect("rendered")
+            .to_string();
+        assert!(
+            rendered.contains("● cide_task_get")
+                && !rendered.contains("cide_cide")
+                && rendered.contains("t-14"),
             "{rendered}"
         );
 
         // The model's words pass whole; reasoning passes dimmed and clipped.
         let text = r#"{"type":"text","sessionID":"s","part":{"type":"text","text":"The task is already in doing.\n\nChecking the build."}}"#;
-        let rendered = render_event(text).text().expect("rendered").to_string();
+        let rendered = render_event(&mut state, text, None)
+            .text()
+            .expect("rendered")
+            .to_string();
         assert!(rendered.contains("Checking the build."), "{rendered}");
         let reasoning = format!(
             r#"{{"type":"reasoning","sessionID":"s","part":{{"type":"reasoning","text":{}}}}}"#,
             serde_json::to_string(&"x".repeat(500)).unwrap()
         );
-        let rendered = render_event(&reasoning)
+        let rendered = render_event(&mut state, &reasoning, None)
             .text()
             .expect("rendered")
             .to_string();
         assert!(rendered.contains('…') && rendered.len() < 400, "{rendered}");
 
-        // A CLI prose line — a warning, a rejection notice — passes verbatim: hiding it would
-        // hide the failure. An event type this build has never met becomes a dim marker, not a
-        // screenful of JSON.
-        assert_eq!(
-            render_event("! permission requested: bash (*)"),
-            Rendered::Keep,
-            "the CLI's own prose is kept as it arrived — rendering it back as itself would \
-             re-terminate it and lose the bytes the child actually wrote"
-        );
-        let unknown = render_event(r#"{"type":"session_share","sessionID":"s"}"#)
+        // A failure the CLI reports at the top level — no `part` at all — names itself.
+        let error = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"ProviderAuthError"}}"#;
+        let rendered = render_event(&mut state, error, None)
             .text()
-            .expect("marker")
+            .expect("rendered")
             .to_string();
+        assert!(
+            rendered.contains("ProviderAuthError") && !rendered.contains("null"),
+            "{rendered}"
+        );
+
+        // An event type this build has never met becomes a dim marker, not a screenful of JSON.
+        let unknown = render_event(
+            &mut state,
+            r#"{"type":"session_share","sessionID":"s"}"#,
+            None,
+        )
+        .text()
+        .expect("marker")
+        .to_string();
         assert!(
             unknown.contains("session_share") && !unknown.contains("sessionID"),
             "{unknown}"
         );
+
+        // What a person may ask for whole, and what nobody will.
+        assert!(keep_event(&tool) && keep_event(text) && keep_event(error));
+        assert!(!keep_event(STEP_START) && !keep_event("! permission requested: bash (*)"));
+
+        // Three orders of magnitude, three shapes.
+        assert_eq!(duration(8), "8ms");
+        assert_eq!(duration(1_234), "1.2s");
+        assert_eq!(duration(125_000), "2m05s");
     }
 
     /// `--auto` rides the project default (`agents.skipPermissions`) — and the message stays the
@@ -1405,6 +2136,91 @@ mod tests {
     /// ```sh
     /// cargo test -p cide-agents opencode -- --ignored
     /// ```
+    /* == the model list ======================================================================= */
+
+    #[test]
+    fn the_model_filter_keeps_ids_and_drops_everything_else() {
+        // The banner `opencode --help` prints today. `models` does not, and the whole point of a
+        // probe is that "today" is not a guarantee: without this filter a release that grew one
+        // would offer `█▀▀█ █▀▀█ …` as a selectable model, which is then written into a role file
+        // and handed to `--model`.
+        let stdout = "\
+█▀▀█ █▀▀█ █▀▀█ █▀▀▄
+opencode/big-pickle
+lmstudio/openai/gpt-oss-20b
+
+warning: a provider was skipped
+unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
+notamodel
+";
+        assert_eq!(
+            model_ids(stdout),
+            vec![
+                "opencode/big-pickle".to_string(),
+                // A second slash and a colon are both real: these two ids are measured off a
+                // working install, and a stricter pattern would silently drop them.
+                "lmstudio/openai/gpt-oss-20b".to_string(),
+                "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M".to_string(),
+            ],
+            "ids survive; a banner, a blank, a warning sentence and a bare word do not"
+        );
+    }
+
+    #[test]
+    fn the_model_list_keeps_the_clis_order_and_drops_repeats() {
+        // Order is the CLI's, which groups by provider. Sorting would scatter a provider's models
+        // through the menu and put whichever id starts with `a` on the row a person picks without
+        // reading.
+        let stdout = "zed/one\nanthropic/two\nzed/one\nzed/three\n";
+        assert_eq!(
+            model_ids(stdout),
+            vec![
+                "zed/one".to_string(),
+                "anthropic/two".to_string(),
+                "zed/three".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_with_whitespace_after_the_slash_is_prose_and_not_a_model() {
+        // The rule that does the work: opencode's ids never contain a space, and every sentence a
+        // CLI prints does.
+        assert!(!is_model_id("see https://opencode.ai/docs for the list"));
+        assert!(!is_model_id("Models: anthropic/claude"));
+        assert!(!is_model_id("/leading"));
+        assert!(!is_model_id("trailing/"));
+        assert!(is_model_id("anthropic/claude-sonnet-4-5"));
+    }
+
+    /// The list is real, and it is this machine's.
+    ///
+    /// `#[ignore]`d for the same reason as the test below: it needs the binary on `PATH`. It
+    /// needs nothing else — `models` reads configuration and never reaches a model, so it costs
+    /// no quota — which makes it the cheapest check that the flag is still spelled `models` and
+    /// still prints one `provider/model` per line.
+    ///
+    /// ```sh
+    /// cargo test -p cide-agents opencode -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs the real opencode binary on PATH"]
+    fn the_real_opencode_lists_models() {
+        let listed = OpencodeHarness
+            .models(None, &cide_ipc::LlmSettings::default())
+            .expect("`opencode models` should answer on a machine with the binary");
+        assert!(
+            !listed.is_empty(),
+            "a configured opencode lists at least one model"
+        );
+        for id in &listed {
+            assert!(
+                is_model_id(id),
+                "every line that survived the filter is an id: {id}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "needs the real opencode binary on PATH"]
     fn the_real_opencode_registers_the_inline_role() {
@@ -1424,5 +2240,576 @@ mod tests {
             listed.contains("developer (primary)"),
             "the inline role is not registered:\n{listed}"
         );
+    }
+
+    /// The real harness on a finished run's conversation is the **TUI** on `--session`, not
+    /// another `run`; and an id the run never reported is refused. (M42)
+    #[test]
+    fn continuing_a_conversation_opens_the_tui_on_its_session() {
+        use cide_ipc::{Harness, HarnessSession};
+
+        let spec = OpencodeHarness
+            .continue_spec(&HarnessSession {
+                harness: Harness::Opencode,
+                id: "ses_0a1b2c".into(),
+                cwd: std::path::PathBuf::from("/p/.cide/worktrees/qa-t-2"),
+            })
+            .expect("a captured id can be continued");
+        assert_eq!(spec.program, "opencode");
+        assert_eq!(
+            spec.args,
+            vec!["--session".to_string(), "ses_0a1b2c".to_string()]
+        );
+        assert!(
+            !spec.args.iter().any(|a| a == "run"),
+            "the TUI, not a headless turn: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.resume.is_none(),
+            "an opencode id is not a cide session"
+        );
+
+        let refused = OpencodeHarness
+            .continue_spec(&HarnessSession {
+                harness: Harness::Opencode,
+                id: "   ".into(),
+                cwd: std::path::PathBuf::from("/p"),
+            })
+            .expect_err("nothing to continue");
+        assert!(
+            matches!(refused, HarnessError::NotAConversation { .. }),
+            "{refused}"
+        );
+
+        let wrong = OpencodeHarness
+            .continue_spec(&HarnessSession {
+                harness: Harness::Claude,
+                id: cide_ipc::SessionId::new().to_string(),
+                cwd: std::path::PathBuf::from("/p"),
+            })
+            .expect_err("wrong harness");
+        assert!(
+            matches!(wrong, HarnessError::WrongHarness { .. }),
+            "{wrong}"
+        );
+    }
+    // ==========================================================================================
+    // The provider document (M45).
+    // ==========================================================================================
+
+    /// A settings value exercising all three provider kinds at once.
+    fn providers() -> cide_ipc::LlmSettings {
+        cide_ipc::LlmSettings {
+            providers: vec![
+                cide_ipc::LlmProvider::Catalog {
+                    id: "openrouter".into(),
+                    label: "OpenRouter".into(),
+                    enabled: true,
+                    api_key: "sk-or-test".into(),
+                },
+                // No key: the ordinary state for somebody whose shell already exports one.
+                cide_ipc::LlmProvider::Catalog {
+                    id: "deepseek".into(),
+                    label: String::new(),
+                    enabled: true,
+                    api_key: String::new(),
+                },
+                cide_ipc::LlmProvider::Custom {
+                    id: "ollama".into(),
+                    label: "Ollama".into(),
+                    enabled: true,
+                    npm: "@ai-sdk/openai-compatible".into(),
+                    base_url: "http://127.0.0.1:11434/v1".into(),
+                    api_key: String::new(),
+                    models: vec![
+                        cide_ipc::LlmModel {
+                            id: "qwen3:8b".into(),
+                            label: "Qwen3 8B".into(),
+                            context: 32768,
+                            output: 4096,
+                        },
+                        // Half a pair, which must write no `limit` at all — see the emission.
+                        cide_ipc::LlmModel {
+                            id: "qwen3:32b".into(),
+                            label: String::new(),
+                            context: 32768,
+                            output: 0,
+                        },
+                    ],
+                },
+                cide_ipc::LlmProvider::External {
+                    id: "openai".into(),
+                    label: "ChatGPT".into(),
+                    setup: "add opencode-openai-codex-auth to your plugin array".into(),
+                    expect: vec!["openai/gpt-5.2".into()],
+                },
+                cide_ipc::LlmProvider::Catalog {
+                    id: "groq".into(),
+                    label: String::new(),
+                    enabled: false,
+                    api_key: "sk-groq-test".into(),
+                },
+            ],
+            pools: Vec::new(),
+        }
+    }
+
+    /// The rule `cide_git::push::preview` states, in a new place: the menu must describe the runs
+    /// that can happen. Two documents built independently would drift into a Model list naming ids
+    /// no run can use, or a run reaching a provider the menu never offered.
+    #[test]
+    fn a_probe_and_a_run_carry_the_same_provider_block() {
+        let llm = providers();
+        let agent = role();
+        let mut plan = plan_for(&agent);
+        plan.llm = llm.clone();
+
+        let run = config_of(&spawn(&plan).spec);
+        let probe: Value =
+            serde_json::from_str(&provider_config_content(&llm).expect("something to say"))
+                .expect("valid JSON");
+
+        assert_eq!(run["provider"], probe["provider"]);
+        assert!(run["provider"].is_object(), "{run}");
+    }
+
+    /// Blank is a key cide omits, never a value cide writes. The document is deep-merged *over*
+    /// the user's own configuration with cide's last, so an `apiKey: ""` would blank a working key
+    /// in a file cide never touched.
+    #[test]
+    fn a_catalog_provider_with_no_key_writes_no_block_at_all() {
+        let members = provider_members(&providers());
+        let block = &members["provider"];
+        assert_eq!(
+            block["openrouter"]["options"]["apiKey"],
+            json!("sk-or-test")
+        );
+        assert!(
+            block.get("deepseek").is_none(),
+            "a catalogued provider with no key must contribute nothing, not an empty object: {block}"
+        );
+    }
+
+    /// A disabled provider is not written, and an external one is never written at all — no
+    /// block, no plugin line, no credential.
+    #[test]
+    fn a_disabled_or_external_provider_writes_nothing() {
+        let members = provider_members(&providers());
+        let block = &members["provider"];
+        assert!(block.get("groq").is_none(), "disabled: {block}");
+        assert!(block.get("openai").is_none(), "external: {block}");
+    }
+
+    /// Listing a plugin makes opencode install it from npm, which would turn pressing Dispatch
+    /// into a package fetch. cide writes the key nowhere, ever.
+    #[test]
+    fn no_document_ever_carries_a_plugin_key() {
+        let mut llm = providers();
+        // Even with nothing but the plugin-backed provider configured.
+        llm.providers
+            .retain(|p| matches!(p, cide_ipc::LlmProvider::External { .. }));
+        assert!(
+            provider_members(&llm).is_empty(),
+            "an external-only settings says nothing"
+        );
+
+        let document = provider_config_content(&providers()).expect("something to say");
+        assert!(!document.contains("plugin"), "{document}");
+    }
+
+    /// A custom endpoint's models are what make `--model ollama/qwen3:8b` resolve, and a `0` limit
+    /// is a claim about a context window rather than a number to write.
+    #[test]
+    fn a_custom_endpoint_declares_its_models_and_pairs_its_limits() {
+        let members = provider_members(&providers());
+        let ollama = &members["provider"]["ollama"];
+        assert_eq!(ollama["npm"], json!("@ai-sdk/openai-compatible"));
+        // opencode's own capitalisation, which its schema declares under
+        // `additionalProperties: false` — `baseUrl` is not a typo that degrades.
+        assert_eq!(
+            ollama["options"]["baseURL"],
+            json!("http://127.0.0.1:11434/v1")
+        );
+        assert!(
+            ollama["options"].get("apiKey").is_none(),
+            "blank key omitted: {ollama}"
+        );
+        let model = &ollama["models"]["qwen3:8b"];
+        assert_eq!(model["name"], json!("Qwen3 8B"));
+        assert_eq!(model["limit"], json!({ "context": 32768, "output": 4096 }));
+
+        // The measured rule: opencode refuses a `limit` carrying one key and not the other, and a
+        // refused document makes the run silently opencode's *default agent*. Half a pair writes
+        // no `limit` at all — which the same probe confirms is accepted.
+        let half = &ollama["models"]["qwen3:32b"];
+        assert!(
+            half.get("limit").is_none(),
+            "half a limit pair writes none: {half}"
+        );
+        assert!(
+            half.get("name").is_none(),
+            "and a blank label writes no name either: {half}"
+        );
+    }
+
+    /// `$defs.ProviderConfig` is `additionalProperties: false`, and the module header records what
+    /// a rejected document costs: the run silently becomes opencode's *default agent*.
+    #[test]
+    fn the_document_carries_only_keys_the_schema_declares() {
+        const DECLARED: &[&str] = &[
+            "api",
+            "name",
+            "env",
+            "id",
+            "npm",
+            "whitelist",
+            "blacklist",
+            "options",
+            "models",
+        ];
+        let members = provider_members(&providers());
+        for (id, entry) in members["provider"].as_object().expect("a map") {
+            for key in entry.as_object().expect("a provider object").keys() {
+                assert!(
+                    DECLARED.contains(&key.as_str()),
+                    "`{id}` carries `{key}`, which the schema does not declare"
+                );
+            }
+        }
+    }
+
+    /// A role whose *file* says claude, redirected onto opencode by a local override, must be
+    /// spawnable by this harness — the guard reads the resolved harness, not the definition.
+    ///
+    /// Without this the override layer would be inert in the most useful direction: the whole
+    /// point is running a committed claude role on opencode here, and the definition's own
+    /// `harness:` would have refused it.
+    #[test]
+    fn a_role_redirected_onto_this_harness_is_not_refused_by_it() {
+        let mut agent = role();
+        agent.def.harness = cide_ipc::Harness::Claude;
+        let mut plan = plan_for(&agent);
+        plan.harness = cide_ipc::Harness::Opencode;
+        let spawn = OpencodeHarness
+            .spawn_spec(&plan)
+            .expect("a role redirected onto opencode spawns on opencode");
+        assert_eq!(spawn.spec.program, "opencode");
+    }
+
+    /// And the guard still fires for a plan genuinely routed to the wrong implementation.
+    #[test]
+    fn a_plan_for_another_harness_is_still_refused() {
+        let mut agent = role();
+        agent.def.harness = cide_ipc::Harness::Opencode;
+        let mut plan = plan_for(&agent);
+        plan.harness = cide_ipc::Harness::Claude;
+        assert!(
+            matches!(
+                OpencodeHarness.spawn_spec(&plan),
+                Err(HarnessError::WrongHarness { .. })
+            ),
+            "the resolved harness is what decides, in both directions"
+        );
+    }
+
+    /// The pool's candidate must reach **both** sites — the argv and the registered agent — or
+    /// `opencode agent list` describes an agent on a model this run is not using.
+    #[test]
+    fn a_pool_candidate_outranks_the_definition_at_both_sites() {
+        let mut agent = role();
+        agent.def.model = Some("role/model".into());
+        let mut plan = plan_for(&agent);
+        plan.choice = Some(cide_ipc::PoolChoice {
+            pool: "cheap-first".into(),
+            index: 0,
+            entry: cide_ipc::PoolEntry {
+                provider: "openrouter".into(),
+                model: "deepseek/deepseek-chat".into(),
+                variant: String::new(),
+            },
+        });
+        let spawn = spawn(&plan);
+        assert_eq!(
+            value_of(&spawn.spec.args, "--model"),
+            "openrouter/deepseek/deepseek-chat"
+        );
+        assert_eq!(
+            config_of(&spawn.spec)["agent"]["developer"]["model"],
+            json!("openrouter/deepseek/deepseek-chat"),
+            "the registered agent must name the same model the argv does"
+        );
+    }
+
+    /// An entry's variant wins over the role's `effort`; an entry naming none leaves it standing.
+    /// This is what stops a role-level `xhigh` being carried onto a candidate whose model does not
+    /// offer it, turning a recoverable rate limit into a hard refusal.
+    #[test]
+    fn an_entrys_variant_beats_the_roles_effort_and_a_blank_one_does_not() {
+        let mut agent = role();
+        agent.effort = Some("role-effort".into());
+        let mut plan = plan_for(&agent);
+        let mut entry = cide_ipc::PoolEntry {
+            provider: "openai".into(),
+            model: "gpt-5.1-codex-mini".into(),
+            variant: "medium".into(),
+        };
+        plan.choice = Some(cide_ipc::PoolChoice {
+            pool: "p".into(),
+            index: 0,
+            entry: entry.clone(),
+        });
+        assert_eq!(value_of(&spawn(&plan).spec.args, "--variant"), "medium");
+
+        entry.variant = String::new();
+        plan.choice = Some(cide_ipc::PoolChoice {
+            pool: "p".into(),
+            index: 0,
+            entry,
+        });
+        assert_eq!(
+            value_of(&spawn(&plan).spec.args, "--variant"),
+            "role-effort",
+            "an entry that says nothing about the variant leaves the role's effort alone"
+        );
+    }
+
+    /// No pool is exactly the behaviour that shipped before pools existed.
+    #[test]
+    fn no_candidate_is_the_definitions_own_model() {
+        let mut agent = role();
+        agent.def.model = Some("role/model".into());
+        let plan = plan_for(&agent);
+        assert!(plan.choice.is_none());
+        assert_eq!(value_of(&spawn(&plan).spec.args, "--model"), "role/model");
+    }
+
+    /// The guard that lets `LlmSettings::cleaned` keep an incomplete row: a half-typed provider
+    /// is stored, so the user can go on typing into it, and refused **here**, where the value is
+    /// used. Dropping it at the storage end is what made every Add button on the Models screen
+    /// inert.
+    #[test]
+    fn a_half_typed_row_is_stored_but_never_emitted() {
+        let llm = cide_ipc::LlmSettings {
+            providers: vec![
+                // What "Add a known provider" produces, before a single keystroke.
+                cide_ipc::LlmProvider::default(),
+                cide_ipc::LlmProvider::Custom {
+                    id: "ollama".into(),
+                    label: String::new(),
+                    enabled: true,
+                    npm: String::new(),
+                    base_url: "http://127.0.0.1:11434/v1".into(),
+                    api_key: String::new(),
+                    // And what "Add model" produces.
+                    models: vec![cide_ipc::LlmModel::default()],
+                },
+            ],
+            pools: Vec::new(),
+        };
+        let members = provider_members(&llm);
+        let block = &members["provider"];
+        assert_eq!(
+            block.as_object().expect("a map").len(),
+            1,
+            "the id-less provider contributes nothing: {block}"
+        );
+        assert!(
+            block["ollama"].get("models").is_none(),
+            "and neither does its id-less model: {block}"
+        );
+    }
+
+    // ==========================================================================================
+    // The failover classifier (M45). The negative corpus is the specification.
+    // ==========================================================================================
+
+    /// Probed verbatim from opencode 1.18.29 with LM Studio deliberately not running. Captured,
+    /// not composed — `opencode.rs`'s fixture rule, and it matters doubly here because the shape
+    /// of a field cide branches on is the thing a release can change.
+    const DEAD_ENDPOINT: &str = r#"{"type":"error","timestamp":1788774068053,"sessionID":"ses_f84c2c937ffeZqPyMKYHabMixA","error":{"name":"APIError","data":{"message":"Cannot connect to API: Unable to connect. Is the computer able to access the url?","isRetryable":true,"metadata":{"url":"http://127.0.0.1:1234/v1/chat/completions"}}}}"#;
+
+    /// Probed verbatim: a model id that does not exist. Generic prose, no `isRetryable`, no
+    /// status code — and a **typo**, which no other candidate in the pool will fix.
+    const BOGUS_MODEL: &str = r#"{"type":"error","timestamp":1788773991554,"sessionID":"ses_f84c2cb0ffeCG22QWVObxw4b4","error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details.","ref":"err_c19594b9"}}}"#;
+
+    #[test]
+    fn a_dead_endpoint_is_unreachable_on_opencodes_own_verdict() {
+        // No status code at all: `isRetryable` is the only signal, which is why it is read.
+        assert_eq!(failover(DEAD_ENDPOINT), Some(FailoverReason::Unreachable));
+    }
+
+    #[test]
+    fn a_status_code_answers_outright() {
+        let with = |code: u64| {
+            format!(
+                r#"{{"type":"error","error":{{"name":"APIError","data":{{"message":"m","statusCode":{code},"isRetryable":false}}}}}}"#
+            )
+        };
+        assert_eq!(failover(&with(429)), Some(FailoverReason::RateLimited));
+        assert_eq!(failover(&with(402)), Some(FailoverReason::RateLimited));
+        assert_eq!(failover(&with(401)), Some(FailoverReason::Auth));
+        assert_eq!(failover(&with(403)), Some(FailoverReason::Auth));
+        // A 5xx with no retryable flag still reads as unreachable only if the CLI says so.
+        assert_eq!(failover(&with(503)), None);
+    }
+
+    #[test]
+    fn opencodes_own_auth_error_is_auth() {
+        let line = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"ProviderAuthError","data":{"providerID":"openrouter","message":"bad key"}}}"#;
+        assert_eq!(failover(line), Some(FailoverReason::Auth));
+    }
+
+    /// **The specification.** A typo must fail loudly once, not burn every candidate in the pool
+    /// one turn at a time and report the last one's error as the cause of death.
+    #[test]
+    fn a_typod_model_id_never_fails_over() {
+        assert_eq!(failover(BOGUS_MODEL), None);
+    }
+
+    /// The status code is the more specific fact and must beat `isRetryable`. A 404 is a statement
+    /// about the request; no other candidate repairs it.
+    #[test]
+    fn an_explicit_four_hundred_beats_a_retryable_flag() {
+        let line = r#"{"type":"error","error":{"name":"APIError","data":{"message":"m","statusCode":404,"isRetryable":true}}}"#;
+        assert_eq!(
+            failover(line),
+            None,
+            "a 404 is about the request, however retryable the CLI calls it"
+        );
+    }
+
+    /// Refused by name, so the refusal is a decision a reader can find rather than a fall-through.
+    #[test]
+    fn a_turns_own_failures_are_not_the_providers_fault() {
+        for name in [
+            "MessageOutputLengthError",
+            "MessageAbortedError",
+            "UnknownError",
+        ] {
+            let line = format!(
+                r#"{{"type":"error","error":{{"name":"{name}","data":{{"message":"m"}}}}}}"#
+            );
+            assert_eq!(failover(&line), None, "{name}");
+        }
+    }
+
+    /// A tool failing is not a provider failing. Swapping the model because a `bash` call was
+    /// refused would be a spectacular non-sequitur.
+    #[test]
+    fn a_failed_tool_call_is_not_a_provider_failure() {
+        let rejected = r#"{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"bash","state":{"status":"error","input":{"command":"ls"},"error":"The user rejected permission to use this specific tool call."}}}"#;
+        assert_eq!(failover(rejected), None);
+        for line in [STEP_START, TEXT, STEP_FINISH] {
+            assert_eq!(failover(line), None);
+        }
+    }
+
+    /// Everything that is not a line at all, and the cheap guard that keeps this off the hot path.
+    #[test]
+    fn prose_and_rubbish_say_nothing() {
+        for line in [
+            "",
+            "{",
+            "not json",
+            "! permission requested: bash (*)",
+            "{}",
+        ] {
+            assert_eq!(failover(line), None, "{line:?}");
+        }
+    }
+
+    /// A release that adds a field must widen nothing here; one that adds a *name* falls through
+    /// to `None`, which is the safe direction.
+    #[test]
+    fn an_unknown_shape_is_read_defensively() {
+        let future = r#"{"type":"error","error":{"name":"APIError","data":{"message":"m","statusCode":429,"isRetryable":true,"futureField":{"x":[1,2]}}}}"#;
+        assert_eq!(failover(future), Some(FailoverReason::RateLimited));
+        let unknown_name =
+            r#"{"type":"error","error":{"name":"SomethingNew2027","data":{"message":"m"}}}"#;
+        assert_eq!(failover(unknown_name), None);
+    }
+
+    /// The harness answers through the trait, and every other harness answers nothing.
+    #[test]
+    fn only_this_harness_diagnoses_its_own_stream() {
+        assert_eq!(
+            OpencodeHarness.diagnose(DEAD_ENDPOINT),
+            Some(FailoverReason::Unreachable)
+        );
+        for harness in crate::harness::registry() {
+            if harness.kind() != cide_ipc::Harness::Opencode {
+                assert_eq!(
+                    harness.diagnose(DEAD_ENDPOINT),
+                    None,
+                    "{:?} must not read another CLI's stream",
+                    harness.kind()
+                );
+            }
+        }
+    }
+
+    // The verdict half of `test_model`, over captured output. The child half needs a real
+    // `opencode` and a real model, which is `tests/real_opencode.rs`'s job.
+
+    #[test]
+    fn a_turn_that_produced_text_is_a_working_model() {
+        assert!(verdict(&format!("{STEP_START}\n{TEXT}\n{STEP_FINISH}"), true, "").is_ok());
+    }
+
+    #[test]
+    fn a_provider_error_is_reported_with_its_own_words() {
+        // The probed shape: a dead local endpoint, exit 1, one error line.
+        let line = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"APIError","data":{"message":"Cannot connect to API: Unable to connect.","isRetryable":true,"metadata":{"url":"http://127.0.0.1:1234/v1"}}}}"#;
+        let answer = verdict(line, false, "").expect_err("a dead endpoint is not a working model");
+        assert!(answer.contains("APIError"), "{answer}");
+        assert!(answer.contains("Cannot connect"), "{answer}");
+    }
+
+    /// An error line the *stream recovered from* must not fail the test: what matters is whether
+    /// the model ended up answering, which is why `answered` is cleared by an error and set again
+    /// by the text that follows it.
+    #[test]
+    fn an_error_the_turn_recovered_from_is_not_a_failure() {
+        let recovered = format!(
+            "{}\n{TEXT}",
+            r#"{"type":"error","timestamp":1,"error":{"name":"APIError","data":{"message":"flaky","isRetryable":true}}}"#
+        );
+        assert!(
+            verdict(&recovered, true, "").is_ok(),
+            "text after an error is still an answer"
+        );
+    }
+
+    /// Exit 0 with nothing usable is not a working model, and says so rather than passing.
+    #[test]
+    fn a_silent_success_is_not_a_pass() {
+        let answer = verdict(STEP_FINISH, true, "").expect_err("no text is no answer");
+        assert!(answer.contains("produced nothing"), "{answer}");
+    }
+
+    /// A child that died before printing JSON falls back to the first useful line of stderr.
+    #[test]
+    fn a_child_that_printed_nothing_useful_quotes_its_stderr() {
+        let answer = verdict("", false, "\n  boom: no such model\n").expect_err("a failure");
+        assert!(answer.contains("boom: no such model"), "{answer}");
+    }
+
+    /// Parsed defensively: the live error object carries fields the published type does not
+    /// declare, and a release that adds one must not turn this into "an unreadable error".
+    #[test]
+    fn an_error_carrying_unknown_fields_still_reads() {
+        let line = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"nope","ref":"err_1","futureField":{"x":1}}}}"#;
+        let answer = verdict(line, false, "").expect_err("a failure");
+        assert!(answer.contains("UnknownError: nope"), "{answer}");
+    }
+
+    /// An installation that has never opened the Models screen probes exactly as it did before
+    /// any of this existed.
+    #[test]
+    fn an_empty_settings_says_nothing_at_all() {
+        let llm = cide_ipc::LlmSettings::default();
+        assert!(provider_members(&llm).is_empty());
+        assert!(provider_config_content(&llm).is_none());
     }
 }

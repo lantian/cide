@@ -127,7 +127,7 @@ fn attaching_inside_the_flush_window_does_not_replay_the_snapshot() {
         landed += 1;
 
         let (sink, rx) = recording_sink();
-        let (_id, snapshot) = session.attach_with_snapshot(sink);
+        let (_id, snapshot) = session.attach_with_snapshot(sink, false);
 
         assert!(
             contains(&snapshot, SENTINEL),
@@ -174,7 +174,7 @@ fn a_sink_attached_with_a_snapshot_still_receives_what_comes_next() {
     let session = PtySession::spawn(spec).expect("spawn sh");
 
     let (sink, rx) = recording_sink();
-    let (_id, _snapshot) = session.attach_with_snapshot(sink);
+    let (_id, _snapshot) = session.attach_with_snapshot(sink, false);
 
     session.write(b"hello\n".to_vec());
 
@@ -208,7 +208,7 @@ fn attaching_to_a_dead_session_answers_from_the_mirror_without_waiting() {
 
     let started = Instant::now();
     let (sink, _rx) = recording_sink();
-    let (_id, snapshot) = session.attach_with_snapshot(sink);
+    let (_id, snapshot) = session.attach_with_snapshot(sink, false);
     let took = started.elapsed();
 
     assert!(

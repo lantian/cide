@@ -56,7 +56,7 @@ export function isClaudeScope(scope: Scope): boolean {
 }
 
 /** `cide_ipc::Harness`. Which CLI actually runs a role. */
-export type HarnessName = 'claude' | 'opencode'
+export type HarnessName = 'claude' | 'opencode' | 'qwen' | 'codex'
 
 /**
  * `cide_ipc::AgentField` — which box on the form a refusal belongs to.
@@ -156,7 +156,7 @@ export const SCOPES: readonly Scope[] = [
 ]
 
 /** `cide_ipc::Harness`, as a set. Pinned to the Rust enum by the check script. */
-export const HARNESSES: readonly HarnessName[] = ['claude', 'opencode']
+export const HARNESSES: readonly HarnessName[] = ['claude', 'opencode', 'qwen', 'codex']
 
 /**
  * `cide_agents::defs::PERMISSION_MODES`, in that module's order.
@@ -808,7 +808,71 @@ export function scopeHint(scope: Scope): string {
 /** What a harness segment says. Unset is a real and common state, not a missing value. */
 export function harnessLabel(harness: HarnessName | null): string {
   if (harness === null) return 'Project default'
-  return harness === 'claude' ? 'Claude' : 'opencode'
+  switch (harness) {
+    case 'claude':
+      return 'Claude'
+    case 'opencode':
+      return 'opencode'
+    case 'qwen':
+      return 'qwen'
+    case 'codex':
+      return 'Codex'
+    // A trailing `: 'opencode'` is what this used to be, and it was a mislabel waiting for the
+    // third harness: every CLI cide had not heard of would have been drawn as opencode, in a
+    // dropdown, with nothing anywhere saying so. A `never` makes the next one a compile error.
+    default: {
+      const unreachable: never = harness
+      return unreachable
+    }
+  }
+}
+
+/**
+ * Which harness's models this draft should be offered.
+ *
+ * `AgentDraft.harness` is nullable — "project default" is a real state and not a missing value,
+ * which is the whole of [`harnessLabel`]'s `null` case — so the form cannot ask for a model list
+ * with it directly. This is the resolution, and it mirrors `cide_agents::defs::load_from`'s:
+ * a Claude Code scope is Claude whatever the file says, otherwise the file, otherwise the
+ * project's `.cide/config.json` default, otherwise Claude.
+ *
+ * The claude-scope override is not a nicety. `.claude/agents/` has no `harness:` key at all, and
+ * `harness/claude.rs` suppresses `--model` entirely for a subagent because the CLI reads it out
+ * of the definition file itself — so offering that role opencode's `provider/model` ids would be
+ * offering values cide has already decided never to pass.
+ *
+ * Here rather than in the component so a check script can drive it: a rule inside a React
+ * component is a rule nothing in this project can test.
+ */
+export function effectiveHarness(draft: Draft, projectDefault: HarnessName | null): HarnessName {
+  if (isClaudeScope(draft.scope)) return 'claude'
+  return draft.harness ?? projectDefault ?? 'claude'
+}
+
+/**
+ * What the empty Model box suggests, per harness.
+ *
+ * The field was placeholdered `sonnet` for every harness, which is Claude's alias vocabulary and
+ * is not a thing opencode accepts: it wants `provider/model`. A placeholder that names a value
+ * the harness would reject is worse than an empty one, because it reads as an example.
+ */
+export function modelPlaceholder(harness: HarnessName): string {
+  switch (harness) {
+    case 'claude':
+      return 'sonnet'
+    case 'opencode':
+      return 'anthropic/claude-sonnet-4-5'
+    case 'qwen':
+      return 'qwen3-coder-plus'
+    // A slug from `codex debug models` — the catalog's own spelling, which the menu beside the
+    // box is read from on this machine. (M44)
+    case 'codex':
+      return 'gpt-5.5'
+    default: {
+      const unreachable: never = harness
+      return unreachable
+    }
+  }
 }
 
 /** `code-reviewer` → `Code Reviewer`, the same rule `cide_agents::defs::label_from_id` uses. */

@@ -276,6 +276,7 @@ const LIVE: readonly RunRef[] = [
     agentLabel: 'Developer',
     phase: 'running',
     session: 's-0001',
+    openable: true,
   },
 ]
 

@@ -38,6 +38,7 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/terminal/logLink.ts',
+      'src/terminal/runLinks.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -55,6 +56,26 @@ try {
   eq(link.parseLogLink(link.formatLogLink(session, 0)), { session, handle: 0 },
     'handle 0 is the first line of a session and must not be read as absent')
   ok(link.isLogLink(uri), 'isLogLink agrees with the parser')
+
+  /*
+   * An agent run's tool line (M42): the glyph, the tool, whatever the renderer put between, and
+   * the handle token at the very end — `cide_agents::harness::opencode::render_tool`'s shape,
+   * read back off the buffer text so a click can resolve it after a replay dropped every OSC 8.
+   */
+  const run = await import(`file://${join(out, 'runLinks.js')}`)
+  const tool = '● bash  cargo test --workspace  1.2s #7'
+  eq(
+    run.parseRunLine(tool),
+    { tool: 'bash', handle: 7, toolEnd: 6, tokenStart: tool.length - 2, end: tool.length },
+    'a completed call: the prefix ends after the tool, the token is the last two characters',
+  )
+  eq(run.parseRunLine(tool + '   ').handle, 7, 'trailing cells are trimmed before the token is read')
+  eq(run.parseRunLine('✗ bash  cat ~/.cargo/config.toml  #9').handle, 9, 'a failed call links too')
+  eq(run.parseRunLine('● cide_task_get  t-14  8ms #0').handle, 0, 'handle 0 is a line, not absence')
+  eq(run.parseRunLine('● bash  cargo test'), null, 'no token, no link — a rendering without a ring')
+  eq(run.parseRunLine('#7 ● bash  cargo test'), null, 'the token is read off the end only')
+  eq(run.parseRunLine('  The task is already in doing. #7'), null, 'prose ending in a hash is not a tool line')
+  eq(run.parseRunLine('● bash  echo #7 #x'), null, 'and the token must be digits')
 
   /*
    * The refusals. Each of these is something a child process can put on the screen by writing

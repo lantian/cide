@@ -81,4 +81,19 @@ staleTurn: boolean,
  * One line of extra context for the row — what the queue is waiting on, which worktree this
  * run holds. `None` for the ordinary case, which is most of them.
  */
-note: string | null, };
+note: string | null, 
+/**
+ * Whether **Open** has anything to show for this run. (M42)
+ *
+ * The gate the panel reads, and it is a field rather than a rule the panel derives from
+ * [`Self::session`] because `session` stopped being the whole answer: a finished `opencode`
+ * run's child is gone and its cide session with it, yet its conversation (`ses_…`) can be
+ * re-opened in the real harness, and a finished `claude` run restored after a restart has
+ * no session at all while its transcript sits on disk. The registry computes this from what
+ * it holds in memory — a session it still owns, or a conversation it has confirmed can be
+ * re-opened — so a roster broadcast costs no filesystem read. `false` for a queued run,
+ * which is what keeps Open *withheld* there rather than drawn disabled.
+ *
+ * What Open then does is a second question with three answers — see [`RunOpen`].
+ */
+openable: boolean, };

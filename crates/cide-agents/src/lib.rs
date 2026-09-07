@@ -40,6 +40,7 @@ pub mod config;
 pub mod defs;
 /// `@role` mentions in task prose — the pure scanner; who acts on one is `cide-app`'s question.
 pub mod mentions;
+pub mod overrides;
 // No `///` summary here, deliberately: `harness.rs`'s own `//!` header is the summary, and an
 // outer doc comment on the `mod` item merges with it into one fragment that rustdoc then resolves
 // in *this* module's scope — so every `[`RunState`]` and `[`SpawnSpec`]` link inside that header
@@ -62,8 +63,9 @@ pub mod tools;
 pub use config::{AgentsConfig, CideConfig, Isolation};
 pub use defs::{AgentProblem, Catalog, LoadedAgent, Severity};
 pub use harness::{
-    ClaudeHarness, Delivery, Harness, HarnessError, HarnessSpawn, Observation, OpencodeHarness,
-    RunPlan, SessionBinding, for_kind, registry,
+    ClaudeHarness, CodexHarness, ContinueSpec, Delivery, FailoverReason, Harness, HarnessError,
+    HarnessSpawn, Observation, OpencodeHarness, QwenHarness, RenderState, RunPlan, SessionBinding,
+    for_kind, registry,
 };
 pub use tools::{Content, TaskSink, ToolResult, descriptors, dispatch};
 

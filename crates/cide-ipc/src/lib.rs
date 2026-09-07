@@ -23,6 +23,8 @@ pub mod ids;
 /// Image documents. Identity only — never the pixels; the module header says why.
 pub mod image;
 pub mod keymap;
+pub mod llm;
+pub mod overrides;
 /// Per-file view memory. Its own module, and deliberately not part of [`workspace`] — the
 /// header of `positions.rs` says why at length.
 pub mod positions;
@@ -37,6 +39,8 @@ pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use image::{ImageDoc, ImageFormat};
 pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
+pub use llm::{LlmModel, LlmProvider, LlmSettings, ModelPool, PoolChoice, PoolEntry};
+pub use overrides::{AgentOverride, AgentOverrides, ProjectOverrides};
 pub use positions::{MarkdownView, ViewPosition};
 pub use settings::{
     ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
@@ -102,8 +106,8 @@ pub mod agents;
 pub mod tasks;
 
 pub use agents::{
-    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, OrchestrationConfig,
-    OrchestrationPatch, RunNotify, RunState,
+    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, LlmModelTest, OrchestrationConfig,
+    OrchestrationPatch, RunNotify, RunOpen, RunState,
 };
 pub use tasks::{
     ATTACHMENTS_DIR, AttachTarget, AttachmentKind, LinkType, StagedFile, Task, TaskAttachment,
@@ -348,7 +352,17 @@ pub enum SplitIntent {
     /// `claude --resume <src> --fork-session` — shares history up to the split point.
     ForkPrimary,
     /// A second sink on an existing session. No new process.
-    Mirror { session: SessionId },
+    ///
+    /// `continues` is what the pane keeps for *later*: the harness conversation this session
+    /// is a view of, so that once the child ends the pane can re-open the real harness on it
+    /// from the right directory (see [`HarnessSession`]). Absent for `claude.mirror` on a pane's
+    /// own session, where the pane already knows everything it needs. (M42)
+    Mirror {
+        session: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        continues: Option<HarnessSession>,
+    },
     /// `claude --resume <session>` — a **new child** picking up a conversation that has ended.
     ///
     /// # Why this is not [`Self::Mirror`], and not [`Self::ForkPrimary`]
@@ -368,6 +382,23 @@ pub enum SplitIntent {
     /// flag the frontend sets is keyed off exactly this distinction, and getting it wrong once
     /// already killed an agent mid-turn (see `cide_app::cmd::agents`' note on `agent_open_pane`).
     Resume { session: SessionId },
+    /// The real harness re-opened on a conversation whose child is gone — `claude --resume <id>`
+    /// or `opencode --session <id>`, in the directory the conversation was filed under. (M42)
+    ///
+    /// # Why this is not [`Self::Resume`]
+    ///
+    /// `Resume` speaks cide's [`SessionId`], which is a *claude* conversation id by construction
+    /// and is resumed from the project root. An agent run's conversation is neither: an opencode
+    /// run's id is the CLI's own `ses_…`, and both harnesses file the transcript under the run's
+    /// **worktree**, so a resume from the root finds nothing at all. [`HarnessSession`] carries
+    /// the three facts a re-open needs and the harness spells the command
+    /// (`cide_agents::Harness::continue_spec`), so the frontend never learns either CLI's flags.
+    ///
+    /// The pane that gets this **owns** its child, exactly as `Resume`'s does — it started the
+    /// process, so closing the pane ends it — and the ownership flag is set from this intent in
+    /// the spawn-plan branch, for the reason recorded beside `agent_open_pane` in
+    /// `cide_app::cmd::agents`.
+    Continue { conversation: HarnessSession },
     /// `$SHELL -l`
     Shell,
     // There is deliberately no `Diff`. A diff pane is not something a *split* can produce:
@@ -377,6 +408,34 @@ pub enum SplitIntent {
     // reachable from no code path, and the arm handling it minted a pane titled
     // "<project> : claude — diff" that would have shown nothing: a `PaneKind::Diff` leaf
     // inside a Claude tab has no spec to read.
+}
+
+/// A harness's own conversation, and where it has to be re-opened from. (M42)
+///
+/// The three facts a pane needs to put the **real harness** back on an agent run's conversation
+/// after the run's child has gone, and none of the facts it does not: no run id (the run may have
+/// left the registry's history by the time the pane comes back after a restart), no argv (the
+/// harness spells that, in Rust, at spawn time).
+///
+/// `id` is a string rather than a [`SessionId`] on purpose. For `claude` it *is* cide's session
+/// uuid, because a claude run's session id is the value handed to `--session-id` and `--resume`
+/// keeps it. For `opencode` it is the CLI's own `ses_…`, minted by the child and scraped off its
+/// output, which no `SessionId` can hold. One field, two spellings, and the harness that wrote it
+/// is the one that reads it.
+///
+/// `cwd` is load-bearing on both harnesses: Claude Code files a transcript under the directory it
+/// was started in, and an agent run starts in its worktree (`.cide/worktrees/<role>-<task>`), so
+/// `claude --resume` from the project root answers *no such conversation*. It travels here rather
+/// than being recomputed from a run because the worktree name is the run's business and the pane
+/// outlives the run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HarnessSession {
+    pub harness: agents::Harness,
+    pub id: String,
+    #[ts(type = "string")]
+    pub cwd: std::path::PathBuf,
 }
 
 /// Lifecycle of a session, driven by Claude Code hooks with a PTY-quiet fallback.

@@ -96,9 +96,11 @@ use cide_core::claude_cli::Injection;
 use cide_ipc::{RunState, SessionState};
 use cide_pty::{Geometry as PtyGeometry, SpawnSpec};
 
+use cide_ipc::HarnessSession;
+
 use super::{
-    ADHOC_PREAMBLE, Delivery, Harness, HarnessError, HarnessSpawn, Observation, RunPlan, SERVER,
-    SessionBinding, tracker_preamble,
+    ADHOC_PREAMBLE, ContinueSpec, Delivery, Harness, HarnessError, HarnessSpawn, Observation,
+    RunPlan, SERVER, SessionBinding, tracker_preamble,
 };
 
 /// The Claude Code CLI as a harness. A unit struct: it holds nothing, and must not.
@@ -139,6 +141,37 @@ impl Harness for ClaudeHarness {
         Delivery::Stdin(submit(text))
     }
 
+    /// `claude`, and the conversation as the [`cide_ipc::SessionId`] it already is.
+    ///
+    /// No `--resume` is written here. `session_spawn` hands `resume` to
+    /// [`cide_claude::conversation`], the one function that owns the fresh/resume/fork
+    /// vocabulary and its real-CLI test — the module header's second point, applied to the
+    /// fourth spawn site. And no role brief, on purpose: the pane is a person's, and a
+    /// `--append-system-prompt` from here would be the one `session_spawn` folds *last*
+    /// silently winning over theirs (the header's third point).
+    fn continue_spec(&self, conversation: &HarnessSession) -> Result<ContinueSpec, HarnessError> {
+        if conversation.harness != cide_ipc::Harness::Claude {
+            return Err(HarnessError::WrongHarness {
+                plan: conversation.harness,
+                harness: cide_ipc::Harness::Claude,
+            });
+        }
+        let id: cide_ipc::SessionId =
+            conversation
+                .id
+                .trim()
+                .parse()
+                .map_err(|_| HarnessError::NotAConversation {
+                    harness: cide_ipc::Harness::Claude,
+                    id: conversation.id.clone(),
+                })?;
+        Ok(ContinueSpec {
+            program: crate::defs::harness_binary(cide_ipc::Harness::Claude).to_string(),
+            args: Vec::new(),
+            resume: Some(id),
+        })
+    }
+
     fn observe(&self, current: RunState, ob: Observation<'_>) -> Option<RunState> {
         match ob {
             // The only observation carrying ground truth about the child, so it answers from
@@ -177,15 +210,41 @@ impl Harness for ClaudeHarness {
             }
         }
     }
+
+    /// The aliases, not a probe — Claude Code has no command that lists models.
+    ///
+    /// So this is [`crate::defs::PERMISSION_MODES`]' status rather than
+    /// `cide_ipc::Harness`': a copy of somebody else's vocabulary that cide is allowed to hold
+    /// stale, because the text box beside it is the real answer and a full model id is typed
+    /// there the day a release adds one. Refusing an unlisted value is the failure to avoid, and
+    /// the form does not.
+    ///
+    /// `cwd` is ignored: an alias means the same thing in every directory.
+    fn models(
+        &self,
+        _cwd: Option<&std::path::Path>,
+        _llm: &cide_ipc::LlmSettings,
+    ) -> Result<Vec<String>, String> {
+        Ok(MODEL_ALIASES.iter().map(|m| (*m).to_string()).collect())
+    }
 }
+
+/// The model aliases `--model` accepts, newest-capability first.
+///
+/// Ordered the way the form should offer them and not alphabetically: a menu's first row is the
+/// one a person picks without reading, so it is the middle of the range rather than the top of
+/// the bill.
+const MODEL_ALIASES: &[&str] = &["sonnet", "opus", "haiku"];
 
 /// Build the child, fresh (`resume: false`) or continuing. One function so the two differ in
 /// exactly the conversation tokens and nothing else — `opencode.rs::child`'s shape, on the
 /// harness where the difference is one argument to [`cide_claude::conversation`].
 fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessError> {
-    if plan.agent.def.harness != cide_ipc::Harness::Claude {
+    // `plan.harness`, the *resolved* one, not the definition's: a role a local override moved onto
+    // this CLI must not be refused by it. See `RunPlan::harness`.
+    if plan.harness != cide_ipc::Harness::Claude {
         return Err(HarnessError::WrongHarness {
-            plan: plan.agent.def.harness,
+            plan: plan.harness,
             harness: cide_ipc::Harness::Claude,
         });
     }
@@ -513,6 +572,8 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
         // and its fifth arrive by one code path — `deliver` below builds the same bytes.
         opening: Some(submit(&plan.prompt)),
         binding: SessionBinding::Caller,
+        // Hooks are this harness's channel; the event file is another harness's.
+        events: None,
     })
 }
 
@@ -757,10 +818,14 @@ mod tests {
             hook_bin: Some(PathBuf::from("/opt/cide/cide-hook")),
             hook_sock: Some(PathBuf::from("/run/user/1000/cide-hooks-42.sock")),
             agent_sock: Some(PathBuf::from("/run/user/1000/cide-agents-42.sock")),
+            events_path: None,
             theme: Theme::Dark,
             proxy: cide_core::proxy::ProxyEnv::default(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
+            llm: cide_ipc::LlmSettings::default(),
+            choice: None,
+            harness: agent.def.harness,
             // Off in the fixture, so every argv assertion below is about what the role
             // and the plan actually said; the skip default has tests of its own.
             skip_permissions: false,
@@ -1471,5 +1536,51 @@ mod tests {
         for flag in ["--model", "--effort", "--allowedTools", "--permission-mode"] {
             assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
         }
+    }
+
+    /// The real harness on a finished run's conversation is `claude` with the id handed back
+    /// as a session to resume — never a `--resume` spelled here. (M42)
+    #[test]
+    fn continuing_a_conversation_names_claude_and_hands_the_id_back_as_a_resume() {
+        use cide_ipc::{Harness, HarnessSession};
+
+        let id = cide_ipc::SessionId::new();
+        let spec = ClaudeHarness
+            .continue_spec(&HarnessSession {
+                harness: Harness::Claude,
+                id: id.to_string(),
+                cwd: std::path::PathBuf::from("/p/.cide/worktrees/developer-t-1"),
+            })
+            .expect("a uuid is a claude conversation");
+        assert_eq!(spec.program, "claude");
+        assert!(
+            spec.args.is_empty(),
+            "the flag is `cide_claude::conversation`'s to write"
+        );
+        assert_eq!(spec.resume, Some(id));
+
+        // Not a uuid: refused with the id in the sentence, rather than handed to a CLI that
+        // would fail after the pane had opened.
+        let refused = ClaudeHarness
+            .continue_spec(&HarnessSession {
+                harness: Harness::Claude,
+                id: "ses_not_a_uuid".into(),
+                cwd: std::path::PathBuf::from("/p"),
+            })
+            .expect_err("not a claude conversation");
+        assert!(refused.to_string().contains("ses_not_a_uuid"), "{refused}");
+
+        // The other harness's conversation is the other harness's to open.
+        let wrong = ClaudeHarness
+            .continue_spec(&HarnessSession {
+                harness: Harness::Opencode,
+                id: id.to_string(),
+                cwd: std::path::PathBuf::from("/p"),
+            })
+            .expect_err("wrong harness");
+        assert!(
+            matches!(wrong, HarnessError::WrongHarness { .. }),
+            "{wrong}"
+        );
     }
 }

@@ -554,6 +554,7 @@ pub(crate) fn open_subject_tab(
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "openspec".into(),
             },
         )

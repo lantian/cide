@@ -23,6 +23,7 @@ const pane = (n: number): Pane => ({
   session: null,
   conversation: null,
   conversationSince: null,
+  continues: null,
   title: `cide : ${n}`,
 })
 

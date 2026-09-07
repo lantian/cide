@@ -166,6 +166,7 @@ function run(from: WireRun): RunView {
     startedMs: ms(from.startedUnixMs),
     staleTurn: from.staleTurn,
     note: from.note,
+    openable: from.openable,
   }
 }
 

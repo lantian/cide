@@ -42,6 +42,22 @@ use crate::ids::{AgentId, ProjectId, RunId, SessionId, TaskId};
 pub enum Harness {
     Claude,
     Opencode,
+    /// Qwen Code (`qwen`). (M43) Claude-shaped on the outside — `--session-id`/`--resume`
+    /// uuids, `--append-system-prompt`, an inline `--mcp-config`, tools named
+    /// `mcp__<server>__<tool>` — and hosted like `claude`: an interactive TUI in the PTY, with
+    /// the run's state read from the JSON event file the CLI writes beside it
+    /// (`--json-file`), because its hooks can only be configured in settings files cide will
+    /// not edit.
+    Qwen,
+    /// OpenAI's Codex CLI (`codex`). (M44) Hosted like `opencode`, not like `qwen`: one
+    /// `codex exec --json` child per turn, the run's state read off the JSONL it prints, the
+    /// thread id captured from its first event because the caller cannot choose one, and a
+    /// follow-up a fresh `codex exec resume <id>` child. The role's brief travels as a
+    /// `-c developer_instructions=` override and cide's tracker as a `-c mcp_servers.cide.*`
+    /// one — with the run's environment spelled into it, because codex hands an MCP server a
+    /// whitelisted environment rather than its own. `codex resume <id>` is the real TUI a
+    /// person re-opens a finished run in.
+    Codex,
 }
 
 /// One role, as the panel draws it.
@@ -339,6 +355,51 @@ pub struct AgentRun {
     /// One line of extra context for the row — what the queue is waiting on, which worktree this
     /// run holds. `None` for the ordinary case, which is most of them.
     pub note: Option<String>,
+    /// Whether **Open** has anything to show for this run. (M42)
+    ///
+    /// The gate the panel reads, and it is a field rather than a rule the panel derives from
+    /// [`Self::session`] because `session` stopped being the whole answer: a finished `opencode`
+    /// run's child is gone and its cide session with it, yet its conversation (`ses_…`) can be
+    /// re-opened in the real harness, and a finished `claude` run restored after a restart has
+    /// no session at all while its transcript sits on disk. The registry computes this from what
+    /// it holds in memory — a session it still owns, or a conversation it has confirmed can be
+    /// re-opened — so a roster broadcast costs no filesystem read. `false` for a queued run,
+    /// which is what keeps Open *withheld* there rather than drawn disabled.
+    ///
+    /// What Open then does is a second question with three answers — see [`RunOpen`].
+    pub openable: bool,
+}
+
+/// What pressing **Open** on a run should do, as `agents_run_open` answers it. (M42)
+///
+/// One question to Rust, because the three answers depend on facts only Rust has — whether the
+/// registry still holds a live child for the run, and whether the harness can re-open the
+/// conversation from its directory — and the frontend then builds the pane through the split
+/// machinery with the intent this names. **Never a pane built by the command**: the argument
+/// beside `agent_open_pane` in `cide_app::cmd::agents` is why, and it is unchanged by this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum RunOpen {
+    /// The run's child is alive: attach a second sink to its session, spawn nothing. For a
+    /// `claude` run that is the real TUI, mid-turn; for `opencode` it is the rendered event
+    /// stream of a turn in flight. `continues` is handed to the pane for later — see
+    /// [`crate::SplitIntent::Mirror`].
+    Mirror {
+        session: SessionId,
+        continues: Option<crate::HarnessSession>,
+    },
+    /// The child is gone and the harness can re-open the conversation: spawn it, in the pane,
+    /// which owns it. See [`crate::SplitIntent::Continue`].
+    Continue { conversation: crate::HarnessSession },
+    /// Nothing to show, and the sentence saying why: a queued run has no child yet, an
+    /// `opencode` run that died before naming its conversation has nothing to continue, a
+    /// `claude` transcript can be gone with its worktree, or the `--resume` injection is off.
+    Unavailable { reason: String },
 }
 
 /// What cide knows about a project's subagents right now.
@@ -889,6 +950,63 @@ pub enum AgentSaveOutcome {
     Rejected { problems: Vec<AgentDraftProblem> },
 }
 
+/// What the role form may offer in its **Model** box, for one harness. (M43)
+///
+/// # Why a list at all, when [`AgentDraft::model`] is validated against nothing
+///
+/// Because "validated against nothing" is a rule about what cide *refuses*, and it says nothing
+/// about what cide can *suggest*. The two are the same asymmetry [`AgentDraft::effort`] states:
+/// a menu, not a rule. This is the strong form of it — Claude Code has aliases anybody can type
+/// (`sonnet`), while opencode wants `provider/model` drawn from whichever providers this machine
+/// has configured, which on a real one includes ids like `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
+/// A field nobody can fill from memory is a field nobody fills, and the effect was that
+/// selecting opencode left every role on the provider default with no way to say otherwise.
+///
+/// So the frontend must never treat this as a closed set. `check-settings-agents.mjs` asserts
+/// `model` is not a closed vocabulary and the box stays typable beside the menu; this type only
+/// Whether one provider/model actually answered, run for real. (M45)
+///
+/// A verdict and not a `Result` on the wire, for `AgentModels::problem`'s reason: the frontend
+/// draws both outcomes as a sentence beside the row, and a rejected `invoke` would have to be
+/// unwrapped through `errorText` into the same sentence anyway — with the difference that a
+/// rejection reads as *cide* failing rather than the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LlmModelTest {
+    /// The `provider/model` that was tried, echoed so a late answer cannot be drawn against a
+    /// row the user has since edited.
+    pub model: String,
+    /// Did it answer?
+    pub ok: bool,
+    /// One whole sentence, either way. The failure half is the provider's own words where there
+    /// were any — see `cide_agents::harness::opencode`'s `error_sentence`.
+    pub detail: String,
+}
+
+/// makes the common case one click.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentModels {
+    /// Which harness this list describes, echoed back.
+    ///
+    /// Echoed for the reason `cmd::settings::ClaudeCliSupport::binary` is: the answer describes
+    /// *this* harness, and a form that captioned it with whatever its dropdown currently says
+    /// would label one CLI's models with the other's name for as long as a probe was in flight —
+    /// which is exactly the moment the user is switching between them.
+    pub harness: Harness,
+    /// The ids, in the order the harness names them. Empty is a legal answer and not an error.
+    pub models: Vec<String>,
+    /// Why there is no list, as a sentence — or `None`.
+    ///
+    /// A sentence about the *machine* ("opencode is not on this app's PATH"), never a refusal
+    /// about the draft: it is drawn as the field's hint and never as an
+    /// [`AgentDraftProblem`], because nothing the user typed caused it and nothing they can type
+    /// in this form fixes it. The box stays editable either way.
+    pub problem: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +1028,7 @@ mod tests {
             notify: RunNotify::Primary,
             stale_turn: true,
             note: None,
+            openable: false,
         };
         let json = serde_json::to_string(&run).expect("serialize");
         // snake_case on both sides would round-trip happily and read `undefined` in the webview.

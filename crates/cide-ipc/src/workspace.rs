@@ -969,6 +969,20 @@ pub enum SettingsSection {
     /// Between `Inspections` and `Agents`, which is where it sits in the nav — the two before it
     /// are about what analyses your code, and this is about what else is running inside cide.
     Extensions,
+    /// Which models cide's agents may reach, and the ordered pools a run falls down. (M45)
+    ///
+    /// Its own section on [`Self::Inspections`]' test applied again. `ClaudeSessions` is *how
+    /// claude is launched* and this is about a different CLI's providers entirely; `Agents` is an
+    /// editor for role *files* and this is a page of genuine global settings riding
+    /// [`crate::SettingsPatch`] like every other.
+    ///
+    /// Immediately before `Agents`, which is where it sits in the nav, because a pool is what a
+    /// role's local override names — the screen should read in the order a person works:
+    /// configure the models, then the roles that use them.
+    ///
+    /// It is also the first section that stores a **credential**, which is its own reason to be
+    /// findable under a heading that names it rather than buried under a CLI's launch options.
+    Models,
     /// The subagent roles this project and this user define, edited as a form. (M18)
     ///
     /// # Why a section, rather than a group under something that exists
@@ -1136,6 +1150,21 @@ pub struct Pane {
     /// `cide_core::workspace::claude_name_cutoffs` is the one reader.
     #[serde(default)]
     pub conversation_since: Option<u64>,
+    /// The harness conversation this pane was opened onto, when it was opened onto one. (M42)
+    ///
+    /// Set for a pane the Agents panel opened on a run — a mirror of the run's live child, or
+    /// the real harness re-opened on its conversation — and `None` for every pane a user split
+    /// themselves. It is what lets the pane act on its own afterwards: the exit bar's *Resume
+    /// this conversation* and a restart re-open the same conversation from the same directory,
+    /// and a restore after a cide restart does the same instead of spawning a fresh child in the
+    /// project root over a worktree transcript it can no longer find.
+    ///
+    /// **Durable, and not a copy of the run.** The run's row is history that
+    /// `AgentRegistry` prunes; the pane may outlive it by weeks. Everything a re-open needs is
+    /// in [`crate::HarnessSession`], and nothing here says which run it was. `#[serde(default)]`
+    /// so a `workspace.json` written before this field loads unchanged.
+    #[serde(default)]
+    pub continues: Option<crate::HarnessSession>,
     /// e.g. `cide : claude`, `cide : bash`, `cide : claude — diff`.
     pub title: String,
 }

@@ -643,6 +643,9 @@ pub async fn session_spawn(
     resume: Option<SessionId>,
     // Optional on the wire, and it has to be: see [`wants_fork`].
     fork: Option<bool>,
+    // A conversation to put the real harness back on. Optional on the wire like `fork`, and
+    // for the same reason; see below.
+    continues: Option<cide_ipc::HarnessSession>,
 ) -> Result<SessionId, SessionError> {
     // Read before the blocking closure: `WorkspaceState` is Tauri-managed state and the
     // closure below is `spawn_blocking`, which cannot hold a `State<'_, _>` across the await.
@@ -663,6 +666,37 @@ pub async fn session_spawn(
     // the configured `claude` binary: this one brings *arguments* with it (`-l`), and the loop
     // that writes the frontend's arguments is on the next line.
     //
+    // **A conversation to re-open overrides the program, the arguments, the cwd and the
+    // resume** (M42). The harness spells the first two — `claude` with the id handed back as
+    // `resume`, or `opencode --session <ses_…>` — and the conversation carries the directory
+    // it was filed under, which is the run's worktree and not the root the frontend would
+    // otherwise name. Everything else below is built exactly as for any pane, which is the
+    // point: a `claude` continuation is a Claude pane's child in every respect (hooks,
+    // `--settings`, the configured binary, the MCP config), and an `opencode` TUI is a program
+    // in a terminal. Decided *here*, above the shell substitution and above
+    // `program_is_claude`, so the placeholder `program: ''` the frontend sends for such a pane
+    // never reaches either.
+    let (program, args, cwd, resume) = match continues.as_ref() {
+        Some(conversation) => {
+            let harness = cide_agents::for_kind(conversation.harness).ok_or_else(|| {
+                SessionError::Pty(format!(
+                    "this build has no implementation for the {:?} harness",
+                    conversation.harness
+                ))
+            })?;
+            let spec = harness
+                .continue_spec(conversation)
+                .map_err(|error| SessionError::Pty(error.to_string()))?;
+            (
+                spec.program,
+                spec.args,
+                conversation.cwd.to_string_lossy().into_owned(),
+                spec.resume.or(resume),
+            )
+        }
+        None => (program, args, cwd, resume),
+    };
+
     // Only for an empty string. A pane that names a program gets that program, so this cannot
     // reach a Claude pane, a test harness, or anything else that knows what it wants.
     let (program, args) = if program.trim().is_empty() {
@@ -1068,6 +1102,16 @@ pub async fn session_spawn(
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
     registry.insert(id, session);
+
+    // This pane is now the real harness on that conversation (M42): the agent registry refuses
+    // to start a second harness process on it while this child lives — a respawn, or a Resume
+    // of the interrupted run — and `report_exit` clears the row when the child is reaped.
+    // After the insert, so a refusal that races this spawn finds a session it can check.
+    if let Some(conversation) = continues.as_ref()
+        && let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>()
+    {
+        agents.note_viewer(conversation, id);
+    }
     Ok(id)
 }
 
@@ -1184,6 +1228,11 @@ pub fn session_attach(
     pane: Option<PaneId>,
     sink: Channel<InvokeResponseBody>,
     geometry: Geometry,
+    // The retained scrollback in front of the screen, for a sink with no buffer of its own —
+    // a pane opened onto a run that has been printing for twenty minutes (M42). Optional on the
+    // wire so every other caller stays byte-identical; the pane decides, because only it knows
+    // whether it already holds a transcript. See `cide_pty::PtySession::attach_with_snapshot`.
+    history: Option<bool>,
 ) -> Result<Response, SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
     s.resize(pty_geometry(geometry))
@@ -1191,7 +1240,7 @@ pub fn session_attach(
 
     let sink: Arc<dyn Sink> =
         Arc::new(move |bytes: &[u8]| sink.send(InvokeResponseBody::Raw(bytes.to_vec())).is_ok());
-    let (id, screen) = s.attach_with_snapshot(sink);
+    let (id, screen) = s.attach_with_snapshot(sink, history.unwrap_or(false));
 
     registry.record_attachment(
         AttachmentKey {

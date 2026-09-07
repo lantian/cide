@@ -18,11 +18,17 @@
  * physical key and is stable under shift, so it is the primary source and `key` is only the
  * fallback for codes this table does not name.
  *
- * The cost is layout independence: on a Dvorak or AZERTY layout `KeyP` is not where `p` is
- * printed. VS Code solves that with a per-layout mapping table shipped for every keyboard
- * layout it knows; that is a large amount of data for a problem no one has reported here
- * yet, and the fallback to `key` keeps unnamed keys layout-correct in the meantime. Worth
- * revisiting if a non-US-layout user complains — the fix belongs in this function alone.
+ * The cost is layout independence, and it cuts both ways. On a Dvorak or AZERTY layout `KeyP`
+ * is not where `p` is printed, and that complaint is still open: VS Code answers it with a
+ * per-layout mapping table shipped for every keyboard layout it knows, which is a large amount
+ * of data for a problem no one has reported here, and the fallback to `key` keeps unnamed keys
+ * layout-correct in the meantime. The other way round *was* reported — "hotkeys not working
+ * when another language is selected", Ctrl+Z under a Russian layout — and reading `code` is
+ * exactly what kept this function right there: WebKitGTK reports `key 'я'` and `keyCode 0`
+ * for the Z key, so everything that resolves by those two (xterm, CodeMirror, this app's
+ * `ev.key` rules) was dead while the gate was fine. `keys/latin.ts` is the fix: it rewrites
+ * such a chord to its US spelling before anything reads it, for exactly the codes this table
+ * names, so the `key` fallback below is reached only for keys outside both tables.
  *
  * This module is deliberately free of DOM types, React and `@/` imports so it can be
  * compiled and executed standalone by `ui/scripts/check-key-gate.mjs`.

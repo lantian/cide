@@ -97,6 +97,22 @@ export function hydrationPlan(s: AttachState): HydrationPlan {
 }
 
 /**
+ * Whether the attach should ask Rust for the mirror's retained scrollback in front of the
+ * screen. (M42)
+ *
+ * Only a host that holds **no** transcript of its own: one that has never hydrated and has no
+ * evicted buffer parked in the ledger. Both of the others already carry history — a hydrated
+ * host refuses the snapshot outright, and an evicted one replays its own serialized scrollback
+ * before the snapshot — and handing either of them the mirror's copy as well would paint the
+ * transcript twice, which is the split-remount duplication bug in a new coat. Asked *before*
+ * the attach, because the answer rides on the request; `hydrationPlan` is asked after and
+ * decides what to do with what came back.
+ */
+export function historyRequest(s: { hydrated: boolean; savedScrollback: boolean }): boolean {
+  return !s.hydrated && !s.savedScrollback
+}
+
+/**
  * The first-frame ordering: which live frames must wait for the snapshot.
  *
  * Frames are queued rather than dropped because they are already charged against this

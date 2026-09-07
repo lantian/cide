@@ -91,7 +91,10 @@ import {
   fieldLabel,
   isFieldEmpty,
   isLinkKind,
+  linkGroups,
   linkLabel,
+  linkTargetStatus,
+  linkTargetText,
   restText,
   statusGlyph,
   statusLabel,
@@ -181,6 +184,167 @@ export function chipClass(chip: Chip): string {
     return cx(styles.chip, chip.tone === 'attention' ? styles.chipStalled : styles.chipAssigned)
   }
   return cx(styles.chip, chip.tone === 'attention' ? styles.chipAttention : styles.chipLive)
+}
+
+/* ------------------------------------------------------------------------ the link list */
+
+/**
+ * A task's links, as a **list** — grouped under one heading per reading, one row per edge. (M40)
+ *
+ * # Why not the chips it was
+ *
+ * M30 drew each edge as a pill reading `Blocked by t-14`, on the argument that "a 320px panel
+ * cannot afford the target's whole title inline, and the id is what agents quote anyway". Both
+ * halves turned out wrong in use: a wrapped cloud of pills has no reading order, and an id with
+ * no title and no state means finding out what `t-14` *is* costs a click or a hover — on the one
+ * section whose entire job is to say what this task stands in relation to. The board already
+ * resolves every target ([`taskLinks`] fills `targetTitle` and `targetStatus`); the chips simply
+ * threw it away.
+ *
+ * A row is therefore the **board row's three cells**, verbatim — `.glyph` toned by the target's
+ * status, `.taskId`, `.taskTitle` — so a link reads like the task it points at rather than like
+ * a different kind of object, and a status marker means here exactly what it means in the list
+ * behind the card.
+ *
+ * # Shared with the compose dialog
+ *
+ * Both surfaces draw the same rows off the same [`LinkChip`], which is why the audit hooks are
+ * props: `check-agents-render.mjs` counts `taskLinkChip` and `taskComposeLinkChip` separately
+ * and its two claims must stay separable. Everything else — the grouping, the markup, the
+ * `gone` treatment — is one implementation, because two would drift on the first of them either
+ * one taught something new.
+ *
+ * The row's `data-kind`/`data-direction`/`data-target`/`data-gone` are the chips' attributes,
+ * unmoved: the digest reads them, so the list-versus-cloud change is provably presentational.
+ *
+ * A row **navigates** where a caller passed `onOpen`, and is inert markup where none did — the
+ * compose dialog's case, whose targets are picks against a task that does not exist yet.
+ * `TaskLine`'s rule: static text rather than a dead button.
+ */
+export function TaskLinkList({
+  chips,
+  auditList,
+  auditRow,
+  auditRemove,
+  onOpen,
+  removeFor,
+  owner,
+}: {
+  chips: readonly LinkChip[]
+  /** The hook on the container, the group heading and the row. See the header. */
+  auditList: string
+  auditRow: string
+  auditRemove: string
+  /** Open the target's card. Absent, a row is a `<span>` and nothing here writes. */
+  onOpen?: ((target: string) => void) | undefined
+  /** This chip's remove, or `undefined` where this end may not drop the edge. */
+  removeFor?: ((chip: LinkChip) => (() => void) | undefined) | undefined
+  /**
+   * The task these edges hang off, for the remove's label only. Absent in the compose dialog,
+   * whose draft has no id yet — which is why it is optional rather than derived from the card:
+   * a screen reader on the card should still hear *which* task it is unlinking from, and that
+   * sentence has nothing to name on the other surface.
+   */
+  owner?: string | undefined
+}) {
+  return (
+    <div className={styles.linkList} data-audit={auditList}>
+      {linkGroups(chips).map((group) => (
+        <div className={styles.linkGroup} key={group.label}>
+          {/*
+            * The reading, not the kind — `linkGroups` carries the argument. Dimmer and a rung
+            * smaller than the board's own `.groupHead`: this is a heading inside a card, under
+            * the "Links" field label, and it must not compete with it.
+            */}
+          <div
+            className={styles.linkGroupHead}
+            data-audit={`${auditRow}Group`}
+            data-label={group.label}
+          >
+            {group.label}
+          </div>
+          {group.chips.map((chip) => {
+            const status = linkTargetStatus(chip)
+            const text = linkTargetText(chip)
+            const remove = removeFor?.(chip)
+            /* The three cells, shared by the button and the span arms below, so the two
+               renderings of one row cannot drift apart. */
+            const cells = (
+              <>
+                <span
+                  className={cx(styles.glyph, TONE_CLASS[statusTone(status)])}
+                  data-status={status}
+                  aria-hidden="true"
+                >
+                  <Icon name={asIcon(statusGlyph(status))} size={1} />
+                </span>
+                <span className={styles.taskId}>{chip.target}</span>
+                <span className={styles.taskTitle}>{text}</span>
+              </>
+            )
+            /* Every discriminator the digest reads, on the row itself — the pill's attributes,
+               unmoved, which is the claim that this redesign changed only how it looks. */
+            const marks = {
+              'data-audit': auditRow,
+              'data-kind': chip.kind,
+              'data-direction': chip.direction,
+              'data-target': chip.target,
+              'data-gone': chip.gone ? 'true' : 'false',
+              /* The title still resolves the target for a hover, and still says so plainly when
+                 there is nothing to resolve. It is no longer the only way to read the row —
+                 which is the point — but a truncated title is a real state at 320px. */
+              title: chip.gone
+                ? `${chip.target} is no longer on the board`
+                : `${chip.target}: ${text}`,
+            }
+            const rowClass = cx(styles.linkRowMain, chip.gone ? styles.linkRowGone : undefined)
+            return (
+              <div
+                className={styles.linkRow}
+                key={`${chip.kind}:${chip.direction}:${chip.target}`}
+              >
+                {onOpen !== undefined ? (
+                  <button
+                    type="button"
+                    className={rowClass}
+                    {...marks}
+                    /* The label carries the reading, the id AND the title: a screen reader gets
+                       the whole row in the order the eye reads it, which is the half of this
+                       change that a sighted-only fix would have missed. */
+                    aria-label={`${chip.label} ${chip.target}: ${text} — open it`}
+                    onClick={() => onOpen(chip.target)}
+                  >
+                    {cells}
+                  </button>
+                ) : (
+                  <span className={rowClass} {...marks}>
+                    {cells}
+                  </span>
+                )}
+                {remove !== undefined && (
+                  <button
+                    type="button"
+                    className={styles.linkRemove}
+                    data-audit={auditRemove}
+                    data-write="true"
+                    title={`Remove this ${chip.label.toLowerCase()} link`}
+                    aria-label={
+                      owner === undefined
+                        ? `Unlink ${chip.target}`
+                        : `Unlink ${chip.target} from ${owner}`
+                    }
+                    onClick={remove}
+                  >
+                    <Icon name="x" size={0} />
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      ))}
+    </div>
+  )
 }
 
 /* ------------------------------------------------------------------- the delete control */
@@ -354,6 +518,7 @@ function asRun(chip: Chip): RunView {
     failure: null,
     staleTurn: false,
     note: null,
+    openable: chip.openable,
   }
 }
 
@@ -976,10 +1141,10 @@ export function TaskDetail(props: TaskDetailProps) {
           * the statement above it; before the spec block and the run strip, which are about the
           * change and the process rather than about which tasks this one stands in relation to.
           *
-          * A chip is a `<button>` that *navigates* — `onOpenTask` moves the card to the target —
-          * and its ✕ is the write. The ✕ is omitted on a directed *incoming* chip: that edge is
-          * stored on (and belongs to) the other task, and the chip itself is the road there. A
-          * `related` chip keeps its ✕ from either end — the store looks on both.
+          * The rows themselves are [`TaskLinkList`], shared with the compose dialog; its header
+          * carries why they are a list and not the pill cloud they were in M30. A row is a
+          * `<button>` that *navigates* — `onOpenTask` moves the card to the target — and its ✕
+          * is the write.
           */}
         {links !== undefined && (links.length > 0 || onLink !== undefined) && (
           <div className={styles.field} data-audit="taskLinks">
@@ -1007,57 +1172,26 @@ export function TaskDetail(props: TaskDetailProps) {
               )}
             </div>
             {links.length > 0 && (
-              <div className={styles.linkChips} data-audit="taskLinkChips">
-                {links.map((chip) => (
-                  <span
-                    className={styles.linkPair}
-                    key={`${chip.kind}:${chip.direction}:${chip.target}`}
-                  >
-                    <button
-                      type="button"
-                      className={cx(styles.linkChip, chip.gone ? styles.linkChipGone : undefined)}
-                      data-audit="taskLinkChip"
-                      data-kind={chip.kind}
-                      data-direction={chip.direction}
-                      data-target={chip.target}
-                      data-gone={chip.gone ? 'true' : 'false'}
-                      /*
-                       * The title resolves the target for a hover; a `gone` chip says so instead.
-                       * The chip's own text stays `label id` — a 320px panel cannot afford the
-                       * target's whole title inline, and the id is what agents quote anyway.
-                       */
-                      title={
-                        chip.gone
-                          ? `${chip.target} is no longer on the board`
-                          : `${chip.target}: ${chip.targetTitle?.trim() !== '' ? chip.targetTitle : 'Untitled'}`
-                      }
-                      aria-label={`${chip.label} ${chip.target} — open it`}
-                      onClick={() => onOpenTask?.(chip.target)}
-                    >
-                      {chip.label} {chip.target}
-                      {chip.gone ? ' (gone)' : ''}
-                    </button>
-                    {/* No ✕ on a kind this build cannot spell on the wire — an unlink the store
-                        would refuse is a dead control; the chip itself still draws and still
-                        navigates. */}
-                    {onUnlink !== undefined &&
-                      isLinkKind(chip.kind) &&
-                      (chip.direction === 'out' || chip.kind === 'related') && (
-                        <button
-                          type="button"
-                          className={styles.linkRemove}
-                          data-audit="taskLinkRemove"
-                          data-write="true"
-                          title={`Remove this ${chip.label.toLowerCase()} link`}
-                          aria-label={`Unlink ${chip.target} from ${task.id}`}
-                          onClick={() => onUnlink(task.id, chip.kind, chip.target)}
-                        >
-                          <Icon name="x" size={0} />
-                        </button>
-                      )}
-                  </span>
-                ))}
-              </div>
+              <TaskLinkList
+                chips={links}
+                auditList="taskLinkChips"
+                auditRow="taskLinkChip"
+                auditRemove="taskLinkRemove"
+                onOpen={onOpenTask}
+                owner={task.id}
+                /* No ✕ on a kind this build cannot spell on the wire — an unlink the store
+                   would refuse is a dead control; the row itself still draws and still
+                   navigates. And none on a derived *incoming* directed edge: that edge is
+                   stored on (and belongs to) the other task, and the row is the road there. A
+                   `related` edge keeps its ✕ from either end — the store looks on both. */
+                removeFor={(chip) =>
+                  onUnlink !== undefined &&
+                  isLinkKind(chip.kind) &&
+                  (chip.direction === 'out' || chip.kind === 'related')
+                    ? () => onUnlink(task.id, chip.kind, chip.target)
+                    : undefined
+                }
+              />
             )}
             {linkAdd != null && onLink !== undefined && (
               <div className={styles.linkAdd} data-audit="taskLinkAdd">

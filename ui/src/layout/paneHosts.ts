@@ -30,6 +30,7 @@ import { createTerminal, promoteWebgl, releaseWebgl, type TerminalHandle } from 
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
 import { attachPathLinks } from '@/terminal/pathLinks'
+import { attachRunLinks } from '@/terminal/runLinkProvider'
 import type { TerminalPaneKind } from '@/terminal/keys'
 import {
   STALL_MS,
@@ -436,6 +437,18 @@ export function openTerminal(paneId: string, kind: TerminalPaneKind): TerminalHa
   host.cleanup.push(
     attachPathLinks(handle, host.el, {
       paneId,
+      session: () => getHost(paneId).sessionId ?? null,
+    }),
+  )
+
+  /*
+   * An agent run's tool lines, after the path links on purpose: xterm keeps the earlier
+   * provider's link wherever two overlap, and a tool line's title is routinely a path the
+   * user wants to open — so the path provider wins the title and this one takes only the
+   * glyph and the handle token at the end. (M42)
+   */
+  host.cleanup.push(
+    attachRunLinks(handle, {
       session: () => getHost(paneId).sessionId ?? null,
     }),
   )
@@ -1000,6 +1013,16 @@ function serializeForEviction(victim: PaneHost): string | undefined {
  * that already holds a transcript — can never replay it a second time, whatever the
  * caller's flags say.
  */
+/**
+ * Whether eviction parked a serialized buffer for this pane — asked without taking it, by the
+ * attach path before it decides what to request from Rust (M42). `takeSavedScrollback` stays
+ * read-and-clear; this is the one read that must not clear, because the take happens after the
+ * attach's round trip and a cleared entry there would mean the replay never happens.
+ */
+export function hasSavedScrollback(paneId: string): boolean {
+  return ledger.get(paneId)?.scrollback !== undefined
+}
+
 export function takeSavedScrollback(paneId: string): string | null {
   const entry = ledger.get(paneId)
   if (!entry || entry.scrollback === undefined) return null

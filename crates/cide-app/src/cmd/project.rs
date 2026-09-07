@@ -1163,6 +1163,7 @@ pub fn tab_new_claude(
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: format!("{name} : claude"),
             },
         )
@@ -1568,6 +1569,7 @@ mod tests {
             session: Some(SessionId::new()),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "p : bash".into(),
         };
         let mirror = Pane {
@@ -1772,6 +1774,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "f".into(),
             },
         )
@@ -1838,6 +1841,7 @@ mod tests {
                     session: None,
                     conversation: None,
                     conversation_since: None,
+                    continues: None,
                     title: "f".into(),
                 },
             )
@@ -2010,6 +2014,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "lib.rs".into(),
             }),
         };
@@ -2032,6 +2037,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "lib.rs".into(),
             },
         )
@@ -2071,6 +2077,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: "a.rs".into(),
             }),
         };

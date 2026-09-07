@@ -130,6 +130,46 @@ pub fn closed_path() -> PathBuf {
     state_dir().join("closed.json")
 }
 
+/// Local redirection of a project's agent roles — harness, pool, model. (M45)
+///
+/// In **config** beside `keymap.json` and `schemes/`, on [`schemes_dir`]'s argument: it is a
+/// user's own arrangement of how things run here, of a piece with a keymap, and it is the kind of
+/// file somebody would keep in a dotfiles repository.
+///
+/// It is deliberately **not** in the project. `.cide/agents/*.md` and `.cide/config.json` are
+/// committed and shared; which provider *this* machine can reach, and which models this person is
+/// willing to spend, are neither. A `pool:` key in a role file would make a teammate's clone name
+/// a pool they do not have on every dispatch — see `cide_ipc::overrides`' header.
+pub fn agent_overrides_path() -> PathBuf {
+    config_dir().join("agent-overrides.json")
+}
+
+/// Read the override file. **Never fails** — see [`load_recent`], which makes the same choice for
+/// the same reason: absent is the ordinary state and unreadable is nothing the caller can act on,
+/// and both mean "no overrides", which is a correct answer rather than a degraded one.
+///
+/// A file this module wrote and a file somebody hand-edited are read identically; a version this
+/// build does not know is read as far as serde can take it rather than discarded, because
+/// discarding it would silently un-redirect every role the moment a newer cide had touched it.
+pub fn load_agent_overrides(path: &Path) -> cide_ipc::AgentOverrides {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return cide_ipc::AgentOverrides::default(),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "agent overrides file unusable");
+            cide_ipc::AgentOverrides::default()
+        }
+    }
+}
+
+/// Write the override file, `0600` like everything else this module owns.
+pub fn save_agent_overrides(path: &Path, overrides: &cide_ipc::AgentOverrides) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(overrides)?)
+}
+
 /// Resolve one XDG base directory, appending the instance's directory name.
 ///
 /// A relative value is ignored, as the spec requires: it would resolve against the working
@@ -1199,6 +1239,7 @@ mod tests {
             session: Some(primary_session),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: format!("{name} : claude"),
         };
         let mut tree = PaneTree {
@@ -1215,6 +1256,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                continues: None,
                 title: format!("{name} : bash"),
             };
             tree.root = LayoutNode::Split {
@@ -1240,6 +1282,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "settings".into(),
         };
         let settings = Tab {
@@ -1908,6 +1951,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "main.rs — diff".into(),
         };
         let project = workspace.projects.values_mut().next().expect("a project");
@@ -2160,6 +2204,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "main.rs".into(),
         };
         project.tabs.push(Tab {

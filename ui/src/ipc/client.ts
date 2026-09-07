@@ -30,6 +30,7 @@ import type {
   FsChange,
   FsStatus,
   GraphicsStatus,
+  HarnessSession,
   HeadlessRequest,
   HeadlessResult,
   KeymapEdit,
@@ -1195,6 +1196,16 @@ export const session = {
      * — the id we pass is honoured and both sessions stay independently resumable.
      */
     fork?: boolean | undefined
+    /**
+     * Put the **real harness** back on a conversation whose run child has ended. (M42)
+     *
+     * Overrides `program`, `args`, `cwd` and `resume`: the harness spells the command in
+     * Rust — `claude` with the id handed to `--resume`, or `opencode --session <ses_…>` —
+     * and the conversation carries the directory it was filed under, which is the run's
+     * worktree. The caller passes `program: ''` and whatever cwd it has; neither is read.
+     * See `SplitIntent::Continue` and `Pane::continues`.
+     */
+    continues?: HarnessSession | undefined
   }) => invoke<SessionId>('session_spawn', opts),
 
   /**
@@ -1952,10 +1963,25 @@ export const paneSession = {
    * The caller must write these bytes before any bytes the channel delivers. See
    * `TerminalPane`, which queues channel frames until it has.
    */
-  attach: (pane: PaneId, id: SessionId, geo: Geometry, onData: (data: ArrayBuffer) => void) => {
+  attach: (
+    pane: PaneId,
+    id: SessionId,
+    geo: Geometry,
+    onData: (data: ArrayBuffer) => void,
+    // The mirror's retained scrollback in front of the screen, for a host that holds no
+    // transcript of its own (M42). `attachModel.historyRequest` is the rule; omitted, Rust
+    // answers the one screen it always did.
+    history = false,
+  ) => {
     const sink = new Channel<ArrayBuffer>()
     sink.onmessage = onData
-    return invoke<ArrayBuffer>('session_attach', { session: id, pane, sink, geometry: geo })
+    return invoke<ArrayBuffer>('session_attach', {
+      session: id,
+      pane,
+      sink,
+      geometry: geo,
+      history,
+    })
   },
 
   /**
@@ -3548,7 +3574,7 @@ export const commitActions = {
  * `remove` state the same asymmetry one block up. The rejection reaches `agentsStore`, which
  * reaches `notifyFailure`.
  * --------------------------------------------------------------------------------------- */
-import type { DispatchRequest, RunId } from './generated'
+import type { DispatchRequest, RunId, RunOpen } from './generated'
 
 export const agentRuns = {
   /**
@@ -3639,15 +3665,22 @@ export const agentRuns = {
   ackStaleTurn: (project: ProjectId, run: RunId) =>
     invoke<void>('agents_ack_stale_turn', { project, run }),
 
-  /*
-   * There is deliberately **no `openPane` wrapper**. Opening a run into a pane is a *gesture*,
-   * not a command: it lives in `ui/src/sidebar/AgentsPanel/openRun.ts` and goes through
-   * `addRow` with `SplitIntent::Mirror`, because `addRow` calls `rememberSpawnPlan` before
-   * `hydrate()` and that is what makes `TerminalPane` set `PaneHost.mirrored`. A pane built by
-   * a command instead arrives over `cide://workspace-changed` with no spawn plan, the flag
-   * stays unset, and `closePane` kills the agent's child on the way out. See `cmd/agents.rs`,
-   * which carries the long version.
+  /**
+   * What pressing **Open** on a run should do — a *question*, never a pane. (M42)
+   *
+   * Rust answers from the two facts only it has: whether the registry still holds a live child
+   * for the run (mirror it), and whether the harness can put itself back on the conversation
+   * from the run's directory (`claude --resume` in the worktree, or the opencode TUI on its
+   * `ses_…` — `continue`). The pane itself is still built by the gesture in
+   * `ui/src/sidebar/AgentsPanel/openRun.ts`, through `addRow` with the intent this names,
+   * because `addRow` calls `rememberSpawnPlan` before `hydrate()` and that is what makes
+   * `TerminalPane` set `PaneHost.mirrored` for a mirror and leave it unset for a continuation.
+   * A pane built by a *command* arrives over `cide://workspace-changed` with no spawn plan, the
+   * flag stays unset, and `closePane` kills the agent's child on the way out — which is why
+   * there is no `openPane` wrapper here and never will be. See `cmd/agents.rs`, which carries
+   * the long version beside the deleted `agent_open_pane`.
    */
+  open: (project: ProjectId, run: RunId) => invoke<RunOpen>('agents_run_open', { project, run }),
 }
 
 /* -----------------------------------------------------------------------------------------
@@ -3867,10 +3900,15 @@ export const logWalk = {
  *
  * The opposite of `agents.roster`, and for the reason `agents.setConfig` states one block up:
  * `pendingCommand` exists for calls made from a *render effect*, where an unhandled rejection
- * unmounts the tree and a `null` fallback is an honest "this build cannot answer". Nothing here
- * is called from an effect — every one of them follows a deliberate click — and each writes a
- * file in the user's repository. A swallowed rejection would be a user pressing Save and being
- * told nothing at all.
+ * unmounts the tree and a `null` fallback is an honest "this build cannot answer". Every call
+ * here that *writes* follows a deliberate click and writes a file in the user's repository, so
+ * none of them may swallow a rejection: that would be a user pressing Save and being told
+ * nothing at all.
+ *
+ * `models` is the one exception and states why on itself: it is read-only, it is called from an
+ * effect, and it decorates a field that must still work when it answers nothing. It is the only
+ * member of this namespace that goes through `pendingCommand`, and a second one appearing is a
+ * sign that a write has been mis-filed rather than that the rule has moved.
  *
  * # A refusal is not a rejection
  *
@@ -3882,7 +3920,15 @@ export const logWalk = {
  * So `.catch` here is for a disk that would not take the write, and the `rejected` arm is for the
  * form.
  * --------------------------------------------------------------------------------------- */
-import type { AgentDraft, AgentSaveOutcome, AgentScope } from './generated'
+import type {
+  AgentDraft,
+  AgentModels,
+  AgentSaveOutcome,
+  AgentScope,
+  Harness,
+  LlmModelTest,
+  ProjectOverrides,
+} from './generated'
 
 export const agentDefs = {
   /**
@@ -3901,6 +3947,78 @@ export const agentDefs = {
    */
   draft: (project: ProjectId, agent: AgentId, scope: AgentScope) =>
     invoke<AgentDraft>('agents_draft', { project, agent, scope }),
+
+  /**
+   * What the form's **Model** box may offer for one harness — a menu, never a rule.
+   *
+   * For opencode this runs `opencode models` on the user's machine, because that is the only
+   * place the answer exists: the ids are `provider/model` over whichever providers they have
+   * configured, and a list cide compiled in would offer models they cannot reach while omitting
+   * every local one they can. Claude Code has no such command and answers with its aliases.
+   *
+   * `harness` is asked for rather than derived from the draft, because the draft's own value is
+   * nullable — "project default" is a real state — and resolving it is `effectiveHarness`'s job
+   * in `agentsDraft.ts`, where a check script can drive it.
+   *
+   * # The one `pendingCommand` in this namespace
+   *
+   * Called from a render effect, so an unhandled rejection would unmount the settings tree; and
+   * `null` is a *drawable* answer here in a way it is not for `draft` or `save` — the box beside
+   * the menu is free text and stays typable, which is the whole reason `model` is not a closed
+   * vocabulary. A build without the handler therefore degrades to exactly the field that shipped
+   * before this existed.
+   *
+   * Note that a *missing* `opencode` is **not** this `null`: that comes back as an ordinary
+   * answer with `problem` set, so the form can say which of the two happened.
+   */
+  models: (project: ProjectId, harness: Harness) =>
+    pendingCommand<AgentModels | null>(
+      'agents_models',
+      () => invoke<AgentModels>('agents_models', { project, harness }),
+      null,
+    ),
+
+  /**
+   * Does this `provider/model` actually answer? One very small real turn. (M45)
+   *
+   * **It spends quota**, so it is only ever called from a button the user pressed, never on
+   * mount and never on a keystroke. Listing a model id proves only that opencode resolved it —
+   * a wrong key, an endpoint that refuses completions, a retired model and an expired plugin
+   * OAuth all list perfectly and fail on the first token.
+   *
+   * Answers a verdict rather than rejecting, so both outcomes are one sentence beside the row;
+   * `null` is only a build with no such handler, exactly as `models` above.
+   */
+  testModel: (project: ProjectId, model: string) =>
+    pendingCommand<LlmModelTest | null>(
+      'llm_test_model',
+      () => invoke<LlmModelTest>('llm_test_model', { project, model }),
+      null,
+    ),
+
+  /**
+   * This project's local, uncommitted role redirections — harness, pool, model. (M45)
+   *
+   * `null` on a build with no such handler; an *absent* override file is not that, it is an
+   * ordinary empty answer, so the screen can tell "this cide cannot do overrides" from "this
+   * project has none".
+   */
+  overrides: (project: ProjectId) =>
+    pendingCommand<ProjectOverrides | null>(
+      'agent_overrides_get',
+      () => invoke<ProjectOverrides>('agent_overrides_get', { project }),
+      null,
+    ),
+
+  /**
+   * Replace this project's overrides, and answer what was stored.
+   *
+   * Whole-table, not per row — see the command's own doc. Rejects only when the file could not be
+   * written, which the screen shows as a sentence rather than swallowing: an override that
+   * silently did not save is a role that runs somewhere else than the screen says.
+   */
+  setOverrides: (project: ProjectId, overrides: ProjectOverrides) =>
+    invoke<ProjectOverrides>('agent_overrides_set', { project, overrides }),
 
   /**
    * Write one role's definition file. Creates, edits, renames and moves between scopes — all

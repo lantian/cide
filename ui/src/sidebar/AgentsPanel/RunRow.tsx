@@ -334,24 +334,25 @@ function RunControls({
   onStop?: ((run: string) => void) | undefined
 }) {
   const { run } = row
-  // `interrupted` resumes too, and it is the row's *only* affordance: the child died with a
-  // cide restart, so there is nothing to open, pause or type at — Resume requeues the run and
-  // a new child continues the same conversation.
+  // `interrupted` resumes too: the child died with a cide restart, and Resume requeues the run
+  // so a new child of the *registry's* continues the same conversation. It is no longer the
+  // row's only affordance — Open puts the real harness on that conversation for a person
+  // instead (M42), and the registry refuses to continue a run while such a pane is open.
   const canResume = run.phase === 'paused' || run.phase === 'interrupted'
   const canStop = !isDonePhase(run.phase)
 
   return (
     <span className={styles.controls} data-audit="agentsControls">
       {/* Withheld, not disabled, for a queued run: `canOpen` is false exactly when there
-          is no session to mirror, and nothing the user could do on this row would change
-          that. */}
+          is nothing to show — no session to mirror and no conversation to re-open — and
+          nothing the user could do on this row would change that. */}
       {row.canOpen && onOpen !== undefined && (
         <button
           type="button"
           className={styles.control}
           data-audit="agentsOpen"
           onClick={() => onOpen(run.run)}
-          title="Open this run's transcript in a pane. The run keeps going either way."
+          title="Open this run's conversation in a pane: the live session while its child works, or the real harness re-opened on it once the child has ended. A live run keeps going either way."
         >
           Open
         </button>

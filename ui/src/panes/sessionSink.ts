@@ -31,6 +31,7 @@
  */
 import {
   getHost,
+  hasSavedScrollback,
   noteParsed,
   noteResized,
   setHostBusy,
@@ -44,7 +45,7 @@ import {
   type Geometry,
 } from '@/ipc/client'
 import type { TerminalHandle } from '@/terminal/xterm'
-import { attachSequencer, hydrationPlan } from './attachModel'
+import { attachSequencer, historyRequest, hydrationPlan } from './attachModel'
 import { exitMarkerBytes, markFor } from './exitMarker'
 
 /**
@@ -518,15 +519,30 @@ async function attach(link: Link): Promise<void> {
   // The screen comes back from `attach` itself, taken at the instant this sink was
   // registered, so the mirror and the sink cannot disagree. See
   // `cide_pty::PtySession::attach_with_snapshot`.
-  const screen = await paneSession.attach(paneId, session, geo, (data) => {
-    // A closed link's frames are dropped, not queued: the Rust side has already detached
-    // (or refused the attach), and a terminal that may be mid-teardown must not be written.
-    if (link.closed) return
-    const bytes = new Uint8Array(data)
-    const at = frames++
-    if (seq.onFrame(at) === 'deliver') deliver(bytes)
-    else held.set(at, bytes)
+  //
+  // Whether to ask for the mirror's retained scrollback in front of that screen (M42) —
+  // only for a host that holds no transcript of its own. `attachModel.historyRequest` is the
+  // rule; the saved-buffer half is *peeked*, not taken, because the take below must still
+  // find it after the round trip.
+  const history = historyRequest({
+    hydrated: host.hydrated,
+    savedScrollback: hasSavedScrollback(paneId),
   })
+  const screen = await paneSession.attach(
+    paneId,
+    session,
+    geo,
+    (data) => {
+      // A closed link's frames are dropped, not queued: the Rust side has already detached
+      // (or refused the attach), and a terminal that may be mid-teardown must not be written.
+      if (link.closed) return
+      const bytes = new Uint8Array(data)
+      const at = frames++
+      if (seq.onFrame(at) === 'deliver') deliver(bytes)
+      else held.set(at, bytes)
+    },
+    history,
+  )
   link.attached = true
   if (link.closed) return
 

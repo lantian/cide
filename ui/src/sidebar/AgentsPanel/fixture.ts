@@ -128,6 +128,9 @@ function run(over: Partial<RunView> & Pick<RunView, 'run' | 'agent' | 'agentLabe
     failure: null,
     staleTurn: false,
     note: null,
+    // What Rust computes from the session and the conversation: a row with a session is
+    // openable, which keeps every story's Open control where it was.
+    openable: (over.session ?? null) !== null,
     ...over,
   }
 }

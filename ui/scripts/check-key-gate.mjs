@@ -11,6 +11,11 @@
  * pass on a keymap whose resolution is wrong for everything else, and would need editing
  * every time `cide-core::keymap::defaults` gains a line.
  *
+ * Since M41 a sweep also runs under a non-Latin layout — the events a Russian, Greek or Hebrew
+ * keyboard produces, `code` physical and `key` foreign — holding the verdict to the US twin's
+ * *and* asserting what the event reads as afterwards, because `keys/latin.ts` rewrites it in
+ * place at both entry points and everything behind the gate depends on that.
+ *
  * This project has no JS test runner and adding one for four pure modules would be a larger
  * commitment than the code it tests, so this follows `check-status-format.mjs`: compile the
  * modules with the TypeScript that is already in `node_modules`, then exercise the output.
@@ -138,6 +143,9 @@ try {
       // claim than the switcher's and therefore worth measuring at both entry points.
       'src/keys/switcher.ts',
       'src/keys/recorder.ts',
+      // The non-Latin rewrite the gate runs first. `tsc` would follow the import anyway; it is
+      // listed so that a reader of this list sees every module the sweeps exercise.
+      'src/keys/latin.ts',
       '--outDir', out,
       '--rootDir', 'src',
       '--module', 'commonjs',
@@ -160,6 +168,7 @@ try {
   const { evaluateWhen } = require(join(out, 'keys/when.js'))
   const switcher = require(join(out, 'keys/switcher.js'))
   const recorder = require(join(out, 'keys/recorder.js'))
+  const latin = require(join(out, 'keys/latin.js'))
 
   /* ------------------------------------------------------------------ the fixture keymap */
 
@@ -655,6 +664,11 @@ try {
 
   /* --------------------------------------------- the claim: both entry points agree */
 
+  // The rewrite's latch is per module instance and the fixture rows below all carry US keys,
+  // so it must be — and stay — Latin here, or a row's `key` becomes order-dependent on which
+  // section ran before it. The non-Latin section at the foot resets it and asserts the same.
+  eq(latin.latinLayoutIsNonLatin(), false, 'the sweeps start with a Latin latch')
+
   let compared = 0
   for (const ctx of CONTEXTS) {
     for (const spec of KEYS) {
@@ -1001,6 +1015,130 @@ try {
     recordedCompared === CONTEXTS.length * KEYS.length * 16,
     'swept the whole modifier × key space a third time with the recorder armed',
   )
+
+  /* ------------------------------------- a non-Latin layout is the same keystroke (M41) */
+
+  /*
+   * Under a Russian layout WebKitGTK reports `key 'я'` and `keyCode 0` for the Z key — only
+   * `code` is physical — and `keys/latin.ts` rewrites such a chord in place, from both entry
+   * points, before anything reads it. Three claims, each measured for every context and all
+   * sixteen modifier sets at both entry points:
+   *
+   * 1. **The gate's verdict is invariant.** A Cyrillic, Greek or Hebrew event resolves to the
+   *    same pass-through, the same command and the same armed prefix as its US twin. The gate
+   *    reads `code`, so this was true before the rewrite existed; it is measured so that it
+   *    stays true if `strokeFromEvent` ever grows a `key` branch for one of these codes.
+   * 2. **Under Ctrl, Alt or Meta the event reads as its US twin afterwards** — `key`,
+   *    `keyCode` and `which` — because that is what xterm, CodeMirror and every `ev.key`
+   *    matcher behind the gate see. Without a chord modifier, or with Shift alone, it reads
+   *    exactly as the browser built it: that is typing, and the character must reach the field.
+   * 3. **`code` is never touched.**
+   *
+   * The rows pair a physical key with what a foreign layout prints on it; `Digit3` carries the
+   * Russian Shift face `№` so a non-ASCII character on a *digit* key is swept too. As with
+   * `KEYS`, one `key` serves all sixteen modifier sets — the unshifted rows are a fiction under
+   * Shift, and the claim is about the rewrite's verdict, not the layout's.
+   */
+  const NON_LATIN = [
+    { code: 'KeyP', key: 'з' },
+    { code: 'KeyZ', key: 'я' },
+    { code: 'KeyF', key: 'а' },
+    { code: 'KeyC', key: 'с' },
+    { code: 'KeyZ', key: 'ζ' },
+    { code: 'KeyZ', key: 'ז' },
+    { code: 'Backquote', key: 'ё' },
+    { code: 'BracketLeft', key: 'х' },
+    { code: 'Comma', key: 'б' },
+    { code: 'Period', key: 'ю' },
+    { code: 'Semicolon', key: 'ж' },
+    { code: 'Digit3', key: '№' },
+  ]
+  const ENTRIES = [
+    ['window', (g, e) => g.gate.windowHandler(e)],
+    ['terminal', (g, e) => g.gate.terminalHandler(e)],
+  ]
+  let nonLatinCompared = 0
+  for (const ctx of CONTEXTS) {
+    for (const spec of NON_LATIN) {
+      for (let bits = 0; bits < 16; bits++) {
+        const mods = {
+          ctrl: (bits & 1) !== 0,
+          alt: (bits & 2) !== 0,
+          shift: (bits & 4) !== 0,
+          meta: (bits & 8) !== 0,
+        }
+        const chord = mods.ctrl || mods.alt || mods.meta
+        const twin = latin.usFace(spec.code, mods.shift)
+        const label = `${JSON.stringify(mods)} ${spec.code} ${JSON.stringify(spec.key)} in ${JSON.stringify(ctx)}`
+        for (const [entry, run] of ENTRIES) {
+          const a = makeGate(ctx)
+          const b = makeGate(ctx)
+          const foreign = event({ ...spec, ...mods })
+          const us = event({ code: spec.code, key: twin.key, ...mods })
+          const viaForeign = run(a, foreign)
+          const viaUs = run(b, us)
+          nonLatinCompared += 1
+
+          if (viaForeign !== viaUs) {
+            fail(`${entry}: a non-Latin keystroke passes through differently from its US twin: ${label}`, `foreign=${viaForeign} us=${viaUs}`)
+          }
+          if (JSON.stringify(a.dispatched) !== JSON.stringify(b.dispatched)) {
+            fail(`${entry}: a non-Latin keystroke dispatched differently from its US twin: ${label}`, `foreign=${JSON.stringify(a.dispatched)} us=${JSON.stringify(b.dispatched)}`)
+          }
+          if (a.gate.pending() !== b.gate.pending()) {
+            fail(`${entry}: a non-Latin keystroke left a different prefix armed from its US twin: ${label}`)
+          }
+          if (foreign.code !== spec.code) fail(`${entry}: the rewrite touched code: ${label}`)
+          if (chord) {
+            if (foreign.key !== twin.key || foreign.keyCode !== twin.keyCode || foreign.which !== twin.keyCode) {
+              fail(
+                `${entry}: after the gate the event does not read as its US twin: ${label}`,
+                `key=${JSON.stringify(foreign.key)} keyCode=${foreign.keyCode} which=${foreign.which}, wanted ${JSON.stringify(twin)}`,
+              )
+            }
+          } else if (foreign.key !== spec.key || Object.hasOwn(foreign, 'keyCode')) {
+            fail(`${entry}: typing was rewritten: ${label}`, `key=${JSON.stringify(foreign.key)}`)
+          }
+        }
+      }
+    }
+  }
+  ok(
+    nonLatinCompared === CONTEXTS.length * NON_LATIN.length * 16 * ENTRIES.length,
+    'swept every non-Latin row against its US twin through both entry points',
+  )
+
+  /*
+   * Claim 1 from the other side: for every code the rewrite knows, `strokeFromEvent` spells the
+   * same chord whatever `key` says. This is the property that lets the rewrite happen *inside*
+   * the gate's handlers without changing a single verdict, and it holds because `latin.ts`'s
+   * table is a subset of the codes `chords.ts`'s `nameFromCode` names. A code added to one
+   * table and not the other fails here by name.
+   */
+  let invariant = 0
+  for (const code of latin.LATIN_CODES) {
+    for (let bits = 0; bits < 16; bits++) {
+      const mods = {
+        ctrl: (bits & 1) !== 0,
+        alt: (bits & 2) !== 0,
+        shift: (bits & 4) !== 0,
+        meta: (bits & 8) !== 0,
+      }
+      const twin = latin.usFace(code, mods.shift)
+      const foreign = strokeFromEvent(event({ code, key: 'я', ...mods }))
+      const us = strokeFromEvent(event({ code, key: twin.key, ...mods }))
+      invariant += 1
+      if (foreign !== us) {
+        fail(`strokeFromEvent consults key for ${code}, so a non-Latin layout spells a different chord`, `foreign=${foreign} us=${us}`)
+      }
+    }
+  }
+  ok(invariant === latin.LATIN_CODES.length * 16, 'held the gate invariant over every code the rewrite knows')
+
+  // The rows above taught the latch a non-Latin layout. Put it back before anything after
+  // this section runs, and say so if it did not take.
+  latin.resetLatinLayout()
+  eq(latin.latinLayoutIsNonLatin(), false, 'the non-Latin section left no latch behind')
 
   /* What the recorder does with the four strokes that are not simply data. */
   {
@@ -1916,10 +2054,10 @@ try {
     process.exit(1)
   }
   console.log(
-    `check-key-gate: ok (${compared + capturedCompared + recordedCompared} chords through the ` +
-      `keyboard entry points, ${capturedCompared} of them with a switcher walk open and ` +
-      `${recordedCompared} with the keystroke recorder armed; ${mouseSwept} thumb-button ` +
-      'presses through the third)',
+    `check-key-gate: ok (${compared + capturedCompared + recordedCompared + nonLatinCompared} ` +
+      `chords through the keyboard entry points, ${capturedCompared} of them with a switcher ` +
+      `walk open, ${recordedCompared} with the keystroke recorder armed and ${nonLatinCompared} ` +
+      `under a non-Latin layout; ${mouseSwept} thumb-button presses through the third)`,
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

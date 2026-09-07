@@ -2075,6 +2075,7 @@ mod tests {
             session: Some(session),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "cide : claude".into(),
         }
     }

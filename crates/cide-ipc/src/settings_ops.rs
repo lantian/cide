@@ -104,6 +104,21 @@ pub struct SettingsPatch {
     /// error rather than a setting that silently never saves.
     #[ts(optional)]
     pub git: Option<GitSettings>,
+    /// Providers and pools, sent whole like every other group. (M45)
+    ///
+    /// For this one that also means the **API keys** cross the IPC on every blur-committed save —
+    /// the same trip `settings.get` already makes in the other direction, and the same trade
+    /// [`crate::ProxySettings`] documents. The boundary is in-process.
+    ///
+    /// A masked or write-only key is **not available in this shape**, and that is worth writing
+    /// down before somebody proposes it: a patch is per *top-level field* (see this type's own
+    /// header), so the screen sends the whole `LlmSettings` back on every edit — a masked key
+    /// would be sent back **as the mask** and overwrite the real one. Making it work would need a
+    /// per-leaf patch type or a "leave this field alone" sentinel, and the header already argues
+    /// against the first. What survives is the rule `ClaudeCliSection` states: a value you cannot
+    /// see is a value you cannot correct.
+    #[ts(optional)]
+    pub llm: Option<crate::llm::LlmSettings>,
 }
 
 /// Two or more commands competing for one keystroke in one context.

@@ -350,6 +350,9 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
      */
     if (ev.type === 'keypress') return false
 
+    // The gate also rewrites a chord typed under a non-Latin layout to its US spelling here —
+    // `keys/latin.ts`, from inside `terminalKeyGate` — so every `ev.key` read below this line
+    // sees `c` rather than `с`, and xterm's own `keyCode` branch sees 67 rather than 0.
     if (!terminalKeyGate(ev)) return false
 
     /*

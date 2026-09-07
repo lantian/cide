@@ -5,6 +5,7 @@ import type { ExplorerSettings } from "./ExplorerSettings";
 import type { GitSettings } from "./GitSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
+import type { LlmSettings } from "./LlmSettings";
 import type { ProxySettings } from "./ProxySettings";
 import type { SidebarSettings } from "./SidebarSettings";
 import type { TerminalSettings } from "./TerminalSettings";
@@ -80,4 +81,19 @@ keepSessionsOnWindowClose: boolean,
  * too. If unsaved edits ever need their own toggle, that is a second field with its own
  * wording, not a second meaning stapled to this one.
  */
-confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: TerminalSettings, graphics: GraphicsSettings, claude: ClaudeSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, };
+confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: TerminalSettings, graphics: GraphicsSettings, claude: ClaudeSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, 
+/**
+ * Which models an opencode run may use, and in what order. (M45) See [`crate::llm`].
+ *
+ * **Global, where a project's own switches are per checkout**, and the split is argued in
+ * that module's header: a credential is a property of the person, and the *name* of a pool
+ * lives in a per-project local override file that is never committed either.
+ *
+ * No `persist` migration behind it, unlike [`ProxyScope`] and [`EditorSettings::autosave`],
+ * and the difference is the test those two state: a defaulted field is an *inference*
+ * whenever the default is a behaviour. Here the default is two empty lists, which is exactly
+ * what every existing workspace does today — no provider declared, no pool, every run on the
+ * role's own `model:` — so an upgraded workspace behaves identically, and a later change of
+ * default touches new installs only.
+ */
+llm: LlmSettings, };

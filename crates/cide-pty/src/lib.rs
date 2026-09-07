@@ -396,6 +396,20 @@ pub struct SpawnSpec {
     /// too. `screen_state()` is the buffer-agnostic picture, which is the right shape for a
     /// replay.
     pub preload: Vec<u8>,
+    /// Keep the pty and the mirror at the spawn geometry for the child's whole life — every
+    /// later [`PtySession::resize`] is a no-op. (M42)
+    ///
+    /// For a child whose output is **lines, not a screen**: an agent run on a harness that
+    /// prints machine events (`opencode run --format json`) neither reads the terminal size nor
+    /// paints into it, so the only thing a resize does to it is *damage the mirror*. `vt100`'s
+    /// `set_size` does not reflow: it truncates every row to the new width and clears every
+    /// wrap flag, so a mirror made wide enough to hold a rendered line whole is cut to the first
+    /// pane that attaches narrower, and one made narrow (the 80-column default a headless run
+    /// used to get) hands every later pane its history as 80-column fragments with hard breaks
+    /// — the "text is not on full width" report. Fixed and wide, the mirror wraps almost
+    /// nothing, what it does wrap keeps its flag for the replay to join, and the pane's own
+    /// terminal soft-wraps each logical line at whatever width it actually has.
+    pub fixed_size: bool,
     /// Announce foreground jobs in this pane that run at least this long.
     ///
     /// `None` — the default, and what every Claude pane uses — watches nothing and costs
@@ -426,6 +440,7 @@ impl SpawnSpec {
             geometry: Geometry::default(),
             credit: CreditPolicy::default(),
             preload: Vec::new(),
+            fixed_size: false,
             watch_jobs: None,
             render: None,
         }
@@ -487,6 +502,12 @@ impl SpawnSpec {
     /// Seed the screen mirror with bytes from a previous run. See [`SpawnSpec::preload`].
     pub fn preload(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.preload = bytes.into();
+        self
+    }
+
+    /// See [`SpawnSpec::fixed_size`].
+    pub fn fixed_size(mut self) -> Self {
+        self.fixed_size = true;
         self
     }
 
@@ -566,6 +587,9 @@ enum Control {
     Attach {
         id: SinkId,
         sink: Arc<dyn Sink>,
+        /// Whether the reply should carry the retained scrollback in front of the screen. See
+        /// [`PtySession::attach_with_snapshot`].
+        history: bool,
         /// The screen as of the cut point. The caller sends this to the sink itself.
         reply: Sender<Vec<u8>>,
     },
@@ -609,6 +633,8 @@ pub struct PtySession {
     sinks: Arc<Mutex<Vec<Registered>>>,
     next_sink_id: AtomicU32,
     geometry: Mutex<Geometry>,
+    /// [`SpawnSpec::fixed_size`], carried so [`Self::resize`] can refuse.
+    fixed_size: bool,
     child_pid: Option<u32>,
     exited: Arc<AtomicBool>,
     /// The reaper's answer. Separate from `exited` on purpose: `exited` is *also* set by the
@@ -735,6 +761,7 @@ impl PtySession {
             sinks,
             next_sink_id: AtomicU32::new(1),
             geometry: Mutex::new(spec.geometry),
+            fixed_size: spec.fixed_size,
             child_pid,
             exited,
             exit,
@@ -891,7 +918,18 @@ impl PtySession {
     /// Falls back to the unsynchronised pair if the coalescer is gone, which is the case for a
     /// child that has already exited: there is no more output, so there is no window to be
     /// wrong about.
-    pub fn attach_with_snapshot(&self, sink: Arc<dyn Sink>) -> (SinkId, Vec<u8>) {
+    ///
+    /// `history` asks for the mirror's retained scrollback **in front of** the screen, for a
+    /// sink that has never seen this session and holds no buffer of its own — a pane opened
+    /// onto an agent run that has been printing for twenty minutes (M42). Without it a live
+    /// child's snapshot is one screen, and everything above the fold is in the mirror and
+    /// nowhere the pane can reach. It is an *option* rather than the default because the
+    /// other attaching sinks hold history already: a pane returning from a park keeps its
+    /// buffer and refuses the snapshot, and an evicted one replays its own serialized
+    /// scrollback first — handing either of them the mirror's copy too would paint the
+    /// transcript twice. The caller knows which sink it is; this does not. See
+    /// [`history_bytes`] for the composition and why the dead-session arm is unchanged.
+    pub fn attach_with_snapshot(&self, sink: Arc<dyn Sink>, history: bool) -> (SinkId, Vec<u8>) {
         let id = self.mint_sink_id();
 
         if !self.exited.load(Ordering::Acquire) {
@@ -899,6 +937,7 @@ impl PtySession {
             let request = Control::Attach {
                 id,
                 sink: Arc::clone(&sink),
+                history,
                 reply: reply_tx,
             };
             if self.control_tx.send(request).is_ok()
@@ -922,6 +961,12 @@ impl PtySession {
         // copy of history to a terminal that already holds one.
         if self.exited.load(Ordering::Acquire) {
             return (id, self.full_state());
+        }
+        // The same answer the coalescer would have given, for the same sink: a caller that
+        // asked for history and reached the fallback gets history here too, or the transcript
+        // a pane opens with would depend on whether the coalescer was busy at the click.
+        if history {
+            return (id, self.history_state());
         }
         // `reattach_state`, not `screen_state`: this is still a sink adopting a child's
         // current screen, and the fallback path differing from the coalescer path in *which
@@ -1044,18 +1089,7 @@ impl PtySession {
         let (_, cols) = vt.screen().size();
         let mut out = Vec::new();
         out.extend_from_slice(b"\x1b\\\x1b[?1049l");
-        // Clamped by the crate to what the scrollback actually holds, which is how the real
-        // depth is learned without a second API.
-        vt.screen_mut().set_scrollback(usize::MAX);
-        let depth = vt.screen().scrollback();
-        for offset in (1..=depth).rev() {
-            vt.screen_mut().set_scrollback(offset);
-            if let Some(row) = vt.screen().rows_formatted(0, cols).next() {
-                out.extend_from_slice(&row);
-            }
-            out.extend_from_slice(b"\x1b[m\r\n");
-        }
-        vt.screen_mut().set_scrollback(0);
+        scrollback_rows(&mut vt, cols, &mut out);
         // A dead screen's tail is mostly empty rows; replaying them would put a page of blank
         // lines under the transcript. `rows` (plain) decides emptiness, `rows_formatted`
         // supplies what is actually written, and the two iterate the same grid.
@@ -1066,9 +1100,15 @@ impl PtySession {
             .iter()
             .rposition(|row| !row.trim().is_empty())
             .map_or(0, |last| last + 1);
-        for row in vt.screen().rows_formatted(0, cols).take(keep) {
+        let screen = vt.screen();
+        for (i, row) in screen.rows_formatted(0, cols).take(keep).enumerate() {
             out.extend_from_slice(&row);
-            out.extend_from_slice(b"\x1b[m\r\n");
+            out.extend_from_slice(b"\x1b[m");
+            // The same join as `scrollback_rows`; the last kept row always ends the line.
+            let last = i + 1 == keep;
+            if last || !screen.row_wrapped(i as u16) {
+                out.extend_from_slice(b"\r\n");
+            }
         }
         out
     }
@@ -1080,6 +1120,12 @@ impl PtySession {
     /// See [`reattach_bytes`] for what it prepends and the bug that made it necessary.
     pub fn reattach_state(&self) -> Vec<u8> {
         reattach_bytes(&self.vt)
+    }
+
+    /// [`Self::reattach_state`] with the retained scrollback in front of it — what a sink that
+    /// asked for `history` is handed. See [`history_bytes`].
+    pub fn history_state(&self) -> Vec<u8> {
+        history_bytes(&self.vt)
     }
 
     /// Whether the child currently has the alternate screen engaged, i.e. it is a
@@ -1116,7 +1162,9 @@ impl PtySession {
     /// repaint nudge goes `cols - 1` and then `cols`, so both of its steps genuinely change the
     /// value and both still land.
     pub fn resize(&self, geometry: Geometry) -> Result<(), PtyError> {
-        if *self.geometry.lock() == geometry {
+        // A line-printing child keeps its spawn geometry for life — see `SpawnSpec::fixed_size`
+        // for why a resize here would only damage the mirror.
+        if self.fixed_size || *self.geometry.lock() == geometry {
             return Ok(());
         }
         self.master
@@ -1242,6 +1290,83 @@ fn reattach_bytes(vt: &Mutex<vt100::Parser>) -> Vec<u8> {
     out
 }
 
+/// Every scrollback row the mirror still holds, oldest first, each as `<row>\x1b[m\r\n`.
+///
+/// The walk [`PtySession::full_state`] has always done, shared with [`history_bytes`] so the two
+/// cannot disagree about a row: `set_scrollback` one row at a time, the top visible row of each
+/// window, the SGR reset so one row's trailing colour cannot bleed into the next. Leaves the
+/// scrollback offset at zero. Answers how many rows it wrote, which is how a caller learns the
+/// depth without a second API — the crate clamps `set_scrollback` to what is actually held.
+fn scrollback_rows(vt: &mut vt100::Parser, cols: u16, out: &mut Vec<u8>) -> usize {
+    vt.screen_mut().set_scrollback(usize::MAX);
+    let depth = vt.screen().scrollback();
+    for offset in (1..=depth).rev() {
+        vt.screen_mut().set_scrollback(offset);
+        let screen = vt.screen();
+        if let Some(row) = screen.rows_formatted(0, cols).next() {
+            out.extend_from_slice(&row);
+        }
+        out.extend_from_slice(b"\x1b[m");
+        // A row the mirror wrapped continues on the next one: no break, so the receiving
+        // terminal sees one logical line and soft-wraps it at its own width. (M42) This is what
+        // "the hard break costing a wrapped line its wrap flag" used to cost — every line
+        // longer than the mirror's width came back as fixed-width fragments in a pane that had
+        // room for it. Only rows the mirror still holds a flag for: `vt100` clears every flag
+        // on a resize, which is why a line-printing child's mirror is never resized
+        // (`SpawnSpec::fixed_size`).
+        if !screen.row_wrapped(0) {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    vt.screen_mut().set_scrollback(0);
+    depth
+}
+
+/// [`reattach_bytes`] with the retained scrollback in front of it. (M42)
+///
+/// The composition, in order, and each part is load-bearing:
+///
+/// 1. ST, then the **normal** buffer — [`PtySession::full_state`]'s lead-in, for its reason:
+///    scrollback lives there, and a receiver left on the alternate screen would paint the
+///    history into a grid that never scrolls.
+/// 2. Every scrollback row, as [`scrollback_rows`] writes them.
+/// 3. **One `\r\n` per screen row**, when anything was replayed. The rows just written fill the
+///    receiver's viewport from the top, and the dump in step 4 opens with a clear-screen
+///    (`\x1b[H\x1b[J`, unconditional in `state_formatted`) that erases the viewport in place
+///    rather than scrolling it away — so without this padding the last screenful of history
+///    would be wiped the instant it was painted. The newlines push it up into the receiver's
+///    scrollback and leave a blank viewport, which is exactly what the dump then paints over.
+/// 4. [`reattach_bytes`]: the buffer identity, then the live screen with its cursor and modes,
+///    so the child's next byte lands where the child thinks the cursor is.
+///
+/// A child on the **alternate** screen gets step 4 alone. `vt100` keeps the scrollback on the
+/// normal grid and reads through whichever grid is active, so there is nothing to replay while
+/// the alternate one is up — and padding the normal buffer with blank rows for nothing would
+/// leave a page of empty scrollback behind the moment the TUI exits.
+///
+/// The dead-session arm ([`PtySession::full_state`]) is deliberately not this function: a dead
+/// child has no cursor to restore and its dump would erase the tail, which is why that arm emits
+/// the final screen as rows rather than as a dump and needs no padding.
+fn history_bytes(mirror: &Mutex<vt100::Parser>) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut vt = mirror.lock();
+        let (rows, cols) = vt.screen().size();
+        if !vt.screen().alternate_screen() {
+            out.extend_from_slice(b"\x1b\\\x1b[?1049l");
+            if scrollback_rows(&mut vt, cols, &mut out) > 0 {
+                for _ in 0..rows {
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+    }
+    // Locked again rather than reusing the guard above: `reattach_bytes` takes the mutex, and
+    // on the coalescer thread — the only writer to the mirror — nothing can slip in between.
+    out.extend_from_slice(&reattach_bytes(mirror));
+    out
+}
+
 /// Handle one control request, on the coalescer thread.
 ///
 /// The order is the whole point and it is not interchangeable:
@@ -1265,7 +1390,12 @@ fn serve_control(
     probe: &mut Option<JobProbe>,
 ) {
     match request {
-        Control::Attach { id, sink, reply } => {
+        Control::Attach {
+            id,
+            sink,
+            history,
+            reply,
+        } => {
             if !pending.is_empty() {
                 broadcast(sinks, vt, policy, Frame::Bytes(std::mem::take(pending)));
                 *first_byte_at = None;
@@ -1274,7 +1404,11 @@ fn serve_control(
             // A caller that has given up (see `ATTACH_TIMEOUT`) leaves nobody on the other
             // end. The sink stays attached regardless — it is registered and will receive
             // output; only the atomicity of its first frame was lost.
-            let _ = reply.send(reattach_bytes(vt));
+            let _ = reply.send(if history {
+                history_bytes(vt)
+            } else {
+                reattach_bytes(vt)
+            });
         }
         Control::JobThreshold(after) => {
             // Absent for every session that watches no jobs — a Claude pane — where the
@@ -2015,6 +2149,117 @@ mod tests {
         );
     }
 
+    /// A line-printing child's mirror keeps its spawn width for life, and a line it wrapped is
+    /// replayed as one line. (M42)
+    ///
+    /// Both halves of the "text is not on full width" report: a resize would truncate the wide
+    /// mirror and clear its wrap flags (`vt100` does not reflow), and a hard break at every
+    /// mirror row is what turned a 300-character rendered line into fragments in a pane that
+    /// had room for it.
+    #[test]
+    fn a_fixed_size_mirror_ignores_resizes_and_replays_wrapped_rows_joined() {
+        let long = "x".repeat(150);
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg(format!("printf '%s\\n' first {long} last"))
+            .geometry(Geometry::new(100, 24, 8, 16))
+            .fixed_size();
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        let deadline = Instant::now() + DEADLINE;
+        while !session.has_exited() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(session.has_exited());
+
+        // The resize a pane would make on attach is refused, so the width stays at 100 and the
+        // 150-character row keeps its wrap flag.
+        session
+            .resize(Geometry::new(40, 10, 8, 16))
+            .expect("a refused resize is not an error");
+        assert_eq!(session.geometry().cols, 100);
+
+        // The SGR reset between two rows of one line is deliberate (a colour must not bleed
+        // from one mirror row into the next); what must be absent is the line break.
+        let replay = String::from_utf8_lossy(&session.full_state())
+            .into_owned()
+            .replace("\x1b[m", "");
+        assert!(
+            replay.contains(&long),
+            "the wrapped row is replayed as one logical line: {replay:?}"
+        );
+        assert!(
+            replay.contains("first") && replay.contains("last"),
+            "{replay:?}"
+        );
+    }
+
+    /// A sink that asks for history is handed the scrollback in front of the live screen; one
+    /// that does not gets the one screen it always got. (M42)
+    ///
+    /// A hundred rows into a 24-row mirror: the first rows have long scrolled off, and the
+    /// child is still alive (`sleep`), so this is the coalescer arm and not the dead-session
+    /// fallback that always replayed everything.
+    #[test]
+    fn a_sink_asking_for_history_is_handed_the_scrollback_before_the_screen() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("i=1; while [ $i -le 100 ]; do echo row-$i-end; i=$((i+1)); done; sleep 30")
+            .geometry(Geometry::new(80, 24, 8, 16));
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        // Wait on the mirror, for the reason the test above gives.
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let screen = String::from_utf8_lossy(&session.screen_state()).into_owned();
+            if screen.contains("row-100-end") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child never printed its last row: {screen:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let (_, plain) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true), false);
+        let plain = String::from_utf8_lossy(&plain).into_owned();
+        assert!(
+            plain.contains("row-100-end"),
+            "the live screen is missing: {plain:?}"
+        );
+        assert!(
+            !plain.contains("row-1-end"),
+            "a plain attach must stay one screen — the eviction replay upstream owns history: {plain:?}"
+        );
+
+        let (_, with_history) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true), true);
+        let text = String::from_utf8_lossy(&with_history).into_owned();
+        let first = text
+            .find("row-1-end")
+            .expect("the first row is in the history");
+        let clear = text
+            .find("\x1b[H\x1b[J")
+            .expect("the screen dump's clear-screen");
+        let last = text.rfind("row-100-end").expect("the live screen follows");
+        assert!(
+            first < clear && clear < last,
+            "history, then the dump, then the screen: {text:?}"
+        );
+        // The padding that keeps the dump's clear from erasing the replayed tail: one line
+        // break per screen row, between the last history row and the dump.
+        let between = &text[first..clear];
+        assert!(
+            between.matches("\r\n").count() >= 24,
+            "the replayed tail must be pushed past the viewport before the clear: {between:?}"
+        );
+        assert!(
+            text.contains("\x1b[?1049l"),
+            "history is replayed onto the normal buffer: {text:?}"
+        );
+
+        session.kill();
+    }
+
     /// The line splitter under the render hook: chunks land mid-line, terminators vary, the
     /// hook may drop or multiply lines, and the cap flushes raw rather than losing bytes.
     #[test]
@@ -2190,7 +2435,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
-        let (_, snapshot) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true));
+        let (_, snapshot) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true), false);
         let text = String::from_utf8_lossy(&snapshot);
         assert!(
             text.contains("transcript line 1\u{1b}") || text.contains("transcript line 1\r"),
@@ -3037,7 +3282,7 @@ mod tests {
             .preload("PREVIOUS-RUN".as_bytes().to_vec());
         let session = PtySession::spawn(spec).expect("spawn sh");
 
-        let (_, screen) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true));
+        let (_, screen) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true), false);
         let text = String::from_utf8_lossy(&screen).into_owned();
         assert!(
             text.contains("PREVIOUS-RUN"),

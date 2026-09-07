@@ -45,7 +45,7 @@
  * harness this build does not have is a parse error with a line number in it, which is only
  * possible while the set has a definition.
  */
-export type Harness = 'claude' | 'opencode'
+export type Harness = 'claude' | 'opencode' | 'qwen' | 'codex'
 
 /**
  * The harnesses, as data, so membership is a lookup rather than a type assertion.
@@ -53,7 +53,7 @@ export type Harness = 'claude' | 'opencode'
  * `check-agents.mjs` asserts this equals Rust's variant list as a set, so adding `Codex` there
  * fails the build here rather than rendering an empty harness column nobody notices.
  */
-export const HARNESSES: readonly Harness[] = ['claude', 'opencode']
+export const HARNESSES: readonly Harness[] = ['claude', 'opencode', 'qwen', 'codex']
 
 /** Is this one of the harnesses this build knows how to label? */
 export function isHarness(value: string): value is Harness {
@@ -71,6 +71,8 @@ export function isHarness(value: string): value is Harness {
 export function harnessLabel(harness: string): string {
   if (harness === 'claude') return 'claude'
   if (harness === 'opencode') return 'opencode'
+  if (harness === 'qwen') return 'qwen'
+  if (harness === 'codex') return 'codex'
   return harness.trim() === '' ? 'unknown harness' : harness
 }
 
@@ -510,6 +512,13 @@ export interface RunView {
   staleTurn: boolean
   /** One line of extra context — what the queue is waiting on, which worktree this run holds. */
   note: string | null
+  /**
+   * Whether **Open** has anything to show — `AgentRun::openable`, computed by Rust from what the
+   * registry holds: a session it still owns, or a conversation the real harness can be re-opened
+   * on. (M42) The wire's fact, restated here so nobody derives it from `session` again: a
+   * finished opencode run has no session and an openable conversation.
+   */
+  openable: boolean
 }
 
 /**
@@ -655,29 +664,25 @@ export function canDispatch(def: AgentDefView, roster: Roster): Dispatchable {
 }
 
 /**
- * Is there a transcript to attach a pane to?
+ * Is there anything for **Open** to show?
  *
- * The session id alone is the answer — a queued run has none, which is exactly why the Open
- * control is *withheld* from a queued row rather than drawn disabled. The phase test is
- * belt-and-braces against a backend that fills `session` before the child reports in: a mirror
- * of a session with no PTY behind it is an empty pane the user then has to close.
+ * `openable` is Rust's answer — a session the registry still holds, or a conversation the real
+ * harness can be re-opened on (M42) — and the phase test is belt-and-braces against a backend
+ * that fills `session` before the child reports in: a mirror of a session with no PTY behind it
+ * is an empty pane the user then has to close. A queued run has neither, which is exactly why
+ * the Open control is *withheld* from a queued row rather than drawn disabled.
  *
- * Deliberately **true for a finished run**: `PtySession` feeds its `vt100` mirror independently
- * of sinks, so a run that ran headless for twenty minutes has its screen waiting, and reading
- * what an agent did is most of the reason to open one at all.
- *
- * **True for an idle run, which is the best case there is.** Its turn is over, so the transcript
- * is complete, *and* its child is alive, so the pane is interactive rather than a screenshot of
- * one: the user can read what the agent did and then type the next turn into it themselves. This
- * needs no arm of its own — `session` is set and the phase is not `queued` — but it is the case
- * the function most exists for, so it is written down.
+ * What Open then does is Rust's to decide at the click (`agentRuns.open`): attach to the live
+ * child, or spawn the harness on the conversation — `claude --resume` in the run's worktree,
+ * or the opencode TUI on its `ses_…`. So this is **true for a finished run** (the transcript
+ * is complete and the harness re-renders it), **true for an interrupted one** (its child died
+ * with the old cide; the conversation did not — this used to be withheld because Open could
+ * only mirror, and a mirror of a dead session was a blank pane under a row whose real
+ * affordance was Resume), and **true for an idle run**, the best case there is: the turn is
+ * over *and* the child is alive, so the pane is interactive rather than a picture of one.
  */
 export function canOpen(run: RunView): boolean {
-  // `interrupted` still carries its session id — the registry needs it to build the resume —
-  // but the process behind it died with the old cide, so an Open aimed at it attaches to
-  // nothing and draws a resume splash over a run whose real affordance is the row's own
-  // Resume. Withheld, not disabled, per the queued rule above.
-  return run.session !== null && run.phase !== 'queued' && run.phase !== 'interrupted'
+  return run.openable && run.phase !== 'queued'
 }
 
 /**

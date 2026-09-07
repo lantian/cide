@@ -286,6 +286,22 @@ export interface TasksDigest {
    * between holding work up and being held up.
    */
   linkChips: string[]
+  /**
+   * The link list's group headings, in document order. (M40)
+   *
+   * The *reading* and not the kind — `blockedBy` is `Blocked by` from one end and `Blocks` from
+   * the other, and putting "this is holding me up" under the same word as "I am holding this
+   * up" is the one seriously misleading thing this section could say.
+   */
+  linkGroups: string[]
+  /**
+   * One row per edge: `<target>|<status>|<text>`. (M40)
+   *
+   * Beside `linkChips` rather than folded into it, because the two make different claims:
+   * `linkChips` is the edge (kind, direction, dangling), this is what a reader actually SEES —
+   * the target's state marker and its title, which the pill cloud computed and threw away.
+   */
+  linkRows: string[]
   /** How many link removes are drawn. Never on a derived *directed* chip — that edge is the
    *  other task's, and the chip itself is the road there. */
   linkRemoves: number
@@ -550,6 +566,13 @@ function digest(
     linkChips: all(html, 'taskLinkChip').map(
       (chip) =>
         `${attr(chip, 'data-kind')}|${attr(chip, 'data-direction')}|${attr(chip, 'data-target')}|${attr(chip, 'data-gone')}`,
+    ),
+    linkGroups: all(html, 'taskLinkChipGroup').map((head) => attr(head, 'data-label')),
+    /* The status off the glyph's own attribute and the text off the row, so a row that drew the
+       right words with no marker at all — or the marker of a status it does not have — fails
+       here rather than looking fine. */
+    linkRows: all(html, 'taskLinkChip').map(
+      (row) => `${attr(row, 'data-target')}|${/data-status="([^"]*)"/.exec(row)?.[1] ?? ''}|${text(row)}`,
     ),
     linkRemoves: count(html, 'data-audit="taskLinkRemove"'),
     linkAddControls: all(html, 'taskLinkAdd').reduce(

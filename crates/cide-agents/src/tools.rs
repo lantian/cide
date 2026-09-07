@@ -278,9 +278,28 @@ const STATUSES: &[TaskStatus] = &[
     TaskStatus::Done,
 ];
 
-/// The harnesses, as a slice, for [`STATUSES`]' reason: the schema's `enum` and the parser must
-/// be the same set by construction. (M33)
-const HARNESSES: &[Harness] = &[Harness::Claude, Harness::Opencode];
+/// The harnesses, for [`STATUSES`]' reason: the schema's `enum` and the parser must be the same
+/// set by construction. (M33; derived from the registry in M43)
+///
+/// # Why this reads the registry instead of listing them
+///
+/// It used to be `&[Harness::Claude, Harness::Opencode]`, and when `Qwen` arrived it stayed that
+/// way — so `cide_agent_create` and `cide_agent_update` advertised a two-value `enum` and an
+/// agent asking for `harness: "qwen"` was refused by its own MCP client before the call ever
+/// reached cide. Nothing here was wrong: [`harness_from_wire`] is serde and accepted `qwen`
+/// perfectly, [`harness_wire`] is an exhaustive `match` and would not compile without it, and
+/// the round-trip test iterates *this* list, so it could only ever confirm what the list already
+/// said. A closed set restated by hand is exactly the drift this file's own `STATUSES` comment
+/// warns about, and the one place with no compiler behind it is the one that broke.
+///
+/// [`crate::harness::registry`] is the answer because it is the list a dispatch actually uses:
+/// `defs::implemented` makes the same argument about `for_kind` being *the* question rather than
+/// a second `match`. A harness in the registry can be run, so it can be named here; one that is
+/// not implemented yet must not be offered, which is a distinction a hand-written list cannot
+/// draw at all.
+fn harnesses() -> impl Iterator<Item = Harness> {
+    crate::harness::registry().iter().map(|h| h.kind())
+}
 
 /// Where a dispatched run's turn endings are announced, as `cide_agent_dispatch` spells it. (M40)
 ///
@@ -1248,10 +1267,11 @@ fn definition_properties(nullable: bool) -> Value {
             ),
         },
         "harness": {
-            // From `HARNESSES` through `harness_wire`, so the schema's enum is by construction
-            // the set `harness_from_wire` will accept. `STATUSES` states the rule.
+            // From the harness registry through `harness_wire`, so the schema's enum is by
+            // construction the set `harness_from_wire` will accept *and* the set a dispatch can
+            // actually run. `harnesses()` records what a hand-written list cost here.
             "type": kind("string"),
-            "enum": HARNESSES.iter().copied().map(harness_wire).collect::<Vec<_>>(),
+            "enum": harnesses().map(harness_wire).collect::<Vec<_>>(),
             "description": format!(
                 "Which CLI runs this role. Leave it out for the project's own default. A harness \
                  that is not installed on this machine makes the role undispatchable, and \
@@ -2676,6 +2696,8 @@ fn harness_wire(harness: Harness) -> &'static str {
     match harness {
         Harness::Claude => "claude",
         Harness::Opencode => "opencode",
+        Harness::Qwen => "qwen",
+        Harness::Codex => "codex",
     }
 }
 
@@ -2889,12 +2911,7 @@ fn nullable_harness(arguments: &Value, key: &str) -> Result<Field<Harness>, Stri
         Field::Value(text) => harness_from_wire(&text).map(Field::Value).ok_or_else(|| {
             format!(
                 "`{key}` must be one of {}, not `{}`",
-                HARNESSES
-                    .iter()
-                    .copied()
-                    .map(harness_wire)
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                harnesses().map(harness_wire).collect::<Vec<_>>().join(", "),
                 one_line(&text)
             )
         }),
@@ -4888,6 +4905,7 @@ mod tests {
             notify: RunNotify::Primary,
             stale_turn: false,
             note: None,
+            openable: false,
         }
     }
 
@@ -5802,8 +5820,57 @@ mod tests {
         for scope in SCOPES.iter().copied() {
             assert_eq!(scope_from_wire(scope_wire(scope)), Some(scope));
         }
-        for harness in HARNESSES.iter().copied() {
+        for harness in harnesses() {
             assert_eq!(harness_from_wire(harness_wire(harness)), Some(harness));
+        }
+    }
+
+    /// Every harness the wire knows is offered by every tool that takes one.
+    ///
+    /// # Why the list is written out here rather than read from `harnesses()`
+    ///
+    /// Because this is a check of `cide_ipc::Harness`'s variants *against* the schema, and a
+    /// list read out of the thing under test passes no matter what either of them says — which
+    /// is exactly how the bug this test exists for survived. `HARNESSES` was
+    /// `&[Claude, Opencode]`, `Qwen` landed on the wire, the round-trip test iterated the list
+    /// and agreed with it, and `cide_agent_update` refused `harness: "qwen"` from inside the
+    /// agent's own MCP client — before the call reached any code cide could have logged.
+    ///
+    /// `harness::tests::the_registry_answers_for_every_harness_the_wire_knows` is the same
+    /// pattern one layer down and says the same thing about why it is hand-written.
+    ///
+    /// Both tools are asserted, not one. They build their role properties from the same helper
+    /// today, and the moment that stops being true is the moment one of them silently offers
+    /// less than the other.
+    #[test]
+    fn every_harness_on_the_wire_is_offered_by_every_tool_that_takes_one() {
+        const EVERY: &[Harness] = &[
+            Harness::Claude,
+            Harness::Opencode,
+            Harness::Qwen,
+            Harness::Codex,
+        ];
+
+        let expected = json!(EVERY.iter().copied().map(harness_wire).collect::<Vec<_>>());
+        for name in [tool::AGENT_CREATE, tool::AGENT_UPDATE] {
+            assert_eq!(
+                input_schema(name)["properties"]["harness"]["enum"],
+                expected,
+                "{name} offers every harness — an agent cannot ask for one the schema omits, \
+                 because its own client refuses the call first"
+            );
+        }
+
+        // And the parser agrees, in both directions, for every one of them. The schema and the
+        // parser being one set is the whole rule; this is the half a schema alone cannot state.
+        for harness in EVERY.iter().copied() {
+            let wire = harness_wire(harness);
+            assert_eq!(harness_from_wire(wire), Some(harness));
+            assert_eq!(
+                nullable_harness(&json!({ "harness": wire }), "harness").unwrap(),
+                Field::Value(harness),
+                "`{wire}` parses as a harness a role can be given"
+            );
         }
     }
 

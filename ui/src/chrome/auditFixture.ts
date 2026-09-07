@@ -76,6 +76,7 @@ function auditTree(pane: string): Tab['tree'] {
         session: null,
         conversation: null,
         conversationSince: null,
+        continues: null,
         title: 'audit',
       },
     },

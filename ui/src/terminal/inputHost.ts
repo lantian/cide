@@ -179,6 +179,12 @@ export function attachInputProbe(
   // `stopPropagation()`. Registered the other way round the probe would report a textarea that
   // had just been cleared and would never see a swallowed event at all, which is the one
   // answer this probe must never be able to give.
+  //
+  // `key=` and `keyCode=` are what survived `keys/latin.ts` — the key gate's window listener
+  // runs before this one and rewrites a chord typed under a non-Latin layout to its US
+  // spelling — while `code=` is the raw physical fact. Under a Russian layout a Ctrl+Z logs
+  // `key="z" code=KeyZ keyCode=90`; `key="я" keyCode=0` on that line means the rewrite did not
+  // run, which is the first thing to check when a chord dies in one language only.
   on('keydown', (ev) => {
     log(
       `input ${tag} ${at()} keydown key=${JSON.stringify(ev.key)} code=${ev.code} ` +

@@ -56,7 +56,29 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { hydrationPlan, attachSequencer } = await import(`file://${join(out, 'attachModel.js')}`)
+  const { hydrationPlan, attachSequencer, historyRequest } = await import(
+    `file://${join(out, 'attachModel.js')}`
+  )
+
+  // --- historyRequest ------------------------------------------------------------------
+  //
+  // The mirror's scrollback is asked for only by a host with no transcript of its own; every
+  // other answer paints the history twice. (M42)
+  eq(
+    historyRequest({ hydrated: false, savedScrollback: false }),
+    true,
+    'a fresh host with nothing parked asks for the history — a run opened mid-way gets its transcript',
+  )
+  eq(
+    historyRequest({ hydrated: false, savedScrollback: true }),
+    false,
+    'an evicted host replays its own buffer and must not be handed the mirror’s copy too',
+  )
+  eq(
+    historyRequest({ hydrated: true, savedScrollback: false }),
+    false,
+    'a hydrated host already holds the transcript',
+  )
 
   // --- hydrationPlan -------------------------------------------------------------------
 

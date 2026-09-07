@@ -1240,6 +1240,8 @@ pub fn harness_from_str(value: &str) -> Option<Harness> {
     match value {
         "claude" => Some(Harness::Claude),
         "opencode" => Some(Harness::Opencode),
+        "qwen" => Some(Harness::Qwen),
+        "codex" => Some(Harness::Codex),
         _ => None,
     }
 }
@@ -1249,6 +1251,8 @@ pub fn harness_name(harness: Harness) -> &'static str {
     match harness {
         Harness::Claude => "claude",
         Harness::Opencode => "opencode",
+        Harness::Qwen => "qwen",
+        Harness::Codex => "codex",
     }
 }
 
@@ -1284,6 +1288,8 @@ pub fn harness_binary(harness: Harness) -> &'static str {
     match harness {
         Harness::Claude => "claude",
         Harness::Opencode => "opencode",
+        Harness::Qwen => "qwen",
+        Harness::Codex => "codex",
     }
 }
 
@@ -3188,12 +3194,28 @@ Work one task at a time.
     /// role is then greyed with a sentence rather than dispatched into a `for_kind` that comes
     /// back empty three layers down, after a git worktree has already been cut.
     ///
+    /// Every variant of the wire enum, written out by hand.
+    ///
+    /// By hand and never derived, for the reason
+    /// `harness::tests::the_registry_answers_for_every_harness_the_wire_knows` states: this is a
+    /// check of `cide_ipc::Harness` *against* this module, and a list read out of the thing under
+    /// test agrees with it no matter what it says. Both loops below used to spell
+    /// `[Claude, Opencode]` inline, so when `Qwen` arrived neither `implemented(Qwen)` nor
+    /// `harness_from_str("qwen")` was checked by anything — and the identical omission in
+    /// `tools.rs` was a harness an agent could not ask for.
+    const EVERY_HARNESS: &[Harness] = &[
+        Harness::Claude,
+        Harness::Opencode,
+        Harness::Qwen,
+        Harness::Codex,
+    ];
+
     /// The second half is read straight off the two functions rather than through a catalog,
     /// because the claim is about the wording each one owns: a future edit that made them agree
     /// would put a user who cannot act in front of an instruction.
     #[test]
     fn the_build_and_the_machine_get_different_sentences() {
-        for harness in [Harness::Claude, Harness::Opencode] {
+        for harness in EVERY_HARNESS.iter().copied() {
             assert_eq!(
                 implemented(harness),
                 None,
@@ -3539,7 +3561,7 @@ Work one task at a time.
     /// The harness spellings are the wire's, in both directions, so a file and a DTO agree.
     #[test]
     fn harness_names_round_trip() {
-        for harness in [Harness::Claude, Harness::Opencode] {
+        for harness in EVERY_HARNESS.iter().copied() {
             assert_eq!(harness_from_str(harness_name(harness)), Some(harness));
             assert_eq!(
                 serde_json::to_string(&harness).unwrap(),

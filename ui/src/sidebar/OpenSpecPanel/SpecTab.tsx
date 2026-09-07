@@ -1115,16 +1115,26 @@ function ChangeTab({
       }
     }
     /*
-     * On `window`, in the **capture** phase, and this is the whole of why the first version did
-     * nothing.
+     * On `document`, in the **capture** phase, and each half of that is a bug the other
+     * version had.
      *
-     * It listened on the page's own element, which only sees an event that bubbles *through* it —
-     * and a click on prose leaves focus on `document.body`, so the keydown never went near the
-     * page. Capture on the window sees it wherever focus is, and `active` is what keeps it from
-     * being a global binding, which `cide_core::keymap` has a test forbidding.
+     * Capture, because the first version listened on the page's own element, which only sees an
+     * event that bubbles *through* it — and a click on prose leaves focus on `document.body`, so
+     * the keydown never went near the page. Capture sees it wherever focus is, and `active` is
+     * what keeps it from being a global binding, which `cide_core::keymap` has a test forbidding.
+     *
+     * `document` rather than `window`, because the key gate's listener is on `window` in capture
+     * (`keys/gate.ts`) and is what rewrites a chord typed under a non-Latin layout to its US
+     * spelling (`keys/latin.ts`) — `event.key` is `а` until it runs, and this handler compares
+     * against `'f'`. Listeners on one target fire in registration order, and this effect belongs
+     * to a component *below* `App`, so with the tab active at first paint React ran it first and
+     * the second version saw `а`; on the next re-run it was registered after the gate and saw
+     * `f`. Order-dependent, with nothing on screen to say so. Document capture runs after every
+     * window-capture listener whatever the order they were added in, and still sees the keystroke
+     * wherever focus is.
      */
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
+    document.addEventListener('keydown', onKey, true)
+    return () => document.removeEventListener('keydown', onKey, true)
   }, [active, find])
 
   /*

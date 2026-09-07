@@ -56,6 +56,21 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
     let (kind, suffix) = match intent {
         SplitIntent::NewClaude | SplitIntent::ForkPrimary => (PaneKind::Claude, "claude"),
         SplitIntent::Mirror { .. } | SplitIntent::Resume { .. } => (PaneKind::Claude, "claude"),
+        // The kind follows the harness, and there is deliberately no `PaneKind` for an agent
+        // (see `AgentsPanel/openRun.ts` for the six-module argument). A `claude` conversation
+        // re-opened is a Claude pane in every respect — hooks, the awaiting model, `claude.fork`
+        // and friends. An opencode TUI is a program in a terminal, which is what a Shell pane
+        // is: no hooks, the job watch (suppressed for a fullscreen TUI), a plain restart bar.
+        SplitIntent::Continue { conversation } => match conversation.harness {
+            cide_ipc::Harness::Claude => (PaneKind::Claude, "claude"),
+            cide_ipc::Harness::Opencode => (PaneKind::Shell, "opencode"),
+            // A Qwen Code TUI is `claude`'s shape without cide's hooks: a program in a
+            // terminal, so a Shell-kind pane like opencode's. (M43)
+            cide_ipc::Harness::Qwen => (PaneKind::Shell, "qwen"),
+            // A codex conversation re-opened is `codex resume <id>`: opencode's shape, a
+            // program in a terminal. (M44)
+            cide_ipc::Harness::Codex => (PaneKind::Shell, "codex"),
+        },
         SplitIntent::Shell => (PaneKind::Shell, "bash"),
     };
     Pane {
@@ -70,7 +85,19 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // `claude --session-id`, so keeping it is what makes `--resume` continue the same
         // transcript and keeps every record naming that conversation correct.
         session: match intent {
-            SplitIntent::Mirror { session } | SplitIntent::Resume { session } => Some(*session),
+            SplitIntent::Mirror { session, .. } | SplitIntent::Resume { session } => Some(*session),
+            // A `claude` conversation's id *is* a session id, and `session_spawn` keeps it
+            // (`--resume` under the same uuid), so the row holds it before the spawn for the
+            // reason the test below states. An opencode `ses_…` is not one, and that pane's
+            // session is minted at the spawn and bound afterwards like a plain split's.
+            SplitIntent::Continue { conversation } => match conversation.harness {
+                cide_ipc::Harness::Claude => conversation.id.trim().parse().ok(),
+                // A uuid too, but not a *claude* session: `agent_rpc` scopes Claude panes by it
+                // and a qwen TUI is not one, so it is bound at the spawn like a shell's.
+                cide_ipc::Harness::Opencode
+                | cide_ipc::Harness::Qwen
+                | cide_ipc::Harness::Codex => None,
+            },
             _ => None,
         },
         // A mirror shows the same child as its source, so the CLI's conversation for it is
@@ -78,6 +105,14 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // frame rather than copying a value that may be a turn out of date.
         conversation: None,
         conversation_since: None,
+        // What the pane keeps for later — see `Pane::continues`. A mirror of a run carries
+        // the run's conversation so the pane can re-open it once the child ends; a
+        // continuation *is* one.
+        continues: match intent {
+            SplitIntent::Mirror { continues, .. } => continues.clone(),
+            SplitIntent::Continue { conversation } => Some(conversation.clone()),
+            _ => None,
+        },
         title: format!("{project_name} : {suffix}"),
     }
 }
@@ -378,6 +413,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: "cide : claude".into(),
         };
         let mut tree = new_tree(first);
@@ -482,12 +518,81 @@ mod tests {
         assert_eq!(resumed.session, Some(session));
         assert_eq!(resumed.kind, PaneKind::Claude);
 
-        let mirrored = pane_for(&SplitIntent::Mirror { session }, "cide");
+        let mirrored = pane_for(
+            &SplitIntent::Mirror {
+                session,
+                continues: None,
+            },
+            "cide",
+        );
         assert_eq!(mirrored.session, Some(session));
         assert_eq!(mirrored.kind, PaneKind::Claude);
+        assert!(mirrored.continues.is_none());
 
         // And the pane a plain split makes is still session-less, which is the case above.
         assert!(pane_for(&SplitIntent::NewClaude, "cide").session.is_none());
+    }
+
+    /// A continued conversation is a pane of its harness's kind, holding what it needs to
+    /// re-open the conversation later — and, for `claude`, its session before the spawn, for
+    /// the reason the test above states. (M42)
+    #[test]
+    fn a_continued_conversation_is_a_pane_of_its_harness_kind() {
+        use cide_ipc::{Harness, HarnessSession};
+
+        let session = cide_ipc::SessionId::new();
+        let claude = HarnessSession {
+            harness: Harness::Claude,
+            id: session.to_string(),
+            cwd: std::path::PathBuf::from("/work/p/.cide/worktrees/developer-t-1"),
+        };
+        let pane = pane_for(
+            &SplitIntent::Continue {
+                conversation: claude.clone(),
+            },
+            "cide",
+        );
+        assert_eq!(pane.kind, PaneKind::Claude);
+        assert_eq!(
+            pane.session,
+            Some(session),
+            "the id is the session, held before the spawn"
+        );
+        assert_eq!(pane.continues.as_ref(), Some(&claude));
+        assert_eq!(pane.title, "cide : claude");
+
+        let opencode = HarnessSession {
+            harness: Harness::Opencode,
+            id: "ses_0123abc".into(),
+            cwd: std::path::PathBuf::from("/work/p"),
+        };
+        let pane = pane_for(
+            &SplitIntent::Continue {
+                conversation: opencode.clone(),
+            },
+            "cide",
+        );
+        assert_eq!(
+            pane.kind,
+            PaneKind::Shell,
+            "an opencode TUI is a program in a terminal"
+        );
+        assert!(
+            pane.session.is_none(),
+            "an opencode id is not a session id; the spawn mints one"
+        );
+        assert_eq!(pane.continues.as_ref(), Some(&opencode));
+        assert_eq!(pane.title, "cide : opencode");
+
+        // A mirror of a run keeps the run's conversation for the same later.
+        let mirrored = pane_for(
+            &SplitIntent::Mirror {
+                session,
+                continues: Some(claude.clone()),
+            },
+            "cide",
+        );
+        assert_eq!(mirrored.continues.as_ref(), Some(&claude));
     }
 
     #[test]

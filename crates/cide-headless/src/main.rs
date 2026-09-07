@@ -1281,6 +1281,7 @@ mod tests {
             session: session.then(SessionId::new),
             conversation: None,
             conversation_since: None,
+            continues: None,
             title: title.into(),
         }
     }

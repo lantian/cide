@@ -279,6 +279,167 @@ pub async fn agents_draft(
     .await
 }
 
+/// What the role form may offer in its **Model** box, for one harness. (M43)
+///
+/// # Why this is a command and not a constant
+///
+/// Because for opencode the answer is a property of the user's machine: `opencode models` lists
+/// whatever providers they have configured and authenticated, and a compiled-in menu would be
+/// wrong in both directions — offering models they cannot reach, and omitting every local one
+/// they can. `AgentModels` carries the argument in full.
+///
+/// Claude Code has no such command, so its harness answers with the aliases and says so. Both
+/// roads end in the same shape, which is the point of asking the harness rather than matching on
+/// the enum here — `cide_agents::harness::Harness::models` is defaulted to an empty list, so a
+/// harness nobody has taught to enumerate degrades to exactly the free-text box that exists
+/// today rather than to a compile error in this file.
+///
+/// # `problem` rather than `Err`
+///
+/// A missing `opencode` is not a failure of this call; it is a fact about the machine, and the
+/// form must still draw a Model box the user can type into. So the sentence rides in the
+/// payload and the `Err` channel is left for what it is for — a worker that did not come back.
+/// `AgentModels::problem` states the same rule from the other side.
+///
+/// # It forks, so it goes to the pool
+///
+/// `blocking`, for that helper's stated reason, and the root is resolved on the caller's thread
+/// so no workspace guard crosses the await. A project with no roots probes with no cwd rather
+/// than refusing: the models a harness can offer are mostly a property of the machine, and
+/// answering "this project has no roots" to somebody choosing a model would be an error about
+/// something they did not ask.
+/// This project's local agent overrides — harness, pool, model, per role. (M45)
+///
+/// Global-ish state read from the profile's config directory rather than the project, so it
+/// answers for a project that is open without touching the checkout. Never fails: an absent or
+/// unreadable file is an empty set, which `cide_core::persist::load_agent_overrides` states at
+/// length and which is the right answer rather than a degraded one.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn agent_overrides_get(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<cide_ipc::ProjectOverrides> {
+    let root = project_root(&state, project)?;
+    blocking(move || {
+        let all =
+            cide_core::persist::load_agent_overrides(&cide_core::persist::agent_overrides_path());
+        Ok(all.project(&root.to_string_lossy()))
+    })
+    .await
+}
+
+/// Replace this project's overrides, and answer what was stored.
+///
+/// **Whole-project, not per row.** The screen holds one small table and sends it back entire, for
+/// `SettingsPatch`'s reason one file over: a per-row command would need a delete verb, an
+/// ordering, and a story about two windows editing the same table — where a whole-table write has
+/// none of those and the file is a few hundred bytes.
+///
+/// An override that says nothing is **kept**, not dropped. `LlmSettings::cleaned`'s lesson: the
+/// webview redraws from what Rust stored, so a row the backend discards is a row the user can
+/// never open and fill in. `overrides::resolve` skips an empty one at the point of use.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn agent_overrides_set(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    overrides: cide_ipc::ProjectOverrides,
+) -> Result<cide_ipc::ProjectOverrides> {
+    let root = project_root(&state, project)?;
+    blocking(move || {
+        let path = cide_core::persist::agent_overrides_path();
+        let mut all = cide_core::persist::load_agent_overrides(&path);
+        let key = root.to_string_lossy().to_string();
+        // A project whose whole table is empty is removed rather than stored as an empty object,
+        // so the file does not accumulate a row per project ever opened. That is safe where
+        // dropping a *row* is not: nothing is being edited here, the user has cleared it.
+        match overrides.all.is_empty() && overrides.roles.is_empty() {
+            true => {
+                all.projects.remove(&key);
+            }
+            false => {
+                all.projects.insert(key.clone(), overrides.clone());
+            }
+        }
+        cide_core::persist::save_agent_overrides(&path, &all).map_err(|error| {
+            CoreError::Io(format!("the overrides could not be written: {error}"))
+        })?;
+        Ok(all.project(&key))
+    })
+    .await
+}
+
+/// Does this provider/model actually answer? One very small real turn. (M45)
+///
+/// **It spends quota**, which is why it is a button the user presses rather than anything
+/// automatic, and why the screen says so beside it. Listing a model id proves only that opencode
+/// *resolved* it: a wrong key, an endpoint that accepts connections and refuses completions, a
+/// retired model and an expired plugin OAuth all list perfectly and fail on the first token.
+///
+/// Answers a verdict rather than rejecting, for [`cide_ipc::LlmModelTest`]'s stated reason, and
+/// forks on the pool for `agents_models`' below.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn llm_test_model(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    model: String,
+) -> Result<cide_ipc::LlmModelTest> {
+    let root = project_root(&state, project).ok();
+    // Read on the caller's thread, like `agents_models` beside it, so no workspace guard crosses
+    // the await. The document handed to the test is the one a run gets.
+    let llm = state.with(|ws| Ok::<_, CoreError>(ws.settings.llm.clone()))?;
+    blocking(move || {
+        let (ok, detail) =
+            match cide_agents::harness::opencode::test_model(root.as_deref(), &llm, &model) {
+                Ok(detail) => (true, detail),
+                Err(detail) => (false, detail),
+            };
+        Ok(cide_ipc::LlmModelTest { model, ok, detail })
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn agents_models(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    harness: cide_ipc::Harness,
+) -> Result<cide_ipc::agents::AgentModels> {
+    let root = project_root(&state, project).ok();
+    // Read on the caller's thread, like `root`, so no workspace guard crosses the await —
+    // `crate::agents::facts` takes the same lock for the same reason. Without it the probe would
+    // list only the providers the user configured by hand, and cide's own would be invisible in
+    // the very dialog where a model is chosen. (M45)
+    let llm = state.with(|ws| Ok::<_, CoreError>(ws.settings.llm.clone()))?;
+    blocking(move || {
+        // The registry is the same lookup the dispatch makes, so this cannot answer for a
+        // harness the fork would refuse — `defs::implemented` makes the identical argument
+        // against matching on the enum in a second place.
+        let Some(implementation) = cide_agents::harness::for_kind(harness) else {
+            return Ok(cide_ipc::agents::AgentModels {
+                harness,
+                models: Vec::new(),
+                // `defs::implemented` answers the same question the `for_kind` miss just
+                // answered, and it owns the sentence. Asking it rather than writing a second one
+                // is what keeps a greyed role in the panel and this dialog saying one thing.
+                problem: defs::implemented(harness),
+            });
+        };
+        Ok(match implementation.models(root.as_deref(), &llm) {
+            Ok(models) => cide_ipc::agents::AgentModels {
+                harness,
+                models,
+                problem: None,
+            },
+            Err(problem) => cide_ipc::agents::AgentModels {
+                harness,
+                models: Vec::new(),
+                problem: Some(problem),
+            },
+        })
+    })
+    .await
+}
+
 /// Write one role's definition file, and tell every window what the project looks like now.
 ///
 /// Creates, edits, renames and moves between scopes — all four are one call, because all four are
@@ -492,6 +653,38 @@ pub async fn agents_resume(
     run: Option<RunId>,
 ) -> Result<()> {
     Arc::clone(&agents).resume(&app, project, run)
+}
+
+/// What pressing **Open** on a run should do. (M42)
+///
+/// A *query*, never a pane. The pane is built by the frontend through the split machinery with
+/// the intent this answers — `SplitIntent::Mirror` for a live child, `SplitIntent::Continue`
+/// for the real harness re-opened on the conversation — for the reason recorded below at the
+/// note on the deleted `agent_open_pane`: a pane built by a command has no spawn plan, and the
+/// ownership flag that stops closing the pane from killing somebody else's child is set from the
+/// plan. The three answers, and the ladder that picks one, are [`AgentRegistry::open_plan`]'s;
+/// this reads the root and the `--resume` switch off the workspace and hands over the session
+/// registry, which is where "is the child alive" is answered.
+///
+/// `async` for [`agents_stop`]'s reason: a synchronous command is polled on the GTK loop, and
+/// this takes a lock the hook thread also takes.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn agents_run_open(
+    agents: State<'_, Arc<AgentRegistry>>,
+    sessions: State<'_, crate::state::SessionRegistry>,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    run: RunId,
+) -> Result<cide_ipc::RunOpen> {
+    let (root, resume_enabled) = state.with(|ws| {
+        let root = workspace::project(ws, project)?
+            .roots
+            .first()
+            .map(|root| root.path.clone())
+            .ok_or(CoreError::NoRoots)?;
+        Ok::<_, CoreError>((root, ws.settings.claude.cli.inject.resume.enabled))
+    })?;
+    agents.open_plan(project, run, &sessions, &root, resume_enabled)
 }
 
 /// Take the stale-turn offer and re-send the run's last dispatched prompt.
