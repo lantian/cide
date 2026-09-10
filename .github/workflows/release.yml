@@ -541,8 +541,14 @@ jobs:
       # running `git archive` produce files with the same name whose gzip layers differ, and
       # whichever upload lost would leave a published checksum matching neither.
       #
-      # No signing secrets are set, so the preflight warns twice and continues, and the
-      # release notes say what an unsigned .dmg does on a machine that downloaded it.
+      # No signing secrets are set, so the bundle is signed with the ad-hoc identity the
+      # overlay names (`bundle.macOS.signingIdentity: "-"` in tauri.macos.conf.json) and not
+      # notarised; the preflight says so and the release notes say what that does on a
+      # machine that downloaded it. It was not always so: 0.8.0 shipped with no identity
+      # anywhere, tauri-bundler *skips* signing in that case rather than sealing ad-hoc, and
+      # the bundle failed Gatekeeper's integrity check outright — "cide is damaged and can't
+      # be opened", Move to Trash the only button. An ad-hoc seal is what turns that into the
+      # "Apple could not verify" dialog, which System Settings lets a user open anyway.
       - name: cargo xtask package --dmg --run
         run: cargo --locked xtask package --dmg --run
 
@@ -642,7 +648,7 @@ jobs:
                 *-linux-*.tar.gz)
                   what="Linux, extract and run. Needs WebKitGTK 4.1 already installed; put \`bin/\` on your \`PATH\` so the desktop entry can find \`cide\`." ;;
                 *.dmg)
-                  what="macOS 11+. **Unsigned** — see below." ;;
+                  what="macOS 11+. **Ad-hoc signed, not notarised** — see below." ;;
                 *-src.tar.gz)
                   what="The source at this tag. \`git archive\`, so its sha256 is reproducible from the tag; the binaries' are not." ;;
                 SHA256SUMS)
@@ -653,9 +659,11 @@ jobs:
               echo "| \`$name\` | $size | $what |"
             done
             echo
-            echo "The \`.dmg\` is not notarised, so a downloaded copy is quarantined and macOS reports"
-            echo "it as damaged rather than as unidentified; \`xattr -dr com.apple.quarantine\` on the"
-            echo "app clears it. Nothing here self-updates yet — no updater endpoint is configured."
+            echo "The \`.dmg\` is signed ad-hoc and not notarised, so the first launch of a downloaded copy"
+            echo "says *Apple could not verify \"cide\" is free of malware*. Click Done, open **System Settings"
+            echo "› Privacy & Security**, scroll to the *Security* section and click **Open Anyway** next to"
+            echo "cide (right-click › Open no longer offers this on macOS 15 and later). Once is enough."
+            echo "Nothing here self-updates yet — no updater endpoint is configured."
             echo
             cat notes/changelog.md
           } > notes/notes.md

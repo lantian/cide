@@ -18,6 +18,55 @@ For the current shape of the project see [`../README.md`](../README.md); for wha
 not exist off Linux see [`platforms.md`](platforms.md); for the decisions a refactor would
 otherwise undo see [`adr/`](adr/).
 
+## The 0.8.0 `.dmg` opens to "damaged", and what is not verified
+
+> *"I've downloaded cide_0.8.0_aarch64.dmg from github (CI build) and it's broken — need to
+> understand why we building broken dmg in CI."*
+
+It was not broken as a build. The bundle inside it was a correct release build — arm64, the Vite
+bundle embedded, all three sidecars present and answering `--version` — and launched under a
+throwaway profile it opened its window and completed the IPC handshake. What it lacked was a
+signature. The macOS job sets no signing secrets, and `tauri-bundler` with no identity to
+resolve **skips signing altogether**; it does not fall back to an ad-hoc seal. So the bundle
+carried nothing but the linker's per-binary ad-hoc stamps and no `_CodeSignature/CodeResources`
+at all, and both `codesign --verify` and `spctl --assess` answered the same sentence: *code has
+no resources but signature indicates they must be present*. Gatekeeper renders that as **"cide is
+damaged and can't be opened"** with *Move to Trash* as the only button. The preflight had
+predicted this in a comment ("nobody has run this"), warned about it on every build, and the
+release notes told the user to `xattr -dr com.apple.quarantine` — an accurate description of the
+outcome, written instead of the fix.
+
+The fix is one character. `crates/cide-app/tauri.macos.conf.json` now names
+`bundle.macOS.signingIdentity: "-"`, codesign's ad-hoc identity; `tauri-macos-sign` passes it
+through as `codesign --force -s - --options runtime`, signs the sidecars inside-out and then the
+bundle, and with no `APPLE_ID` set logs *skipping app notarization* and carries on. The shipped
+0.8.0 bundle re-signed by hand exactly that way passes `codesign --verify --strict --deep`,
+satisfies its designated requirement, and — quarantined with a Safari attribute — gets the
+ordinary *"Apple could not verify"* dialog, which System Settings › Privacy & Security follows
+with **Open Anyway**. Not notarised on either road; only the second is walkable without a
+terminal. `APPLE_SIGNING_IDENTITY` in the environment outranks the overlay, as `tauri-cli` ranks
+them, so a Mac with a real certificate is not held to it.
+
+The preflight learned the ladder. With nothing in the environment and `-` in the overlay it is
+an `[ok]` that quotes the dialog an ad-hoc seal produces; with a named identity it is `[ok]` plus
+the notarisation warning; with nothing anywhere it is the old `[warn]`, now saying that this is
+what 0.8.0 shipped as and naming the way back. One new `[fail]`: `APPLE_CERTIFICATE` set without
+`APPLE_SIGNING_IDENTITY`, because the bundler checks that the imported certificate's *name
+contains* the configured identity, a Developer ID name has no dash in it, and the refusal
+otherwise arrives after the `.app` is built. `the_checked_in_overlay_signs_ad_hoc` asserts the
+key against the real file, because removing it fails no build anywhere — the `.dmg` uploads and
+the first person to find out is whoever downloads it. The release notes and `docs/platforms.md`
+now describe the Open Anyway road rather than the `xattr` one.
+
+**What is not verified.** No `.dmg` has been built by `cargo tauri build` with this key: the
+seal was checked by re-signing the shipped bundle by hand, `--options runtime` included, and
+launching the result for fifteen seconds under a throwaway profile — window up, IPC handshake,
+login-shell PATH probe, clean shutdown. That the bundler's own invocation produces the same seal
+rests on reading `tauri-macos-sign` 2.3.4, not on a run. The Gatekeeper *dialog* was never
+clicked through either: `spctl`'s verdict moved from the integrity failure to the plain
+`rejected` every non-notarised app gets, which is the difference between the two sentences, but
+nobody has yet seen Open Anyway appear for cide. The next release is that test.
+
 ## Dispatch without a task, and where a run reports (M40), and what is not verified
 
 > *"Main agent can not start subagent without a task — task is a required field in the MCP tool.

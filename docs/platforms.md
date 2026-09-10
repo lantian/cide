@@ -641,14 +641,26 @@ What no amount of configuration can do:
 * **Notarisation needs a paid Apple Developer Program membership** ($99/yr) for a Developer ID
   Application certificate. A free Apple ID yields a local-run-only certificate that cannot be
   notarised.
-* **Without notarisation a downloaded `.dmg` is quarantined** and Gatekeeper refuses it as
-  *"damaged and can't be opened"* — which blames the download, not the signature — until the
-  user runs `xattr -dr com.apple.quarantine`. The preflight says so in as many words.
+* **Without notarisation a downloaded `.dmg` is quarantined**, and which dialog Gatekeeper
+  then shows depends on whether it can *verify* the bundle, not on whether it trusts it. The
+  0.8.0 `.dmg` was built with no identity anywhere, and `tauri-bundler` then skips signing
+  entirely — no fallback — so the bundle had nothing but the linker's per-binary stamps and no
+  resource seal; `spctl` said *"code has no resources but signature indicates they must be
+  present"* and macOS said *"damaged and can't be opened"*, blaming the download, with Move to
+  Trash as the only button and `xattr -dr com.apple.quarantine` the only way through. The
+  overlay now names `bundle.macOS.signingIdentity: "-"`, codesign's ad-hoc identity: the same
+  bundle re-signed that way passes `codesign --verify --strict --deep`, satisfies its designated
+  requirement, and gets the ordinary *"Apple could not verify"* dialog with **Open Anyway** in
+  System Settings › Privacy & Security. Checked on this Mac by re-signing the shipped 0.8.0
+  bundle by hand, `--options runtime` included, and launching it under a throwaway profile.
+  `APPLE_SIGNING_IDENTITY` in the environment outranks the overlay, so a real certificate is
+  unaffected — except that `APPLE_CERTIFICATE` *without* it now trips the bundler's
+  name-contains-identity check against `-`, which the preflight fails on before the build.
 * **The updater is a third artefact.** `tauri-plugin-updater`'s macOS channel is an
   `.app.tar.gz`, not the `.dmg`; and no `plugins.updater` is configured on any platform yet.
 
-An unsigned or ad-hoc-signed `.app` and `.dmg` that run locally are entirely buildable, and
-that is the honest first target.
+An ad-hoc-signed `.app` and `.dmg` that run locally and open from a download after one trip
+through System Settings are entirely buildable, and that is the honest first target.
 
 **The icon set is left one raster short, knowingly.** The overlay carries its own `bundle.icon`
 list because the platform merge *replaces* the array rather than extending it, and the macOS
