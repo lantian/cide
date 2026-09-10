@@ -550,6 +550,12 @@ pub struct AppInfo {
     /// invocation, so a sidecar key here would break `cargo build --workspace` there while
     /// leaving Linux green — a red build on the one platform nobody here can reproduce.
     pub macos_external_bin: Vec<String>,
+    /// `bundle.macOS.signingIdentity` from `TAURI_MACOS_CONF`. Checked in as `"-"`, codesign's
+    /// ad-hoc identity, and that one character is the difference between two Gatekeeper
+    /// dialogs — see [`signing_verdicts`]. `APPLE_SIGNING_IDENTITY` in the environment outranks
+    /// it (`tauri-cli` reads the variable first and the config second), so a Mac with a real
+    /// certificate is not held to it.
+    pub macos_signing_identity: Option<String>,
     /// `build.beforeBuildCommand` from `TAURI_CONF` — the frontend build `cargo tauri build`
     /// runs before it compiles anything. `None` when the config configures none.
     pub before_build: Option<BeforeBuild>,
@@ -2273,14 +2279,30 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
 const MACOS_SIGNING_VARS: [&str; 2] = ["APPLE_SIGNING_IDENTITY", "APPLE_CERTIFICATE"];
 const MACOS_NOTARY_VARS: [&str; 3] = ["APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID"];
 
+/// `codesign -s -`: sign with no certificate at all. The seal is still a seal — every Mach-O
+/// gets a code directory and the bundle gets `_CodeSignature/CodeResources` — it just names
+/// nobody, so Gatekeeper cannot notarise or trust it, only *verify* it.
+///
+/// That verification is the whole point. The first published `.dmg` (0.8.0) was built with no
+/// identity anywhere, and `tauri-bundler` then skips signing outright rather than falling back
+/// to this — so the bundle carried nothing but the linker's per-binary ad-hoc stamps and no
+/// resource seal at all. `spctl` answered *"code has no resources but signature indicates they
+/// must be present"*, which Gatekeeper renders as **"cide is damaged and can't be opened"** with
+/// *Move to Trash* as the only button. The same bundle re-signed with this identity verifies
+/// (`codesign --verify --strict --deep` passes, the designated requirement is satisfied) and a
+/// quarantined copy gets the ordinary **"Apple could not verify"** dialog instead, which System
+/// Settings › Privacy & Security lets the user open anyway. Neither road is notarised; only
+/// the second is walkable without a terminal.
+const ADHOC_IDENTITY: &str = "-";
+
 /// The macOS-only preflight: the overlay, the sidecar rule that applies there, and signing.
 ///
-/// **Every verdict here was written from `tauri-utils`' schema and `tauri-bundler`'s macOS
-/// bundler, not from a build.** Nobody has run this. It is still worth having, because the two
-/// things it catches are both silent: a `.app` built with no code signature at all, which
-/// downloads with a quarantine bit and refuses to open with *"cide is damaged and can't be
-/// opened"* — a message that blames the download rather than the missing signature — and an
-/// overlay key that would break `cargo build` on a Mac while leaving Linux green.
+/// **Most verdicts here were written from `tauri-utils`' schema and `tauri-bundler`'s macOS
+/// bundler, not from a build.** The signing ones are the exception since 0.8.0: that release's
+/// `.dmg` was the unsigned case, and the ad-hoc road was checked by re-signing its bundle by
+/// hand and assessing both with `spctl` (see [`ADHOC_IDENTITY`]). The rest is still worth
+/// having, because what it catches is silent: an overlay key that would break `cargo build` on
+/// a Mac while leaving Linux green.
 fn macos_checks(info: &AppInfo) -> Vec<Verdict> {
     let mut out = Vec::new();
 
@@ -2320,6 +2342,7 @@ fn macos_checks(info: &AppInfo) -> Vec<Verdict> {
             .into_iter()
             .filter(|v| std::env::var_os(v).is_none())
             .collect::<Vec<_>>(),
+        info.macos_signing_identity.as_deref(),
     ));
 
     // The updater's macOS channel is a different artefact from the `.dmg`. Worth one line
@@ -2342,30 +2365,87 @@ fn macos_checks(info: &AppInfo) -> Vec<Verdict> {
 /// verdict makes the test that checks the wording pass or fail depending on whose machine it
 /// runs on, and a signing certificate on a developer's Mac is exactly the case where a wrong
 /// message costs the most.
-fn signing_verdicts(configured: &[&str], notary_unset: &[&str]) -> Vec<Verdict> {
+///
+/// `configured` is which of [`MACOS_SIGNING_VARS`] the environment sets, `notary_unset` which
+/// of [`MACOS_NOTARY_VARS`] it does not, and `config_identity` is `bundle.macOS.signingIdentity`
+/// from the overlay — [`ADHOC_IDENTITY`] as checked in. The environment outranks the file
+/// exactly as `tauri-cli` ranks them, so the ladder is: a certificate in the environment, then
+/// whatever the overlay names, then nothing.
+fn signing_verdicts(
+    configured: &[&str],
+    notary_unset: &[&str],
+    config_identity: Option<&str>,
+) -> Vec<Verdict> {
     let mut out = Vec::new();
-    out.push(if configured.is_empty() {
-        // A warning and not a failure, deliberately. An unsigned local build is a legitimate
-        // thing to want and is the only thing available without a paid Apple Developer Program
-        // membership; refusing it would make this task unusable for the first Mac build, which
-        // is the one that matters most.
-        Verdict::Warn(format!(
-            "none of {MACOS_SIGNING_VARS:?} is set, so the bundle will be unsigned. It runs \
-             locally, but a downloaded copy is quarantined and Gatekeeper reports it as damaged \
-             rather than as unidentified; a user has to `xattr -dr com.apple.quarantine` it. A \
-             Developer ID certificate needs a paid Apple Developer Program membership"
-        ))
-    } else {
-        Verdict::Ok(format!(
+    let adhoc_in_config = config_identity == Some(ADHOC_IDENTITY);
+
+    if !configured.is_empty() {
+        out.push(Verdict::Ok(format!(
             "code signing configured via {}",
             configured.join(", ")
-        ))
-    });
+        )));
+
+        // The one way the overlay's `"-"` can hurt a real certificate. `tauri-bundler` imports
+        // `APPLE_CERTIFICATE` into a throwaway keychain and then checks that the certificate's
+        // name *contains* the configured identity; with no `APPLE_SIGNING_IDENTITY` the
+        // identity is the overlay's `-`, and a Developer ID name has no dash in it, so the
+        // bundler refuses with "does not match provided identity" — after the `.app` is built,
+        // minutes in. Said here, before anything is compiled.
+        if adhoc_in_config
+            && configured.contains(&"APPLE_CERTIFICATE")
+            && !configured.contains(&"APPLE_SIGNING_IDENTITY")
+        {
+            out.push(Verdict::Fail(format!(
+                "APPLE_CERTIFICATE is set but APPLE_SIGNING_IDENTITY is not, and \
+                 {TAURI_MACOS_CONF} names the ad-hoc identity `{ADHOC_IDENTITY}`. tauri-bundler \
+                 checks that the imported certificate's name contains the configured identity, \
+                 so it would refuse the certificate after building the .app. Set \
+                 APPLE_SIGNING_IDENTITY to the certificate's name (`Developer ID Application: \
+                 …`); the environment outranks the overlay"
+            )));
+        }
+    } else if adhoc_in_config {
+        // Not a warning: this is the configured, deliberate outcome of a build with no
+        // certificate, and the one that produces a bundle Gatekeeper can *verify*. What a
+        // downloaded copy then says is worth spelling out, because it is a different sentence
+        // from the unsigned one and the release notes quote it.
+        out.push(Verdict::Ok(format!(
+            "none of {MACOS_SIGNING_VARS:?} is set, so the bundle is ad-hoc signed \
+             ({TAURI_MACOS_CONF} names signingIdentity `{ADHOC_IDENTITY}`): every binary and \
+             the bundle carry a seal Gatekeeper can verify. A downloaded copy is quarantined \
+             and says \"Apple could not verify\", and System Settings › Privacy & Security \
+             offers Open Anyway. An ad-hoc signature cannot be notarised; removing the dialog \
+             altogether needs a Developer ID certificate, which needs a paid Apple Developer \
+             Program membership"
+        )));
+    } else if let Some(identity) = config_identity {
+        out.push(Verdict::Ok(format!(
+            "code signing configured via {TAURI_MACOS_CONF} signingIdentity {identity:?}"
+        )));
+    } else {
+        // A warning and not a failure, deliberately. An unsigned local build is a legitimate
+        // thing to want; refusing it would make this task unusable for a Mac build that has
+        // edited the overlay for a reason. But it is the 0.8.0 outcome, so it says so — and
+        // `the_checked_in_overlay_signs_ad_hoc` keeps the checked-in file off this branch.
+        out.push(Verdict::Warn(format!(
+            "none of {MACOS_SIGNING_VARS:?} is set and {TAURI_MACOS_CONF} names no \
+             signingIdentity, so the bundle will be unsigned — tauri-bundler skips signing \
+             entirely rather than sealing it ad-hoc. It runs locally, but a downloaded copy is \
+             quarantined and Gatekeeper reports it as damaged rather than as unidentified, with \
+             Move to Trash as the only button; a user has to `xattr -dr com.apple.quarantine` \
+             it. That is what the 0.8.0 .dmg shipped as. Put signingIdentity \
+             `{ADHOC_IDENTITY}` back in the overlay for a bundle Gatekeeper can verify, or set \
+             APPLE_SIGNING_IDENTITY to a Developer ID certificate"
+        )));
+    }
 
     // Only worth saying once there is a signature to notarise. Said unconditionally it is noise
     // on every unsigned build, and a preflight people learn to skip is worse than one that says
-    // less.
-    if !notary_unset.is_empty() && !configured.is_empty() {
+    // less. Not said for the ad-hoc case either: nothing notarises a signature that names
+    // nobody, so the sentence would prescribe a step that cannot be taken.
+    let notarisable = !configured.is_empty()
+        || matches!(config_identity, Some(identity) if identity != ADHOC_IDENTITY);
+    if !notary_unset.is_empty() && notarisable {
         out.push(Verdict::Warn(format!(
             "signing is configured but {notary_unset:?} {} unset, so the bundle will not be \
              notarised and Gatekeeper will still warn on a downloaded copy",
@@ -3491,6 +3571,10 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         macos_bundle_targets: list(macos.pointer("/bundle/targets")),
         macos_icons: list(macos.pointer("/bundle/icon")),
         macos_external_bin: list(macos.pointer("/bundle/externalBin")),
+        macos_signing_identity: macos
+            .pointer("/bundle/macOS/signingIdentity")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         before_build: read_before_build(conf.pointer("/build/beforeBuildCommand")),
     })
 }
@@ -3599,6 +3683,7 @@ mod tests {
             macos_bundle_targets: vec!["app".into(), "dmg".into()],
             macos_icons: vec!["icons/32x32.png".into()],
             macos_external_bin: Vec::new(),
+            macos_signing_identity: Some(ADHOC_IDENTITY.into()),
             before_build: Some(before_build()),
         }
     }
@@ -4878,19 +4963,21 @@ mod tests {
 
     #[test]
     fn an_unsigned_mac_build_is_a_warning_and_says_what_a_user_will_see() {
-        // Not a failure: an unsigned local build is the only thing available without a paid
-        // Apple Developer Program membership, and it is exactly what a first Mac build wants.
-        // The wording matters as much as the level — Gatekeeper's message for a quarantined
-        // unsigned bundle blames the *download* ("is damaged"), so a reader who has not been
-        // told will go looking for a corrupt file.
-        let unsigned = signing_verdicts(&[], &MACOS_NOTARY_VARS);
+        // Not a failure: an unsigned local build is a legitimate thing to want from a Mac that
+        // has edited the overlay. The wording matters as much as the level — Gatekeeper's
+        // message for a quarantined unsigned bundle blames the *download* ("is damaged"), so a
+        // reader who has not been told will go looking for a corrupt file. This is the branch
+        // the 0.8.0 .dmg shipped from, so the warning also has to name the way back.
+        let unsigned = signing_verdicts(&[], &MACOS_NOTARY_VARS, None);
         let warning = unsigned
             .iter()
             .find(|c| matches!(c, Verdict::Warn(d) if d.contains("unsigned")))
             .unwrap_or_else(|| panic!("no unsigned-bundle warning in {unsigned:?}"));
         assert!(
-            warning.detail().contains("damaged") && warning.detail().contains("quarantine"),
-            "the warning has to name what the user sees: {}",
+            warning.detail().contains("damaged")
+                && warning.detail().contains("quarantine")
+                && warning.detail().contains(ADHOC_IDENTITY),
+            "the warning has to name what the user sees and the way back: {}",
             warning.detail()
         );
         // …and nothing about notarisation, which is noise on a build that has no signature to
@@ -4898,7 +4985,11 @@ mod tests {
         assert_eq!(unsigned.len(), 1, "{unsigned:?}");
 
         // With a certificate but no notary credentials, the second warning is the useful one.
-        let signed = signing_verdicts(&["APPLE_SIGNING_IDENTITY"], &["APPLE_ID"]);
+        let signed = signing_verdicts(
+            &["APPLE_SIGNING_IDENTITY"],
+            &["APPLE_ID"],
+            Some(ADHOC_IDENTITY),
+        );
         assert!(
             matches!(signed.first(), Some(Verdict::Ok(_))),
             "a configured signing identity is not a warning: {signed:?}"
@@ -4911,9 +5002,100 @@ mod tests {
         );
 
         // Fully configured: no warnings at all, or the preflight cries wolf on the one setup
-        // that is actually correct.
-        let full = signing_verdicts(&["APPLE_SIGNING_IDENTITY"], &[]);
+        // that is actually correct — and the overlay's ad-hoc identity must not get in the
+        // way of it, because the environment outranks the file.
+        let full = signing_verdicts(&["APPLE_SIGNING_IDENTITY"], &[], Some(ADHOC_IDENTITY));
         assert!(full.iter().all(|c| matches!(c, Verdict::Ok(_))), "{full:?}");
+    }
+
+    #[test]
+    fn an_ad_hoc_mac_build_is_the_configured_outcome_and_says_the_other_dialog() {
+        // The 0.8.0 lesson. With nothing in the environment tauri-bundler *skips* signing, and
+        // a bundle with no seal fails Gatekeeper's integrity check — "damaged", Move to Trash.
+        // The overlay's `-` turns that into a verifiable ad-hoc seal, whose dialog is "Apple
+        // could not verify" with Open Anyway in System Settings. Ok, not Warn: it is the
+        // deliberate outcome of a build with no certificate, and the sentence the release
+        // notes quote has to be this one and not the unsigned one.
+        let adhoc = signing_verdicts(&[], &MACOS_NOTARY_VARS, Some(ADHOC_IDENTITY));
+        assert_eq!(adhoc.len(), 1, "{adhoc:?}");
+        let Some(Verdict::Ok(detail)) = adhoc.first() else {
+            panic!("an ad-hoc signed bundle is the configured outcome, not a warning: {adhoc:?}")
+        };
+        assert!(
+            detail.contains("ad-hoc")
+                && detail.contains("could not verify")
+                && detail.contains("Open Anyway")
+                && !detail.contains("damaged"),
+            "the verdict has to name the dialog an ad-hoc seal produces, and not the other one: \
+             {detail}"
+        );
+        // No notarisation warning: an ad-hoc signature cannot be notarised, so the sentence
+        // would prescribe a step that cannot be taken.
+        assert!(
+            !adhoc
+                .iter()
+                .any(|c| matches!(c, Verdict::Warn(d) if d.contains("notarised"))),
+            "{adhoc:?}"
+        );
+
+        // A named identity in the overlay, on the other hand, is a certificate: notarisable, so
+        // the missing credentials are worth a warning.
+        let named = signing_verdicts(&[], &["APPLE_ID"], Some("Developer ID Application: X"));
+        assert!(
+            named
+                .iter()
+                .any(|c| matches!(c, Verdict::Ok(d) if d.contains(TAURI_MACOS_CONF))),
+            "{named:?}"
+        );
+        assert!(
+            named
+                .iter()
+                .any(|c| matches!(c, Verdict::Warn(d) if d.contains("not be notarised"))),
+            "{named:?}"
+        );
+    }
+
+    #[test]
+    fn a_certificate_without_an_identity_is_refused_before_the_build_starts() {
+        // tauri-bundler imports APPLE_CERTIFICATE and then checks the certificate's name
+        // *contains* the configured identity; with the overlay's `-` and no
+        // APPLE_SIGNING_IDENTITY that is a refusal after the .app is built, minutes in. The
+        // preflight says it in the first second — and only when the overlay is the reason,
+        // because with no identity anywhere the bundler uses the certificate as it is.
+        let trapped = signing_verdicts(&["APPLE_CERTIFICATE"], &[], Some(ADHOC_IDENTITY));
+        assert!(
+            trapped.iter().any(|c| matches!(c, Verdict::Fail(d)
+                if d.contains("APPLE_SIGNING_IDENTITY") && d.contains(TAURI_MACOS_CONF))),
+            "{trapped:?}"
+        );
+        let both = signing_verdicts(
+            &["APPLE_SIGNING_IDENTITY", "APPLE_CERTIFICATE"],
+            &[],
+            Some(ADHOC_IDENTITY),
+        );
+        assert!(both.iter().all(|c| matches!(c, Verdict::Ok(_))), "{both:?}");
+        let no_overlay = signing_verdicts(&["APPLE_CERTIFICATE"], &[], None);
+        assert!(
+            no_overlay.iter().all(|c| matches!(c, Verdict::Ok(_))),
+            "{no_overlay:?}"
+        );
+    }
+
+    #[test]
+    fn the_checked_in_overlay_signs_ad_hoc() {
+        // Against the real file, because the real file is the one CI builds the .dmg from and
+        // the one that shipped 0.8.0 without this key. Removing it fails no build anywhere: the
+        // bundler logs nothing louder than a preflight warning, the .dmg uploads, and the first
+        // person to find out is whoever downloads it.
+        let root = crate::workspace_root().expect("a workspace root");
+        let live = read_app_info(&root).expect("tauri.macos.conf.json parses");
+        assert_eq!(
+            live.macos_signing_identity.as_deref(),
+            Some(ADHOC_IDENTITY),
+            "{TAURI_MACOS_CONF} must name bundle.macOS.signingIdentity \"{ADHOC_IDENTITY}\": \
+             without it tauri-bundler skips signing entirely and a downloaded .dmg opens to \
+             \"cide is damaged\" rather than to a dialog with Open Anyway in it"
+        );
     }
 
     #[test]

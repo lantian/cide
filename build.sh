@@ -22,8 +22,8 @@
 #
 # There is deliberately no copy into /Applications. That would be an unverified claim about a
 # platform nobody has run — installing a .app has rules (quarantine, signature, Gatekeeper) this
-# script is in no position to assert, and the preflight's own signing warning is the honest
-# statement of what an unsigned local bundle does there.
+# script is in no position to assert, and the preflight's own signing verdict is the honest
+# statement of what an ad-hoc-signed local bundle does there.
 #
 #   ./build.sh                # the artefact this host is for: AppImage on Linux, .dmg on macOS
 #   ./build.sh --all          # everything this host is responsible for — on Linux that adds the
