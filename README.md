@@ -96,6 +96,15 @@ beside the repository. `./scripts/clone-forks.sh` does that, at the revisions `p
 pin; [`docs/forks.md`](docs/forks.md) is what they are and why. `cargo xtask package` can also
 produce a `.deb`, a Flatpak, a binary tarball or a source tarball.
 
+**If `./run.sh` fails on macOS before anything starts**, it is the shell and not the build.
+macOS ships bash **3.2.57** as `/bin/bash` — the last GPLv2 release — and `run.sh` is written to
+run on it, so `mapfile: command not found` or an `unbound variable` naming an array means a
+bash 4 construct has crept back into the script: a bug here, reportable as one.
+`./scripts/check-bash32.sh` names the line, and `brew install bash` is the workaround meanwhile.
+Start it as `./run.sh` rather than `sh run.sh` or `zsh run.sh` — the shebang is what picks bash,
+and the script now refuses the other two by name instead of dying on a parse error.
+[`docs/platforms.md`](docs/platforms.md) has the whole account.
+
 [CONTRIBUTING.md](CONTRIBUTING.md) has the rest: the run.sh flags, profiles, every check CI runs,
 and packaging.
 

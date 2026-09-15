@@ -33,7 +33,12 @@ It runs on **macOS as well as Linux**, which took three fixes and is easy to und
 (bash 4; macOS ships 3.2), no bare `"${array[@]}"` that could be empty (`set -u` aborts on it
 before bash 4.4), and no `/proc` — a process's profile is read from `/proc/<pid>/environ` where
 that exists and from the profile's own `instance.lock` where it does not. `docs/platforms.md`
-has the whole account.
+has the whole account, and **`./scripts/check-bash32.sh` is what keeps the first two fixed** — a
+bash 4 builtin is not a syntax error, so `bash -n` passes, every Linux job passes, and the break
+is invisible until a Mac runs the script. It scans every `*.sh` with comments stripped first (the
+`read_pids` comment says `mapfile` four times) and fails when a rule stops matching its own
+fixture. `run.sh` refuses `sh run.sh` and `zsh run.sh` by name, and names the class when it dies
+before launching under bash 3.x.
 
 **`./run.sh` launches the `dev` profile, not your real instance.** cide is developed inside
 cide, so the two run side by side; before profiles they shared one `workspace.json` and one

@@ -48,6 +48,42 @@
 #   ./run.sh --fresh              # start from an empty workspace
 #   ./run.sh --on-top             # keep the window above others, for screenshots
 #
+# --- the shell this is running under -----------------------------------------------------
+#
+# Checked first, before `set`, before `cd`, before anything below is even parsed. There are
+# two ways to reach this script with a shell that cannot run it and neither says so usefully.
+#
+# `zsh run.sh` or `sh run.sh` is the reflex on a Mac, where zsh is the login shell: the
+# shebang is then just a comment, and the first thing that breaks is an array assignment
+# forty lines down, reported as a parse error about a `(`. And a bash older than 3.2 predates
+# much of what is here.
+#
+# Before `set -uo pipefail` rather than after, because `pipefail` is not a POSIX `set`
+# option: under dash that line errors first, and its complaint is about an option rather than
+# about the shell, which sends the reader somewhere else entirely.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "run.sh needs bash, and is running under another shell." >&2
+  echo "  Run it as ./run.sh, which is what the shebang is for, or as: bash run.sh" >&2
+  exit 2
+fi
+# `sh run.sh` on a Mac is bash 3.2 *in POSIX mode*, which passes the test above — BASH_VERSION
+# is set — and then dies eighty lines down on the first `< <(...)`, because POSIX mode turns
+# process substitution off. Reported as "syntax error near unexpected token `<'", which reads
+# like a broken script rather than a wrong invocation.
+case ":${SHELLOPTS:-}:" in
+  *:posix:*)
+    echo "run.sh is running as \`sh run.sh\`, which is bash in POSIX mode." >&2
+    echo "  POSIX mode disables process substitution, which this script needs." >&2
+    echo "  Run it as ./run.sh, which is what the shebang is for, or as: bash run.sh" >&2
+    exit 2 ;;
+esac
+if [ "${BASH_VERSINFO[0]}" -lt 3 ] ||
+   { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  echo "run.sh needs bash 3.2 or newer; this is bash $BASH_VERSION." >&2
+  echo "  brew install bash, then make sure it comes first on PATH." >&2
+  exit 2
+fi
+
 set -uo pipefail
 
 cd "$(dirname "$0")"
@@ -64,6 +100,40 @@ if [ -f .env ]; then
   . ./.env
   set +a
 fi
+
+# --- what to say when this dies before it launches anything ------------------------------
+#
+# bash 3.2.57 is what macOS ships as /bin/bash — the last GPLv2 release, frozen in 2007 — and
+# on a Mac with no newer bash on PATH it is what `#!/usr/bin/env bash` finds. Everything here
+# is written to run on it (`scripts/check-bash32.sh` is what keeps it that way), but the way
+# that promise breaks is silent on every Linux machine and brutal on a Mac: a bash 4 builtin
+# is not a syntax error, so nothing catches it until the script aborts mid-launch with
+# `mapfile: command not found` and an unbound-variable cascade from `set -u` behind it. That
+# happened, it is written up in docs/platforms.md, and the person it happened to had no
+# working build left to investigate it with.
+#
+# So a bash-3 run that ends badly without having started the app says which half to suspect.
+# Nothing is printed on a clean run, and nothing on bash 4, where this class cannot occur.
+launched=0
+# Every exit this script takes on purpose goes through `bail`, so the hint can tell a refusal
+# the script wrote itself — an unknown flag, a missing ui/dist — from a shell that fell over
+# on the way. Without it `./run.sh --bogus` on a Mac answers a typo with a lecture about bash.
+expected_exit=0
+bail() { expected_exit=1; exit "$1"; }
+launch_hint() {
+  [ "${1:-0}" -ne 0 ] || return 0
+  [ "$expected_exit" -eq 0 ] || return 0
+  [ "$launched" -eq 0 ] || return 0
+  [ "${BASH_VERSINFO[0]}" -lt 4 ] || return 0
+  echo >&2
+  echo "[run] this exited before launching anything, under bash $BASH_VERSION." >&2
+  echo "      macOS ships bash 3.2.57 as /bin/bash and that is the only bash most Macs have." >&2
+  echo "      If the errors above are a \"command not found\" for a shell builtin, or an" >&2
+  echo "      \"unbound variable\" naming an array, then this script needs a bash you do not" >&2
+  echo "      have — a bug here, not in your setup. ./scripts/check-bash32.sh names the line;" >&2
+  echo "      \`brew install bash\` is the workaround meanwhile. See docs/platforms.md." >&2
+}
+trap 'launch_hint $?' EXIT
 
 MAX_WINDOWS=8
 DEV_PORT=1420
@@ -86,7 +156,7 @@ while [ $# -gt 0 ]; do
     # A value flag, which is why this loop shifts rather than iterating `$@` directly. Both
     # spellings, because `--profile=x` is what anyone scripting it will reach for.
     --profile)
-      [ $# -ge 2 ] || { echo "--profile needs a name" >&2; usage; exit 2; }
+      [ $# -ge 2 ] || { echo "--profile needs a name" >&2; usage; bail 2; }
       profile="$2"; shift ;;
     --profile=*)      profile="${1#--profile=}" ;;
     --bench)          env_flags+=(CIDE_BENCH=1) ;;
@@ -107,7 +177,7 @@ while [ $# -gt 0 ]; do
     --inspect)        env_flags+=(CIDE_CONSOLE_BRIDGE=1 WEBKIT_INSPECTOR_SERVER=127.0.0.1:9222) ;;
     --on-top)         env_flags+=(CIDE_ON_TOP=1) ;;
     --fresh)          fresh=1 ;;
-    *) echo "unknown option: $1" >&2; usage; exit 2 ;;
+    *) echo "unknown option: $1" >&2; usage; bail 2 ;;
   esac
   shift
 done
@@ -325,7 +395,7 @@ except Exception:
       echo "[run] Inspect it with:  ./target/debug/cide-headless tree"
       echo "[run] Or start clean:   ./run.sh --profile default --fresh"
     fi
-    exit 1
+    bail 1
   fi
 fi
 
@@ -367,12 +437,12 @@ echo "[run] ${build[*]}"
 if ! "${build[@]}"; then
   echo "[run] REFUSING: the backend did not build, so there is nothing safe to launch." >&2
   echo "[run] The compiler's own output is above." >&2
-  exit 1
+  bail 1
 fi
 
 if [ ! -x "$BIN" ]; then
   echo "[run] REFUSING: $BIN is still missing after a successful build." >&2
-  exit 1
+  bail 1
 fi
 
 # --- the frontend the binary will ask for ----------------------------------------------
@@ -388,12 +458,15 @@ cleanup() {
     kill -TERM "$vite_pid" 2>/dev/null
   fi
 }
-trap cleanup EXIT INT TERM
+# `$?` is captured before cleanup runs: cleanup's own `kill` overwrites it, and the hint needs
+# the status the script is actually leaving with.
+trap 'exit_status=$?; cleanup; launch_hint "$exit_status"' EXIT
+trap cleanup INT TERM
 
 if [ "$release" = 1 ]; then
   if [ ! -f ui/dist/index.html ]; then
     echo "[run] ui/dist is missing; run: pnpm --dir ui build" >&2
-    exit 1
+    bail 1
   fi
 else
   if port_open; then
@@ -416,7 +489,7 @@ else
       echo "[run] the dev server did not come up on $DEV_PORT. Last lines:" >&2
       tail -n 15 /tmp/cide-vite.log >&2
       echo "[run] Or run without one:  ./run.sh --release" >&2
-      exit 1
+      bail 1
     fi
     echo "[run] dev server ready on $DEV_PORT"
   fi
@@ -436,6 +509,7 @@ echo "[run] starting ${env_flags[*]:-} $BIN  (profile: ${profile:-default})"
 # is empty, and `"${empty[@]}"` under `set -u` aborts there. That combination is precisely the
 # escape hatch — the one invocation somebody reaches for when something has gone wrong — so it is
 # the worst one to have die on an unbound variable.
+launched=1
 if [ -n "$profile" ]; then
   env "${env_flags[@]}" "$BIN"
 elif [ "${#env_flags[@]}" -gt 0 ]; then
@@ -445,4 +519,5 @@ else
 fi
 status=$?
 echo "[run] cide exited with status $status"
+expected_exit=1
 exit "$status"
