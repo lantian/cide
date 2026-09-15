@@ -613,7 +613,37 @@ fn build() -> Vec<Command> {
         Command::new("tab.console", "Go to Claude console", WINDOW)
             .when("shellWindow && projectOpen")
             .keywords(&["home", "chat", "prompt", "agent", "first"]),
-        // Project. Two families, and the split is the point rather than duplication.
+        // Project. Opening one, then two families for moving between the ones already open —
+        // and the split between those two is the point rather than duplication.
+        //
+        // Opening a project had no command at all: the only two routes were the header's `+`
+        // and the `▾` beside it, so the gesture was mouse-only and — because a `keymap.json`
+        // names command ids — unbindable. Reported as "Missing 'Open project' command in
+        // command palette".
+        //
+        // **No `when` clause**, and it is the one command here for which that is a claim rather
+        // than an omission. `settings.open` and `help.about` carry `projectOpen` because they
+        // need somewhere to appear — `App.tsx` mounts `OverlayHost` in the shell branch and only
+        // with a project, so the palette itself cannot be raised without one either, and this
+        // row is in practice only ever *picked* by someone who already has a project. A key
+        // bound to it is the other half, and that one runs with nothing open at all: it raises
+        // an OS dialog rather than anything of cide's, so it is the state the command is most
+        // wanted in and a clause would be exactly wrong there.
+        //
+        // The ellipsis is this table's convention for a row that raises something rather than
+        // acting — `git.commit`, `git.branch.switch`, `scratch.new` — and here what it raises
+        // is the OS folder picker. `dispatch.ts` runs it through the same `browseForProject`
+        // the header's `+` does, which goes to `project_pick` and never to
+        // `@tauri-apps/plugin-dialog`: that dialog cannot be parented on Linux, so a second
+        // road spelled here would reintroduce the picker-behind-the-window bug on the surface
+        // least likely to be retested.
+        Command::new("project.open", "Open project…", PROJECT).keywords(&[
+            "folder",
+            "directory",
+            "add",
+            "browse",
+            "load",
+        ]),
         //
         // The *switcher* is Ctrl+` — the key left of `1`, which is what a keyboard reports as
         // `Backquote` on every layout: hold the modifier, walk a popup in most-recently-used
