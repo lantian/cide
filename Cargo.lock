@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "cide-docker"
-version = "0.8.2-dev"
+version = "0.9.1-dev"
 dependencies = [
  "bollard",
  "cide-core",
