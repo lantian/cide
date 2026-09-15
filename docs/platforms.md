@@ -354,8 +354,10 @@ at before choosing:
 * **Settings → Appearance** offers three graphics switches that persist and do nothing there.
   `graphics::LADDER_APPLIES` is the seam to gate them on; the screen wants eyes before it grows
   a fourth state.
-* **`run.sh` does not run on a stock Mac.** It uses `mapfile` (bash 4+; macOS ships 3.2 as
-  `/bin/bash`) and `ps -eo ppid=,pid=,comm=`, whose `comm` prints a full path there.
+* ~~**`run.sh` does not run on a stock Mac.** It uses `mapfile` (bash 4+; macOS ships 3.2 as
+  `/bin/bash`) and `ps -eo ppid=,pid=,comm=`, whose `comm` prints a full path there.~~ **Fixed
+  and verified on bash 3.2.57** — the section below is the account. `scripts/check-bash32.sh`
+  is what keeps it fixed, and it is in CI.
 * **Case-insensitive filesystems.** APFS folds case by default and `canonicalize` does not
   normalise it, so `cide_fs::ops::check_within` — textual by design — would refuse a terminal
   link naming `/Users/x/proj/…` for a project opened as `/Users/x/Proj`. Unquantified.
@@ -652,6 +654,46 @@ both platforms (`launchd` there, `init` here).
 Verified on macOS 15 / bash 3.2.57, all four paths: a fresh launch; stopping the previous instance
 of the same profile; leaving an instance of *another* profile alone (reported as a stranger, still
 running afterwards); and `--profile default` with an empty flag array.
+
+### And then nothing kept it fixed
+
+Every fix above is a fix by hand to a file anybody may edit, and the failure class does not
+announce itself anywhere a contributor is likely to be looking: a bash 4 builtin is not a syntax
+error, so `bash -n` passes, `shellcheck` says nothing about it, and every Linux CI job is green.
+The break surfaces on a Mac, at launch, as the script aborting — which is also the moment the
+person who found it has no working build to investigate it with. Three things now stand in for
+the hand fix.
+
+**`scripts/check-bash32.sh` scans every `*.sh` in the repository** (enumerated with `git ls-files`,
+never listed — a hardcoded list stops covering a script the moment somebody adds one) for twelve
+constructs that need a bash newer than 3.2: `mapfile`/`readarray`, `declare -A`, `declare -n`,
+`${v^^}`/`${v,,}`, `${v@Q}`, `coproc`, `&>>`, `wait -n`, `;;&`, `globstar`, `$EPOCHSECONDS` and
+`printf %(fmt)T`. Two things about it are load-bearing rather than tidy. It **strips comments
+first**, because the house style is to name the failure a rule prevents and `read_pids`' own
+comment says `mapfile` four times — grepping the raw source flags the explanation of the fix as
+the bug, which is the trap `CLAUDE.md` already records three frontend checks falling into. And it
+carries a **fixture**: one line per rule, scanned after the real files, and a rule that no longer
+matches its own example is a hard error. Every assertion in it is a search for absence, so a
+detector that has quietly stopped detecting reports every script as clean and stays green until a
+Mac finds it — which is the exact failure the script exists to prevent. It runs under bash 3.2
+itself, so it uses two parallel indexed arrays where an associative one would read better.
+
+**`run.sh` refuses a shell it cannot run on, before `set`.** `zsh run.sh` and `sh run.sh` are the
+reflex on a Mac, where zsh is the login shell, and neither announced itself usefully: under zsh
+the shebang is a comment and the first array assignment is a parse error about a `(`; under `sh`
+it is bash 3.2 *in POSIX mode*, which sets `BASH_VERSION` and passes a naive check, then dies
+eighty lines down on the first `< <(...)` with ``syntax error near unexpected token `<' `` — POSIX
+mode turns process substitution off. Both are now named, with the invocation that works. The
+check is before `set -uo pipefail` on purpose: `pipefail` is not a POSIX `set` option, so under
+dash that line errors first and complains about an option rather than about the shell.
+
+**And a run that ends before it launches anything, under bash 3.x, says which half to suspect.**
+The hint is keyed off three facts, because the useful message is narrow: a non-zero exit, nothing
+launched, and a bash old enough for the class to be possible. It is silent on bash 4, silent on a
+clean run, and silent on a refusal the script wrote itself — every deliberate exit goes through
+`bail`, which sets `expected_exit`, so `./run.sh --bogus` answers a typo with the usage rather
+than with a lecture about bash. The wording points at `scripts/check-bash32.sh` and calls the
+state a bug in the script rather than in the reader's setup, because it is.
 
 ## The terminal's line height is wrong on every Retina display
 
