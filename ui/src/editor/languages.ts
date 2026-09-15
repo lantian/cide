@@ -64,6 +64,7 @@ const BUILTIN_GRAMMARS: Readonly<Record<string, () => Promise<Grammar>>> = {
   python: async () => (await import('./languages/python')).spec,
   clike: async () => (await import('./languages/clike')).spec,
   shell: async () => (await import('./languages/shell')).spec,
+  dockerfile: async () => (await import('./languages/dockerfile')).spec,
   json: async () => (await import('./languages/data')).json,
   toml: async () => (await import('./languages/data')).toml,
   yaml: async () => (await import('./languages/data')).yaml,

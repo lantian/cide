@@ -12,11 +12,12 @@
 import { registerLanguages } from '@/editor/languages'
 import { rememberSpawnPlan } from '@/layout/spawnPlans'
 import { reconcile, restack } from '@/keys/switcher'
-import { windowProjectsOf } from '@/keys/target'
+import { activeProjectIdOf, windowProjectsOf } from '@/keys/target'
 import { useMemo } from 'react'
 import { create } from 'zustand'
 import { destroyHost, noteLivePanes, peekHost, releaseHost } from '@/layout/paneHosts'
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
+import { pruneNotices, setNoticeScope } from '@/chrome/notices'
 import type { CloseScope } from '@/chrome/closeConfirmModel'
 import { planFileIndex, type IndexTarget } from './fileIndex'
 import { useSessionStatus } from './sessionStatus'
@@ -351,6 +352,21 @@ const paneConversations = new Map<string, string | null>()
  * what the user did, `/clear` scrolls it rather than erasing it, and cide must not be more
  * destructive than the command it is reacting to.
  */
+/**
+ * Forget the toasts of a project that is no longer open.
+ *
+ * Beside `syncFileIndex` and `syncConversations` for their reason: `applySnapshot` is the one
+ * place this window hears that a project was closed **in another window**, so a prune wired to
+ * `closeProject` alone would leave the other window's toasts sitting in a stack that can never
+ * show them and never dismiss them.
+ *
+ * `pruneNotices` returns without waking anybody when nothing is dropped, which is every call
+ * but the rare one — this runs on every accepted mutation.
+ */
+function syncNotices(workspace: Workspace): void {
+  pruneNotices(new Set(Object.keys(workspace.projects)))
+}
+
 function syncConversations(workspace: Workspace): void {
   const seen = new Set<string>()
   const panes = Object.values(workspace.projects).flatMap((project) => [
@@ -1271,6 +1287,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     syncFileIndex(workspace)
     syncHostBudget(workspace)
     syncConversations(workspace)
+    // A project closed here or in another window takes its toasts with it. See `syncNotices`.
+    syncNotices(workspace)
     flushSynced(Number(workspace.rev))
   },
 
@@ -1289,6 +1307,34 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   setTheme: (theme) => set({ theme }),
   toggleTheme: () => set((s) => ({ theme: s.theme === 'dark' ? 'light' : 'dark' })),
 }))
+
+/*
+ * Tell the toast stack which project this window is showing.
+ *
+ * At module scope, and here rather than in `chrome/Failures.tsx` or `App.tsx`, for three
+ * reasons that are each a bug avoided:
+ *
+ *   * this module is imported by everything that can raise a notice — the panels, the key
+ *     dispatcher, the panes — so a window that can produce a toast has already run this line
+ *     before any component mounts. A registration somebody has to remember is a feature that
+ *     is off until it is filed as a bug, which the head of `panes/awaiting.ts` records this
+ *     app having shipped three times;
+ *   * not an effect: an effect runs after the first paint and unregisters on unmount, so a
+ *     rejection during boot — the very failure a user most needs told about — would be
+ *     stamped by nobody;
+ *   * a getter, read at `notify` time. The bootstrap is an IPC round trip, so a value captured
+ *     here would be `null` for the life of the window.
+ *
+ * `activeProjectIdOf` and not `useActiveProject()`: the latter answers `null` off a shell, so
+ * in a detached window every toast that window raised would be stamped `null`… which is
+ * harmless, and then its *own* project's notices would be invisible to it. The former answers
+ * `role.project` there, which is what that window is showing.
+ *
+ * If this line is ever lost, `notices.ts` falls back to `() => null` — every notice unscoped
+ * and shown in every project, which is exactly the behaviour before scoping. It must never
+ * fail the other way.
+ */
+setNoticeScope(() => activeProjectIdOf(useWorkspace.getState().boot))
 
 /** A stable empty list, so a bootless window does not hand React a new array every read. */
 const NO_PROJECTS: Project[] = []

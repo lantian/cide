@@ -458,8 +458,18 @@ try {
     'README.md': 'Markdown',
     // Case-folded before lookup, on both halves of the table.
     'SRC/MAIN.RS': 'Rust',
-    'DOCKERFILE': 'Shell',
-    Dockerfile: 'Shell',
+    // M45. These two said `Shell` until then, and that was not a quirk of the check — it
+    // was cide's actual answer: `"dockerfile"` sat in the shell entry's `filenames`, so a
+    // `FROM` line was highlighted as a shell command that happened to start with a word.
+    'DOCKERFILE': 'Dockerfile',
+    Dockerfile: 'Dockerfile',
+    'api.dockerfile': 'Dockerfile',
+    Containerfile: 'Dockerfile',
+    // **Plain text, and deliberately so.** `lookup` tries the whole name and then the text after
+    // the last dot, so the other multi-stage convention matches neither. Pinned here rather than
+    // left unstated: it is a real gap, and the fix is a change to how every language resolves —
+    // see the `dockerfile` entry in `cide_ipc::lang::builtins`.
+    'Dockerfile.prod': 'Plain Text',
     Makefile: 'Shell',
     '/home/u/.bashrc': 'Shell',
     '/home/u/.gitconfig': 'TOML',
@@ -947,6 +957,7 @@ try {
     python: require(join(out, 'editor/languages/python.js')).spec,
     clike: require(join(out, 'editor/languages/clike.js')).spec,
     shell: require(join(out, 'editor/languages/shell.js')).spec,
+    dockerfile: require(join(out, 'editor/languages/dockerfile.js')).spec,
     markdown: require(join(out, 'editor/languages/markdown.js')).spec,
     sql: require(join(out, 'editor/languages/sql.js')).spec,
     json: require(join(out, 'editor/languages/data.js')).json,
@@ -994,6 +1005,32 @@ try {
   }
 
   const sources = {
+    /*
+     * Dockerfile, added in M45 when `Dockerfile` stopped resolving to the *shell* table. Every
+     * line below is a shape that table got wrong or a shape the hook exists for.
+     */
+    dockerfile: [
+      '# syntax=docker/dockerfile:1',
+      '# escape=\\',
+      '# an ordinary comment',
+      'ARG NODE=20',
+      'FROM node:${NODE}-alpine AS build',
+      'WORKDIR /app',
+      'COPY --chown=node:node package*.json ./',
+      'RUN --mount=type=cache,target=/root/.npm npm ci',
+      'RUN echo "run copy from as" && echo run',
+      'ENV PATH="/app/node_modules/.bin:$PATH" LANG=C.UTF-8',
+      'ONBUILD COPY . /app',
+      'HEALTHCHECK --interval=30s CMD curl -f http://localhost/ || exit 1',
+      'FROM alpine',
+      'COPY --from=build /app/dist /srv',
+      'ENTRYPOINT ["node", "server.js"]',
+      'CMD []',
+      "LABEL org.opencontainers.image.source='https://example.test/x'",
+      'run lower case is valid too',
+      'FROMAGE is not an instruction',
+      '',
+    ].join('\n'),
     /*
      * Go, added in M12 when `.go` stopped pointing at the `clike` table. Every line is a shape
      * that table got wrong or a shape the hook exists for.
@@ -1198,6 +1235,72 @@ try {
       '\u0000\u001f',
     ].join('\n')
     tokenize(spec, adversarial, `${lang} over adversarial input`)
+  }
+
+  /*
+   * Dockerfile, in detail. (M45)
+   *
+   * The sweep above proves the grammar advances; this proves it is *right*, and every assertion
+   * is a shape the shell table — which this language used until M45 — got wrong.
+   *
+   * The load-bearing one is `positionSensitive`: an instruction is a keyword at the start of a
+   * line and a word everywhere else. A keyword list has no such notion, so `RUN echo run` would
+   * light up three times, and `apt-get install copy` would light up in the middle of a shell
+   * command. That is the single most visible thing about a Dockerfile and it cannot be expressed
+   * without the hook.
+   */
+  {
+    const tag = (source, word) => {
+      const found = tokenize(grammars.dockerfile, source, 'dockerfile detail').find(
+        (t) => t.text === word,
+      )
+      return found === undefined ? null : found.tag
+    }
+
+    eq(tag('FROM alpine', 'FROM'), 'keyword', 'an instruction at the start of a line')
+    // **Not `keyword`**, rather than a specific tag: what matters is that it is not painted as
+    // an instruction. The generic path calls a bare word `variableName`, which is a detail of
+    // that path and not a claim this assertion should be pinning.
+    ok(
+      tag('RUN echo run', 'run') !== 'keyword',
+      'and NOT the same word later on the line — `RUN echo run` must light up once, or every ' +
+        'shell command containing `copy`, `add` or `run` is painted as an instruction',
+    )
+    eq(tag('run echo hi', 'run'), 'keyword', 'lower case is valid Docker and must colour')
+    ok(
+      tag('FROMAGE is not an instruction', 'FROMAGE') !== 'keyword',
+      'and a word that merely starts with one is not an instruction — the `(?=\\s|$)` guard',
+    )
+
+    eq(tag('FROM node:20 AS build', 'AS'), 'keyword', 'the stage-naming keyword')
+    eq(
+      tag('COPY --from=build /a /b', '--from'),
+      'propertyName',
+      'an instruction flag, which the shell table read as two operators and a word',
+    )
+    eq(
+      tag('RUN --mount=type=cache,target=/x true', '--mount'),
+      'propertyName',
+      'including the one whose value contains `=` and `,`',
+    )
+    eq(tag('FROM node:${NODE}-alpine', '${NODE}'), 'propertyName', 'a braced expansion')
+    eq(tag('ENV P=$PATH', '$PATH'), 'propertyName', 'and a bare one')
+
+    // Directives are the half that is silently expensive to get wrong: a broken `# syntax=`
+    // changes nothing visible, and BuildKit falls back without saying so.
+    eq(tag('# syntax=docker/dockerfile:1', '# syntax=docker/dockerfile:1'), 'meta',
+      'a parser directive is not a comment')
+    eq(tag('# an ordinary comment', '# an ordinary comment'), 'comment',
+      'and an ordinary comment still is one')
+
+    // `ONBUILD` is the one place two instructions are adjacent, and it is answered from the
+    // line rather than from carried state — see `afterOnbuild`.
+    eq(tag('ONBUILD COPY . /app', 'ONBUILD'), 'keyword', 'ONBUILD itself')
+    eq(tag('ONBUILD COPY . /app', 'COPY'), 'keyword', 'and the instruction it carries')
+    ok(
+      tag('COPY ONBUILD /app', 'ONBUILD') !== 'keyword',
+      'but ONBUILD as an argument is a word, not a keyword',
+    )
   }
 
   // Every tag name the grammars actually emit has to resolve to a class, or the token is
@@ -6637,6 +6740,7 @@ try {
       python: () => require(join(out, 'editor/languages/python.js')).spec,
       clike: () => require(join(out, 'editor/languages/clike.js')).spec,
       shell: () => require(join(out, 'editor/languages/shell.js')).spec,
+      dockerfile: () => require(join(out, 'editor/languages/dockerfile.js')).spec,
       markdown: () => require(join(out, 'editor/languages/markdown.js')).spec,
       sql: () => require(join(out, 'editor/languages/sql.js')).spec,
       json: () => require(join(out, 'editor/languages/data.js')).json,

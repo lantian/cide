@@ -598,7 +598,7 @@ fn is_primary_console_spawn(
 }
 
 /// Convert a wire geometry into the PTY crate's own, which clamps and derives pixel dims.
-fn pty_geometry(g: Geometry) -> PtyGeometry {
+pub(crate) fn pty_geometry(g: Geometry) -> PtyGeometry {
     PtyGeometry::new(g.cols, g.rows, g.cell_width, g.cell_height)
 }
 

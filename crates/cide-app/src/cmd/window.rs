@@ -1015,6 +1015,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 title: "Cargo.toml".into(),
+                docker: None,
             },
         )
         .expect("a file tab opens");
@@ -1059,6 +1060,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "atlas : claude — mirror".into(),
+            docker: None,
         };
         let mirror_id = mirror.id;
         {
@@ -1117,6 +1119,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "atlas : claude".into(),
+            docker: None,
         };
         let second_id = second.id;
         {
@@ -1166,6 +1169,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "atlas : claude".into(),
+            docker: None,
         };
         let second_id = second.id;
         {

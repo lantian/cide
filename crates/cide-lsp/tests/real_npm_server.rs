@@ -50,6 +50,7 @@ fn an_npm_installed_server_is_found_and_reaches_ready() {
         install_hint: "npm install -g typescript-language-server typescript".into(),
         declares_watched_files: false,
         extra_path_hints: vec![],
+        init_options: None,
     });
     let handles = cide_lsp::discover::install(wanted);
     let server = handles[2];

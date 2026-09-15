@@ -1671,6 +1671,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "cide : claude".into(),
+            docker: None,
         }
     }
 
@@ -1683,6 +1684,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "cide : bash".into(),
+            docker: None,
         }
     }
 
@@ -3069,6 +3071,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "workspace.rs".into(),
+            docker: None,
         };
         let e = editor.id;
         let mut tree = new_tree(editor);

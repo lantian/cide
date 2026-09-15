@@ -38,6 +38,16 @@ pub struct Tuning {
 /// "the shipped rust-analyzer", and the object it carries is what `Session` sends as
 /// `initializationOptions` and repeats as every `workspace/configuration` answer.
 pub fn init_options(server: Server, provenance: Provenance, tuning: Tuning) -> Option<Value> {
+    // **Lane one**, and it is checked first because it is unconditional: options a *definition*
+    // declares are sent whatever the provenance. `yaml-language-server` is always a stock
+    // installation and has no idea a Compose file is a Compose file until it is handed a schema
+    // map — see `cide_ipc::lang::LanguageServerDef::init_options` for the whole argument.
+    //
+    // One producer each, and the separation is the point: nothing may put a fork option in a
+    // definition, and nothing may put a definition's options behind the gate below.
+    if let Some(declared) = server.def().init_options {
+        return Some(declared);
+    }
     if !wants_options(server, provenance) {
         return None;
     }

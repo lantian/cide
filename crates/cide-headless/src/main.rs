@@ -45,6 +45,7 @@ usage:
   cide-headless agents <root>             render its subagent roles and config
   cide-headless spec <root> [change]      render its openspec/ board, or one change in full
   cide-headless ext                       render marketplaces, extensions and contributions
+  cide-headless docker                    resolve a Docker daemon and render what it holds
   cide-headless version                   print this binary's version";
 
 fn main() {
@@ -65,6 +66,7 @@ fn main() {
         "agents" => agents(rest),
         "spec" => spec(rest),
         "ext" => ext(),
+        "docker" => docker(rest),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         "version" | "-V" | "--version" => emit(&format!("{}\n", version())),
         other => {
@@ -1263,6 +1265,159 @@ fn source_name(source: &cide_ipc::ext::ContributionSource) -> String {
     }
 }
 
+/// Resolve a Docker daemon and render what it holds. (M41)
+///
+/// `docker` alone runs the whole ladder; `docker <endpoint>` connects to one directly, which is
+/// how the connection switcher's road is exercised without a window.
+///
+/// # Why the ladder is printed even when it succeeds
+///
+/// Because the interesting failure is not "no Docker" — it is cide choosing a *different* daemon
+/// from the one `docker ps` talks to, which looks like an empty board and reads like a bug in the
+/// panel. Printing every context and every socket that was found, with the chosen one marked,
+/// turns that into something a user can see in one line. `cide_spec`'s `spec <root>` prints the
+/// resolved binary for the same reason.
+fn docker(args: &[String]) {
+    let endpoint = match args {
+        [] => None,
+        [value] => match cide_docker::connect::Endpoint::parse(value) {
+            Ok(endpoint) => Some(endpoint),
+            Err(refusal) => fail(refusal.sentence()),
+        },
+        _ => {
+            eprintln!("cide-headless: `docker` takes at most one endpoint");
+            usage_and_exit();
+        }
+    };
+
+    let probes = cide_docker::connect::probe();
+    let mut out = String::new();
+    for context in &probes.contexts {
+        out.push_str(&format!(
+            "context  {}{}  {}\n",
+            if context.current { "*" } else { " " },
+            context.name,
+            context.endpoint.as_url()
+        ));
+    }
+    for socket in &probes.sockets {
+        out.push_str(&format!("socket    {}\n", socket.display()));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+
+    out.push_str(&render_docker(&cide_docker::board(endpoint)));
+    emit(&out);
+}
+
+/// A board as text.
+fn render_docker(board: &cide_ipc::docker::DockerBoard) -> String {
+    use cide_ipc::docker::DockerBoard;
+    match board {
+        // Printed whole rather than summarised, `spec`'s reason: the sentence is the only thing
+        // on screen that can explain why a machine running Docker reports that it is not.
+        DockerBoard::Absent { hint } => format!("{hint}\n"),
+        DockerBoard::Unusable {
+            reason, endpoint, ..
+        } => {
+            if endpoint.is_empty() {
+                format!("{reason}\n")
+            } else {
+                format!("{endpoint}\n{reason}\n")
+            }
+        }
+        DockerBoard::Ready(snapshot) => {
+            let mut out = format!(
+                "{}  {} api {}{}\n\n",
+                snapshot.endpoint,
+                snapshot.server,
+                snapshot.api_version,
+                snapshot
+                    .context
+                    .as_ref()
+                    .map(|name| format!("  context {name}"))
+                    .unwrap_or_default()
+            );
+
+            out.push_str(&format!("{} container(s)\n", snapshot.containers.len()));
+            for container in &snapshot.containers {
+                let ports: Vec<String> = container
+                    .ports
+                    .iter()
+                    .filter_map(|port| {
+                        port.public
+                            .map(|public| format!("{public}->{}/{}", port.private, port.protocol))
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "  {:<10} {:<24} {:<28} {}{}{}\n",
+                    container.state,
+                    truncate(&container.name, 24),
+                    truncate(&container.image, 28),
+                    container.status,
+                    container
+                        .health
+                        .as_ref()
+                        .map(|h| format!("  [{h}]"))
+                        .unwrap_or_default(),
+                    if ports.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}", ports.join(" "))
+                    }
+                ));
+                if let Some(compose) = &container.compose {
+                    out.push_str(&format!(
+                        "           compose {}/{}\n",
+                        compose.project, compose.service
+                    ));
+                }
+            }
+
+            out.push_str(&format!("\n{} image(s)\n", snapshot.images.len()));
+            for image in &snapshot.images {
+                out.push_str(&format!(
+                    "  {:<40} {:>10}  {}\n",
+                    // An untagged image is a dangling layer, which is the whole basis of a
+                    // prune — so it is named as one rather than left blank.
+                    if image.tags.is_empty() {
+                        "<dangling>".to_string()
+                    } else {
+                        truncate(&image.tags.join(" "), 40)
+                    },
+                    bytes(image.size),
+                    &image.id[..image.id.len().min(19)]
+                ));
+            }
+            out
+        }
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+fn bytes(size: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,6 +1437,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: title.into(),
+            docker: None,
         }
     }
 

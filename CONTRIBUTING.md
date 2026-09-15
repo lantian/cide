@@ -35,6 +35,12 @@ starts Vite, waits for the port, stops any previous instance (SIGTERM, so the wo
 reaps orphaned `claude` children, and refuses to start when the saved workspace would open more
 than eight windows.
 
+It runs on **macOS as well as Linux**, which took three fixes and is easy to undo: no `mapfile`
+(bash 4; macOS ships 3.2), no bare `"${array[@]}"` that could be empty (`set -u` aborts on it
+before bash 4.4), and no `/proc` — a process's profile is read from `/proc/<pid>/environ` where
+that exists and from the profile's own `instance.lock` where it does not. `docs/platforms.md`
+has the whole account.
+
 That last guard is not hypothetical: a workspace here once accumulated 242 copies of one
 directory in per-project window mode, and the restore path faithfully opened a window for each.
 
@@ -121,6 +127,29 @@ Packaging is what needs them, all three, at the revisions `packaging/*.lock` pin
 The script has no URLs of its own — it sources the same locks the release workflow does. Where
 those pins come from, how to move one, and how the three repositories relate to their upstreams
 is `docs/forks.md`.
+
+## When a timing test fails and the code looks innocent
+
+`cargo` never garbage-collects `target/debug/deps/`, so it grows with every rebuild — a long
+session can leave tens of thousands of files there. Executing a binary out of a directory that
+large is measurably slower, and this workspace has timing-sensitive tests with real deadlines:
+`cide-fs`'s watcher suite waits ten seconds for a filesystem event, and `cide-pty`'s soak has its
+own clock.
+
+A test that fails **deterministically, always at its deadline**, while its crate and every
+dependency it links are provably unchanged, is usually this. `cargo clean` is the remedy.
+
+The fastest way to be sure it is not a real regression, before doing anything else:
+
+```sh
+git worktree add --detach /tmp/head-check HEAD   # a pristine tree, its own target/
+(cd /tmp/head-check && cargo test -p <crate> --test <name>)
+```
+
+If HEAD passes there and your tree fails, copy your changed crates in **one at a time** and re-run.
+That turns a theory into a yes or no in a couple of minutes. It is also worth running the built
+test binary from somewhere other than `deps/` — if the same bytes pass there, the code is not the
+problem.
 
 ## Checking it
 

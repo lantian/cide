@@ -15,6 +15,7 @@ members = [
     "crates/cide-lang",
     "crates/cide-lsp",
     "crates/cide-deps",
+    "crates/cide-docker",
     "crates/cide-ext",
     "crates/cide-hook",
     "crates/cide-headless",
@@ -51,6 +52,7 @@ cide-agents = { path = "crates/cide-agents" }
 cide-lang = { path = "crates/cide-lang" }
 cide-lsp = { path = "crates/cide-lsp" }
 cide-deps = { path = "crates/cide-deps" }
+cide-docker = { path = "crates/cide-docker" }
 cide-ext = { path = "crates/cide-ext" }
 
 # --- shell (only cide-app may depend on tauri) ---
@@ -195,6 +197,40 @@ tree-sitter-go = "0.25.0"
 # two incompatible 0.x versions into the graph — the exact failure this workspace's rule exists to
 # prevent. `tower-lsp` is a framework for building *servers*.
 lsp-types = "0.97.0"
+# --- containers ---
+# The Docker Engine API client (ADR 0013). A dependency of **exactly one crate** — `cide-docker`
+# — which must never re-export it, the rule `lsp-types` states two entries up and for the same
+# reason: everything crossing that crate's boundary is cide's own `cide_ipc::docker` DTO, so a
+# bump is a diff inside one crate rather than a fork of the graph.
+#
+# Hand-rolling the client was considered and lost on the ground the `zip` entry already argues:
+# chunked transfer-encoding, the 8-byte stdcopy demux frame, connection hijacking for exec, and
+# `DOCKER_HOST` parsing are each a small correctness trap against a stream cide does not control,
+# and there are four of them before anything useful happens.
+#
+# `default-features = false` with the default set spelled out again, which is **not** a saving
+# and is written that way on purpose: `pipe` is the unix-socket road (`connect_with_socket` is
+# `cfg(all(feature = "pipe", unix))`) and it looks like it drags a Windows transport in, but
+# bollard declares `hyper-named-pipe` under `[target."cfg(windows)".dependencies]`, so on Linux
+# and macOS it costs nothing. Naming the set explicitly is what makes the *absent* features the
+# statement: no `ssl`, no `ssh`, no `websocket`, no `chrono`, no `buildkit`. TLS above all — an
+# `https://` endpoint refuses by name in `Docker::open` rather than connecting in the clear, and
+# that refusal is only honest while this line has no TLS feature to fall back on.
+bollard = { version = "0.21.1", default-features = false, features = ["http", "pipe"] }
+# Reading one file out of a container. (M44)
+#
+# `GET /containers/{id}/archive?path=` answers with a **tar stream** and there is no endpoint that
+# answers with a file — so a tar reader is not a convenience here, it is the only road. Hand-rolling
+# one was considered and lost on the `zip` entry's argument: a 512-byte-header format with three
+# incompatible extensions for long names (GNU, POSIX/pax, v7) is a hundred lines against an archive
+# cide did not create, and the failure mode of getting it wrong is reading the wrong bytes rather
+# than an error.
+#
+# `default-features = false`: the default set adds `xattr` and `filetime`, which exist to *extract*
+# an archive onto a filesystem faithfully. cide never extracts — it reads one entry into memory —
+# so both are cost with no use.
+tar = { version = "0.4.44", default-features = false }
+
 
 # --- async / mcp ---
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }

@@ -32,3 +32,9 @@ cide-agents = { workspace = true }
 # covered less than it claimed to. `ext` calls the real `ExtStore::new`, so an `AppHandle` reached
 # for anywhere in `cide-ext` stops this binary building.
 cide-ext = { workspace = true }
+# M41's crate, linked for the reason the list keeps restating: a crate this binary does not link
+# is a crate the no-tauri proof does not cover. It is also the fastest way to see which daemon a
+# launch resolves to — `cide_docker::connect`'s ladder reads a context store, so the answer
+# differs between machines and is the first thing to ask for when a panel says there is no Docker
+# on a machine where `docker ps` works.
+cide-docker = { workspace = true }

@@ -125,7 +125,11 @@ if [ -n "$profile" ]; then
 else
   STATE_LEAF="cide"
 fi
-WORKSPACE="${XDG_STATE_HOME:-$HOME/.local/state}/$STATE_LEAF/workspace.json"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$STATE_LEAF"
+WORKSPACE="$STATE_DIR/workspace.json"
+# `cide_app::instance::LOCK_FILE`, beside the workspace in the same profile directory. Read by
+# `lock_holder` below to tell this profile's instance from another's.
+LOCKFILE="$STATE_DIR/instance.lock"
 
 if [ "$release" = 1 ]; then
   BIN=./target/release/cide
@@ -135,9 +139,28 @@ fi
 
 # --- stop whatever is already running -------------------------------------------------
 
+# Read a pid per line into an array, portably.
+#
+# `mapfile` was here and is a **bash 4** builtin. macOS ships bash 3.2.57 at `/bin/bash` and the
+# shebang is `/usr/bin/env bash`, so on a Mac with no newer bash this script died at this line
+# before it started anything — `mapfile: command not found`, then an unbound-variable cascade from
+# `set -u`. See `docs/platforms.md`.
+#
+# The `< <(...)` process substitution is deliberate and not a pipe: a pipe would run the loop in a
+# subshell and the array would be empty the moment it returned.
+read_pids() {
+  local __var="$1" __line
+  eval "$__var=()"
+  while IFS= read -r __line; do
+    [ -n "$__line" ] || continue
+    eval "$__var+=(\"\$__line\")"
+  done
+}
+
 # Matched on the exact binary path rather than the word "cide", which would also match this
-# script, an editor holding the source, and the agent session that started it.
-mapfile -t candidates < <(pgrep -f "^${BIN}$" 2>/dev/null || true)
+# script, an editor holding the source, and the agent session that started it. Anchored `-f`
+# behaves the same on BSD `pgrep` as on procps', which was checked rather than assumed.
+read_pids candidates < <(pgrep -f "^${BIN}$" 2>/dev/null || true)
 
 # Which profile a running process belongs to, read from its own environment.
 #
@@ -147,22 +170,83 @@ mapfile -t candidates < <(pgrep -f "^${BIN}$" 2>/dev/null || true)
 # what the profile exists to prevent. `grep -qxF` because the match must be exact: without
 # `-x` the profile `dev` matches a process running `dev2`. An unreadable `environ` is a pid
 # that died between `pgrep` and here, which is not a match.
+# Whether the profile's lock file names this pid.
+#
+# `cide_app::instance` writes `{pid, exe, profile}` into `instance.lock` beside `workspace.json`
+# as its own one-instance guard, so the profile already keeps a record of which process owns it.
+# The file lives in the profile's *own* state directory, so its path already encodes the profile;
+# the `profile` field is compared as well, because a file that disagrees with the directory it is
+# in is a file this should not be trusting.
+#
+# Used only where `/proc` is not — see [`in_this_profile`].
+lock_names() {
+  [ -r "$LOCKFILE" ] || return 1
+  # The three values go in as **arguments**, not interpolated into the program text: `$profile`
+  # is whatever the user typed after `--profile`, and a name containing a quote would otherwise
+  # close the string literal it was pasted into. A developer script running a developer's own
+  # argument is not an attack surface, but a quoting bug here would look like "the profile filter
+  # stopped working", which is the expensive kind of wrong.
+  python3 -c '
+import json, sys
+lock, pid, profile = sys.argv[1], int(sys.argv[2]), sys.argv[3] or None
+try:
+    rec = json.load(open(lock))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if rec.get("pid") == pid and rec.get("profile") == profile else 1)
+' "$LOCKFILE" "$1" "$profile" 2>/dev/null
+}
+
+# Which profile a running process belongs to.
+#
+# The binary path alone is not enough. It separates this script from an installed build —
+# `^./target/debug/cide$` cannot match an AppImage — but `./run.sh` and `./run.sh --profile
+# default` are the *same* path, and killing across that line is exactly what the profile exists to
+# prevent.
+#
+# Two roads, and `/proc` is tried **first** on purpose. It is live truth: the kernel's copy of the
+# process's own environment, which cannot be stale and cannot describe a pid the kernel has since
+# reissued. The lock file is a *written record* and can be both. So on Linux this behaves exactly
+# as it did before the file was consulted at all, and the lock is what makes the function work on
+# a platform that has no `/proc`.
+#
+# `grep -qxF` because the match must be exact: without `-x` the profile `dev` matches a process
+# running `dev2`. An unreadable `environ` is a pid that died between `pgrep` and here, a process
+# owned by somebody else, or a kernel with no `/proc` — the first two are not a match and the
+# third falls through.
+#
+# **And no third road: a process this cannot identify is left alone.** macOS does not let one
+# process read another's environment — `ps -E` and `ps eww` both decline — so on a Mac an instance
+# that never took the lock (`CIDE_ALLOW_SECOND_INSTANCE`) is a stranger. That is the safe
+# direction, and it is deliberately the opposite of the bias in `cide_app::instance`, which starts
+# the app on every doubt: the doubt here is about *killing somebody else's application*, so silence
+# means leave it alone. The cost is a launch that then refuses because the lock is held, which is a
+# loud and correct failure rather than a quiet and wrong one.
 in_this_profile() {
-  local env_file="/proc/$1/environ"
-  [ -r "$env_file" ] || return 1
-  if [ -n "$profile" ]; then
-    tr '\0' '\n' < "$env_file" 2>/dev/null | grep -qxF "CIDE_PROFILE=$profile"
-  else
-    # The default profile is the *absence* of the variable, so this is the mirror image.
-    ! tr '\0' '\n' < "$env_file" 2>/dev/null | grep -q '^CIDE_PROFILE='
+  local pid="$1" env_file="/proc/$1/environ"
+
+  if [ -r "$env_file" ]; then
+    if [ -n "$profile" ]; then
+      tr '\0' '\n' < "$env_file" 2>/dev/null | grep -qxF "CIDE_PROFILE=$profile"
+    else
+      # The default profile is the *absence* of the variable, so this is the mirror image.
+      ! tr '\0' '\n' < "$env_file" 2>/dev/null | grep -q '^CIDE_PROFILE='
+    fi
+    return
   fi
+
+  lock_names "$pid"
 }
 
 running=()
 strangers=()
-for pid in "${candidates[@]}"; do
-  if in_this_profile "$pid"; then running+=("$pid"); else strangers+=("$pid"); fi
-done
+# `${#candidates[@]}` first: under `set -u`, bash 3.2 treats `"${empty[@]}"` as an unbound
+# variable and aborts. bash 4.4 relaxed that, which is why this never showed on Linux.
+if [ "${#candidates[@]}" -gt 0 ]; then
+  for pid in "${candidates[@]}"; do
+    if in_this_profile "$pid"; then running+=("$pid"); else strangers+=("$pid"); fi
+  done
+fi
 
 if [ "${#running[@]}" -gt 0 ]; then
   echo "[run] stopping ${#running[@]} running instance(s): ${running[*]}"
@@ -202,7 +286,13 @@ fi
 
 # A `claude` reparented to init is one the app failed to reap. Left alone they accumulate
 # across launches, each holding a PTY and a model connection.
-mapfile -t orphans < <(ps -eo ppid=,pid=,comm= | awk '$1 == 1 && $3 == "claude" { print $2 }')
+#
+# The basename is compared, not the whole field, because **`comm` is a full path on macOS**:
+# procps prints `claude`, BSD `ps` prints `/opt/homebrew/bin/claude`, so `$3 == "claude"` matched
+# nothing on a Mac and the reaping silently did not happen. Reparenting is to pid 1 on both —
+# `launchd` there, `init` here.
+read_pids orphans < <(ps -eo ppid=,pid=,comm= 2>/dev/null |
+  awk '$1 == 1 { n = split($3, seg, "/"); if (seg[n] == "claude") print $2 }')
 if [ "${#orphans[@]}" -gt 0 ]; then
   echo "[run] reaping ${#orphans[@]} orphaned claude process(es)"
   kill -TERM "${orphans[@]}" 2>/dev/null
@@ -341,10 +431,17 @@ echo "[run] starting ${env_flags[*]:-} $BIN  (profile: ${profile:-default})"
 # child of a profiled instance inherits `CIDE_PROFILE=dev` from it. Without the explicit unset,
 # `./run.sh --profile default` run from a dev pane — the single most likely way anyone reaches
 # for the escape hatch — would silently come up in the dev profile anyway.
+#
+# The `${#env_flags[@]}` guard is bash 3.2 again: with no flags and `--profile default` the array
+# is empty, and `"${empty[@]}"` under `set -u` aborts there. That combination is precisely the
+# escape hatch — the one invocation somebody reaches for when something has gone wrong — so it is
+# the worst one to have die on an unbound variable.
 if [ -n "$profile" ]; then
   env "${env_flags[@]}" "$BIN"
-else
+elif [ "${#env_flags[@]}" -gt 0 ]; then
   env -u CIDE_PROFILE "${env_flags[@]}" "$BIN"
+else
+  env -u CIDE_PROFILE "$BIN"
 fi
 status=$?
 echo "[run] cide exited with status $status"

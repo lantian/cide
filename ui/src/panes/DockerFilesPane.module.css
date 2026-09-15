@@ -1,0 +1,246 @@
+/*
+ * The container file browser. (M44)
+ *
+ * ## Why a list and not a tree
+ *
+ * cide has two file trees already — `sidebar/FileTree.tsx` at 3000 lines and
+ * `GitPanel/ChangesTree.tsx` beside it — and neither is reusable: the first is file-system
+ * specific down to its drag rules, the second is a checkbox list of changed paths. A third would
+ * be a third implementation of expand/collapse, roving focus, speed search and virtualisation,
+ * for a surface where every expansion is a **round trip into a container**.
+ *
+ * A one-directory-at-a-time list with a breadcrumb above it is the right shape for that cost:
+ * it fetches exactly what is on screen, it has no expansion state to keep consistent with a
+ * filesystem that changes underneath it, and it is the shape every remote file browser has
+ * settled on for the same reason.
+ *
+ * Every size is a rung of the `--fs-ui-*` ladder and every colour is a token.
+ */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+/* The breadcrumb, which is also the way back up. */
+.trail {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: calc(28px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.crumb {
+  appearance: none;
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-2);
+  cursor: pointer;
+}
+
+.crumb:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.crumbCurrent {
+  composes: crumb;
+  color: var(--text);
+  cursor: default;
+}
+
+.crumbCurrent:hover {
+  background: transparent;
+}
+
+.sep {
+  flex: none;
+  color: var(--faint);
+}
+
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/*
+ * A row. 24px, the height every list in cide uses, so a container's files and the project's
+ * files scan at the same rate.
+ */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  text-align: left;
+  cursor: default;
+}
+
+.row:hover,
+.row:focus-visible {
+  background: var(--chrome-hi);
+}
+
+.icon {
+  flex: none;
+  color: var(--dim);
+  display: grid;
+  place-items: center;
+}
+
+.name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A symlink's target, which is the fact that explains why opening it will refuse. */
+.link {
+  flex: none;
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+}
+
+.size {
+  flex: none;
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The notice: an image with no shell, a directory that refused, a file that will not open.
+ *
+ * Prose in the pane rather than an empty list, and that is the whole point of the surface — an
+ * empty tree is a lie about a filesystem that is full, and there is nothing on screen to
+ * correct it.
+ */
+.notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-6);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+/* The opened file, below the list. */
+.viewer {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.viewerBar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  background: var(--panel);
+}
+
+.viewerPath {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.close {
+  appearance: none;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: calc(20px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  border: none;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  /* `padding: 0`: `appearance: none` does not reset WebKit's default button padding, and with
+     `box-sizing: border-box` it shrinks the content box until the mark overflows to one side of
+     its own hover background. `DockerPanel.module.css`'s `.headerAction` carries the full note. */
+  padding: 0;
+}
+
+.close:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.surface {
+  flex: 1;
+  min-height: 0;
+}
+
+/*
+ * The Info view, which shares the viewer's bar and sits in the same place below the list — one
+ * detail surface, never two open at once, because a pane this narrow cannot afford a second
+ * stacked panel and the two answer the same question about the same row.
+ */
+.info {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  max-height: 40%;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.infoRow {
+  display: flex;
+  gap: var(--sp-4);
+  padding: var(--sp-1) var(--sp-4);
+  font-size: var(--fs-ui-11);
+  line-height: 1.6;
+}
+
+.infoName {
+  flex: none;
+  width: calc(84px * var(--ui-scale));
+  color: var(--dim);
+}
+
+.infoValue {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}

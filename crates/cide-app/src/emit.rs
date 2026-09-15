@@ -716,3 +716,35 @@ pub fn ext_changed(app: &AppHandle, snapshot: &cide_ipc::ext::ExtensionSnapshot)
         tracing::debug!(%error, "ext-changed reached no window");
     }
 }
+
+/// The machine's Docker daemon changed — a container started, an image was pulled, the
+/// connection was switched. (M41)
+pub const DOCKER_CHANGED: &str = "cide://docker-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DockerChanged {
+    board: cide_ipc::docker::DockerBoard,
+}
+
+/// Broadcast the machine's Docker board.
+///
+/// # Why this carries neither a `rev` nor a project
+///
+/// No `rev` for [`SPEC_CHANGED`]'s reason, which holds here in the same form: the board is
+/// **derived**, every emit is preceded by a fresh read, and `docker_state::DockerState`'s
+/// coalescer runs exactly one flusher per burst — so only one read is ever in flight and two
+/// boards cannot land out of order. A second path that read a board and emitted it directly
+/// would break that property silently, which is why this function is the only caller's road.
+///
+/// No project because a daemon is not one. It belongs to the machine, every window shows the
+/// same containers, and keying this by project would send N copies of one answer that disagree
+/// while they refresh.
+pub fn docker_changed(app: &AppHandle, board: &cide_ipc::docker::DockerBoard) {
+    let payload = DockerChanged {
+        board: board.clone(),
+    };
+    if let Err(error) = app.emit(DOCKER_CHANGED, payload) {
+        tracing::debug!(%error, "docker-changed reached no window");
+    }
+}

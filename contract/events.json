@@ -3,6 +3,7 @@
   "cide://capabilities-changed",
   "cide://close-blocked",
   "cide://diagnostics",
+  "cide://docker-changed",
   "cide://ext-changed",
   "cide://fs-changed",
   "cide://fs-status",

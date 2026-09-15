@@ -452,6 +452,50 @@ for (const entry of ALLOWED) {
   )
 }
 
+/* -- 6: a mark's box is not displaced by the padding nobody reset ---------------------------- */
+
+/*
+ * **`appearance: none` does not reset a `<button>`'s padding**, and WebKit's default is `1px 6px`.
+ *
+ * With the global `box-sizing: border-box`, a `width: 20px` icon button therefore has an **8px**
+ * content box. The mark's auto-sized grid track is 14px, a track wider than its content box
+ * overflows towards the inline *end*, and the glyph ends up 6px from the left edge of its own
+ * hover background and flush against the right. `place-items: center` cannot save it: that
+ * centres the item inside its track, and it is the track that is displaced.
+ *
+ * Reported as "the icon hover background isn't centred", which is exactly what it looks like.
+ * Every icon button written before the Docker panel already set `padding: 0` — `ActivityRail`,
+ * `TabStrip`, the tool window — so this had never been seen. A convention that four files keep
+ * and the fifth forgets is not a rule, which is what this turns it into.
+ *
+ * The rule is deliberately narrow: a block that both centres with `place-items: center` **and**
+ * fixes a `width` is an icon-sized box, and one that neither states a padding nor composes from
+ * something that does is the shape that fails. A padded button (a toolbar row, a labelled
+ * control) states its padding and is not matched.
+ */
+{
+  const styles = sources(SRC, ['.css'])
+  for (const file of styles) {
+    const text = readFileSync(file, 'utf8')
+    const where = relative(SRC, file)
+    // Rule blocks, crudely but sufficiently: this stylesheet dialect nests nothing but media
+    // queries, and a media query's body has no `place-items` of its own.
+    for (const [, selector, body] of text.matchAll(/([^{}]*)\{([^{}]*)\}/g)) {
+      if (!/place-items:\s*center/.test(body)) continue
+      if (!/\bwidth:/.test(body)) continue
+      if (/\bpadding\b/.test(body) || /\bcomposes:/.test(body)) continue
+      ok(
+        false,
+        `${where}: \`${selector.trim().split('\n').pop().trim()}\` centres a mark in a fixed-width `
+          + 'box and resets no padding. If it is a <button>, WebKit keeps `1px 6px` through '
+          + '`appearance: none` and the mark lands off its own hover background — add '
+          + '`padding: 0`. If it is not a button, say so with `padding: 0` anyway or give it the '
+          + 'padding it means.',
+      )
+    }
+  }
+}
+
 if (failed) {
   console.error(`\n${failed} icon check(s) failed`)
   process.exit(1)

@@ -80,6 +80,9 @@ import { ExtensionTab } from '@/ext/ExtensionTab'
 import { liveCount } from '@/sidebar/AgentsPanel/model'
 import { useAgents } from '@/sidebar/agentsStore'
 import { TasksPanel, TaskDetailHost } from '@/sidebar/TasksPanel'
+import { DockerFilesPane } from '@/panes/DockerFilesPane'
+import { DockerInspectPane } from '@/panes/DockerInspectPane'
+import { useDocker } from '@/sidebar/dockerStore'
 import { OpenSpecPanel } from '@/sidebar/OpenSpecPanel'
 import { ProposeDialog, useProposeDialog } from '@/sidebar/OpenSpecPanel/ProposeDialog'
 import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
@@ -107,7 +110,7 @@ import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
 import { jumpTo, pendingJump } from '@/editor/jump'
 import { UNKNOWN_LINE } from '@/editor/navHistory'
-import { claudeSend, specEvents } from '@/ipc/client'
+import { claudeSend, dockerEvents, specEvents } from '@/ipc/client'
 import { startFileDrop } from '@/sidebar/TasksPanel/fileDrop'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
@@ -874,6 +877,7 @@ export function App() {
    */
   const attachSpec = useSpec((s) => s.attach)
   const adoptSpec = useSpec((s) => s.adopt)
+  const adoptDocker = useDocker((s) => s.adopt)
 
   useEffect(() => {
     attachSpec(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
@@ -887,6 +891,27 @@ export function App() {
       void off.then((stop) => stop())
     }
   }, [adoptSpec])
+
+  /*
+   * Docker: one board for the machine, read by the panel and by the rail's badge. (M41)
+   *
+   * Subscribed **here** rather than inside `DockerPanel`, for the reason the two blocks above
+   * give: the badge has to stay live while the sidebar is shut or showing Files, and a listener
+   * registered inside a panel goes stale the moment that panel unmounts.
+   *
+   * There is no `attach` beside it, unlike the spec board, and that is the whole difference a
+   * machine-scoped board makes: no project to follow, and nothing to reset when one changes.
+   * The first *read* is the panel's own, in `DockerPanelHost` — a daemon nobody has opened the
+   * panel for is a socket cide has no reason to connect to.
+   */
+  useEffect(() => {
+    const off = dockerEvents.onChanged((board) => {
+      adoptDocker(board)
+    })
+    return () => {
+      void off.then((stop) => stop())
+    }
+  }, [adoptDocker])
 
   /*
    * Subagents: one roster, read by the panel and by the rail's ⌬ badge. (M18)
@@ -2346,6 +2371,16 @@ const WorkspaceContent = memo(function WorkspaceContent({
                           ? { change: tab.kind.subject.change }
                           : { spec: tab.kind.subject.spec })}
                       />
+                    ) : tab.kind.kind === 'docker' ? (
+                      /*
+                       * A `docker inspect` document, replacing the pane tree for the two reasons
+                       * the OpenSpec and Extension arms above give: it is a page *about*
+                       * something rather than a document in the project, and there is nothing
+                       * for a split to split.
+                       */
+                      <DockerInspectPane target={tab.kind.target} title={tab.kind.title} />
+                    ) : tab.kind.kind === 'dockerFiles' ? (
+                      <DockerFilesPane container={tab.kind.container} name={tab.kind.name} />
                     ) : (
                     <SplitTree
                       tree={tab.tree}

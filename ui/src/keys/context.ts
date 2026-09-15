@@ -53,6 +53,7 @@
  */
 import { useWorkspace } from '@/store/workspace'
 import { registeredBuffers } from '@/editor/openBuffers'
+import { isComposePath } from '@/chrome/composeModel'
 import {
   activeProjectOf,
   claudeTargetOf,
@@ -94,6 +95,7 @@ export const DERIVED_FLAGS = [
   'closableTab',
   'editorOpen',
   'fileTabActive',
+  'composeFileActive',
   'claudeTarget',
   'shellWindow',
 ] as const
@@ -143,6 +145,18 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
     // Derived from `focusedTabPath`, the same function the handler and the Explorer's button
     // call, so the row the palette offers is offered exactly when the button is enabled.
     fileTabActive: focusedTabPath(boot) !== null,
+    // Narrower: that file is one Compose would read. (M48)
+    //
+    // Off `focusedTabPath` rather than `focusedFilePath` for the reason `fileTabActive` above it
+    // gives — a file tab split with a shell pane is still a file tab, and a Compose run does not
+    // care which pane has focus. `isComposePath` decides by name, which is
+    // `cide_docker::compose::is_compose_file`'s own rule and its own note on why it is not a
+    // parse: this is evaluated on every keystroke, and reading the file to look for a
+    // `services:` key would be a disk read per key.
+    composeFileActive: (() => {
+      const path = focusedTabPath(boot)
+      return path !== null && isComposePath(path)
+    })(),
     claudeTarget: claudeTargetOf(boot) !== null,
     // There is no `repoOpen`, and its absence is deliberate — see the note at the foot of
     // `target.ts`. It was derived from `ProjectRoot.repo`, which Rust never filled, so it was
