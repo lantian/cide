@@ -263,10 +263,19 @@ fn a_rebase_pull_matches_the_git_binary() {
         "main",
     ]);
 
+    // The tree, and deliberately **not** the tip's oid. A rebase moves the committer date (see
+    // the `%at`-not-`%ct` comment below), so the two tips are the same commit only when cide's
+    // replay and the twin's `git pull --rebase` happen to land inside one wall-clock second.
+    // They did on every machine this was written on, and did not on a loaded macOS runner, where
+    // the assertion failed with two perfectly correct rebases. Nothing is given up by dropping
+    // it: everything the oid covered is asserted below over the whole replayed range — the tree
+    // here, then the worktree, the index, the commit count, and author identity, author date and
+    // message. `a_rebase_pull_keeps_the_author_and_moves_the_committer` is where the committer
+    // is the subject rather than an accident.
     assert_eq!(
-        head(&work),
-        head(&twin),
-        "the rebased tip is the same commit"
+        work.git(&["rev-parse", "HEAD^{tree}"]),
+        twin.git(&["rev-parse", "HEAD^{tree}"]),
+        "the rebased tree is the one git produced"
     );
     assert_eq!(worktree_hash(&work), worktree_hash(&twin));
     assert_eq!(
