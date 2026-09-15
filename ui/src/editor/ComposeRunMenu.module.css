@@ -1,0 +1,43 @@
+/*
+ * The compose gutter's menu. Shaped like `ContextMenu.module.css`'s box on purpose — it is a menu
+ * and must not read as a second kind of one — but it cannot *be* that component: see
+ * `ComposeRunMenu.tsx` for why this road is a tooltip with a React root rather than a hook.
+ */
+.menu {
+  display: flex;
+  flex-direction: column;
+  min-width: calc(150px * var(--ui-scale));
+  padding: var(--sp-1) 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  box-shadow: var(--shadow-2);
+}
+
+.head {
+  padding: var(--sp-1) var(--sp-4) var(--sp-2);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row {
+  appearance: none;
+  display: block;
+  width: 100%;
+  padding: var(--sp-2) var(--sp-4);
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  text-align: left;
+  cursor: pointer;
+}
+
+.row:hover,
+.row:focus-visible {
+  background: var(--chrome-hi);
+}

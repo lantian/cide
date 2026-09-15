@@ -19,6 +19,7 @@
 import { useSyncExternalStore } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { guardUnlisten } from '@/ipc/unlisten'
 import { currentUserAgent, drawsOwnResizeGrips } from './windowControls'
 import styles from './WindowFrame.module.css'
 
@@ -226,9 +227,18 @@ function attach(): void {
     .onResized(() => {
       void refresh()
     })
-    .then((unlisten) => {
+    .then((fn) => {
+      /*
+       * Guarded, because this is the branch that loses the registration race: `attach` and
+       * `detach` run back to back whenever the last subscriber goes and another arrives, and
+       * `else unlisten()` then fires at the earliest instant the handle exists — which is
+       * sometimes before the eval that registered it has run. See `ipc/unlisten.ts`; the
+       * `.catch` below never saw this one, because the rejection is the discarded result of
+       * the call rather than of the chain.
+       */
+      const unlisten = guardUnlisten(fn)
       if (mine === generation) unlistenResize = unlisten
-      else unlisten()
+      else void unlisten()
     })
     .catch(() => {
       /* No window event stream means the flag stays at whatever the one-shot poll above read

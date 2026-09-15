@@ -391,6 +391,7 @@ pub fn tab_open_settings(
                 conversation: None,
                 conversation_since: None,
                 title: "settings".into(),
+                docker: None,
             },
         )?;
         Ok(id)

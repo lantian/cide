@@ -440,7 +440,6 @@ export const BUILTIN_LANGUAGES: readonly LanguageDef[] = [
       ".bashrc",
       ".zshrc",
       ".profile",
-      "dockerfile",
       "makefile"
     ],
     "fenceAliases": [
@@ -477,6 +476,54 @@ export const BUILTIN_LANGUAGES: readonly LanguageDef[] = [
       {
         "label": "Shell",
         "ext": "sh"
+      }
+    ]
+  },
+  {
+    "id": "dockerfile",
+    "label": "Dockerfile",
+    "extensions": [
+      {
+        "ext": "dockerfile"
+      },
+      {
+        "ext": "containerfile"
+      }
+    ],
+    "filenames": [
+      "dockerfile",
+      "containerfile"
+    ],
+    "fenceAliases": [
+      "docker"
+    ],
+    "grammar": {
+      "name": "Dockerfile",
+      "keywords": [],
+      "caseInsensitiveKeywords": false,
+      "types": [],
+      "atoms": [],
+      "builtins": [],
+      "nestedComments": false,
+      "tripleQuotes": false,
+      "capitalisedIsType": false,
+      "callSyntax": false,
+      "rules": []
+    },
+    "fold": {
+      "lineComment": "#",
+      "quotes": "\"'",
+      "lifetimes": false,
+      "rawStrings": false,
+      "indentBlocks": false,
+      "headingFolds": false,
+      "fencedBlocks": false,
+      "regions": true
+    },
+    "scratch": [
+      {
+        "label": "Dockerfile",
+        "ext": "dockerfile"
       }
     ]
   },
@@ -619,7 +666,8 @@ export const BUILTIN_SERVERS: readonly LanguageServerDef[] = [
     "declaresWatchedFiles": false,
     "extraPathHints": [
       "~/.cargo/bin"
-    ]
+    ],
+    "initOptions": null
   },
   {
     "binary": "gopls",
@@ -636,6 +684,52 @@ export const BUILTIN_SERVERS: readonly LanguageServerDef[] = [
     "declaresWatchedFiles": true,
     "extraPathHints": [
       "~/go/bin"
-    ]
+    ],
+    "initOptions": null
+  },
+  {
+    "binary": "docker-langserver",
+    "args": [
+      "--stdio"
+    ],
+    "languageIds": [
+      "dockerfile"
+    ],
+    "projectMarkers": [],
+    "projectKind": "Docker",
+    "installHint": "npm install -g dockerfile-language-server-nodejs",
+    "declaresWatchedFiles": true,
+    "extraPathHints": [],
+    "initOptions": null
+  },
+  {
+    "binary": "yaml-language-server",
+    "args": [
+      "--stdio"
+    ],
+    "languageIds": [
+      "yaml"
+    ],
+    "projectMarkers": [],
+    "projectKind": "YAML",
+    "installHint": "npm install -g yaml-language-server",
+    "declaresWatchedFiles": false,
+    "extraPathHints": [],
+    "initOptions": {
+      "yaml": {
+        "schemas": {
+          "https://raw.githubusercontent.com/compose-spec/compose-spec/master/schema/compose-spec.json": [
+            "compose.yaml",
+            "compose.yml",
+            "compose.*.yaml",
+            "compose.*.yml",
+            "docker-compose.yaml",
+            "docker-compose.yml",
+            "docker-compose.*.yaml",
+            "docker-compose.*.yml"
+          ]
+        }
+      }
+    }
   }
 ]

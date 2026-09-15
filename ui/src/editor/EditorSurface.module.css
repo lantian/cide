@@ -1235,3 +1235,46 @@
   color: var(--faint);
   text-decoration: line-through;
 }
+
+/*
+ * The Compose run column. (M48)
+ *
+ * **Not reserved in the `.cm-gutters` width above**, unlike the change column immediately before
+ * it, and the asymmetry is deliberate. That reservation is unconditional because whether a file
+ * differs from HEAD changes with every keystroke, so a conditional one would shift every line
+ * number the instant somebody typed. This column's condition is the *file name*, which cannot
+ * change while a buffer is open — `composeGutter` answers `[]` for anything but a compose file,
+ * so the column exists in exactly the buffers that draw into it and its width never moves under
+ * anybody.
+ *
+ * Sized to the glyph rather than a token step: it holds one triangle and nothing else, ever.
+ */
+.body :global(.cm-cide-compose) {
+  flex: none;
+  width: calc(14px * var(--ui-scale));
+}
+
+/*
+ * Three classes deep, for `.cm-cide-changes`' reason one rule up: `highlightActiveLineGutter()`
+ * paints `var(--tk-sel)` on **every** gutter element of the caret's line at (0,2,0), and the line
+ * a marker sits on is exactly the line somebody editing a service is most likely to be on. (0,3,0)
+ * wins regardless of source order, so reordering this file cannot silently blank the marker.
+ */
+.body :global(.cm-cide-compose .cm-gutterElement .cm-compose-run) {
+  display: block;
+  margin: 0 auto;
+  color: var(--dim);
+  cursor: pointer;
+  /*
+   * Paint only, and the duration is a token — which is also the whole of this file's answer to
+   * `prefers-reduced-motion`. `tokens.css` zeroes `--dur-*` under that query for every rule at
+   * once, so a second media block here would be a surface opting out of the global answer
+   * without saying so. `check:motion` refuses one, and it caught the block that used to be
+   * below this rule.
+   */
+  transition: color var(--dur-1) ease;
+}
+
+.body :global(.cm-cide-compose .cm-gutterElement .cm-compose-run:hover) {
+  color: var(--accent);
+}

@@ -201,9 +201,14 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
    * import that, so the surfacing stays at the gesture, where a reader looking at the click can
    * find it.
    */
-  const guarded = useCallback((done: Promise<void>) => {
-    void done.catch(notifyFailure)
-  }, [])
+  const guarded = useCallback(
+    (done: Promise<void>) => {
+      // Stamped with this panel's project, so the reason lands in the project the write was
+      // aimed at rather than in whichever one the user has switched to by the time it fails.
+      void done.catch((reason: unknown) => notifyFailure(reason, { project }))
+    },
+    [project],
+  )
 
   /*
    * Which role's Integrate is armed, or `null`.
@@ -246,26 +251,35 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
         .getState()
         .integrate(agent)
         .then((done) => {
+          // All three carry the project: an integrate is a merge over a real repository and
+          // takes as long as it takes, so its answer routinely arrives after the user has
+          // moved on — and a merge report shown over a different repository is worse than one
+          // shown late.
           if (done.kind === 'upToDate') {
             notify(`${agent} has nothing to integrate — its branch holds no new commits.`, {
               kind: 'warn',
+              project,
             })
             return
           }
           if (done.kind === 'merged') {
             const n = done.files === 1 ? '1 file' : `${done.files} files`
-            notify(`Integrated ${agent}: ${n} at ${done.commit.slice(0, 8)}.`, { kind: 'ok' })
+            notify(`Integrated ${agent}: ${n} at ${done.commit.slice(0, 8)}.`, {
+              kind: 'ok',
+              project,
+            })
             return
           }
           notify(`${agent} conflicts with your branch — nothing was merged.`, {
             kind: 'error',
+            project,
             hint: 'Your checkout is untouched. Resolve on the agent’s branch, or open its pane and ask it to.',
             detail: done.paths.join('\n'),
           })
         })
-        .catch(notifyFailure)
+        .catch((reason: unknown) => notifyFailure(reason, { project }))
     },
-    [],
+    [project],
   )
 
   /*

@@ -1,0 +1,524 @@
+/*
+ * The Docker panel. (M41)
+ *
+ * ## Width
+ *
+ * `--w-sidebar-files`, borrowed rather than given a token of its own, on the argument
+ * `ExtensionsPanel.module.css` and `ProblemsPanel.module.css` both make: this is the explorer's
+ * column with different rows in it, and a user who widens the tree to read long paths means the
+ * same thing when they widen this — container names and image references are exactly as long.
+ *
+ * ## The shape of a row, and why it is a line and not a card
+ *
+ * The opposite call from the Extensions panel, and for the reason that panel states: a row here
+ * is *one* thing with a state, and a list of containers is read by scanning down the left edge
+ * for the ones that are not green. Cards would put 60px between two facts that belong on the
+ * same glance. So: a status dot, a name, and a dim second line — 40px, two lines, a hairline
+ * between stacks and nothing between rows.
+ *
+ * ## The dot carries the state, and the text carries the detail
+ *
+ * Colour is never the only channel — every dot has a `title` and every row a second line naming
+ * the state in words. A red dot beside "Exited (0) 2 days ago" is redundant on purpose; the
+ * redundancy is what makes the panel work for somebody who cannot tell the two greens apart.
+ *
+ * ## Actions
+ *
+ * Hidden until the row is hovered or focused, and revealed as a group. A five-button strip
+ * drawn permanently on every row is what made the first version unreadable at 252px: the buttons
+ * are the least-used thing on the row and were taking a third of its width.
+ *
+ * Every size is a rung of the `--fs-ui-*` ladder and every colour is a token.
+ */
+
+.panel {
+  width: var(--w-sidebar-files);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/*
+ * In the bottom tool window the panel fills its tab rather than owning a width.
+ *
+ * `ExtPanel.module.css`'s rule, matched declaration for declaration — the two panels sit in the
+ * same slot and a panel that kept its sidebar width there would leave a column of background
+ * beside it, which is what a sidebar panel dropped into the bottom panel looks like.
+ */
+.docked {
+  width: auto;
+  flex: 1 1 auto;
+  border-right: none;
+  /*
+   * **`height: 100%`, and it is what makes the two columns scroll apart.**
+   *
+   * `ToolWindow.module.css`'s `.body` is one `overflow: auto` scroller wrapping whatever tab is
+   * active, which is right for a Log tab — one long list, one scrollbar. This panel is two
+   * columns that each own their scrolling, and it only works if the panel has a **definite**
+   * height to divide: `.columns` is `flex: 1; min-height: 0`, and `flex: 1` of an auto-height
+   * parent is still the content's height. So `.body` overflowed instead, and one scrollbar moved
+   * the list and the detail together — selecting a row at the foot of the list scrolled the
+   * detail off the top, which is exactly when it is wanted.
+   *
+   * `flex: 1 1 auto` above cannot do it: `.body` is a block, not a flex container, so the flex
+   * shorthand is inert there. It stays because the sidebar placement *is* a flex child.
+   *
+   * The alternative was making `.body` stop scrolling for this one tab, which pushes a fact about
+   * the Docker panel into the tool window's own stylesheet and leaves the next panel with the
+   * same shape to discover this again.
+   */
+  height: 100%;
+}
+
+/* --- header ------------------------------------------------------------------------------- */
+
+/* The panel header, identical in all seven sidebar panels — see `ExtensionsPanel.module.css`
+ * for the four declarations that made it this and why each of them changed. */
+.header {
+  height: var(--h-panelheader);
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-3) 0 var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.headerAction {
+  appearance: none;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: calc(20px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  border: none;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-13);
+  line-height: 1;
+  cursor: pointer;
+  /*
+   * **`padding: 0`, and it is not tidying.**
+   *
+   * `appearance: none` does not reset padding in WebKit — the UA default for a `<button>` is
+   * `1px 6px`, and it survives. With the global `box-sizing: border-box` a 20px button therefore
+   * has an **8px** content box, the mark's auto-sized grid track is 14px wide, and a track wider
+   * than its content box overflows towards the inline **end**. So the glyph sat 6px from the left
+   * edge of its own hover background and flush against the right, which is what "the icon's hover
+   * background isn't centred" looks like. `place-items: center` cannot fix it: it centres the item
+   * in its track, and the track is what is displaced.
+   *
+   * Every other icon button in the app already sets this — `ActivityRail`, `TabStrip`, the tool
+   * window — which is why it had never been reported. `check:ui-icons` asserts it now, because a
+   * convention four files keep and one forgets is not a rule.
+   */
+  padding: 0;
+}
+
+.headerAction:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.headerAction:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* --- the connection, in the header row ---------------------------------------------------- */
+
+/*
+ * The context switcher lives beside Refresh rather than on a line of its own.
+ *
+ * It had 22px to itself and that was 22px spent saying "this is a Docker panel" a second time:
+ * both controls are about *which daemon this is*, and a header row is where a panel's controls
+ * go. The version sits after it, tabular, so switching contexts does not shuffle the row.
+ */
+.connection {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/* Holds the row's shape when there is no context store to draw. */
+.connectionSpacer {
+  flex: 1;
+  min-width: 0;
+}
+
+.contextPicker {
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  padding: 0;
+  cursor: pointer;
+}
+
+.contextPicker:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.contextPicker:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.apiVersion {
+  flex: none;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The panel's own name, in the sidebar only. */
+.headerLabel {
+  flex: none;
+  font-weight: 500;
+}
+
+/* --- body --------------------------------------------------------------------------------- */
+
+/*
+ * The list and the detail, side by side.
+ *
+ * The list keeps a floor so the detail cannot squeeze it to nothing, and the detail takes the
+ * rest — which is what makes this usable in the bottom panel (wide) and in a sidebar (narrow),
+ * where the detail simply gets less.
+ */
+.columns {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.body {
+  flex: 1 1 0;
+  min-width: calc(220px * var(--ui-scale));
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/*
+ * The selected row.
+ *
+ * A background rather than a border: a border would move the text by a pixel as selection
+ * changed, which is the flicker every list in cide avoids the same way.
+ */
+/*
+ * **Three classes deep, and that is not decoration.**
+ *
+ * `.rowSelected:hover` and `.row:hover` are both (0,2,0), so the cascade falls through to source
+ * order — and `.row:hover` is 160 lines further down this file. Hovering the selected row
+ * therefore painted `--chrome-hi` straight over `--accent-dim` and the selection vanished under
+ * the pointer, which is the one moment a user most needs to see it: reported as "selected row
+ * under hover seen as not selected".
+ *
+ * `.row.rowSelected` is (0,3,0) and wins **regardless of source order**, which is the point.
+ * Fixing this by moving the rule instead would have worked today and turned any later reordering
+ * of this file into a silent regression — the argument `editor/EditorSurface.module.css` already
+ * makes about `highlightActiveLineGutter` painting over the change bars, and it is the same shape:
+ * a state rule losing to a hover rule that has no idea it exists.
+ *
+ * `:focus-within` is here for the same reason. Tabbing into a selected row's action buttons was
+ * the keyboard spelling of the same disappearance.
+ */
+.row.rowSelected,
+.row.rowSelected:hover,
+.row.rowSelected:focus-within {
+  background: var(--accent-dim);
+}
+
+/*
+ * The empty, absent and unusable screens.
+ *
+ * One class for all three, because they are one shape: a sentence and — for the two that are
+ * recoverable — a Retry. The *sentence* is what differs, and it is composed in Rust where the
+ * reason is known. See `cide_ipc::docker::DockerBoard`.
+ */
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-5);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.noticeEndpoint {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  word-break: break-all;
+}
+
+.retry {
+  appearance: none;
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--chrome);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.retry:hover:not(:disabled) {
+  background: var(--chrome-hi);
+}
+
+/*
+ * A failed gesture's sentence, above the list.
+ *
+ * The daemon's own words — "You cannot remove a running container" — and it stays until the next
+ * gesture rather than fading, because it is the answer to a button that appeared to do nothing.
+ */
+
+/* --- groups and rows ---------------------------------------------------------------------- */
+
+.groupLabel {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-5);
+  font-size: var(--fs-ui-11);
+  font-weight: 500;
+  color: var(--dim);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/*
+ * The twisty and the name are one button, so the whole heading toggles.
+ *
+ * A 6px chevron is not a target: every tree in cide toggles on the row, and a heading that only
+ * answered its arrow would be the one place that did not.
+ */
+.groupToggle {
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.groupToggle:hover {
+  color: var(--text);
+}
+
+/* How many containers are inside, so a collapsed group still says how much it is hiding. */
+.groupCount {
+  flex: none;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.groupName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * A stack heading's buttons.
+ *
+ * Revealed on hover like a row's, and for the same reason — but the *heading* is what is
+ * hovered, not a row, so this is scoped to `.groupLabel` rather than `.row`.
+ */
+.groupActions {
+  flex: none;
+  display: flex;
+  gap: calc(2px * var(--ui-scale));
+  visibility: hidden;
+}
+
+.groupLabel:hover .groupActions,
+.groupLabel:focus-within .groupActions {
+  visibility: visible;
+}
+
+/*
+ * Why the buttons are not there.
+ *
+ * Permanent rather than on hover: it is the answer to "where are the controls", and a control
+ * that is missing gives nobody a reason to hover over the place it should have been.
+ */
+.groupBlocked {
+  flex: none;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  cursor: help;
+}
+
+.sectionLabel {
+  composes: groupLabel;
+  border-top: 1px solid var(--border-soft);
+  margin-top: var(--sp-2);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: calc(40px * var(--ui-scale));
+  padding: var(--sp-2) var(--sp-3) var(--sp-2) var(--sp-5);
+  cursor: default;
+}
+
+.row:hover,
+.row:focus-within {
+  background: var(--chrome-hi);
+}
+
+/*
+ * The state dot.
+ *
+ * 8px, and never the only channel — it carries a `title` and the row's second line names the
+ * state in words. See the stylesheet header.
+ */
+.dot {
+  flex: none;
+  width: calc(8px * var(--ui-scale));
+  height: calc(8px * var(--ui-scale));
+  border-radius: 50%;
+  background: var(--dim);
+}
+
+.toneRunning {
+  background: var(--green);
+}
+
+.toneWarning {
+  background: var(--yellow);
+}
+
+.toneStopped {
+  background: var(--dim);
+  opacity: 0.5;
+}
+
+.toneNeutral {
+  background: var(--dim);
+}
+
+.rowText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: calc(1px * var(--ui-scale));
+}
+
+.rowName {
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowDetail {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowPorts {
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The action strip, revealed on hover or focus.
+ *
+ * `visibility` and not `display`, so the row's height does not change when the pointer crosses
+ * it — a list that reflows under the cursor is unusable, and the buttons are the tallest thing
+ * on the row.
+ */
+.actions {
+  flex: none;
+  display: flex;
+  gap: calc(2px * var(--ui-scale));
+  visibility: hidden;
+}
+
+.row:hover .actions,
+.row:focus-within .actions {
+  visibility: visible;
+}
+
+.action {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: calc(20px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  border: none;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  /* `padding: 0` for the reason spelled out above — WebKit's button padding is not reset
+     by `appearance: none`, and it pushes the mark off its own hover background. */
+  padding: 0;
+}
+
+.action:hover:not(:disabled) {
+  background: var(--chrome);
+  color: var(--text);
+}
+
+.action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.actionDanger:hover:not(:disabled) {
+  color: var(--red);
+}
+
+.imageSize {
+  flex: none;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}

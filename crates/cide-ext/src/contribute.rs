@@ -383,6 +383,7 @@ mod tests {
             install_hint: "npm i -g yaml-language-server".into(),
             declares_watched_files: false,
             extra_path_hints: vec![],
+            init_options: None,
         };
         let first = Contributions {
             languages: vec![language("yaml", "yaml")],

@@ -31,6 +31,7 @@ fn def(binary: &str) -> cide_ipc::lang::LanguageServerDef {
         install_hint: "-".into(),
         declares_watched_files: false,
         extra_path_hints: vec![],
+        init_options: None,
     }
 }
 
@@ -52,29 +53,37 @@ fn the_table_is_append_only_and_falls_back_to_the_builtins() {
          conclude cide drives no language servers at all"
     );
     assert_eq!(Server::GOPLS.binary(), "gopls");
-    assert_eq!(servers().len(), 2);
+    // Derived rather than a literal: M45 added two builtins and the literal `2` here was the
+    // only thing that noticed. What the test is *about* is that an uninstalled registry already
+    // reports the builtins — the count is incidental, and pinning it made adding one a failure
+    // in a file about extensions.
+    let builtins = cide_ipc::lang::builtin_servers().len();
+    assert_eq!(servers().len(), builtins);
 
     // The real startup call, then two contributed servers on top of it.
+    //
+    // `sqls` and `svelteserver` — deliberately two names **no builtin uses**. This registry is
+    // append-only and does not deduplicate (that is `cide_ext::contribute`'s job, one layer up),
+    // so a contributed name that collided with a builtin would add a second row and make this
+    // test's arithmetic a statement about the merge rather than about the table.
     let mut wanted = cide_ipc::lang::builtin_servers();
     wanted.push(def("sqls"));
-    wanted.push(def("yaml-language-server"));
+    wanted.push(def("svelteserver"));
     let handles = install(wanted);
-    assert_eq!(handles.len(), 4);
+    assert_eq!(handles.len(), builtins + 2);
     assert_eq!(
         handles[0],
         Server::RUST_ANALYZER,
         "the builtins keep the indices their constants name, which ninety call sites rely on"
     );
     assert_eq!(handles[1], Server::GOPLS);
-    let sqls = handles[2];
+    let sqls = handles[builtins];
     assert_eq!(sqls.binary(), "sqls");
 
     // `sqls`' extension is disabled.
-    install(vec![
-        cide_ipc::lang::builtin_servers()[0].clone(),
-        cide_ipc::lang::builtin_servers()[1].clone(),
-        def("yaml-language-server"),
-    ]);
+    let mut without_sqls = cide_ipc::lang::builtin_servers();
+    without_sqls.push(def("svelteserver"));
+    install(without_sqls);
     assert_eq!(
         sqls.binary(),
         "sqls",
@@ -84,7 +93,7 @@ fn the_table_is_append_only_and_falls_back_to_the_builtins() {
     );
     assert_eq!(
         servers().len(),
-        3,
+        builtins + 1,
         "and the inactive row is not offered for starting"
     );
     assert!(servers().iter().all(|s| s.binary() != "sqls"));
@@ -103,7 +112,10 @@ fn the_table_is_append_only_and_falls_back_to_the_builtins() {
     let mut wanted = cide_ipc::lang::builtin_servers();
     wanted.push(def("sqls"));
     let again = install(wanted);
-    assert_eq!(again[2], sqls, "`sqls` is the same handle it always was");
+    assert_eq!(
+        again[builtins], sqls,
+        "`sqls` is the same handle it always was"
+    );
 
     // An updated extension's new arguments reach the row rather than appending another.
     let mut updated = def("sqls");
@@ -123,7 +135,7 @@ fn the_table_is_append_only_and_falls_back_to_the_builtins() {
     let mut wanted = cide_ipc::lang::builtin_servers();
     wanted.push(css);
     let handles = install(wanted);
-    let css = handles[2];
+    let css = handles[builtins];
     assert_eq!(css.language_id_for(Some("scss")), "scss");
     assert_eq!(css.language_id_for(Some("less")), "less");
     assert_eq!(

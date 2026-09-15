@@ -219,8 +219,13 @@ try {
   eq(TABS_INITIAL, { open: false, history: [], active: null }, 'a project with no saved state')
   eq(
     tabRow(TABS_INITIAL).map((r) => [r.id, r.label, r.active, r.closable]),
-    [[null, 'Log', true, false]],
-    'the Log tab is always there, always first, and never closable',
+    [
+      [null, 'Log', true, false],
+      ['docker', 'Docker', false, false],
+    ],
+    'the Log tab is always there, always first, and never closable — and since M46 Docker is ' +
+      'always second and never closable either: both are fixtures of the panel rather than ' +
+      'things the user opened',
   )
   eq(historyTitle('crates/cide-git/src/log.rs'), 'log.rs', 'a tab is called its basename')
   eq(historyTitle('README.md'), 'README.md', 'including at the root')
@@ -246,8 +251,10 @@ try {
   eq(three.history.map((t) => t.id), ['h1', 'h2', 'h3'], 'tabs keep the order they were opened')
   eq(
     tabRow(three).map((r) => r.id),
-    [null, 'h1', 'h2', 'h3'],
-    'and the Log tab still leads the row',
+    [null, 'docker', 'h1', 'h2', 'h3'],
+    'and the Log tab still leads the row, with Docker behind it and every history tab after ' +
+      'both — a fixture that moved as history tabs came and went would be a target that is ' +
+      'never in the same place twice',
   )
   ok(
     tabRow(three).filter((r) => r.closable).length === 3,

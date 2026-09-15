@@ -42,21 +42,45 @@
  * them, and no more: the colour of the edge, and the ARIA role. A modal treatment was rejected
  * for the same reason it was rejected for failures — see the head of `Failures.module.css`.
  */
-import { useEffect, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useSyncExternalStore } from 'react'
 import {
   dismiss,
   getServerSnapshot,
   getSnapshot,
   notifyFailure,
   subscribe,
+  visible,
   type Notice,
 } from './notices'
+import { useWorkspace } from '@/store/workspace'
+import { activeProjectIdOf } from '@/keys/target'
 import { Icon } from '@/icons/Icon'
 
 import styles from './Failures.module.css'
 
 export function Failures(): React.ReactNode {
-  const notices = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+  /*
+   * This window's project, and the stack is filtered to it.
+   *
+   * The reported bug is that a toast raised in one project stayed in the corner through a
+   * switch to the next: the stack is module-level and therefore per *window*, and in the
+   * default `Stacked` mode one window holds every open project. `notify` stamps each notice
+   * with the project that was on screen (see `setNoticeScope`, registered in
+   * `store/workspace.ts`), and `visible` keeps this project's plus everything that belongs to
+   * no project at all — an app-level failure, and any window with nothing open.
+   *
+   * Hidden, not dropped: coming back to the project shows its notice again. A toast never
+   * dismisses itself here, so dropping one on a switch would lose a failure the user has not
+   * read, which is the exact thing this file exists to prevent.
+   *
+   * **The filter is a `useMemo` over the whole snapshot, never inside `getSnapshot`.** A
+   * snapshot callback that builds a fresh array per call is a re-render loop that ends at
+   * *Maximum update depth exceeded* and unmounts the root — the failure `check:selectors` was
+   * written for. The selector below returns a `string | null`, which is safe by the same rule.
+   */
+  const project = useWorkspace((s) => activeProjectIdOf(s.boot))
+  const all = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+  const notices = useMemo(() => visible(all, project), [all, project])
 
   useEffect(() => {
     const onRejection = (event: PromiseRejectionEvent) => {

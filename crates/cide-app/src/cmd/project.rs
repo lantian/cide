@@ -1164,6 +1164,7 @@ pub fn tab_new_claude(
                 conversation: None,
                 conversation_since: None,
                 title: format!("{name} : claude"),
+                docker: None,
             },
         )
     })
@@ -1569,6 +1570,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "p : bash".into(),
+            docker: None,
         };
         let mirror = Pane {
             session: Some(primary),
@@ -1773,6 +1775,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 title: "f".into(),
+                docker: None,
             },
         )
         .expect("a tab opens");
@@ -1839,6 +1842,7 @@ mod tests {
                     conversation: None,
                     conversation_since: None,
                     title: "f".into(),
+                    docker: None,
                 },
             )
             .expect("a tab opens");
@@ -2011,6 +2015,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 title: "lib.rs".into(),
+                docker: None,
             }),
         };
 
@@ -2033,6 +2038,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 title: "lib.rs".into(),
+                docker: None,
             },
         )
         .expect("opens");
@@ -2072,6 +2078,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 title: "a.rs".into(),
+                docker: None,
             }),
         };
         assert_eq!(reopen_plan(&ws, &orphan), Reopen::Skip);

@@ -148,6 +148,14 @@ const SERVER_KEYS: &[&str] = &[
     "installHint",
     "declaresWatchedFiles",
     "extraPathHints",
+    // M45. **Allowed**, and the question was asked rather than defaulted: this is arbitrary JSON
+    // handed to a spawned process, which sounds like a new hole and is not one. A manifest that
+    // reaches this table has already declared `process:spawn` and already names the binary and
+    // its `args` — anything `initOptions` could express, `args` could express first, and against
+    // a far smaller review surface. Refusing it would instead mean an extension contributing a
+    // server that *needs* configuration (a YAML server with its own schemas, the case cide's own
+    // builtin exists for) could never configure it at all.
+    "initOptions",
 ];
 const PANEL_KEYS: &[&str] = &["id", "label", "icon", "location"];
 const COMMAND_KEYS: &[&str] = &["id", "title", "keywords"];
@@ -1502,6 +1510,7 @@ mod tests {
                 install_hint: String::new(),
                 declares_watched_files: false,
                 extra_path_hints: vec![],
+                init_options: None,
             })
             .expect("serialise"),
         );

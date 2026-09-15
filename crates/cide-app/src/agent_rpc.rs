@@ -2076,6 +2076,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             title: "cide : claude".into(),
+            docker: None,
         }
     }
 

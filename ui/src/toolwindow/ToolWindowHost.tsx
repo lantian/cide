@@ -24,11 +24,20 @@ import { useWorkspace } from '@/store/workspace'
 import { LogTab } from '@/gitlog/LogTab'
 import { ToolWindowView } from './ToolWindow'
 import { ToolWindowSplitter } from './ToolWindowSplitter'
-import { isExtTab, restoreTabs, tabRow, walkTab, type HistoryTab } from './toolWindowModel'
+import {
+  DOCKER_TAB,
+  isDockerTab,
+  isExtTab,
+  restoreTabs,
+  tabRow,
+  walkTab,
+  type HistoryTab,
+} from './toolWindowModel'
 // M22. Contributed tabs are not part of `ToolWindowState` and deliberately are not stored — see
 // `ExtTab` in the model for why — so they arrive from the extension store and the active one is
 // held here, in the webview, beside the other transient gesture state.
 import { ExtPanelHost } from '@/ext/ExtPanelHost'
+import { DockerPanel } from '@/sidebar/DockerPanel'
 import { useExtPanels } from '@/ext/extStore'
 import { useState } from 'react'
 
@@ -51,11 +60,27 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
    * window does not leave this one showing a tab that no longer exists.
    */
   const [extActive, setExtActive] = useState<string | null>(null)
+  /*
+   * Whether the Docker tab is in front. (M46)
+   *
+   * Webview state beside `extActive` and for a narrower reason — see `DOCKER_TAB`. Rust's own
+   * `active` is left exactly where it was while this is true, so switching to Docker and back
+   * returns to the history tab the user had open, which is the behaviour a contributed tab
+   * already has.
+   */
+  const [dockerActive, setDockerActive] = useState(false)
   const shownExt =
     extActive !== null && panels.some((panel) => panel.view === extActive) ? extActive : null
 
   const onActivate = useCallback(
     (id: string | null) => {
+      if (isDockerTab(id)) {
+        // Never reaches Rust: `tool_window_activate` takes a uuid and `docker` is not one.
+        setExtActive(null)
+        setDockerActive(true)
+        return
+      }
+      setDockerActive(false)
       if (isExtTab(id)) {
         // Never reaches Rust: `tool_window_activate` takes a `HistoryTabId`, which is a uuid, and
         // an `ext:` id is not one. Rust's own `active` is left exactly where it was, so switching
@@ -104,7 +129,9 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
     // A contributed tab in front wins over Rust's `active`, which stays where it was — see
     // `onActivate`. `restoreTabs` has already repaired the stored half, and this cannot make it
     // invalid again because `shownExt` is only ever an id in `panels`.
-    active: shownExt ?? repaired.active,
+    // Docker outranks a contributed tab, which outranks Rust's — the order the three are
+    // *selected* in, so the last thing clicked is the thing in front.
+    active: dockerActive ? DOCKER_TAB : (shownExt ?? repaired.active),
   }
   const rows = tabRow(tabs)
   const active = tabs.history.find((t) => t.id === tabs.active) ?? null
@@ -125,7 +152,20 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
          * generation counter and the selection are all per question, and re-pointing would leave
          * one tab's rows on screen under another tab's heading for a frame.
          */}
-        {extPanel === null ? (
+        {dockerActive ? (
+          /*
+           * The machine's containers. (M46)
+           *
+           * `placement="bottom"` so the panel draws no title of its own — the tab strip above it
+           * already says Docker, and two headings stacked is what a sidebar panel dropped into
+           * the bottom panel looks like. It keeps its connection line and its Refresh, because
+           * those are controls rather than a heading.
+           *
+           * Not keyed: unlike a Log or an extension tab there is only ever one of these, so a
+           * remount would throw away a live board and re-read the daemon for nothing.
+           */
+          <DockerPanel placement="bottom" />
+        ) : extPanel === null ? (
           <LogTab
             key={active?.id ?? 'log'}
             project={project}

@@ -48,4 +48,25 @@ declaresWatchedFiles: boolean,
  * Directories to add to the child's `PATH` when the binary is not otherwise findable —
  * `~/.cargo/bin`, `~/go/bin`, `~/.local/share/npm/bin`. `~` is expanded; nothing else is.
  */
-extraPathHints: Array<string>, };
+extraPathHints: Array<string>, 
+/**
+ * `initializationOptions` this definition wants sent, whatever the provenance. (M45)
+ *
+ * # The two lanes, and why they are separate
+ *
+ * `cide_lsp::config::init_options` sends cide's *own* configuration only to a
+ * `Provenance::Bundled` or `Override` resolution — the shipped rust-analyzer fork and a
+ * developer's build of it — so that a stock server gets byte-for-byte the handshake it has
+ * always got. That gate is right for the fork, whose option names are a two-repo contract,
+ * and wrong for a server that simply needs to be *told something*: `yaml-language-server`
+ * has no idea a Compose file is a Compose file until it is handed a schema map, and it is
+ * always a stock installation.
+ *
+ * So a definition may carry its own options, which are sent regardless of provenance, while
+ * the fork-specific ones stay provenance-gated. **One producer each**: nothing may put a
+ * fork option here, and nothing may put a definition's options behind that gate.
+ *
+ * `None` — the default, and what every builtin but `yaml-language-server` answers — means
+ * "say nothing", which is the pre-M45 behaviour exactly.
+ */
+initOptions?: unknown, };

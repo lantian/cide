@@ -1159,12 +1159,33 @@ mod tests {
     /// The port is obtained by binding and dropping rather than hardcoded: a fixed number
     /// would make this test depend on nothing else on the machine having chosen it, and the
     /// one it would fail on is a developer who happens to be running Vite.
+    ///
+    /// # Why it tries several ports
+    ///
+    /// Binding an ephemeral port and dropping it hands that number straight back to the kernel,
+    /// which is free to give it to the next asker — and under `cargo test --workspace` there are
+    /// several: `cide-ide-mcp`'s tests bind loopback listeners in a *concurrent test binary*, and
+    /// one of them taking the number this just released turns a correct answer into a failure.
+    /// Observed three times in about ten full runs; never once when this crate is tested alone,
+    /// which is exactly the shape of a race against a neighbour rather than a bug here.
+    ///
+    /// So: a handful of attempts, and the assertion is that *some* genuinely closed port reads as
+    /// closed. A single attempt tests the same thing with a dice roll in front of it — and the
+    /// failure it produces reads as `port_listening` being broken, which is the expensive kind of
+    /// wrong. Anything still listening on every one of five freshly-released ports is not a flake.
     #[test]
     fn a_closed_port_is_not_a_dev_server() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-        let port = listener.local_addr().expect("bound").port();
-        drop(listener);
-        assert!(!port_listening(port));
+        let mut taken = Vec::new();
+        for _ in 0..5 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+            let port = listener.local_addr().expect("bound").port();
+            drop(listener);
+            if !port_listening(port) {
+                return;
+            }
+            taken.push(port);
+        }
+        panic!("every freshly-released port was answered by something: {taken:?}");
     }
 
     #[test]
