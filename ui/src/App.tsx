@@ -123,7 +123,6 @@ import { focusPaneDom } from '@/panes/paneFocus'
 import { liveHosts } from '@/layout/paneHosts'
 import { SettingsTab } from '@/settings/SettingsTab'
 import { toggleTheme as togglePersistedTheme } from '@/settings/useSettings'
-import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
   app as appApi,
   benchMode,
@@ -278,18 +277,6 @@ const MOCK_HEIGHT = 900
  */
 const NO_PROJECT_LIST: never[] = []
 const NO_TAB_LIST: never[] = []
-
-/**
- * Ask for a directory and open it as a project.
- *
- * The native picker rather than a text field: a project is a real path, and typing one is
- * both slower and the only way to get it wrong.
- */
-async function pickProject(open: (paths: string[]) => Promise<void>): Promise<void> {
-  const chosen = await openDialog({ directory: true, multiple: true, title: 'Open project' })
-  if (chosen === null) return
-  await open(Array.isArray(chosen) ? chosen : [chosen])
-}
 
 // WebKitGTK draws its own menu on every right-click, and with `devtools` enabled that menu
 // offers "Inspect element". Suppressed here rather than per surface: a surface-by-surface
@@ -1492,7 +1479,6 @@ export function App() {
            */
           onActivate={(id) => void activateProject(id as ProjectId)}
           onClose={(id) => void closeProject(id)}
-          onNew={() => void pickProject(openProject)}
           onToggleTheme={togglePersistedTheme}
           /*
            * The header's ⊞ and ⧉ aim at the focused pane. Omitting them renders the buttons

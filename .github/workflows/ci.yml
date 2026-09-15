@@ -126,6 +126,30 @@ jobs:
           echo "ok: $checked workspace members checked, tauri confined to cide-app"
 
   # ---------------------------------------------------------------------------------
+  # Every shell script still runs on macOS's bash.
+  #
+  # macOS ships bash 3.2.57 as /bin/bash — the last GPLv2 release — and every script here has
+  # `#!/usr/bin/env bash`, so that is what runs them on a Mac with no newer bash on PATH.
+  # `run.sh` died that way once, at `mapfile: command not found` with an unbound-variable
+  # cascade behind it, before it had started anything (docs/platforms.md has the account).
+  #
+  # It is here rather than in the macos job for two reasons. That job is advisory
+  # (continue-on-error), so it gates nothing; and the check is a grep, so it needs no Mac —
+  # what it is checking is the source, not the host. Seconds, no toolchain, no checkout cache.
+  #
+  # ubuntu-24.04 runs this under bash 5, which is the point: the class is invisible to the
+  # shell running the check, which is why a shell that would catch it is no defence at all.
+  # ---------------------------------------------------------------------------------
+  shell-portability:
+    name: every *.sh runs on bash 3.2
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: No script needs a bash newer than macOS ships
+        run: ./scripts/check-bash32.sh
+
+  # ---------------------------------------------------------------------------------
   # Rust: build, test, lint, format, and the two xtask gates.
   # ---------------------------------------------------------------------------------
   rust:

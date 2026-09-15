@@ -24,8 +24,8 @@
 import { useCallback, useRef } from 'react'
 import { useContextMenu } from '@/menus'
 import { projectMenu, type RecentEntry } from '@/ipc/client'
-import { useWorkspace } from '@/store/workspace'
 import { recentEntries } from './menuModel'
+import { browseForProject } from './projectOpen'
 import { Icon } from '@/icons/Icon'
 
 import styles from './AppHeader.module.css'
@@ -51,13 +51,11 @@ export function ProjectMenu() {
    */
   const anchor = useRef<HTMLDivElement>(null)
 
+  // The picker itself lives in `chrome/projectOpen.ts`, because the palette's *Open project…*
+  // is the same gesture and two spellings of it is how one of them ends up on the plugin
+  // dialog that cannot be parented on Linux. That module's doc is where the why lives.
   const browse = useCallback(() => {
-    void (async () => {
-      const chosen = await projectMenu.browse()
-      // Cancelling is not a failure and must not be reported as one.
-      if (chosen.length === 0) return
-      await useWorkspace.getState().openProject(chosen)
-    })()
+    void browseForProject()
   }, [])
 
   const { openFor, isOpen, menu } = useContextMenu({
