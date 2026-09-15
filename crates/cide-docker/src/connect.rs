@@ -358,6 +358,23 @@ pub fn contexts_in(docker_dir: &Path) -> Vec<Context> {
 /// does not ask for — it is listed so the refusal names it rather than reporting nothing found.
 #[must_use]
 pub fn sockets_present(home: Option<&Path>, xdg_runtime: Option<&Path>) -> Vec<PathBuf> {
+    sockets_present_under(Path::new("/"), home, xdg_runtime)
+}
+
+/// [`sockets_present`], with the machine's own root injected.
+///
+/// The per-user directories have been parameters from the start so that the Linux layouts could
+/// be asserted from a Mac — but the machine's own sockets were left absolute, which quietly made
+/// that assertion true only on a host that is not itself running Docker. CI's Linux runner is,
+/// so `/var/run/docker.sock` is a real file there, every scratch layout came back with an entry
+/// nobody had written into it, and `the_linux_layouts_resolve_in_the_right_order` failed for no
+/// reason but the runner having a daemon. The segments joined below are relative, so a root of
+/// `/` spells exactly the paths this always probed.
+fn sockets_present_under(
+    root: &Path,
+    home: Option<&Path>,
+    xdg_runtime: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = xdg_runtime {
         // Rootless Docker.
@@ -372,14 +389,14 @@ pub fn sockets_present(home: Option<&Path>, xdg_runtime: Option<&Path>) -> Vec<P
     // The machine's own. `/run` as well as `/var/run`: the second is a symlink to the first on
     // every systemd distribution, and is *not* inside a container or a minimal namespace where
     // only one of the two is mounted.
-    candidates.push(PathBuf::from("/var/run/docker.sock"));
-    candidates.push(PathBuf::from("/run/docker.sock"));
+    candidates.push(root.join("var/run/docker.sock"));
+    candidates.push(root.join("run/docker.sock"));
 
     // Then podman, in the same per-user-first order.
     if let Some(dir) = xdg_runtime {
         candidates.push(dir.join("podman").join("podman.sock"));
     }
-    candidates.push(PathBuf::from("/run/podman/podman.sock"));
+    candidates.push(root.join("run/podman/podman.sock"));
 
     candidates.retain(|path| path.exists());
     // `/var/run` and `/run` are the same file on a systemd machine, and listing a socket twice
@@ -627,9 +644,12 @@ mod tests {
     /// The shapes a **Linux** machine presents, none of which this was developed on.
     ///
     /// Written as a function of injected directories precisely so it can be asserted from a Mac:
-    /// `sockets_present` takes `home` and `xdg_runtime` rather than reading the environment, so
-    /// the rootless, Desktop and podman layouts can all be built in a scratch directory and the
-    /// *order* — which is the part that decides which daemon a user gets — pinned here.
+    /// `sockets_present_under` takes the machine's root, `home` and `xdg_runtime` rather than
+    /// reading the environment, so the rootless, Desktop, machine and podman layouts can all be
+    /// built in a scratch directory and the *order* — which is the part that decides which daemon
+    /// a user gets — pinned here. The root is injected because it was not, once: this test read
+    /// the real `/var/run/docker.sock` and so passed only on a host with no Docker of its own,
+    /// which every developer machine here happened to be and no CI runner is.
     #[test]
     fn the_linux_layouts_resolve_in_the_right_order() {
         let dir = std::env::temp_dir().join(format!("cide-docker-linux-{}", std::process::id()));
@@ -643,21 +663,40 @@ mod tests {
 
         // Rootless Docker alone.
         std::fs::write(run.join("docker.sock"), b"").expect("socket stand-in");
-        let found = sockets_present(Some(&home), Some(&run));
+        let found = sockets_present_under(&dir, Some(&home), Some(&run));
         assert_eq!(found, vec![run.join("docker.sock")]);
 
         // Docker Desktop beside it: the rootless one still wins, because `$XDG_RUNTIME_DIR` is
         // this user's running daemon and `~/.docker/run` is Desktop's, which may not be up.
         std::fs::write(home.join(".docker/run/docker.sock"), b"").expect("socket stand-in");
-        let found = sockets_present(Some(&home), Some(&run));
+        let found = sockets_present_under(&dir, Some(&home), Some(&run));
         assert_eq!(found.first(), Some(&run.join("docker.sock")));
         assert_eq!(found.len(), 2, "and both are offered: {found:?}");
+
+        // The machine's own, which is what a plain `apt install docker.io` leaves. It is listed,
+        // and listed *after* both per-user sockets — the opposite of a PATH search, because a
+        // rootless or Desktop socket was started by this user and `/var/run/docker.sock` may be a
+        // leftover. Only an injected root can say this; with the real one it was whatever the
+        // host happened to have.
+        std::fs::create_dir_all(dir.join("var/run")).expect("scratch dirs");
+        std::fs::write(dir.join("var/run/docker.sock"), b"").expect("socket stand-in");
+        let found = sockets_present_under(&dir, Some(&home), Some(&run));
+        assert_eq!(
+            found,
+            vec![
+                run.join("docker.sock"),
+                home.join(".docker/run/docker.sock"),
+                dir.join("var/run/docker.sock"),
+            ],
+            "the machine's own comes after both per-user sockets: {found:?}"
+        );
+        std::fs::remove_file(dir.join("var/run/docker.sock")).expect("remove");
 
         // Podman, which is the default engine on Fedora and RHEL. Listed, and listed **after**
         // Docker: a panel called Docker showing podman's containers on a machine running both
         // would be wrong, and `DOCKER_HOST` is how somebody says otherwise.
         std::fs::write(podman.join("podman.sock"), b"").expect("socket stand-in");
-        let found = sockets_present(Some(&home), Some(&run));
+        let found = sockets_present_under(&dir, Some(&home), Some(&run));
         assert_eq!(
             found.last(),
             Some(&podman.join("podman.sock")),
@@ -667,7 +706,7 @@ mod tests {
         // And on a machine with only podman it is the answer rather than nothing at all.
         std::fs::remove_file(run.join("docker.sock")).expect("remove");
         std::fs::remove_file(home.join(".docker/run/docker.sock")).expect("remove");
-        let found = sockets_present(Some(&home), Some(&run));
+        let found = sockets_present_under(&dir, Some(&home), Some(&run));
         assert_eq!(found, vec![podman.join("podman.sock")]);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -711,12 +750,25 @@ mod tests {
         // The specific beats the general, which is the opposite of a PATH search: a rootless or
         // Desktop socket was chosen by this user, `/var/run/docker.sock` may be a leftover.
         let dir = std::env::temp_dir().join(format!("cide-docker-sockets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let run = dir.join("run");
+        // The machine gets a root of its own rather than `dir`, or its `var/run/docker.sock`
+        // would land beside the per-user socket and the two would dedupe into one entry.
+        let machine = dir.join("machine");
         std::fs::create_dir_all(&run).expect("scratch dir");
+        std::fs::create_dir_all(machine.join("var/run")).expect("scratch dir");
         std::fs::write(run.join("docker.sock"), b"").expect("a stand-in for a socket");
+        // The machine's own socket, which this test is named for and never created — so what it
+        // asserted was that the per-user socket beat nothing at all, and it went on passing with
+        // the order reversed. It could not create one until the root became a parameter.
+        std::fs::write(machine.join("var/run/docker.sock"), b"").expect("a stand-in for a socket");
 
-        let found = sockets_present(None, Some(&run));
-        assert_eq!(found.first(), Some(&run.join("docker.sock")));
+        let found = sockets_present_under(&machine, None, Some(&run));
+        assert_eq!(
+            found,
+            vec![run.join("docker.sock"), machine.join("var/run/docker.sock")],
+            "the per-user socket comes first: {found:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
