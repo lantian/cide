@@ -9710,6 +9710,35 @@ the override and the role are both silent. The document's `model`, `small_model`
 block are in the fingerprint as well, so an edit to that file under a pause restarts the run;
 its keybinds and theme are deliberately not, because a restart costs the in-flight turn.
 
+### Two test failures on the way in, and why they differed
+
+The commit went to CI with one failure and ran locally with another, and neither was in a crate
+the milestone touched.
+
+**CI: `cide-pty`'s `a_rendered_session_shows_the_rendering_in_mirror_and_sink_alike`**, a sink
+holding `""`. The test's own comment blamed a known race — the reader delivering everything
+before `attach` ran — and guarded it with a `sleep 0.2`. The mechanism was a second one. The
+output arm feeds the mirror as each chunk arrives and hands sinks the bytes only at the next
+flush, which for a small chunk is the idle tick up to `FLUSH_INTERVAL` later; the test polled the
+*mirror* for the last line and then read the *sink* — inside a window that a 10 ms poll on a
+quiet machine rarely lands in and a loaded two-vCPU runner did. The fixture now gates the child
+on a line the test writes after attaching (the first race, closed by construction rather than by
+a sleep) and waits on the sink it asserts on (the second). It runs in 10 ms instead of 200.
+
+**Locally: `cide-ext`'s `the_sibling_marketplace_installs_and_supersedes_two_builtins`**, a
+warning that `yaml-language-server` "is already driven by cide itself". That test runs only
+beside a `../cide-marketplace` checkout and skips itself otherwise — and CI has none, which is
+the whole of why it fails on one machine and not the other. What it found is real and older
+than this milestone: the Docker work added a builtin `yaml-language-server` (for Compose's
+schema map), promising in its own comment that a YAML extension would supersede it, while the
+server merge in `cide_ext::contribute` answered any extension on a builtin's binary with
+first-wins. So installing the marketplace's YAML extension changed nothing about which server
+ran, silently, since M45 — the install-that-does-nothing the merge's header calls the worst
+first impression of the feature. The merge now treats a binary as it treats a name: an
+extension displaces a builtin and `ServerBinding::supersedes` records it; two extensions stay
+first-wins with the loser named. The cost `cide_ipc::lang` states stands: the extension's row
+replaces the builtin's whole, schema map included.
+
 ### What is NOT verified
 
 The chair's second Resume has not happened yet at the time of writing: the fix above was made

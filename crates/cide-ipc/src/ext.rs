@@ -438,6 +438,13 @@ pub struct LanguageBinding {
 pub struct ServerBinding {
     pub def: LanguageServerDef,
     pub source: ContributionSource,
+    /// A source this one displaced, if any — `LanguageBinding::supersedes`' twin. An extension's
+    /// server on a binary a builtin also drives takes the builtin's place *including its
+    /// configuration* (the builtin `yaml-language-server`'s Compose schema map, say), and that
+    /// is a displacement worth being able to read off the binding rather than a silent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub supersedes: Option<ContributionSource>,
 }
 
 /// A panel in the resolved registry.

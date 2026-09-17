@@ -2466,17 +2466,30 @@ mod tests {
 
     /// The hook, end to end: one rendered stream is what the mirror holds and what a sink is
     /// delivered — there is no raw copy anywhere downstream for the two to disagree over.
+    ///
+    /// # Two races this fixture closes, both of which ended in a sink holding `""`
+    ///
+    /// The child prints nothing until it is *told to*, by a line the test writes after the sink
+    /// is attached: a fresh sink gets no replay from the pty (hydration is the pane layer's
+    /// job), and under a saturated box the reader thread once delivered the whole output before
+    /// `attach` ran. A `sleep 0.2` before the `printf` guarded that for a while; a gate the test
+    /// holds guards it by construction.
+    ///
+    /// And the sink is waited on **directly**, not read the moment the mirror shows the last
+    /// line. The output arm feeds the mirror as each chunk arrives and hands sinks the bytes
+    /// only at the next flush — a small chunk waits for the idle tick, up to `FLUSH_INTERVAL`
+    /// later (`PtySession::attach_with_snapshot`'s doc states the lag) — so the mirror
+    /// legitimately runs ahead of every sink by a few milliseconds. Polling the mirror and then
+    /// asserting on the sink was reading the sink inside that window, which a 10 ms poll on a
+    /// quiet machine rarely lands in and a loaded 2-vCPU CI runner did: the coalescer thread
+    /// was preempted between the mirror feed and the flush, and the assertion read `""`. The
+    /// second failure carried the first's diagnosis in its message, which is why it took two
+    /// to see.
     #[test]
     fn a_rendered_session_shows_the_rendering_in_mirror_and_sink_alike() {
         let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
             .arg("-c")
-            // The `sleep` is what makes the sink assertion below race-free: the sink is
-            // attached after the spawn, a fresh sink gets no replay from the pty (hydration is
-            // the pane layer's job), and under a saturated box the reader thread once
-            // delivered the whole output before `attach` ran — the sink then held `""` and
-            // this test failed with the coalescer blameless. The same beat, for the same
-            // reason, as the harness-bound-run test over in `cide-app`.
-            .arg("sleep 0.2; printf 'alpha\\nbeta\\n'")
+            .arg("read go; printf 'alpha\\nbeta\\n'")
             .render(LineRender::new(Arc::new(|line: &str| {
                 Rendered::Replace(format!("[{line}]"))
             })));
@@ -2488,29 +2501,37 @@ mod tests {
             sink_copy.lock().extend_from_slice(bytes);
             true
         }));
+        // The gate. Everything the child prints from here is printed to an attached sink.
+        session.write(b"go\n".to_vec());
 
         let deadline = Instant::now() + DEADLINE;
-        let mut screen = String::new();
+        let mut delivered = String::new();
         while Instant::now() < deadline {
-            screen = String::from_utf8_lossy(&session.screen_state()).into_owned();
-            if screen.contains("[beta]") {
+            delivered = String::from_utf8_lossy(&received.lock()).into_owned();
+            if delivered.contains("[beta]") {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
+            delivered.contains("[alpha]") && delivered.contains("[beta]"),
+            "a sink was delivered something other than the rendering: {delivered:?}"
+        );
+        assert!(
+            !delivered.contains("alpha\nbeta"),
+            "the raw lines leaked past the hook: {delivered:?}"
+        );
+
+        // By the time a sink holds a byte the mirror already held it — the mirror is fed first
+        // and only from the coalescer thread — so this needs no wait of its own.
+        let screen = String::from_utf8_lossy(&session.screen_state()).into_owned();
+        assert!(
             screen.contains("[alpha]") && screen.contains("[beta]"),
-            "the mirror holds the raw stream, so a rehydrated pane would too: {screen:?}"
+            "the mirror holds the rendered stream, so a rehydrated pane would too: {screen:?}"
         );
         assert!(
             !screen.contains("alpha\nbeta"),
             "the raw lines leaked past the hook: {screen:?}"
-        );
-
-        let delivered = String::from_utf8_lossy(&received.lock().clone()).into_owned();
-        assert!(
-            delivered.contains("[alpha]"),
-            "a sink was delivered something the mirror does not hold: {delivered:?}"
         );
     }
 

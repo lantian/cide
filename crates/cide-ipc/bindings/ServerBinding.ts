@@ -5,4 +5,11 @@ import type { LanguageServerDef } from "./LanguageServerDef";
 /**
  * A language server in the resolved registry, with the source that declared it.
  */
-export type ServerBinding = { def: LanguageServerDef, source: ContributionSource, };
+export type ServerBinding = { def: LanguageServerDef, source: ContributionSource, 
+/**
+ * A source this one displaced, if any — `LanguageBinding::supersedes`' twin. An extension's
+ * server on a binary a builtin also drives takes the builtin's place *including its
+ * configuration* (the builtin `yaml-language-server`'s Compose schema map, say), and that
+ * is a displacement worth being able to read off the binding rather than a silent one.
+ */
+supersedes?: ContributionSource, };
