@@ -1,0 +1,239 @@
+/*
+ * The Docker panel's detail pane. (M47)
+ *
+ * ## Why it is a second column and not a second panel
+ *
+ * Because the question it answers is about the row that is still on screen. A user clicking
+ * `shop-db-1` wants to know which port it is on *while looking at the list* — a surface that
+ * replaced the list would make that a navigation, and a surface that opened a tab would make it
+ * two. `TabKind::Docker` is still there for the whole document; this is for the answer.
+ *
+ * ## Rows are `name value`, not a table
+ *
+ * A table wants column widths, and the names here range from `Id` to a 40-character mount
+ * destination. A two-part row with the name ellipsised and the value free to wrap is what reads
+ * at 300px and at 900px, which is the range this pane actually gets.
+ *
+ * Every size is a rung of the `--fs-ui-*` ladder and every colour is a token.
+ */
+
+.pane {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: var(--h-panelheader);
+  padding: 0 var(--sp-3) 0 var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.headerAction {
+  appearance: none;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: calc(20px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  border: none;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  /* `padding: 0`: `appearance: none` does not reset WebKit's default button padding, and with
+     `box-sizing: border-box` it shrinks the content box until the mark overflows to one side of
+     its own hover background. `DockerPanel.module.css`'s `.headerAction` carries the full note. */
+  padding: 0;
+}
+
+.headerAction:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-bottom: var(--sp-4);
+}
+
+/* Nothing selected, or the thing is gone. Prose rather than a blank column. */
+.empty {
+  padding: var(--sp-6) var(--sp-4);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.section {
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+
+.sectionLabel {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-ui-11);
+  font-weight: 500;
+  color: var(--dim);
+  text-transform: capitalize;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: calc(2px * var(--ui-scale)) 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+}
+
+.rowName {
+  flex: none;
+  width: calc(96px * var(--ui-scale));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+
+/*
+ * Selectable, and `break-word` rather than ellipsis: the answer to "what is this mounted from" is
+ * usually about to be copied, and a truncated path cannot be.
+ */
+.rowValue {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.none {
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+/* --- the one editable field -------------------------------------------------------------- */
+
+.ports {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  padding: var(--sp-2);
+}
+
+.ports:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.problem {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--red);
+}
+
+.applyRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-top: var(--sp-2);
+}
+
+.apply {
+  appearance: none;
+  flex: none;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--chrome);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  cursor: pointer;
+}
+
+.apply:hover:not(:disabled) {
+  background: var(--chrome-hi);
+}
+
+.apply:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/*
+ * What Apply does, beside the button.
+ *
+ * There is no confirmation dialog — that was a deliberate choice — so this line is the only place
+ * the consequence is stated. It appears only once the field is dirty, so it reads as a
+ * description of the pending act rather than as a permanent warning nobody sees after a week.
+ */
+.applyNote {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  line-height: 1.35;
+}
+
+/*
+ * A value that is also a row in the left column. (M50)
+ *
+ * Underlined on hover rather than always, and never coloured like a web link: every value in this
+ * pane is selectable text and a permanently-decorated subset would read as a different *kind* of
+ * value rather than as one you can also click. The cursor and the hover rule are what say it is
+ * live — which is enough, because the rows that carry a link are the four a reader is already
+ * looking for (Image, Mounts, Networks, Containers).
+ *
+ * `text-align: left` because a `<button>` centres its text and every other value in this column
+ * is a span that does not.
+ */
+.rowLink {
+  appearance: none;
+  border: none;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.rowLink:hover,
+.rowLink:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}

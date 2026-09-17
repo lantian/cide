@@ -1241,6 +1241,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: format!("{name} : claude"),
+            docker: None,
         };
         let mut tree = PaneTree {
             root: LayoutNode::Leaf { pane: console.id },
@@ -1258,6 +1259,7 @@ mod tests {
                 conversation_since: None,
                 continues: None,
                 title: format!("{name} : bash"),
+                docker: None,
             };
             tree.root = LayoutNode::Split {
                 id: SplitId::new(),
@@ -1284,6 +1286,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: "settings".into(),
+            docker: None,
         };
         let settings = Tab {
             id: TabId::new(),
@@ -1953,6 +1956,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: "main.rs — diff".into(),
+            docker: None,
         };
         let project = workspace.projects.values_mut().next().expect("a project");
         project.tabs.push(Tab {
@@ -1988,6 +1992,120 @@ mod tests {
             "a snake_case key means `rename_all_fields` is missing"
         );
         assert_eq!(load(&path), workspace);
+    }
+
+    /// A container pane keeps its container across a quit, and an old file still loads. (M42)
+    ///
+    /// Three claims, and each fails silently on its own.
+    ///
+    /// **It round-trips at all.** `Pane::docker` is `#[serde(default)]`, which is what lets every
+    /// `workspace.json` written before M42 still load — and is exactly what would hide a
+    /// serialisation bug, because a field that fails to *write* reads back as `None` and looks
+    /// like an ordinary shell pane. That is not a cosmetic loss: `TerminalPane::specFor` branches
+    /// on this field, so a pane that lost it opens a **local shell** where the user left a
+    /// container's, in a pane with the container's name still on its tab.
+    ///
+    /// **It is spelled camelCase on the wire**, like every other DTO here. A snake_case key means
+    /// `rename_all` is missing, and the frontend reads `undefined` — which is the same silent
+    /// local-shell outcome as above.
+    ///
+    /// **`CURRENT_SCHEMA` does not move for it.** `tool_window`'s argument below, unchanged: the
+    /// default is `None`, a file without the field loads as a pane with no container, and that is
+    /// exactly what such a file described. A bump would refuse the document instead.
+    #[test]
+    fn a_container_pane_keeps_its_container_and_an_older_file_still_loads() {
+        let dir = TempDir::new("docker-pane");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = fixture();
+        let pane = Pane {
+            id: PaneId::new(),
+            // A `Shell` pane, deliberately — see `cide_ipc::Pane::docker` for why a container's
+            // pane is not a kind of its own.
+            kind: PaneKind::Shell,
+            role: PaneRole::Auxiliary,
+            session: None,
+            conversation: None,
+            conversation_since: None,
+            continues: None,
+            title: "shop : shop-db-1".into(),
+            docker: Some(cide_ipc::workspace::DockerPane {
+                container: "c".repeat(64),
+                name: "shop-db-1".into(),
+                stream: cide_ipc::docker::DockerStream::Exec,
+            }),
+        };
+        let project = workspace.projects.values_mut().next().expect("a project");
+        project.tabs.push(Tab {
+            id: TabId::new(),
+            kind: TabKind::ClaudeFull {
+                title: "shop-db-1".into(),
+            },
+            tree: PaneTree {
+                root: LayoutNode::Leaf { pane: pane.id },
+                focused: pane.id,
+                maximized: None,
+                panes: IndexMap::from_iter([(pane.id, pane)]),
+            },
+        });
+
+        save_atomic(&path, &workspace).expect("save");
+        let raw = fs::read_to_string(&path).expect("read the file back");
+        assert!(
+            raw.contains(r#""container": ""#),
+            "the container id reaches the file; got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("working_dir") && !raw.contains(r#""docker_pane""#),
+            "a snake_case key means `rename_all` is missing"
+        );
+        assert_eq!(load(&path), workspace, "and the whole pane comes back");
+
+        // The half that keeps every pre-M42 file loading: the field simply absent.
+        //
+        // Built by deleting the key from the parsed document rather than by editing the text,
+        // because a text edit would depend on how `to_string_pretty` happened to lay the object
+        // out — and a replacement that silently matched nothing would leave this asserting that a
+        // file *with* the field loads, which the first half already does.
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        strip_key(&mut value, "docker");
+        let older = dir.join("older.json");
+        fs::write(
+            &older,
+            serde_json::to_string_pretty(&value).expect("re-serialise"),
+        )
+        .expect("write the older shape");
+        let loaded = load(&older);
+        let pane = loaded
+            .projects
+            .values()
+            .flat_map(|p| p.tabs.iter())
+            .flat_map(|tab| tab.tree.panes.values())
+            .find(|pane| pane.title == "shop : shop-db-1")
+            .expect("the pane still loads");
+        assert_eq!(
+            pane.docker, None,
+            "a file written before the field existed loads as a pane with no container, which is \
+             exactly what it described"
+        );
+    }
+
+    /// Remove every occurrence of a key, at any depth. For building a pre-field document.
+    fn strip_key(value: &mut serde_json::Value, key: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove(key);
+                for entry in map.values_mut() {
+                    strip_key(entry, key);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    strip_key(item, key);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The git tool window's state survives a quit, and is spelled camelCase on the wire. (M18)
@@ -2206,6 +2324,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: "main.rs".into(),
+            docker: None,
         };
         project.tabs.push(Tab {
             id: TabId::new(),

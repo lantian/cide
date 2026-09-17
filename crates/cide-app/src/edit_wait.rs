@@ -650,6 +650,7 @@ mod tests {
                 conversation_since: None,
                 continues: None,
                 title: "f".into(),
+                docker: None,
             },
         )
         .expect("opens")

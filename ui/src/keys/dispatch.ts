@@ -57,6 +57,7 @@ import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
+import { browseForProject } from '@/chrome/projectOpen'
 // M22. The one seam into the extension host from the key layer: `invoke` posts to a worker and
 // answers whether one was there to hear it, which is what makes a contributed command reportable
 // as unavailable rather than silently inert.
@@ -129,6 +130,8 @@ import {
 } from './target'
 import { clusterPlan, detachedTabs } from '@/windows/windowTabs'
 import { useProposeDialog } from '@/sidebar/OpenSpecPanel/ProposeDialog'
+import { isComposePath, type ComposeVerb } from '@/chrome/composeModel'
+import { runCompose } from '@/chrome/composeRun'
 
 export interface DispatchDeps {
   /**
@@ -355,6 +358,11 @@ function pullPass(
         kind: 'ok',
         detail: report.detail,
         actions: actions.length > 0 ? actions : undefined,
+        // Named rather than left to the ambient scope. A pull is seconds of network, and this
+        // report carries a *View commits* link bound to this project's log — filed under
+        // whatever project the user had switched to in the meantime, the toast would offer to
+        // open a range in a repository it is not about.
+        project,
       })
     }
 
@@ -785,6 +793,23 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       /* ---------------------------------------------------------------------- Projects */
 
       /*
+       * Ask for a folder and open it. Until this arm the gesture was mouse-only — the header's
+       * `+` and the `▾` beside it were the whole of it — so it could be neither typed in the
+       * palette nor bound in a `keymap.json`. It carries no `when` clause; the registry's
+       * comment is where the argument for that lives.
+       *
+       * Through `browseForProject`, which is also what the header's `+` calls. Spelling the
+       * picker again here would mean reaching for `@tauri-apps/plugin-dialog` — the obvious
+       * import, and the one that opens the dialog *behind* the window on Linux because the
+       * plugin parents it only on Windows and macOS. One road, so the fix cannot ship off.
+       *
+       * `void` rather than awaited: the dispatcher answers synchronously, a cancel is a
+       * no-op by contract, and a real failure is `Failures`' job as it is everywhere else here.
+       */
+      case 'project.open':
+        return void browseForProject()
+
+      /*
        * Ctrl+` — the held-modifier switcher over **projects**, in most-recently-used order.
        *
        * It was Ctrl+Tab until the tab switcher above took that chord; `cide_core::keymap` holds
@@ -1079,6 +1104,50 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
        * `treeStore.reveal` directly, because a second call site with its own preconditions is
        * how three gestures come to behave in three ways.
        */
+      /*
+       * The six Compose verbs, against the file the window is showing. (M48)
+       *
+       * One arm for all six: the id's last segment *is* the verb — `docker.compose.recreate` →
+       * `recreate` — and six identical cases differing by one string is six places for them to
+       * drift. The clause `composeFileActive` is re-checked here rather than trusted, because a
+       * `when` clause gates the palette and never the keyboard (see `cide_core::commands`'
+       * header), and a `keymap.json` may bind any of these to a chord.
+       *
+       * Every refusal is a **sentence**. `unmet` writes a diagnostic line and nothing to the
+       * screen, which is indistinguishable from a key that does nothing — the defect this file
+       * has now found more than a dozen times.
+       */
+      case 'docker.compose.up':
+      case 'docker.compose.down':
+      case 'docker.compose.restart':
+      case 'docker.compose.recreate':
+      case 'docker.compose.build':
+      case 'docker.compose.pull': {
+        if (boot()?.role.kind !== 'shell') {
+          notify('A Compose run opens a pane, and this window holds a single detached one.', {
+            kind: 'warn',
+            hint: 'Run it from the main window, or from the file tree\u2019s context menu there.',
+          })
+          return
+        }
+        // `focusedTabPath`, the same source `composeFileActive` is derived from, so the row the
+        // palette offered and the file this acts on cannot disagree. `args.path` still wins, for
+        // `file.reveal`'s reason: a `keymap.json` entry may carry one.
+        const path = pathArg(args) ?? focusedTabPath(boot())
+        if (path === null || !isComposePath(path)) {
+          notify('This tab is not a Compose file, so there is nothing to run.', {
+            kind: 'warn',
+            hint: 'Open a compose.yaml or docker-compose.yml first.',
+          })
+          return
+        }
+        // The last dotted segment. Narrowed by the `case` labels above, so this cannot be any
+        // string but one of the six — which is why it is a cast and not a lookup that could miss.
+        const verb = command.slice(command.lastIndexOf('.') + 1) as ComposeVerb
+        void runCompose(path, verb)
+        return
+      }
+
       case 'file.reveal': {
         /*
          * Every refusal below is a *sentence*, and that is the whole of what this arm learned.

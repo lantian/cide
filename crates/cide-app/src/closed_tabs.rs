@@ -207,6 +207,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: "x".into(),
+            docker: None,
         })
     }
 

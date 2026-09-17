@@ -367,8 +367,10 @@ at before choosing:
 * **Settings → Appearance** offers three graphics switches that persist and do nothing there.
   `graphics::LADDER_APPLIES` is the seam to gate them on; the screen wants eyes before it grows
   a fourth state.
-* **`run.sh` does not run on a stock Mac.** It uses `mapfile` (bash 4+; macOS ships 3.2 as
-  `/bin/bash`) and `ps -eo ppid=,pid=,comm=`, whose `comm` prints a full path there.
+* ~~**`run.sh` does not run on a stock Mac.** It uses `mapfile` (bash 4+; macOS ships 3.2 as
+  `/bin/bash`) and `ps -eo ppid=,pid=,comm=`, whose `comm` prints a full path there.~~ **Fixed
+  and verified on bash 3.2.57** — the section below is the account. `scripts/check-bash32.sh`
+  is what keeps it fixed, and it is in CI.
 * **Case-insensitive filesystems.** APFS folds case by default and `canonicalize` does not
   normalise it, so `cide_fs::ops::check_within` — textual by design — would refuse a terminal
   link naming `/Users/x/proj/…` for a project opened as `/Users/x/Proj`. Unquantified.
@@ -579,6 +581,191 @@ code path can be exercised at all. Measured here on 2026-08-31 with `PATH=/usr/b
 and it recovered nvm, pyenv, linuxbrew, sdkman and `~/go/bin` — every one of them a directory no
 static list can name.
 
+## Docker on Linux, from a Mac
+
+The whole Docker integration (M41–M47) was written on macOS against colima, and `docs/journal.md`
+says so. This is what was done about Linux *before* anyone ran it there, and what is still unknown.
+
+**The socket ladder covers what a Linux machine actually has.** Rootless Docker at
+`$XDG_RUNTIME_DIR/docker.sock`, Docker Desktop at `~/.docker/run`, the machine's own at
+`/var/run/docker.sock` **and** `/run/docker.sock` — the second is a symlink to the first on every
+systemd distribution, and is not inside a container or a minimal namespace where only one is
+mounted, so both are tried and the pair is deduplicated on the *resolved* path.
+
+**Podman is in it.** It speaks the same API, carries the same compose labels, and is the default
+engine on Fedora and RHEL — a Linux developer is as likely to have `podman.sock` as `docker.sock`,
+and on many machines only podman. Rootless at `$XDG_RUNTIME_DIR/podman/podman.sock`, rootful at
+`/run/podman/podman.sock`. It is ordered **after** Docker's sockets: on a machine running both, a
+panel called Docker showing podman's containers would be wrong, and `DOCKER_HOST` is how somebody
+says otherwise. `podman compose` and `podman-compose` are in the Compose ladder for the same
+reason.
+
+**The two Linux first-run failures say what to do.** `/var/run/docker.sock` is `root:docker` mode
+660, so a user not in the `docker` group gets `EACCES` on a daemon that is running perfectly —
+that is the most common Linux first-run failure, and the message names `usermod -aG docker $USER`
+and says *the daemon itself is running; this is a permission, not a fault*. A missing socket names
+`systemctl start docker`. Both are matched on the error text, which is all there is, and both are
+pinned by a test — neither can be reached from the machine they were written on.
+
+**What made this testable from a Mac**: `sockets_present` takes `home` and `xdg_runtime` as
+arguments rather than reading the environment, so a Linux layout can be built in a scratch
+directory and the *order* asserted. `connect::ladder` is a function of a `Probes`. That is the
+same discipline `cide_spec::discover` and `cide_lsp::discover` already follow, and it is the only
+reason any of this has Linux coverage at all.
+
+**What is still unknown**, and only a Linux machine can answer:
+
+  - Whether `hyperlocal` connects to a rootless socket under a systemd user session.
+  - Whether `ls -lAp` parses identically under a musl-based `ls` that is neither GNU nor BusyBox.
+  - Whether podman's Engine API answers every call this crate makes — `list_volumes` and
+    `list_networks` above all, which are the two with the least-standardised shapes.
+  - The exec pane against a rootless daemon, where the hijacked connection crosses a user
+    namespace.
+
+Nothing above is a `cfg` — the Docker code has exactly one, a `#[cfg(unix)]` in a test — so a
+Linux build compiles the same source. The risk is behavioural, not conditional.
+
+## `run.sh`, and the three things that made it Linux-only
+
+It died on a Mac before it started anything:
+
+```
+./run.sh: line 140: mapfile: command not found
+./run.sh: line 165: candidates[@]: unbound variable
+```
+
+Three separate assumptions, and only the first announces itself.
+
+**`mapfile` is a bash 4 builtin.** macOS ships bash **3.2.57** at `/bin/bash` — the last GPLv2
+release — and the shebang is `/usr/bin/env bash`, so a Mac with no newer bash on `PATH` gets 3.2.
+Replaced with a `read_pids` helper over `while IFS= read -r`, fed by the same process substitution
+(a *pipe* would run the loop in a subshell and the array would be empty on return).
+
+**`"${empty[@]}"` aborts under `set -u` in bash 3.2.** bash 4.4 relaxed it; before that it is an
+unbound variable. That is the second line of the error above, and it also lurked in the launch
+itself — `./run.sh --profile default` with no other flag leaves `env_flags` empty, and that is the
+escape hatch, the one invocation somebody reaches for when something has already gone wrong. Every
+expansion that can be empty is now behind a `${#a[@]}` test.
+
+**A process's profile was read from `/proc/<pid>/environ`.** macOS has no `/proc`, and it does not
+let one process read another's environment at all — `ps -E` and `ps eww` both decline. So the
+profile filter, which is the whole thing that keeps `./run.sh` from killing the instance you are
+working in, could not work.
+
+The answer was already on disk: `cide_app::instance` writes `{pid, exe, profile}` into
+`instance.lock` in the profile's own state directory as its one-instance guard. `in_this_profile`
+now tries `/proc` **first** and falls back to that file.
+
+The ordering is the point, and it is what keeps Linux byte-identical: `/proc` is the kernel's copy
+of the process's own environment — live truth, never stale, never describing a pid that has since
+been reissued. The lock file is a *written record* and can be both. So Linux behaves exactly as it
+did before the file was consulted at all, and the lock is what makes the function work on a
+platform that has no `/proc`.
+
+**And there is deliberately no third road.** A process that cannot be identified is left alone —
+the opposite of the bias in `cide_app::instance`, which starts the app on every doubt. The doubt
+there is about refusing to launch; the doubt here is about *killing somebody else's application*.
+The cost is a launch that then refuses because the lock is held, which is a loud correct failure
+rather than a quiet wrong one.
+
+**A fourth thing was wrong and silent: `comm` is a full path on macOS.** The orphan reaper matched
+`$3 == "claude"` against `ps -eo ppid=,pid=,comm=`, and BSD `ps` prints
+`/opt/homebrew/bin/claude` where procps prints `claude` — so reaping orphaned `claude` processes
+never happened on a Mac, with no error. It compares the basename now. Reparenting is to pid 1 on
+both platforms (`launchd` there, `init` here).
+
+Verified on macOS 15 / bash 3.2.57, all four paths: a fresh launch; stopping the previous instance
+of the same profile; leaving an instance of *another* profile alone (reported as a stranger, still
+running afterwards); and `--profile default` with an empty flag array.
+
+### And then nothing kept it fixed
+
+Every fix above is a fix by hand to a file anybody may edit, and the failure class does not
+announce itself anywhere a contributor is likely to be looking: a bash 4 builtin is not a syntax
+error, so `bash -n` passes, `shellcheck` says nothing about it, and every Linux CI job is green.
+The break surfaces on a Mac, at launch, as the script aborting — which is also the moment the
+person who found it has no working build to investigate it with. Three things now stand in for
+the hand fix.
+
+**`scripts/check-bash32.sh` scans every `*.sh` in the repository** (enumerated with `git ls-files`,
+never listed — a hardcoded list stops covering a script the moment somebody adds one) for twelve
+constructs that need a bash newer than 3.2: `mapfile`/`readarray`, `declare -A`, `declare -n`,
+`${v^^}`/`${v,,}`, `${v@Q}`, `coproc`, `&>>`, `wait -n`, `;;&`, `globstar`, `$EPOCHSECONDS` and
+`printf %(fmt)T`. Two things about it are load-bearing rather than tidy. It **strips comments
+first**, because the house style is to name the failure a rule prevents and `read_pids`' own
+comment says `mapfile` four times — grepping the raw source flags the explanation of the fix as
+the bug, which is the trap `CLAUDE.md` already records three frontend checks falling into. And it
+carries a **fixture**: one line per rule, scanned after the real files, and a rule that no longer
+matches its own example is a hard error. Every assertion in it is a search for absence, so a
+detector that has quietly stopped detecting reports every script as clean and stays green until a
+Mac finds it — which is the exact failure the script exists to prevent. It runs under bash 3.2
+itself, so it uses two parallel indexed arrays where an associative one would read better.
+
+**`run.sh` refuses a shell it cannot run on, before `set`.** `zsh run.sh` and `sh run.sh` are the
+reflex on a Mac, where zsh is the login shell, and neither announced itself usefully: under zsh
+the shebang is a comment and the first array assignment is a parse error about a `(`; under `sh`
+it is bash 3.2 *in POSIX mode*, which sets `BASH_VERSION` and passes a naive check, then dies
+eighty lines down on the first `< <(...)` with ``syntax error near unexpected token `<' `` — POSIX
+mode turns process substitution off. Both are now named, with the invocation that works. The
+check is before `set -uo pipefail` on purpose: `pipefail` is not a POSIX `set` option, so under
+dash that line errors first and complains about an option rather than about the shell.
+
+**And a run that ends before it launches anything, under bash 3.x, says which half to suspect.**
+The hint is keyed off three facts, because the useful message is narrow: a non-zero exit, nothing
+launched, and a bash old enough for the class to be possible. It is silent on bash 4, silent on a
+clean run, and silent on a refusal the script wrote itself — every deliberate exit goes through
+`bail`, which sets `expected_exit`, so `./run.sh --bogus` answers a typo with the usage rather
+than with a lecture about bash. The wording points at `scripts/check-bash32.sh` and calls the
+state a bug in the script rather than in the reader's setup, because it is.
+
+## The terminal's line height is wrong on every Retina display
+
+Found by running the pane audit on a Mac (M45's session), and it is not a Docker bug — it has been
+there since the two font controls were wired, and it affects any HiDPI display, Linux included.
+
+Every terminal that opens logs:
+
+```
+Error: lineHeight cannot be less than 1, value: 0.6363636363636364
+    _sanitizeAndValidateOption@…/@xterm_xterm.js
+    createTerminal@src/terminal/xterm.ts:110
+```
+
+xterm rejects the option and falls back to `1`, so the cell is the full glyph box — roughly half
+again the intended leading — and the terminal no longer matches the editor beside it, which is the
+exact symptom `--fs-code` was made a shared token to end.
+
+**The cause is a unit mismatch in `settings/fontScale.ts::codeMetrics`.** It computes
+
+```ts
+const lineHeight = Math.round(fontSize * LEADING_RATIO)   // CSS px
+const box = Math.ceil(fontSize * GLYPH_BOX_EM * ratio)    // DEVICE px — `ratio` is the dpr
+termLineHeight: lineHeight / box
+```
+
+`lineHeight` is in CSS pixels and `box` is in device pixels, so the quotient is divided by the dpr
+one time too many. At 12.5px it is `22/17 = 1.29` on a dpr-1 display and `22/33 = 0.67` on a
+dpr-2 one — and xterm's floor for that option is 1.
+
+**`check:fonts` tests dpr 2 and passes**, which is the part worth keeping. It asserts that cide's
+arithmetic reproduces the leading it wanted — `floor(ceil(12.5 × boxEm × 2) × 0.67) = 22` — and
+that is true. What it does not assert is that the multiplier is a value xterm will *accept*. The
+model is internally consistent and disagrees with the library, which is why nothing caught it: the
+gate checks the sum, not the constraint.
+
+**The fix is one expression** — carry `lineHeight` into device pixels before dividing:
+
+```ts
+termLineHeight: box > 0 ? (lineHeight * ratio) / box : 1
+```
+
+which gives 1.29 at dpr 1 (unchanged) and 1.33 at dpr 2. `check-fonts.mjs`'s cell assertion has to
+move with it, and it should gain the assertion that was missing: **every multiplier it produces is
+≥ 1**, because that is the constraint the library actually imposes.
+
+Not done here. It changes the terminal's metrics for every user on every platform, which is a
+decision that deserves its own change rather than riding along with a Docker milestone.
+
 ## Every extension was dead on macOS, and the reason was four words in a comment
 
 Reported from a Mac: the yaml, graphql and protobuf panels each drew *its worker could not be
@@ -664,14 +851,26 @@ What no amount of configuration can do:
 * **Notarisation needs a paid Apple Developer Program membership** ($99/yr) for a Developer ID
   Application certificate. A free Apple ID yields a local-run-only certificate that cannot be
   notarised.
-* **Without notarisation a downloaded `.dmg` is quarantined** and Gatekeeper refuses it as
-  *"damaged and can't be opened"* — which blames the download, not the signature — until the
-  user runs `xattr -dr com.apple.quarantine`. The preflight says so in as many words.
+* **Without notarisation a downloaded `.dmg` is quarantined**, and which dialog Gatekeeper
+  then shows depends on whether it can *verify* the bundle, not on whether it trusts it. The
+  0.8.0 `.dmg` was built with no identity anywhere, and `tauri-bundler` then skips signing
+  entirely — no fallback — so the bundle had nothing but the linker's per-binary stamps and no
+  resource seal; `spctl` said *"code has no resources but signature indicates they must be
+  present"* and macOS said *"damaged and can't be opened"*, blaming the download, with Move to
+  Trash as the only button and `xattr -dr com.apple.quarantine` the only way through. The
+  overlay now names `bundle.macOS.signingIdentity: "-"`, codesign's ad-hoc identity: the same
+  bundle re-signed that way passes `codesign --verify --strict --deep`, satisfies its designated
+  requirement, and gets the ordinary *"Apple could not verify"* dialog with **Open Anyway** in
+  System Settings › Privacy & Security. Checked on this Mac by re-signing the shipped 0.8.0
+  bundle by hand, `--options runtime` included, and launching it under a throwaway profile.
+  `APPLE_SIGNING_IDENTITY` in the environment outranks the overlay, so a real certificate is
+  unaffected — except that `APPLE_CERTIFICATE` *without* it now trips the bundler's
+  name-contains-identity check against `-`, which the preflight fails on before the build.
 * **The updater is a third artefact.** `tauri-plugin-updater`'s macOS channel is an
   `.app.tar.gz`, not the `.dmg`; and no `plugins.updater` is configured on any platform yet.
 
-An unsigned or ad-hoc-signed `.app` and `.dmg` that run locally are entirely buildable, and
-that is the honest first target.
+An ad-hoc-signed `.app` and `.dmg` that run locally and open from a download after one trip
+through System Settings are entirely buildable, and that is the honest first target.
 
 **The icon set is left one raster short, knowingly.** The overlay carries its own `bundle.icon`
 list because the platform merge *replaces* the array rather than extending it, and the macOS

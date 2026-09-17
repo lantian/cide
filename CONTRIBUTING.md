@@ -35,6 +35,23 @@ starts Vite, waits for the port, stops any previous instance (SIGTERM, so the wo
 reaps orphaned `claude` children, and refuses to start when the saved workspace would open more
 than eight windows.
 
+It runs on **macOS as well as Linux**, which took three fixes and is easy to undo: no `mapfile`
+(bash 4; macOS ships 3.2), no bare `"${array[@]}"` that could be empty (`set -u` aborts on it
+before bash 4.4), and no `/proc` — a process's profile is read from `/proc/<pid>/environ` where
+that exists and from the profile's own `instance.lock` where it does not. `docs/platforms.md`
+has the whole account.
+
+**`./scripts/check-bash32.sh` is what keeps the first two fixed**, and it is in CI. The class it
+covers is silent everywhere a contributor is likely to be working: a bash 4 builtin is not a
+syntax error, so `bash -n` passes and every Linux job passes, and nothing notices until a Mac
+runs the script and has no working build left to investigate it with. It scans every `*.sh` in
+the repository (comments stripped first — the house style is to name the failure a rule prevents,
+so `read_pids`' own comment says `mapfile` four times) and carries a fixture that every rule must
+still match, because a search for absence that has stopped searching reports everything clean.
+`run.sh` itself refuses `sh run.sh` and `zsh run.sh` by name rather than dying on a parse error
+eighty lines down, and if it exits before launching anything under bash 3.x it says which half
+to suspect.
+
 That last guard is not hypothetical: a workspace here once accumulated 242 copies of one
 directory in per-project window mode, and the restore path faithfully opened a window for each.
 
@@ -122,6 +139,29 @@ The script has no URLs of its own — it sources the same locks the release work
 those pins come from, how to move one, and how the three repositories relate to their upstreams
 is `docs/forks.md`.
 
+## When a timing test fails and the code looks innocent
+
+`cargo` never garbage-collects `target/debug/deps/`, so it grows with every rebuild — a long
+session can leave tens of thousands of files there. Executing a binary out of a directory that
+large is measurably slower, and this workspace has timing-sensitive tests with real deadlines:
+`cide-fs`'s watcher suite waits ten seconds for a filesystem event, and `cide-pty`'s soak has its
+own clock.
+
+A test that fails **deterministically, always at its deadline**, while its crate and every
+dependency it links are provably unchanged, is usually this. `cargo clean` is the remedy.
+
+The fastest way to be sure it is not a real regression, before doing anything else:
+
+```sh
+git worktree add --detach /tmp/head-check HEAD   # a pristine tree, its own target/
+(cd /tmp/head-check && cargo test -p <crate> --test <name>)
+```
+
+If HEAD passes there and your tree fails, copy your changed crates in **one at a time** and re-run.
+That turns a theory into a yes or no in a couple of minutes. It is also worth running the built
+test binary from somewhere other than `deps/` — if the same bytes pass there, the code is not the
+problem.
+
 ## Checking it
 
 Everything CI runs, in CI's order:
@@ -153,6 +193,7 @@ pnpm --dir ui build
 - **Which check covers what you touched** is the table in [`CLAUDE.md`](CLAUDE.md) — it is
   maintained per surface and names the silent-failure class each check exists to catch. Read the
   row for the area you are editing before you edit it.
+- Shell portability: `scripts/check-bash32.sh` (every `*.sh` still runs on macOS's bash 3.2).
 - Icon drift: `scripts/gen-icons.sh --check`. Casing collisions: `pnpm --dir ui run check:casing`
   — a name differing from a sibling's only in case is one path on macOS, and it cost a Mac build
   once.

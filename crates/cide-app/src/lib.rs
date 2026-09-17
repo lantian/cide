@@ -24,6 +24,7 @@ pub mod cmd;
 /// Platform-neutral model, `cfg`-gated AppKit glue, and a no-op on Linux — its header says why
 /// the dock is the *only* surface that can name projects the desktop cannot see.
 pub mod dock;
+pub mod docker_state;
 pub mod dotcide;
 pub mod edit_wait;
 pub mod emit;
@@ -193,6 +194,26 @@ fn log_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         // orderly quit — and that was the last thing in the log a user is asked to send back.
         // See `cide_lsp::server::EXIT_LOG_TARGET` for why this is a target and not a level.
         .level_for(cide_lsp::server::EXIT_LOG_TARGET, log::LevelFilter::Info)
+        /*
+         * The fourth, and this one is not only about noise. (M52)
+         *
+         * `bollard` logs every decoded response body at DEBUG — `Decoded into string: [{"Name":
+         * "none","Id":…` — so a single board read writes the full JSON for every container, image,
+         * volume and network on the machine. That is tens of kilobytes per read, and it rotated
+         * the log the way `notify` used to.
+         *
+         * **And a container's JSON carries its environment.** `docker inspect` reports `Env`
+         * verbatim: database passwords, API tokens, whatever the user's compose file sets. cide's
+         * log is the file users are asked to send back when something breaks, and it must not be
+         * a place secrets accumulate — `redact`ing a third-party crate's own formatting is not
+         * possible, so the level is the control.
+         *
+         * `Info` rather than `Warn`: bollard says nothing at `Info`, and a genuine transport
+         * failure is reported at `Warn`/`Error` and still arrives. `RUST_LOG=bollard=debug` is
+         * the deliberate override for someone debugging the wire, who is then choosing to write
+         * those bodies to disk.
+         */
+        .level_for("bollard", log::LevelFilter::Info)
         // Two megabytes, three files. A session's worth of diagnostics is a few hundred
         // kilobytes; the old 40 KB could not hold one project's start-up. `KeepSome` rather
         // than `KeepAll` because a log directory that grows for ever is the other way to
@@ -335,6 +356,11 @@ pub fn run() {
     // thread that reads a board and emits it, and being the *only* thing that does so is what
     // lets `cide://spec-changed` carry no revision. See `emit::spec_changed`.
     builder = builder.manage(std::sync::Arc::new(spec_state::SpecBoards::default()));
+    // M41. Holds the machine's Docker connection and the coalescer behind
+    // `cide://docker-changed`. Managed from the start rather than on first use, `SpecBoards`'
+    // reason: `docker_board` resolves it on every call, and a command that cannot resolve its
+    // state fails in a way the panel cannot distinguish from a daemon that is down.
+    builder = builder.manage(std::sync::Arc::new(docker_state::DockerState::default()));
     // M18. Empty until something is dispatched, and managed from the start for the same reason:
     // `agents_roster` reads it on every call, and a command that cannot resolve its state fails
     // rather than answering "nothing is running", which is what an empty registry already says.
@@ -635,6 +661,24 @@ pub fn run() {
             cmd::spec::spec_config_get,
             cmd::spec::spec_config_set,
             cmd::spec::spec_schemas,
+            // M41: Docker.
+            cmd::docker::docker_board,
+            cmd::docker::docker_container_action,
+            cmd::docker::docker_remove,
+            cmd::docker::docker_volume_size,
+            cmd::docker::docker_use_endpoint,
+            cmd::docker::docker_session_open,
+            cmd::docker::docker_inspect,
+            cmd::docker::docker_compose_action,
+            cmd::docker::docker_compose_plan,
+            cmd::docker::docker_watch,
+            cmd::docker::docker_open_inspect,
+            cmd::docker::docker_files_list,
+            cmd::docker::docker_files_read,
+            cmd::docker::docker_open_files,
+            cmd::docker::docker_detail,
+            cmd::docker::docker_recreate,
+            cmd::docker::docker_files_download,
             // --- M18: subagent orchestration ---
             cmd::agents::agents_roster,
             cmd::agents::agents_config_get,

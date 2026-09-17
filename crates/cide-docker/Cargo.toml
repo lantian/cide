@@ -1,0 +1,50 @@
+[package]
+name = "cide-docker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# What a Docker daemon is running, and what it holds. (M41 — ADR 0013)
+#
+# It speaks the Engine API over a socket; it never shells out to `docker` for anything the API
+# can answer, and the one thing the API cannot answer — compose `up`/`down`, which is a CLI
+# plugin and not a daemon feature — is quarantined in `compose.rs` behind its own discovery
+# ladder. See the crate header in `src/lib.rs`.
+#
+# No tauri, no `cide-fs`, no `cide-lsp`.
+[dependencies]
+# The DTOs this crate answers with. They are cide's contract, not Docker's — the shapes the
+# Engine API emits live in `model.rs` here, `Deserialize`-only, so an upstream API change lands
+# in this crate without touching the wire the panels are built against.
+cide-ipc = { workspace = true }
+# `child_env::{prepare_command, arm}` for the compose lane (the workspace's spawn chokepoint),
+# `toolchain::{which, is_executable}` for finding its plugin.
+cide-core = { workspace = true }
+# The Engine API client. Never re-exported — see the root manifest's entry.
+bollard = { workspace = true }
+# `cide-docker` owns a private runtime so its public API can be blocking; see the crate header.
+tokio = { workspace = true }
+# Stream handles hand back a receiver, the same channel `cide-pty` coalesces over.
+crossbeam-channel = { workspace = true }
+# The session machinery an exec pane and a log follow ride on, rather than a second terminal
+# stack — see `src/session.rs`. `cide-pty` links no tauri either, so `cide-headless` still proves
+# this whole road.
+cide-pty = { workspace = true }
+# Draining a bollard `Stream` on the pump task. `StreamExt::next`, and nothing else.
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The context store names each context's directory by the hex SHA-256 of the context's name.
+# Already a workspace dependency; this crate is its second consumer.
+# One mutex, in `session::ExecTransport`. The workspace-wide choice; `cide-pty` and
+# `cide-tasks` make the same one.
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+# Reading one file out of `GET /archive`, which answers with a tar. See the root manifest.
+tar = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# No dev-dependencies, `cide-spec`'s reason: the tests are functions of injected values, and the
+# few that touch disk build scratch directories out of `std::env::temp_dir()` keyed by pid.

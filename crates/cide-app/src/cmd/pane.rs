@@ -72,6 +72,14 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
             cide_ipc::Harness::Codex => (PaneKind::Shell, "codex"),
         },
         SplitIntent::Shell => (PaneKind::Shell, "bash"),
+        // A `Shell` pane, deliberately — see `cide_ipc::Pane::docker` for why a container's pane
+        // is not a kind of its own. The suffix is the container's own name rather than the word
+        // "docker", because a tab strip with four panes all called `docker` tells you nothing.
+        SplitIntent::Docker { name, .. } => (PaneKind::Shell, name.as_str()),
+        // A `Shell` pane too, and for a stronger version of the same reason: the session this
+        // adopts *is* a shell — a local child with a local cwd — and only its argv differs. The
+        // argv is never seen here: it was spent on the `session_spawn` that produced the id.
+        SplitIntent::Adopt { title, .. } => (PaneKind::Shell, title.as_str()),
     };
     Pane {
         id: PaneId::new(),
@@ -86,6 +94,10 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // transcript and keeps every record naming that conversation correct.
         session: match intent {
             SplitIntent::Mirror { session, .. } | SplitIntent::Resume { session } => Some(*session),
+            // The whole point of this variant: the pane names its session *durably*, so nothing
+            // has to survive the gap between the split resolving and the pane mounting. See
+            // `SplitIntent::Adopt` for the race that gap actually loses.
+            SplitIntent::Adopt { session, .. } => Some(*session),
             // A `claude` conversation's id *is* a session id, and `session_spawn` keeps it
             // (`--resume` under the same uuid), so the row holds it before the spawn for the
             // reason the test below states. An opencode `ses_…` is not one, and that pane's
@@ -111,6 +123,18 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         continues: match intent {
             SplitIntent::Mirror { continues, .. } => continues.clone(),
             SplitIntent::Continue { conversation } => Some(conversation.clone()),
+            _ => None,
+        },
+        docker: match intent {
+            SplitIntent::Docker {
+                container,
+                name,
+                stream,
+            } => Some(cide_ipc::workspace::DockerPane {
+                container: container.clone(),
+                name: name.clone(),
+                stream: *stream,
+            }),
             _ => None,
         },
         title: format!("{project_name} : {suffix}"),
@@ -404,6 +428,91 @@ mod tests {
         pane_for(&SplitIntent::Shell, "cide")
     }
 
+    #[test]
+    fn an_adopted_pane_is_a_shell_that_durably_names_its_session() {
+        // The whole reason this variant exists. The first cut of the compose road carried the
+        // argv on the intent and parked it in `layout/spawnPlans.ts`; a plan is recorded after
+        // `pane_split` resolves and the pane can render as soon as the `workspace_changed`
+        // broadcast lands, which is sent *before* the command returns. A mirror that loses its
+        // plan adopts a held session and looks fine. A compose pane that lost its plan fell
+        // through to a login shell — reported as "compose up does nothing, only opens an empty
+        // terminal", which is precisely what it was.
+        let session = SessionId::new();
+        let pane = pane_for(
+            &SplitIntent::Adopt {
+                session,
+                title: "compose up : shop".to_string(),
+            },
+            "cide",
+        );
+
+        // A shell pane: every gesture on it behaves like a shell's, and only its argv differed.
+        assert_eq!(pane.kind, PaneKind::Shell);
+        // **Durable**, which is the fix: nothing has to survive the gap any more.
+        assert_eq!(pane.session, Some(session));
+        // The title is how a user tells this pane from the login shell it otherwise looks like.
+        assert_eq!(pane.title, "cide : compose up : shop");
+        assert!(pane.docker.is_none());
+        // And no conversation: a compose run is a child with an argv, not a harness conversation,
+        // so there is nothing for the exit bar to re-open. See `SplitIntent::Continue`.
+        assert!(pane.continues.is_none());
+
+        /*
+         * And the argv is nowhere, because it was spent on the spawn that produced the id. A
+         * restored pane re-running `docker compose up` at launch — against a file that may have
+         * changed, on a machine just unlocked — is the outcome worth designing against.
+         *
+         * # Structurally, and never by grepping the JSON for short tokens
+         *
+         * The first cut of this test greped for `["docker-compose", "compose.yaml", "/srv/shop",
+         * "-d"]`, and **`-d` matches a uuid**: a hyphen followed by the hex digit `d` occurs in a
+         * `Pane`'s two ids about **40% of the time** (measured). So it failed roughly two runs in
+         * five, passed alone often enough to look fine, and accused a line of production code that
+         * was correct.
+         *
+         * The key set says the real thing anyway, and it is worth being exact about which half of
+         * it the compiler already covers. Adding a field to `Pane` is a **compile error** at every
+         * construction site (`Pane` has no `Default`), so a smuggled field cannot arrive quietly.
+         * What the compiler cannot see is the **wire**: a `#[serde(rename)]` on an existing field
+         * changes what `workspace.json` carries with nothing failing to build — verified by doing
+         * it, which is the only way to know an assertion like this is live.
+         */
+        let stored = serde_json::to_value(&pane).expect("a pane serialises");
+        let mut keys: Vec<&str> = stored
+            .as_object()
+            .expect("a pane is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "continues",
+                "conversation",
+                "conversationSince",
+                "docker",
+                "id",
+                "kind",
+                "role",
+                "session",
+                "title",
+            ],
+            "a new durable field on `Pane` needs a decision about whether a compose run may write \
+             to it — see `SplitIntent::Adopt`",
+        );
+
+        // And the distinctive halves of the argv, which cannot collide with a uuid: every one of
+        // them holds a character no hex digit or hyphen can produce.
+        let text = stored.to_string();
+        for token in ["docker-compose", "compose.yaml", "/srv/shop"] {
+            assert!(
+                !text.contains(token),
+                "`{token}` reached workspace.json: {text}"
+            );
+        }
+    }
+
     /// A console tab holding one row of `n` tiles.
     fn tree_of(n: usize) -> PaneTree {
         let first = Pane {
@@ -415,6 +524,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: "cide : claude".into(),
+            docker: None,
         };
         let mut tree = new_tree(first);
         let mut last = tree.focused;

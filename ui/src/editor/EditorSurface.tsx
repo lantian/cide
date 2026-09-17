@@ -90,6 +90,7 @@ import { completionExtensions } from './completion'
 const LINT_GUTTER = lintGutter()
 import { blameExtension, setBlame } from './blame'
 import { CHANGE_BARS, setChangeBaseline } from './changeBars'
+import { composeGutter } from './composeGutter'
 import { onImagePaste } from './pasteImage'
 import { fsClipboard } from '@/ipc/client'
 import { isNoClipboardImage } from '@/sidebar/fsError'
@@ -1378,6 +1379,25 @@ export function EditorSurface({
      * argument, and it is the one thing about this extension that reads differently from blame.
      */
     shared.push(CHANGE_BARS)
+    /*
+     * The Compose run column, on a compose file and on nothing else. (M48)
+     *
+     * **After `CHANGE_BARS`**, so it sits furthest right, hard against the text — which is where
+     * IDEA draws its run marks and, more to the point, the only place left: the order of this
+     * array is the order gutters lay out, and every column before it is claimed (`blameSlot`
+     * furthest left, then line numbers, then the fold chevrons, then the change strip).
+     *
+     * **A function of the path rather than one value for the process**, unlike `CHANGE_BARS`
+     * immediately above, and the asymmetry is the point: the change column's width is reserved
+     * unconditionally in the stylesheet so it must be present in every buffer, and this one must
+     * be present in almost none. `composeGutter` answers `[]` for anything that is not a compose
+     * file, so a Rust buffer pays for neither the scan nor the column.
+     *
+     * Outside the `!oversize` block, and it costs nothing to say why: a compose file large enough
+     * to trip `HIGHLIGHT_LIMIT_BYTES` is not a thing, and gating it would make the gutter's
+     * presence depend on a threshold nobody browsing a compose file would ever think about.
+     */
+    shared.push(composeGutter(path))
     if (readOnly) {
       shared.push(
         EditorState.readOnly.of(true),

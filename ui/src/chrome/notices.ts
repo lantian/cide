@@ -23,6 +23,22 @@
  *
  * Module-level and per-window. `Failures` mounts once per window (the shell returns before it
  * for a detached pane and renders its own), so there is exactly one reader.
+ *
+ * # Per window was not a narrow enough scope
+ *
+ * It was the only scope this had, and it is the right *outer* one — a detached window is
+ * another realm and nothing here crosses it. But in the default `Stacked` window mode one
+ * window holds every open project, and a toast is the outcome of something done *in* a
+ * project. So a pull that failed in one repository stayed in the corner while the user
+ * switched to another, reporting the first project's outcome over the second's: the reported
+ * bug, "the notification is shared on all of them".
+ *
+ * The scope is therefore a project as well: [`Notice.project`] carries it, [`notify`] stamps
+ * it from an injected getter ([`setNoticeScope`]) so ninety-odd call sites need not change,
+ * [`visible`] is the filter `Failures` renders through, and [`admit`]'s two rules — the
+ * collapse by message and the cap — are applied within a view rather than across the window.
+ * A notice with no project is shown everywhere, which is both the honest answer for an
+ * app-level failure and the direction a missing registration has to fail in.
  */
 
 /**
@@ -85,10 +101,76 @@ export interface Notice {
   detail?: string | undefined
   /** What the notice offers to do next. See [`NoticeAction`]. */
   actions?: readonly NoticeAction[] | undefined
+  /**
+   * The project this notice is about, or `null` for one that is about the app or the window.
+   *
+   * # Why a notice has a project at all
+   *
+   * The stack is module-level and therefore per *window*, which was the whole scope this
+   * surface had: a toast raised while one project was active stayed on screen through a switch
+   * to the next one, so every project reported every other project's outcomes. A window is the
+   * right outer boundary — a detached window is a separate realm and nothing crosses it — but
+   * inside one window, in the default `Stacked` mode, every open project shares this corner.
+   *
+   * # Why `string` and not `ProjectId`
+   *
+   * The import-free rule at the foot of this file, not laziness. `ProjectId` is a `string`
+   * alias, and even a type import pulls `ipc/client.ts` into the one-file program
+   * `check-notices.mjs` compiles. `awaitingRule.ts` spells `SessionPhase` out for the same
+   * reason.
+   *
+   * # Why absent means *shown everywhere*
+   *
+   * Because the other direction fails silently and catastrophically. An unstamped notice —
+   * one raised before the scope is registered, or by a window with no project open — is shown
+   * in every project, which is exactly the behaviour that shipped before this field existed.
+   * A default of "hide unless it matches" turns a missing registration into a stack that
+   * renders nothing, which is the control-wired-to-nothing symptom this whole surface was
+   * built to remove, arriving from the surface itself.
+   *
+   * A notice whose project has since been closed is dropped by [`prune`], not hidden.
+   */
+  project?: string | null | undefined
 }
 
-/** How many are shown at once. Beyond this the oldest is dropped. */
+/**
+ * How many are shown at once, **in one project's view**. Beyond this the oldest is dropped.
+ *
+ * The qualifier is the whole of the change: the cap is applied to the notices that would share
+ * a screen with the incoming one (see [`capped`]), not to the list. A global cap lets three
+ * toasts from a project the user is not looking at evict the one toast they can see — the
+ * command they just ran then reports nothing, and no check in this suite can see it happen.
+ */
 export const MAX_SHOWN = 3
+
+/**
+ * Whether two notices belong to the same view.
+ *
+ * `undefined` and `null` are one bucket — "not about a project" arrives both ways, from a
+ * caller that said nothing and from one that said so outright, and they mean the same thing.
+ */
+function sameScope(a: string | null | undefined, b: string | null | undefined): boolean {
+  return (a ?? null) === (b ?? null)
+}
+
+/**
+ * Enforce [`MAX_SHOWN`] over the notices that share a screen with the one just admitted.
+ *
+ * The cohort, not the list, and not a bucket per project either: what may never exceed three
+ * is what a user can *see at once*, which is this project's notices plus the unscoped ones.
+ * `.slice(-MAX_SHOWN)` over the whole list is one line shorter and drops toasts nobody was
+ * shown, in favour of ones nobody can see.
+ */
+function capped(next: readonly Notice[], project: string | null): readonly Notice[] {
+  const cohort = visible(next, project)
+  if (cohort.length <= MAX_SHOWN) return next
+  const oldest = cohort[0]
+  // Unreachable — `MAX_SHOWN` is positive, so a longer cohort has a first element — and
+  // written out because `noUncheckedIndexedAccess` is on and a `!` here would be the only
+  // one in the file.
+  if (oldest === undefined) return next
+  return next.filter((n) => n !== oldest)
+}
 
 /**
  * Admit one notice to the list, or decline it.
@@ -107,9 +189,23 @@ export const MAX_SHOWN = 3
  * reader does not re-render for a duplicate.
  */
 export function admit(current: readonly Notice[], notice: Notice): readonly Notice[] {
-  const at = current.findIndex((n) => n.text === notice.text)
+  /*
+   * The comparison is the message **and the project**, and the second half is not tidiness.
+   *
+   * "Already up to date with origin" in two repositories the user has open is two different
+   * events. Collapsed by text alone, the second one either produces no toast at all — the
+   * precise symptom this surface exists to remove — or, when it carries a body or a link,
+   * refreshes the first in place *and re-stamps it*, so the toast vanishes from the project it
+   * was about and appears in the one that is on screen. Both are invisible to every other
+   * check in the suite.
+   *
+   * Within one project nothing moves: five submodules reporting the same sentence still
+   * collapse to one toast, which is why `git.pull` and `pushRun` go on aggregating their
+   * repositories before they notify (`check-push.mjs`, `check-branches.mjs`).
+   */
+  const at = current.findIndex((n) => n.text === notice.text && sameScope(n.project, notice.project))
   const shown = current[at]
-  if (shown === undefined) return [...current, notice].slice(-MAX_SHOWN)
+  if (shown === undefined) return capped([...current, notice], notice.project ?? null)
   /*
    * The same words, and one toast — but the *newer facts* under them. (M37)
    *
@@ -135,6 +231,39 @@ export function admit(current: readonly Notice[], notice: Notice): readonly Noti
   const next = current.slice()
   next[at] = { ...notice, id: shown.id }
   return next
+}
+
+/**
+ * The notices one project's view shows: its own, plus everything that belongs to no project.
+ *
+ * Pure and exported so `check-notices.mjs` can drive it, and that is the point rather than a
+ * convenience — both ways of getting this wrong are silent. A filter that keeps nothing empties
+ * the stack, which looks exactly like a surface that was never wired up; one that keeps
+ * everything restores the bug it was written for, and nothing on screen says so.
+ *
+ * Returns the **same array** when nothing is hidden — the common case, one project open. A
+ * fresh array per call in a snapshot position is the infinite render loop `getServerSnapshot`
+ * below already carries a note about.
+ */
+export function visible(current: readonly Notice[], project: string | null): readonly Notice[] {
+  const keep = current.filter((n) => n.project === undefined || n.project === null || n.project === project)
+  return keep.length === current.length ? current : keep
+}
+
+/**
+ * Drop the notices of projects that are no longer open.
+ *
+ * Hidden is not the same as gone: a closed project's toasts can never be shown again and can
+ * never be dismissed, so without this they sit in the list for the life of the window. Driven
+ * from `store/workspace.ts`'s `applySnapshot`, which is the one place a project closed **in
+ * another window** is heard about.
+ *
+ * Same-array when nothing is dropped, which is every call but the rare one: this runs on every
+ * accepted workspace mutation.
+ */
+export function prune(current: readonly Notice[], open: ReadonlySet<string>): readonly Notice[] {
+  const keep = current.filter((n) => n.project === undefined || n.project === null || open.has(n.project))
+  return keep.length === current.length ? current : keep
 }
 
 /**
@@ -213,6 +342,48 @@ export function hintFor(text: string): string | undefined {
     : undefined
 }
 
+// --- which project a notice is about ----------------------------------------------------------
+
+/**
+ * How `notify` learns which project this window is showing. Registered by
+ * `store/workspace.ts`; see [`setNoticeScope`].
+ *
+ * **The default answers `null`, and the direction matters more than the value.** An
+ * unregistered scope means every notice is unscoped and therefore shown in every project,
+ * which is what this surface did before it had a scope at all. The opposite default turns a
+ * lost registration into a stack that renders nothing.
+ */
+let scopeOf: () => string | null = () => null
+
+/**
+ * Tell the notices which project this window is showing.
+ *
+ * A **getter**, not a value: `notify` fires from the first frame to the last, and the
+ * bootstrap is an IPC round trip, so a value captured at registration would be `null` for the
+ * life of the window. Registered at module scope in `store/workspace.ts` — this app has
+ * shipped three features that only worked when somebody remembered to install them (the note
+ * at the head of `panes/awaiting.ts` is about the last of them), so it is not an effect and
+ * not a call anybody has to make from a component.
+ */
+export function setNoticeScope(get: () => string | null): void {
+  scopeOf = get
+}
+
+/**
+ * The project to stamp on a notice raised right now.
+ *
+ * Swallows a throw on purpose. The scope reads a store through a closure it does not own, and
+ * the failure this surface must never have is a toast that does not appear: an exception here
+ * would take the report down with the getter, on the path whose entire job is to report.
+ */
+function currentScope(): string | null {
+  try {
+    return scopeOf()
+  } catch {
+    return null
+  }
+}
+
 // --- the store ------------------------------------------------------------------------------
 
 let notices: readonly Notice[] = []
@@ -246,6 +417,17 @@ export function notify(
     hint?: string | undefined
     detail?: string | undefined
     actions?: readonly NoticeAction[] | undefined
+    /**
+     * Which project this outcome belongs to, when the caller knows better than the window
+     * does — a pull, a push, an integrate: anything whose answer can land seconds after the
+     * gesture, by which time the user may be looking at another project.
+     *
+     * Omit it and the notice is stamped with whatever project this window is showing *now*,
+     * which is right for the ninety-odd call sites that answer a gesture within a frame.
+     * `null` says outright that this is about the app or the window and belongs in every
+     * project's view.
+     */
+    project?: string | null | undefined
   },
 ): void {
   nextId += 1
@@ -261,17 +443,46 @@ export function notify(
       hint: options.hint ?? (kind === 'error' ? hintFor(text) : undefined),
       detail: options.detail,
       actions: options.actions,
+      /*
+       * `=== undefined`, and never `options.project ?? currentScope()`.
+       *
+       * The `??` spelling is shorter and silently discards an explicit `project: null` — a
+       * caller saying "this is app-level, show it everywhere" would have its notice stamped
+       * with whatever project happened to be on screen, and then hidden from every other one.
+       * Same trap as the `kind ??` default this option bag refuses, and pinned the same way in
+       * `check-notices.mjs`.
+       */
+      project: options.project === undefined ? currentScope() : options.project,
     }),
   )
 }
 
-/** Report a rejection. Separate from `notify` only so the kind cannot be got wrong. */
-export function notifyFailure(reason: unknown): void {
-  notify(describe(reason), { kind: 'error' })
+/**
+ * Report a rejection. Separate from `notify` only so the kind cannot be got wrong.
+ *
+ * The options are optional, so all ninety-odd existing callers are untouched and the handful
+ * that hold a project id can name it.
+ */
+export function notifyFailure(reason: unknown, options?: { project?: string | null }): void {
+  notify(describe(reason), {
+    kind: 'error',
+    ...(options?.project === undefined ? {} : { project: options.project }),
+  })
 }
 
 export function dismiss(id: number): void {
   publish(notices.filter((n) => n.id !== id))
+}
+
+/**
+ * Forget the notices of every project that is no longer open. See [`prune`].
+ *
+ * `publish` returns early on the same array, so the overwhelmingly common call — nothing to
+ * drop — wakes nobody, which is what makes it safe on the every-mutation path it is driven
+ * from.
+ */
+export function pruneNotices(open: ReadonlySet<string>): void {
+  publish(prune(notices, open))
 }
 
 export function subscribe(listener: () => void): () => void {

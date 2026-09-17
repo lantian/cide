@@ -103,6 +103,8 @@ import {
 } from '@/ipc/client'
 import { Icon, FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
+import { COMPOSE_LABEL, COMPOSE_VERBS, isComposePath } from '@/chrome/composeModel'
+import { runCompose } from '@/chrome/composeRun'
 // The sentence, not a second copy of it. `NO_HOST` is user-visible prose that now appears on
 // four surfaces — the tab strip's *Show history for this file*, this panel's, and the two
 // header menus — and four literals is how one of them comes to say something slightly
@@ -1885,6 +1887,38 @@ export function FileTree({
           label: 'Open to the Side',
           ...sideAction(row.isDir, row.path, onOpenToSide),
         },
+        /*
+         * *Compose ▸* — the six verbs, on a compose file and on nothing else. (M48)
+         *
+         * A **submenu**, because six flat rows in a menu that already has fifteen would bury
+         * *Rename* and *Move to Trash*; and one parent row is also how a reader learns this file
+         * is special at all. `isComposePath` decides by name — see its own note on why this is
+         * not a parse — so the cost of it appearing on a `values.yaml` somebody named oddly is
+         * one submenu Compose then refuses in its own words.
+         *
+         * The entries are built when the submenu **opens**, which `MenuItem.submenu` requires
+         * and which happens to be right here anyway: nothing about them depends on state that
+         * could move, and `row.path` is captured rather than re-read for the same reason *Open*
+         * above captures it — an eviction between the right-click and the click must not make
+         * this quietly act on a different file.
+         *
+         * Spread into the array rather than pushed conditionally after it, so the separator that
+         * follows stays with the group above it whether or not this row is a compose file.
+         */
+        ...(row.isDir || !isComposePath(row.path)
+          ? []
+          : ([
+              {
+                id: 'compose',
+                label: 'Compose',
+                submenu: () =>
+                  COMPOSE_VERBS.map((verb) => ({
+                    id: `compose-${verb}`,
+                    label: COMPOSE_LABEL[verb],
+                    run: () => void runCompose(row.path, verb),
+                  })),
+              },
+            ] satisfies MenuEntry[])),
         { kind: 'separator' },
         /*
          * Cut / Copy / Paste of the **files**, above the two items that copy their *names*.

@@ -271,9 +271,14 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    * deliberately does not import that, so the surfacing stays at the gesture, where a reader
    * looking at the click can find it.
    */
-  const guarded = useCallback((done: Promise<void>) => {
-    void done.catch(notifyFailure)
-  }, [])
+  const guarded = useCallback(
+    (done: Promise<void>) => {
+      // Stamped with this panel's project, so a write that fails after the user has moved on
+      // reports in the project it was aimed at rather than over the next one's board.
+      void done.catch((reason: unknown) => notifyFailure(reason, { project }))
+    },
+    [project],
+  )
 
   return (
     <>

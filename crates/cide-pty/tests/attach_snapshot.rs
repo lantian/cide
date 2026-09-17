@@ -190,9 +190,12 @@ fn a_sink_attached_with_a_snapshot_still_receives_what_comes_next() {
 
 /// Attaching to a child that has already exited answers with the screen rather than hanging.
 ///
-/// The coalescer thread has ended by then, so this exercises the fallback path — and the
-/// thing that must not happen is the two-second `ATTACH_TIMEOUT` being paid on every
-/// rehydration of a dead pane, of which a restored workspace has one per pane.
+/// `attach_with_snapshot` takes the fallback on the `exited` flag alone, without ever asking
+/// the coalescer, so that is the path this exercises — and the thing that must not happen is
+/// the two-second `ATTACH_TIMEOUT` being paid on every rehydration of a dead pane, of which a
+/// restored workspace has one per pane. (The coalescer having *ended* is a likely consequence
+/// and not the trigger; see the mirror wait in the body, which is there because the two are
+/// genuinely separate events.)
 #[test]
 fn attaching_to_a_dead_session_answers_from_the_mirror_without_waiting() {
     let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
@@ -206,6 +209,28 @@ fn attaching_to_a_dead_session_answers_from_the_mirror_without_waiting() {
     }
     assert!(session.has_exited(), "child never finished");
 
+    // …and then for the mirror, which is a different event. `has_exited()` is deliberately the
+    // *earliest* honest answer: it is set by whichever of two observers gets there first, the
+    // coalescer seeing EOF on the master or the reaper seeing `wait()` return. When the reaper
+    // wins, the child's bytes are still on their way into the mirror and the snapshot below is
+    // legitimately empty — so this test was asserting something `has_exited()` does not promise
+    // and its own header assumes ("the coalescer thread has ended by then"). It held on every
+    // macOS run measured here — 200 spawns, the coalescer first every time, under load too — and
+    // did not hold on a Linux runner, which is where it failed.
+    //
+    // `full_state`, not `screen_state`: the exited arm of `attach_with_snapshot` answers with
+    // the whole transcript, so that is the buffer whose readiness this is about.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !contains(&session.full_state(), SENTINEL) && Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+    assert!(
+        contains(&session.full_state(), SENTINEL),
+        "the child's output never reached the mirror at all"
+    );
+
+    // Measured from here, so the wait above cannot pay for the fallback the assertion below is
+    // about.
     let started = Instant::now();
     let (sink, _rx) = recording_sink();
     let (_id, snapshot) = session.attach_with_snapshot(sink, false);

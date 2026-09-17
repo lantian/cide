@@ -142,6 +142,14 @@ const ICONS = [
   'file-diff', 'message-square', 'arrow-up-right', 'arrow-right', 'arrow-left-right',
   // Git log and the markdown view switcher.
   'list-tree', 'file-code', 'book-open-text',
+  // M42's two pane-opening buttons on a container row: a terminal into it, and its logs.
+  //
+  // `container` was here for M41's rail button and went with it when the panel moved to the
+  // bottom tool window in M46: a tab strip is text, so nothing draws the mark any more. Worth
+  // knowing that `check:ui-icons` did **not** catch it — `DockerPanel.tsx` uses icons and holds
+  // the string `'container'` for an unrelated reason (`InspectTarget`'s `kind`), which is enough
+  // to put it in the `loose` set that exempts an entry from the dead-icon sweep.
+  'square-terminal', 'scroll-text',
   // The task composer's formatting toolbar — `sidebar/TasksPanel/markdownTools.ts`. `text-quote`
   // rather than `quote`: upstream's `quote` is a filled speech mark, and filled icons are
   // refused below by design.

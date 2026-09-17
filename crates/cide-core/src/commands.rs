@@ -105,6 +105,15 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     // there. Derivable from the mirror as Rust actually fills it — `TabKind::File` is written
     // by `tab_open_file` on every file open — which is the rule the `repoOpen` disaster left.
     "fileTabActive",
+    // Narrower than `fileTabActive`: the tab this window shows is about a file *and* that file
+    // is one Compose would read. (M48)
+    //
+    // Derivable from the mirror as Rust actually fills it — `TabKind::File` carries the path and
+    // `cide_docker::compose::is_compose_file` decides by name — which is the rule the `repoOpen`
+    // disaster left behind, and the reason this is a flag rather than a check inside the handler.
+    // Six Compose rows offered on every `.rs` file, each of them inert, is precisely the
+    // listed-but-silently-dead state this module exists to make unrepresentable.
+    "composeFileActive",
     "claudeTarget",
     // There is deliberately no `repoOpen`. See the note above the Git group in [`build`]: the
     // webview cannot answer "does this project contain a git repository" without asking the
@@ -254,7 +263,25 @@ struct Score {
 /// rank below everything that matched a real title, because both are guesses.
 const TIER_TITLE_PREFIX: u8 = 6;
 const TIER_TITLE_WORD: u8 = 5;
-const TIER_TITLE_SUBSTRING: u8 = 4;
+/*
+ * **There is no title-*substring* tier, and 4 is deliberately left empty.** (M48)
+ *
+ * There was one, between [`TIER_TITLE_WORD`] and [`TIER_ID`], and it could only ever fire for a
+ * needle matching strictly *inside* a word — a word-boundary match has already returned one tier
+ * above. That is an accident of spelling rather than a claim on the word, and the day
+ * `Compose Recreate` was added is the day it cost something: `create` matched inside `Recreate`
+ * and displaced `New branch…`, whose claim on that word is a *declared keyword*. Nobody typing
+ * `create` into this palette means "re-create a Docker stack".
+ *
+ * The same trap was dodged once before by renaming a command — `git.tag.create` became
+ * `git.tag.new` so it would not take `create` on [`TIER_ID`], and that note still stands beside
+ * the test. Renaming cannot work here: `recreate` is Compose's own verb and the title has to say
+ * it. So the tier is gone instead, which is the fix that generalises.
+ *
+ * Nothing became unfindable. A needle inside a word is still a subsequence of the title, so it
+ * lands on [`TIER_SUBSEQUENCE`] and the row is still offered — one rank lower, under every
+ * command that matched a word.
+ */
 const TIER_ID: u8 = 3;
 const TIER_KEYWORD: u8 = 2;
 const TIER_ALL_WORDS: u8 = 1;
@@ -276,13 +303,21 @@ fn score(command: &Command, needle: &str) -> Option<Score> {
             offset,
         });
     }
-    if let Some(offset) = title.find(needle) {
-        return Some(Score {
-            tier: TIER_TITLE_SUBSTRING,
-            offset,
-        });
-    }
-    if let Some(offset) = command.id.to_lowercase().find(needle) {
+    // A **word** of the id, not a substring of one — `word_prefix` and not `find`, the same rule
+    // the keyword tier below already follows and for a sharper version of the same reason.
+    //
+    // This was `find` until M48, and the day `docker.compose.recreate` was added is the day it
+    // cost something: `recreate` *contains* `create`, so a query of `create` scored on this tier
+    // — which sits above keywords — and *Compose Recreate* displaced *New branch…*, whose claim
+    // on that word is a declared keyword. Nobody typing `create` into this palette means
+    // "recreate a Docker stack".
+    //
+    // The test above `git.tag.new` records that this trap was dodged once before by *renaming* a
+    // command (`git.tag.create` → `git.tag.new`). That worked because cide owned the word; it
+    // does not work here, because `recreate` is Compose's own verb and the id has to say it. So
+    // the tier is narrowed instead, which is the fix that generalises: an id segment is a word,
+    // and matching inside one was never what this tier meant.
+    if let Some(offset) = word_prefix(&command.id.to_lowercase(), needle) {
         return Some(Score {
             tier: TIER_ID,
             offset,
@@ -426,6 +461,13 @@ const VIEW: &str = "View";
 /// "Pause subagents" sitting beside "Fork session into new pane" would read as two ways of
 /// doing one thing.
 const AGENTS: &str = "Agents";
+
+/// Docker, and for now only the half that acts on a file. (M48)
+///
+/// Its own group rather than rows under [`FILE`]: *Compose Up* beside *Save All* reads as a thing
+/// you do to the buffer. The container half of Docker is a panel and has no palette rows at all —
+/// it acts on a row the user has selected there, which is not something a palette can name.
+const DOCKER: &str = "Docker";
 
 /// Build the table. Order here is palette order.
 fn build() -> Vec<Command> {
@@ -571,7 +613,37 @@ fn build() -> Vec<Command> {
         Command::new("tab.console", "Go to Claude console", WINDOW)
             .when("shellWindow && projectOpen")
             .keywords(&["home", "chat", "prompt", "agent", "first"]),
-        // Project. Two families, and the split is the point rather than duplication.
+        // Project. Opening one, then two families for moving between the ones already open —
+        // and the split between those two is the point rather than duplication.
+        //
+        // Opening a project had no command at all: the only two routes were the header's `+`
+        // and the `▾` beside it, so the gesture was mouse-only and — because a `keymap.json`
+        // names command ids — unbindable. Reported as "Missing 'Open project' command in
+        // command palette".
+        //
+        // **No `when` clause**, and it is the one command here for which that is a claim rather
+        // than an omission. `settings.open` and `help.about` carry `projectOpen` because they
+        // need somewhere to appear — `App.tsx` mounts `OverlayHost` in the shell branch and only
+        // with a project, so the palette itself cannot be raised without one either, and this
+        // row is in practice only ever *picked* by someone who already has a project. A key
+        // bound to it is the other half, and that one runs with nothing open at all: it raises
+        // an OS dialog rather than anything of cide's, so it is the state the command is most
+        // wanted in and a clause would be exactly wrong there.
+        //
+        // The ellipsis is this table's convention for a row that raises something rather than
+        // acting — `git.commit`, `git.branch.switch`, `scratch.new` — and here what it raises
+        // is the OS folder picker. `dispatch.ts` runs it through the same `browseForProject`
+        // the header's `+` does, which goes to `project_pick` and never to
+        // `@tauri-apps/plugin-dialog`: that dialog cannot be parented on Linux, so a second
+        // road spelled here would reintroduce the picker-behind-the-window bug on the surface
+        // least likely to be retested.
+        Command::new("project.open", "Open project…", PROJECT).keywords(&[
+            "folder",
+            "directory",
+            "add",
+            "browse",
+            "load",
+        ]),
         //
         // The *switcher* is Ctrl+` — the key left of `1`, which is what a keyboard reports as
         // `Backquote` on every layout: hold the modifier, walk a popup in most-recently-used
@@ -1040,6 +1112,43 @@ fn build() -> Vec<Command> {
         Command::new("git.tag.new", "Tag commit…", GIT)
             .when("projectOpen")
             .keywords(&["tag", "release", "version", "label"]),
+        /*
+         * Compose, against the file in front of you. (M48)
+         *
+         * The third of the surfaces M48 gives these verbs — the file tree's context menu and the
+         * editor's gutter are the other two — and the one that exists because the other two both
+         * need a pointer to be somewhere. `shellWindow` because the run opens a pane and a
+         * detached-pane window has nowhere to put one; `composeFileActive` because offering
+         * *Compose Up* on a Rust file is the listed-and-inert row this module refuses.
+         *
+         * Here rather than after the Agents group, so `groups()` — whose order is first
+         * appearance in this table — puts Docker beside File and Git. These act on the file that
+         * is open, which is what those two groups are about; between *Go to tasks* and the
+         * terminal commands they would read as being about the pane.
+         *
+         * No default bindings. Six chords for verbs reached from two better surfaces would spend
+         * the keymap's remaining Ctrl+Shift space on something nobody asked for — and the two
+         * that might earn one (`up`, `down`) are destructive enough that a mistyped chord takes a
+         * stack down under somebody's hands. `keymap.json` is where a user disagrees.
+         */
+        Command::new("docker.compose.up", "Compose Up", DOCKER)
+            .when("shellWindow && composeFileActive")
+            .keywords(&["docker", "compose", "start", "stack", "services"]),
+        Command::new("docker.compose.down", "Compose Down", DOCKER)
+            .when("shellWindow && composeFileActive")
+            .keywords(&["docker", "compose", "stop", "stack", "remove"]),
+        Command::new("docker.compose.restart", "Compose Restart", DOCKER)
+            .when("shellWindow && composeFileActive")
+            .keywords(&["docker", "compose", "stack"]),
+        Command::new("docker.compose.recreate", "Compose Recreate", DOCKER)
+            .when("shellWindow && composeFileActive")
+            .keywords(&["docker", "compose", "apply", "force", "stack"]),
+        Command::new("docker.compose.build", "Compose Build", DOCKER)
+            .when("shellWindow && composeFileActive")
+            .keywords(&["docker", "compose", "image", "stack"]),
+        Command::new("docker.compose.pull", "Compose Pull", DOCKER)
+            .when("shellWindow && composeFileActive")
+            .keywords(&["docker", "compose", "image", "fetch", "stack"]),
         // Navigate — within the file the caret is in. (M12)
         //
         // `editorFocused` and nothing weaker throughout. `editorOpen` would offer a member walk
@@ -1734,8 +1843,8 @@ mod tests {
         assert_eq!(
             groups(),
             vec![
-                "Window", "Project", "Claude", "Agents", "Terminal", "File", "Git", "Navigate",
-                "View",
+                "Window", "Project", "Claude", "Agents", "Terminal", "File", "Git", "Docker",
+                "Navigate", "View",
             ]
         );
     }
@@ -1968,7 +2077,11 @@ mod tests {
     }
 
     #[test]
-    fn a_title_prefix_outranks_a_title_substring() {
+    fn a_title_prefix_outranks_a_word_later_in_a_title() {
+        // Named for what it measures. It was `..._outranks_a_title_substring` and never touched
+        // the substring tier: `window` matches `Detach pane into window` at a *word* boundary,
+        // which is the tier above. The substring tier is gone now — see the note beside
+        // `TIER_ID` — and this comparison is unchanged by that, which is the point of saying so.
         let found = ids(&search("window"));
         let stacked = found.iter().position(|id| *id == "window.mode.stacked");
         let detach = found.iter().position(|id| *id == "pane.detachToWindow");
@@ -1976,6 +2089,25 @@ mod tests {
             stacked < detach,
             "`Window mode: stacked` should beat `Detach pane into window`: {found:?}"
         );
+    }
+
+    #[test]
+    fn a_word_inside_another_word_does_not_outrank_a_declared_keyword() {
+        // The regression M48 paid for, pinned from both ends.
+        //
+        // `Compose Recreate` contains `create` inside a word; `New branch…` declares it as a
+        // keyword. The title tiers used to include a substring rung above keywords, so adding
+        // the Docker group silently moved `New branch…` down — a palette answer that got worse
+        // because an unrelated feature landed.
+        let found = ids(&search("create"));
+        assert_eq!(found[0], "git.branch.new", "{found:?}");
+
+        // And the other end: the Compose row is still *offered*, one tier lower, through the
+        // subsequence rung. Removing the tier must not remove the command from the list.
+        assert!(found.contains(&"docker.compose.recreate"), "{found:?}");
+
+        // The whole-word claim is untouched — `recreate` still finds it first.
+        assert_eq!(ids(&search("recreate"))[0], "docker.compose.recreate");
     }
 
     #[test]

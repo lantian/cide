@@ -613,16 +613,99 @@ enum Frame {
     Eof,
 }
 
+/// Where a session's bytes come from and go to. (M42)
+///
+/// # Why this exists
+///
+/// Everything downstream of the reader thread in this file — the bounded channel, the
+/// coalescer, [`FLUSH_BYTES`]/[`FLUSH_INTERVAL`], the vt100 mirror, the sink list,
+/// [`CreditPolicy`] and the credit watchdog — is a statement about *a stream of terminal
+/// bytes*, not about a pty. M42 needed a second kind of stream: a `docker exec` hijacked
+/// connection, and a `docker logs -f` follow. Reimplementing that machinery for them would
+/// have meant a second terminal stack with a second answer to backpressure, reattach and
+/// gapless detach, which is the most expensive and most load-bearing code in this repository.
+///
+/// So the pty becomes one implementation of this and the rest of the file stops knowing.
+/// [`PtySession::spawn`] is unchanged in behaviour and is now a wrapper over
+/// [`PtySession::connect`].
+///
+/// # Two rules, both silent when broken
+///
+/// **[`Self::foreground_pgid`] returning `None` must mean the jobs watcher observes nothing**,
+/// not that it polls something else. `cide_app::lifecycle::watch_jobs` announces `Busy` and
+/// `AwaitingInput` from `tcgetpgrp` against the child's own pid; a transport with no process
+/// group has no such comparison to make, and [`JobWatch::observe`] already treats `None` as *no
+/// information* rather than as a prompt. The default implementation is therefore the correct
+/// one for everything that is not a local pty, and overriding it is the exceptional act.
+///
+/// **[`Self::kill`] must be idempotent and must not block.** It is called from the shutdown
+/// ladder, possibly several times, possibly on a transport whose far end is already gone.
+pub trait Transport: Send + Sync + 'static {
+    /// Tell the far end the window changed size.
+    fn resize(&self, geometry: Geometry) -> Result<(), PtyError>;
+
+    /// Ask the far end to go away. Escalation is the caller's policy; see [`PtySession::kill`].
+    fn kill(&self);
+
+    /// Which process group owns the terminal, or `None` when that cannot be known.
+    ///
+    /// `None` is the honest answer for every transport that is not a local pty, and it is the
+    /// default for that reason — see the trait's own note on why this is not a gap.
+    fn foreground_pgid(&self) -> Option<i32> {
+        None
+    }
+}
+
+/// The local pty, which is what every session was before M42.
+struct PtyTransport {
+    /// Behind its own lock because [`Self::resize`] and `process_group_leader` both need it and
+    /// they are called from different threads — the command worker and the coalescer.
+    master: Mutex<Box<dyn MasterPty + Send>>,
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+}
+
+impl Transport for PtyTransport {
+    fn resize(&self, geometry: Geometry) -> Result<(), PtyError> {
+        self.master
+            .lock()
+            .resize(geometry.to_pty_size())
+            .map_err(|e| PtyError::Resize(e.into()))
+    }
+
+    fn kill(&self) {
+        let _ = self.killer.lock().kill();
+    }
+
+    /// # Why this is the one override
+    ///
+    /// `None` on a platform without the call is the same answer as `None` from a pty that has
+    /// gone away, and [`JobWatch::observe`] treats it as no information rather than as a prompt
+    /// — so a build for a target this is not implemented on simply never notices a job, which is
+    /// exactly the pre-existing behaviour.
+    #[cfg(unix)]
+    fn foreground_pgid(&self) -> Option<i32> {
+        self.master.lock().process_group_leader()
+    }
+
+    #[cfg(not(unix))]
+    fn foreground_pgid(&self) -> Option<i32> {
+        None
+    }
+}
+
 /// A live PTY session.
 ///
 /// Owned by the session registry in the app crate, never by a window, tab or pane —
 /// closing any of those detaches a sink, it does not kill the child.
 pub struct PtySession {
-    /// Shared with the coalescer, which asks it `tcgetpgrp` on a slow tick — see
-    /// [`JobProbe`]. An `Arc` rather than this struct's own `Mutex` only for that: the
-    /// coalescer thread is started inside [`PtySession::spawn`], before this struct exists,
-    /// so there is nothing else it could borrow from.
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// Where the bytes come from — a local pty, or since M42 anything else that is a stream of
+    /// terminal bytes. See [`Transport`].
+    ///
+    /// Shared with the coalescer, which asks it `tcgetpgrp` on a slow tick — see [`JobProbe`].
+    /// An `Arc` rather than this struct's own field only for that: the coalescer thread is
+    /// started inside [`PtySession::connect`], before this struct exists, so there is nothing
+    /// else it could borrow from.
+    transport: Arc<dyn Transport>,
     writer_tx: Sender<Vec<u8>>,
     /// Attach requests, serviced on the coalescer thread. A channel of its own rather than a
     /// variant on the reader→coalescer channel: that one reaching `Disconnected` is how EOF is
@@ -644,7 +727,6 @@ pub struct PtySession {
     /// marker and the credit watchdog want; this answers "and how", which only the reaper
     /// knows.
     exit: Arc<Mutex<ExitSlot>>,
-    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     credit: CreditPolicy,
     /// Who to tell when this pane's foreground goes to a job and comes back.
     ///
@@ -701,6 +783,51 @@ impl PtySession {
         // line is present.
         drop(pair.slave);
 
+        let transport = Arc::new(PtyTransport {
+            master: Mutex::new(pair.master),
+            killer: Mutex::new(child.clone_killer()),
+        });
+
+        // The reaper's question, as a closure, so [`Self::connect`] never has to know what kind
+        // of thing it is waiting for. `portable_pty::Child::wait` blocks, which is why it runs
+        // on a thread of its own and not on any tick.
+        let mut child = child;
+        Ok(Self::connect(
+            spec,
+            reader,
+            writer,
+            transport,
+            child_pid,
+            Box::new(move || classify(child.wait())),
+        ))
+    }
+
+    /// Build a session over any [`Transport`]. (M42)
+    ///
+    /// This is [`Self::spawn`]'s whole tail, and it is everything in this file that is *not*
+    /// about a pty: the vt100 mirror, the bounded reader channel, the coalescer, the sink list,
+    /// the writer and the reaper. A `docker exec` or a `docker logs -f` stream reaches it with a
+    /// reader, a writer and a way to be waited on, and gets attach/detach, park, scrollback,
+    /// credit and the reattach snapshot without another line.
+    ///
+    /// `wait` blocks and is run on the reaper thread. For a pty it is `child.wait()`; for a
+    /// docker exec it is polling `GET /exec/{id}/json` for an `ExitCode`; for a log follow it is
+    /// simply the stream ending.
+    ///
+    /// # The coalescer is not optional, whatever the transport
+    ///
+    /// A log follow has the pty's exact traffic profile — many small line-sized writes — and
+    /// Tauri routes a raw `Channel` payload under 1024 bytes through `webview.eval` with the
+    /// bytes spelled out as a JSON array of decimal numbers, on the GTK main loop. Every stream
+    /// that reaches a sink must come through here for that reason; see this module's header.
+    pub fn connect(
+        spec: SpawnSpec,
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        transport: Arc<dyn Transport>,
+        child_pid: Option<u32>,
+        wait: Box<dyn FnOnce() -> Exit + Send>,
+    ) -> Arc<Self> {
         let vt = Arc::new(Mutex::new(vt100::Parser::new(
             spec.geometry.rows,
             spec.geometry.cols,
@@ -720,15 +847,16 @@ impl PtySession {
         let (writer_tx, writer_rx) = unbounded::<Vec<u8>>();
         let (control_tx, control_rx) = unbounded::<Control>();
 
-        let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
         let job_listeners: JobListeners = Arc::new(Mutex::new(Vec::new()));
 
         // Only when asked, and only when the child actually started: `tcgetpgrp` compares
         // against the shell's own pid, so a spawn that produced no pid has nothing to
-        // compare with and watches nothing rather than guessing.
+        // compare with and watches nothing rather than guessing. A transport with no process
+        // group answers `None` for ever, which `JobWatch::observe` reads as no information —
+        // see [`Transport::foreground_pgid`].
         let probe = match (spec.watch_jobs, child_pid) {
             (Some(after), Some(pid)) => Some(JobProbe {
-                master: Arc::clone(&master),
+                transport: Arc::clone(&transport),
                 watch: JobWatch::new(pid as i32, after),
                 listeners: Arc::clone(&job_listeners),
                 last_poll: None,
@@ -749,12 +877,11 @@ impl PtySession {
         );
         spawn_writer(writer, writer_rx);
 
-        let killer = child.clone_killer();
         let exit = Arc::new(Mutex::new(ExitSlot::Running(Vec::new())));
-        spawn_reaper(child, Arc::clone(&exited), Arc::clone(&exit));
+        spawn_reaper(wait, Arc::clone(&exited), Arc::clone(&exit));
 
-        Ok(Arc::new(Self {
-            master,
+        Arc::new(Self {
+            transport,
             writer_tx,
             control_tx,
             vt,
@@ -765,10 +892,9 @@ impl PtySession {
             child_pid,
             exited,
             exit,
-            killer: Mutex::new(killer),
             credit: spec.credit,
             job_listeners,
-        }))
+        })
     }
 
     /// The child's OS process id.
@@ -1167,10 +1293,7 @@ impl PtySession {
         if self.fixed_size || *self.geometry.lock() == geometry {
             return Ok(());
         }
-        self.master
-            .lock()
-            .resize(geometry.to_pty_size())
-            .map_err(|e| PtyError::Resize(e.into()))?;
+        self.transport.resize(geometry)?;
         self.vt
             .lock()
             .screen_mut()
@@ -1181,7 +1304,7 @@ impl PtySession {
 
     /// Ask the child to exit. Escalation to SIGKILL is the caller's policy.
     pub fn kill(&self) {
-        let _ = self.killer.lock().kill();
+        self.transport.kill();
     }
 }
 
@@ -1435,7 +1558,7 @@ const JOB_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// rewritten to stop doing. The coalescer is already awake for output and already ticks while
 /// idle, so this costs one syscall on a tick that was happening anyway.
 struct JobProbe {
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    transport: Arc<dyn Transport>,
     watch: JobWatch,
     listeners: JobListeners,
     last_poll: Option<Instant>,
@@ -1458,9 +1581,10 @@ impl JobProbe {
         self.last_poll = Some(now);
 
         // Both locks are taken and released one at a time, never nested: the coalescer holds
-        // `vt` on every chunk of output and the resize path holds `master`, so a routine that
-        // wanted both at once would be the only place in this file able to order them wrongly.
-        let foreground = foreground_pgid(&self.master);
+        // `vt` on every chunk of output and the pty transport holds `master` for the whole of
+        // `foreground_pgid`, so a routine that wanted both at once would be the only place in
+        // this file able to order them wrongly.
+        let foreground = self.transport.foreground_pgid();
         let alternate_screen = vt.lock().screen().alternate_screen();
 
         let Some(event) = self.watch.observe(foreground, alternate_screen, now) else {
@@ -1470,22 +1594,6 @@ impl JobProbe {
             listener(event);
         }
     }
-}
-
-/// Which process group currently owns the terminal, or `None` if it cannot be known.
-///
-/// `None` on a platform without the call is the same answer as `None` from a pty that has
-/// gone away, and [`JobWatch::observe`] treats it as no information rather than as a prompt —
-/// so a build for a target this is not implemented on simply never notices a job, which is
-/// exactly the pre-existing behaviour.
-#[cfg(unix)]
-fn foreground_pgid(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) -> Option<i32> {
-    master.lock().process_group_leader()
-}
-
-#[cfg(not(unix))]
-fn foreground_pgid(_master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) -> Option<i32> {
-    None
 }
 
 /// How many bytes of one unterminated line [`render_lines`] will hold before giving up on it.
@@ -1823,14 +1931,14 @@ fn spawn_writer(mut writer: Box<dyn Write + Send>, rx: Receiver<Vec<u8>>) {
 /// `waitpid` on that pid answers `ECHILD` — so a status dropped here is gone for good,
 /// which is why the previous version could only ever report -1.
 fn spawn_reaper(
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    wait: Box<dyn FnOnce() -> Exit + Send>,
     exited: Arc<AtomicBool>,
     slot: Arc<Mutex<ExitSlot>>,
 ) {
     thread::Builder::new()
         .name("cide-pty-reap".into())
         .spawn(move || {
-            let exit = classify(child.wait());
+            let exit = wait();
             // Three steps, and the order is the whole point.
             //
             // 1. Store the status, so `has_exited()` can never flip ahead of

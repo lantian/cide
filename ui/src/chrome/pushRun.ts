@@ -77,7 +77,10 @@ function pushPass(
     // identical text, so five submodules all saying "already up to date" would show one toast
     // that silently spoke for five.
     const report = pushReport(done)
-    notify(report.text, { kind: 'ok', detail: report.detail })
+    // Stamped with the project rather than left to the ambient scope: a push is seconds of
+    // network, and a report that lands after the user has switched projects would otherwise be
+    // filed under — and shown only in — the project they switched *to*.
+    notify(report.text, { kind: 'ok', detail: report.detail, project })
   })
 }
 

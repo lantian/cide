@@ -190,6 +190,7 @@ impl Server {
             language_ids: Vec::new(),
             project_markers: Vec::new(),
             project_kind: "unknown".into(),
+            init_options: None,
             install_hint: "reinstall the extension that provided it".into(),
             declares_watched_files: false,
             extra_path_hints: Vec::new(),
