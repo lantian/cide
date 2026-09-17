@@ -642,6 +642,16 @@ pub async fn agents_pause(
 
 /// `SIGCONT`, reopen the queue, drain it. The mirror of [`agents_pause`], including its scope rule.
 ///
+/// **On the settings as they stand now.** A `SIGCONT` cannot change a process's argv or
+/// environment, so a frozen run whose harness, model, pool, effort or (for opencode) provider
+/// document moved while it was paused is not thawed but *restarted*: rebound to a fresh session,
+/// its old child wound down, and a new child forked on the current settings continuing the same
+/// conversation — the pool failover's road, keeping the slot, the worktree and the screen. A run
+/// whose settings did not move is thawed in place, so a short pause never costs the in-flight
+/// turn. `AgentRegistry::plan_restarts` is the decision and carries the rules (a conversation open
+/// in a pane is never restarted; a changed pool is re-stamped from the top; a child that had not
+/// begun its turn is replayed fresh).
+///
 /// A run frozen long enough that its turn may have died is watched for a few seconds afterwards
 /// and, if nothing stirs, offered a retry through `AgentRun::stale_turn`. That is a *suspicion*
 /// and never a re-dispatch; see [`agents_retry_turn`].
@@ -652,7 +662,11 @@ pub async fn agents_resume(
     project: ProjectId,
     run: Option<RunId>,
 ) -> Result<()> {
-    Arc::clone(&agents).resume(&app, project, run)
+    // On a worker, for the dispatch's reason: the comparison a Resume makes reads the project's
+    // `.cide/` and, for an opencode role, asks the `opencode` binary for its resolved
+    // configuration — half a second of process spawn that must not sit on the async runtime.
+    let registry = Arc::clone(&agents);
+    blocking(move || registry.resume(&app, project, run)).await
 }
 
 /// What pressing **Open** on a run should do. (M42)

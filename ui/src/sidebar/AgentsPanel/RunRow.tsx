@@ -375,7 +375,7 @@ function RunControls({
           className={cx(styles.control, styles.controlGlyph)}
           data-audit="agentsResume"
           onClick={() => onResume(run.run)}
-          title="Continue this run."
+          title="Continue this run — on the current model settings, restarting it on a new child if they changed."
           aria-label="Resume this run"
         >
           <Icon name="play" size={1} />

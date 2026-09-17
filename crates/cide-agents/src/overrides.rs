@@ -5,9 +5,12 @@
 //! reach for a workspace or an `AppHandle`, so the caller loads the overrides at the edge and
 //! hands them in — the arrangement `RunPlan::claude` already establishes.
 
-use cide_ipc::{AgentOverride, Harness, LlmSettings, PoolChoice, PoolEntry, ProjectOverrides};
+use cide_ipc::{
+    AgentOverride, Harness, LlmProvider, LlmSettings, PoolChoice, PoolEntry, ProjectOverrides,
+};
 
 use crate::defs::LoadedAgent;
+use crate::harness::opencode::UserConfig;
 
 /// What a role will actually run as, here, on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,129 @@ impl Resolved {
             index: 0,
             entry: entry.clone(),
         })
+    }
+
+    /// Everything a child is forked with that a person can change from Settings, a role file or
+    /// opencode's own configuration, as one comparable value. See [`ChildSettings`].
+    ///
+    /// `opencode` is what the binary resolved for this project, read at the edge
+    /// (`harness::opencode::user_config`); it is kept only for an opencode child, for the same
+    /// reason as the providers.
+    #[must_use]
+    pub fn child_settings(
+        &self,
+        llm: &LlmSettings,
+        opencode: Option<&UserConfig>,
+    ) -> ChildSettings {
+        let for_opencode = self.harness == Harness::Opencode;
+        ChildSettings {
+            harness: self.harness,
+            pool: self.pool.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            // Only opencode reads the provider document (`harness::opencode::provider_members`),
+            // so only an opencode child is a different child when a provider changes. Carrying
+            // the providers for every harness would restart a `claude` run over a key it never
+            // sees.
+            providers: for_opencode.then(|| llm.providers.clone()),
+            opencode: for_opencode.then(|| opencode.cloned()).flatten(),
+        }
+    }
+
+    /// Fold opencode's own default model in, where nothing in cide names one.
+    ///
+    /// **A continued opencode session keeps the model it last used**, whatever the configuration
+    /// now says (`harness::opencode::UserConfig` carries the measurement), so a role that names
+    /// no model was a role whose model no continuation could move. With the default spelled here
+    /// every opencode child gets an explicit `--model` — the same one a fresh child would have
+    /// picked — and a continuation follows the configuration like a fresh start does. Applied
+    /// only for opencode, only under no pool (the pool *is* the model choice) and only where the
+    /// override and the role are both silent, so nothing a person wrote is displaced by it.
+    #[must_use]
+    pub fn with_default_model(mut self, default: Option<String>) -> Self {
+        if self.harness == Harness::Opencode && self.pool.is_empty() && self.model.is_none() {
+            self.model = default.filter(|model| !model.trim().is_empty());
+        }
+        self
+    }
+
+    /// The role as the harness should read it: the committed definition with this machine's
+    /// single-model and effort overrides folded **into** it.
+    ///
+    /// # Why a fold and not two more `RunPlan` fields
+    ///
+    /// Every harness reads `plan.agent.def.model` and `plan.agent.effort`, and so does every one
+    /// of their tests. `model` and `effort` were computed here from the first day of overrides
+    /// and read by nothing — the only caller took `harness`, `pool` and `refusal` off this struct
+    /// and handed the harness the file's own `LoadedAgent` — so the Model and Effort fields on
+    /// the Settings screen wrote a file, drew a value, and changed no child. A fold at the one
+    /// place overrides are resolved is the fix that cannot be forgotten by the next harness,
+    /// because the next harness will read the definition exactly as the four existing ones do.
+    ///
+    /// The file on disk is untouched; this is a value the plan borrows for one fork. While a
+    /// pool applies, `def.model` is folded to `None` on purpose — `model` is `None` then, because
+    /// the pool *is* the model choice and the candidate outranks the definition in every harness
+    /// that takes one.
+    #[must_use]
+    pub fn apply(&self, agent: &LoadedAgent) -> LoadedAgent {
+        let mut folded = agent.clone();
+        folded.def.model = self.model.clone();
+        folded.effort = self.effort.clone();
+        folded
+    }
+}
+
+/// What a child is forked with, as far as a person can change it without touching the run.
+///
+/// Recorded on a run at every fork and compared at **Resume**: a paused run whose settings no
+/// longer match is put on a new child continuing the same conversation, instead of `SIGCONT`ing
+/// a process whose model, provider and limits were fixed on its argv and environment at the
+/// first fork. Equality is the whole interface — the registry never reads a field of this off a
+/// run, it asks "would the child I fork now be a different child?" — and the fields are exactly
+/// what the harnesses read: the resolved harness, the pool as configured (not the position in
+/// it, which is the run's own business), the single model, the effort, and for opencode alone
+/// the provider document its `OPENCODE_CONFIG_CONTENT` is built from, which is where a model's
+/// context and output limits live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSettings {
+    pub harness: Harness,
+    pub pool: Vec<PoolEntry>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// `Some` for opencode, `None` for every harness that never reads the provider document.
+    pub providers: Option<Vec<LlmProvider>>,
+    /// What opencode itself resolved — its default model and its providers — for an opencode
+    /// child; `None` for every other harness, and for an opencode child forked while the
+    /// binary could not be asked.
+    pub opencode: Option<UserConfig>,
+}
+
+impl ChildSettings {
+    /// The fields on which `other` differs from this, by name, for a log line: a Resume that
+    /// restarts a run should say what moved, and one that does not should be able to say
+    /// nothing did.
+    #[must_use]
+    pub fn changed_fields(&self, other: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.harness != other.harness {
+            changed.push("harness");
+        }
+        if self.pool != other.pool {
+            changed.push("pool");
+        }
+        if self.model != other.model {
+            changed.push("model");
+        }
+        if self.effort != other.effort {
+            changed.push("effort");
+        }
+        if self.providers != other.providers {
+            changed.push("providers");
+        }
+        if self.opencode != other.opencode {
+            changed.push("opencode config");
+        }
+        changed
     }
 }
 
@@ -442,5 +568,263 @@ mod tests {
         let out = resolve(&agent, &overrides, &LlmSettings::default());
         assert_eq!(out.harness, Harness::Claude);
         assert_eq!(out.model.as_deref(), Some("committed-model"));
+    }
+
+    // ==========================================================================================
+    // The fold. `model` and `effort` were resolved here and read by nobody until this existed —
+    // the Settings screen's Model and Effort fields changed no child. See `Resolved::apply`.
+    // ==========================================================================================
+
+    /// The override's single model and effort land where the harnesses read them, and nothing
+    /// else about the role moves.
+    #[test]
+    fn applying_the_resolution_puts_the_override_where_the_harness_reads_it() {
+        let agent = role(AgentScope::Project, Harness::Claude);
+        let out = resolve(
+            &agent,
+            &with(AgentOverride {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            }),
+            &LlmSettings::default(),
+        );
+        let folded = out.apply(&agent);
+        assert_eq!(folded.def.model.as_deref(), Some("opus"));
+        assert_eq!(folded.effort.as_deref(), Some("high"));
+
+        let mut rest = folded.clone();
+        rest.def.model = agent.def.model.clone();
+        rest.effort = agent.effort.clone();
+        assert_eq!(rest, agent, "only the two overridden fields changed");
+        assert_eq!(
+            agent.def.model.as_deref(),
+            Some("committed-model"),
+            "the value handed in is untouched — the fold is a borrowed copy, never the file"
+        );
+    }
+
+    /// No override is the committed role, field for field, through the fold as well.
+    #[test]
+    fn applying_nothing_is_the_committed_role() {
+        let agent = role(AgentScope::Project, Harness::Claude);
+        let out = resolve(
+            &agent,
+            &ProjectOverrides::default(),
+            &LlmSettings::default(),
+        );
+        assert_eq!(out.apply(&agent), agent);
+    }
+
+    /// While a pool applies the definition's model is folded away: the candidate is the model
+    /// choice, and a definition still naming one would be a second answer for a harness to read.
+    #[test]
+    fn a_pool_folds_the_definitions_model_away() {
+        let agent = role(AgentScope::Project, Harness::Opencode);
+        let out = resolve(
+            &agent,
+            &with(AgentOverride {
+                pool: Some("cheap-first".into()),
+                ..Default::default()
+            }),
+            &settings(vec![entry("openrouter", "deepseek-chat")]),
+        );
+        assert!(!out.pool.is_empty());
+        assert_eq!(out.apply(&agent).def.model, None);
+    }
+
+    // ==========================================================================================
+    // The fingerprint a Resume compares. Equality is the interface; these pin what moves it.
+    // ==========================================================================================
+
+    fn custom_provider(context: u32) -> LlmProvider {
+        LlmProvider::Custom {
+            id: "lmstudio".into(),
+            label: String::new(),
+            enabled: true,
+            npm: String::new(),
+            base_url: "http://localhost:1234/v1".into(),
+            api_key: String::new(),
+            models: vec![cide_ipc::LlmModel {
+                id: "qwen3-8b".into(),
+                label: String::new(),
+                context,
+                output: 0,
+            }],
+        }
+    }
+
+    fn settings_with_provider(context: u32) -> LlmSettings {
+        LlmSettings {
+            providers: vec![custom_provider(context)],
+            pools: vec![cide_ipc::ModelPool {
+                name: "cheap-first".into(),
+                description: String::new(),
+                entries: vec![entry("lmstudio", "qwen3-8b")],
+            }],
+        }
+    }
+
+    /// The same configuration twice is the same child — a Resume with nothing changed must be a
+    /// plain thaw, or every pause would cost the in-flight turn.
+    #[test]
+    fn unchanged_settings_fingerprint_equal() {
+        let agent = role(AgentScope::Project, Harness::Opencode);
+        let overrides = with(AgentOverride {
+            pool: Some("cheap-first".into()),
+            ..Default::default()
+        });
+        let llm = settings_with_provider(32_000);
+        let a = resolve(&agent, &overrides, &llm).child_settings(&llm, None);
+        let b = resolve(&agent, &overrides, &llm).child_settings(&llm, None);
+        assert_eq!(a, b);
+    }
+
+    /// A model's context limit lives in the provider document, which only opencode reads: the
+    /// same edit is a different child for an opencode role and the same child for a claude one.
+    #[test]
+    fn a_context_limit_moves_an_opencode_child_and_not_a_claude_one() {
+        let overrides = with(AgentOverride {
+            pool: Some("cheap-first".into()),
+            ..Default::default()
+        });
+        let before = settings_with_provider(32_000);
+        let after = settings_with_provider(128_000);
+
+        let opencode = role(AgentScope::Project, Harness::Opencode);
+        assert_ne!(
+            resolve(&opencode, &overrides, &before).child_settings(&before, None),
+            resolve(&opencode, &overrides, &after).child_settings(&after, None),
+            "opencode is forked with the document the limit is written into"
+        );
+
+        let claude = role(AgentScope::Project, Harness::Claude);
+        assert_eq!(
+            resolve(&claude, &overrides, &before).child_settings(&before, None),
+            resolve(&claude, &overrides, &after).child_settings(&after, None),
+            "a claude child never sees the provider document"
+        );
+    }
+
+    /// The pool's entries are compared, not its name or the run's position in it.
+    #[test]
+    fn editing_the_pool_moves_the_fingerprint() {
+        let agent = role(AgentScope::Project, Harness::Opencode);
+        let overrides = with(AgentOverride {
+            pool: Some("cheap-first".into()),
+            ..Default::default()
+        });
+        let one = settings(vec![entry("openrouter", "deepseek-chat")]);
+        let two = settings(vec![
+            entry("openrouter", "deepseek-chat"),
+            entry("anthropic", "claude-sonnet-4-5"),
+        ]);
+        assert_ne!(
+            resolve(&agent, &overrides, &one).child_settings(&one, None),
+            resolve(&agent, &overrides, &two).child_settings(&two, None)
+        );
+    }
+
+    fn user_config(model: &str) -> UserConfig {
+        UserConfig {
+            model: Some(model.into()),
+            small_model: None,
+            provider: r#"{"deepseek":{}}"#.into(),
+        }
+    }
+
+    /// opencode's own default lands on an opencode role that names nothing, and nowhere else:
+    /// not on a pool (the pool is the model choice), not over a role's or an override's own
+    /// model, and never on another harness.
+    #[test]
+    fn opencodes_default_fills_only_a_silent_opencode_role() {
+        let llm = LlmSettings::default();
+        let default = Some("deepseek/deepseek-flash".to_string());
+
+        let mut silent = role(AgentScope::Project, Harness::Opencode);
+        silent.def.model = None;
+        let out = resolve(&silent, &ProjectOverrides::default(), &llm)
+            .with_default_model(default.clone());
+        assert_eq!(out.model.as_deref(), Some("deepseek/deepseek-flash"));
+        assert_eq!(
+            out.apply(&silent).def.model.as_deref(),
+            Some("deepseek/deepseek-flash"),
+            "and it reaches the harness through the fold, as `--model`"
+        );
+
+        let named = role(AgentScope::Project, Harness::Opencode);
+        let out =
+            resolve(&named, &ProjectOverrides::default(), &llm).with_default_model(default.clone());
+        assert_eq!(out.model.as_deref(), Some("committed-model"));
+
+        let pooled = resolve(
+            &silent,
+            &with(AgentOverride {
+                pool: Some("cheap-first".into()),
+                ..Default::default()
+            }),
+            &settings(vec![entry("openrouter", "deepseek-chat")]),
+        )
+        .with_default_model(default.clone());
+        assert_eq!(pooled.model, None);
+
+        let mut claude = role(AgentScope::Project, Harness::Claude);
+        claude.def.model = None;
+        let out = resolve(&claude, &ProjectOverrides::default(), &llm).with_default_model(default);
+        assert_eq!(out.model, None, "opencode's default is opencode's");
+
+        let blank = resolve(&silent, &ProjectOverrides::default(), &llm)
+            .with_default_model(Some("  ".into()));
+        assert_eq!(blank.model, None, "a blank default is no default");
+    }
+
+    /// opencode's resolved configuration is part of an opencode child's fingerprint and of no
+    /// other harness's — the same split as the providers, for the same reason.
+    #[test]
+    fn opencodes_configuration_moves_an_opencode_child_and_not_a_claude_one() {
+        let llm = LlmSettings::default();
+        let overrides = ProjectOverrides::default();
+        let before = user_config("vllm/qwen3.8-27b-long");
+        let after = user_config("deepseek/deepseek-flash");
+
+        let opencode = role(AgentScope::Project, Harness::Opencode);
+        let was = resolve(&opencode, &overrides, &llm).child_settings(&llm, Some(&before));
+        let now = resolve(&opencode, &overrides, &llm).child_settings(&llm, Some(&after));
+        assert_ne!(was, now);
+        assert_eq!(was.changed_fields(&now), vec!["opencode config"]);
+
+        let claude = role(AgentScope::Project, Harness::Claude);
+        assert_eq!(
+            resolve(&claude, &overrides, &llm).child_settings(&llm, Some(&before)),
+            resolve(&claude, &overrides, &llm).child_settings(&llm, Some(&after))
+        );
+    }
+
+    /// The single model, the effort and the harness each move it, for every harness.
+    #[test]
+    fn model_effort_and_harness_each_move_the_fingerprint() {
+        let agent = role(AgentScope::Project, Harness::Claude);
+        let llm = LlmSettings::default();
+        let base = resolve(&agent, &ProjectOverrides::default(), &llm).child_settings(&llm, None);
+        for over in [
+            AgentOverride {
+                model: Some("opus".into()),
+                ..Default::default()
+            },
+            AgentOverride {
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+            AgentOverride {
+                harness: Some(Harness::Codex),
+                ..Default::default()
+            },
+        ] {
+            assert_ne!(
+                resolve(&agent, &with(over.clone()), &llm).child_settings(&llm, None),
+                base,
+                "{over:?}"
+            );
+        }
     }
 }

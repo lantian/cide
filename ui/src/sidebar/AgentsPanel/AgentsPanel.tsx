@@ -162,7 +162,8 @@ const PAUSE_ALL_TITLE =
  * apart: a project with the queue shut and nothing running is indistinguishable from an idle
  * one, and the thawing of frozen children and the reopening of the queue are separate facts.
  */
-const RESUME_ALL_TITLE = 'Resume: continue every frozen agent and reopen the dispatch queue'
+const RESUME_ALL_TITLE =
+  'Resume: continue every frozen agent on the current model settings, and reopen the dispatch queue'
 
 /**
  * What the unarmed `Integrate` says. Three clauses, and the third is the one that stops this

@@ -119,23 +119,39 @@ impl Harness for ClaudeHarness {
     }
 
     fn spawn_spec(&self, plan: &RunPlan<'_>) -> Result<HarnessSpawn, HarnessError> {
-        assemble(plan, false)
+        assemble(plan, None)
     }
 
-    /// The continuing child for a run restored from the registry's snapshot — `claude
-    /// --resume`, into the same worktree the transcript lives under.
+    /// The continuing child — `claude --resume`, into the same worktree the transcript lives
+    /// under — in one of two shapes, decided by whether `session` **is** `plan.session`.
     ///
-    /// `_session` is redundant by construction on this harness: [`SessionBinding::Caller`]
-    /// means the caller chose the id, and a resume rebinds the run to that same previous
-    /// [`cide_ipc::SessionId`] before the fork (`ResumePoint::rebind` in the registry), so
-    /// `plan.session` *is* the conversation being continued. The parameter exists because the
-    /// trait speaks the harness-minted shape, where the two ids genuinely differ.
+    /// It is, for a run restored from the registry's snapshot: [`SessionBinding::Caller`] means
+    /// the caller chose the id, and that resume rebinds the run to its previous
+    /// [`cide_ipc::SessionId`] before the fork (`ResumePoint::rebind` in the registry), so the
+    /// conversation is continued under its own id and nothing about hook routing, the row or an
+    /// open pane changes. The parameter was redundant by construction for as long as that was
+    /// the only continuation.
+    ///
+    /// It is not, for a run the registry restarts on new settings while its old child is still
+    /// being wound down: the run is rebound to a **fresh** id first — `AgentRegistry::respawn`'s
+    /// rule, so the dying child's exit and its last hook frames belong to nobody — and the new
+    /// child is `--resume <old> --fork-session --session-id <new>`, the one shape in which naming
+    /// an id beside a resume is legal (`cide_claude::conversation`). The fork inherits the whole
+    /// conversation and the old transcript survives untouched.
     fn respawn_spec(
         &self,
         plan: &RunPlan<'_>,
-        _session: &str,
+        session: &str,
     ) -> Result<HarnessSpawn, HarnessError> {
-        assemble(plan, true)
+        let parent: cide_ipc::SessionId =
+            session
+                .trim()
+                .parse()
+                .map_err(|_| HarnessError::NotAConversation {
+                    harness: cide_ipc::Harness::Claude,
+                    id: session.to_string(),
+                })?;
+        assemble(plan, Some(parent))
     }
     fn deliver(&self, text: &str) -> Delivery {
         Delivery::Stdin(submit(text))
@@ -236,10 +252,14 @@ impl Harness for ClaudeHarness {
 /// the bill.
 const MODEL_ALIASES: &[&str] = &["sonnet", "opus", "haiku"];
 
-/// Build the child, fresh (`resume: false`) or continuing. One function so the two differ in
-/// exactly the conversation tokens and nothing else — `opencode.rs::child`'s shape, on the
-/// harness where the difference is one argument to [`cide_claude::conversation`].
-fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessError> {
+/// Build the child, fresh (`resume: None`) or continuing the conversation `resume` names. One
+/// function so the shapes differ in exactly the conversation tokens and nothing else —
+/// `opencode.rs::child`'s shape, on the harness where the difference is one argument to
+/// [`cide_claude::conversation`].
+fn assemble(
+    plan: &RunPlan<'_>,
+    resume: Option<cide_ipc::SessionId>,
+) -> Result<HarnessSpawn, HarnessError> {
     // `plan.harness`, the *resolved* one, not the definition's: a role a local override moved onto
     // this CLI must not be refused by it. See `RunPlan::harness`.
     if plan.harness != cide_ipc::Harness::Claude {
@@ -320,24 +340,31 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
 
     // ---- 2. `--session-id <uuid>` ----
     //
-    // `resume: None, fork: false` — a run is always a fresh conversation. Resuming one is a
-    // separate gesture with a separate question behind it (which worktree the transcript is
-    // under; see the module header), and it is not this slice's.
+    // Fresh, a plain resume, or a fork — `cide_claude::conversation`'s three shapes, chosen by
+    // `resume` alone. A fork is asked for exactly when the conversation being continued is not
+    // filed under this plan's session: the registry rebound the run to a fresh id before this
+    // fork (see `respawn_spec` on the harness), and `--resume <parent> --session-id <new>`
+    // without `--fork-session` is the pair the CLI rejects.
     //
     // `cli.inject` and not a fresh resolution, so the flag folded here is the same value the
     // refusal verdicts above were computed against: cide can never refuse a user's
     // `--session-id` while passing none of its own.
-    let (effective, conversation) = cide_claude::conversation(
-        plan.session,
-        // A resume names the run's own previous id — see `respawn_spec` on the harness.
-        resume.then_some(plan.session),
-        false,
-        &cli.inject,
-    );
-    debug_assert_eq!(
-        effective, plan.session,
-        "a fresh conversation is filed under the id it was handed"
-    );
+    let fork = resume.is_some_and(|parent| parent != plan.session);
+    let (effective, conversation) =
+        cide_claude::conversation(plan.session, resume, fork, &cli.inject);
+    if effective != plan.session {
+        // The degraded fork: `--fork-session` is switched off in the user's injection settings,
+        // so the child continues under the *parent's* id while the registry filed it under
+        // `plan.session`. Hook frames still arrive — they are routed on `CIDE_SESSION`, set
+        // below to the plan's id — but the transcript lands under the parent, so the next
+        // resume of `plan.session` will find nothing. Said once in the log, because there is no
+        // screen involved in a dispatch and no cheaper shape to fall back to.
+        tracing::warn!(
+            session = %plan.session,
+            parent = %effective,
+            "continuing a run without --fork-session: its transcript stays under the parent id"
+        );
+    }
     args.extend(conversation);
 
     // **Is this role a Claude Code subagent?** (M30) One question, asked once, because four
@@ -1536,6 +1563,54 @@ mod tests {
         for flag in ["--model", "--effort", "--allowedTools", "--permission-mode"] {
             assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
         }
+    }
+
+    /// A continuation under the run's own id is a plain `--resume`, and nothing else — the
+    /// restored-run shape, where the registry rebound the run to its previous id first.
+    #[test]
+    fn respawning_under_the_same_id_is_a_plain_resume() {
+        let agent = role();
+        let session = SessionId::new();
+        let plan = plan_for(&agent, session);
+        let args = ClaudeHarness
+            .respawn_spec(&plan, &session.to_string())
+            .expect("a uuid is a claude conversation")
+            .spec
+            .args;
+        assert_eq!(value_of(&args, "--resume"), session.to_string());
+        for absent in ["--fork-session", "--session-id"] {
+            assert!(!args.iter().any(|a| a == absent), "{absent} in {args:?}");
+        }
+    }
+
+    /// A continuation under a **fresh** id is a fork: `--resume <old> --fork-session
+    /// --session-id <new>`. This is the shape a restart on new settings takes — the registry
+    /// rebinds the run before winding the old child down, so the dying child's exit belongs to
+    /// nobody — and `--resume <old> --session-id <new>` without the fork flag is exactly the pair
+    /// 2.1.227 refuses (`cide_claude::session`'s header).
+    #[test]
+    fn respawning_under_a_fresh_id_forks_the_conversation() {
+        let agent = role();
+        let old = SessionId::new();
+        let new = SessionId::new();
+        let plan = plan_for(&agent, new);
+        let args = ClaudeHarness
+            .respawn_spec(&plan, &old.to_string())
+            .expect("a uuid is a claude conversation")
+            .spec
+            .args;
+        assert_eq!(value_of(&args, "--resume"), old.to_string());
+        assert_eq!(value_of(&args, "--session-id"), new.to_string());
+        assert!(
+            at(&args, "--fork-session") > at(&args, "--resume"),
+            "the fork flag qualifies the resume: {args:?}"
+        );
+
+        // Not a uuid: refused with the id in the sentence, `continue_spec`'s rule.
+        let refused = ClaudeHarness
+            .respawn_spec(&plan, "ses_not_a_uuid")
+            .expect_err("not a claude conversation");
+        assert!(refused.to_string().contains("ses_not_a_uuid"), "{refused}");
     }
 
     /// The real harness on a finished run's conversation is `claude` with the id handed back

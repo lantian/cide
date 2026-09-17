@@ -862,6 +862,142 @@ fn describe(error: &cide_core::child_env::FilterError) -> String {
 /// thread — and the cost of it being low is a correct list thrown away on a slow machine.
 const MODELS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What opencode itself resolves as the user's configuration for a project — the parts of it
+/// a run's behaviour turns on. Asked of the binary, never parsed from its files.
+///
+/// # Why cide reads this at all
+///
+/// **A continued session keeps the model it last used.** Measured on 1.18.31, in a log: a run
+/// forked with `--session <id>` and no `--model` streamed to `providerID=vllm` — the provider the
+/// session had been on — forty minutes after the user's `opencode.jsonc` had switched `model` to
+/// `deepseek/deepseek-flash`, while a *fresh* session forked in between went to deepseek. Only an
+/// explicit `--model` moves a continued session. So a role that names no model, under no pool and
+/// no override, was a role whose model cide could not change on any continuation: not on a
+/// follow-up, not on a resume after a cide restart, and not on a restart for new settings — the
+/// last of which exists for nothing else. The fix is that every opencode child gets `--model`:
+/// the pool's candidate, the role's or the override's, and failing all three **opencode's own
+/// default**, which is what a fresh child would have picked anyway. [`UserConfig::model`] is that
+/// default; `overrides::Resolved::with_default_model` folds it in.
+///
+/// # Why the binary and not the files
+///
+/// The default is the end of a merge — `~/.config/opencode/opencode.json` or `.jsonc` (JSONC:
+/// comments and trailing commas), then `opencode.json`/`opencode.jsonc`/`.opencode/opencode.json`
+/// walked up from the cwd, then `OPENCODE_CONFIG`, then whatever the org's remote config adds —
+/// and a copy of that merge in Rust would be right until the next release moved it. `opencode
+/// debug config` prints the merge as the binary performed it, in half a second, with the same
+/// environment a child gets. It is asked **without** `OPENCODE_CONFIG_CONTENT`: cide's own
+/// document is merged at the fork and never names a model, so the user's configuration alone is
+/// the honest reading of "what would opencode pick".
+///
+/// # What is kept
+///
+/// `model`, `small_model` and the `provider` block — the keys a person edits to point runs
+/// somewhere else, and the ones `AgentRegistry::plan_restarts` compares at Resume so that such an
+/// edit restarts a paused run. The rest of the document (keybinds, theme, `permission`) is
+/// deliberately not here: a restart costs the in-flight turn, and a keybind is not worth one.
+/// `provider` is kept as the JSON it was printed as, for equality only; nothing reads a field
+/// of it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UserConfig {
+    /// `model`, as `provider/model`. `None` when the configuration names none.
+    pub model: Option<String>,
+    /// `small_model`, the same shape.
+    pub small_model: Option<String>,
+    /// The `provider` object, serialised. Empty when there is none.
+    ///
+    /// **Carries the user's API keys** — `provider.<id>.options.apiKey` is where opencode keeps
+    /// them — which is why this struct's `Debug` is written by hand below and never derived: a
+    /// `LiveRun` is one `{:?}` away from a log line, and the log is the file users are asked to
+    /// send back (`log_plugin`'s argument about `bollard`, in the Docker row of `CLAUDE.md`).
+    pub provider: String,
+}
+
+impl std::fmt::Debug for UserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserConfig")
+            .field("model", &self.model)
+            .field("small_model", &self.small_model)
+            .field(
+                "provider",
+                &format_args!("<{} bytes, redacted>", self.provider.len()),
+            )
+            .finish()
+    }
+}
+
+/// Ask the installed `opencode` for the configuration it resolves in `cwd`. See [`UserConfig`].
+///
+/// `cwd` is the project root: opencode walks up from the cwd to the git worktree root for the
+/// project's file, and a cide worktree is its own root, so from inside one only the checkout's
+/// committed copy would be seen — the project root sees the same file plus any uncommitted edit
+/// to it, which is the reading a person editing that file expects.
+pub fn user_config(cwd: &std::path::Path) -> Result<UserConfig, String> {
+    let binary =
+        cide_core::toolchain::which(crate::defs::harness_binary(cide_ipc::Harness::Opencode))
+            .ok_or_else(|| {
+                crate::defs::installed(cide_ipc::Harness::Opencode)
+                    .unwrap_or_else(|| "`opencode` could not be found".to_string())
+            })?;
+    let mut command = std::process::Command::new(&binary);
+    command.args(["debug", "config"]);
+    command.env("NO_COLOR", "1");
+    command.current_dir(cwd);
+    // The chokepoint, for `models`' reason one screen up. The extra `PATH` entry is the
+    // binary's own directory, for a version-manager shim's shebang.
+    let bin_dir: Vec<std::path::PathBuf> = binary
+        .parent()
+        .map(|d| vec![d.to_path_buf()])
+        .unwrap_or_default();
+    let filtered = cide_core::child_env::run_filter_with(command, None, CONFIG_DEADLINE, &bin_dir)
+        .map_err(|error| describe(&error))?;
+    if !filtered.ok {
+        let detail = filtered
+            .stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty());
+        return Err(match detail {
+            Some(line) => format!("`opencode debug config` failed: {line}"),
+            None => "`opencode debug config` failed and said nothing".to_string(),
+        });
+    }
+    parse_user_config(&String::from_utf8_lossy(&filtered.stdout))
+}
+
+/// The pure half of [`user_config`]: the printed document to the three kept fields.
+///
+/// A missing key is `None`/empty and never a failure — a configuration with no `model` is a
+/// legitimate one that lets the provider's default stand. A value of the wrong type is ignored
+/// the same way, because the alternative is refusing to fork a run over a key cide does not
+/// even read. Only an unparseable document is an error, and that one names itself.
+pub fn parse_user_config(printed: &str) -> Result<UserConfig, String> {
+    let document: Value = serde_json::from_str(printed.trim()).map_err(|error| {
+        format!("`opencode debug config` printed something that is not JSON: {error}")
+    })?;
+    let string = |key: &str| {
+        document
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    Ok(UserConfig {
+        model: string("model"),
+        small_model: string("small_model"),
+        provider: document
+            .get("provider")
+            .filter(|provider| provider.is_object())
+            .map(Value::to_string)
+            .unwrap_or_default(),
+    })
+}
+
+/// `opencode debug config` reads files and prints; half a second measured. Generous, because a
+/// miss here degrades a fork to "let opencode pick" rather than failing it.
+const CONFIG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The `provider/model` ids in `opencode models` output, in order, without repeats.
 ///
 /// # Why this filters rather than trusting the lines
@@ -2239,6 +2375,64 @@ notamodel
         assert!(
             listed.contains("developer (primary)"),
             "the inline role is not registered:\n{listed}"
+        );
+    }
+
+    /// The printed document to the three kept fields, and every absence a `None` rather than a
+    /// refusal. See `UserConfig`.
+    #[test]
+    fn the_resolved_configuration_yields_its_model_and_providers() {
+        let printed = r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek/deepseek-flash",
+  "small_model": "deepseek/deepseek-flash",
+  "compaction": { "auto": true },
+  "provider": { "deepseek": { "options": { "apiKey": "sk" } }, "vllm": { "npm": "@ai-sdk/openai-compatible" } },
+  "keybinds": { "leader": "ctrl+x" }
+}"#;
+        let config = parse_user_config(printed).expect("json");
+        assert_eq!(config.model.as_deref(), Some("deepseek/deepseek-flash"));
+        assert_eq!(
+            config.small_model.as_deref(),
+            Some("deepseek/deepseek-flash")
+        );
+        assert!(config.provider.contains("vllm"), "{}", config.provider);
+
+        // The same providers, another model: a different configuration. The same document with
+        // a keybind changed: the same one — a restart is not worth a keybind.
+        let moved = parse_user_config(&printed.replace("deepseek/deepseek-flash", "vllm/qwen"))
+            .expect("json");
+        assert_ne!(moved, config);
+        let rebound = parse_user_config(&printed.replace("ctrl+x", "ctrl+a")).expect("json");
+        assert_eq!(rebound, config);
+
+        let bare =
+            parse_user_config(r#"{ "model": "", "provider": "not an object" }"#).expect("json");
+        assert_eq!(
+            bare,
+            UserConfig {
+                model: None,
+                small_model: None,
+                provider: String::new()
+            }
+        );
+
+        let refused = parse_user_config("opencode: no such command").expect_err("not json");
+        assert!(refused.contains("not JSON"), "{refused}");
+    }
+
+    /// The installed binary answers `debug config` with a document the parser reads. Free: it
+    /// reads files and prints, and never reaches a model.
+    #[test]
+    #[ignore = "runs the real opencode"]
+    fn a_real_debug_config_is_readable() {
+        let config = user_config(&std::env::temp_dir()).expect("opencode is installed");
+        // `{:?}` and not the fields: the provider block carries keys, and the redaction is the
+        // thing worth seeing here.
+        eprintln!("{config:?}");
+        assert!(
+            !format!("{config:?}").contains("apiKey"),
+            "a key reached a Debug rendering"
         );
     }
 
