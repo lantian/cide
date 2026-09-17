@@ -269,6 +269,16 @@ struct LiveRun {
     /// child comes up — a failover message written there would live for about a second.
     /// [`Self::wire`] composes the two.
     pool_note: Option<String>,
+    /// What the child that stands was forked with, as far as a person can change it from
+    /// Settings or a role file. `None` until the first fork, and after a restore.
+    ///
+    /// Written at every fork by [`AgentRegistry::stamp_and_choose`] and read by exactly one
+    /// decision — [`AgentRegistry::plan_restarts`], which asks at Resume whether the child it
+    /// would fork *now* is a different child from the one that is frozen. A `SIGCONT` cannot
+    /// change a process's argv or environment, so a paused run whose settings moved is put on a
+    /// new child continuing the same conversation instead; one whose settings did not is thawed
+    /// in place, which is what keeps a short pause from costing the in-flight turn.
+    forked_with: Option<cide_agents::overrides::ChildSettings>,
     /// cide killed this child on purpose, so its death is not a provider's fault.
     ///
     /// Set by [`AgentRegistry::stop`] and read by [`AgentRegistry::plan_failover`]: without it, a
@@ -588,6 +598,14 @@ struct Inner {
     /// reaped. Consulted by [`AgentRegistry::respawn`] and the interrupted-run requeue, which
     /// refuse rather than race.
     viewers: HashMap<(Harness, String), SessionId>,
+    /// Restarts a Resume has decided and the old child's exit has not yet carried out, keyed by
+    /// the session that child was filed under. See [`AgentRegistry::plan_restarts`].
+    ///
+    /// Keyed by the **old** session on purpose: the run itself is already bound to its successor's
+    /// fresh id, so the exit handler — which knows only the session it was attached to — could not
+    /// find the run through `runs` at all. That is the point of the rebind (nothing the dying
+    /// child says can reach the run) and this table is what the rebind costs.
+    restarts: HashMap<SessionId, Failover>,
 }
 
 /// One frozen session, as the registry files it. See [`Inner::frozen_sessions`].
@@ -653,6 +671,7 @@ impl AgentRegistry {
                 provider_failure: None,
                 spent: Vec::new(),
                 pool_note: None,
+                forked_with: None,
                 stopping: false,
                 // The opening prompt is turn one, so a provider failure before any answer is a
                 // first-turn failure — the case that can abandon its conversation for free.
@@ -789,6 +808,7 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
                     // run outright, so the `None` arm is a belt-and-braces answer rather than a
                     // state a user reaches.
                     cide_hook_binary().and_then(|_| cide_agents::harness::for_kind(live.harness)),
+                    Restarted::Cide,
                 ),
                 false => live.prompt.clone(),
             };
@@ -825,6 +845,63 @@ fn resume_point(live: &LiveRun) -> Option<ResumePoint> {
     }
 }
 
+/// What a child forked now would be forked with, per role — or `None` for a role that cannot be
+/// forked now, which a Resume reads as "nothing to compare, thaw in place".
+type SettingsNow<'a> = dyn Fn(&AgentId) -> Option<cide_agents::overrides::ChildSettings> + 'a;
+
+/// Read what a fork would resolve to, for every role of `project`, once.
+///
+/// The same reads a fork makes — [`facts`] and `load_project` — done on the caller's thread
+/// before any registry lock, and captured, so the comparison a Resume makes across a whole
+/// project's runs is against one snapshot of the settings rather than a file that could move
+/// between two rows. A resolution the fork would **refuse** (an override naming a pool that is
+/// not configured) answers `None`: a broken setting is not a changed one, and restarting a
+/// healthy paused run into a refusal would end it for nothing — the refusal waits for the next
+/// dispatch, where it is shown.
+fn settings_now(app: &AppHandle, project: ProjectId) -> Box<SettingsNow<'static>> {
+    let facts = match facts(app, project) {
+        Ok(facts) => facts,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the settings a resume compares; thawing every run as it stands");
+            return Box::new(|_| None);
+        }
+    };
+    let agents = cide_agents::load_project(&facts.root);
+    Box::new(move |id| {
+        let agent = agents.get(id)?;
+        let resolved = facts.resolve(agent);
+        if resolved.refusal.is_some() {
+            return None;
+        }
+        Some(facts.child_settings(&resolved))
+    })
+}
+
+/// Clear a run's pool stamp so its next fork stamps the pool as configured now. The one place
+/// the stickiness rule on [`LiveRun::pool`] yields, and only to a person's Resume — never to a
+/// failover or a follow-up, which continue on the list the run was arranged on.
+fn restamp(live: &mut LiveRun) {
+    live.pool.clear();
+    live.pool_index = 0;
+    live.spent.clear();
+    live.pool_note = None;
+}
+
+/// What a run says while its settings restart is between the old child and the new.
+const RESTARTING_NOTE: &str =
+    "restarting on the current settings; a new child continues the same conversation";
+
+/// The same, for a run whose frozen child had not begun — nothing to continue, so the dispatch
+/// is replayed on the current settings instead.
+const RESTARTING_FRESH_NOTE: &str =
+    "restarting on the current settings; nothing had happened yet, so the dispatch is replayed";
+
+/// What a run whose settings changed says when a pane holds its conversation and it is thawed
+/// as it stands instead. See `plan_restarts`.
+const SETTINGS_KEPT_FOR_A_PANE: &str = "settings changed, but this run's conversation is open in a pane, and two harness processes \
+     must not write one conversation — it continues on the settings it started with. Close that \
+     pane and pause and resume it again to restart it.";
+
 /// What a queued run in a paused project says instead of nothing.
 ///
 /// One sentence, naming the state and the gesture that ends it. It deliberately does *not* say
@@ -854,15 +931,17 @@ fn continuation_prompt(
     task: Option<&TaskId>,
     title: Option<&str>,
     tools: Option<&dyn cide_agents::harness::Harness>,
+    why: Restarted,
 ) -> String {
     let title = title
         .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|title| !title.is_empty())
         .map(|title| format!(" ({title})"))
         .unwrap_or_default();
+    let opening = why.opening();
     match (task, tools) {
         (Some(id), Some(harness)) => format!(
-            "cide restarted while you were working. Re-read task {id}{title} with {}, \
+            "{opening} Re-read task {id}{title} with {}, \
              check your worktree with git status, and continue from \
              where the conversation left off.",
             harness.tool_name("cide_task_get")
@@ -870,12 +949,37 @@ fn continuation_prompt(
         // A task it cannot re-read is a task it can still be reminded of by name; the git half of
         // the sentence is the half that does not need the bridge.
         (Some(id), None) => format!(
-            "cide restarted while you were working. You were on task {id}{title}: check your \
+            "{opening} You were on task {id}{title}: check your \
              worktree with git status and continue from where the conversation left off."
         ),
-        (None, _) => "cide restarted while you were working. Check the tree with git status and \
-                 continue from where the conversation left off."
-            .to_string(),
+        (None, _) => format!(
+            "{opening} Check the tree with git status and \
+             continue from where the conversation left off."
+        ),
+    }
+}
+
+/// Why a run is being told to pick up where it left off — the first clause of
+/// [`continuation_prompt`]. Two sentences rather than one vague one, because the model is
+/// about to be asked to reconcile a conversation with a working tree, and "cide restarted" on
+/// a machine that never went down is a false lead about what may have changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restarted {
+    /// The cide process went down and came back; the child died with it.
+    Cide,
+    /// A person changed the model settings under a pause and resumed; cide restarted the run.
+    Settings,
+}
+
+impl Restarted {
+    fn opening(self) -> &'static str {
+        match self {
+            Self::Cide => "cide restarted while you were working.",
+            Self::Settings => {
+                "cide restarted you on new model settings while you were paused; the \
+                 conversation so far is yours, the process is new."
+            }
+        }
     }
 }
 
@@ -1641,6 +1745,19 @@ impl AgentRegistry {
     /// The mirror of [`Self::pause`], including the order: the children are thawed **before** the
     /// marks are cleared, so no admission can reach a child that is still frozen — which is the
     /// same hazard the mark-first rule closes from the other side.
+    ///
+    /// # Resume is on the settings as they stand now
+    ///
+    /// A `SIGCONT` changes nothing about a process: the model, provider and limits a child was
+    /// forked with are on its argv and in its environment, fixed at the fork. So a run whose
+    /// settings moved while it was paused is not thawed — it is **restarted**: rebound to a
+    /// fresh session, its old child wound down, and a new child forked on the current settings
+    /// continuing the same conversation, through the same road a pool failover takes
+    /// ([`Self::fork_failover`]), which keeps the slot, the worktree and the screen. A run whose
+    /// settings did not move is thawed in place, and that distinction is the whole reason the
+    /// comparison exists: restarting every resumed run would cost every short pause its
+    /// in-flight turn. [`Self::plan_restarts`] is the decision; the ordering it needs is written
+    /// there.
     pub fn resume(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -1649,18 +1766,47 @@ impl AgentRegistry {
     ) -> Result<()> {
         let thaws = self.plan_thaws(project, run)?;
 
+        // What a child forked *now* would be forked with, per role. Read off the workspace and
+        // the project's `.cide/` before any registry lock, for `pause`'s reason — this lock is
+        // also taken from the hook applier thread — and once, because both halves of Resume
+        // below compare against it.
+        let settings_now = settings_now(app, project);
+        let sessions = app.try_state::<SessionRegistry>();
+
+        // Decided **before** the `SIGCONT`, and the order is load-bearing: a run being restarted
+        // is rebound to its successor's session under the lock, so nothing the old child prints
+        // or reports between the thaw and its death can reach the run — `respawn`'s
+        // rebind-before-kill rule, applied here.
+        let restarts =
+            self.plan_restarts(project, sessions.as_deref(), &thaws, settings_now.as_ref());
+
         for thaw in &thaws {
             signal_session(app, thaw.session, PauseSignal::Cont);
         }
 
-        let watch = self.finish_thaws(project, run.is_none(), &thaws, now_unix_ms());
+        let mut watch = self.finish_thaws(project, run.is_none(), &thaws, now_unix_ms());
+        // A restarted run's old child is about to die on purpose; watching it for a sign of life
+        // would raise a stale-turn offer on a run whose successor is already being forked.
+        watch.retain(|(session, _)| !restarts.contains(session));
+
+        // Only now: thawed, so the signal lands — a stopped process does not act on SIGHUP or
+        // SIGTERM — and rebound, so the exit that follows belongs to nobody but `plan_restart`,
+        // which forks the successor from the reaper thread once the old child is really gone.
+        if let Some(sessions) = sessions.as_deref() {
+            for old in &restarts {
+                if let Some(pty) = sessions.get(*old) {
+                    tracing::info!(session = %old, "winding down a paused run's child to restart it on the current settings");
+                    pty.kill();
+                }
+            }
+        }
 
         // The other thing Resume can mean since the snapshot landed: runs whose children died
         // with a cide restart go back through the queue, continuing their conversations. Before
         // the pump, so this press is what starts them; through the queue, because an
         // interrupted run holds no slot and its role's worktree may meanwhile belong to a
         // newer run — admission is the arbiter, exactly as for a dispatch.
-        self.requeue_interrupted(project, run, app.try_state::<SessionRegistry>().as_deref())?;
+        self.requeue_interrupted(project, run, sessions.as_deref(), settings_now.as_ref())?;
 
         // The queue is open again, so whatever was waiting may start.
         self.pump(app);
@@ -1755,6 +1901,197 @@ impl AgentRegistry {
         watch
     }
 
+    /// Which of the sessions a Resume is about to thaw belong to runs whose settings have moved
+    /// since their fork — and, for each, the whole of the mark. **Reads the settings through
+    /// `settings_now` and nothing else off disk**, so a test drives it with a closure.
+    ///
+    /// Answers the sessions of the *old* children, which the caller winds down after the
+    /// `SIGCONT`; the successor of each is forked by [`Self::plan_restart`] from that child's
+    /// exit, through the failover road. Everything here happens under the lock, before any
+    /// signal is sent, and in this order for these reasons:
+    ///
+    /// * **The comparison is against what the standing child got** (`LiveRun::forked_with`),
+    ///   never a re-derivation: the question is whether the fork would differ, and only the
+    ///   record of the fork can answer it.
+    /// * **The run is rebound to a fresh session first.** From here the dying child's hook
+    ///   frames, its output and its exit find no run that owns their session — which is what
+    ///   makes it safe to `SIGCONT` a process cide is about to kill. A claude successor is
+    ///   therefore a *fork* of the conversation (`--resume <old> --fork-session --session-id
+    ///   <new>`, `harness::claude::respawn_spec`), which is also what keeps the old transcript
+    ///   intact; opencode's and codex's carry the conversation in their own flags and mint cide
+    ///   sessions freely anyway.
+    /// * **The freeze is taken here**, so `finish_thaws` has nothing to restore on this run and
+    ///   the row reads `Starting` — a working phase, so the slot and the checkout stay this run's
+    ///   across the swap, exactly as `plan_failover` arranges it.
+    /// * **A frozen child that had not begun its turn** (`Starting`, on its first prompt) has no
+    ///   conversation worth a continuation line: the dispatch is replayed fresh, on the new
+    ///   settings, and a claude run gets a new conversation rather than a fork of an empty one.
+    ///   A `Starting` child on a later turn is an opencode respawn that never reported in; its
+    ///   follow-up is re-sent into the conversation it was meant for.
+    /// * **A changed pool is re-stamped** (`restamp`), so the successor starts at the top of the
+    ///   list the person arranged; an unchanged pool keeps the run's place in it. This is the
+    ///   one place the stickiness rule yields, and it yields to a person and never to a failover.
+    /// * **A conversation a pane is driving is not restarted** (M42's rule, `viewed_by`): the row
+    ///   says so and the run is thawed as it stands. Two harness processes must not write one
+    ///   transcript, and the person typing into that pane outranks the settings screen.
+    fn plan_restarts(
+        &self,
+        project: ProjectId,
+        sessions: Option<&SessionRegistry>,
+        thaws: &[Thawing],
+        settings_now: &SettingsNow<'_>,
+    ) -> Vec<SessionId> {
+        let mut inner = self.inner.lock();
+        let mut restarting = Vec::new();
+        for thaw in thaws {
+            let Some(run) = thaw.run else {
+                continue;
+            };
+            let viewed = sessions.is_some_and(|sessions| {
+                inner
+                    .runs
+                    .get(&run)
+                    .is_some_and(|live| viewed_by(&inner, sessions, live).is_some())
+            });
+            let Some(live) = inner
+                .runs
+                .get_mut(&run)
+                .filter(|live| live.project == project)
+            else {
+                continue;
+            };
+            // A frozen run with a child, and only that: a run that ended under the freeze has no
+            // freeze left (`set_state`'s `over` arm), and a queued one never had a child.
+            let (Some(frozen), Some(old)) = (live.frozen.as_ref(), live.session) else {
+                continue;
+            };
+            if old != thaw.session {
+                continue;
+            }
+            // Each outcome below is said once in the log, at info, because the one report this
+            // was written from read "resuming, but nothing in logs": a Resume that decides to
+            // change nothing must still be able to say so, and one that restarts must say what
+            // moved.
+            let Some(was) = live.forked_with.as_ref() else {
+                tracing::info!(%run, "resume: this run's fork recorded no settings; thawing in place");
+                continue;
+            };
+            let Some(now) = settings_now(&live.agent) else {
+                tracing::info!(%run, agent = %live.agent, "resume: this role cannot be resolved now; thawing in place");
+                continue;
+            };
+            let changed = was.changed_fields(&now);
+            if changed.is_empty() {
+                tracing::info!(%run, "resume: settings unchanged since this run's fork; thawing in place");
+                continue;
+            }
+            if viewed {
+                tracing::info!(%run, ?changed, "resume: settings changed, but a pane holds this run's conversation; thawing in place");
+                live.note = Some(SETTINGS_KEPT_FOR_A_PANE.to_string());
+                continue;
+            }
+            tracing::info!(%run, ?changed, "resume: settings changed since this run's fork; restarting it on the current ones");
+
+            let pre = frozen.state.clone();
+            let pool_changed = was.pool != now.pool;
+            let never_began = matches!(pre, RunState::Starting);
+            let resume = match never_began && live.turns <= 1 {
+                true => None,
+                false => resume_point(live).map(|point| point.conversation),
+            };
+            let prompt = match (&resume, never_began) {
+                (Some(_), false) => continuation_prompt(
+                    live.task.as_ref(),
+                    live.task_title.as_deref(),
+                    cide_hook_binary().and_then(|_| cide_agents::harness::for_kind(live.harness)),
+                    Restarted::Settings,
+                ),
+                // The turn never began, or there is no conversation to continue: the prompt the
+                // dying child was given is the prompt its successor gets.
+                (Some(_), true) | (None, _) => live.prompt.clone(),
+            };
+            if resume.is_none() {
+                // Nothing to continue, so nothing to go on naming — `plan_failover`'s clear, for
+                // the same reason: left set, Open would show a conversation this run walked
+                // away from.
+                live.harness_session = None;
+            }
+            let next = SessionId::new();
+            // `bind_session`, inline: the lock is held, and it must be — the rebind and the
+            // decision are one atomic step or a frame could land between them.
+            live.session = Some(next);
+            live.frozen = None;
+            live.stale_turn = false;
+            live.state = RunState::Starting;
+            if pool_changed {
+                restamp(live);
+            }
+            if resume.is_some() && !never_began {
+                // A continuation line is a prompt into a conversation that carries real work,
+                // so a later provider failure must continue it rather than abandon it — the
+                // distinction `plan_failover` draws on this counter.
+                live.turns = live.turns.saturating_add(1);
+            }
+            live.note = Some(
+                match resume.is_some() {
+                    true => RESTARTING_NOTE,
+                    false => RESTARTING_FRESH_NOTE,
+                }
+                .to_string(),
+            );
+            let failover = Failover {
+                run,
+                project,
+                agent: live.agent.clone(),
+                task: live.task.clone(),
+                task_title: live.task_title.clone(),
+                change: live.change.clone(),
+                prompt,
+                resume,
+                session: Some(next),
+                previous: Some(old),
+                why: Carried::Settings,
+            };
+            inner.frozen_sessions.remove(&old);
+            inner.restarts.insert(old, failover);
+            restarting.push(old);
+        }
+        restarting
+    }
+
+    /// The restart `plan_restarts` decided for the run whose old child was filed under
+    /// `session`, taken once, from that child's exit — or `None`, which is every other exit.
+    ///
+    /// Taken and not read, like `plan_failover`'s latch: an exit forks one successor. Two
+    /// refusals, both about a fork that must not happen after all. **Stop** was pressed while
+    /// the old child was being wound down: `stop` latched `stopping` and signalled a session
+    /// that has no child yet, so nothing else will end this run — it is ended here, as `stop`
+    /// ends a run that never reached a child, or it would hold its slot for ever under a row
+    /// nothing can press. And the process is **going down** (`snapshot_sealed`): the snapshot
+    /// already carries this run as interrupted under its old session, and a successor forked
+    /// into a teardown would be killed by the ladder it was born into.
+    fn plan_restart(&self, session: SessionId) -> Option<Failover> {
+        let mut inner = self.inner.lock();
+        let failover = inner.restarts.remove(&session)?;
+        let stopping = inner
+            .runs
+            .get(&failover.run)
+            .is_none_or(|live| live.stopping);
+        if stopping {
+            drop(inner);
+            self.fail(
+                None,
+                failover.run,
+                "stopped while restarting on the current settings",
+            );
+            return None;
+        }
+        if self.snapshot_sealed.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(failover)
+    }
+
     /// Put [`RunState::Interrupted`] runs back on their roles' queues, marked continuing.
     ///
     /// `run: None` is the project scope — every interrupted run the project has — matching
@@ -1765,11 +2102,18 @@ impl AgentRegistry {
     /// transcript a person is typing into. The skipped row says so in its note; the refused
     /// press gets the sentence. `sessions` is what "right now" is asked of; `None` (a test
     /// without a registry) means nobody is viewing anything.
+    ///
+    /// `settings_now` is what the resume will fork with, per role, for one comparison: a run
+    /// restored **on a pool** comes back at the position it had settled on (`SavedRun::pool`),
+    /// which is right while the pool is the one it settled into and wrong once a person has
+    /// edited it while cide was down — a position into a list that no longer exists. Such a
+    /// run has its stamp cleared here, so the fork re-stamps from the top of the current pool.
     fn requeue_interrupted(
         &self,
         project: ProjectId,
         run: Option<RunId>,
         sessions: Option<&SessionRegistry>,
+        settings_now: &SettingsNow<'_>,
     ) -> Result<()> {
         let one_run = run.is_some();
         let mut inner = self.inner.lock();
@@ -1803,6 +2147,11 @@ impl AgentRegistry {
                 "resuming after a cide restart; a new child continues the same conversation"
                     .to_string(),
             );
+            if !live.pool.is_empty()
+                && settings_now(&live.agent).is_some_and(|now| now.pool != live.pool)
+            {
+                restamp(live);
+            }
             let key = live.key();
             inner.queues.entry(key).or_default().push_back(run);
         }
@@ -2163,15 +2512,17 @@ impl AgentRegistry {
     /// wind down and no kill to order against. The rebind still matters for `bind_session`'s own
     /// reason: it is what makes any late frame on the dead session belong to nobody.
     async fn fork_failover(self: &Arc<Self>, app: AppHandle, failover: Failover) {
-        // Read before the rebind, while the run still names the child that just died.
-        let previous = self
-            .inner
-            .lock()
-            .runs
-            .get(&failover.run)
-            .and_then(|live| live.session);
-        let session = SessionId::new();
-        self.bind_session(failover.run, session);
+        // The session the successor is filed under: the one a restart already bound under the
+        // lock that decided it (`plan_restarts`), or a fresh one bound here for a provider
+        // failover. Either way the binding precedes the fork, for `bind_session`'s own reason.
+        let session = match failover.session {
+            Some(session) => session,
+            None => {
+                let session = SessionId::new();
+                self.bind_session(failover.run, session);
+                session
+            }
+        };
         let admission = Admission {
             run: failover.run,
             project: failover.project,
@@ -2183,8 +2534,10 @@ impl AgentRegistry {
             // it is not a follow-up, which is also why `turns` does not move.
             prompt: failover.prompt,
             resume: failover.resume.map(|conversation| ResumePoint {
-                // `None`: opencode's conversation travels in `--session`, not in the cide session
-                // id, and this path is opencode's alone — no other harness has a pool.
+                // `None`: the successor is a **new** cide session in every case that reaches
+                // here. opencode's and codex's conversations travel in their own flags, and a
+                // claude continuation under a fresh id is a fork (`respawn_spec` on that
+                // harness), which is exactly what lets the dying child's exit belong to nobody.
                 rebind: None,
                 conversation,
             }),
@@ -2193,7 +2546,7 @@ impl AgentRegistry {
             .resume
             .as_ref()
             .map(|point| point.conversation.clone());
-        // The screen the refused child last showed, read from the session it was filed under —
+        // The screen the old child last showed, read from the session it was filed under —
         // which `report_exit` deliberately leaves in the registry, so a pane that was watching
         // this run can still paint what it printed. Carried into the successor's mirror so the
         // transcript survives the swap rather than starting blank at the second model.
@@ -2202,8 +2555,12 @@ impl AgentRegistry {
         // unchanged from a respawn today, and this is what the next Open shows.
         let preload = app
             .try_state::<SessionRegistry>()
-            .and_then(|sessions| previous.and_then(|previous| sessions.get(previous)))
-            .map(|pty| pty.full_state());
+            .and_then(|sessions| {
+                failover
+                    .previous
+                    .and_then(|previous| sessions.get(previous))
+            })
+            .map(|pty| (pty.full_state(), failover.why));
         self.bring_up(app, admission, session, resume, preload)
             .await;
     }
@@ -2337,6 +2694,9 @@ impl AgentRegistry {
             change: live.change.clone(),
             prompt: live.prompt.clone(),
             resume,
+            session: None,
+            previous: live.session,
+            why: Carried::Failover,
         })
     }
 
@@ -2349,13 +2709,19 @@ impl AgentRegistry {
     /// edited under a live run would move the candidate a failover advances to. Every later call
     /// reads what is already there, so `pool_index` — which only a failover moves, and only
     /// upward — is what decides.
+    ///
+    /// Every fork also records here what it was forked *with* (`LiveRun::forked_with`), because
+    /// this is the one function every fork passes through and the comparison a Resume makes is
+    /// only honest against the settings the standing child actually got.
     fn stamp_and_choose(
         &self,
         run: RunId,
         resolved: &cide_agents::overrides::Resolved,
+        settings: cide_agents::overrides::ChildSettings,
     ) -> Option<cide_ipc::PoolChoice> {
         let mut inner = self.inner.lock();
         let live = inner.runs.get_mut(&run)?;
+        live.forked_with = Some(settings);
         if live.pool.is_empty() && live.pool_index == 0 {
             live.pool.clone_from(&resolved.pool);
             if let Some(name) = &resolved.pool_name
@@ -2490,6 +2856,7 @@ fn signal_pty(_pty: &PtySession, _signal: PauseSignal) {}
 /// A failover on that same run is the ordinary case — there is nothing to continue precisely
 /// because the provider refused before a word was said — so `resume` is an `Option` here and its
 /// `None` is a plan rather than a refusal.
+#[derive(Debug, Clone)]
 struct Failover {
     run: RunId,
     project: ProjectId,
@@ -2497,10 +2864,40 @@ struct Failover {
     task: Option<TaskId>,
     task_title: Option<String>,
     change: Option<String>,
-    /// The prompt to re-send. The **same** one the refused turn carried.
+    /// The prompt to send. For a provider failover the **same** one the refused turn carried;
+    /// for a restart on new settings, the continuation line — or the dispatch, replayed, when
+    /// the frozen child had not begun its turn.
     prompt: String,
     /// The conversation to continue, or `None` to start a fresh one. See `plan_failover`.
     resume: Option<String>,
+    /// The session the successor is already bound to, or `None` to mint and bind one at the
+    /// fork. A restart binds under the lock that decides it — before the old child is signalled,
+    /// `respawn`'s rule — so by the time this is acted on the binding is done.
+    session: Option<SessionId>,
+    /// The session the dying child was filed under: the screen carried into the successor's
+    /// mirror is read from it. `None` for a run that never reached a child.
+    previous: Option<SessionId>,
+    /// Which sentence separates the carried screen from the successor's output.
+    why: Carried,
+}
+
+/// Why a run's successor is carrying its predecessor's screen — what the separator between
+/// the two says. A person reading the pane needs to know which of these happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carried {
+    /// The provider refused and the pool's next candidate continues.
+    Failover,
+    /// A person changed the settings under a pause and resumed.
+    Settings,
+}
+
+impl Carried {
+    fn separator(self) -> &'static [u8] {
+        match self {
+            Self::Failover => FAILOVER_SEPARATOR,
+            Self::Settings => SETTINGS_SEPARATOR,
+        }
+    }
 }
 
 // Nothing else is carried, deliberately: this is the *same* run, so its label, harness, limits,
@@ -2776,7 +3173,16 @@ impl AgentRegistry {
                         agent: live.agent.clone(),
                         agent_label: live.agent_label.clone(),
                         harness: live.harness,
-                        session: live.session,
+                        // A run whose restart is still pending names the session its
+                        // conversation is filed under — the old child's, which is what a
+                        // `claude --resume` after this restart needs — not the fresh id its
+                        // successor would have taken had the old exit landed in time.
+                        session: inner
+                            .restarts
+                            .values()
+                            .find(|pending| pending.run == live.run)
+                            .and_then(|pending| pending.previous)
+                            .or(live.session),
                         harness_session: live.harness_session.clone(),
                         task: live.task.clone(),
                         task_title: live.task_title.clone(),
@@ -2926,6 +3332,10 @@ impl AgentRegistry {
                     provider_failure: None,
                     spent: Vec::new(),
                     pool_note: None,
+                    // Not persisted. A restored run's next child is a resume that re-reads the
+                    // settings and stamps this afresh; there is no frozen child whose argv this
+                    // could be compared against.
+                    forked_with: None,
                     stopping: false,
                     // A resumed run has had at least one prompt, so its next failure is a
                     // mid-conversation one and must not abandon the transcript.
@@ -3076,6 +3486,12 @@ struct Facts {
     /// carries the argument, which is that a teammate's clone must not name a pool they do not
     /// have.
     overrides: cide_ipc::ProjectOverrides,
+    /// What opencode resolves as this project's own configuration, asked of the binary the first
+    /// time an opencode role needs it and not before — a `claude` fork never pays for it. `None`
+    /// inside means it was asked and could not answer, which degrades a fork to "let opencode
+    /// pick" and a Resume comparison to "nothing to compare"; the log has the sentence.
+    /// See `cide_agents::harness::opencode::UserConfig` for why every opencode child needs it.
+    opencode: std::cell::OnceCell<Option<cide_agents::harness::opencode::UserConfig>>,
     hook_bin: Option<PathBuf>,
     hook_sock: Option<PathBuf>,
     agent_sock: Option<PathBuf>,
@@ -3131,6 +3547,7 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
         )
         .project(&root_key),
         llm,
+        opencode: std::cell::OnceCell::new(),
         hook_bin: cide_hook_binary(),
         hook_sock: app
             .try_state::<crate::hooks::HookServer>()
@@ -3144,6 +3561,51 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
         // dispatching again picks it up without a relaunch.
         spec_cli: cide_spec::discover::find().ok(),
     })
+}
+
+impl Facts {
+    /// opencode's resolved configuration for this project, read once. See the field.
+    fn opencode(&self) -> Option<&cide_agents::harness::opencode::UserConfig> {
+        self.opencode
+            .get_or_init(|| match cide_agents::harness::opencode::user_config(&self.root) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "opencode could not say what it resolves as this project's configuration; \
+                         its children will run on whatever it picks, and a Resume cannot compare it"
+                    );
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// The role as it resolves here, with opencode's own default folded in where cide names no
+    /// model — `Resolved::with_default_model`, fed from the one place that can read it.
+    fn resolve(&self, agent: &cide_agents::LoadedAgent) -> cide_agents::overrides::Resolved {
+        let resolved = cide_agents::overrides::resolve(agent, &self.overrides, &self.llm);
+        match resolved.harness {
+            Harness::Opencode => {
+                let default = self.opencode().and_then(|config| config.model.clone());
+                resolved.with_default_model(default)
+            }
+            Harness::Claude | Harness::Codex | Harness::Qwen => resolved,
+        }
+    }
+
+    /// What a child of `resolved` is forked with, for the record every fork keeps and the
+    /// comparison a Resume makes. See `LiveRun::forked_with`.
+    fn child_settings(
+        &self,
+        resolved: &cide_agents::overrides::Resolved,
+    ) -> cide_agents::overrides::ChildSettings {
+        let opencode = match resolved.harness {
+            Harness::Opencode => self.opencode(),
+            Harness::Claude | Harness::Codex | Harness::Qwen => None,
+        };
+        resolved.child_settings(&self.llm, opencode)
+    }
 }
 
 /// The `cide-hook` binary, beside our own executable and **absolute**.
@@ -3239,9 +3701,9 @@ impl AgentRegistry {
         admission: Admission,
         session_id: SessionId,
         resume: Option<String>,
-        // What the dying child last had on screen, when this fork continues a run whose pane a
-        // person may be reading. `None` for an ordinary start. (M45)
-        preload: Option<Vec<u8>>,
+        // What the dying child last had on screen, and why it is being carried, when this fork
+        // continues a run whose pane a person may be reading. `None` for an ordinary start. (M45)
+        preload: Option<(Vec<u8>, Carried)>,
     ) {
         let run = admission.run;
         let project = admission.project;
@@ -3408,6 +3870,12 @@ impl AgentRegistry {
             // the checkout on it — after which the queued sibling is admitted and `bring_up` winds
             // down whatever it finds in the checkout. A failover decided after that would re-fork
             // into a directory the queue has already given away. See `plan_failover`.
+            // A restart decided at Resume, carried out by the exit it asked for. First, because
+            // the run is no longer bound to this session and `plan_failover` could not find it.
+            if let Some(restart) = registry.plan_restart(session) {
+                over_to(&registry, restart);
+                return;
+            }
             if let Some(failover) = registry.plan_failover(session, exit.code) {
                 over_to(&registry, failover);
                 return;
@@ -3680,6 +4148,10 @@ const FAILOVER_SEPARATOR: &[u8] =
 const RESTART_SEPARATOR: &[u8] =
     b"\r\n\x1b[2m\xe2\x80\x94 resumed after a cide restart \xe2\x80\x94\x1b[0m\r\n";
 
+/// The same, for a run restarted on new settings at Resume. See `AgentRegistry::plan_restarts`.
+const SETTINGS_SEPARATOR: &[u8] =
+    b"\r\n\x1b[2m\xe2\x80\x94 restarted on the current model settings \xe2\x80\x94\x1b[0m\r\n";
+
 fn start_child(
     app: &AppHandle,
     registry: &Arc<AgentRegistry>,
@@ -3687,8 +4159,9 @@ fn start_child(
     admission: &Admission,
     session: SessionId,
     resume: Option<&str>,
-    // The dying child's screen, for a fork that continues a run somebody may be watching. (M45)
-    preload: Option<Vec<u8>>,
+    // The dying child's screen, for a fork that continues a run somebody may be watching, and
+    // the sentence that separates it from what comes next. (M45)
+    preload: Option<(Vec<u8>, Carried)>,
 ) -> Result<Started> {
     // Read fresh, at the moment of the spawn, and refused again here. The refusal is not a
     // repetition of the one `agents_dispatch` made: a run can sit in a queue for minutes, and in
@@ -3757,13 +4230,20 @@ fn start_child(
     // What this role actually runs as *here*: the committed definition folded with this
     // machine's local override. Pure, and computed before anything is forked or written, so its
     // one refusal costs nothing when it fires. (M45)
-    let resolved = cide_agents::overrides::resolve(agent, &facts.overrides, &facts.llm);
+    let resolved = facts.resolve(agent);
     // The only refusal this fold produces: an override naming a pool that is not configured
     // here. Refused rather than degraded, because falling back would answer with a model nobody
     // chose and bill for it — and people build a pool to *cap* spend. See `overrides::resolve`.
     if let Some(refusal) = resolved.refusal {
         return Err(CoreError::Io(refusal));
     }
+    // The definition as the harness reads it: this machine's single-model and effort overrides
+    // folded **into** it. Every harness reads `plan.agent.def.model` and `plan.agent.effort`, and
+    // until this fold existed the resolution's `model` and `effort` were computed and read by
+    // nothing — the Settings screen's Model and Effort fields changed no child. `Resolved::apply`
+    // says why it is a fold and not two more plan fields. The file on disk is untouched.
+    let folded = resolved.apply(agent);
+    let agent = &folded;
 
     // Where a harness that reports through a JSON event file would write it: beside the agent
     // socket, one per run, so it lives and dies with this cide's runtime directory. Minted for
@@ -3806,7 +4286,11 @@ fn start_child(
         // already advanced `pool_index` by the time it re-forks, and a respawn must continue on
         // whatever the run settled on rather than walking back to the top of the list. The pool
         // itself is stamped on the first fork and never re-read — see `LiveRun::pool`.
-        choice: registry.stamp_and_choose(admission.run, &resolved),
+        choice: registry.stamp_and_choose(
+            admission.run,
+            &resolved,
+            facts.child_settings(&resolved),
+        ),
         // The resolved harness, so the implementation `for_kind` picked below and the one the
         // plan claims are the same CLI. A redirected role would otherwise be refused by the very
         // harness it was deliberately routed to. See `RunPlan::harness`.
@@ -3880,12 +4364,13 @@ fn start_child(
     // the child), fed from the screen the last teardown saved. Absent file, absent preload:
     // a crash keeps the runs and loses the screens, and blank-above-continuation is honest.
     //
-    // A failover's screen is handed in directly (`preload`) and is the *live* mirror of the child
-    // that just died, read before this fork; a restart's comes off disk. They are separated
-    // because their separators differ — "the provider refused, continuing elsewhere" and "resumed
-    // after a cide restart" are different facts and a person reading the pane needs to know which.
+    // A failover's or a settings restart's screen is handed in directly (`preload`) and is the
+    // *live* mirror of the child that just died, read before this fork; a cide restart's comes
+    // off disk. They are separated because their separators differ — "the provider refused,
+    // continuing elsewhere", "restarted on new settings" and "resumed after a cide restart" are
+    // different facts and a person reading the pane needs to know which.
     let carried = match preload {
-        Some(screen) => Some((screen, FAILOVER_SEPARATOR)),
+        Some((screen, why)) => Some((screen, why.separator())),
         None => admission
             .resume
             .as_ref()
@@ -4664,7 +5149,7 @@ mod tests {
         // Resume's two halves, exercised app-free: reopen the queue, requeue the interrupted.
         after.inner.lock().paused_projects.remove(&project);
         after
-            .requeue_interrupted(project, None, None)
+            .requeue_interrupted(project, None, None, &|_| None)
             .expect("nobody is viewing anything in a test without a session registry");
         let mut admissions = after.take_admissions();
         admissions.sort_by_key(|admission| admission.run != worked);
@@ -4719,7 +5204,7 @@ mod tests {
         let after = Arc::new(AgentRegistry::default());
         after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
         after
-            .requeue_interrupted(project, Some(run), None)
+            .requeue_interrupted(project, Some(run), None, &|_| None)
             .expect("nobody is viewing anything in a test without a session registry");
         let admissions = after.take_admissions();
         assert_eq!(admissions.len(), 1);
@@ -6156,13 +6641,13 @@ mod tests {
         assert!(!registry.owns_session(session));
 
         let refused = registry
-            .requeue_interrupted(project, Some(run), Some(&sessions))
+            .requeue_interrupted(project, Some(run), Some(&sessions), &|_| None)
             .expect_err("viewed");
         assert!(refused.to_string().contains("open in a pane"), "{refused}");
         assert_eq!(state_of(&registry, run), RunState::Interrupted);
 
         registry
-            .requeue_interrupted(project, None, Some(&sessions))
+            .requeue_interrupted(project, None, Some(&sessions), &|_| None)
             .expect("the project scope skips rather than refuses");
         assert_eq!(state_of(&registry, run), RunState::Interrupted);
         let note = registry.inner.lock().runs[&run].note.clone();
@@ -6177,7 +6662,7 @@ mod tests {
         wait_exited(&pty);
         registry.forget_viewer(session);
         registry
-            .requeue_interrupted(project, Some(run), Some(&sessions))
+            .requeue_interrupted(project, Some(run), Some(&sessions), &|_| None)
             .expect("free again");
         assert_eq!(state_of(&registry, run), RunState::Queued);
     }
@@ -6236,5 +6721,470 @@ mod tests {
         assert!(!row.openable);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ==========================================================================================
+    // Resume on the settings as they stand. The decision half (`plan_restarts`) and the exit
+    // half (`plan_restart`) are both under the lock and app-free, so they are driven directly;
+    // the fork is `fork_failover`'s, the same road a pool failover takes.
+    // ==========================================================================================
+
+    fn forked_on(harness: Harness, model: &str) -> cide_agents::overrides::ChildSettings {
+        cide_agents::overrides::ChildSettings {
+            harness,
+            pool: Vec::new(),
+            model: Some(model.into()),
+            effort: None,
+            providers: None,
+            opencode: None,
+        }
+    }
+
+    /// A claude run forked on `model`, running, and then frozen by a project pause — with a
+    /// queued sibling behind it in a one-slot role, so a slot given away shows up as an
+    /// admission.
+    fn a_frozen_run(
+        registry: &AgentRegistry,
+        project: ProjectId,
+        model: &str,
+    ) -> (RunId, SessionId) {
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        let _waiting = registry.enqueue(spec(project, "developer", 1, 4));
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1, "one slot, one admission");
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&run)
+            .expect("the run")
+            .forked_with = Some(forked_on(Harness::Claude, model));
+        assert!(registry.set_state(None, run, RunState::Running));
+        registry
+            .take_freezes(project, None, None, 1_000)
+            .expect("a project may always be paused");
+        assert_eq!(
+            state_of(registry, run),
+            RunState::Paused {
+                since_unix_ms: 1_000
+            }
+        );
+        (run, session)
+    }
+
+    /// **A changed setting restarts the frozen run; nothing else about it moves.** The run is
+    /// rebound to a fresh session before any signal, reads `Starting`, keeps its slot, and the
+    /// old session carries the restart the exit will act on: a claude fork of the conversation
+    /// with the continuation line as its prompt.
+    #[test]
+    fn a_resume_after_a_settings_change_restarts_the_frozen_run_on_a_fresh_session() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let (run, old) = a_frozen_run(&registry, project, "sonnet");
+
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
+            Some(forked_on(Harness::Claude, "opus"))
+        });
+        assert_eq!(restarts, vec![old], "the old child is what gets wound down");
+
+        let pending = {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            assert_eq!(
+                live.state,
+                RunState::Starting,
+                "a working phase across the swap"
+            );
+            assert!(
+                live.frozen.is_none(),
+                "the freeze was taken here, not by finish_thaws"
+            );
+            assert!(live.slot, "the slot is still this run's");
+            assert_ne!(live.session, Some(old), "rebound before any signal is sent");
+            assert_eq!(
+                live.turns, 2,
+                "a continuation line is a prompt into real work"
+            );
+            assert_eq!(live.note.as_deref(), Some(RESTARTING_NOTE));
+            assert!(
+                !inner.frozen_sessions.contains_key(&old),
+                "nothing left for the shutdown thaw to find"
+            );
+            inner.restarts[&old].clone()
+        };
+        assert_eq!(pending.run, run);
+        assert_eq!(pending.resume.as_deref(), Some(old.to_string().as_str()));
+        assert_eq!(pending.previous, Some(old));
+        assert_ne!(pending.session, Some(old));
+        assert_eq!(pending.session, registry.inner.lock().runs[&run].session);
+        assert_eq!(pending.why, Carried::Settings);
+        assert!(
+            pending.prompt.contains("new model settings"),
+            "{}",
+            pending.prompt
+        );
+
+        // The thaw's bookkeeping has nothing to restore on this run and nothing to watch.
+        let watch = registry.finish_thaws(project, true, &thaws, 2_000);
+        assert!(watch.iter().all(|(session, _)| *session != old));
+        assert_eq!(state_of(&registry, run), RunState::Starting);
+        assert!(
+            registry.take_admissions().is_empty(),
+            "the restart gave the role's one slot to the queued sibling"
+        );
+
+        // The exit half: taken exactly once, from the old child's exit.
+        let forked = registry.plan_restart(old).expect("the pending restart");
+        assert_eq!(forked.run, run);
+        assert!(registry.plan_restart(old).is_none(), "taken, not read");
+        assert!(
+            registry.plan_failover(old, 1).is_none(),
+            "no run owns the old session any more, so nothing else can read its exit"
+        );
+    }
+
+    /// **Unchanged settings are a plain thaw** — the in-flight turn survives a short pause, which
+    /// is the whole reason the comparison exists.
+    #[test]
+    fn a_resume_with_unchanged_settings_thaws_in_place() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let (run, old) = a_frozen_run(&registry, project, "sonnet");
+
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
+            Some(forked_on(Harness::Claude, "sonnet"))
+        });
+        assert!(restarts.is_empty());
+        // A role that cannot be resolved now — deleted, or its override refused — is not a
+        // change either.
+        assert!(
+            registry
+                .plan_restarts(project, None, &thaws, &|_| None)
+                .is_empty()
+        );
+
+        registry.finish_thaws(project, true, &thaws, 2_000);
+        let inner = registry.inner.lock();
+        let live = &inner.runs[&run];
+        assert_eq!(live.state, RunState::Running, "back exactly where it was");
+        assert_eq!(live.session, Some(old));
+        assert!(inner.restarts.is_empty());
+    }
+
+    /// A frozen child that had not begun its turn has nothing worth continuing: the dispatch is
+    /// replayed fresh on the new settings, under a new conversation.
+    #[test]
+    fn a_frozen_child_that_never_began_is_replayed_fresh() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        let old = SessionId::new();
+        registry.bind_session(run, old);
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&run)
+            .expect("the run")
+            .forked_with = Some(forked_on(Harness::Claude, "sonnet"));
+        assert_eq!(state_of(&registry, run), RunState::Starting);
+        registry
+            .take_freezes(project, None, None, 1_000)
+            .expect("paused");
+
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
+            Some(forked_on(Harness::Claude, "opus"))
+        });
+        assert_eq!(restarts, vec![old]);
+        let pending = registry.inner.lock().restarts[&old].clone();
+        assert!(pending.resume.is_none(), "nothing to continue");
+        assert_eq!(pending.prompt, "do the thing", "the dispatch, replayed");
+        let inner = registry.inner.lock();
+        let live = &inner.runs[&run];
+        assert_eq!(live.turns, 1, "a replay is not a second prompt");
+        assert_eq!(live.note.as_deref(), Some(RESTARTING_FRESH_NOTE));
+    }
+
+    /// An opencode run continues its harness conversation, and its pool is re-stamped only when
+    /// the pool itself changed — an unchanged pool keeps the run's place in it.
+    #[test]
+    fn an_opencode_restart_continues_the_conversation_and_restamps_only_a_changed_pool() {
+        let pool: Vec<cide_ipc::PoolEntry> = (0..3)
+            .map(|i| pool_entry("openrouter", &format!("model-{i}")))
+            .collect();
+        let forked = |pool: &[cide_ipc::PoolEntry], effort: Option<&str>| {
+            cide_agents::overrides::ChildSettings {
+                harness: Harness::Opencode,
+                pool: pool.to_vec(),
+                model: None,
+                effort: effort.map(str::to_string),
+                providers: Some(Vec::new()),
+                opencode: None,
+            }
+        };
+        let frozen_on_the_pool = |registry: &AgentRegistry, project: ProjectId| {
+            let run = registry.enqueue(opencode_spec(project, "developer"));
+            registry.take_admissions();
+            let old = SessionId::new();
+            registry.bind_session(run, old);
+            {
+                let mut inner = registry.inner.lock();
+                let live = inner.runs.get_mut(&run).expect("the run");
+                live.pool = pool.clone();
+                live.pool_index = 1;
+                live.harness_session = Some("ses_first".into());
+                live.forked_with = Some(forked(&pool, None));
+            }
+            assert!(registry.set_state(None, run, RunState::Running));
+            registry
+                .take_freezes(project, None, None, 1_000)
+                .expect("paused");
+            (run, old)
+        };
+
+        // The pool was edited: the successor starts at the top of the new list.
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let (run, old) = frozen_on_the_pool(&registry, project);
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let edited = vec![pool_entry("anthropic", "claude-sonnet-4-5")];
+        let restarts =
+            registry.plan_restarts(project, None, &thaws, &|_| Some(forked(&edited, None)));
+        assert_eq!(restarts, vec![old]);
+        let pending = registry.inner.lock().restarts[&old].clone();
+        assert_eq!(
+            pending.resume.as_deref(),
+            Some("ses_first"),
+            "opencode's conversation is the id it printed"
+        );
+        {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            assert!(
+                live.pool.is_empty(),
+                "cleared, so the fork stamps the current pool"
+            );
+            assert_eq!(live.pool_index, 0);
+            assert_eq!(live.harness_session.as_deref(), Some("ses_first"));
+        }
+
+        // Only the effort moved: the run keeps its place on the pool it settled into.
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let (run, old) = frozen_on_the_pool(&registry, project);
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
+            Some(forked(&pool, Some("high")))
+        });
+        assert_eq!(restarts, vec![old]);
+        let inner = registry.inner.lock();
+        let live = &inner.runs[&run];
+        assert_eq!(live.pool, pool);
+        assert_eq!(
+            live.pool_index, 1,
+            "sticky: the list is the one the run was arranged on"
+        );
+    }
+
+    /// A conversation a pane is driving is thawed as it stands, and the row says why (M42's
+    /// rule): two harness processes must not write one transcript.
+    #[test]
+    fn a_conversation_open_in_a_pane_keeps_the_settings_it_started_with() {
+        let registry = AgentRegistry::default();
+        let sessions = SessionRegistry::default();
+        let project = ProjectId::new();
+        let (run, old) = a_frozen_run(&registry, project, "sonnet");
+
+        let pty = PtySession::spawn(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("sleep 30"),
+        )
+        .expect("spawn sh");
+        sessions.insert(old, Arc::clone(&pty));
+        registry.note_viewer(
+            &HarnessSession {
+                harness: Harness::Claude,
+                id: old.to_string(),
+                cwd: PathBuf::from("/p/.cide/worktrees/developer-t-1"),
+            },
+            old,
+        );
+
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let restarts = registry.plan_restarts(project, Some(&sessions), &thaws, &|_| {
+            Some(forked_on(Harness::Claude, "opus"))
+        });
+        assert!(
+            restarts.is_empty(),
+            "not restarted underneath the person typing into it"
+        );
+        {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            assert_eq!(live.session, Some(old));
+            assert!(live.frozen.is_some(), "left for finish_thaws");
+            assert!(
+                live.note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("open in a pane")),
+                "{:?}",
+                live.note
+            );
+        }
+        registry.finish_thaws(project, true, &thaws, 2_000);
+        assert_eq!(state_of(&registry, run), RunState::Running);
+
+        pty.kill();
+        wait_exited(&pty);
+    }
+
+    /// Stop pressed while the old child is being wound down: the successor is not forked and
+    /// the run ends, releasing its slot — it would otherwise hold it for ever under a row
+    /// nothing can press.
+    #[test]
+    fn stop_during_a_pending_restart_ends_the_run_instead_of_forking() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let (run, old) = a_frozen_run(&registry, project, "sonnet");
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        registry.plan_restarts(project, None, &thaws, &|_| {
+            Some(forked_on(Harness::Claude, "opus"))
+        });
+        registry.finish_thaws(project, true, &thaws, 2_000);
+
+        // What `stop` does under the lock before it signals.
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&run)
+            .expect("the run")
+            .stopping = true;
+
+        assert!(registry.plan_restart(old).is_none(), "no fork into a Stop");
+        let inner = registry.inner.lock();
+        let live = &inner.runs[&run];
+        assert!(
+            matches!(&live.state, RunState::Failed { reason } if reason.contains("stopped")),
+            "{:?}",
+            live.state
+        );
+        assert!(!live.slot, "released, so the queued sibling may start");
+        assert!(inner.restarts.is_empty());
+    }
+
+    /// A restart the old exit has not yet carried out is snapshotted under the **old** session:
+    /// the conversation is filed there, and a cide restart in that window must resume it, not
+    /// the fresh id nothing was ever written under.
+    #[test]
+    fn a_pending_restart_is_snapshotted_under_the_old_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "cide-pending-restart-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let (run, old) = a_frozen_run(&registry, project, "sonnet");
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        registry.plan_restarts(project, None, &thaws, &|_| {
+            Some(forked_on(Harness::Claude, "opus"))
+        });
+        assert_ne!(registry.inner.lock().runs[&run].session, Some(old));
+
+        registry.write_snapshot_to(&path);
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("written")).expect("json");
+        let saved = file["runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .find(|saved| saved["run"] == serde_json::json!(run.to_string()))
+            .expect("the run");
+        assert_eq!(saved["session"], serde_json::json!(old.to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Interrupted road makes the same choice about a pool edited while cide was down: the
+    /// restored position is into a list that no longer exists, so the resume re-stamps; an
+    /// unchanged pool keeps the place the snapshot preserved.
+    #[test]
+    fn resuming_an_interrupted_run_restamps_a_pool_edited_while_cide_was_down() {
+        let pool: Vec<cide_ipc::PoolEntry> = (0..3)
+            .map(|i| pool_entry("openrouter", &format!("model-{i}")))
+            .collect();
+        let interrupted_on = |registry: &AgentRegistry, project: ProjectId| {
+            let run = registry.enqueue(opencode_spec(project, "developer"));
+            registry.take_admissions();
+            registry.bind_session(run, SessionId::new());
+            registry.set_state(None, run, RunState::Interrupted);
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&run).expect("the run");
+            live.pool = pool.clone();
+            live.pool_index = 2;
+            run
+        };
+        let settings = |pool: &[cide_ipc::PoolEntry]| cide_agents::overrides::ChildSettings {
+            harness: Harness::Opencode,
+            pool: pool.to_vec(),
+            model: None,
+            effort: None,
+            providers: Some(Vec::new()),
+            opencode: None,
+        };
+
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = interrupted_on(&registry, project);
+        let edited = vec![pool_entry("anthropic", "claude-sonnet-4-5")];
+        registry
+            .requeue_interrupted(project, None, None, &|_| Some(settings(&edited)))
+            .expect("requeued");
+        assert_eq!(state_of(&registry, run), RunState::Queued);
+        assert!(registry.inner.lock().runs[&run].pool.is_empty());
+        assert_eq!(registry.inner.lock().runs[&run].pool_index, 0);
+
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = interrupted_on(&registry, project);
+        registry
+            .requeue_interrupted(project, None, None, &|_| Some(settings(&pool)))
+            .expect("requeued");
+        assert_eq!(registry.inner.lock().runs[&run].pool, pool);
+        assert_eq!(registry.inner.lock().runs[&run].pool_index, 2);
+    }
+
+    /// The two openings name different events, because the model is about to reconcile a
+    /// conversation with a tree and "cide restarted" on a machine that never went down is a
+    /// false lead.
+    #[test]
+    fn the_continuation_line_says_which_kind_of_restart_it_was() {
+        let task = TaskId("t-7".into());
+        let after_cide = continuation_prompt(Some(&task), Some("Tabs"), None, Restarted::Cide);
+        assert!(
+            after_cide.starts_with("cide restarted while you were working."),
+            "{after_cide}"
+        );
+        let after_settings =
+            continuation_prompt(Some(&task), Some("Tabs"), None, Restarted::Settings);
+        assert!(
+            after_settings.contains("new model settings"),
+            "{after_settings}"
+        );
+        for line in [&after_cide, &after_settings] {
+            assert!(line.contains("t-7 (Tabs)"), "{line}");
+            assert!(line.contains("git status"), "{line}");
+        }
     }
 }

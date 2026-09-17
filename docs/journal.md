@@ -9599,6 +9599,136 @@ package that may not exist is an `install_hint` pointing at a 404. `docker-langs
 the Compose entry.
 
 
+## Resume on the settings as they stand, and the override that changed nothing
+
+The question was ordinary: pause every agent, switch a role's provider, model or context
+limit, resume — does the resumed run use the new settings or the ones it was paused with? The
+answer was *the old ones*, and for a reason no amount of settings work could have changed. Pause
+is a mark and a `SIGSTOP`; resume is a `SIGCONT`. A signal cannot alter a process's argv or its
+environment, and those are where every setting a harness reads had been fixed at the fork:
+`--model` and `--effort` for a `claude`, `--model`/`--variant` and the whole
+`OPENCODE_CONFIG_CONTENT` document (providers, keys, base URLs, the per-model `limit.context`
+and `limit.output`) for an opencode. A `claude` run is one process for its whole life, so the old
+settings held until the run ended. An opencode run is one process per turn, so the *next* turn
+re-read the provider document — but the pool and the run's place in it are stamped at the first
+fork and deliberately never re-read, so the model stayed too. Only a run that had not started, or
+one interrupted by a cide restart, ever saw a new setting.
+
+Reading that path turned up a second thing, older and worse. `cide_agents::overrides::resolve`
+had computed `model` and `effort` — the Settings screen's per-role Model and Effort override,
+folded over the file's own — since the day overrides existed, and nothing read them. The one
+caller took `harness`, `pool` and `refusal` off the result and handed the harness the file's own
+`LoadedAgent`; every harness reads `plan.agent.def.model` and `plan.agent.effort`. So the two
+fields wrote an override file, drew a value in the panel, and changed no child. Only the pool and
+the harness overrides had ever done anything. The fix is a fold, `Resolved::apply`, made once in
+`start_child` before the plan is built: a borrowed copy of the definition with the two values
+where the harnesses already look. It is a fold and not two more `RunPlan` fields because the next
+harness will read the definition exactly as the four existing ones do, and a fold at the one
+place overrides are resolved cannot be forgotten by it.
+
+### What Resume does now
+
+Resume compares. Every fork records what the child was forked with — `ChildSettings`, one
+comparable value: the resolved harness, the pool as configured, the single model, the effort,
+and for opencode alone the provider document, which is where a context limit lives. Equality is
+the whole interface: at Resume the registry resolves each frozen run's role again, off the
+workspace and the project's `.cide/` before any lock, and asks whether the child it would fork
+*now* is a different child. If not, the run is thawed in place, exactly as before — a short
+pause must never cost the in-flight turn, and restarting every resumed run would. If so, the run
+is **restarted**: put on a new child continuing the same conversation, through the road a pool
+failover already takes (`fork_failover` → `bring_up`), which keeps the slot, the worktree and
+the screen, with a separator in the pane saying why.
+
+The ordering is the design, and it is written out on `plan_restarts`:
+
+- **Rebind first, under the lock that decides.** The run is bound to a fresh session before any
+  signal is sent. From then on the dying child's output, its hook frames and its exit find no
+  run that owns their session — `respawn`'s rebind-before-kill rule, which is what makes it safe
+  to `SIGCONT` a process cide is about to kill (a stopped process does not act on SIGHUP or
+  SIGTERM, so the thaw has to happen).
+- **The successor is forked from the old child's exit**, by `plan_restart`, which runs *first*
+  in `watch_exit_with` because the run no longer owns the old session and `plan_failover` could
+  not find it. The pending restart lives in a table keyed by the old session — the cost of the
+  rebind, and the only way the exit handler, which knows only the session it was attached to,
+  can find its way back to the run. Taken and not read, like the failover latch: one exit, one
+  successor.
+- **A claude continuation under a fresh id is a fork.** `--resume <old> --fork-session
+  --session-id <new>` — the one shape in which naming an id beside a resume is legal, and the
+  pair without the fork flag is exactly what 2.1.227 refuses (`cide_claude::session`'s header).
+  `respawn_spec` on the claude harness now decides between a plain resume and a fork by whether
+  the conversation it is handed *is* the plan's session; the restored-from-snapshot road still
+  rebinds to the previous id and gets the plain resume it always had. The old transcript
+  survives untouched, which is a better property than the same-id continuation would have had.
+- **A conversation a pane is driving is not restarted** (M42's rule): the row says so and the
+  run is thawed as it stands. Two harness processes must not write one transcript, and the
+  person typing into that pane outranks the settings screen.
+- **A changed pool is re-stamped** from the top of the list the person arranged; an unchanged
+  pool keeps the run's place in it. This is the one place the stickiness rule on
+  `LiveRun::pool` yields, and it yields to a person's Resume and never to a failover or a
+  follow-up. The Interrupted road makes the same choice for a pool edited while cide was down,
+  where the restored position would otherwise be into a list that no longer exists.
+- **A frozen child that had not begun its turn** is replayed fresh on the new settings, under a
+  new conversation: there is nothing to continue, and a fork of an empty conversation would be
+  a lie about continuing it.
+- **Stop during the window** ends the run instead of forking: `stop` signals a session that has
+  no child yet, so nothing else would, and a run holding a slot under a row nothing can press
+  is the failure. And a **cide restart in the window** snapshots the run under its *old*
+  session, where the conversation is actually filed, not the fresh id nothing was written under.
+
+### As reported from a chair: the model a continued session keeps
+
+The first report back read *"resuming, but nothing in logs; it still waits for the 127.0.0.1
+model, but I switched opencode's default to the DeepSeek API"*. Two findings, and only the
+smaller one was the comparison.
+
+The smaller: the switch was made in `~/.config/opencode/opencode.jsonc` — opencode's own
+`model` key — and that file was not part of what Resume compared, so the roles (which name no
+model, under no pool and no override) fingerprinted identically and every run was thawed in
+place, silently. The plain-thaw path logged nothing, which is what "nothing in logs" was: a
+decision with no sentence. Every outcome of `plan_restarts` now says itself once at info, with
+the field names that moved.
+
+The larger, found in opencode's own log: the seven children on screen had been forked at 21:56,
+*after* the 21:08 switch, through the interrupted-run road, and were streaming to
+`providerID=vllm modelID=qwen3.8-27b-long` — while a fresh session forked at 21:23 had gone to
+deepseek. **A continued `--session` keeps the model it last used**, whatever the configuration
+now says, and only an explicit `--model` moves it. So a role naming no model was a role whose
+model no continuation could change: not a follow-up, not a resume after a cide restart, and not
+the restart this milestone exists for — a `--session` fork with no `--model` would have put the
+run straight back on the model it was paused on, fingerprint or no fingerprint.
+
+The fix is that every opencode child gets `--model`: the pool's candidate, the role's or the
+override's, and failing all three **opencode's own default**, which is what a fresh child would
+have picked anyway. cide asks the binary for it — `opencode debug config` prints the resolved
+merge in half a second, with the same environment a child gets, asked *without*
+`OPENCODE_CONFIG_CONTENT` so the answer is the user's configuration alone — rather than
+parsing `opencode.jsonc` and the project files and `OPENCODE_CONFIG` in Rust, a copy of
+opencode's precedence that would be right until the release that moved it. `Facts` reads it
+once per fork or Resume, lazily, so a `claude` fork never pays the half second;
+`Resolved::with_default_model` folds it in only for opencode, only under no pool, and only where
+the override and the role are both silent. The document's `model`, `small_model` and `provider`
+block are in the fingerprint as well, so an edit to that file under a pause restarts the run;
+its keybinds and theme are deliberately not, because a restart costs the in-flight turn.
+
+### What is NOT verified
+
+The chair's second Resume has not happened yet at the time of writing: the fix above was made
+against the log and the argv, and the run that will show whether a `--session` continuation
+with an explicit `--model deepseek/deepseek-flash` leaves vLLM behind is the user's to press.
+Beyond that, nothing here has been seen on a display, and no real harness has been restarted
+through this road from a running app. What is pinned: the decision half and the exit half of the restart,
+driven app-free with an injected resolver (`cargo test -p cide-app -- agents`); the fingerprint's
+equality rules and the fold (`cargo test -p cide-agents`); and both claude continuation shapes as
+argv (`respawning_under_a_fresh_id_forks_the_conversation`). What is not: that a `claude` killed
+mid-turn by `pty.kill()` has flushed enough transcript for `--fork-session` to inherit the turn
+in flight — the Interrupted road has lived with the same exposure since the snapshot landed, and
+the shutdown ladder's graces are what it relies on. The `--fork-session` shape itself is checked
+against the installed CLI by `cide-claude`'s `#[ignore]`d `real_session_args`, which costs
+nothing and was run here: both of its cases pass against the installed `claude`, so the fork
+argv this road builds is one the CLI accepts. The quota-free `real_opencode` pair (a provider
+at a closed port) was run as well and passes.
+
+
 ## The chrome audit
 
 M3's stated acceptance criterion was a screenshot diff against the design mock at 1440x900 in
