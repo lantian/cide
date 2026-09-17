@@ -2562,6 +2562,7 @@ mod tests {
                 conversation_since: None,
                 continues: None,
                 title: "secondary : claude".into(),
+                docker: None,
             },
         )
         .expect("split in a second claude pane");
@@ -2579,6 +2580,7 @@ mod tests {
                 conversation_since: None,
                 continues: None,
                 title: "fixture : bash".into(),
+                docker: None,
             },
         )
         .expect("split in a shell pane");

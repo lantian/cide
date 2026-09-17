@@ -488,6 +488,54 @@ stale-latch window after switching from a non-Latin layout to a Latin non-US one
 Latin letter is typed. Alt+letter in a terminal under Russian, which changed on purpose. And
 macOS, where Option is a level-3 shift and `latinRewrite`'s `altIsChord` must be `false` —
 `docs/platforms.md` carries it.
+## The 0.8.0 `.dmg` opens to "damaged", and what is not verified
+
+> *"I've downloaded cide_0.8.0_aarch64.dmg from github (CI build) and it's broken — need to
+> understand why we building broken dmg in CI."*
+
+It was not broken as a build. The bundle inside it was a correct release build — arm64, the Vite
+bundle embedded, all three sidecars present and answering `--version` — and launched under a
+throwaway profile it opened its window and completed the IPC handshake. What it lacked was a
+signature. The macOS job sets no signing secrets, and `tauri-bundler` with no identity to
+resolve **skips signing altogether**; it does not fall back to an ad-hoc seal. So the bundle
+carried nothing but the linker's per-binary ad-hoc stamps and no `_CodeSignature/CodeResources`
+at all, and both `codesign --verify` and `spctl --assess` answered the same sentence: *code has
+no resources but signature indicates they must be present*. Gatekeeper renders that as **"cide is
+damaged and can't be opened"** with *Move to Trash* as the only button. The preflight had
+predicted this in a comment ("nobody has run this"), warned about it on every build, and the
+release notes told the user to `xattr -dr com.apple.quarantine` — an accurate description of the
+outcome, written instead of the fix.
+
+The fix is one character. `crates/cide-app/tauri.macos.conf.json` now names
+`bundle.macOS.signingIdentity: "-"`, codesign's ad-hoc identity; `tauri-macos-sign` passes it
+through as `codesign --force -s - --options runtime`, signs the sidecars inside-out and then the
+bundle, and with no `APPLE_ID` set logs *skipping app notarization* and carries on. The shipped
+0.8.0 bundle re-signed by hand exactly that way passes `codesign --verify --strict --deep`,
+satisfies its designated requirement, and — quarantined with a Safari attribute — gets the
+ordinary *"Apple could not verify"* dialog, which System Settings › Privacy & Security follows
+with **Open Anyway**. Not notarised on either road; only the second is walkable without a
+terminal. `APPLE_SIGNING_IDENTITY` in the environment outranks the overlay, as `tauri-cli` ranks
+them, so a Mac with a real certificate is not held to it.
+
+The preflight learned the ladder. With nothing in the environment and `-` in the overlay it is
+an `[ok]` that quotes the dialog an ad-hoc seal produces; with a named identity it is `[ok]` plus
+the notarisation warning; with nothing anywhere it is the old `[warn]`, now saying that this is
+what 0.8.0 shipped as and naming the way back. One new `[fail]`: `APPLE_CERTIFICATE` set without
+`APPLE_SIGNING_IDENTITY`, because the bundler checks that the imported certificate's *name
+contains* the configured identity, a Developer ID name has no dash in it, and the refusal
+otherwise arrives after the `.app` is built. `the_checked_in_overlay_signs_ad_hoc` asserts the
+key against the real file, because removing it fails no build anywhere — the `.dmg` uploads and
+the first person to find out is whoever downloads it. The release notes and `docs/platforms.md`
+now describe the Open Anyway road rather than the `xattr` one.
+
+**What is not verified.** No `.dmg` has been built by `cargo tauri build` with this key: the
+seal was checked by re-signing the shipped bundle by hand, `--options runtime` included, and
+launching the result for fifteen seconds under a throwaway profile — window up, IPC handshake,
+login-shell PATH probe, clean shutdown. That the bundler's own invocation produces the same seal
+rests on reading `tauri-macos-sign` 2.3.4, not on a run. The Gatekeeper *dialog* was never
+clicked through either: `spctl`'s verdict moved from the integrity failure to the plain
+`rejected` every non-notarised app gets, which is the difference between the two sentences, but
+nobody has yet seen Open Anyway appear for cide. The next release is that test.
 
 ## Dispatch without a task, and where a run reports (M40), and what is not verified
 
@@ -8559,6 +8607,998 @@ an identical layout. The editor and terminal staying put was checked in the ship
 and by the gates, not on screen: switching tabs needs input injection this desktop has no tool
 for. The chrome audit below has not been re-run to a clean result since the sweep.
 
+## Docker: the daemon, the panel, and what is not verified (M41)
+
+The ask was "a Docker extension" — Dockerfile support plus IDEA's container tool window. The first
+finding reshaped the whole plan and is worth stating before anything else, because it is the kind
+of thing that gets discovered three days in.
+
+**cide's extension system cannot host this.** ADR 0010 puts extension code in a Web Worker whose
+whole capability surface is five entries in `ui/src/ext/protocol.ts` — `readFile`, `activeText`,
+`reveal`, `outline`, `diagnostics`. No process, no socket, and `tauri.conf.json`'s CSP deliberately
+omits `cide-ext:` from `connect-src`, so a worker cannot `fetch` at all. `Capability::ProcessSpawn`
+exists but unlocks exactly one thing: the declarative `languageServers` list. An extension can
+parse a `docker-compose.yml` and draw a tree of what it says; it cannot ask the daemon a single
+question. So this is built in, and ADR 0010 is left exactly as it was. ADR 0013 records the rest.
+
+### What landed
+
+`cide-docker`, the Engine API over a socket via `bollard` — held to the `lsp-types` rule, a
+dependency of one crate that never re-exports it. `cide_ipc::docker` as the wire, `cmd/docker.rs`
+as three commands, `docker_state.rs` as the coalescer behind `cide://docker-changed`, and a sidebar
+panel with the container list grouped into compose stacks, an image list, lifecycle buttons and a
+context switcher. `cide-headless docker` is the no-tauri proof and the way to see which daemon a
+launch resolves to.
+
+### The connection ladder is the part that earns its length
+
+`/var/run/docker.sock` is the path every example uses and it is not where the daemon is on a great
+many working machines. On the one this was written on it does not exist at all: `docker context ls`
+reports `colima *`, `colima-ozon` and `default`, and the live socket is under `~/.colima`. A build
+that assumed the constant would report "Docker is not running" on a machine where `docker ps`
+works — wrong, and wrong in a way that blames the user. So the context store is read:
+`~/.docker/config.json` names the current context and each one's metadata lives in
+`~/.docker/contexts/meta/<sha256 of its name>/meta.json`. The hash is undocumented and is pinned in
+a test against that machine's two real directory names.
+
+### Three bugs the real daemon found that the tests had not
+
+Written down because all three are the same shape — a synthetic fixture that agreed with the code
+rather than with Docker.
+
+**`health` has two spellings for "no healthcheck".** The generated enum has an `EMPTY` variant, and
+a test asserted it was filtered. A live Docker Engine sends `"none"` for every container whose
+image declares no healthcheck, which is most of them, and the panel drew a `[none]` badge on every
+ordinary container on the machine. Both are filtered now, with the second's assertion kept separate
+so the reason survives.
+
+**A published port is reported twice.** On an IPv6-capable host the daemon reports each publish
+bound to `0.0.0.0` *and* to `::`. Both mean "every interface" and are dropped as saying nothing,
+which left two rows equal in every field — `5433->5432/tcp 5433->5432/tcp`. Deduplicated on the
+pair actually shown, and deliberately not further: a port on `127.0.0.1` beside one on a LAN address
+is two genuinely different facts, and it is the one somebody checks before asking whether a database
+is exposed.
+
+**An untagged image carries the string `<none>:<none>`**, not an empty tag list.
+
+### What the gates caught
+
+`check:theme` refused five invented tokens (`--ok`, `--warn`, `--danger`, `--danger-bg`,
+`--text-faint`) that would have taken their `var()` fallbacks in silence; the palette spells them
+`--green`, `--yellow`, `--red`, `--faint`. `check:ui-icons` refused the vendored `container` mark
+until something drew it. Both are exactly what their headers say they are for.
+
+### What is NOT verified
+
+**Nothing in this milestone has been seen on a display.** Every claim below the Rust layer rests on
+`check:docker` (the model under node) and `check:docker-render` (the five stories through Vite's SSR
+bundle), and a story can pass every digest while the panel is wrong in a way only a person sees.
+Specifically unconfirmed: the rail button's mark at every UI scale, the action strip's hover reveal
+(SSR has no pointer, so the check asserts only that the buttons are in the markup), the context
+switcher's `<select>` under both themes, and whether a second window updates from
+`cide://docker-changed` — the coalescer is exercised by no test at all. Run `./run.sh`, open the
+panel, stop a container and watch another window; then `colima stop` and confirm the panel degrades
+to a sentence with a working Retry rather than throwing into `PanelBoundary`.
+
+**Linux is untested for this feature specifically.** The ladder was verified against colima on
+macOS, which is the awkward case and therefore a good one — but `$XDG_RUNTIME_DIR`'s rootless rung
+and the `docker` group's `EACCES` sentence have been read and not run. `docs/platforms.md`'s
+standing caveat applies with more force than usual here, because the socket path is the feature.
+
+**M42–M45 are not started.** Log panes and exec panes need a `Transport` seam in `cide-pty`;
+inspect tabs, volumes, networks and compose actions are M43; the container filesystem browser is
+M44; and the Dockerfile language — today a Dockerfile still highlights as *shell*, because
+`"dockerfile"` sits in the shell entry's `filenames` at `crates/cide-ipc/src/lang.rs` — is M45.
+
+
+## Docker, the rest of it: streams, stacks, files, and the language (M42–M45)
+
+M41 read the daemon and drew a panel. These four made it usable.
+
+### M42 — an exec pane and a log pane are real `cide-pty` sessions
+
+The one structural change in the programme, and the one that paid for itself immediately.
+
+`cide-pty` gained a `Transport` seam. Everything downstream of the reader thread — the bounded
+channel, the coalescer, `FLUSH_BYTES`/`FLUSH_INTERVAL`, the vt100 mirror, the sink list,
+`CreditPolicy` and its watchdog — was already a statement about *a stream of terminal bytes*
+rather than about a pty; only four things were genuinely pty-specific (the `master` handle, the
+killer, the reaper, the jobs watcher). `PtySession::spawn` is unchanged in behaviour and is now a
+thin wrapper over `PtySession::connect`, which takes a reader, a writer, a transport and a way to
+be waited on. 54 `cide-pty` tests passed unmodified across the refactor, which is the evidence
+that the seam is where the seam already was.
+
+So `docker exec -it` and `docker logs -f` are ordinary sessions. They get attach/detach, park
+across a project switch, scrollback, the reattach snapshot, credit and — the one that is a
+correctness requirement rather than a nicety — the coalescer. A log follow has the PTY's exact
+traffic profile, and Tauri routes a `Channel` payload under 1024 bytes through `webview.eval` as a
+JSON array of decimal numbers on the GTK main loop.
+
+Two things that had to be said out loud in the code rather than discovered:
+
+**There is no "kill an exec" in the Engine API.** Docker exposes create, start, inspect and
+resize, and nothing that stops one. `ExecTransport::kill` drops the input side, the daemon
+delivers EOF on stdin, and a shell exits — but a program that ignores stdin does not. Closing a
+pane running `sleep 600` in a container leaves it running. A pty pane would have sent SIGHUP.
+
+**A container's pane is a `Shell` pane with `Pane::docker` set**, not a `PaneKind` of its own:
+every gesture — split, move, detach, close, the grab handle — behaves identically, so a new kind
+would have been an arm in three crates and the webview, each a copy of the `Shell` one. It is
+durable rather than a spawn plan, because `spawnPlans.ts` lives in the clicking window's realm and
+a restored pane that had forgotten would open a **local shell** where the user left a container's.
+
+### M43 — inspect, volumes, networks, and the compose exception
+
+`TabKind::Docker` is a read-only `inspect` document in an `EditorSurface`. The raw JSON and not a
+modelled view, deliberately: `inspect` is the one place everything is worth showing, cide cannot
+know which field somebody is hunting, and the field they want is disproportionately likely to be
+one Docker added last release. `tab_outlives_close` is **false** — a tab restored a day later
+would be an apology about an id that no longer resolves.
+
+Compose is ADR 0013's stated exception and behaves as designed: stacks are grouped from
+`com.docker.compose.project` labels (pure Engine API), and `up`/`down`/`restart` run the CLI
+plugin. When the plugin is missing the stacks **still list** and only the buttons go quiet, with
+the reason on screen — asserted by a sixth render story.
+
+The load-bearing argument in the whole lane is `-p <project>`: without it Compose derives the
+project name from the working directory, so a stack brought up from a directory that has since
+been renamed is a *different* project and `down` reports success having stopped nothing.
+
+### M44 — the container filesystem, and the API gap behind it
+
+**The Engine API has no directory listing.** `GET /archive?path=X` returns a tar of the whole
+subtree, so asking for `/` tars the container; `HEAD` describes one entry and nothing about its
+children. There is no third endpoint.
+
+So listing runs `ls -lAp` through M42's exec machinery and reading one file is `GET /archive` —
+which needs no shell, so a distroless image cannot be *browsed* and its files can still be *read*
+by path. `-p`'s trailing slash decides what is a directory, never the mode string: BusyBox pads
+differently, an ACL adds `+`, SELinux adds `.`, and a symlink to a directory is `l` and still a
+directory. The parser is lenient by design — the long format is not a standard — and both GNU and
+BusyBox dialects are pinned.
+
+A list with a breadcrumb rather than a tree, and the stylesheet argues it: cide has two file trees
+and neither is reusable, a third would be a third implementation of expand/collapse, focus and
+virtualisation, and every expansion here is a round trip into a container.
+
+Read-only. `PUT /archive` exists and cide does not call it: an edit written back is lost the
+moment the container is recreated, which under compose is the ordinary way it restarts.
+
+### M45 — Dockerfile stops being a shell script
+
+`"dockerfile"` sat in the shell entry's `filenames`, so a `FROM` line was highlighted as a shell
+command that happened to start with a word. It has its own language now, and four things in the
+grammar are why a keyword list could not have done it: an instruction is a keyword **only at the
+start of a line** (`RUN echo run` must light up once), `# syntax=` is a directive and not a
+comment, `AS` names a stage, and `--mount=`/`--from=` are flags. All four are asserted in
+`check:editor` against a corpus.
+
+Two servers were added to `builtin_servers()`, and one field to `LanguageServerDef`:
+`init_options`, sent whatever the provenance, beside the existing lane that sends cide's own
+fork-specific options only to a bundled build. That is what lets a stock `yaml-language-server`
+be handed the Compose schema — it has no idea a Compose file is a Compose file otherwise.
+
+### M46 — the panel moved, and two bugs it took a running app to find
+
+Reported from an actual Mac, which is exactly the half `check:docker-render` cannot reach: the
+panel was empty and Refresh raised *"null is not an object (evaluating 'c.compose.project')"*.
+
+**`#[ts(optional)]` makes the type lie.** It changes the emitted TypeScript — `compose?:
+ComposeMembership` — and nothing about what serde writes. So an absent value went out as
+`"compose": null` while the declared type promised the key was missing; `container.compose ===
+undefined` was false, and the next line threw. Every container with no compose labels hit it,
+which on most machines is most of them.
+
+Three fixes, and the belt-and-braces is deliberate because the type system cannot see the
+discrepancy: every `#[ts(optional)]` in `cide_ipc::docker` is now paired with
+`skip_serializing_if`, `adapt.ts` normalises `null` to `undefined` at the seam, and
+`groupByCompose` uses `== null` — the one loosened comparison in that file, with the reason
+written beside it. Pinned in three places: a Rust test over a constructed row, an ignored test
+over a **live daemon's** board, and a `check:docker` case that was confirmed to fail when the
+model's comparison is put back.
+
+The live-board test is worth its own line. It first grepped the serialised board for `null` and
+failed on a real machine — because Docker's `none` network is driven by the **`null` driver**, so
+`"driver":"null"` is a legitimate value in every board anyone will ever have. It walks the
+document structurally now and names the offending key paths.
+
+**And the panel moved to the bottom tool window**, which was the other half of the report. It is a
+fixture there like Log: always present, never closable, second in the row — ahead of the history
+tabs the user opened and behind Log, because a fixture that moved as history tabs came and went
+would be a target that is never in the same place twice. `DOCKER_TAB` is a sentinel id and
+`isDockerTab` is the guard that keeps it away from `tool_window_activate`, which takes a uuid.
+
+The selection is webview state and is **not** persisted. That is not the contributed-tab argument
+— Docker cannot be uninstalled — it is narrower: `ToolWindowState::active` is an optional uuid in
+`workspace.json`, and widening it to carry a builtin sentinel is a wire change, a migration and a
+new way for a stored value to be invalid, for a tab that is one click from the one worth coming
+back to.
+
+The `container` rail icon went with the rail button. `check:ui-icons` did **not** notice, and the
+reason is recorded in `vendor-ui-icons.mjs`: `DockerPanel.tsx` draws icons and holds the string
+`'container'` for an unrelated reason (`InspectTarget`'s `kind`), which is enough to put it in the
+`loose` set that exempts an entry from the dead-icon sweep.
+
+### An intermittent `cide-git` failure, recorded and not chased
+
+Surfaced repeatedly while running the suite for M46 and **not** caused by any of this work —
+`crates/cide-git` is untouched. Written down because the next person to see it should not start
+from zero, and because the shape of it is unusual enough to be worth a paragraph.
+
+`tests/patch_props.rs::synthesized_patches_agree_with_git_apply_cached` fails roughly **one run in
+three, run alone**, which is the part that does not fit: its cases come from `for seed in
+0..total` over a seeded `Rng`, so it should be perfectly deterministic. The failing case is stable
+when it does fail:
+
+```
+seed 484 [rename] r_new.txt(Renamed, Crlf, trailing=true):
+  whole-file staging of r_new.txt diverged from `git add`
+  cide  b40f10bda6883d4f88ba652fd4833c72500547b0
+  git   57d1768a7890ffcb8d13c1feac74b8c75afdd378
+```
+
+The test leaves its repositories behind on failure, and the preserved one shows `r_new.txt` with
+CRLF line endings and git's index holding the `57d1768a` blob — the `git add` side. So cide's
+whole-file staging produced different bytes for a renamed CRLF file, in some runs and not others.
+
+What was ruled out: machine load (it fails alone as readily as under `--workspace`), a dirty
+`TMPDIR`, and `core.autocrlf` (unset globally, `false` in the test repo). What was not
+established: where the non-determinism enters. Nothing obvious in `tests/support` reads a clock
+or a thread RNG; the only per-run input is the pid, which names the scratch directory.
+
+It is either a real CRLF/rename staging bug that only some interleaving exposes, or a
+non-determinism in the harness that makes seed 484 generate different bytes between runs. Both are
+worth knowing and neither is a guess worth acting on, so this records the evidence rather than a
+conclusion. `CIDE_GIT_CASES` bounds the corpus if somebody wants to bisect toward it.
+
+### What is NOT verified
+
+**Nothing in M42–M45 has been seen on a display**, and that is a larger gap than it was for M41
+because three of these four are *panes and tabs*. What the exec and log roads do have is a real
+daemon behind them: `cargo test -p cide-docker -- --ignored` opens a shell in a live
+`postgres:16-alpine`, runs a command, and asserts the output reached the vt100 mirror through the
+coalescer and the sink list; it follows that container's logs; it lists `/` (19 entries), reads
+`/etc/hostname`, and confirms a directory, a binary and a symlink each refuse by name. That is the
+machinery. What no test touches is whether the *pane* paints it.
+
+Specifically unconfirmed: that a docker pane survives a detach into its own window and a park
+across a project switch (the seam says it must — nothing has watched it); that a restored
+`Pane::docker` reopens against a container that no longer exists and lands somewhere sensible;
+that the inspect tab's `EditorSurface` colours JSON at every UI scale; that the file browser's
+breadcrumb and viewer split behave when the pane is short; and that a Compose `up` taking two
+minutes leaves the panel usable rather than merely `busy`.
+
+**Two real bugs were found by running against the daemon after the unit tests passed** — the same
+shape as M41's three. `/bin/sh` on Alpine is a **symlink**, which `GET /archive` returns as a link
+entry with no content, and the reader fell through to "held no file cide could read"; it names the
+target now. And a `format!` line-continuation had been eaten, so a refusal printed twenty spaces
+mid-sentence.
+
+**One gap left open on purpose.** `Dockerfile.prod` — the other multi-stage convention — resolves
+to plain text. `languages.ts::lookup` tries the whole name and then the text after the last dot,
+so it matches neither. Closing it means a third rung in that lookup, which changes how *every*
+language resolves and would quietly start matching `Makefile.am` and `data.json.bak`. That is a
+decision about the file-type registry, not about Docker, and it is pinned as plain text in
+`check:editor` so it is a recorded gap rather than a surprise.
+
+## Docker, as reported from a chair (M47–M48)
+
+Eight complaints, in the user's own words, after actually using the panel. Every one of them is a
+thing no check could have found, and three turned out to be features that had never worked at all
+rather than features that looked wrong.
+
+### M47 — the eight
+
+**Switching context broke it, permanently.** The switcher sat on its own row above Refresh and,
+once switched, could not switch back. Both halves are fixed: it is in one row with Refresh, and
+the endpoint is parsed by `connect::Endpoint::parse` on the Rust side rather than passed through
+as a string — so `ssh://` is refused by name instead of reaching a code path that had never been
+told it cannot be reached.
+
+**Groups were not collapsible.** They are now, collapsed by default **except the one holding
+running containers** — `initiallyOpen` is the rule and it is import-free so `check:docker` drives
+it. A panel that opens with forty stopped containers expanded is a panel nobody scrolls.
+
+**Logs opened without follow.** They follow now.
+
+**Clicking a row did nothing.** It opens an IDEA-style detail pane on the right, and the ports in
+it are **editable**. That last one needs its own paragraph.
+
+Docker cannot change a running container. There is no endpoint, and there never has been: a port
+map is fixed at create time. So "edit the ports" can only mean *remove and create again*, which
+gives the container a **new id** — every handle anything else is holding goes stale. The user's
+instruction was *"recreate, silently like IDEA"*, and that is what `cide_docker::detail::recreate`
+does. It names **every** field of `ContainerCreateBody` rather than spreading
+`..Default::default()`, which is not style: a field left to its default is a setting silently
+dropped from the user's container, and the list of them is long enough that a reader has to be
+able to check it against the inspect output. `.v(false)` on the remove, or the volumes go with it.
+
+**`dialog.confirm not allowed. Command not found`** on every remove. Tauri intercepts
+`globalThis.confirm` and routes it to the dialog plugin, which this window's capability file does
+not grant — so the browser primitive that works everywhere else in the world throws here. It is a
+rendered `ConfirmDestructive` now, which is the same answer `changeBars` reached for a different
+reason: a dialog that is a component can be styled, themed and checked, and one that blocks a
+thread cannot.
+
+**Compose projects were written as "not a compose".** Grouping read the label correctly and the
+*label* was absent — see M46's `#[ts(optional)]` entry, of which this was the last unfixed
+symptom.
+
+### M48 — Compose from a file, and the container filesystem's menu
+
+**The file explorer had no context menu.** It has one: *Open*, *Save to…*, *Copy path*, *Info*. A
+symlink offers only the last two, for `activate`'s reason — `GET /archive` does not follow one, so
+an open refuses and a download hands back an empty link entry.
+
+*Save to…* opens its dialog in **Rust**, through `tauri_plugin_dialog` on the `WebviewWindow`,
+following `cmd::project::project_pick`. Not the webview picker, and the reason is the same wall
+`globalThis.confirm` hit one milestone earlier: the JS-side picker is capability-gated and this
+app does not grant it. The host API is neither gated nor resource-backed. A directory comes out as
+a tar, because the Engine API has no recursive read that is not one. A cancelled dialog answers
+`null` and says **nothing at all** — cancelling is an answer, not a failure.
+
+*Info* is why `ContainerEntry` grew `mode`, `owner` and `modified`. All three are kept as the
+**strings `ls` printed**. The mode especially: BusyBox, GNU and the ACL/SELinux suffixes (`+`,
+`.`) all spell it differently, and a mode cide half-understood would render as a *wrong*
+permission set rather than an unfamiliar one — `ContainerRow::state`'s rule applied to the one
+field where being wrong is a security claim. `modified` is not a timestamp either, because `ls`
+prints the *year* instead of the time past six months: there is no instant to recover, and
+inventing one would date half a listing to midnight.
+
+**Compose actions on a compose file, across four surfaces**, which is what the user asked for and
+chose: the file tree's context menu, the editor's gutter, the command palette, and the output in a
+pane. One runner behind all four (`chrome/composeRun.ts`), because the gesture is identical and
+the ordering inside it is delicate in exactly one place — the plan is resolved **before** the
+split, so a machine with no Compose gets the sentence naming what to install *instead of* an empty
+pane titled `compose up`.
+
+The pane is the piece that unlocked the rest. `ComposeAction` used to stop at `up`, `down` and
+`restart`, and said so in these words: *there is no `build`, `pull` or `run`, because each of those
+is a long-running job with output worth watching, which is a pane and not a button — and until
+there is somewhere to watch it, a button that silently spends four minutes is worse than no
+button.* M48 built that somewhere, so the constraint is lifted rather than argued away. `Recreate`
+joins them as its own variant rather than a flag, for the reason the detail pane already paid for:
+Docker cannot change a running container, so *recreate* is the only verb that answers "I edited
+this file, apply it". `is_quick()` is where the split lives — the panel's buttons wait for an
+answer and may only offer bounded verbs; `build` and `pull` belong to the pane road, and
+`check:docker` scrapes that `matches!` arm and asserts the panel's list equals it in **both**
+directions.
+
+A compose pane is an **ordinary shell pane**. `SplitIntent::Compose` carries the argv, Rust reads
+only the title off it and stores none of it, and `session_spawn` does the rest — so the job watcher
+lights the pane dot when the run ends, the proxy environment reaches a `pull`, Ctrl+C reaches the
+child, and detaching into a window loses nothing. Storing the argv was considered and is the one
+outcome worth designing against: a restored pane would run `docker compose up` at launch, against a
+file that may have changed, on a machine the user has only just unlocked.
+
+`-p <project>` became optional, and that is a correctness change rather than a convenience. From
+the panel the name came off a container's own label and passing it is not optional. From a **file**
+there is no label, and Compose's own derivation — a `name:` in the file, `COMPOSE_PROJECT_NAME` in
+the `.env` beside it, then the directory's basename — is the right answer and cide cannot improve
+on it. A guessed `-p` would override all three and act on a stack nobody has.
+
+The gutter is the only surface that can name a **service**, because the other three know a file and
+nothing about what is inside it. `composeTargets` scans rather than parses, and the reason is that
+it runs on a buffer being edited: a YAML parser's answer to a half-typed document is an exception,
+and a gutter that vanished between `web:` and its body would be worse than one that is
+occasionally generous. Generous is the only way it can be wrong — an extra marker offers a run
+Compose refuses by name in the pane, while a missing one gives the user nothing and no way to find
+out why.
+
+### Two bugs found by running the binary, not by reading it
+
+**Every stack button in the panel was refused by the CLI, from M43 until M48.** `compose::act`
+resolved `find_docker()` and built its argv with `argv`, which deliberately omits the `compose`
+word — that word belongs to `Invocation::program`, and only `find_compose` knows whether the rung
+that answered needs it. So the panel ran `docker -p shop -f compose.yaml up -d` and got `unknown
+shorthand flag: 'p' in -p`. **Every unit test passed the whole time**, and correctly: each one
+asserts on the argv, and the argv was right. Only running the binary can catch that class, so
+`a_real_stack_goes_up_and_comes_down_both_ways` now does — it writes a one-service compose file,
+brings it up through the panel's road, recreates one service through the file's road, and takes
+both down. It is `#[ignore]`d and needs a daemon; it was run, and the whole sequence passes
+against colima here.
+
+Worth noting which rung this machine resolves to, because it is the awkward one the ladder exists
+for: `Standalone("/opt/homebrew/bin/docker-compose")`. `docker compose` does not work here at all —
+Homebrew installs the plugin into a directory it does not add to `cliPluginsExtraDirs` — so the
+machine that found this bug is the machine where the missing word is fatal rather than cosmetic.
+
+**A palette answer got worse because an unrelated feature landed.** Adding `docker.compose.recreate`
+displaced *New branch…* as the first result for `create`: `Recreate` contains `create` inside a
+word, and the ranking had a title-*substring* tier above the keyword tier, where `git.branch.new`'s
+claim on that word lives. The same trap was dodged once before by renaming a command
+(`git.tag.create` → `git.tag.new`); renaming cannot work here, because `recreate` is Compose's own
+verb. So the substring tier is gone. It could only ever fire for a match strictly inside a word — a
+word-boundary match returns one tier above — which is an accident of spelling rather than a claim
+on the word. Nothing became unfindable: a needle inside a word is still a subsequence of the title,
+so the row is still offered, one rank lower. `TIER_ID` was narrowed to word boundaries in the same
+pass, for the same reason.
+
+### M49 — the two things a screenshot would have caught
+
+Both reported from the chair, within a minute of each other, and neither is findable by reading.
+
+**Images, Volumes and Networks were not collapsible.** M47 made the container *groups* fold and
+missed the three sections below them — they were plain `<div class="sectionLabel">` with no
+chevron, no button and no state. They fold now, through the **same** `toggled` set the stacks use
+rather than a second mechanism, and they start **shut**: `initiallyOpen`'s argument applied to the
+lists that are longest and acted on least, which is also what IDEA does with the same three. The
+count rides on the heading, and that is the load-bearing half — a shut section that did not say
+how much it was hiding is indistinguishable from an empty one, and nobody would open it.
+
+**The icon hover backgrounds were off-centre**, and the cause is worth writing down because it is
+invisible to every check this project had and to reading the rule.
+
+`appearance: none` **does not reset a `<button>`'s padding**. WebKit's default is `1px 6px` and it
+survives. With the global `box-sizing: border-box`, a `width: 20px` icon button therefore has an
+**8px** content box; the mark's auto-sized grid track is 14px; a track wider than its content box
+overflows towards the inline *end*. So the glyph sat 6px from the left edge of its own hover
+background and flush against the right. `place-items: center` cannot save it — that centres the
+item inside its track, and it is the track that is displaced.
+
+Every icon button written before the Docker panel already set `padding: 0` — `ActivityRail`,
+`TabStrip`, the tool window — which is why this had never been seen. A convention four files keep
+and the fifth forgets is not a rule, so `check:ui-icons` asserts it now: a block that centres a
+mark with `place-items: center` **and** fixes a `width` must state its padding. Turning it on found
+**two more genuine instances outside Docker** — `AppHeader`'s `.action` and `ExtensionsPanel`'s
+`.headerAction` — plus three spans that now say `padding: 0` deliberately.
+
+`check:docker-render`'s heading scrape needed splitting for this milestone, and the reason is its
+own small lesson: `.sectionLabel` **composes** `.groupLabel`, so both class names land on the
+element and no class-based test can tell a section from a stack. The section carries a
+`data-audit` and the two families are read apart — a combined list would have gone on passing
+while the thing worth asserting (the count on a shut heading) was looked at by nothing.
+
+### M49, continued — three more from the chair, and one of them was in the daemon
+
+**Network rows changed several times a minute.** Reported as churn and it was literally that:
+`GET /networks` and `GET /volumes` return their rows in a **different order on every call**. Six
+consecutive reads against the live daemon here gave six different orders. The panel refetches the
+whole board on every daemon event, so those two sections reshuffled under the pointer.
+
+`docker network ls` does not have this problem because the **CLI** sorts. cide talks to the API
+(ADR 0013), so the sort is cide's to do — the conclusion `files::parse_listing` had already
+reached about `ls` output one module over, arriving a second time by a different road.
+
+Networks and volumes sort by name, case-insensitively (byte order puts every capital ahead of
+every lowercase, which reads as no order at all). Containers and images are **not** re-sorted:
+the daemon returns them newest-first, that order is meaningful, and both measured stable across
+repeated reads here. They did get a tiebreak on id — two rows created in the same second have no
+defined order between them, which is the same churn arriving once in a while instead of every
+time, and once in a while is worse because it reads as a glitch rather than a bug.
+
+The unit tests cover the rules; the one that would have *caught* this needs a daemon, because the
+defect is in what the daemon answers. `two_reads_of_an_unchanged_daemon_draw_the_same_order` takes
+seven snapshots and compares the orders, and it was confirmed to fail when the sort is removed.
+
+**A selected row went grey under the pointer.** `.rowSelected:hover` and `.row:hover` are both
+(0,2,0), so the cascade fell through to source order — and the hover rule is 160 lines further
+down the file. The selection disappeared at the one moment it is most wanted. It is `.row
+.rowSelected` at (0,3,0) now, winning regardless of source order: moving the rule instead would
+have worked today and made any later reshuffle of that file a silent regression, which is the
+argument `EditorSurface`'s change bars already make about `highlightActiveLineGutter`.
+
+**One scrollbar moved both columns.** `ToolWindow.module.css`'s `.body` is a single `overflow:
+auto` box wrapping whatever tab is active — right for a Log tab, one long list — and the docked
+panel had no *definite* height inside it, so `.columns`' `flex: 1` resolved to the content height
+and the panel's own two scrollers never engaged. Selecting a row at the foot of the list scrolled
+the detail off the top. `height: 100%` on `.docked` is the whole fix; `flex: 1 1 auto` could not
+do it because `.body` is a block, not a flex container. The alternative — making `.body` stop
+scrolling for this one tab — pushes a fact about the Docker panel into the tool window's
+stylesheet and leaves the next panel with the same shape to rediscover it.
+
+#### The check that passed by reading its own comment
+
+Worth its own heading because it nearly shipped. The scroll assertions grep the stylesheet, and
+the first version matched `height: 100%` **inside the comment explaining `height: 100%`** — so it
+passed with the declaration deleted. Found by trying it, which is the only way it could have been.
+
+The rule extractor strips comments now, and it is the same lesson `check:diff-render` already
+records about `diffBlame.ts` naming a package in prose that survives into the emitted bundle: a
+grep over source that has not had its comments removed is a grep over documentation. Every one of
+these four declarations was then confirmed to fail the check when removed, individually.
+
+### M50 — a link between the columns, and the race that ate a compose run
+
+**"Compose up does nothing, only opens an empty terminal."** It was exactly that, and the
+diagnosis came from a deduction rather than a screen: a lost *intent* would have produced a
+**Claude** pane, because `default_intent` for a `Col` split is `NewClaude`. The user saw a
+terminal. So the intent arrived, the pane was a correctly-titled `Shell`, and what went missing
+was the **spawn plan**.
+
+`layout/spawnPlans.ts` parks a value between a split committing and `TerminalPane` mounting, and
+`store/workspace.ts` records it *after* `pane_split` resolves. But the pane can render as soon as
+the `workspace_changed` broadcast lands, and Rust emits that **before** the command returns. The
+gap is normally won by the promise microtask beating React's scheduled render — normally.
+`forkPrimary` and `mirror` have lived with it because both degrade gracefully: a mirror that loses
+its plan adopts a held session and looks fine. `TerminalPane`'s own comment already records that
+this happens ("a pane can render in a window that never heard of the plan"). Compose had no
+graceful degradation — it fell through to `specFor`'s shell arm and opened a login shell.
+
+So the road no longer uses a plan. `SplitIntent::Compose` became **`SplitIntent::Adopt { session,
+title }`**: `runCompose` spawns the session *first* through the ordinary `session_spawn` — job
+watcher, proxy environment, `$EDITOR`, park-across-a-project-switch, all of it — and the pane is
+created already naming it in `Pane::session`, which is durable. Nothing has to survive anything.
+
+The pane **owns** its child, unlike a mirror: `mirrored` is set from a plan and this road has no
+plan, so closing the pane ends the run — which is what Ctrl+W should mean to whoever started it.
+A restore re-runs nothing: the id names a session that died with the previous process, so
+`sessionIsHeld` refuses it and the pane falls back to a plain shell in the same directory, with
+the dead session's parting screen replayed above it by `lifecycle::shell_preload`. The compose
+output is still there to read.
+
+The price of spawning first is that there is no pane to measure, so the session starts at
+`sessionSink.FALLBACK` and is resized the moment the pane attaches. Reusing that constant rather
+than inventing a second one keeps "what size when we cannot measure" to one answer in this app.
+
+**And the detail pane's references are links now.** A container's detail names the image it runs,
+the volumes it mounts and the networks it is on; a network's names the containers attached to it.
+Every one of those is a row in the left column, and they were dead text — the user read a name and
+then went looking for it by hand. Clicking one selects that row, opens whatever heading it lives
+under, and scrolls it into view.
+
+Three things about it are load-bearing. `resolveRef` answers **`null` for an ordinary reference
+that points at no row** — a bind mount names a host path, an image may have been removed, a
+container may be gone since the snapshot — and the pane then draws plain text rather than a link
+that selects nothing. The *host* resolves, not the pane, because whether `nginx:latest` is a row
+is a question about the board the pane has never seen. And `keysToOpenFor` answers the section
+**and** the compose group in one call: opening one and forgetting the other is the half that only
+shows up following a network's link to a container inside a folded stack.
+
+Matching is generous in exactly one direction: an image is found by **any** of its tags, because
+`docker inspect` reports whichever tag started the container while the row carries them all.
+Nothing matches on a substring, and `check:docker` pins that from both ends.
+
+#### The comment-grep trap, twice more
+
+`check:docker` learned the same lesson two more times in one sitting. The scroll assertion matched
+`height: 100%` **inside the comment explaining `height: 100%`** and passed with the declaration
+deleted; then the spawn-plan assertion matched `spawnPlans.ts` inside the paragraph explaining why
+that road no longer uses it. Both greps strip comments now.
+
+It is worth naming as a rule rather than three incidents: **a check that greps source must strip
+comments first, and this repository's comments make that mandatory rather than tidy** — the house
+style is to name the failure a rule prevents, so the words a check looks for are exactly the words
+its own documentation contains. `check:diff-render` recorded the first instance, about
+`diffBlame.ts` naming a package in prose that survived into the emitted bundle.
+
+
+### M51 — two things a sample file found in ten minutes
+
+Asked for a throwaway compose file to test against, at `docker.compose.yaml`. Writing it found two
+defects, both silent, and neither reachable without an actual file.
+
+**`docker.compose.yaml` was not recognised as a compose file.** The name test looked at the *first*
+dotted segment, which is enough for `compose.yaml`, `docker-compose.yml` and
+`compose.override.yaml` and refuses this one, whose first segment is `docker`. The failure is the
+worst shape available: Compose reads the file happily, cide draws no gutter marker and offers no
+menu entry, and nothing anywhere says why. The rule is any dot-separated segment now — still
+refusing `composer.lock.yaml`, `decompose.yaml` and `values.yaml`, none of which has a *segment*
+equal to `compose`, which is why the test is on a whole segment rather than a prefix.
+
+**The pane's title named the directory when the file names the project.** `compose up : tmp` says
+nothing; the file declared `name: cide-sample` one line down. `project_name_in` reads it — a scan
+and not a parse, `composeTargets`' reason plus one of its own: this builds a *label*, so the worst
+case of being wrong is a pane named after its directory, and pulling in a YAML parser to improve a
+label (and then having it throw on a half-typed file) is the wrong trade. Top-level only, so a
+`name` under `services:` is read as the service it is.
+
+The first cut of that scan was wrong in a way worth recording, because it passed a careless
+reading: it returned on the first non-indented line that was not `name:`, so a file beginning with
+a comment or with `services:` answered `None` however plainly it declared a name — which is every
+file it was written for. `continue`, not `?`. The test drives the exact shape that broke it.
+
+The sample stack is two services, no build step, on ports 18080 and 16379 so it cannot collide
+with anything real. It was brought up against the daemon here: nginx answers 200, redis answers
+PONG, `cide-headless docker` groups both under `cide-sample`, all six verbs produce argv Compose
+accepts, and the gutter's scan puts markers on line 1, `web` and `cache` — and correctly puts none
+on `cache-data` under `volumes:`.
+
+### M52 — reading a daemon nobody is looking at, and writing environments to the log
+
+Reported from the log: continuous `bollard` DEBUG lines dumping whole response bodies, **with the
+Docker panel closed**. Two defects behind one symptom, and the second is the more serious.
+
+**The event subscription started lazily and never stopped.** `ensure_watching` connects on the
+first successful board read — "a daemon nobody has opened the panel for is a socket cide has no
+reason to connect to", says its own doc — and that was half a rule. Once started it lived for the
+rest of the session, turning every daemon event into a **full board read**: containers, images,
+volumes and networks, four calls. On any machine where something is starting and stopping — a
+compose stack, a CI runner, a devcontainer — that is continuous, for a panel nobody can see.
+
+The justification for subscribing app-wide was written down and had **expired**. `App.tsx` says it
+in as many words: the rail badge has to stay live while the sidebar is shut, so the listener
+cannot live inside the panel. M46 moved the panel into the bottom tool window and deleted that
+badge, and nothing outside the panel has read the board since — the only consumer left is
+`adoptDocker`, which stores it. The comment survived the feature it was describing.
+
+So the panel now says when it is on screen and when it stops being, and `DockerState` counts —
+`AtomicUsize` rather than a flag, because every window has its own panel and the first to close
+must not take the stream from the second. Released with `fetch_update` and not `fetch_sub`: an
+unmount arriving twice would wrap the count to `usize::MAX` and leave the subscription running
+with no way left to stop it. Stopping drops the watch and **keeps the connection**, which costs
+nothing idle and makes reopening instant.
+
+Rust cannot work this out for itself, and that is worth stating because it looks like something it
+should be able to: whether a panel is mounted is a fact about a React tree in a window it has no
+handle on, and the panel lives in a tool-window tab that changes with a click Rust never hears.
+
+**And `bollard` was logging container environments.** It writes every decoded response body at
+DEBUG, so one board read puts the full JSON for every object on the machine into the log — tens of
+kilobytes, rotating it the way `notify` used to before M-whenever. That is the noise half. The
+other half is that `docker inspect` reports `Env` verbatim: database passwords, API tokens,
+whatever a compose file sets. cide's log is the file users are asked to send back when something
+breaks, and it must not be somewhere secrets accumulate. A third-party crate's own formatting
+cannot be redacted, so the level is the control — `bollard` is capped at `Info`, where it says
+nothing, while a genuine transport failure still arrives at `Warn`. `RUST_LOG=bollard=debug`
+remains for somebody debugging the wire, who is then choosing to write those bodies to disk.
+
+Worth keeping in mind as a class rather than an incident: **a lazily-started subscription needs a
+stop as much as a start**, and the comment justifying where a listener lives outlives the feature
+that justified it. Both halves here were correct when written.
+
+### M53 — the file a stack was brought up with, and a heading that would not stay shut
+
+Three reports in one sitting, and two of them were defects in work from the milestone before.
+
+**"No configuration file provided: not found" on Recreate.** The panel passed a **hardcoded empty
+file list** to every stack action, so Compose ran with no `-f` and fell back to searching the
+working directory for a default-named file. That works by accident for `compose.yaml` and
+`docker-compose.yml`, and fails for every other name.
+
+`com.docker.compose.project.config_files` was already on the wire and already parsed — the adapter
+dropped it with a comment saying M43's stack actions "will" use it. They never did. It is carried
+to `Group.files` now, taken from **any** member that has the label (`workingDir`'s rule: one
+container recreated without labels must not cost the whole stack its buttons).
+
+The report's shape explained itself once measured: **`restart` and `down` resolve from the project
+label and need no config file; `up`, `recreate`, `build` and `pull` read it.** So Stop and Restart
+worked on that stack while Recreate did not.
+
+And the real-daemon test that should have caught this was **written against `compose.yaml`** — a
+default name — so it was green throughout. It uses `docker.compose.yaml` now and asserts that
+Recreate *fails* without the file list, so it can see the bug it exists for. A test whose fixture
+sidesteps the failure is worse than no test: it is a green light over the exact case.
+
+**A group would not stay collapsed.** M50's follow-a-link effect depended on `defaults`, which is
+`useMemo` over `groupByCompose(board.containers)` — a fresh array every render — so it fired
+constantly and re-opened the selected row's heading the instant the user collapsed it. It now
+remembers which selection it has already opened for, compared by *identity* rather than reference:
+`selected` is rebuilt on every render of the host, so a reference test would be the same bug in a
+different spelling.
+
+**Auto-update on compose up** was confirmed working end to end rather than changed: the daemon
+emits 11 events for a compose up of the sample stack, `watch_events` sees all of them, and a
+dropped watch reports nothing. What was added is the one link whose failure gives exactly
+"updates once and then never again" — a `take_due` that forgets to clear `flushing` — now pinned
+by a test that was confirmed to fail when the line is removed, plus a `docker: board changed`
+debug line, newly useful because M52 quieted `bollard`.
+
+#### A test of mine that failed two runs in five
+
+`an_adopted_pane_is_a_shell_that_durably_names_its_session` greped the serialised pane for
+`["docker-compose", "compose.yaml", "/srv/shop", "-d"]`. **`-d` matches a uuid**: a hyphen
+followed by the hex digit `d` appears in a `Pane`'s two ids about **40%** of the time, measured.
+So it failed roughly two runs in five, passed alone often enough to look fine, and pointed at a
+line of production code that was correct.
+
+Replaced by an assertion on the serialised **key set**, and it is worth being exact about which
+half of that the compiler already covers: adding a field to `Pane` is a compile error at every
+construction site, so a smuggled field cannot arrive quietly. What the compiler cannot see is the
+**wire** — a `#[serde(rename)]` changes what `workspace.json` carries with nothing failing to
+build. Verified by doing exactly that, which is the only way to know such an assertion is live.
+
+The general shape, since this is the second flaky assertion of my own in two milestones: **a
+substring test against generated data is a coin toss with extra steps.** The tokens that survived
+all contain a character no hex digit or hyphen can produce.
+
+### M54 — an unordered channel cannot carry edges
+
+"Panel still not updating on compose up" — the second report of the same symptom, and this time
+the cause was **the fix from M52**, in two independent ways.
+
+The log settled where to look before any code was read. Today's run held 292 lines and **zero**
+docker lines: no board read, no emit, nothing. Combined with the M52 emit line existing and
+`bollard` being quiet, that says the event road was never travelled at all.
+
+M52 counted watchers with an `AtomicUsize` — incremented when a panel mounted, decremented when it
+unmounted. `docker_watch` is `async`, so Tauri runs it on its worker pool, and **React's
+StrictMode fires `watch(true)`, `watch(false)`, `watch(true)` in one tick**: three concurrent
+commands in no guaranteed order. Two things break, and both were shipped:
+
+* a decrement handled **before** its increment is clamped by the `saturating_sub` that was there
+  to prevent a wrap, and is simply **lost** — so the count drifts *up* and the subscription is
+  never stopped. Measured in a test: mount/unmount/mount ending at **2**, not 1.
+* a `false` whose *action* overtook a `true`'s left the count at 1 with **no subscription
+  running**. Nothing re-reads the count, so that state never recovers. A live panel, silent for
+  ever.
+
+The counter cannot be repaired by clamping, because the problem is not arithmetic: **an unordered
+channel cannot carry edges.** So the wire carries *levels* — each window says what is true for it
+now, stamped with a sequence number it increments itself, and Rust keeps the newest statement per
+window and discards anything older. The answer is then a function of the latest statement from
+each window, which no reordering can disturb. A `watch_gate` mutex is held across the bookkeeping
+*and* the action, so a stop can no longer overtake a start.
+
+And M52's `if !self.watched() { return; }` in `mark_changed` is **gone**. It was belt and braces
+beside dropping the subscription — redundant, because no subscription means no callbacks, which is
+self-enforcing — and redundant in the dangerous direction: it can only fail *closed*. When the
+counter and the subscription disagreed it turned a recoverable state into permanent silence. The
+worst case without it is a few extra reads from an event already in flight; the gate's worst case
+was unbounded and invisible.
+
+#### A test that passed with the bug deleted
+
+Worth recording, because it nearly closed this a second time. The first version of the race test
+drove `decide` — the counter — and asserted on the order of the **decisions**. It passed with the
+gate removed, because the bug was in the order of the **actions**. The action needs an `AppHandle`
+and a daemon, so the function was restructured to take it as a parameter: `watching_with(window,
+seq, watching, act)` is what ships, `watching` passes the real action and the test passes a
+closure that yields and records. No mirror to drift, and the gate, the bookkeeping and the
+ordering under test are the ones that run.
+
+Both guards were then confirmed load-bearing by deleting each and watching the tests fail — which
+is the only way to know. The second version of the test is also what *found* the lost decrement:
+it asserted a final count of 1 and got 2.
+
+### M55 — proving the backend, and the silence above it
+
+Third report of "the panel does not update", and this round began by establishing what is *not*
+broken rather than by changing anything.
+
+**The backend is correct, proven live.** With the user's own app running, a probe container
+started and stopped:
+
+```
+13:10:06  docker: board changed, emitting rows=9
+13:10:10  docker: board changed, emitting rows=8
+```
+
+The daemon's events arrive, the coalescer fires, the board is read and the emit goes out with the
+right rows — in the running process, not a test. The wire board was dumped to JSON
+(`the_wire_board_as_json`) and the **frontend's own adapter** was run over it outside the app: it
+produces `stack:cide-sample(2)` correctly, from both plain JSON numbers and bigints.
+
+So the failure is above the emit, in the webview — and there it is silent by construction.
+
+**`adaptBoard`'s switch is exhaustive over `DockerBoard`, which is a statement about the types and
+not about the bytes.** Handed a payload that is not what the type says, it matched nothing,
+returned `undefined`, and `newerBoard` threw one line later on a property of it. Down the *command*
+road that surfaces as a rejected `invoke`. Down the **event** road it is silent: a throw inside a
+Tauri listener callback has nowhere to go but the webview console. The board stays as it was,
+manual Refresh goes on working because it is a different call, and nothing anywhere says why.
+
+That is the shape of every observation, and the reason three rounds were spent on it: the failure
+mode is *indistinguishable from a daemon with nothing to report*. It is named now — `adaptBoard`
+refuses with a message naming what arrived, and `dockerStore.adopt` turns that into a notice. Four
+payload shapes are driven in `check:docker`, including the one the design invites (passing the
+event's `{ board }` wrapper rather than its `board`), and the assertions were confirmed to fail —
+seven of them — when the silent return is put back.
+
+The check had to grow a way to compile the seam: `adapt.ts` is the one file it drives that is not
+import-free, and `tsc` refuses a `paths` mapping on the command line, so its single type-only
+import is rewritten to a stub. The stub types the board as `any` **deliberately** — every
+assertion it enables is about a value the type system says cannot exist, which is exactly the
+blind spot the wire keeps walking into. That relaxation is confined to that one compile; the
+import-free modules are still compiled at full strictness.
+
+**And a keepalive was being treated as a change.** The log showed four emits exactly 60 seconds
+apart, every one carrying an unchanged board: this daemon sends a typeless event on an idle stream
+about once a minute, and `watch_events` passed anything `Ok` straight through. Each cost a
+four-call board read and an emit to every window, for nothing, for as long as a panel is open.
+Events with no `typ` are now ignored — not a filter on *which* changes matter, which the header
+argues against at length, but a refusal to call a keepalive a change. Confirmed against the real
+daemon afterwards: a compose up still delivers its events.
+
+Whether this fixes what the user sees is **not yet known**, and that is worth stating plainly. What
+is known is that the backend is right, the adapter is right on real bytes, and the one path that
+could fail without saying anything no longer can.
+
+### M56 — removing an image, a volume or a network, and refusing when it is in use
+
+The user's words: *"Missing ability to remove images, network, volumes"*, then — before any code
+was written — *"It should reject to remove if image, network or volume is used"*. The second half
+settled the one design question worth asking, and it is the opposite of what containers do.
+
+**Nothing on this road forces.** Docker already refuses each of the three by default, and its
+sentence names *what* holds the thing. Measured against the real daemon rather than assumed:
+
+```
+volume:  remove cide-rm-54084: volume is in use - [21e7bc17f8e4…]
+network: error while removing network: network cide-rm-54084 has active endpoints
+image:   conflict: unable to delete 28bd5fe8b56d (cannot be forced) - image is being used
+         by running container 21e7bc17f8e4
+```
+
+Those sentences are worth more than the removal would have been, which is the whole argument. A
+container is cattle and `act`'s `Remove` forces on purpose — it is stopped first and it *will*
+happen, because the frontend has already confirmed. An image is a multi-gigabyte download, a
+volume may hold the only copy of somebody's database, and a network torn out from under a running
+container breaks it in a way that is not obvious afterwards. There is no undo for any of them.
+
+So the two roads stay separate rather than becoming one with a flag, and **removability is a
+question the types answer**: `cide_ipc::docker::Removable` has three arms and deliberately no
+container. A fifth inspectable kind cannot become silently removable — somebody has to add it and
+decide. `removableFrom` answers `null` for a container in one place rather than four.
+
+The confirmation says the thing the user actually needs to know, which is **not** irreversibility:
+Docker refuses while anything is using it, so that is the *likely* outcome, and a dialog warning
+only that this cannot be undone would leave a refusal reading as a bug. `removalPrompt` says both,
+in that order.
+
+The button is drawn for every row and is **not** greyed when the thing is in use. The board knows
+a count — an image's `containers`, a volume's `inUseBy` — and that count is a snapshot, while the
+daemon is the authority and answers with the container's id. Greying on a stale count would refuse
+removals that would have worked and would explain nothing; pressing it gets the real answer. That
+is a different trade from `stackBlocked`, where the fact is genuinely knowable up front, and the
+difference is worth stating because the two look alike.
+
+`removing_something_in_use_refuses_and_names_what_holds_it` builds a container, a volume and a
+network, asserts all three refuse **with words**, then removes the unused ones — because a test
+that only checked refusals would pass against a `remove` that refuses everything.
+
+### An intermittent `cide-pty` failure, recorded and not chased
+
+`a_rendered_session_shows_the_rendering_in_mirror_and_sink_alike` failed in two of three
+`--workspace` runs and passed 3/3 run alone. `crates/cide-pty` carries M42's `Transport` seam and
+nothing from this milestone; the coalescer it exercises was not touched.
+
+`target/debug/deps/` is at **100,082 files**, well past the 64,740 that `CONTRIBUTING.md`'s *When a
+timing test fails and the code looks innocent* records as the cause of exactly this class — and
+this is the load-sensitive shape rather than the deadline-sensitive one, since it survives being
+run on its own. `cargo clean` is the documented remedy and was not run here, because a long rebuild
+in the middle of a report is its own kind of noise. Recorded so the next person starts from the
+evidence rather than from zero.
+
+### M57 — a refusal nobody could see, and the size Docker will not tell you
+
+**"No error notification when trying to remove image that is used."** The sentence existed. It was
+drawn at the top of the list column, which is a *scrolling* column — so scroll down to Images,
+press Remove, and Docker's refusal renders a few hundred pixels above the fold. The message had
+nowhere to be seen.
+
+All five gestures had it, not just removal: stopping a container while scrolled to the bottom was
+the same defect and nobody had happened to hit it. They route to `chrome/notices.ts` now, which is
+the surface that documents itself for exactly this — *the outcome of something somebody just did*
+— and whose toasts **never dismiss themselves**, so a refusal naming a container id can be read at
+leisure. `project: null`, because a daemon belongs to the machine and stamping the notice with
+whatever project the window shows would hide it from every other one.
+
+The inline strip is gone rather than kept beside the toast. Two copies of one sentence is noise,
+and the copy that failed at the job is the one to drop.
+
+### A volume's size, and why nothing shows it
+
+*"No way to show volume size on right panel?"* There was not, and the reason is worth recording
+because it is not an oversight of cide's: **`GET /volumes` carries no size at all.** Checked, not
+assumed — the payload has seven keys and `UsageData` is `None`. The only endpoint that has it is
+`/system/df`, which walks the filesystem: measured here at **8.4 seconds cold**, and about 1.3
+warm once the daemon has cached the walk. `docker volume ls` shows no size for the same reason,
+and `docker system df` is the separate, slower command you run when you want one.
+
+So it is asked **only while a volume is selected**, and never from a board read. That is the load-
+bearing half: the event stream produces a refresh for every container that starts anywhere on the
+machine, and a filesystem walk on each of those would be continuous. `check:docker` asserts
+`snapshot` never reaches for it, and the assertion was confirmed to fail when a `df` is put there.
+
+The row has **three** states, because *nobody measured* and *empty* are different claims —
+`ImageRow`'s `-1` and `VolumeRow`'s `inUseBy` already carry that rule, and a volume drawn as `0 B`
+when nobody counted is a lie about somebody's data. The waiting state names `docker system df` by
+name, so a two-second pause reads as a filesystem walk rather than a hang.
+
+Two things found by trying rather than by reading. `bollard`'s `type=volume` filter **cannot be
+encoded** — its builder takes a `Vec<String>` and the call fails with *Unable to URLEncode:
+unsupported value* — so the whole walk is asked for, which is what `docker system df` does anyway.
+And the items in `VolumesDiskUsage` are untyped `serde_json::Value` in the crate, so the two fields
+cide needs are deserialised into a private struct here: `cide_spec::model`'s discipline, that the
+foreign API's shape is `Deserialize`-only and never reaches the wire.
+
+### M58 — one word, two measurements
+
+*"Why is image size different in left and right panel?"* — `nginx:alpine` drawn as 98 MB in the
+list and 28 MB in the detail. Not a wrong field on either side: both read a value the daemon calls
+`Size`, and **the daemon means something different by each**.
+
+```
+GET /images/json          102,437,698   ← the list, and what `docker images` prints
+GET /images/{id}/json      29,017,379   ← the detail
+```
+
+Asking the same daemon for the manifest settled it to the byte. The image is a sixteen-platform
+index with one platform present locally, and
+
+```
+101,547,206  (linux/arm64, unpacked)  +  890,492  (its attestation)  =  102,437,698
+```
+
+while `29,007,046` is that platform's **content** — the compressed blobs as they were pulled. This
+is the containerd image store (`io.containerd.snapshotter.v1`, confirmed in `docker info`); on the
+classic store the two endpoints agree, which is why nobody had seen it before.
+
+So neither number was wrong and neither was cide's invention. What was wrong is that both were
+labelled *Size*. The list's is the one that keeps the name, because it is what the row beside it
+shows and what `docker images` prints, and the compressed figure is drawn beneath it.
+
+That second row was called **Download** for about ten minutes, and the very next question asked
+was *"and what is download size?"* — which is the label failing, not the reader. It said what the
+number was *for* rather than what it *is*, and it over-claimed besides: under the containerd store
+those blobs stay in the content store after unpacking, so they are not merely something once
+transferred, they are on the disk right now. It is **Compressed** now — the word the daemon's own
+manifest uses (`Content`), in a term a reader already owns — and the value carries the rest,
+`28 MB — the layers as pulled`, so nobody has to hover to find out. Both rows grew a tooltip for
+the sentence underneath, because both names stay terms of art however carefully chosen.
+
+The lesson is worth keeping separate from the bug: **a row nobody can read without asking is named
+wrongly, and a tooltip is the second fix rather than the first.**
+
+The second row appears **only when the two differ**. On the classic store they are one number, and
+drawing one value twice under two labels would invent a distinction that does not exist there —
+so the rule is about the values, and cide never has to detect which storage driver is in use.
+
+The detail is handed the board's number rather than asking the daemon a second question: the panel
+already has the row, and the two sides reading one value is the other half of *the panels agree*.
+`imageSizeRows` is import-free, so `check:docker` drives it with the real figures from the report;
+putting the inspect number back under `Size`, or drawing both rows unconditionally, each fail it.
+
+### What is NOT verified
+
+**None of M47–M58 has been seen on a display**, which is exactly how M49's two defects survived
+M48's green sweep — both are things a person looking at the panel sees in a second and no check
+could reach until one was written for them. The machinery has a real daemon behind it —
+`cargo test -p cide-docker -- --ignored` is ten tests now, including the compose one above and a
+filesystem listing that reads `mode`, `owner` and `modified` off a live container — and 90
+frontend checks and 73 Rust test binaries pass. What no test touches is whether any of it *paints*.
+
+Specifically unconfirmed: that the detail pane's port editor round-trips visibly (the
+`portsText`/`parsePorts` pair is checked, the form is not); that a recreate leaves the panel
+pointing at the **new** id rather than the stale one it was selected on; that the file explorer's
+context menu opens at the pointer inside a pane that is scrolled; that the compose gutter's mark
+lands in the right column beside the change bars at every UI scale; that its menu flips above near
+the foot of a pane; and that a compose run's pane is readable while `up` is pulling.
+
+**The gutter mark has never been seen at all.** It is `iconElement('play', 0)` in a column sized to
+one mark, and `check:ui-icons` refused the `▶` character this was first written with — which is the
+check working, and is also the only thing that has looked at it.
+
+### A test that failed for a reason that was not in the code
+
+Worth writing down because the diagnosis took longer than any of the features and the answer is
+not in any source file.
+
+`cide-fs`'s `a_shown_target_directory_is_still_never_watched` started failing — deterministically,
+5/5, always at 11.65 s, which is its 10-second deadline plus the quiet window before it. It looked
+exactly like a regression: it appeared during this work, `cide-fs` links `cide-ipc` and `cide-ipc`
+had changed.
+
+It was none of that. What finally isolated it: the **same binary bytes** pass when copied to
+another directory and fail from `target/debug/deps/` — including a copy sitting in that same
+directory under a different name. `crates/cide-fs` was untouched, a pristine HEAD worktree carrying
+this branch's `Cargo.toml`, `Cargo.lock`, `cide-ipc` and `cide-docker` passed 5/5, and cargo
+computed an *identical* metadata hash for the test binary in both trees — which is cargo saying the
+inputs are the same.
+
+The cause was that `target/debug/deps/` had reached **64,740 entries** — `cargo clean` took
+53.5 GiB and 128,011 files with it. Adding bollard's dependency
+tree grew it, and a session's worth of rebuilds grew it much further; executing a timing-sensitive
+test out of a directory that large is enough to push it past a ten-second deadline. `cargo clean`
+is the whole remedy, and it was: the test went from failing 5/5 at 11.65 s to passing 3/3 at
+2.45 s with no source change at all.
+
+Two things worth keeping from it. The first is a method: when a test looks like a regression,
+`git worktree add` a pristine HEAD beside it and move one directory at a time — it is faster than
+reading, and it produces a yes/no rather than a theory. The second is about this test: a deadline
+that a full `deps/` can exhaust is a deadline that will fail again on a slower machine or in a
+loaded CI container. It is not this milestone's to change, and it is recorded here so the next
+person to see it does not spend the afternoon that was spent here.
+
+**Unverified from this machine:** which Dockerfile language server to name. Docker publishes one
+that covers Dockerfile *and* Compose in a single binary, which would fold the second server entry
+into the first — `npm` here is behind a proxy that would not answer, and a builtin naming a
+package that may not exist is an `install_hint` pointing at a 404. `docker-langserver` from
+`dockerfile-language-server-nodejs` is named instead. Moving is a one-line change plus deleting
+the Compose entry.
+
+
 ## The chrome audit
 
 M3's stated acceptance criterion was a screenshot diff against the design mock at 1440x900 in
@@ -8607,6 +9647,7 @@ crates/
   cide-lang/       tree-sitter: what a Rust or Go file declares.                 (M12)
   cide-lsp/        An LSP *client*: rust-analyzer and gopls.                     (M12)
   cide-deps/       What a project depends on, and where its source is unpacked.   (M13)
+  cide-docker/     A Docker daemon over the Engine API: containers, images.        (M41)
   cide-hook/       Second binary: bridges a Claude hook to the running IDE.      (M7)
   cide-headless/   Third binary: proves the core links without tauri.
                    `tree|commands|keymap|tasks|agents`.

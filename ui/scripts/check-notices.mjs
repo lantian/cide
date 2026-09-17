@@ -9,13 +9,20 @@
  *
  * Every one of them fails **silently**. That is the whole argument.
  *
- *   * `admit` collapses by message. That is right for a user retrying one gesture and
- *     catastrophic for a command that speaks for several repositories: five submodules each
- *     reporting "Already up to date with origin" collapse into one toast, and the surface
- *     that was built to prove a command is not dead then under-reports four of them with
- *     nothing on screen to say so. `git.pull` aggregates before it notifies precisely because
- *     of this, and the collapse is pinned here so the aggregation stays necessary rather than
- *     becoming a habit nobody remembers the reason for.
+ *   * `admit` collapses by message **within one project**. That is right for a user retrying
+ *     one gesture and catastrophic for a command that speaks for several repositories: five
+ *     submodules each reporting "Already up to date with origin" collapse into one toast, and
+ *     the surface that was built to prove a command is not dead then under-reports four of
+ *     them with nothing on screen to say so. `git.pull` aggregates before it notifies
+ *     precisely because of this, and the collapse is pinned here so the aggregation stays
+ *     necessary rather than becoming a habit nobody remembers the reason for. Across two
+ *     projects the same sentence is two events, and collapsing them moves a toast out of the
+ *     project it was about.
+ *   * The **scope** — which project a notice is filed under, and which ones a view shows —
+ *     fails silently in both directions and in one of them fatally: a filter that keeps
+ *     nothing renders an empty stack, which is the control-wired-to-nothing symptom this
+ *     surface exists to remove, produced by the surface itself. So the degradation is pinned
+ *     as hard as the behaviour: an unregistered or throwing scope must show everything.
  *   * `describe` is what stands between a tagged `GitError` on the wire and `[object Object]`
  *     in a toast. A control that says `[object Object]` is a control the user reads as broken.
  *   * The cap drops the *oldest*. Dropping the newest instead would hide the failure that just
@@ -149,6 +156,129 @@ try {
       + 'hiding it behind two that have already been on screen is the wrong way round',
   )
 
+  // --- one project's view, and the two rules that had to follow it into it ------------------
+  //
+  // The stack is module-level and therefore per *window*, and in the default `Stacked` mode one
+  // window holds every open project. So a toast raised in one project stayed in the corner
+  // through a switch to the next, reporting the first project's outcome over the second's —
+  // "the notification is shared on all of them". A notice now carries the project it is about,
+  // `visible` is the filter the toast list is rendered through, and `admit`'s collapse and cap
+  // apply to a *view* rather than to the window.
+  //
+  // Every rule below fails silently, and two of them fail in the direction that empties the
+  // stack — which looks exactly like the control-wired-to-nothing symptom this whole surface
+  // exists to remove.
+  {
+    const of = (id, text, project) => ({ id, kind: 'ok', text, ...(project === undefined ? {} : { project }) })
+    const list = [of(1, 'a', 'p1'), of(2, 'b', 'p2'), of(3, 'c', null), of(4, 'd')]
+
+    eq(
+      m.visible(list, 'p1').map((n) => n.text),
+      ['a', 'c', 'd'],
+      "a project's view is its own notices plus everything that belongs to no project — an "
+        + 'app-level failure has to be seen from wherever the user is standing',
+    )
+    eq(
+      m.visible(list, 'p2').map((n) => n.text),
+      ['b', 'c', 'd'],
+      'and it is the other project that is hidden, not merely *a* different one — asserted on '
+        + 'the contents, because a length check passes for a filter with the comparison inverted',
+    )
+    eq(
+      m.visible(list, null).map((n) => n.text),
+      ['c', 'd'],
+      'a window with no project open sees only the unscoped ones',
+    )
+    const unscoped = [of(1, 'a'), of(2, 'b', null)]
+    ok(
+      m.visible(unscoped, 'p1') === unscoped,
+      'nothing hidden returns the SAME array — a fresh one per read in a snapshot position is '
+        + 'the infinite render loop `getServerSnapshot` already carries a note about',
+    )
+    ok(m.visible(list, 'p1') !== list, 'and a different array when something is')
+
+    // --- the collapse is per project -------------------------------------------------------
+    //
+    // "Already up to date with origin" in two repositories the user has open is two events.
+    // Collapsed by text alone the second either shows nothing at all, or — carrying a body or a
+    // link — refreshes the first *and re-stamps it*, so the toast leaves the project it was
+    // about and appears in the one on screen.
+    const twoProjects = m.admit(m.admit([], of(1, 'Already up to date', 'p1')), of(2, 'Already up to date', 'p2'))
+    eq(twoProjects.length, 2, 'the same words in two projects are two notices')
+    eq(m.visible(twoProjects, 'p1').length, 1, 'and each project sees exactly one of them')
+    eq(m.visible(twoProjects, 'p2').length, 1, 'on both sides')
+
+    const twice = m.admit([], of(1, 'Already up to date', 'p1'))
+    ok(
+      m.admit(twice, of(2, 'Already up to date', 'p1')) === twice,
+      'WITHIN one project the collapse is untouched, and is still declined by returning the '
+        + 'same array. `git.pull` and `pushRun` aggregate their repositories before they notify '
+        + 'precisely because of it — see check-push.mjs and check-branches.mjs — and per-project '
+        + 'dedupe does not make that aggregation unnecessary',
+    )
+    ok(
+      m.admit(twice, of(2, 'Already up to date')) !== twice,
+      'and an unscoped notice is a different bucket from a scoped one, never a match for it',
+    )
+
+    // --- the cap is over what shares a screen ----------------------------------------------
+    //
+    // A global cap lets three toasts from a project nobody is looking at evict the one toast
+    // that is on screen: the command the user just ran then reports nothing, and no other check
+    // in this suite can see it happen.
+    let mixed = []
+    for (const [i, text] of ['a1', 'a2', 'a3'].entries()) mixed = m.admit(mixed, of(i + 1, text, 'p1'))
+    mixed = m.admit(mixed, of(4, 'b1', 'p2'))
+    eq(
+      m.visible(mixed, 'p1').map((n) => n.text),
+      ['a1', 'a2', 'a3'],
+      "a burst in another project evicts nothing from this one's view",
+    )
+    eq(m.visible(mixed, 'p2').map((n) => n.text), ['b1'], 'and the other project keeps its own')
+    mixed = m.admit(mixed, of(5, 'a4', 'p1'))
+    eq(
+      m.visible(mixed, 'p1').map((n) => n.text),
+      ['a2', 'a3', 'a4'],
+      'a fourth in this project drops THIS view\u2019s oldest',
+    )
+    eq(m.visible(mixed, 'p2').map((n) => n.text), ['b1'], 'and still nothing of the other one')
+
+    // An unscoped notice is in every view, so it is capped with whichever one it lands in.
+    let global = []
+    for (const [i, text] of ['g1', 'g2', 'g3'].entries()) global = m.admit(global, of(i + 1, text))
+    global = m.admit(global, of(4, 'p', 'p1'))
+    eq(
+      m.visible(global, 'p1').map((n) => n.text),
+      ['g2', 'g3', 'p'],
+      'MAX_SHOWN is a bound on what a user can see at once, so an unscoped notice counts '
+        + 'towards the view it is shown in',
+    )
+
+    // --- `admit` reads no ambient state ----------------------------------------------------
+    m.setNoticeScope(() => {
+      throw new Error('admit read the ambient scope')
+    })
+    ok(
+      m.admit([], of(1, 'pure')).length === 1,
+      '`admit` is pure: the ambient project is `notify`\u2019s business, and a scope read in '
+        + 'here would make every assertion above depend on hidden state',
+    )
+    m.setNoticeScope(() => null)
+
+    // --- a closed project takes its notices with it ----------------------------------------
+    const open = new Set(['p1'])
+    eq(
+      m.prune(list, open).map((n) => n.text),
+      ['a', 'c', 'd'],
+      "a closed project's notices are dropped, not hidden: they can never be shown again and "
+        + 'never dismissed, so hiding them leaves them in the list for the life of the window',
+    )
+    ok(
+      m.prune(unscoped, new Set()) === unscoped,
+      'and nothing to drop returns the same array — this runs on every accepted mutation',
+    )
+  }
+
   // --- turning a rejection into a sentence -------------------------------------------------
 
   eq(m.describe('boom'), 'boom', 'a thrown string is already a sentence')
@@ -275,6 +405,63 @@ try {
     m.clearNotices()
   }
 
+  /* ----------------------------------------- which project `notify` files a notice under */
+  //
+  // The ambient half. `store/workspace.ts` registers a getter at module scope; everything below
+  // is what happens when it is there, when it is not, and when it throws — and the direction of
+  // the last two is the point. A scoping bug that empties the stack is the original defect this
+  // surface exists to prevent, arriving from the surface itself.
+  {
+    m.clearNotices()
+    m.setNoticeScope(() => null)
+    m.notify('unregistered', { kind: 'ok' })
+    eq(
+      m.getSnapshot()[0].project,
+      null,
+      'with no scope registered a notice is stamped `null`…',
+    )
+    eq(
+      m.visible(m.getSnapshot(), 'anything').length,
+      1,
+      '…which means shown in every project — exactly the behaviour before scoping existed. An '
+        + 'uninstalled getter must degrade to everything-shown and never to an empty stack',
+    )
+
+    m.clearNotices()
+    m.setNoticeScope(() => {
+      throw new Error('the store is not there yet')
+    })
+    m.notify('during boot', { kind: 'error' })
+    eq(m.getSnapshot().length, 1, 'a throwing scope does not take the report down with it')
+    eq(m.getSnapshot()[0].project, null, '…and the notice falls back to unscoped')
+
+    m.clearNotices()
+    m.setNoticeScope(() => 'p1')
+    m.notify('ambient', { kind: 'ok' })
+    eq(m.getSnapshot()[0].project, 'p1', 'otherwise a notice is stamped with what the getter says')
+
+    m.notify('explicit', { kind: 'ok', project: 'p9' })
+    eq(m.getSnapshot()[1].project, 'p9', 'an explicit project outranks the ambient one')
+
+    m.notify('deliberately global', { kind: 'ok', project: null })
+    eq(
+      m.getSnapshot()[2].project,
+      null,
+      'and an explicit `null` means app-level — shown everywhere. This is the `??` trap: '
+        + '`options.project ?? currentScope()` would silently re-stamp it with the project on '
+        + 'screen and then hide it from every other one',
+    )
+
+    m.clearNotices()
+    m.notifyFailure({ message: 'boom' })
+    eq(m.getSnapshot()[0].project, 'p1', 'notifyFailure takes the ambient scope like anything else')
+    m.notifyFailure({ message: 'boom elsewhere' }, { project: 'p2' })
+    eq(m.getSnapshot()[1].project, 'p2', '…and accepts one, for the callers that hold it')
+
+    m.clearNotices()
+    m.setNoticeScope(() => null)
+  }
+
   /* ------------------------------------------------------------------ three kinds, not two */
   //
   // The vocabulary is `ok` / `warn` / `error`, and each one reaches the screen as a different
@@ -311,6 +498,61 @@ try {
   ok(
     !/kind\s*\?\?/.test(src),
     'and there is no `??` default behind it, which is the other way the same hole opens',
+  )
+
+  /* ------------------------------------------- and the same trap, one field further along */
+  ok(
+    /options\.project === undefined/.test(src),
+    '`notify` chooses the ambient project on `=== undefined`, so an explicit `project: null` '
+      + 'survives as "this is app-level, show it everywhere"',
+  )
+  ok(
+    !/options\.project\s*\?\?/.test(src),
+    'and not with `??`, which is one character shorter and silently re-stamps that `null` with '
+      + 'whatever project is on screen — then hides the notice from every other one',
+  )
+
+  /* ---------------------------------------------- the two halves of the scope, still wired */
+  //
+  // Both are one deleted line away from restoring the reported bug with nothing failing: an
+  // unregistered scope stamps every notice `null` (shown everywhere, i.e. today), and a
+  // component that renders the raw snapshot shows every project's notices in every project.
+  // Neither shows up in a type-check, a render check or any assertion above.
+  const store = readFileSync(join(UI, 'src', 'store', 'workspace.ts'), 'utf8').replace(
+    /\/\*[\s\S]*?\*\//g,
+    '',
+  )
+  ok(
+    /^setNoticeScope\(/m.test(store),
+    '`store/workspace.ts` registers the notice scope at MODULE scope (column 0). Inside an '
+      + 'effect it would run after the first paint and unregister on unmount, so a rejection '
+      + 'during boot — the failure a user most needs telling about — would be stamped by nobody',
+  )
+  ok(
+    /activeProjectIdOf/.test(store),
+    '…through `activeProjectIdOf`, which answers `role.project` in a detached window where '
+      + '`useActiveProject()` answers `null`',
+  )
+  ok(
+    /pruneNotices\(/.test(store),
+    'and it prunes on every snapshot, so a project closed in ANOTHER window takes its toasts '
+      + 'with it rather than leaving them in a list that can neither show nor dismiss them',
+  )
+  // Read here rather than reusing the `toast` const below: that one is declared further down,
+  // beside the assertions about the component's markup, and this section is about the wiring.
+  const failures = readFileSync(join(UI, 'src', 'chrome', 'Failures.tsx'), 'utf8').replace(
+    /\/\*[\s\S]*?\*\//g,
+    '',
+  )
+  ok(
+    /visible\(/.test(failures) && /notices\.map\(/.test(failures),
+    '`Failures.tsx` renders the FILTERED list. Mapping the raw snapshot is the reported bug '
+      + 'restored, and it looks like a simplification',
+  )
+  ok(
+    !/getSnapshot,\s*getServerSnapshot\)[\s\S]{0,80}\.filter\(/.test(failures),
+    'and the filter is not inside the snapshot callback: a `getSnapshot` that builds a fresh '
+      + 'array per call re-renders for ever and unmounts the root (see check:selectors)',
   )
 
   /* ------------------------------------------------------- the text has to be copyable out */

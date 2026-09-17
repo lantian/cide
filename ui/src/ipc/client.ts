@@ -11,7 +11,8 @@
  * uses.
  */
 import { Channel, convertFileSrc, invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { listen as tauriListen, type Event as TauriEvent } from '@tauri-apps/api/event'
+import { guardUnlisten } from './unlisten'
 import type {
   Axis,
   Bootstrap,
@@ -93,6 +94,27 @@ import type {
 } from './generated'
 
 export type * from './generated'
+
+/**
+ * `listen`, with an unsubscribe that survives the registration race.
+ *
+ * Every subscription below goes through this rather than through `@tauri-apps/api/event`
+ * directly, and the shadowing name is the point: a call site cannot opt out by forgetting
+ * that there is something to opt into. `ipc/unlisten.ts` has the whole account — the short
+ * version is that Tauri answers `listen()` over the `ipc://` fetch while it registers the
+ * listener over a *queued eval*, so the id can arrive before the entry it names exists, and
+ * unsubscribing in that window throws a `TypeError` that `chrome/Failures.tsx` then puts on
+ * screen as a red toast about `handlerId`.
+ *
+ * The handle handed back is idempotent and never rejects, which is what a `return () =>
+ * unlisten?.()` in an effect cleanup has always assumed.
+ */
+function listen<T>(
+  event: string,
+  handler: (event: TauriEvent<T>) => void,
+): Promise<() => void> {
+  return tauriListen<T>(event, handler).then((fn) => guardUnlisten(fn))
+}
 
 export type SessionId = string
 
@@ -4561,5 +4583,255 @@ import { getCurrentWebview, type DragDropEvent } from '@tauri-apps/api/webview'
 export const dragDrop = {
   /** Every drag event this webview receives, until the answer is called. */
   onEvent: (handler: (event: DragDropEvent) => void) =>
-    getCurrentWebview().onDragDropEvent((event) => handler(event.payload)),
+    /*
+     * Guarded like every `listen` above, and with one more reason to be: `onDragDropEvent` is
+     * four subscriptions (`enter`/`over`/`drop`/`leave`) behind one handle, removed in a row,
+     * so the first one that loses the registration race abandons the other three. A retry
+     * re-runs all four, which is safe because removing an already-removed listener is a no-op
+     * at the Tauri end.
+     */
+    getCurrentWebview()
+      .onDragDropEvent((event) => handler(event.payload))
+      .then((fn) => guardUnlisten(fn)),
+}
+
+/* ==========================================================================================
+ * Docker — the machine's daemon, its containers and its images. (M41)
+ *
+ * **Nothing here takes a project.** A Docker daemon belongs to the machine: every window shows
+ * the same containers, and keying these by project would be N copies of one answer that disagree
+ * while they refresh. That is also why `dockerEvents.onChanged` carries a board and no id.
+ *
+ * **Reads go through `pendingCommand` and mutations do not.** The board's failure is already a
+ * board — `DockerBoard` has an `absent` and an `unusable` arm carrying the sentence — so the only
+ * thing `pendingCommand` catches here is the command surface itself being gone. A mutation's
+ * failure is the daemon refusing ("You cannot remove a running container"), and swallowing that
+ * would be a button that reports success and does nothing.
+ * ======================================================================================== */
+import type {
+  ComposeAction,
+  ComposeRun,
+  ContainerAction,
+  Removable,
+  ContainerEdit,
+  ContainerListing,
+  DockerBoard,
+  DockerDetail,
+  DockerStream,
+  InspectTarget,
+} from './generated'
+
+/**
+ * Stamps `docker.watch` calls so Rust can discard one that lost a race. (M54)
+ *
+ * Module scope and window lifetime, deliberately: it is compared only with other stamps from this
+ * same webview, so it needs no coordination with anything — and JavaScript is single-threaded, so
+ * the increments are ordered even when their deliveries are not.
+ */
+let watchSeq = 0
+
+export const docker = {
+  board: () =>
+    pendingCommand(
+      'docker_board',
+      () => invoke<DockerBoard>('docker_board', {}),
+      null as DockerBoard | null,
+    ),
+
+  /**
+   * Start, stop, restart, pause, unpause, kill or remove one container.
+   *
+   * Answers with the whole board, so the acting window repaints from one round trip; the other
+   * windows are updated by `cide://docker-changed`, which Rust emits from the same call.
+   */
+  action: (container: string, action: ContainerAction) =>
+    invoke<DockerBoard>('docker_container_action', { container, action }),
+
+  /**
+   * Point at a different daemon. `endpoint` is a `DOCKER_HOST` URL taken from a `ContextRow`;
+   * `undefined` restores cide's own ladder.
+   *
+   * Restoring the ladder is deliberately *not* the same as naming whichever endpoint it currently
+   * picks: a machine whose `docker context use` changes under a running cide should follow it,
+   * and only an explicit choice should pin.
+   */
+  use: (endpoint?: string) => invoke<DockerBoard>('docker_use_endpoint', { endpoint }),
+
+  /**
+   * Open a shell in a container, or follow its logs, and get back a **`SessionId`**.
+   *
+   * # Why this answers a session id and not something Docker-shaped
+   *
+   * Because what comes back *is* an ordinary session. Rust builds it through
+   * `PtySession::connect` over M42's `Transport` seam, so from here on it is indistinguishable
+   * from a shell pane: `session.attach`, `session.write`, `session.resize` and `session.exit`
+   * all work on it, and detaching the pane into a window or parking it across a project switch
+   * works because none of that code knows where the bytes come from.
+   *
+   * `geometry` matters at *open* time and not only afterwards — the daemon sizes an exec's
+   * terminal when it is created, so a session opened at the wrong size starts at 80×24 and only
+   * corrects on the first resize, which for a pane nobody resizes is never.
+   */
+  openSession: (container: string, stream: DockerStream, geometry: Geometry) =>
+    invoke<SessionId>('docker_session_open', { container, stream, geometry }),
+
+  /**
+   * What the detail pane shows for one thing — structured, not the raw document.
+   *
+   * Never rejects for a Docker reason: a thing that is gone answers `{kind: 'missing'}` with a
+   * sentence, which on this surface is an ordinary outcome rather than a failure.
+   */
+  detail: (target: InspectTarget) => invoke<DockerDetail>('docker_detail', { target }),
+
+  /**
+   * Apply an edit to a container **by replacing it**.
+   *
+   * Docker cannot change a running container's ports. Rust removes the container and creates a
+   * new one from the same image under the same name — see `cide_docker::detail::recreate`. The
+   * **id changes**, so an exec pane or log follow holding the old one is attached to a container
+   * that no longer exists; they end, and the panel re-points on the board that comes back.
+   */
+  recreate: (container: string, edit: ContainerEdit) =>
+    invoke<DockerBoard>('docker_recreate', { container, edit }),
+
+  /** The raw `inspect` document, pretty-printed. Read on every open and never stored. */
+  inspect: (target: InspectTarget) => invoke<string>('docker_inspect', { target }),
+
+  /** Open a read-only inspect tab, or activate the one already showing this thing. */
+  openInspect: (project: ProjectId, target: InspectTarget, name: string) =>
+    invoke<TabId>('docker_open_inspect', { project, target, name }),
+
+  /**
+   * Bring a Compose stack up, down, or restart it.
+   *
+   * The one road in this namespace that is **not** the Engine API — there is no endpoint for
+   * compose, so Rust runs the CLI plugin. ADR 0013 records why that exception exists and why it
+   * is the only one. A failure carries Compose's own last line, which is the sentence that says
+   * what went wrong, and it must not be swallowed.
+   */
+  /** List one directory inside a container. Never rejects for a container reason. */
+  listFiles: (container: string, path: string) =>
+    invoke<ContainerListing>('docker_files_list', { container, path }),
+
+  /**
+   * Read one file out of a container, as text.
+   *
+   * A rejection **is** the answer for the ordinary refusals — a directory, a symlink, a binary,
+   * something over the cap — and each carries a sentence naming which, so it is shown rather
+   * than caught.
+   */
+  readFile: (container: string, path: string) =>
+    invoke<string>('docker_files_read', { container, path }),
+
+  /**
+   * Copy a file or directory out of a container onto this machine.
+   *
+   * Rust opens the save dialog — the webview's picker is capability-gated and cide does not grant
+   * it, which is the same wall `globalThis.confirm` hit. A **directory** comes out as a tar,
+   * because the Engine API has no recursive read that is not one and `docker cp` produces the
+   * same shape.
+   *
+   * Answers the path written, or `null` when the dialog was cancelled. Cancelled is not an error.
+   */
+  download: (container: string, path: string, directory: boolean) =>
+    invoke<string | null>('docker_files_download', { container, path, directory }),
+
+  /**
+   * Remove an image, a volume or a network. (M56)
+   *
+   * **Nothing here forces**, and a refusal is the ordinary answer rather than a failure of the
+   * call: Docker declines while anything is using the thing and names what — which is worth more
+   * than the removal would have been. The rejection carries that sentence and `dockerStore` shows
+   * it; swallowing it would be a button that reports success and removes nothing.
+   *
+   * A *container* is not addressable here. It is removed through `action(id, 'remove')`, which
+   * forces after the frontend has confirmed — see `cide_ipc::docker::Removable` for why the two
+   * roads are deliberately separate rather than one with a flag.
+   */
+  remove: (target: Removable) => invoke<DockerBoard>('docker_remove', { target }),
+
+  /**
+   * How much disk one volume is using. (M57)
+   *
+   * **Costs a filesystem walk**, so it is asked once a volume's detail is open and never as part
+   * of a board read: `GET /volumes` carries no size at all, and `/system/df` — the only endpoint
+   * that does — was measured at 8.4 seconds cold and about 1.3 warm on a real daemon. `docker
+   * volume ls` shows no size for the same reason.
+   *
+   * `null` is the daemon declining to measure, which is **not** zero. A volume drawn as `0 B`
+   * when nobody counted is a claim that it is empty.
+   */
+  volumeSize: (name: string) => invoke<bigint | null>('docker_volume_size', { name }),
+
+  /** Open a container's file browser, or activate the tab already showing it. */
+  openFiles: (project: ProjectId, container: string, name: string) =>
+    invoke<TabId>('docker_open_files', { project, container, name }),
+
+  compose: (
+    project: string,
+    action: ComposeAction,
+    workingDir: string | undefined,
+    files: readonly string[],
+  ) =>
+    invoke<DockerBoard>('docker_compose_action', {
+      project,
+      action,
+      workingDir,
+      files,
+    }),
+
+  /**
+   * Resolve a compose **file** and a verb into something a terminal pane can spawn. (M48)
+   *
+   * The other road, and the difference is what is known. `compose` above acts on a *running*
+   * stack whose project name came off a container label; this one acts on a file the user
+   * clicked, where there is no label to read and Compose's own derivation — a `name:` in the
+   * file, `COMPOSE_PROJECT_NAME` in the `.env` beside it, then the directory's basename — is the
+   * right answer and cide cannot improve on it.
+   *
+   * Answers a plan rather than running it: the run belongs in a pane, and a pane is spawned by
+   * `session.spawn` through `SplitIntent::Compose`. Rejects with the install sentence when there
+   * is no Compose on this machine.
+   */
+  composePlan: (file: string, action: ComposeAction, services: readonly string[] = []) =>
+    invoke<ComposeRun>('docker_compose_plan', { file, action, services }),
+
+  /**
+   * Say that a panel is, or is no longer, on screen. (M52)
+   *
+   * What it controls is the daemon's **event subscription**, which is an open socket and a full
+   * board read — containers, images, volumes, networks — per event. That was started lazily and
+   * never stopped, so a session that opened the Docker tab once went on reading the daemon for
+   * the rest of its life for a panel nobody was looking at.
+   *
+   * Rust cannot know this: whether a panel is mounted is a fact about the React tree, and the
+   * panel lives in a tool-window tab that changes with a click Rust never hears about.
+   *
+   * # `seq` is not optional, and a boolean alone is not enough
+   *
+   * `docker_watch` is `async`, so Tauri runs these on its worker pool and **they can be handled
+   * out of order**. React's StrictMode makes that routine rather than rare: mounting a panel in
+   * development fires `true`, `false`, `true` in the same tick, three commands at once.
+   *
+   * A counter on the Rust side could not survive it — a decrement handled before its increment is
+   * clamped at zero and lost, so the count drifts up and the subscription is never stopped, and
+   * the reverse ordering left a live panel with no subscription and no way back. Both shipped,
+   * and both were reported as "the panel does not update".
+   *
+   * So each call states what is true *now* and stamps it, and Rust keeps the newest statement per
+   * window. Monotonic per webview, which is all it needs to be: the stamps are only ever compared
+   * with others from the same window.
+   */
+  watch: (watching: boolean) => invoke<void>('docker_watch', { seq: (watchSeq += 1), watching }),
+}
+
+/**
+ * A standalone object, not a member of `events`, for the reason `specEvents` states: appending
+ * cannot reach inside a literal that closed above.
+ */
+export const dockerEvents = {
+  onChanged: (handler: (board: DockerBoard) => void) =>
+    listen<{ board: DockerBoard }>('cide://docker-changed', (event) =>
+      handler(event.payload.board),
+    ),
 }

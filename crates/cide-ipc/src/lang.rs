@@ -335,6 +335,28 @@ pub struct LanguageServerDef {
     /// `~/.cargo/bin`, `~/go/bin`, `~/.local/share/npm/bin`. `~` is expanded; nothing else is.
     #[serde(default)]
     pub extra_path_hints: Vec<String>,
+    /// `initializationOptions` this definition wants sent, whatever the provenance. (M45)
+    ///
+    /// # The two lanes, and why they are separate
+    ///
+    /// `cide_lsp::config::init_options` sends cide's *own* configuration only to a
+    /// `Provenance::Bundled` or `Override` resolution — the shipped rust-analyzer fork and a
+    /// developer's build of it — so that a stock server gets byte-for-byte the handshake it has
+    /// always got. That gate is right for the fork, whose option names are a two-repo contract,
+    /// and wrong for a server that simply needs to be *told something*: `yaml-language-server`
+    /// has no idea a Compose file is a Compose file until it is handed a schema map, and it is
+    /// always a stock installation.
+    ///
+    /// So a definition may carry its own options, which are sent regardless of provenance, while
+    /// the fork-specific ones stay provenance-gated. **One producer each**: nothing may put a
+    /// fork option here, and nothing may put a definition's options behind that gate.
+    ///
+    /// `None` — the default, and what every builtin but `yaml-language-server` answers — means
+    /// "say nothing", which is the pre-M45 behaviour exactly.
+    #[serde(default)]
+    #[ts(optional)]
+    #[ts(type = "unknown")]
+    pub init_options: Option<serde_json::Value>,
 }
 
 // ==========================================================================================
@@ -534,7 +556,10 @@ pub fn builtins() -> Vec<LanguageDef> {
             id: "shell".into(),
             label: "Shell".into(),
             extensions: exts(&[("sh", None), ("bash", None), ("zsh", None), ("fish", None)]),
-            filenames: words(&[".bashrc", ".zshrc", ".profile", "dockerfile", "makefile"]),
+            // `dockerfile` was here until M45 and was the whole of cide's "Dockerfile support":
+            // a `FROM` line highlighted as a shell command that happened to start with a word.
+            // It has its own entry below now.
+            filenames: words(&[".bashrc", ".zshrc", ".profile", "makefile"]),
             fence_aliases: words(&["shell", "console", "shell-session", "sh-session", "zsh"]),
             grammar: named("Shell"),
             fold: FoldSpecDto {
@@ -546,6 +571,38 @@ pub fn builtins() -> Vec<LanguageDef> {
                 ..FoldSpecDto::default()
             },
             scratch: scratch(&[("Shell", "sh")]),
+        },
+        LanguageDef {
+            id: "dockerfile".into(),
+            label: "Dockerfile".into(),
+            // **Both directions**, because both conventions are in wide use: `Dockerfile` is a
+            // whole name, `api.dockerfile` is an extension.
+            //
+            // # What this does not catch, stated
+            //
+            // `Dockerfile.prod` — the other multi-stage convention — resolves to **plain text**.
+            // `languages.ts::lookup` tries the whole lowercased name and then the text after the
+            // last dot, so `Dockerfile.prod` matches neither `dockerfile` nor `prod`. Catching it
+            // would mean a third rung in that lookup (try the first segment), which is a change
+            // to how *every* language resolves and would quietly start matching `Makefile.am`,
+            // `data.json.bak` and anything else with a suffixed name. That may well be right, and
+            // it is a decision about the file-type registry rather than about Docker — so it is
+            // left alone here rather than made as a side effect of adding one language.
+            extensions: exts(&[("dockerfile", None), ("containerfile", None)]),
+            filenames: words(&["dockerfile", "containerfile"]),
+            fence_aliases: words(&["docker"]),
+            grammar: named("Dockerfile"),
+            fold: FoldSpecDto {
+                line_comment: Some("#".into()),
+                // Both, because both appear in `ENV` and `LABEL` values and in a `RUN` line's
+                // shell. Not multiline: a Dockerfile continues a line with a trailing backslash
+                // rather than by leaving a quote open, and treating a stray apostrophe in a
+                // comment as opening a string would swallow the rest of the file.
+                quotes: Some("\"'".into()),
+                regions: true,
+                ..FoldSpecDto::default()
+            },
+            scratch: scratch(&[("Dockerfile", "dockerfile")]),
         },
         LanguageDef {
             id: "sql".into(),
@@ -648,6 +705,9 @@ pub fn builtin_servers() -> Vec<LanguageServerDef> {
             // gitignore-filtered index, and telling it twice makes it worse rather than better.
             declares_watched_files: false,
             extra_path_hints: words(&["~/.cargo/bin"]),
+            // The fork's options ride the provenance gate in `cide_lsp::config`, not this
+            // field — see its documentation for why the two lanes must not mix.
+            init_options: None,
         },
         LanguageServerDef {
             binary: "gopls".into(),
@@ -659,6 +719,92 @@ pub fn builtin_servers() -> Vec<LanguageServerDef> {
             // gopls has no watcher and needs to be told.
             declares_watched_files: true,
             extra_path_hints: words(&["~/go/bin"]),
+            // gopls is configured through the *env* lane (`GOPLSCACHE`), also provenance-gated.
+            init_options: None,
+        },
+        // M45. The Dockerfile language server.
+        //
+        // **`docker-langserver`, from `dockerfile-language-server-nodejs`**, and the choice was
+        // made deliberately rather than by reaching for the newest thing: Docker now publishes a
+        // server of its own that covers Dockerfile *and* Compose in one binary, which would have
+        // folded the entry below into this one — but it could not be verified from the machine
+        // this was written on (npm is behind a proxy that would not answer), and a builtin naming
+        // a package that may not exist is an `install_hint` that sends people to a 404. This one
+        // has been the Dockerfile server since long before either. Moving to Docker's own is a
+        // one-line change here plus deleting the Compose entry below, and is worth doing the
+        // moment somebody can run `npm view` on it.
+        //
+        // **Never bundled.** It resolves at `Provenance::SystemPath` or `HintDir` through the npm
+        // ladder, which is the rung that exists for exactly this: an `npm -g` install lands in a
+        // directory a shell rc file adds to `PATH` and a desktop launcher does not.
+        LanguageServerDef {
+            binary: "docker-langserver".into(),
+            args: words(&["--stdio"]),
+            language_ids: words(&["dockerfile"]),
+            // **None**, and that is a decision rather than an omission. There is no file that
+            // means "this project uses Docker" — a Dockerfile is very often the only one in a
+            // repository — so requiring a marker would mean the server never starting for most
+            // of the projects that have one.
+            project_markers: vec![],
+            project_kind: "Docker".into(),
+            install_hint: "npm install -g dockerfile-language-server-nodejs".into(),
+            // It has no watcher of its own, and a Dockerfile's `COPY` sources change constantly.
+            declares_watched_files: true,
+            extra_path_hints: vec![],
+            init_options: None,
+        },
+        // Compose, which is YAML with a schema.
+        //
+        // # Why this claims `yaml` and therefore every YAML file
+        //
+        // Because cide has no `dockercompose` language and should not invent one: a Compose file
+        // *is* YAML, it is edited as YAML, and a language id of its own would mean a second
+        // grammar entry, a second fold spec and a second scratch row — all aliases of the YAML
+        // ones — to change one server's configuration. So the server claims `yaml`, and the
+        // *schema map* below is what makes it treat a Compose file differently from any other.
+        //
+        // # And what happens when an extension contributes one too
+        //
+        // The extension wins — `cide_ext::contribute`'s documented rule, keyed by binary: a later
+        // claim on the same name beats a builtin, because otherwise installing a YAML extension
+        // would visibly do nothing. The cost is stated here so it is not a surprise: such an
+        // extension supersedes this row *including its schema map*, and Compose completion goes
+        // back to plain YAML until that extension declares its own.
+        LanguageServerDef {
+            binary: "yaml-language-server".into(),
+            args: words(&["--stdio"]),
+            language_ids: words(&["yaml"]),
+            project_markers: vec![],
+            project_kind: "YAML".into(),
+            install_hint: "npm install -g yaml-language-server".into(),
+            declares_watched_files: false,
+            extra_path_hints: vec![],
+            // **The whole reason `init_options` exists.** `yaml-language-server` has no idea a
+            // Compose file is a Compose file; a schema map is the only way to tell it, and it is
+            // always a stock installation, so the provenance gate in `cide_lsp::config` would
+            // never send it anything. See the field's own documentation for the two lanes.
+            //
+            // The globs are Compose's own documented file names. `schemastore` is where every
+            // other editor points for this and is what keeps the schema current without cide
+            // shipping a copy that goes stale — the cost, stated: the server fetches it, so a
+            // machine with no network gets plain YAML rather than schema completion, which is
+            // exactly what it had before M45.
+            init_options: Some(serde_json::json!({
+                "yaml": {
+                    "schemas": {
+                        "https://raw.githubusercontent.com/compose-spec/compose-spec/master/schema/compose-spec.json": [
+                            "compose.yaml",
+                            "compose.yml",
+                            "compose.*.yaml",
+                            "compose.*.yml",
+                            "docker-compose.yaml",
+                            "docker-compose.yml",
+                            "docker-compose.*.yaml",
+                            "docker-compose.*.yml"
+                        ]
+                    }
+                }
+            })),
         },
     ]
 }

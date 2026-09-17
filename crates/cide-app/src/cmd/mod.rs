@@ -79,4 +79,5 @@ pub mod ext;
 // M28: OpenSpec. Its own module rather than rows in `cmd::tasks`, because everything here spawns
 // a subprocess and answers with somebody else's file format — the two facts that keep `cide-spec`
 // a separate crate apply one layer up as well.
+pub mod docker;
 pub mod spec;

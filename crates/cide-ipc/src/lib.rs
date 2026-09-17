@@ -146,6 +146,15 @@ pub use lang::{
 // `Task` and `cide-tasks` never has to know what a requirement is.
 pub mod spec;
 
+// What a Docker daemon is running. (M41)
+//
+// Its own module for `spec`'s reason applied to somebody else's daemon: these are the shapes the
+// panels are built against, and the Engine API's own JSON lives in `cide_docker::model`. Not
+// re-exported at the crate root — spelled `cide_ipc::docker::ContainerRow`, the rule `git` and
+// `history` follow, so that a second vocabulary of rows, states and ids stays greppable apart
+// from cide's own.
+pub mod docker;
+
 pub use spec::{
     ArtifactState, ChangeSummary, DeltaOperation, SpecAcceptPlan, SpecAccepted, SpecArtifact,
     SpecArtifactRules, SpecArtifactText, SpecBoard, SpecChange, SpecCommand, SpecConfig,
@@ -401,6 +410,57 @@ pub enum SplitIntent {
     Continue { conversation: HarnessSession },
     /// `$SHELL -l`
     Shell,
+    /// A pane attached to a container — an interactive exec, or a log follow. (M42)
+    ///
+    /// Carries the container's *name* as well as its id because the pane's title is written at
+    /// split time, and asking the daemon for one here would put a round trip inside a layout
+    /// mutation. The name is also what [`crate::workspace::DockerPane`] stores and deliberately
+    /// never re-resolves — see its own note.
+    Docker {
+        container: String,
+        name: String,
+        stream: crate::docker::DockerStream,
+    },
+    /// A pane for a session that **already exists**, which this pane then owns. (M48, reworked M50)
+    ///
+    /// # Why a compose run spawns first and splits second
+    ///
+    /// The first cut carried the argv here and parked it in `layout/spawnPlans.ts` between the
+    /// split committing and `TerminalPane` mounting. That is the road `ForkPrimary` and `Mirror`
+    /// take, and it has a race those two survive and this one did not: the plan is recorded after
+    /// `pane_split` **resolves**, while the pane it is for can render as soon as the
+    /// `workspace_changed` broadcast lands — which is sent before the command returns. A mirror
+    /// that loses its plan falls through to adopting a held session and looks fine; a compose
+    /// pane that lost its plan fell through to `specFor`'s shell arm and opened **a login shell**.
+    /// Reported as "compose up does nothing, only opens an empty terminal", and it was exactly
+    /// that: an empty terminal.
+    ///
+    /// So the session is spawned first — an ordinary `session_spawn`, with everything that brings:
+    /// the job watcher that lights the pane dot when the run ends, the proxy environment a `pull`
+    /// needs, `$EDITOR`, park-across-a-project-switch — and the pane is created already naming it.
+    /// `Pane::session` is durable, so no plan has to survive anything.
+    ///
+    /// # This pane **owns** its child, unlike [`Self::Mirror`]
+    ///
+    /// The distinction that killed an agent mid-turn once (see `cmd::agents`' note on
+    /// `agent_open_pane`): a mirror is a second sink on somebody else's session and closing it
+    /// must not end the child, while this pane's session was started *for* it. The frontend sets
+    /// `mirrored` from a plan, and this road has no plan — so the flag stays false and closing the
+    /// pane ends the run, which is what a person who opened it expects of Ctrl+W.
+    ///
+    /// # What a restore does
+    ///
+    /// Nothing re-runs. The id names a session that died with the previous process, so
+    /// `sessionIsHeld` refuses it and the pane falls back to a plain shell in the same directory —
+    /// with the dead session's parting screen replayed above it by `lifecycle::shell_preload`, so
+    /// the compose output the user was reading is still there. A pane that re-spawned its argv at
+    /// launch, against a file that may have changed, on a machine just unlocked, is the one
+    /// outcome here worth designing against.
+    Adopt {
+        session: SessionId,
+        /// What the pane is called — `compose up : shop`.
+        title: String,
+    },
     // There is deliberately no `Diff`. A diff pane is not something a *split* can produce:
     // what it renders comes from its tab's `TabKind::Diff { spec }`, and the two gestures
     // that open one — an `openDiff` RPC and the git panel — both create the tab and the pane

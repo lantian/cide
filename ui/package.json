@@ -1,12 +1,14 @@
 {
   "name": "cide-ui",
   "private": true,
-  "version": "0.7.1-dev",
+  "version": "0.9.1-dev",
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "check:agents": "node scripts/check-agents.mjs",
     "check:agents-render": "node scripts/check-agents-render.mjs",
+    "check:docker": "node scripts/check-docker.mjs",
+    "check:docker-render": "node scripts/check-docker-render.mjs",
     "check:attach": "node scripts/check-attach.mjs",
     "check:awaiting": "node scripts/check-awaiting.mjs",
     "check:blame": "node scripts/check-blame.mjs",
@@ -94,6 +96,7 @@
     "check:tree-status": "node scripts/check-tree-status.mjs",
     "check:ui-icons": "node scripts/check-ui-icons.mjs",
     "check:ui-scale": "node scripts/check-ui-scale.mjs",
+    "check:unlisten": "node scripts/check-unlisten.mjs",
     "check:window-controls": "node scripts/check-window-controls.mjs",
     "dev": "vite",
     "preview": "vite preview",

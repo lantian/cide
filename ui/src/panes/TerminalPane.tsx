@@ -36,7 +36,9 @@ import { acknowledgesKey } from './awaitingRule'
 import {
   claudeSession,
   diag,
+  docker as dockerApi,
   session as sessionApi,
+  type DockerStream,
   type Geometry,
   type HarnessSession,
   type Pane,
@@ -70,6 +72,15 @@ export interface TerminalSpec {
    * same place as the first mount did.
    */
   continues?: HarnessSession | undefined
+  /**
+   * This pane's bytes come from a container, not from a child on this machine. (M42)
+   *
+   * When set, `program`, `args`, `cwd`, `resume` and `fork` are all ignored — the session is
+   * opened by `docker.openSession` instead of `session.spawn`. They are still *filled in* by
+   * `specFor` because a `TerminalSpec` with holes in it would make every reader of this type
+   * check which kind it was holding, and only `sessionFor` actually needs to know.
+   */
+  docker?: { container: string; stream: DockerStream } | undefined
 }
 
 export interface TerminalPaneProps {
@@ -211,6 +222,21 @@ function specFor(
     }
     case 'shell': {
       const prior = restore !== undefined ? (pane.session ?? undefined) : undefined
+      /*
+       * A container's pane is a shell pane with `pane.docker` set — see `cide_ipc::Pane`'s field
+       * for why it is not a `PaneKind` of its own. The check is here, inside the `shell` arm,
+       * rather than as a case above it, because that is what the durable state actually says:
+       * every gesture on this pane behaves like a shell's, and only where the bytes come from
+       * differs.
+       *
+       * **No `resume`.** A screen replay is right for a local shell — the text the child left
+       * behind is the text that was true — and wrong for a container: the pane comes back after
+       * a restart, opens a *new* exec, and a replayed screen above it would be a transcript of a
+       * shell session that no longer exists, in a container that may not either.
+       */
+      if (pane.docker) {
+        return { program: LOGIN_SHELL, args: [], cwd, project, docker: pane.docker }
+      }
       return { program: LOGIN_SHELL, args: [], cwd, project, resume: prior }
     }
     default:
@@ -312,8 +338,18 @@ async function sessionFor(paneId: string, spec: TerminalSpec, geometry: Geometry
 
   let p = pending.get(paneId)
   if (!p) {
-    p = sessionApi
-      .spawn({ ...spec, geometry })
+    // The one branch, and it is the whole of M42 on this side: a docker pane asks the daemon
+    // for a session instead of asking Rust to fork a child. Everything after this line — the
+    // host binding, `ensureAttached`, the sink, the exit bar — is identical, because what comes
+    // back is an ordinary `SessionId`.
+    //
+    // Inside the `pending` dedupe deliberately: StrictMode mounts this effect twice in
+    // development, and an exec opened twice would leave a live shell in the container that no
+    // pane is attached to.
+    const opened = spec.docker
+      ? dockerApi.openSession(spec.docker.container, spec.docker.stream, geometry)
+      : sessionApi.spawn({ ...spec, geometry })
+    p = opened
       .then((id) => {
         getHost(paneId).sessionId = id
         return id

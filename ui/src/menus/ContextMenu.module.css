@@ -120,6 +120,11 @@
   place-items: center;
   width: 12px;
   color: var(--accent);
+  /* Not a button, so there is no UA padding to undo — stated because `check:ui-icons` asks every
+     mark-in-a-fixed-box to say what its padding is, and "none, deliberately" is an answer. The
+     rule exists because a <button> that stays silent keeps WebKit's `1px 6px` and draws its mark
+     off-centre inside its own hover background. */
+  padding: 0;
 }
 
 .label {

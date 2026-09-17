@@ -53,6 +53,10 @@ function tabTitle(kind: TabKind): string {
       return 'Settings'
     case 'extension':
       return kind.name
+    case 'docker':
+      return kind.title
+    case 'dockerFiles':
+      return `${kind.name} : files`
     case 'openSpec':
       return kind.subject.kind === 'change' ? kind.subject.change : kind.subject.spec
   }

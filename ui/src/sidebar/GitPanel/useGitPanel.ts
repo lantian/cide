@@ -2455,13 +2455,18 @@ export function useGitPanel(
          * from a dead one. That is the complaint this panel keeps answering; it must not be the
          * thing this button produces.
          */
+        // Both stamped with the project this panel is attached to, not with whatever the
+        // window is showing when the pass finishes: the loop above is one round trip per
+        // conflicted file, so a large merge outlives a project switch easily.
         if (settled > 0) {
           notify(`Resolved ${settled} of ${looked} conflicted file${looked === 1 ? '' : 's'}`, {
             kind: 'ok',
+            project,
           })
         } else {
           notify('Nothing could be resolved automatically', {
             kind: 'warn',
+            project,
             hint:
               looked === 0
                 ? 'Every conflicted file has already been answered.'

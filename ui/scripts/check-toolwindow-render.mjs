@@ -72,14 +72,14 @@ try {
   // It is always there, always first, and can never be closed. The model encodes that by giving
   // it no id and keeping it out of `history`; this is the half that proves the row agrees.
 
-  eq(byName.logOnly.labels, ['Log'], 'a project with no history tabs shows exactly the Log tab')
+  eq(byName.logOnly.labels, ['Log', 'Docker'], 'a project with no history tabs shows exactly the Log tab')
   eq(byName.logOnly.active, 'Log', 'and it is the one selected')
   eq(byName.logOnly.closable, [], 'the Log tab renders NO close control — it cannot be closed')
   eq(byName.logOnly.hide, true, 'the panel can still be hidden, which is the way out')
 
   eq(
     byName.twoHistories.labels,
-    ['Log', 'log.rs', 'App.tsx'],
+    ['Log', 'Docker', 'log.rs', 'App.tsx'],
     'history tabs follow the Log tab in the order they were opened, labelled by basename',
   )
   eq(
@@ -91,17 +91,18 @@ try {
   eq(byName.twoHistories.active, 'App.tsx', 'opening a history tab puts it in front')
   eq(
     byName.twoHistories.tabRoles,
-    3,
-    'three tabs claim role="tab" and nothing else does — the close buttons are siblings of the '
+    4,
+    'four tabs claim role="tab" and nothing else does — Log, Docker and the two histories. The '
+      + 'count moved with M46 and the claim did not: the close buttons are siblings of the '
       + 'tabs, not children, because a <button> inside a role="tab" is unreachable in the tab’s '
       + 'own reading order and a close control a keyboard cannot reach is one only a mouse can use',
   )
 
-  eq(byName.oneHistory.labels, ['Log', 'log.rs'], 'one history tab, after the Log tab')
+  eq(byName.oneHistory.labels, ['Log', 'Docker', 'log.rs'], 'one history tab, after the Log tab')
   eq(byName.logInFront.active, 'Log', 'showing the Log tab does not close the history tabs')
   eq(
     byName.logInFront.labels,
-    ['Log', 'log.rs', 'App.tsx'],
+    ['Log', 'Docker', 'log.rs', 'App.tsx'],
     'and leaves them exactly where they were',
   )
 

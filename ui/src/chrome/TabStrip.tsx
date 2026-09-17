@@ -723,6 +723,34 @@ function viewFor(kind: TabKind): TabView {
         audit: undefined,
       }
 
+    case 'docker':
+      return {
+        // Settings' shape again, for the reason the OpenSpec arm above gives: this is a page
+        // *about* something rather than a document in the project.
+        shape: styles.shapeSettings,
+        // The stored title — `shop-db-1 : container`. Written at open time because a target
+        // carries an id, and `a3f9c1…` is not a tab label.
+        body: <span>{kind.title}</span>,
+        closable: true,
+        // Never. An inspect document is read-only and re-read on every open; there is nothing
+        // in it that could be unsaved.
+        dirty: false,
+        hint: 'docker inspect',
+        audit: undefined,
+      }
+
+    case 'dockerFiles':
+      return {
+        shape: styles.shapeSettings,
+        body: <span>{`${kind.name} : files`}</span>,
+        closable: true,
+        // Read-only, always: `PUT /archive` exists and cide does not call it, so nothing in this
+        // tab can be unsaved. See `cide_docker::files`.
+        dirty: false,
+        hint: 'container files',
+        audit: undefined,
+      }
+
     default:
       return unhandled(kind)
   }

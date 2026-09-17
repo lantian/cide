@@ -19,6 +19,30 @@
  * loses its only permanent tab.
  */
 
+/**
+ * The Docker tab's id. (M46)
+ *
+ * A sentinel string, the way `ext:` ids are, and for the same reason: `ToolWindowTabs::active` is
+ * a `HistoryTabId` — a uuid — everywhere it reaches Rust, so anything that is not one must never
+ * be sent. [`isDockerTab`] is the guard, and `ToolWindowHost` holds this tab's selection in the
+ * webview exactly as it holds a contributed tab's.
+ *
+ * # Why the Docker tab is not persisted, when it easily could be
+ *
+ * A contributed tab is not persisted because there may be no such extension next launch. That
+ * argument does not apply here — Docker cannot be uninstalled — so the real reason is narrower
+ * and worth stating: `ToolWindowState::active` is typed as an optional uuid in `workspace.json`,
+ * and widening it to carry a builtin sentinel is a wire change, a migration, and a new way for a
+ * stored value to be invalid. The Log tab is the right thing to come back to, and Docker is one
+ * click from it.
+ */
+export const DOCKER_TAB = 'docker'
+
+/** Whether an id addresses the Docker tab rather than one of Rust's. */
+export function isDockerTab(id: string | null): boolean {
+  return id === DOCKER_TAB
+}
+
 /** One open per-file History tab. A structural restatement of `HistoryTab` in `generated.ts`. */
 export interface HistoryTab {
   readonly id: string
@@ -119,6 +143,20 @@ export function tabRow(tabs: ToolWindowTabs): TabRow[] {
       closable: false,
     },
   ]
+  // Docker, immediately after Log and before anything the user opened. (M46)
+  //
+  // Second rather than last, which is the opposite of where contributed tabs go — and the
+  // difference is who put the tab there. A contributed tab appears because an extension was
+  // enabled, so it must not push the user's own history tabs along; Docker is a fixture of the
+  // panel like Log, and a fixture that moved as history tabs came and went would be a target that
+  // is never in the same place twice. Not closable, for the same reason Log is not.
+  rows.push({
+    id: DOCKER_TAB,
+    label: 'Docker',
+    title: "This machine's containers and images",
+    active: isDockerTab(tabs.active ?? null),
+    closable: false,
+  })
   for (const tab of tabs.history) {
     rows.push({
       id: tab.id,

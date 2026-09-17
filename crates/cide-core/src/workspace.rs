@@ -130,6 +130,7 @@ pub fn open_project(
             conversation_since: None,
             continues: None,
             title: format!("{name} : claude"),
+            docker: None,
         }),
     };
     let active_tab = console.id;
@@ -440,6 +441,13 @@ pub fn tab_outlives_close(kind: &TabKind) -> bool {
     match kind {
         TabKind::Diff { spec, .. } => !matches!(spec.origin, DiffOrigin::ClaudeMcp { .. }),
         TabKind::Merge { .. } => false,
+        // **False**, and it is the same argument `toolWindowModel.ts` makes about contributed
+        // bottom tabs. An inspect tab is a view of a container that exists *now*; nothing
+        // durable is in it, the document is re-read on every open, and a container is removed
+        // and recreated as an ordinary part of using Docker. So a tab restored by
+        // `Ctrl+Shift+T` a day later would be a permanent apology tab about an id that no
+        // longer resolves — and, worse, `reopen_project` would restore it on every launch.
+        TabKind::Docker { .. } | TabKind::DockerFiles { .. } => false,
         TabKind::ClaudeHome
         | TabKind::ClaudeFull { .. }
         | TabKind::File { .. }
@@ -2375,6 +2383,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         conversation_since: None,
         continues: None,
         title: title.to_string(),
+        docker: None,
     }
 }
 

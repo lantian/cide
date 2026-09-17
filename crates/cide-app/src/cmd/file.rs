@@ -100,6 +100,7 @@ pub(crate) fn open_file_tab(
                 conversation_since: None,
                 continues: None,
                 title,
+                docker: None,
             },
         )
     })
@@ -662,6 +663,7 @@ fn diff_pane(title: String) -> Pane {
         conversation_since: None,
         continues: None,
         title,
+        docker: None,
     }
 }
 
@@ -1074,6 +1076,7 @@ fn revision_pane(title: String) -> Pane {
         conversation_since: None,
         continues: None,
         title,
+        docker: None,
     }
 }
 
@@ -2882,6 +2885,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: title.into(),
+            docker: None,
         }
     }
 
@@ -2895,6 +2899,7 @@ mod tests {
             conversation_since: None,
             continues: None,
             title: title.into(),
+            docker: None,
         }
     }
 
@@ -3116,6 +3121,7 @@ mod tests {
                 conversation_since: None,
                 continues: None,
                 title: "main.rs".into(),
+                docker: None,
             },
         )
         .expect("opens a file tab");

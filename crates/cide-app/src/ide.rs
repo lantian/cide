@@ -714,6 +714,7 @@ fn open_diff_tab(app: &AppHandle, project: ProjectId, broker: &DiffBroker, reque
         conversation_since: None,
         continues: None,
         title,
+        docker: None,
     };
 
     let opened = state.update(|ws| {

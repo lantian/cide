@@ -1051,9 +1051,17 @@ export function EditorPane({
              * The timers are not rearmed after a failure either — see `EditorSurface` — so the
              * retries stop until the user touches the file again.
              */
+            /* Stamped with this pane's project — the one notice in this file that has to be.
+             * Everything else here answers a gesture within a frame, so the ambient scope is
+             * this project by construction; an autosave fires on a timer while the user is
+             * somewhere else, which is precisely when "somewhere else" can be another
+             * project. Filed under that one, the report about *this* file would never be
+             * shown here at all. `undefined` falls back to the ambient scope, which is right
+             * for a buffer that is in no project. */
             notify(`cide could not save ${basename(path)}: ${describe(error)}`, {
               kind: 'error',
               hint: 'Your changes are still in the buffer.',
+              project,
             })
           }
           // Rethrown either way: the surface leaves the tab dirty on a rejected promise, and the
@@ -1062,7 +1070,7 @@ export function EditorPane({
           throw error
         },
       ),
-    [path],
+    [path, project],
   )
 
   /**

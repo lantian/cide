@@ -70,19 +70,6 @@ export interface AppHeaderProps {
   activeProject?: string | null | undefined
   onActivate?: ((id: string) => void) | undefined
   onClose?: ((id: string) => void) | undefined
-  /**
-   * **No longer used, and deliberately still accepted.**
-   *
-   * `App.tsx` supplies a handler that opens `@tauri-apps/plugin-dialog`'s folder dialog. That
-   * dialog cannot be parented on Linux — the plugin guards `set_parent` behind
-   * `cfg(windows | macos)` — which is exactly the reported "the project popup opens *behind*
-   * the cide window". The `+` therefore goes to `project_pick` instead, unconditionally: a fix
-   * that took effect only once a second file stopped passing a prop is a fix that ships off.
-   *
-   * The field stays so the existing call site still type-checks, and so this comment sits where
-   * whoever deletes it will read it. Delete the prop and `pickProject` together.
-   */
-  onNew?: (() => void) | undefined
   onToggleTheme?: (() => void) | undefined
   /**
    * Split the focused pane of the active tab.
@@ -210,7 +197,9 @@ export function AppHeader({
       {/*
        * The `+` and the recent-projects caret. A component of its own because the `+` had to
        * stop going through `@tauri-apps/plugin-dialog` — its dialog cannot be parented on
-       * Linux and so opened behind this window. `onNew` is not forwarded; see its doc above.
+       * Linux and so opened behind this window. The header takes no handler for it at all:
+       * the prop that used to be accepted-and-ignored is gone, and `chrome/projectOpen.ts` is
+       * now the one road, shared with the palette's *Open project…*.
        *
        * **A sibling of `.tabs`, not a child of it.** It used to sit inside, after the last
        * project, and `.tabs` is a clipping box full of `flex: none` tabs — so at seven or eight

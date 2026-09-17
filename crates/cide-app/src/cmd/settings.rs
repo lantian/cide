@@ -408,6 +408,7 @@ pub fn tab_open_settings(
                 conversation_since: None,
                 continues: None,
                 title: "settings".into(),
+                docker: None,
             },
         )?;
         Ok(id)

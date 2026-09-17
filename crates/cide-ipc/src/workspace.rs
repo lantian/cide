@@ -679,6 +679,35 @@ pub enum TabKind {
         /// Unsaved edits in the centre pane. Same flag, same guard, as [`Self::File`]'s.
         dirty: bool,
     },
+    /// A container's filesystem, browsed. (M44)
+    ///
+    /// # Why no path is stored
+    ///
+    /// Because every step of a walk would be a `workspace.json` mutation and a broadcast to every
+    /// window — for a gesture that happens as fast as somebody can click. The current directory
+    /// is component state; a restored tab opens at `/`, which is a small loss against a layout
+    /// file rewritten on every double-click.
+    ///
+    /// `tab_outlives_close` answers `false` here for [`Self::Docker`]'s reason: the container may
+    /// not exist tomorrow.
+    DockerFiles {
+        container: String,
+        name: String,
+    },
+    /// A read-only `docker inspect` document. (M43)
+    ///
+    /// # Why the *text* is not here
+    ///
+    /// Because a tab is durable and the document is not. `workspace.json` would grow by 40 KB
+    /// per open inspect tab, and every byte of it would be a claim about a container's state at
+    /// the moment the tab was opened — which is exactly what an inspect tab must not assert
+    /// after a restart. So the tab carries only what to ask for, and the document is re-read.
+    ///
+    /// See [`crate::workspace::tab_outlives_close`]'s answer for this variant: it is `false`.
+    Docker {
+        target: crate::docker::InspectTarget,
+        title: String,
+    },
     Settings {
         section: SettingsSection,
     },
@@ -793,6 +822,11 @@ impl TabKind {
             Self::Settings { .. } => "Settings".into(),
             Self::Extension { name, .. } => name.clone(),
             Self::OpenSpec { subject } => subject.label(),
+            // Written at open time and stored, rather than derived from the target here: a
+            // target carries an *id*, and `a3f9c1…` is not a tab label. The caller has the name
+            // because it came from a row that was already drawing it.
+            Self::Docker { title, .. } => title.clone(),
+            Self::DockerFiles { name, .. } => format!("{name} : files"),
         }
     }
 }
@@ -1167,6 +1201,42 @@ pub struct Pane {
     pub continues: Option<crate::HarnessSession>,
     /// e.g. `cide : claude`, `cide : bash`, `cide : claude — diff`.
     pub title: String,
+    /// The container this pane's bytes come from, when they come from one. (M42)
+    ///
+    /// # Why this is a field on a `Shell` pane and not a `PaneKind` variant
+    ///
+    /// Because it is not a different *kind* of pane. A docker pane is an xterm attached to a
+    /// session, and every gesture that acts on one — split, move, detach, close, the grab handle,
+    /// the title bar — behaves identically whether the bytes come from a local shell or a
+    /// container. A new `PaneKind` would add an arm to every match over it in three crates and
+    /// the webview, and each of those arms would be a copy of the `Shell` one.
+    ///
+    /// # Why it is durable rather than a spawn plan
+    ///
+    /// `layout/spawnPlans.ts` carries per-gesture intent and its header states the limit plainly:
+    /// a plan lives in the *clicking window's* JavaScript realm, and does not survive a restart
+    /// or reach another window. That is right for "fork this conversation" and wrong here — a
+    /// restored pane whose identity had been forgotten would open a **local shell** where the
+    /// user left a container's, which is not a missing feature but a wrong one.
+    ///
+    /// `#[serde(default)]` so a `workspace.json` written before this field loads unchanged.
+    #[serde(default)]
+    #[ts(optional)]
+    pub docker: Option<DockerPane>,
+}
+/// Which container a pane is attached to, and how. (M42)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DockerPane {
+    /// The full container id, which is what every call is addressed by.
+    pub container: String,
+    /// The name as it was when the pane was opened — for the title, and for the sentence when the
+    /// container is gone. **Not** re-resolved on restore: a name is reused whenever a compose
+    /// stack is recreated, and a pane that silently re-pointed at a *different* container with
+    /// the same name would be the worst outcome available here.
+    pub name: String,
+    pub stream: crate::docker::DockerStream,
 }
 
 /// Which way to move when navigating between panes with the keyboard.
