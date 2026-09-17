@@ -155,11 +155,22 @@ pub fn resolve(
     //
     // Keyed by binary, because that is what is actually spawned: two extensions both driving
     // `yaml-language-server` would otherwise start two of it against the same root.
+    //
+    // The module's one rule, applied to a binary as it is to a name: an extension's server
+    // **displaces a builtin's** on the same binary, and loses to an earlier extension's. The
+    // first half was missing for a milestone. `cide_ipc::lang` grew a builtin
+    // `yaml-language-server` for Compose, promising in its own comment that a YAML extension
+    // would supersede it — and this loop answered every such extension with "already driven by
+    // cide itself, the first one wins", which is exactly the install-that-does-nothing the
+    // module header calls the worst first impression of the feature. Nothing on CI could see it:
+    // the one test that installs the real YAML extension runs only beside a `../cide-marketplace`
+    // checkout, which CI does not have.
     let mut servers: Vec<ServerBinding> = builtin_servers
         .into_iter()
         .map(|def| ServerBinding {
             def,
             source: ContributionSource::Builtin,
+            supersedes: None,
         })
         .collect();
     for contributor in extensions {
@@ -167,7 +178,10 @@ pub fn resolve(
             extension: contributor.id.clone(),
         };
         for def in &contributor.contributes.language_servers {
-            if let Some(prior) = servers.iter().find(|s| s.def.binary == def.binary) {
+            let prior = servers.iter().position(|s| s.def.binary == def.binary);
+            if let Some(index) = prior
+                && servers[index].source != ContributionSource::Builtin
+            {
                 conflicts.push(warning(
                     &contributor.manifest,
                     None,
@@ -175,7 +189,7 @@ pub fn resolve(
                         "`{}` is already driven by {}. The first one wins; two of the same \
                          server against one project is two answers to every question.",
                         def.binary,
-                        describe(&prior.source)
+                        describe(&servers[index].source)
                     ),
                 ));
                 continue;
@@ -196,10 +210,17 @@ pub fn resolve(
                     ));
                 }
             }
-            servers.push(ServerBinding {
+            let binding = ServerBinding {
                 def: def.clone(),
                 source: source.clone(),
-            });
+                supersedes: prior.map(|_| ContributionSource::Builtin),
+            };
+            match prior {
+                // In the builtin's place rather than appended, so the registry's order — which
+                // `cide-lsp`'s discovery walks — is the builtins' order with one row replaced.
+                Some(index) => servers[index] = binding,
+                None => servers.push(binding),
+            }
         }
     }
 
@@ -370,6 +391,64 @@ mod tests {
         );
         assert_eq!(resolved.conflicts.len(), 1);
         assert!(resolved.conflicts[0].message.contains("m.sql"));
+    }
+
+    /// An extension's server on a binary a builtin also drives takes the builtin's place, and
+    /// says so — `an_extension_supersedes_a_builtin_and_says_so`, for a server. The builtin
+    /// `yaml-language-server` carries Compose's schema map; the extension's row replaces it
+    /// whole, which `cide_ipc::lang` states as the cost, and the displacement is on the binding.
+    #[test]
+    fn an_extensions_server_supersedes_a_builtins_on_the_same_binary() {
+        let server = |binary: &str, args: &[&str]| LanguageServerDef {
+            binary: binary.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            language_ids: vec!["yaml".into()],
+            project_markers: vec![],
+            project_kind: "YAML".into(),
+            install_hint: "npm i -g yaml-language-server".into(),
+            declares_watched_files: false,
+            extra_path_hints: vec![],
+            init_options: None,
+        };
+        let contributes = Contributions {
+            languages: vec![language("yaml", "yaml")],
+            language_servers: vec![server("yaml-language-server", &["--stdio", "--ext"])],
+            ..Contributions::default()
+        };
+        let id = reference("m", "yaml");
+        let resolved = resolve(
+            vec![language("yaml", "yaml")],
+            vec![
+                server("yaml-language-server", &["--stdio"]),
+                server("other-language-server", &[]),
+            ],
+            &[Contributor {
+                id: id.clone(),
+                manifest: "/m/yaml/cide-extension.json".into(),
+                contributes: &contributes,
+            }],
+        );
+        assert_eq!(resolved.servers.len(), 2, "one row replaced, none added");
+        let yaml = &resolved.servers[0];
+        assert_eq!(yaml.def.binary, "yaml-language-server");
+        assert_eq!(
+            yaml.source,
+            ContributionSource::Extension { extension: id },
+            "installing a YAML extension that leaves the builtin server in charge is an install \
+             that does nothing"
+        );
+        assert_eq!(
+            yaml.def.args,
+            vec!["--stdio", "--ext"],
+            "the extension's row, whole"
+        );
+        assert_eq!(yaml.supersedes, Some(ContributionSource::Builtin));
+        assert_eq!(resolved.servers[1].def.binary, "other-language-server");
+        assert!(
+            resolved.conflicts.is_empty(),
+            "a builtin losing is not a conflict: {:?}",
+            resolved.conflicts
+        );
     }
 
     #[test]
