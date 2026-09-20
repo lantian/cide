@@ -29,7 +29,7 @@ use cide_agents::{AgentProblem, Catalog, Isolation, ProjectAgents, Severity, def
 use cide_core::layout;
 use cide_ipc::keymap::{Command, KeymapLayer, ResolvedBinding};
 use cide_ipc::workspace::{LayoutNode, PaneTree, Project, Tab, TabKind, WindowRole, Workspace};
-use cide_ipc::{Axis, PaneId, PaneKind, PaneRole, ProjectId, Task, TaskFile, TaskStatus};
+use cide_ipc::{Axis, PaneId, PaneKind, PaneRole, ProjectId, TaskFile, TaskRow, TaskStatus};
 use cide_pty::{Geometry, PtySession, Sink, SpawnSpec};
 
 const USAGE: &str = "\
@@ -46,6 +46,7 @@ usage:
   cide-headless spec <root> [change]      render its openspec/ board, or one change in full
   cide-headless ext                       render marketplaces, extensions and contributions
   cide-headless docker                    resolve a Docker daemon and render what it holds
+  cide-headless properties <path>         what the properties card would say about a path
   cide-headless version                   print this binary's version";
 
 fn main() {
@@ -67,6 +68,7 @@ fn main() {
         "spec" => spec(rest),
         "ext" => ext(),
         "docker" => docker(rest),
+        "properties" => properties(rest),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         "version" | "-V" | "--version" => emit(&format!("{}\n", version())),
         other => {
@@ -74,6 +76,118 @@ fn main() {
             usage_and_exit();
         }
     }
+}
+
+/// What the properties card would say about a path, without a window. (M70)
+///
+/// The card is three commands deep in `cide-app` and every one of its facts is a *claim about a
+/// file* — the shape where a wrong answer looks exactly like a right one. This is how a claim is
+/// checked against the tool that owns it:
+///
+/// ```text
+/// cide-headless properties src/main.rs   # then compare with `stat` and `git log`
+/// ```
+///
+/// `cide-headless docker` and `cide-headless spec <root>` exist for the same reason, and the
+/// reason is the same one: a feature whose failure mode is a plausible sentence needs a way to
+/// print that sentence beside the truth.
+///
+/// # Why there is no git half here
+///
+/// It would need `cide-git`, and `cide-git` is `git2` with `vendored-openssl` — which is exactly
+/// why `docs/platforms.md`'s Darwin type-check runs the workspace excluding `cide-app`,
+/// `cide-git` and `xtask`. Linking it here would cost a fourth exclusion and with it this
+/// binary's macOS coverage, permanently, to save typing `git log` in the next shell over.
+///
+/// The trade is easy because the halves are not equally exposed. `cide_git::properties` has
+/// eight tests against real repositories and `git log --follow` as a direct oracle beside it.
+/// The stat half has neither: its hazard is a `metadata` that silently follows a symlink, and
+/// the only external oracle for that is `stat`, run by hand, against this.
+fn properties(args: &[String]) {
+    let Some(raw) = args.first() else {
+        eprintln!("cide-headless: properties needs a path");
+        usage_and_exit();
+    };
+    let path = cide_core::properties::absolutise(std::path::Path::new(raw));
+
+    let props = match cide_core::properties::read(&path) {
+        Ok(props) => props,
+        Err(e) => {
+            eprintln!("cide-headless: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", props.path.display()));
+    out.push_str(&format!("  name         {}\n", props.name));
+    out.push_str(&format!("  kind         {:?}\n", props.kind));
+    out.push_str(&format!("  size         {} B\n", props.len));
+    out.push_str(&format!("  readonly     {}\n", props.readonly));
+    if let Some(mode) = props.mode_string.as_deref() {
+        out.push_str(&format!("  permissions  {mode}\n"));
+    }
+    if let Some(owner) = props.owner.as_ref() {
+        out.push_str(&format!(
+            "  owner        {}({}) {}({})\n",
+            owner.user.as_deref().unwrap_or("?"),
+            owner.uid,
+            owner.group.as_deref().unwrap_or("?"),
+            owner.gid,
+        ));
+    }
+    for (label, at) in [
+        ("modified", props.modified_unix_ms),
+        ("changed", props.changed_unix_ms),
+        ("created", props.created_unix_ms),
+    ] {
+        // Seconds beside the milliseconds, because that is what `stat %Y` prints and the whole
+        // point of this subcommand is being diffable against it.
+        match at {
+            Some(ms) => out.push_str(&format!("  {label:<12} {ms} ms  ({} s)\n", ms / 1000)),
+            None => out.push_str(&format!("  {label:<12} not recorded\n")),
+        }
+    }
+    if let Some(target) = props.symlink_target.as_ref() {
+        out.push_str(&format!(
+            "  target       {} ({})\n",
+            target.display(),
+            if props.symlink_broken == Some(true) {
+                "broken"
+            } else {
+                "resolves"
+            },
+        ));
+    }
+    match (props.text.as_ref(), props.text_skipped.as_deref()) {
+        (Some(text), _) => out.push_str(&format!(
+            "  lines        {} · {:?} · {}\n",
+            text.lines,
+            text.ending,
+            if text.utf8 { "UTF-8" } else { "not UTF-8" },
+        )),
+        (None, Some(why)) => out.push_str(&format!("  lines        {why}\n")),
+        (None, None) => {}
+    }
+
+    if matches!(props.kind, cide_ipc::PathKind::Dir) {
+        match cide_core::properties::dir_summary(&path) {
+            Ok(s) => out.push_str(&format!(
+                "  entries      {} file(s), {} folder(s), {} B{}\n",
+                s.files,
+                s.dirs,
+                s.bytes,
+                if s.truncated {
+                    "  (at least — the walk hit its budget)"
+                } else {
+                    ""
+                },
+            )),
+            Err(e) => out.push_str(&format!("  entries      could not walk: {e}\n")),
+        }
+    }
+
+    emit(&out);
 }
 
 /// `cide-headless 0.7.1-dev`.
@@ -594,8 +708,12 @@ fn status_name(status: TaskStatus) -> &'static str {
 /// Blank rather than `0 comments`, the way a pane with no session prints no session column: this
 /// column exists so that the tasks carrying a conversation are findable at a glance, and a column
 /// of zeroes is precisely what stops that working.
-fn comment_count(task: &Task) -> String {
-    match task.comments.len() {
+fn comment_count(task: &TaskRow) -> String {
+    // The index's own count since M68, not `comments.len()` — this reads `.cide/tasks.json` and
+    // nothing else, which is the point of it. A version that opened every task's content file to
+    // count would turn `cide-headless tasks` from one read into one per task, and the number it
+    // printed would be identical.
+    match task.comment_count {
         0 => String::new(),
         1 => "1 comment".to_string(),
         n => format!("{n} comments"),
@@ -1424,8 +1542,7 @@ mod tests {
     use cide_agents::{AgentsConfig, CideConfig, LoadedAgent};
     use cide_ipc::workspace::{Pane, ProjectRoot, ToolWindowState};
     use cide_ipc::{
-        AgentDef, AgentId, Harness, SessionId, Side, TabId, TaskAuthor, TaskComment, TaskId,
-        WindowLabel,
+        AgentDef, AgentId, Harness, SessionId, Side, TabId, TaskAuthor, TaskId, WindowLabel,
     };
 
     fn pane(title: &str, kind: PaneKind, role: PaneRole, session: bool) -> Pane {
@@ -1748,38 +1865,28 @@ mod tests {
         status: TaskStatus,
         agent: Option<&str>,
         comments: usize,
-    ) -> Task {
-        Task {
+    ) -> TaskRow {
+        // A **row**, since M68: `cide-headless tasks` reads `.cide/tasks.json` and nothing else, so
+        // the comment column comes from the index's own count rather than from a log this command
+        // deliberately never opens. The parameter stays a `usize` of comments because that is what
+        // the column is about; it lands as the count the index carries.
+        TaskRow {
             id: TaskId(id.into()),
             title: title.into(),
-            body: String::new(),
             status,
             agent: agent.map(|a| AgentId(a.into())),
             change: None,
             links: Vec::new(),
             session: None,
-            comments: (0..comments)
-                .map(|i| TaskComment {
-                    // Derived from the index, not minted: this fixture's output is compared
-                    // against a fixed string, and a fresh uuid per run would never match.
-                    id: cide_ipc::CommentId(format!("c-{i}")),
-                    author: TaskAuthor::User,
-                    text: format!("comment {i}"),
-                    at_unix_ms: 1,
-                    edited_at_unix_ms: None,
-                    deleted: false,
-                    attachments: Vec::new(),
-                })
-                .collect(),
-            history: Vec::new(),
             created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 2,
-            attachments: Vec::new(),
+            comment_count: u32::try_from(comments).expect("a fixture's comment count"),
+            attachment_count: 0,
         }
     }
 
-    fn tracker(tasks: Vec<Task>) -> TaskFile {
+    fn tracker(tasks: Vec<TaskRow>) -> TaskFile {
         TaskFile {
             schema_version: TaskFile::CURRENT_SCHEMA,
             rev: 7,

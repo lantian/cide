@@ -258,8 +258,6 @@ export interface TaskView {
   /** `t-17`. Short on purpose: agents quote task ids inside prompts and comments. */
   id: string
   title: string
-  /** The whole statement of the work, possibly empty. Never `null` — the wire is not nullable. */
-  body: string
   status: TaskStatus
   /**
    * The role this task is **for**, never "who is working on it now".
@@ -300,18 +298,22 @@ export interface TaskView {
    * a merge can never leave the two directions disagreeing.
    */
   links: readonly LinkView[]
-  /** Oldest first on the wire; [`commentOrder`] is the defence against a file that is not. */
-  comments: readonly CommentView[]
-  /** Files on the body, oldest first, live only. (M39) */
-  attachments: readonly AttachmentView[]
   /**
-   * Every status transition, oldest first; [`historyOrder`] is the same defence. (M27)
+   * How many live comments the task has — a **number here, the text in [`TaskDetailView`]**. (M68)
    *
-   * Recorded in Rust where the mutation is applied, so "by whom" is the connection's identity
-   * and not a claim in a payload. The card draws it **collapsed** — it is the log you need
-   * rarely and must be able to trust absolutely when you do.
+   * The row draws no count today, and this field is not for it: it is what keeps the *list* able
+   * to say "there is a conversation on this one" without the board carrying the conversation. It
+   * is the same number `cide_task_list` prints to an agent, derived once in
+   * `cide_tasks::row_of`.
+   *
+   * A cache over a file the tracker's own content files own, so it can disagree with them after a
+   * hand edit or a partial merge; Rust recomputes it whenever it loads content and takes content's
+   * answer. Nothing here may treat it as authoritative enough to render a *sentence* from — "no
+   * comments yet" is a claim, and it belongs to a card that has actually read the log.
    */
-  history: readonly StatusChangeView[]
+  commentCount: number
+  /** Live attachments across the body and every live comment, as one number. (M39's count.) */
+  attachmentCount: number
   /**
    * Who asked for this task. Structural restatement of `Task::createdBy`.
    *
@@ -326,6 +328,47 @@ export interface TaskView {
   createdBy: CommentAuthor
   createdMs: number
   updatedMs: number
+}
+
+/**
+ * One task with its content: a [`TaskView`] plus the body, the log, the files and the history. (M68)
+ *
+ * # Why this is a second type and not four optional fields on [`TaskView`]
+ *
+ * Because optional fields would make *"not fetched yet"* and *"the task has none"* the same value,
+ * and every one of those four renders a **sentence** in the card: `No description.`,
+ * `No comments yet.`, a status-history disclosure that simply is not drawn, an Attachments section
+ * that vanishes label and all. Each of those is a positive claim, and a claim made out of a value
+ * nobody has fetched is the confident-empty-list failure this module already carries three separate
+ * defences against — `BOARD_UNKNOWN` drawing nothing, `listEmpty` splitting one empty list into
+ * three sentences, `AttachmentPreview` having a third state for *refused*.
+ *
+ * The worst of them is not a sentence at all. `startEdit`/[`fieldValue`] seed the body editor from
+ * `body`; with an unfetched body that reads `''`, the editor opens empty, [`isDirty`] reports dirty
+ * on the first keystroke, and [`commitEdit`] writes an empty body over the real one. That is silent
+ * data loss on a gesture that looks like an ordinary edit.
+ *
+ * A separate type makes all of it a **compile error** instead: nothing that reads content can be
+ * handed a row, so the card is only ever built from a task whose content has actually arrived, and
+ * the host draws its own pending state until then. That is the same move `TaskAttachmentId` makes
+ * by having no `Default` — the way to stop a value being invented is for there to be no way to
+ * spell it.
+ */
+export interface TaskDetailView extends TaskView {
+  /** The whole statement of the work, possibly empty. Never `null` — the wire is not nullable. */
+  body: string
+  /** Oldest first on the wire; [`commentOrder`] is the defence against a file that is not. */
+  comments: readonly CommentView[]
+  /** Files on the body, oldest first, live only. (M39) */
+  attachments: readonly AttachmentView[]
+  /**
+   * Every status transition, oldest first; [`historyOrder`] is the same defence. (M27)
+   *
+   * Recorded in Rust where the mutation is applied, so "by whom" is the connection's identity
+   * and not a claim in a payload. The card draws it **collapsed** — it is the log you need
+   * rarely and must be able to trust absolutely when you do.
+   */
+  history: readonly StatusChangeView[]
 }
 
 /**
@@ -698,13 +741,39 @@ function hitsQuery(q: string, texts: readonly string[]): boolean {
  * most model-authored text in the tracker, so it is also where a short query matches most and
  * means least. Searching the conversation is a different feature from finding a task.
  *
- * Total, and never throws: every field read is a `string` by construction, and a rogue status
- * plays no part in it, so a task this build cannot place is still findable.
+ * Total, and never throws: a rogue status plays no part in it, so a task this build cannot place is
+ * still findable.
+ *
+ * # The rule itself now lives in Rust, and this reads its answer (M68)
+ *
+ * Every word above still describes what a hit *is* — `cide_tasks::search` implements exactly it,
+ * and its doc points back here. What changed is where the text is. The board stopped carrying
+ * bodies when it stopped carrying 2.19 MB of tracker into a `webview.eval` per window per
+ * mutation, and a filter cannot read a field it was not sent.
+ *
+ * The alternative was to keep filtering here on the id and the title alone. That is the one option
+ * this module may not take: the box would go on accepting a word from a task's body, find nothing,
+ * and draw [`listEmpty`]'s `'search'` sentence — *nothing matched `<query>`* — over a task that
+ * contains it. A confident false negative about the user's own data, which is the failure the three
+ * separate empty screens exist to prevent.
+ *
+ * Matching on ids keeps one definition of a hit. A local pre-filter on id and title, unioned with
+ * Rust's answer, was considered and dropped: it would be a second spelling of the same comparison,
+ * and the thing it buys — sub-millisecond feedback on a search that already takes well under a
+ * millisecond for a board of any size a person has — is not worth a rule with two homes.
  */
-export function matchesQuery(task: TaskView, query: string): boolean {
-  const q = query.trim().toLowerCase()
-  if (q === '') return true
-  return hitsQuery(q, [task.id, task.title, task.body])
+export type QueryMatches = ReadonlySet<string> | null
+
+/**
+ * The ids `task_search` answered with, or `null` for **no query at all**.
+ *
+ * `null` matches everything, the way a `null` [`StatusFilter`] does, and it is also what a caller
+ * holds while an answer is outstanding — deliberately, because the alternative is a frame of empty
+ * board every time a keystroke invalidates the previous answer. A stale-but-complete list is a
+ * worse *filter* and a far better *claim* than an empty one.
+ */
+export function matchesQuery(task: TaskView, matched: QueryMatches): boolean {
+  return matched === null || matched.has(task.id)
 }
 
 /**
@@ -729,12 +798,22 @@ export function matchesQuery(task: TaskView, query: string): boolean {
  */
 export type EmptyList = 'tracker' | 'filter' | 'search'
 
-export function listEmpty(board: Board, filter: StatusFilter, query = ''): EmptyList | null {
+export function listEmpty(
+  board: Board,
+  filter: StatusFilter,
+  query = '',
+  matched: QueryMatches = null,
+): EmptyList | null {
   if (board.kind !== 'ready') return null
   if (board.tasks.length === 0) return 'tracker'
-  if (board.tasks.some((task) => matchesFilter(task, filter) && matchesQuery(task, query))) {
+  if (board.tasks.some((task) => matchesFilter(task, filter) && matchesQuery(task, matched))) {
     return null
   }
+  // `query` still decides *which* sentence, because it is what the screen has to name and offer to
+  // clear; `matched` decides only what survived. They disagree for exactly one frame — a query
+  // typed whose answer has not landed — and in that frame `matched` is `null`, so the branch above
+  // has already returned `null` and no sentence is drawn at all. That is the honest state: nothing
+  // is claimed about a search that has not run.
   return query.trim() === '' ? 'filter' : 'search'
 }
 
@@ -776,12 +855,16 @@ export function listEmpty(board: Board, filter: StatusFilter, query = ''): Empty
  * the group that claims the least. Not `doing`, which would be the panel asserting that work is
  * under way on the strength of a value it could not read.
  */
-export function groups(board: Board, filter: StatusFilter = null, query = ''): TaskGroup[] {
+export function groups(
+  board: Board,
+  filter: StatusFilter = null,
+  matched: QueryMatches = null,
+): TaskGroup[] {
   if (board.kind !== 'ready') return []
   const buckets = new Map<TaskStatus, TaskView[]>()
   for (const status of GROUP_ORDER) buckets.set(status, [])
   for (const task of board.tasks) {
-    if (!matchesFilter(task, filter) || !matchesQuery(task, query)) continue
+    if (!matchesFilter(task, filter) || !matchesQuery(task, matched)) continue
     buckets.get(groupOf(task))?.push(task)
   }
   const out: TaskGroup[] = []
@@ -988,7 +1071,7 @@ export function armedDelete(board: Board, armed: ArmedDelete | null): string | n
  * identity does not rebuild the log on every keystroke in the title field above it — the same
  * argument [`newerBoard`] and `notices.ts`'s `admit` make.
  */
-export function commentOrder(task: TaskView): readonly CommentView[] {
+export function commentOrder(task: TaskDetailView): readonly CommentView[] {
   const comments = task.comments
   let ordered = true
   for (let i = 1; i < comments.length; i += 1) {
@@ -1011,7 +1094,7 @@ export function commentOrder(task: TaskView): readonly CommentView[] {
  * defence rather than a transformation — this file is committed, and a merge can interleave two
  * sides' rows.
  */
-export function historyOrder(task: TaskView): readonly StatusChangeView[] {
+export function historyOrder(task: TaskDetailView): readonly StatusChangeView[] {
   const history = task.history
   let ordered = true
   for (let i = 1; i < history.length; i += 1) {
@@ -1492,7 +1575,7 @@ export function assigneeLabel(
  * segment should rest as text after all — from having to invent a second answer for it.
  */
 export function restText(
-  task: TaskView,
+  task: TaskDetailView,
   field: string,
   roles: Readonly<Record<string, string>>,
 ): string {
@@ -1517,7 +1600,7 @@ export function restText(
  * agent comes to look dirty — `null` against `''` — and writes an `Assign(null)` over a `null`
  * on the way out, bumping `rev` and repainting every window for a change that is not one.
  */
-export function fieldValue(task: TaskView, field: string): string {
+export function fieldValue(task: TaskDetailView, field: string): string {
   if (field === 'title') return task.title
   if (field === 'body') return task.body
   if (field === 'assignee') return task.agent ?? ''
@@ -1564,7 +1647,7 @@ export interface EditIntent {
 }
 
 /** A field freshly put into edit: the draft starts at the value on screen. */
-export function startEdit(task: TaskView, field: EditableField): FieldEdit {
+export function startEdit(task: TaskDetailView, field: EditableField): FieldEdit {
   return { field, draft: fieldValue(task, field) }
 }
 
@@ -1579,7 +1662,7 @@ export function startEdit(task: TaskView, field: EditableField): FieldEdit {
  * Compared verbatim, without trimming. A user who added a trailing space meant to, and a card
  * that silently declined to save it would be a second, invisible rule about what their text is.
  */
-export function isDirty(task: TaskView, edit: FieldEdit | null): boolean {
+export function isDirty(task: TaskDetailView, edit: FieldEdit | null): boolean {
   if (edit === null) return false
   return edit.draft !== fieldValue(task, edit.field)
 }
@@ -1606,7 +1689,7 @@ export function isDirty(task: TaskView, edit: FieldEdit | null): boolean {
  * is open, because a gesture nobody can name must not be able to close one they can.
  */
 export function beginEdit(
-  task: TaskView,
+  task: TaskDetailView,
   current: FieldEdit | null,
   field: string,
 ): EditIntent {
@@ -1630,7 +1713,7 @@ export function beginEdit(
  * because the user asked it to and refusing would leave them pressing a button that appears to
  * do nothing.
  */
-export function commitEdit(task: TaskView, current: FieldEdit | null): EditIntent {
+export function commitEdit(task: TaskDetailView, current: FieldEdit | null): EditIntent {
   return {
     commit: isDirty(task, current) && current !== null
       ? { field: current.field, value: current.draft }
@@ -1673,7 +1756,7 @@ export type CloseCause = 'escape' | 'dismiss'
  * A clean field commits nothing on the way out either way, for [`isDirty`]'s reason.
  */
 export function closeCard(
-  task: TaskView,
+  task: TaskDetailView,
   current: FieldEdit | null,
   cause: CloseCause,
 ): EditIntent {
@@ -1818,7 +1901,7 @@ export function assigneeFromDraft(draft: string): string | null {
  * for a task whose title is *literally* `Untitled`, drawing a real title as if it were absent.
  * Asked of the value rather than of the rendering, there is nothing to get wrong.
  */
-export function isFieldEmpty(task: TaskView, field: string): boolean {
+export function isFieldEmpty(task: TaskDetailView, field: string): boolean {
   return fieldValue(task, field).trim() === ''
 }
 
@@ -2072,7 +2155,7 @@ export function basename(path: string): string {
  * Every image on the task, in the order the card draws them: the body's first, then each
  * comment's in log order. The lightbox's prev/next walk, so ←/→ follow the eye down the card.
  */
-export function imageAttachmentsOf(task: TaskView): readonly AttachmentView[] {
+export function imageAttachmentsOf(task: TaskDetailView): readonly AttachmentView[] {
   const images = task.attachments.filter((a) => a.kind === 'image')
   for (const comment of commentOrder(task)) {
     for (const attachment of comment.attachments) {

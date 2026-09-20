@@ -55,10 +55,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cide_agents::config::{self, CideConfig};
 use cide_agents::defs;
 use cide_agents::harness::Harness;
+use cide_agents::tools::Stopped;
 use cide_agents::{Isolation, LoadedAgent, ProjectAgents};
 use cide_core::{CoreError, workspace};
 use cide_ipc::agents::{AgentDraft, AgentSaveOutcome, AgentScope};
@@ -69,7 +71,7 @@ use cide_ipc::{
 use cide_tasks::TaskStore;
 use tauri::{AppHandle, Manager, State};
 
-use crate::agents::{AgentRegistry, DispatchSpec};
+use crate::agents::{AgentRegistry, DispatchSpec, HeldPair, StopBy, StopRequest};
 use crate::tasks_state::TasksStores;
 use crate::workspace_state::WorkspaceState;
 
@@ -582,6 +584,43 @@ pub async fn agents_dispatch(
     tasks: State<'_, Arc<TasksStores>>,
     request: DispatchRequest,
 ) -> Result<RunId> {
+    match dispatch_or_duplicate(app, state, agents, tasks, request).await? {
+        DispatchOutcome::Started(run) => Ok(run),
+        // Flattened to the sentence, because both callers of *this* function asked for the
+        // dispatch out loud: the panel's button and `cide_agent_dispatch`. The one caller that
+        // did not ask — auto-dispatch, where a repeated assignment is an ordinary gesture rather
+        // than a request — calls `dispatch_or_duplicate` directly and reads the tag.
+        DispatchOutcome::Duplicate { why, .. } => Err(CoreError::Io(why)),
+    }
+}
+
+/// What a dispatch did, for the one caller that must tell a duplicate from a failure. (M66)
+///
+/// [`agents_dispatch`] flattens this to `Err(CoreError::Io(why))`. [`crate::task_triggers`] does
+/// not: an assignment repeated while a run lives is not a failure of anything — it is that
+/// module's "everything declines by doing nothing" policy meeting a guard that finally exists —
+/// and a `warn!` there would put a frightening line in the log for the ordinary case of a user
+/// re-picking the assignee already on the task.
+///
+/// A tag rather than a [`CoreError`] variant, deliberately. `CoreError` is a `ts-rs` type whose
+/// struct variants reach the webview as `{ kind, detail: { … } }`, and `ui/src/ipc/errorText.ts`
+/// prints `detail` only when it is a **string** — so a `DuplicateRun { run, state }` would have
+/// shown the panel the literal word `duplicateRun`, which is the `[object Object]` failure that
+/// file's header was written about. The sentence rides `Io` like every other refusal
+/// [`plan_dispatch`] composes, and the discriminator stays inside Rust where only Rust needs it.
+pub(crate) enum DispatchOutcome {
+    Started(RunId),
+    Duplicate { held: HeldPair, why: String },
+}
+
+/// The whole of [`agents_dispatch`] except the flattening. See [`DispatchOutcome`].
+pub(crate) async fn dispatch_or_duplicate(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    agents: State<'_, Arc<AgentRegistry>>,
+    tasks: State<'_, Arc<TasksStores>>,
+    request: DispatchRequest,
+) -> Result<DispatchOutcome> {
     let project = request.project;
     let root = project_root(&state, project)?;
     // `ensure` rather than `get`, for `cmd::tasks::tracker`'s reason: the restore loop warms a
@@ -591,27 +630,107 @@ pub async fn agents_dispatch(
     // Cloned out of the `State` guard before the await: a guard held across one is un-`Send`, and
     // the registry is behind an `Arc` for exactly this — see `lib.rs`.
     let registry = Arc::clone(&agents);
+    let lookup = Arc::clone(&agents);
 
-    let spec = blocking(move || plan_dispatch(&root, &store, &request)).await?;
-    let run = registry.enqueue(spec);
+    let spec = blocking(move || {
+        // Read on the worker rather than here, for this module's standing reason: the registry's
+        // lock is also taken by the hook applier thread, and this command is the one an
+        // orchestrating session holds its turn behind.
+        let held = request
+            .task
+            .as_ref()
+            .and_then(|task| lookup.run_holding(project, &request.agent, task));
+        plan_dispatch(&root, &store, held.as_ref(), &request)
+    })
+    .await?;
+
+    // Named before the move: on the duplicate arm the spec is gone and the sentence wants them.
+    let (agent, task) = (spec.agent.clone(), spec.task.clone());
+    let run = match registry.enqueue_unique(spec) {
+        Ok(run) => run,
+        // The window the answer above could not cover — see `AgentRegistry::enqueue_unique`.
+        // Composed through the same function, so a user cannot tell which gate fired.
+        Err(held) => {
+            let why = duplicate_refusal(&agent, task.as_ref(), &held);
+            return Ok(DispatchOutcome::Duplicate { held, why });
+        }
+    };
     registry.mark_changed(&app, project);
     // Returns at once; each admitted run starts on its own task.
     registry.pump(&app);
-    Ok(run)
+    Ok(DispatchOutcome::Started(run))
 }
 
-/// Stop a run: cancel it if it is queued, kill its child if it has one.
+/// Stop a run, from the **Agents panel**: cancel it if it is queued, kill its child if it has
+/// one, now.
+///
+/// # This road does not ask, and `cide_agent_stop` does — deliberately
+///
+/// The panel's button is the outright kill it has always been. The tool asks the run to wind
+/// down first, gives it the project's grace to write what it knows onto its task, and kills it
+/// only if that runs out (M67). Two routes to one word meaning two things is normally the split
+/// `openPushDialog` exists to prevent, and it is a deliberate choice here rather than an
+/// oversight: a person at the panel pressing Stop on a run they are watching wants it to stop,
+/// and has the row in front of them to see that it did. If this ever grows a wind-down, the
+/// affordance for forcing is a second press on an already-stopping row — `stop_route` already
+/// answers `Kill` for that — and **not** a modifier, which would be an undiscoverable gesture
+/// for a destructive act.
 ///
 /// `async` although it touches no disk, for the reason at the top of this module: a synchronous
 /// command is polled on the GTK loop, and this takes a lock the hook thread also takes.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn agents_stop(
+pub async fn agents_stop(app: AppHandle, project: ProjectId, run: RunId) -> Result<()> {
+    agents_stop_with(app, project, run, StopBy::User, None, true).await?;
+    Ok(())
+}
+
+/// The whole of a stop, for both doors. See [`agents_stop`] and `AgentSink::stop`.
+///
+/// **The grace is read here**, on a worker, and handed to the registry as a value — that module
+/// takes a lock the hook applier also takes and nothing under it may touch a disk. Read fresh at
+/// each stop rather than cached at dispatch, on `nudge_orchestrator`'s rule: `.cide/config.json`
+/// is committed, so a teammate's commit or a `git checkout` can change the number under a
+/// running app, and a deadline computed at dispatch would honour one nobody now has.
+pub(crate) async fn agents_stop_with(
     app: AppHandle,
-    agents: State<'_, Arc<AgentRegistry>>,
     project: ProjectId,
     run: RunId,
-) -> Result<()> {
-    Arc::clone(&agents).stop(&app, project, run)
+    by: StopBy,
+    reason: Option<String>,
+    force: bool,
+) -> Result<Stopped> {
+    let agents = app
+        .try_state::<Arc<AgentRegistry>>()
+        .map(|state| Arc::clone(&state))
+        .ok_or_else(|| CoreError::Io("this window has no agent registry".into()))?;
+
+    // A force never reads the file: the grace it would have found changes nothing, and a stop
+    // is the gesture people reach for when something has gone wrong — it must not be able to
+    // wait on a disk.
+    let grace = if force {
+        Duration::ZERO
+    } else {
+        let root = project_root(&app.state::<WorkspaceState>(), project)?;
+        blocking(move || Ok(cide_agents::load_project(&root).config.agents.stop_grace()))
+            .await
+            // A project whose config cannot be read still stops; it stops the old way. A stop
+            // that refused because a file was unparseable would be the worst possible moment
+            // for this feature to be the thing in the way.
+            .unwrap_or(Duration::ZERO)
+    };
+
+    let request = StopRequest {
+        by,
+        // One line, at the door: this text is typed into a TUI and the harness ends it with
+        // `\r`, so an embedded newline would be another Enter — `opening_prompt`'s rule, and
+        // the one every prompt path in this codebase inherits.
+        reason: reason
+            .map(|reason| one_line(&reason))
+            .filter(|r| !r.is_empty()),
+        force,
+        grace,
+    };
+    agents.stop(&app, project, run, &request)
 }
 
 /// Close this project's dispatch queue and freeze its children — or freeze one run.
@@ -890,16 +1009,54 @@ fn integrate(root: &Path, agent: &AgentId, task: Option<&TaskId>) -> Result<Agen
 // Line comments, not doc comments: this attaches to no item, and a `///` block that documents
 // nothing is what `clippy::empty_line_after_doc_comments` exists to catch.
 
+/// The sentence both duplicate gates answer with. (M66)
+///
+/// One function because the two gates are a policy check ([`plan_dispatch`]) and a race backstop
+/// (`AgentRegistry::enqueue_unique`), and a user who hit the second must not get a different
+/// answer from the one who hit the first — "sometimes it says something else" is the shape of
+/// bug report nobody can act on.
+///
+/// It names the **run id**, because that is what Stop and `cide_agent_stop` take, and the **state
+/// word**, because that is what `cide_agent_runs` prints on the row — a run named here has to be
+/// findable in that list by the word this sentence used for it. Both spellings come from
+/// `cide_agents::tools`, so this cannot describe a state as something the run list calls
+/// something else; the second clause is that module's own advice for the states where "stop it or
+/// wait" would be wrong.
+fn duplicate_refusal(agent: &AgentId, task: Option<&TaskId>, held: &HeldPair) -> String {
+    let detail = match cide_agents::tools::run_state_detail(&held.state) {
+        Some(detail) => format!(" — {detail}"),
+        None => String::new(),
+    };
+    let task = task.map_or_else(|| "this task".to_string(), TaskId::to_string);
+    format!(
+        "`{agent}` is already on {task}: run {} [{}]{detail}. A role gets one run per task, \
+         because a second wants the same worktree — it would queue behind the first and replay \
+         the same prompt into it. Stop that run if it is going the wrong way, or wait for it to \
+         end and read the task's comments; the Agents panel shows it, and so does `{}`.",
+        held.run,
+        cide_agents::tools::run_state_wire(&held.state),
+        cide_agents::tools::tool::AGENT_RUNS,
+    )
+}
+
 /// Turn a dispatch request into something the queue can hold — or refuse it.
 ///
 /// Everything here is disk work and pure decision, in that order, and it is the **only** place a
-/// dispatch is refused before a worktree exists. The order matters: the role is looked up, the
-/// refusal is asked for, and only then is a task read. A refusal that came after the task read
-/// would still be correct and would have spent a file read on a run that was never going to
-/// start; a refusal that came after `worktree::ensure` would have left a checkout behind.
+/// dispatch is refused before a worktree exists. The order matters: the role is looked up, a
+/// repeat is refused (M66), the refusal table is asked, and only then is a task read. A refusal
+/// that came after the task read would still be correct and would have spent a file read on a
+/// run that was never going to start; a refusal that came after `worktree::ensure` would have
+/// left a checkout behind.
+///
+/// `held` is the run already on this (role, task) pair, if there is one — a **caller-supplied
+/// fact**, in `autodispatch::blocker_statuses`' position and for its reason: the registry is a
+/// live lock and this function is disk and decision, so the fact arrives as a value and the
+/// tests can put any state in it. It is only half the guard; the other half, the half that wins
+/// the race, is `AgentRegistry::enqueue_unique`. (M66)
 fn plan_dispatch(
     root: &Path,
     store: &TaskStore,
+    held: Option<&HeldPair>,
     request: &DispatchRequest,
 ) -> Result<DispatchSpec> {
     let project = cide_agents::load_project(root);
@@ -910,6 +1067,36 @@ fn plan_dispatch(
             config::CIDE_DIR
         ))
     })?;
+    /*
+     * The duplicate gate, and it comes **first** — before even the project's own switch. (M66)
+     *
+     * The refusal table below answers *may this project run this role at all?*; this answers
+     * *is this dispatch a repeat?*, which is a fact about the request and about the world right
+     * now. When both are true this one is the better sentence, for two reasons.
+     *
+     * It is the more *truthful*: a run holding this pair is proof that subagents were on and the
+     * bridge was there when it started, so answering "subagents are off for this project" while
+     * a subagent of that role is live on that very task is the less accurate of the two things
+     * cide could say. And it is the one that *ends* the exchange — the table's answers all
+     * invite the caller to fix something and dispatch again, and a caller that did would be
+     * refused here on the second attempt. A two-step refusal for one gesture is how an
+     * orchestrating model ends up starting the run it was being told it already had.
+     *
+     * The role lookup stays above it, because "this project defines no role named X" outranks
+     * everything: a name cide cannot resolve is not a pair it can be holding.
+     *
+     * The cost, stated: the task id is taken from the request rather than from the store, so a
+     * dispatch naming a deleted task answers this instead of `NoSuchTask`. That is a race
+     * between a delete and a live run of that very task, and the sentence is still true in it.
+     */
+    if let Some(held) = held {
+        return Err(CoreError::Io(duplicate_refusal(
+            &request.agent,
+            request.task.as_ref(),
+            held,
+        )));
+    }
+
     // The one function a dispatch site calls: off for this project, no `cide-hook` to bridge the
     // tracker, a fault in the definition, or `bypassPermissions` the project never authorised.
     // See `cide_agents::dispatch_refusal`. This is the earliest of the three call sites and the
@@ -1394,6 +1581,7 @@ fn problem_sentence(project: &ProjectAgents) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cide_ipc::RunState;
 
     /// The harness these prompt tests are written against, and the bridge they assume.
     ///
@@ -1552,6 +1740,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A held pair, for the duplicate gate's table. (M66)
+    fn held(state: RunState) -> HeldPair {
+        HeldPair {
+            run: RunId::new(),
+            state,
+        }
+    }
+
+    /// A scratch project with one role — everything the duplicate gate needs.
+    ///
+    /// Deliberately **not** `enable`d and needing no `cide-hook` and no harness on PATH: the
+    /// gate sits above the refusal table, so these tests lean on nothing about the machine.
+    /// That is half of why it sits there; see the gate's own comment for the other half.
+    fn with_a_role(tag: &str) -> (PathBuf, TaskStore, ProjectId, TaskId) {
+        let root = temp(tag);
+        role(
+            &root,
+            "game-designer",
+            "---\nname: game-designer\ndescription: Designs the game.\n---\nYou design.\n",
+        );
+        let store = TaskStore::open(&root);
+        (root, store, ProjectId::new(), TaskId("t-904".into()))
+    }
+
+    fn request(project: ProjectId, task: &TaskId) -> DispatchRequest {
+        DispatchRequest {
+            project,
+            agent: AgentId("game-designer".into()),
+            task: Some(task.clone()),
+            prompt: None,
+            notify: None,
+        }
+    }
+
+    /// **The whole of M66 in one assertion.** A dispatch onto a task the role is already on is
+    /// refused, and the refusal names the run that is already going.
+    ///
+    /// The reported shape exactly: a task created with an assignee had started `game-designer`,
+    /// and the orchestrator then dispatched the same role onto the same task, so the board drew
+    /// one live run and one queued behind it.
+    #[test]
+    fn a_dispatch_onto_a_task_the_role_is_already_on_is_refused_and_names_the_live_run() {
+        let (root, store, project, task) = with_a_role("duplicate-refused");
+        let live = held(RunState::Running);
+
+        let why = plan_dispatch(&root, &store, Some(&live), &request(project, &task))
+            .expect_err("the role is already on this task")
+            .to_string();
+
+        assert!(why.contains(&live.run.to_string()), "{why}");
+        assert!(why.contains("[running]"), "{why}");
+        assert!(why.contains("one run per task"), "{why}");
+        assert!(why.contains("t-904"), "{why}");
+        // Refused before a worktree, like every other refusal this function owns.
+        assert!(
+            !root.join(".cide/worktrees").exists(),
+            "a refused dispatch left a checkout behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The gate outranks the project's own switch, and the role lookup outranks the gate. (M66)
+    ///
+    /// Both halves of the ordering the gate's comment argues for: a live run on the pair is
+    /// proof the project *was* on, so "subagents are off" would be the less true answer — while
+    /// a role cide cannot resolve is not a pair anything can be holding, so that one still wins.
+    #[test]
+    fn a_held_pair_outranks_the_project_switch_and_never_outranks_an_unknown_role() {
+        let (root, store, project, task) = with_a_role("duplicate-outranks-switch");
+        // The project has never been enabled; `a_dispatch_into_a_disabled_project_…` below is
+        // the same root state with nothing holding, and gets the switch's sentence.
+        let why = plan_dispatch(
+            &root,
+            &store,
+            Some(&held(RunState::Running)),
+            &request(project, &task),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(why.contains("one run per task"), "{why}");
+        assert!(!why.contains("Subagents are off"), "{why}");
+
+        let mut ghost = request(project, &task);
+        ghost.agent = AgentId("nobody".into());
+        let why = plan_dispatch(&root, &store, Some(&held(RunState::Running)), &ghost)
+            .expect_err("refused")
+            .to_string();
+        assert!(why.contains("defines no role named"), "{why}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The sentence has to teach a rule, not report a fault.
+    ///
+    /// Its reader is usually a language model that has just asked for one thing twice, and the
+    /// difference between "you already started this, here it is" and "something went wrong" is
+    /// the difference between it carrying on and it trying to repair cide.
+    #[test]
+    fn the_duplicate_refusal_tells_the_caller_what_to_do_instead() {
+        let (root, store, project, task) = with_a_role("duplicate-advice");
+        let why = plan_dispatch(
+            &root,
+            &store,
+            Some(&held(RunState::Running)),
+            &request(project, &task),
+        )
+        .expect_err("refused")
+        .to_string();
+
+        assert!(why.contains("Stop that run"), "{why}");
+        assert!(why.contains("cide_agent_runs"), "{why}");
+        assert!(why.contains("Agents panel"), "{why}");
+        let lower = why.to_lowercase();
+        for fault in ["failed", "error", "could not"] {
+            assert!(
+                !lower.contains(fault),
+                "this reads as a fault rather than a rule: {why}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The state word is the run list's word, and the second clause is the run list's advice.
+    ///
+    /// Both come from `cide_agents::tools`, so a run named in this sentence is findable in
+    /// `cide_agent_runs` by the word the sentence used — and "stop it" is not offered as the
+    /// only option for a state where it is the wrong one.
+    #[test]
+    fn an_idle_run_is_refused_with_the_word_the_run_list_uses_for_it() {
+        let (root, store, project, task) = with_a_role("duplicate-idle");
+        let why = plan_dispatch(
+            &root,
+            &store,
+            Some(&held(RunState::Idle)),
+            &request(project, &task),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(why.contains("[idle]"), "{why}");
+        assert!(why.contains("its turn ended"), "{why}");
+
+        let why = plan_dispatch(
+            &root,
+            &store,
+            Some(&held(RunState::Paused { since_unix_ms: 1 })),
+            &request(project, &task),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(why.contains("[paused]"), "{why}");
+        assert!(why.contains("only the user can resume it"), "{why}");
+
+        // A state with no second clause says nothing extra rather than an empty dash.
+        let why = plan_dispatch(
+            &root,
+            &store,
+            Some(&held(RunState::Queued)),
+            &request(project, &task),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(why.contains("[queued]"), "{why}");
+        assert!(!why.contains("[queued] —"), "{why}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M40's road: a dispatch with no task contends for nothing, so nothing holds it. (M66)
+    ///
+    /// `held` is `None` by construction for such a request — `dispatch_or_duplicate` only asks
+    /// the registry when there is a task — and `enqueue_unique` refuses to look either. This
+    /// pins the near half: the gate is not reached, so the switch's sentence comes through.
+    #[test]
+    fn a_dispatch_with_no_task_is_never_refused_as_a_duplicate() {
+        let root = temp("duplicate-taskless");
+        role(
+            &root,
+            "game-designer",
+            "---\nname: game-designer\ndescription: Designs the game.\n---\nYou design.\n",
+        );
+        let store = TaskStore::open(&root);
+        let why = plan_dispatch(
+            &root,
+            &store,
+            None,
+            &DispatchRequest {
+                project: ProjectId::new(),
+                agent: AgentId("game-designer".into()),
+                task: None,
+                prompt: Some("check the build".into()),
+                notify: None,
+            },
+        )
+        .expect_err("this project was never enabled")
+        .to_string();
+        assert!(!why.contains("one run per task"), "{why}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **A refusal short-circuits before a worktree exists.**
     ///
     /// The ordering this module owes the user: a project that has never turned subagents on must
@@ -1572,6 +1962,7 @@ mod tests {
         let why = plan_dispatch(
             &root,
             &store,
+            None,
             &DispatchRequest {
                 project: ProjectId::new(),
                 agent: cide_ipc::AgentId("developer".into()),

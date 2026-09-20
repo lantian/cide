@@ -1458,82 +1458,89 @@ try {
     ])
     const ids = (list) => list.flatMap((g) => g.tasks.map((t) => t.id))
 
+    /*
+     * The text rule moved to Rust in M68, and so did its tests: the board no longer carries a
+     * body, so `cide_tasks::search` is the one definition of a hit and
+     * `search_reads_the_id_the_title_and_the_body_but_never_the_comments` in `cide-tasks` is
+     * where *id, title, body, never the comments* is pinned. Restating it here would be the
+     * second copy that whole arrangement exists to avoid.
+     *
+     * What is left in this module is the **seam**, and it has its own failure to prevent.
+     */
+    const matched = (...ids) => new Set(ids)
+
     ok(
-      matchesQuery(task({ title: 'Anything at all' }), ''),
-      'an empty query matches everything — "no search" is the empty string, the one value a ' +
-        'text box cannot avoid resting in',
+      matchesQuery(task({ id: 't-1' }), null),
+      'null is "no query at all" and matches everything, the way a null StatusFilter does — and ' +
+        'it is also what a caller holds while an answer is outstanding',
     )
-    ok(
-      matchesQuery(task({ title: 'Anything at all' }), '   '),
-      'and so does whitespace: a stray space must not blank the board with nothing visibly typed',
-    )
-    ok(matchesQuery(task({ title: 'Add the RETRY bar' }), 'retry'), 'matching is case-insensitive')
-    ok(
-      matchesQuery(task({ title: 'x', body: 'offer a Retry instead' }), 'RETRY'),
-      '…in both directions, and the body counts — it is the statement of the work, which is ' +
-        'what a user half-remembering a task actually recalls',
-    )
-    ok(
-      matchesQuery(task({ id: 't-14', title: 'x', body: '' }), 't-14'),
-      'the id counts too — it is on the row, and agents quote it in prompts and comments',
-    )
-    eq(matchesQuery(task({ title: 'Sweep the table', body: '' }), 'retry'), false, 'and a miss is a miss')
+    ok(matchesQuery(task({ id: 't-2' }), matched('t-1', 't-2')), 'a named id survives')
     eq(
-      matchesQuery(
-        task({
-          title: 'x',
-          body: '',
-          comments: [{ id: 'c-1', author: { kind: 'user' }, text: 'the retry path', atMs: 1, editedMs: null }],
-        }),
-        'retry',
-      ),
+      matchesQuery(task({ id: 't-3' }), matched('t-1', 't-2')),
       false,
-      'comments are NOT searched: a hit there draws a row whose visible line contains nothing ' +
-        'the user typed — a match with an invisible reason — and the log is the tracker’s ' +
-        'noisiest, most model-authored text, so it is where a short query matches most and ' +
-        'means least',
+      'and one the search did not name does not',
+    )
+    eq(
+      matchesQuery(task({ id: 't-1' }), matched()),
+      false,
+      'an EMPTY set is a real answer — "the search ran and nothing matched" — and must not be ' +
+        'read as "no search": that conflation is what would draw the whole board under a query ' +
+        'that genuinely matches none of it',
     )
 
     eq(
-      ids(groups(board, null, 'retry')),
+      ids(groups(board, null, matched('t-1', 't-2'))),
       ['t-2', 't-1'],
       'a query narrows the list — still in GROUP_ORDER, still recency inside a group, because ' +
         'a search FILTERS and never re-ranks: the order is the same one the unnarrowed list ' +
         'draws, so a row keeps its place as the query grows and shrinks',
     )
     eq(
-      ids(groups(board, 'todo', 'retry')),
+      ids(groups(board, 'todo', matched('t-1', 't-2'))),
       ['t-1'],
       'and it composes with the status filter as the intersection — each control is its own ' +
         'claim about the row',
     )
     eq(
       ids(groups(board, null)),
-      ids(groups(board, null, '')),
+      ids(groups(board, null, null)),
       'the argument defaults to no query, so every caller that predates it is unchanged',
     )
 
-    eq(listEmpty(board, null, 'retry'), null, 'a query with matches is not empty')
+    eq(listEmpty(board, null, 'retry', matched('t-1')), null, 'a query with matches is not empty')
     eq(
-      listEmpty(board, null, 'quaternion'),
+      listEmpty(board, null, 'quaternion', matched()),
       'search',
       'one with none is its OWN state, a third sentence rather than a reuse of the filter’s: ' +
         'the way out of this one is clearing what was typed, so the screen has to name the query',
     )
+    /*
+     * The new silent failure, and the reason `matched` is nullable rather than defaulting to an
+     * empty set. Between a keystroke and `task_search`'s answer there is no id set, and a panel
+     * that read that state as "nothing matched" would print `No tasks match "retry"` — about a
+     * search it had not run yet — over a board that may well contain it. One frame is enough: it
+     * is the frame the user is looking at while they type.
+     */
     eq(
-      listEmpty(ready(1, []), null, 'retry'),
+      listEmpty(board, null, 'retry', null),
+      null,
+      'a typed query whose answer has NOT landed draws no sentence at all: nothing is claimed ' +
+        'about a search that has not run',
+    )
+    eq(
+      listEmpty(ready(1, []), null, 'retry', matched()),
       'tracker',
       'an empty tracker stays the tracker screen under a query — there was nothing to have hidden',
     )
     eq(
-      listEmpty(board, 'review', 'retry'),
+      listEmpty(board, 'review', 'retry', matched('t-1')),
       'search',
       'when both narrowings are on and nothing survives, the search takes the blame — the ' +
         'sentence can name the query AND the status it ran inside, where blaming the filter ' +
         'would claim a status hid tasks that a different control is hiding',
     )
     eq(
-      listEmpty(board, 'done', ''),
+      listEmpty(board, 'done', '', null),
       'filter',
       'and with no query at all the filter keeps its own screen exactly as before',
     )

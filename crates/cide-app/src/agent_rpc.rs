@@ -52,8 +52,8 @@
 //!
 //! | the header names | served |
 //! | --- | --- |
-//! | a run this process dispatched | the **eight** `cide_task_*` tools, scoped to that run's project, signing every comment as that run's role |
-//! | a Claude pane of a project — its console (`primary_session`) or any other | those eight **and** the seven `cide_agent*` tools, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
+//! | a run this process dispatched | the **nine** `cide_task_*` tools, scoped to that run's project, signing every comment as that run's role |
+//! | a Claude pane of a project — its console (`primary_session`) or any other | those nine **and** the eleven orchestration tools, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
 //! | anything else, or nothing | a valid `initialize` and an **empty** tool list |
 //!
 //! Never a crash, and never another project's tasks. The primary-session question is still asked,
@@ -81,7 +81,7 @@
 //!
 //! # Why the two pane rows became one (M40)
 //!
-//! M30's row served a second Claude pane the task tools and withheld the seven `cide_agent*`
+//! M30's row served a second Claude pane the task tools and withheld the orchestration
 //! ones, on the argument that those belong to the console the product-owner paragraph was
 //! appended to. The hole that left was the mirror of M30's: a second pane could already *start*
 //! a run — assigning or @mentioning a role starts it, through `crate::task_triggers` — and never
@@ -107,7 +107,7 @@
 //! would, under the other order, be handed the dispatch tools. Asking the run question first
 //! means a connection that is a run can never be read as anything else.
 //!
-//! That is the whole of the answer to *may an agent dispatch an agent*: the seven orchestration
+//! That is the whole of the answer to *may an agent dispatch an agent*: the eleven orchestration
 //! tools are never in a run's `tools/list`, and [`call_tool`] refuses a name the connection was
 //! not shown, so a run that guesses `cide_agent_dispatch` is answered `METHOD_NOT_FOUND` before
 //! anything reaches the registry. Closed by construction rather than by asking a model not to.
@@ -142,11 +142,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cide_agents::Delivery;
-use cide_agents::tools::{self, AgentSink, Integrated, TaskSink, ToolResult};
+use cide_agents::tools::{self, AgentSink, Integrated, Stopped, TaskSink, ToolResult};
 use cide_ipc::{
     AgentDef, AgentId, AgentRoster, AgentRun, AttachTarget, ChangeName, DispatchRequest, Harness,
-    PaneKind, ProjectId, RunId, RunNotify, RunState, SessionId, SessionState, Task, TaskAuthor,
-    TaskEdit, TaskId, TaskNew,
+    LlmSettings, OrchestrationConfig, OrchestrationPatch, PaneKind, ProjectId, ProjectOverrides,
+    RunId, RunNotify, RunState, SessionId, SessionState, Task, TaskAuthor, TaskEdit, TaskId,
+    TaskNew, TaskRow,
     agents::{AgentDraft, AgentSaveOutcome, AgentScope},
 };
 use cide_ipc::{Project, Workspace};
@@ -156,7 +157,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 
-use crate::agents::AgentRegistry;
+use crate::agents::{AgentRegistry, DeathFacts, StopBy, StopHow};
 use crate::state::SessionRegistry;
 use crate::task_triggers::TaskMutation;
 use crate::tasks_state::TasksStores;
@@ -353,7 +354,7 @@ struct ProjectTools {
     /// Who a comment written over this connection is from. Decided from the header, never from
     /// the payload — see the module header.
     author: TaskAuthor,
-    /// Whether this connection is a Claude *pane* — and therefore whether the seven `cide_agent*`
+    /// Whether this connection is a Claude *pane* — and therefore whether the eleven orchestration
     /// tools exist for it at all. False for a run: the line this module exists to draw.
     ///
     /// A `bool` and not a second `ToolAccess` implementation, because the two differ in exactly
@@ -472,7 +473,7 @@ impl ProjectTools {
 /// the agent half of that funnel and does nothing but adapt shapes.
 ///
 /// **It holds no `AppHandle`, and that is worth keeping.** A store plus an author is everything
-/// the eight task tools need, so this type is constructible in a test — which is what
+/// the nine task tools need, so this type is constructible in a test — which is what
 /// `a_store_backed_sink_mutates_and_reports_that_it_did` does, and `tauri`'s mock app is behind a
 /// feature this build does not enable. The orchestration half needs managed state and therefore
 /// lives in [`RegistrySink`] beside it rather than widening this.
@@ -496,7 +497,7 @@ struct StoreSink {
 }
 
 impl TaskSink for StoreSink {
-    fn list(&self) -> Result<Vec<Task>, String> {
+    fn list(&self) -> Result<Vec<TaskRow>, String> {
         Ok(self.store.list())
     }
 
@@ -719,6 +720,123 @@ impl AgentSink for RegistrySink {
         Ok(registry.dispatching(self.project))
     }
 
+    // --- what a role runs on (M71) ----------------------------------------------------------
+    //
+    // Every one of these goes through the `cmd::` command rather than the writer under it, which
+    // is `write_definition`'s shape above and for its reason: the command is already the one
+    // writer, it carries the validation, and it is what emits. Reaching past it would give this
+    // module a second road to the same file, and the two would disagree about exactly the parts
+    // nobody tests twice.
+
+    fn config(&self) -> Result<OrchestrationConfig, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        tauri::async_runtime::block_on(crate::cmd::agents::agents_config_get(
+            workspace,
+            self.project,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn set_config(&self, patch: OrchestrationPatch) -> Result<OrchestrationConfig, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        let agents = self
+            .app
+            .try_state::<Arc<AgentRegistry>>()
+            .ok_or_else(|| gone().to_string())?;
+        // `agents_config_set` merges into the file that is on disk, so the six disk-only keys a
+        // user hand-edited survive a write made from here — and it refuses an *enable* outside a
+        // git repository with the sentence naming the two ways out. The handler has already
+        // refused `enabled`, so that arm is unreachable through this road; it is left to the
+        // command rather than restated, because one refusal is one wording.
+        tauri::async_runtime::block_on(crate::cmd::agents::agents_config_set(
+            self.app.clone(),
+            workspace,
+            agents,
+            self.project,
+            patch,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn overrides(&self) -> Result<ProjectOverrides, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        tauri::async_runtime::block_on(crate::cmd::agents::agent_overrides_get(
+            workspace,
+            self.project,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn set_overrides(&self, overrides: ProjectOverrides) -> Result<(), String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        tauri::async_runtime::block_on(crate::cmd::agents::agent_overrides_set(
+            workspace,
+            self.project,
+            overrides,
+        ))
+        .map_err(|error| error.to_string())?;
+        // **The one emission this road has to make itself.** `agent_overrides_set` emits nothing,
+        // which is correct for the panel that calls it — the screen is writing what it is already
+        // drawing — and wrong for a write nothing on screen made: `agent-overrides.json` lives in
+        // the profile's config directory, which `crate::dotcide` does not watch and nothing else
+        // does either, so an override a model wrote would be invisible in every open window until
+        // somebody reopened the panel. The roster is what carries a role's override, so the roster
+        // is what goes out.
+        if let Some(roster) = crate::cmd::agents::project_roster(&self.app, self.project) {
+            crate::emit::agents_changed(&self.app, self.project, &roster);
+        }
+        Ok(())
+    }
+
+    fn llm(&self) -> Result<LlmSettings, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        workspace
+            .with(|ws| Ok::<_, cide_core::CoreError>(ws.settings.llm.clone()))
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_llm(&self, llm: LlmSettings) -> Result<(), String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        // A `SettingsPatch` naming one group, which is the same call the Models screen makes:
+        // `apply_patch` touches only the fields a patch names, runs `LlmSettings::cleaned`, and
+        // the `cide://workspace-changed` that `WorkspaceState::update` broadcasts is what redraws
+        // an open Settings screen. No live run is disturbed, deliberately — an opencode child's
+        // configuration is composed at the fork and a running process's environment cannot
+        // change, so a provider edited now is honoured from the next dispatch or the next Resume.
+        crate::cmd::settings::settings_set(
+            workspace,
+            self.app.clone(),
+            cide_ipc::SettingsPatch {
+                llm: Some(llm),
+                ..cide_ipc::SettingsPatch::default()
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    fn resolutions(&self) -> Result<Vec<(AgentId, cide_agents::overrides::Resolved)>, String> {
+        crate::agents::resolutions_for(&self.app, self.project).map_err(|error| error.to_string())
+    }
+
     fn definition(&self, scope: AgentScope, name: &AgentId) -> Result<Option<AgentDraft>, String> {
         let root = self.root()?;
         // Straight to `cide_agents::defs`, unlike the write below: `cmd::agents::agents_draft`
@@ -815,24 +933,33 @@ impl AgentSink for RegistrySink {
         .map_err(|error| error.to_string())
     }
 
-    fn stop(&self, run: RunId, reason: Option<&str>) -> Result<(), String> {
-        let agents = self
-            .app
-            .try_state::<Arc<AgentRegistry>>()
-            .ok_or_else(|| gone().to_string())?;
-        // The only place the reason goes. `AGENT_STOP`'s description says exactly this to the
-        // model and names `cide_task_comment` as the durable alternative, so a caller that wants
-        // the project to remember why has a tool for it rather than a lie about this one.
+    fn stop(&self, run: RunId, reason: Option<&str>, force: bool) -> Result<Stopped, String> {
+        // One of three destinations now, and the least valuable of them. (M67) The reason is
+        // also typed into the child as part of the wind-down instruction — which is what lets
+        // the run's own final comment answer the objection rather than merely describe where it
+        // got to — and written onto the task. This line used to say it was the *only* place the
+        // reason went, and `AGENT_STOP`'s description named `cide_task_comment` as the durable
+        // alternative; both were true and both had to go.
         tracing::info!(
             %run,
             reason = reason.unwrap_or("(none given)"),
+            force,
             "the orchestrator stopped a subagent run"
         );
-        tauri::async_runtime::block_on(crate::cmd::agents::agents_stop(
+        // The `block_on` stays, and it is not a wait: `agents_stop` returns as soon as the
+        // request is accepted, by design. A stop that blocked for the whole grace would be the
+        // `openDiff` hazard with a timer on it — a tool call that lets one wedged subagent
+        // freeze the product owner mid-turn, when the frozen session is the only thing that
+        // could have stopped the others. It would also routinely time out in the client, and a
+        // model's move after a failed stop is to stop again, which *is* the escalation to a
+        // kill: the blocking design would quietly convert graceful stops into forced ones.
+        tauri::async_runtime::block_on(crate::cmd::agents::agents_stop_with(
             self.app.clone(),
-            agents,
             self.project,
             run,
+            StopBy::Orchestrator,
+            reason.map(str::to_string),
+            force,
         ))
         .map_err(|error| error.to_string())
     }
@@ -1508,16 +1635,7 @@ fn note_death(app: &AppHandle, project: ProjectId, run: RunId) {
     let Some(store) = stores.get(project) else {
         return;
     };
-    let text = match facts.code {
-        Some(code) => format!(
-            "run {run} ({}) ended with exit {code} before finishing this task",
-            facts.agent_label
-        ),
-        None => format!(
-            "run {run} ({}) failed before finishing this task",
-            facts.agent_label
-        ),
-    };
+    let text = epitaph(run, &facts);
     match store.edit(
         &facts.task,
         TaskEdit::Comment { text },
@@ -1527,6 +1645,149 @@ fn note_death(app: &AppHandle, project: ProjectId, run: RunId) {
         // A task deleted between the death and this write is a fine reason to say nothing.
         Err(error) => {
             tracing::debug!(%run, %error, "no death comment; the task is gone or unwritable");
+        }
+    }
+}
+
+/// What one run's ending says on its task. (M67)
+///
+/// Pure over [`DeathFacts`], so the seven sentences are asserted in this module's tests rather
+/// than read out of a live app by somebody who had to stop a real agent to see one.
+///
+/// # The two old sentences do not move, and that is the disambiguation
+///
+/// `ended with exit {code}` and `failed` are byte-identical to what they were before M67, and
+/// they are what the **unstopped** arms still produce. The point is not that they changed — it
+/// is that they now *only* fire when nobody asked, so the reader of an old board and the reader
+/// of a new one are told the same thing by the same words. Editing them to mention stops would
+/// have re-merged the crash and the stop from the other direction, which is the bug M67 exists
+/// to fix.
+///
+/// House form throughout: a lower-case fragment led by `run {id} ({Role})`, no terminal full
+/// stop, and the reason spliced after an em dash — **omitted entirely** when there is none,
+/// because `(none given)` belongs in a log and not on somebody's board.
+fn epitaph(run: RunId, facts: &DeathFacts) -> String {
+    let who = facts.agent_label.as_str();
+    let Some(stop) = facts.stop.as_ref() else {
+        // Nobody asked. Unchanged, deliberately — see the header.
+        return match facts.code {
+            Some(code) => {
+                format!("run {run} ({who}) ended with exit {code} before finishing this task")
+            }
+            None => format!("run {run} ({who}) failed before finishing this task"),
+        };
+    };
+
+    let by = stop.by.phrase();
+    // Composed once: every stopped arm ends with it or with nothing.
+    let because = match stop
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        Some(reason) => format!(" — {reason}"),
+        None => String::new(),
+    };
+    let exit = match facts.code {
+        Some(code) => format!(" (exit {code})"),
+        None => String::new(),
+    };
+
+    match &stop.how {
+        // Still winding down at the moment its end was observed. Reachable when the child dies
+        // of something else mid-wind-down — a crash, an OOM kill — and it is worth its own
+        // clause: the run was asked, and what came back is not what was asked for.
+        StopHow::WindingDown { .. } => format!(
+            "run {run} ({who}) was stopped by {by} and died before it could wind \
+             down{exit}{because}"
+        ),
+        StopHow::WoundDown => format!(
+            "run {run} ({who}) was stopped by {by} and wound down as asked{exit}; what it had \
+             to say is in its own last comment{because}"
+        ),
+        StopHow::Forced { why } => format!(
+            "run {run} ({who}) was stopped by {by} and {why}, so cide ended it{exit}; anything \
+             it had not already written down is gone{because}"
+        ),
+        // Two spellings, and they must not collapse into one: "we asked and it would not go"
+        // is `Forced` above, and this is "we never asked". `why` is `None` when that was the
+        // caller's own choice, and names the obstacle when it was not — a stop that silently
+        // declined to ask first is a feature that appears not to work.
+        StopHow::Immediate { why: None } => format!(
+            "run {run} ({who}) was killed outright by {by}, without being asked to wind \
+             down{exit}; its in-flight turn is gone{because}"
+        ),
+        StopHow::Immediate { why: Some(why) } => format!(
+            "run {run} ({who}) was stopped by {by} and killed outright{exit}. It was not asked \
+             to wind down first: {why}{because}"
+        ),
+        StopHow::BeforeStart => format!(
+            "run {run} ({who}) was stopped by {by} before it started; nothing ran and nothing \
+             in this task's worktree changed{because}"
+        ),
+        StopHow::Discarded => format!(
+            "run {run} ({who}) was discarded by {by} without being resumed; its conversation is \
+             still on disk, so this task can be dispatched again{because}"
+        ),
+        // Not a stop anybody asked for — `bring_up` reclaiming a checkout — and until M67 it
+        // produced the crash sentence above about a run whose turn had already ended.
+        StopHow::Reclaimed => format!(
+            "run {run} ({who}) was wound down to give its worktree to another task{exit}; its \
+             turn had already ended, so nothing was interrupted"
+        ),
+    }
+}
+
+/// A run has been asked to wind down: say so on its task, now. (M67)
+///
+/// **The one comment that is written before the end**, and only on the one road that has a
+/// window. Every other stop is over by the time `AgentRegistry::stop` returns and says
+/// everything it has to say in [`epitaph`]; a wind-down takes up to the whole grace, and a cide
+/// that quits inside it would take the caller's reason with it. Two comments on one task is a
+/// real cost — every comment is tokens in `cide_task_get` — and it is paid only where the run
+/// is about to write its *own* comment between the two, so the three read as a conversation:
+/// you were asked, here is what I did, here is how it ended.
+///
+/// `get`, never `ensure` — [`note_death`]'s rule: a project whose tracker is not open has no
+/// board on screen and no orchestrator attached to read it, and opening and parsing the file to
+/// write into it would be disk work on behalf of nobody.
+pub fn note_stop_asked(app: &AppHandle, project: ProjectId, run: RunId) {
+    let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+        return;
+    };
+    let Some(asked) = registry.stop_asked_facts(run) else {
+        return;
+    };
+    let Some(stores) = app.try_state::<Arc<TasksStores>>() else {
+        return;
+    };
+    let Some(store) = stores.get(project) else {
+        return;
+    };
+    let because = match asked
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        Some(reason) => format!(" — {reason}"),
+        None => String::new(),
+    };
+    let text = format!(
+        "run {run} ({}) was asked to wind down by {}, with {}s to finish and report{because}",
+        asked.agent_label,
+        asked.by.phrase(),
+        asked.grace_secs,
+    );
+    match store.edit(
+        &asked.task,
+        TaskEdit::Comment { text },
+        TaskAuthor::Orchestrator,
+    ) {
+        Ok(_) => crate::tasks_state::broadcast(app, project, &store),
+        Err(error) => {
+            tracing::debug!(%run, %error, "no stop comment; the task is gone or unwritable");
         }
     }
 }
@@ -2326,7 +2587,7 @@ mod tests {
             }
         }
 
-        /// The product owner's list: the eight task tools and the seven orchestration ones.
+        /// The product owner's list: the nine task tools and the eleven orchestration ones.
         fn every() -> Self {
             Self {
                 names: tools::tool::EVERY.to_vec(),
@@ -2426,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scoped_connection_lists_the_six_and_calls_them() {
+    fn a_scoped_connection_lists_the_task_tools_and_calls_them() {
         let access = FakeAccess::all();
         let listed =
             ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &access).expect("a reply");
@@ -2630,7 +2891,7 @@ mod tests {
     /// through the transport, the header line and the JSON-RPC layer, exactly as `cide-hook mcp`
     /// drives them.
     ///
-    /// Three connections, three answers: sixteen tools for the project's primary session, nine for
+    /// Three connections, three answers: twenty tools for the project's primary session, nine for
     /// a run, none for anything else. And the enforcement half beside the advertisement: the run
     /// connection asks for `cide_agent_dispatch` by name and is answered `METHOD_NOT_FOUND`
     /// **without the call reaching the sink at all**, which is the assertion that matters — an
@@ -2675,15 +2936,19 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 16, "{names:?}");
+            assert_eq!(names.len(), 20, "{names:?}");
             assert_eq!(names, tools::tool::EVERY);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));
-            // The two that are deliberately not tools, checked here as well as in
+            // The settings four reach a product owner's pane and nowhere else. (M71)
+            assert!(names.contains(&"cide_agents_config"));
+            assert!(names.contains(&"cide_llm_pool"));
+            // The three that are deliberately not tools, checked here as well as in
             // `cide_agents::tools`, because this is the list a model actually receives.
             assert!(!names.contains(&"cide_agent_pause"));
             assert!(!names.contains(&"cide_agent_resume"));
             assert!(!names.contains(&"cide_agent_delete"));
+            assert!(!names.contains(&"cide_llm_test_model"));
         }
 
         {
@@ -2726,6 +2991,29 @@ mod tests {
             let refused = run.recv();
             assert_eq!(refused["error"]["code"], json!(METHOD_NOT_FOUND));
             assert!(refused["result"].is_null(), "{refused}");
+
+            // And the settings tools, guessed by name. A subagent that could re-point its
+            // siblings' models — or raise the project's own concurrency cap — is the failure the
+            // family split exists to make unreachable, so it is asserted where the bytes are and
+            // not only in the slice. (M71)
+            for guessed in [
+                "cide_agents_config",
+                "cide_agent_override",
+                "cide_llm_provider",
+                "cide_llm_pool",
+            ] {
+                run.send(json!({
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": { "name": guessed, "arguments": { "maxConcurrent": 9 } },
+                }));
+                let refused = run.recv();
+                assert_eq!(
+                    refused["error"]["code"],
+                    json!(METHOD_NOT_FOUND),
+                    "{guessed} answered a run"
+                );
+                assert!(refused["result"].is_null(), "{refused}");
+            }
         }
 
         server.join().expect("the server thread");
@@ -3410,5 +3698,139 @@ mod tests {
             Some(0),
             "the nudge never arrived as a submitted line"
         );
+    }
+    // ======================================================================================
+    // The epitaph (M67). Pure over `DeathFacts`, so the sentences are asserted here rather
+    // than read out of a live app by somebody who had to stop a real agent to see one.
+    // ======================================================================================
+
+    fn facts(code: Option<i32>, stop: Option<StopHow>, reason: Option<&str>) -> DeathFacts {
+        DeathFacts {
+            task: cide_ipc::TaskId::from("t-4".to_string()),
+            agent_label: "Developer".to_string(),
+            code,
+            stop: stop.map(|how| crate::agents::StopRecord {
+                by: StopBy::Orchestrator,
+                reason: reason.map(str::to_string),
+                how,
+                grace_secs: 60,
+            }),
+        }
+    }
+
+    /// **The two sentences that do not move.** This is the disambiguation.
+    ///
+    /// They are byte-identical to what they were before M67, and they are what the *unstopped*
+    /// arms still produce — so an old board and a new one say the same thing with the same
+    /// words. The point is not that they changed; it is that they now only fire when nobody
+    /// asked. Editing them to mention a stop would re-merge the crash and the stop from the
+    /// other direction, which is the bug this milestone exists to fix.
+    #[test]
+    fn a_death_nobody_ordered_reads_exactly_as_it_always_did() {
+        let run = RunId::new();
+        assert_eq!(
+            epitaph(run, &facts(Some(129), None, None)),
+            format!("run {run} (Developer) ended with exit 129 before finishing this task")
+        );
+        assert_eq!(
+            epitaph(run, &facts(None, None, None)),
+            format!("run {run} (Developer) failed before finishing this task")
+        );
+    }
+
+    /// Every deliberate ending says so, says whose hand it was, and says which kind it was.
+    #[test]
+    fn a_deliberate_ending_is_distinguishable_from_a_crash_and_from_the_other_kinds() {
+        let run = RunId::new();
+        const WHY: &str = "the migration is going the wrong way";
+        let why = Some(WHY);
+
+        let wound = epitaph(run, &facts(Some(0), Some(StopHow::WoundDown), why));
+        assert!(wound.contains("was stopped by the orchestrator"), "{wound}");
+        assert!(wound.contains("wound down as asked"), "{wound}");
+        assert!(wound.contains("its own last comment"), "{wound}");
+        assert!(wound.contains(WHY), "{wound}");
+
+        let forced = epitaph(
+            run,
+            &facts(
+                Some(129),
+                Some(StopHow::Forced {
+                    why: "it did not wind down in time",
+                }),
+                why,
+            ),
+        );
+        assert!(forced.contains("did not wind down in time"), "{forced}");
+        assert!(forced.contains("exit 129"), "{forced}");
+
+        // **"We asked and it would not go" and "we never asked" must not collapse.** That is
+        // this milestone's own bug, one level down, and exactly what `exit 129` meaning both a
+        // stop and a crash was.
+        let outright = epitaph(
+            run,
+            &facts(Some(129), Some(StopHow::Immediate { why: None }), why),
+        );
+        assert!(outright.contains("killed outright"), "{outright}");
+        assert!(outright.contains("without being asked"), "{outright}");
+        assert_ne!(outright, forced);
+
+        // And an unasked kill that was not the caller's choice names the obstacle. A stop that
+        // silently declined to ask first is a feature that appears not to work.
+        let blocked = epitaph(
+            run,
+            &facts(
+                Some(129),
+                Some(StopHow::Immediate {
+                    why: Some("it was waiting on a permission prompt"),
+                }),
+                None,
+            ),
+        );
+        assert!(
+            blocked.contains("not asked to wind down first"),
+            "{blocked}"
+        );
+        assert!(blocked.contains("permission prompt"), "{blocked}");
+
+        let cancelled = epitaph(run, &facts(None, Some(StopHow::BeforeStart), why));
+        assert!(cancelled.contains("before it started"), "{cancelled}");
+        assert!(cancelled.contains("nothing ran"), "{cancelled}");
+
+        let discarded = epitaph(run, &facts(None, Some(StopHow::Discarded), None));
+        assert!(discarded.contains("without being resumed"), "{discarded}");
+        assert!(discarded.contains("still on disk"), "{discarded}");
+
+        // The reclaim: not a stop anybody asked for. Until M67 it borrowed the crash sentence
+        // and reported a run whose turn had *already ended* as having died before finishing.
+        let reclaimed = epitaph(run, &facts(Some(129), Some(StopHow::Reclaimed), None));
+        assert!(
+            reclaimed.contains("give its worktree to another task"),
+            "{reclaimed}"
+        );
+        assert!(reclaimed.contains("nothing was interrupted"), "{reclaimed}");
+        assert!(
+            !reclaimed.contains("before finishing this task"),
+            "the crash sentence must not leak here: {reclaimed}"
+        );
+
+        // Every stopped arm is distinguishable from the crash line, which is the whole ask.
+        let crashed = epitaph(run, &facts(Some(129), None, None));
+        for other in [
+            &wound, &forced, &outright, &blocked, &cancelled, &discarded, &reclaimed,
+        ] {
+            assert_ne!(other, &crashed);
+        }
+    }
+
+    /// No reason given: the clause comes off. `(none given)` belongs in a log, not on a board.
+    #[test]
+    fn an_epitaph_with_no_reason_carries_no_dangling_clause() {
+        let run = RunId::new();
+        for reason in [None, Some(""), Some("   ")] {
+            let text = epitaph(run, &facts(Some(0), Some(StopHow::WoundDown), reason));
+            assert!(!text.contains('—'), "{text}");
+            assert!(!text.ends_with(' '), "{text}");
+        }
     }
 }

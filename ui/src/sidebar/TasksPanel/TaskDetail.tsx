@@ -108,6 +108,7 @@ import {
   type LinkTargetOption,
   type RunRef,
   type TaskStatus,
+  type TaskDetailView,
   type TaskView,
   type Tone,
   dropTargetKey,
@@ -551,7 +552,22 @@ export interface LinkAdd {
 }
 
 export interface TaskDetailProps {
-  task: TaskView
+  /**
+   * The task, **with its content**. (M68)
+   *
+   * A `TaskDetailView` rather than the board's `TaskView`, and the type is doing real work: the
+   * board no longer carries a body, a log, a history or a file list, so a card built from a row
+   * would have `''` and `[]` for all four — and every one of those renders a *sentence*
+   * (`No description.`, `No comments yet.`, a history disclosure that simply is not drawn, an
+   * Attachments section that vanishes label and all). The worst of it is not a sentence: the body
+   * editor would open empty, report dirty on the first keystroke, and write that emptiness over
+   * the real body.
+   *
+   * So the card is unrepresentable without content, and `TaskDetailHost` draws its own pending
+   * state until `task_get` has answered. Nothing in this file needs a "not loaded" branch as a
+   * result, which is the point — see `TaskDetailView`'s own doc in `model.ts`.
+   */
+  task: TaskDetailView
   /** Every run cide knows about, so the live-run strip can find this task's. */
   runs: readonly RunRef[]
   /** Agent id → label, for the assignee list and the chip's fallback ladder. */
@@ -786,6 +802,96 @@ export function TaskDetailModal(props: TaskDetailProps) {
     >
       <TaskDetail {...props} />
     </OverlayCard>
+  )
+}
+
+/**
+ * The card before `task_get` has answered: the row's own facts, and nothing claimed. (M68)
+ *
+ * # Why this exists rather than the card rendering with empty content
+ *
+ * Because every empty value the card would fall back to is a **sentence about the user's data**:
+ * `No description.`, `No comments yet.`, a status-history disclosure that is simply not drawn, an
+ * Attachments section that vanishes label and all. Drawn from content nobody has fetched, each of
+ * those is a confident claim that the task has none — the failure `BOARD_UNKNOWN` exists to prevent
+ * one level up, where *nobody has looked* deliberately draws nothing rather than borrowing
+ * `absent`'s screen.
+ *
+ * So the pending card draws only what the **row** actually knows — the id, the title, the status —
+ * and says out loud that the rest is on its way. The row is already in hand from the board, so
+ * there is no spinner-over-nothing: the card opens with its heading filled in, which is also why
+ * this is not simply `null` until the answer lands (a modal that appears blank and then populates
+ * reads as a bug).
+ *
+ * `TaskView` and not `TaskDetailView`: this is the one component in the file that may be handed a
+ * row, and the *only* reason it is allowed to is that it draws no content field at all.
+ */
+export interface TaskDetailPendingProps {
+  task: TaskView
+  onClose: () => void
+}
+
+/**
+ * The portal. [`TaskDetailPending`] is everything inside it — the same split
+ * [`TaskDetailModal`]/[`TaskDetail`] make, and for the same reason: `OverlayCard` portals to
+ * `document.body`, which a server render produces nothing for, so the check drives the inner half.
+ */
+export function TaskDetailPendingModal(props: TaskDetailPendingProps) {
+  return (
+    <OverlayCard label={`Task ${props.task.id}`} onDismiss={props.onClose}>
+      <TaskDetailPending {...props} />
+    </OverlayCard>
+  )
+}
+
+export function TaskDetailPending({ task, onClose }: TaskDetailPendingProps) {
+  return (
+    <>
+      <div className={styles.taskCard} data-audit="tasksCardPending">
+        <div className={styles.cardHead} data-audit="taskCardHead">
+          {/* The loaded card's own glyph, tone class and all — the head is the part of the card
+              that is entirely a function of the row, so it is drawn identically rather than
+              approximated. */}
+          <span
+            className={cx(styles.glyph, TONE_CLASS[statusTone(task.status)])}
+            data-audit="tasksDetailGlyph"
+            aria-hidden="true"
+          >
+            <Icon name={asIcon(statusGlyph(task.status))} size={1} />
+          </span>
+          <span className={styles.detailId} data-audit="tasksDetailId">
+            {task.id}
+          </span>
+          {/*
+            * The same three ways out the loaded card offers, for its reasons — and `autoFocus`
+            * here as well, or Escape would not work until something inside was touched. This card
+            * is short-lived and may still be the one on screen when the user changes their mind.
+            */}
+          <button
+            type="button"
+            className={styles.close}
+            data-audit="tasksClose"
+            autoFocus
+            title="Close (Esc)"
+            aria-label="Close task"
+            onClick={onClose}
+          >
+            <Icon name="x" size={1} />
+          </button>
+        </div>
+        <p className={styles.pendingBody}>
+          <span className={styles.pendingTitle}>{task.title}</span>
+        {/*
+          * A statement about the *fetch*, never about the task. "Loading the description and log"
+          * names what is missing and why; "No comments yet" over the same state would be the lie
+          * this component exists to make unrepresentable.
+          */}
+          <span className={styles.pendingNote} data-audit="tasksCardPendingNote">
+            Loading the description and log…
+          </span>
+        </p>
+      </div>
+    </>
   )
 }
 
@@ -2116,7 +2222,7 @@ function FieldRow({
   props,
 }: {
   field: EditableField
-  task: TaskView
+  task: TaskDetailView
   roles: Readonly<Record<string, string>>
   editing: FieldEdit | null
   run: (intent: EditIntent) => void

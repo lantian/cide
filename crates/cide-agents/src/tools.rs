@@ -1,15 +1,15 @@
-//! The sixteen MCP tools cide serves a `claude`: their names, their schemas, and handlers that
+//! The twenty MCP tools cide serves a `claude`: their names, their schemas, and handlers that
 //! touch nothing. (M18)
 //!
 //! Two families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
 //! connection's header line, never from anything the caller says:
 //!
-//! * the eight `cide_task_*` tools ([`tool::ALL`]) — the shared tracker, served to the project's
+//! * the nine `cide_task_*` tools ([`tool::ALL`]) — the shared tracker, served to the project's
 //!   own session **and** to every dispatched subagent run, because the tracker is the medium
 //!   they exchange state through;
-//! * the seven `cide_agent*` tools ([`tool::ORCHESTRATION`]) — the roster, the two that author
-//!   a role, and the dispatch — served **only** to the project's primary session, which is the
-//!   product owner.
+//! * the eleven orchestration tools ([`tool::ORCHESTRATION`]) — the roster, the two that author
+//!   a role, the four that decide what a role *runs on* (M71), and the dispatch — served
+//!   **only** to the project's primary session, which is the product owner.
 //!
 //! That split is the whole of the answer to *may an agent dispatch another agent*: a run's
 //! connection is never handed the vocabulary, so the question never reaches a model at all. See
@@ -97,6 +97,55 @@
 //! one. Claude Code's two scopes are refused for a create by `defs::validate` itself, and for its
 //! own reason: cide does not author files in a directory whose format it does not define.
 //!
+//! # The four settings tools write one row, never a table (M71)
+//!
+//! `cide_agents_config`, `cide_agent_override`, `cide_llm_provider` and `cide_llm_pool` change
+//! what a role runs on: the project's concurrency cap and default harness, this machine's
+//! per-role redirections, and the providers and pools an opencode run draws from. They exist
+//! because the loop this vocabulary is for — decompose, dispatch, read what came back, adjust,
+//! dispatch again — had no *adjust*: every one of those knobs was a `#[tauri::command]` the
+//! webview alone could reach, so an orchestrator that worked out a role was too expensive could
+//! only ask the user to open Settings.
+//!
+//! Each one names **one row**, and the read-modify-write happens on the far side of the sink.
+//! That is not ergonomics. `agent_overrides_set` takes a whole `ProjectOverrides` and
+//! `SettingsPatch::llm` a whole `LlmSettings`, so a tool shaped like the command it calls would
+//! let one call from a model that had not read first **erase every provider and every API key on
+//! the machine**. It is `tool::TASK_LINK`'s argument, which is written out above, arriving at
+//! three more tables at once: an array field can say what the set *is* and never what the caller
+//! *did*.
+//!
+//! Two narrower rules follow from the same place. A credential is **written and never rendered**
+//! — `cide_ipc::LlmProvider`'s `Debug` is hand-written so no `tracing::debug!` can print a key,
+//! and a tool result is a transcript, a `run-logs/<run>.log` and a scrollback, so the roster says
+//! `key set` and never the key. And a pool entry is taken as `{provider, model}` and never as one
+//! `provider/model` string, because the first-slash-wins splitter has exactly one home
+//! (`ui/src/settings/llmPools.ts`), whose own header records that two splitters would eventually
+//! disagree about what a provider is.
+//!
+//! # `enabled` is reported by the roster and written by nobody here
+//!
+//! [`tool::AGENTS_CONFIG`] patches `maxConcurrent` and `harness` and refuses `enabled` — by name,
+//! with a sentence, rather than by ignoring an argument it was sent. `crate::config`'s header is
+//! the argument: a project that has never heard of subagents can never spawn one, every unreadable
+//! or half-written file funnels to `enabled: false`, and *"guessing `true` … means unattended
+//! `claude` processes in somebody's repository, editing files, spending their quota, with the user
+//! having done nothing to ask for it."* A model that could flip it would be making exactly that
+//! guess on the user's behalf, in a project it is already running in — which is the one place the
+//! opt-in has to come from somewhere else. The five disk-only keys (`isolation`,
+//! `allowDangerousPermissions`, `nudgeOrchestrator`, `autoDispatch`, `skipPermissions`) and
+//! `stopGraceSecs` need no such argument: they are not on `cide_ipc::OrchestrationPatch` at all,
+//! which is a line `crate::config` drew long before this vocabulary existed.
+//!
+//! # `cide_llm_test_model` is deliberately absent
+//!
+//! The probe behind the Models screen's Test button runs a real, very small turn against the
+//! provider — which **spends the user's quota**, and is why `cmd::agents::llm_test_model`'s own
+//! doc says it is a button a person presses rather than anything automatic. A tool would make it
+//! a thing a model does in a loop while trying candidates. The orchestrator finds out whether a
+//! model answers the way every other caller does: it dispatches, and the run either works or
+//! fails over to the next entry in the pool with the reason recorded against it.
+//!
 //! # `cide_agent_delete` is deliberately absent
 //!
 //! For `cide_task_delete`'s reason, one turn further: a role's body is somebody's system prompt,
@@ -141,9 +190,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use cide_ipc::{
-    AgentDef, AgentId, AgentRun, AttachTarget, AttachmentKind, ChangeName, Harness, LinkType,
-    RunId, RunNotify, RunState, Task, TaskAttachment, TaskAuthor, TaskEdit, TaskId, TaskLinkSpec,
-    TaskStatus,
+    AgentDef, AgentId, AgentOverride, AgentRun, AttachTarget, AttachmentKind, ChangeName, Harness,
+    LinkType, LlmModel, LlmProvider, LlmSettings, ModelPool, OrchestrationConfig,
+    OrchestrationPatch, PoolEntry, ProjectOverrides, RunId, RunNotify, RunState, Task,
+    TaskAttachment, TaskAuthor, TaskEdit, TaskId, TaskLinkSpec, TaskRow, TaskStatus,
     agents::{AgentDraft, AgentField, AgentScope},
 };
 
@@ -185,6 +235,18 @@ pub mod tool {
     /// Change one role's definition file, field by field. A field left out is left as the file
     /// has it, which is what makes this safe to call on a definition nobody has read. (M33)
     pub const AGENT_UPDATE: &str = "cide_agent_update";
+    /// This project's own `.cide/config.json`: how many runs at once, and which CLI a role that
+    /// names none gets. **Never [`crate::config::AgentsConfig::enabled`]** — see the module
+    /// header. (M71)
+    pub const AGENTS_CONFIG: &str = "cide_agents_config";
+    /// Point one role — or every role that names nothing of its own — at a different harness,
+    /// model, pool or effort, on this machine only. (M71)
+    pub const AGENT_OVERRIDE: &str = "cide_agent_override";
+    /// Add, change or remove one LLM provider: an id, an endpoint, a credential. (M71)
+    pub const LLM_PROVIDER: &str = "cide_llm_provider";
+    /// Add, change or remove one model pool — the ordered list a run falls down. (M71)
+    pub const LLM_POOL: &str = "cide_llm_pool";
+
     /// Hand a task to a role. **Enqueues and answers with a run id at once** — see the crate's
     /// `enqueue` and `agents_dispatch`, which both carry this rule in full.
     pub const AGENT_DISPATCH: &str = "cide_agent_dispatch";
@@ -218,13 +280,21 @@ pub mod tool {
     /// The orchestration vocabulary, served to a project's **primary session only**.
     ///
     /// Ordered the way the loop runs: find out what roles exist, define or correct the one the
-    /// work in front of you wants, hand it a task, watch, intervene, take the work back. A model
-    /// skimming this list in order reads the product owner's job description, which is most of
-    /// what makes it do the job.
+    /// work in front of you wants, settle what it runs on, hand it a task, watch, intervene, take
+    /// the work back. A model skimming this list in order reads the product owner's job
+    /// description, which is most of what makes it do the job.
+    ///
+    /// The four settings tools (M71) sit with the two that author a role rather than after the
+    /// integrate, because *what a role runs on* is part of defining it: the turn that decides a
+    /// role is too expensive is the turn before the dispatch, not the one after the merge.
     pub const ORCHESTRATION: &[&str] = &[
         AGENTS_LIST,
         AGENT_CREATE,
         AGENT_UPDATE,
+        AGENTS_CONFIG,
+        AGENT_OVERRIDE,
+        LLM_PROVIDER,
+        LLM_POOL,
         AGENT_DISPATCH,
         AGENT_RUNS,
         AGENT_STOP,
@@ -251,6 +321,10 @@ pub mod tool {
         AGENTS_LIST,
         AGENT_CREATE,
         AGENT_UPDATE,
+        AGENTS_CONFIG,
+        AGENT_OVERRIDE,
+        LLM_PROVIDER,
+        LLM_POOL,
         AGENT_DISPATCH,
         AGENT_RUNS,
         AGENT_STOP,
@@ -297,6 +371,14 @@ const STATUSES: &[TaskStatus] = &[
 /// a second `match`. A harness in the registry can be run, so it can be named here; one that is
 /// not implemented yet must not be offered, which is a distinction a hand-written list cannot
 /// draw at all.
+/// The one provider kind [`tool::LLM_PROVIDER`] reports and never writes. (M71)
+///
+/// `cide_ipc::LlmProvider::kind` is the producer and this is a name for one of its three answers;
+/// `the_provider_schema_offers_what_cide_can_write` asserts they are the same word, because a
+/// typo here would not fail to compile — it would quietly offer `external` in the schema and then
+/// refuse every call that took the offer.
+const EXTERNAL_PROVIDER: &str = "external";
+
 fn harnesses() -> impl Iterator<Item = Harness> {
     crate::harness::registry().iter().map(|h| h.kind())
 }
@@ -414,10 +496,18 @@ impl ToolResult {
 /// tag would be. The app maps `CoreError` through `Display` at the seam, which is one line there
 /// and no error vocabulary here.
 pub trait TaskSink: Send + Sync {
-    /// Every task, in file order — which is the order the panel renders and the order the
-    /// tracker's array holds. Filtering and truncation happen in [`dispatch`], where they are
-    /// pure and testable.
-    fn list(&self) -> Result<Vec<Task>, String>;
+    /// Every task's **row**, in file order — the order the panel renders and the tracker's array
+    /// holds. Filtering and truncation happen in [`dispatch`], where they are pure and testable.
+    ///
+    /// Rows and not whole tasks since M68, and the reason is the same one that shaped
+    /// [`render_summary`]: a list must not cost what a list of bodies costs. A task's content lives
+    /// in its own file now, so a `Vec<Task>` here would open one file per task on **every**
+    /// `cide_task_list`, every auto-dispatch trigger burst and every dispatch gate check — the
+    /// expense `DEFAULT_LIST_LIMIT` exists to bound, moved from tokens to syscalls.
+    ///
+    /// Everything the list renders is on the row, counts included. [`Self::get`] is the road to a
+    /// body and a log, which is exactly the split `cide_task_get` already documented.
+    fn list(&self) -> Result<Vec<TaskRow>, String>;
 
     /// One task by id, or `Ok(None)` when there is no such id.
     ///
@@ -505,6 +595,37 @@ pub enum Integrated {
     Merged { commit: String, files: usize },
     /// Refused **before touching anything**, listing the conflicting paths.
     Conflicts { paths: Vec<String> },
+}
+
+/// What [`tool::AGENT_STOP`] did. See [`AgentSink::stop`].
+///
+/// The whole point of the enum is that a stop now has **more than one outcome** and the caller
+/// acts on which: a wind-down leaves the role busy for up to the grace and promises a comment
+/// that is not written yet, while every other arm is over by the time the answer is composed.
+/// A `Result<(), String>` could not say that, and the sentence it produced — *"Its role is free
+/// to start the next task"* — would have become a lie on the one road this milestone added.
+///
+/// [`Integrated`]'s shape and for its reason: the app decides, this crate phrases, and the
+/// words a model reads are a pure function of a value a test can construct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// Asked to wind down, and still alive. `secs` is this project's grace, `task` is where it
+    /// was told to report.
+    WindingDown { secs: u64, task: Option<TaskId> },
+    /// Cancelled in the queue. No child ever existed, so there was nobody to ask.
+    BeforeStart,
+    /// An [`cide_ipc::RunState::Interrupted`] row discarded. The conversation stays on disk.
+    Discarded,
+    /// The child was killed without being asked. `why` is `None` for an explicit `force` and
+    /// names the obstacle otherwise — a paused child, a permission prompt, a conversation held
+    /// in a pane. Never left implicit: a stop that silently declined to ask first is a feature
+    /// that appears not to work.
+    Killed {
+        why: Option<String>,
+        task: Option<TaskId>,
+    },
+    /// It had already ended. Idempotent, deliberately — see [`AgentSink::stop`].
+    AlreadyOver,
 }
 
 /// Where the five orchestration tools read and write.
@@ -600,9 +721,21 @@ pub trait AgentSink: Send + Sync {
 
     /// End a run. Idempotent on one that has already finished.
     ///
-    /// `reason` is carried so the app can log it beside the kill; it is deliberately *not* a
-    /// durable record, and [`tool::AGENT_STOP`]'s description says so and names the tool that is.
-    fn stop(&self, run: RunId, reason: Option<&str>) -> Result<(), String>;
+    /// # `reason` is no longer a log line, and that is the whole of M67
+    ///
+    /// It has three destinations now, in descending order of value. It is **typed into the
+    /// child** as part of the wind-down instruction, which is what lets the run's own final
+    /// comment answer the objection rather than merely describe where it got to; it is written
+    /// **onto the task**, so the board records why without the caller composing the same
+    /// sentence twice; and it still reaches the log. Until M67 only the last was true, and
+    /// [`tool::AGENT_STOP`]'s description said so out loud — a caller who wanted the project to
+    /// remember was told to call [`tool::TASK_COMMENT`] as well.
+    ///
+    /// `force` skips the asking. The answer says which road was taken, because "we asked and it
+    /// would not go" and "we never asked" are different facts about the same dead process, and
+    /// a caller that cannot tell them apart is the bug this tool was changed to fix, one level
+    /// down.
+    fn stop(&self, run: RunId, reason: Option<&str>, force: bool) -> Result<Stopped, String>;
 
     /// Merge one of the role's worktree branches into the branch the project root has checked
     /// out: `cide/<agent>-<task>` when a task is named, `cide/<agent>` when not — the base
@@ -654,6 +787,63 @@ pub trait AgentSink: Send + Sync {
     /// header on why there is no `cide_agent_resume`; a pause is a person's gesture and a model
     /// that could lift it could lift the one taken to stop it.
     fn dispatching(&self) -> Result<bool, String>;
+
+    // --- what a role runs on (M71) ------------------------------------------------------------
+    //
+    // Seven methods and four tools, and the asymmetry is deliberate: the **setters take the whole
+    // value** and the handlers above them do the patching. Read-modify-write on this side of the
+    // trait would put the interesting cases — clearing one field, naming a pool that is not
+    // configured, removing the last entry of a pool, leaving every other provider's key alone —
+    // behind an `AppHandle`, and this module's standing rule is that all of them are reachable
+    // from a unit test with no socket and no `.cide/` anywhere.
+
+    /// This project's `.cide/config.json`, defaults filled in. Three fields, never the six
+    /// disk-only ones — `cide_ipc::OrchestrationConfig` is the line.
+    fn config(&self) -> Result<OrchestrationConfig, String>;
+
+    /// Write a patch into that file and answer with the config as it now stands.
+    ///
+    /// The patch cannot carry `enabled`: the handler refuses it before this is called, and
+    /// `cide_ipc::OrchestrationPatch` is what the implementation forwards, so the only way to
+    /// reach the switch from here would be to widen a type nothing else wants widened.
+    fn set_config(&self, patch: OrchestrationPatch) -> Result<OrchestrationConfig, String>;
+
+    /// This project's local, uncommitted role redirections, or an empty table.
+    ///
+    /// Never an `Err` for absence — `cide_core::persist::load_agent_overrides` states at length
+    /// that a missing or unreadable file *is* the empty set and that this is a correct answer
+    /// rather than a degraded one. An `Err` here is cide being gone.
+    fn overrides(&self) -> Result<ProjectOverrides, String>;
+
+    /// Store this project's whole overrides table.
+    ///
+    /// Whole-table because the command underneath is (`cmd::agents::agent_overrides_set`, whose
+    /// doc argues it): the file is a few hundred bytes, and a per-row command would need a delete
+    /// verb, an ordering and a story about two windows. What must not be whole-table is the
+    /// **tool**, which is the module header's rule.
+    fn set_overrides(&self, overrides: ProjectOverrides) -> Result<(), String>;
+
+    /// The machine's providers and pools.
+    ///
+    /// Global rather than per project — it is `Settings`, and it rides every
+    /// `cide://workspace-changed` to every window — which is why the tools that write it are
+    /// served to a product owner's pane and to nothing else.
+    fn llm(&self) -> Result<LlmSettings, String>;
+
+    /// Store providers and pools. See [`Self::set_overrides`] for why this takes the whole value.
+    fn set_llm(&self, llm: LlmSettings) -> Result<(), String>;
+
+    /// What each role would actually run as, here, right now. (M71)
+    ///
+    /// Built by `crate::overrides::resolve` — the same function a dispatch resolves with, rather
+    /// than an `override.model ?? def.model` written a second time in a renderer, which would be a
+    /// roster that agreed with the dispatch until the day the rule changed on one side. It is also
+    /// where `Resolved::refusal` comes from, so a pool that is not configured on this machine is
+    /// visible in the roster instead of being discovered by a dispatch that fails.
+    ///
+    /// Ordered as [`Self::agents`] orders them, and a role missing from the answer is one whose
+    /// definition could not be loaded — the roster says so rather than inventing a resolution.
+    fn resolutions(&self) -> Result<Vec<(AgentId, crate::overrides::Resolved)>, String>;
 }
 
 // --- what `tools/list` says --------------------------------------------------------------------
@@ -785,13 +975,76 @@ pub fn description(name: &str) -> &'static str {
              to edit when a name is defined in more than one place; leave it out for the \
              definition that is in effect, which is the one cide_agents_list shows you."
         }
+        tool::AGENTS_CONFIG => {
+            "Change this project's subagent settings: `maxConcurrent`, how many runs may be live \
+             across the whole project whatever a role's own limit says, and `harness`, the CLI a \
+             role that names none of its own gets. It writes `.cide/config.json`, which is \
+             **committed** \u{2014} your next commit carries it, and a teammate pulling it runs what it \
+             says \u{2014} so change it for a reason you would write in a commit message. \
+             cide_agents_list reports both values as they stand. What this deliberately cannot do \
+             is switch subagents **on or off**: that is the user's opt-in to processes that edit \
+             their repository unattended, it lives in the Agents panel, and asking for it here is \
+             refused rather than ignored. A raised cap takes effect on the next admission, so a \
+             run already queued starts without being re-dispatched."
+        }
+        tool::AGENT_OVERRIDE => {
+            "Point a role at a different harness, model, pool or effort **on this machine only**. \
+             Unlike cide_agent_update, which edits the role's committed definition file, this \
+             writes a local file no commit carries \u{2014} which makes it the right tool for trying \
+             something, and the wrong one for a decision the project should keep. Name an `agent` \
+             for one role, or leave it out to set the default for every role in this project that \
+             does not have a row of its own. A role's own row **replaces** that default outright \
+             rather than merging field by field, so a role you override onto claude does not keep \
+             the project-wide pool. Send a field as null to clear it and fall back to the \
+             definition. `pool` and `model` are mutually exclusive (one list of models, or one \
+             model), and both only mean anything when the role's effective harness is opencode \
+             \u{2014} cide_agents_list says so against the role when it is not. A role defined in \
+             `.claude/agents/` cannot be overridden at all: a Claude Code subagent runs under \
+             Claude Code, and there is no second answer."
+        }
+        tool::LLM_PROVIDER => {
+            "Add, change or remove one LLM provider \u{2014} where an opencode run's models come from. \
+             Only the fields you send are changed on a provider that already exists, so this is \
+             safe to call without reading first; `remove: true` deletes the row by id. Two kinds: \
+             `catalog` is a provider opencode's own catalog already describes (openrouter, \
+             deepseek, google \u{2026}), where cide supplies the credential and nothing else, and \
+             `custom` is an OpenAI-compatible endpoint the catalog has never heard of (ollama, LM \
+             Studio, a llama.cpp server), which **must** declare a `baseUrl` and its `models` or \
+             `--model <id>/<model>` resolves to nothing. `apiKey` may be left out entirely when \
+             the key is already in the environment cide was launched from, which is the ordinary \
+             case; when you do set one it is stored and never shown back to you by any tool. A \
+             third kind, `external`, describes a provider somebody else's opencode plugin \
+             installs \u{2014} cide_agents_list reports one, and this tool does not write one, because \
+             there is nothing in it for cide to configure. This is **machine-wide settings, not \
+             this project's**: every project the user opens sees it. Providers take effect from \
+             the next dispatch \u{2014} a running child's environment cannot change."
+        }
+        tool::LLM_POOL => {
+            "Add, change or remove one model pool: the **ordered** list of models a run falls \
+             down as providers refuse it. The first entry is what a run gets; the rest are what \
+             it gets when that one is rate-limited, unreachable or will not authenticate \u{2014} so \
+             the order is the whole point, and `entries` is stored exactly as you send it. Each \
+             entry is a provider id and a model id **as two fields**, never one `provider/model` \
+             string, because a model id may itself contain slashes. `variant` on an entry is that \
+             candidate's own effort setting and beats the role's. Sending `entries` replaces the \
+             pool's whole list (that is what ordering means); everything else about the pool is \
+             left alone. `remove: true` deletes the pool by name \u{2014} a role overridden onto a pool \
+             that no longer exists is **refused at dispatch**, not silently given a default, and \
+             cide_agents_list shows that refusal, so check who is pointed at it first. A pool \
+             only applies to a role whose effective harness is opencode. Machine-wide, like \
+             cide_llm_provider."
+        }
         tool::AGENT_DISPATCH => {
             "Start one of this project's roles on some work. **The ordinary road is a task**: \
              create it first with cide_task_create and put the statement of the work in its \
              body — the run is pointed at the task, reads it itself, works in its own worktree \
              and reports back through the task's comments. Not needed after an assignment \
              (assigning a task already starts the role), so with a task this is for re-running \
-             a role or adding a one-line extra `instructions`. **The exception is a run with no \
+             a role **once its previous run has ended**, or adding a one-line extra \
+             `instructions`. A role gets **one run per task at a time**: a dispatch onto a task \
+             the role is already on is refused, naming the run you already started, so stop that \
+             one with cide_agent_stop or wait for it rather than asking twice. **The exception \
+             is a run with no \
              task**: leave `task` out and put the whole brief in `instructions`, for a quick \
              check, a test run, or a small piece of work not worth a task. Such a run stands in \
              the project root beside you — no worktree, no branch, nothing to integrate, nothing \
@@ -816,10 +1069,21 @@ pub fn description(name: &str) -> &'static str {
              are left out unless you ask for them."
         }
         tool::AGENT_STOP => {
-            "End a run: cancel it if it is still queued, kill its child if it is working. Reach \
-             for this when a run is going the wrong way or its task no longer matters — it frees \
-             the role to start the next task. What the project should remember about why belongs \
-             in a cide_task_comment; `reason` here only reaches cide's log."
+            "End a run. **The default asks rather than kills**: cide interrupts whatever the run \
+             is doing, tells it that it is being stopped and why — your `reason`, in your own \
+             words — and gives it this project's `agents.stopGraceSecs` (from \
+             `.cide/config.json`) to write what it finished and what it was part-way through \
+             into its task's comments before it exits. That handover is the thing a killed run \
+             could never leave: an agent an hour into a task usually knows something it has not \
+             written down, and before this a stop threw all of it away and left the board the \
+             same `exit 129` a crash leaves. So **`reason` is no longer only a log line** — it \
+             is handed to the run itself and recorded on the task, which makes it the most \
+             useful argument here rather than the least. A run that is still queued is cancelled \
+             outright; there is nobody to speak to. `force: true` skips the asking and kills the \
+             child now, for a run that is wedged, looping or doing damage — its in-flight turn \
+             and anything it has not already written down are lost, which is exactly what the \
+             default avoids. This returns **immediately** either way: read the result in the \
+             task's comments, and watch the row with cide_agent_runs."
         }
         tool::AGENT_INTEGRATE => {
             "Take a role's finished work back into the branch this project has checked out, by \
@@ -1136,6 +1400,243 @@ pub fn input_schema(name: &str) -> Value {
                 "required": ["agent"],
             })
         }
+        tool::AGENTS_CONFIG => json!({
+            "type": "object",
+            // No `enabled`, and the handler refuses one that arrives anyway — see the module
+            // header. A property left out of a schema is a property most clients still send; the
+            // refusal is what makes the absence a stated rule rather than a silent drop.
+            "properties": {
+                "maxConcurrent": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description":
+                        "How many runs may be live across the whole project at once, whatever a \
+                         role's own max-concurrent says. Every run is a full CLI with its own \
+                         context window and its own bill, which is why the default is 2.",
+                },
+                "harness": {
+                    "type": "string",
+                    "enum": harnesses().map(harness_wire).collect::<Vec<_>>(),
+                    "description":
+                        "The CLI a role runs under when its own definition names none. Per \
+                         project rather than per machine, because which CLI a team runs is a \
+                         property of the team's repository — and this file is committed beside \
+                         the role definitions, so the two are reviewed together.",
+                },
+            },
+        }),
+        tool::AGENT_OVERRIDE => json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description":
+                        "The role to redirect, e.g. `developer`. Leave it out to set the default \
+                         for every role in this project that has no row of its own — which is \
+                         the common case by a distance, and the one that does not silently miss \
+                         the next role somebody adds.",
+                },
+                "harness": {
+                    // `null` is in the enum as well as in the type. It is the clearing gesture,
+                    // and a client that validates a schema before it sends would otherwise refuse
+                    // to send the one value that expresses "take the definition's answer back".
+                    "type": ["string", "null"],
+                    "enum": harnesses()
+                        .map(|harness| json!(harness_wire(harness)))
+                        .chain(std::iter::once(Value::Null))
+                        .collect::<Vec<_>>(),
+                    "description":
+                        "Run this role on a different CLI here. Pass null to clear it and take \
+                         the role's own answer back.",
+                },
+                "pool": {
+                    "type": ["string", "null"],
+                    "description":
+                        "Run it against this named pool, falling down the list as providers \
+                         refuse. Mutually exclusive with `model`, and only meaningful when the \
+                         role's effective harness is opencode. A pool that is not configured on \
+                         this machine refuses the dispatch rather than falling back to a \
+                         default. Pass null to clear it.",
+                },
+                "model": {
+                    "type": ["string", "null"],
+                    "description":
+                        "Run it against this one model instead — `provider/model` for opencode, \
+                         the harness's own spelling otherwise. The quick way to try something. \
+                         Mutually exclusive with `pool`. Pass null to clear it.",
+                },
+                "effort": {
+                    "type": ["string", "null"],
+                    "description":
+                        "The reasoning-effort knob this role runs at here, in the harness's own \
+                         vocabulary. A pool entry's own `variant` beats it. Pass null to clear \
+                         it.",
+                },
+                "maxConcurrent": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description":
+                        "How many tasks this role may work on at once, here. Pass null to take \
+                         the number in its definition back.",
+                },
+            },
+        }),
+        tool::LLM_PROVIDER => json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description":
+                        "The provider id, which is the left half of every `provider/model` and \
+                         the key this call edits: an id that is already configured is patched, \
+                         one that is not is added.",
+                },
+                "kind": {
+                    // From `cide_ipc::llm::PROVIDER_KINDS` minus `external`, which the roster
+                    // reports and this tool does not write: it describes somebody else's opencode
+                    // plugin, carrying setup prose rather than an endpoint or a credential, so
+                    // there is nothing in it for a model to choose between.
+                    "type": "string",
+                    "enum": cide_ipc::llm::PROVIDER_KINDS
+                        .iter()
+                        .filter(|kind| **kind != EXTERNAL_PROVIDER)
+                        .collect::<Vec<_>>(),
+                    "description":
+                        "`catalog` for a provider opencode's own catalog already describes, \
+                         where cide supplies only the credential; `custom` for an \
+                         OpenAI-compatible endpoint it has never heard of, which must also \
+                         declare `baseUrl` and `models`. Required when adding; on an existing \
+                         provider, leaving it out keeps the kind it has and sending a different \
+                         one replaces the row.",
+                },
+                "label": {
+                    "type": "string",
+                    "description": "What the Settings screen calls it. Blank means the id speaks for itself.",
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description":
+                        "Whether cide writes anything for this provider. A disabled provider \
+                         stays configured and is struck out of every pool that names it.",
+                },
+                "apiKey": {
+                    "type": "string",
+                    "description":
+                        "The credential, stored and never read back to you by any tool. Leave it \
+                         out — which is the ordinary case — when the key is already in the \
+                         environment cide was launched from, because opencode reads the \
+                         catalog's own variable names at highest precedence. An empty string \
+                         clears a stored key.",
+                },
+                "baseUrl": {
+                    "type": "string",
+                    "description":
+                        "`custom` only, and required for it: `http://localhost:11434/v1` for \
+                         ollama, `http://127.0.0.1:1234/v1` for LM Studio.",
+                },
+                "npm": {
+                    "type": "string",
+                    "description":
+                        "`custom` only. The SDK package the endpoint wants; \
+                         `@ai-sdk/openai-compatible` is what a local OpenAI-compatible server \
+                         needs and what cide uses when this is blank.",
+                },
+                "models": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description":
+                                    "The model id as the endpoint serves it, and the right half \
+                                     of `provider/model`. It may itself contain `/` and `:`.",
+                            },
+                            "label": { "type": "string" },
+                            "context": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description":
+                                    "The context limit in tokens, which opencode computes its \
+                                     compaction against. Give this and `output` together or \
+                                     neither: a pair with one half missing is refused.",
+                            },
+                            "output": { "type": "integer", "minimum": 0 },
+                        },
+                        "required": ["id"],
+                    },
+                    "description":
+                        "`custom` only, and required for it: the whole model list, replacing \
+                         what is there. opencode has no catalog for an endpoint it has never \
+                         heard of, so without this `--model <id>/<model>` resolves to nothing.",
+                },
+                "remove": {
+                    "type": "boolean",
+                    "description":
+                        "Delete this provider instead of changing it. Pool entries naming it are \
+                         **kept** and struck out rather than deleted, because the provider may \
+                         be the next thing you add back.",
+                },
+            },
+            "required": ["id"],
+        }),
+        tool::LLM_POOL => json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description":
+                        "The pool's name, which is what an override points at and the key this \
+                         call edits: a name that exists is patched, one that does not is added.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One line saying what this pool is for, for the Settings screen.",
+                },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "provider": {
+                                "type": "string",
+                                "description":
+                                    "A provider id as cide_llm_provider configured it. An entry \
+                                     naming one that does not exist is kept and struck out, not \
+                                     dropped.",
+                            },
+                            "model": {
+                                "type": "string",
+                                "description":
+                                    "The model id under that provider. **Not** \
+                                     `provider/model` — the two halves stay apart here, because \
+                                     a model id may itself contain slashes.",
+                            },
+                            "variant": {
+                                "type": "string",
+                                "description":
+                                    "This candidate's own effort setting, which beats the role's \
+                                     `effort`. Effort vocabularies are per model, so a role-level \
+                                     one carried onto a failover candidate can be refused \
+                                     outright by the CLI.",
+                            },
+                        },
+                        "required": ["provider", "model"],
+                    },
+                    "description":
+                        "The whole ordered list, replacing what is there. First is what a run \
+                         gets; the rest are what it falls to.",
+                },
+                "remove": {
+                    "type": "boolean",
+                    "description":
+                        "Delete this pool instead of changing it. Check cide_agents_list first \
+                         for a role overridden onto it: that role's dispatch is refused until \
+                         the override is changed.",
+                },
+            },
+            "required": ["name"],
+        }),
         tool::AGENT_DISPATCH => json!({
             "type": "object",
             "properties": {
@@ -1201,8 +1702,19 @@ pub fn input_schema(name: &str) -> Value {
                 "reason": {
                     "type": "string",
                     "description":
-                        "Why, for cide's log. It is not part of the project's record — put that \
-                         in a comment on the task.",
+                        "Why — written as the run itself should hear it, because cide types it \
+                         into the child as part of the wind-down instruction and records it on \
+                         the task beside the stop. A run told *why* it is being stopped writes \
+                         a far better handover than one told only *that* it is. Two sentences \
+                         is plenty: say what you would have put in a comment.",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description":
+                        "Kill the child now instead of asking it to wind down first. Defaults \
+                         to false. For a run that is wedged, looping or doing damage — its \
+                         in-flight turn and anything it has not already written to the task are \
+                         lost. A queued run has no child, so this changes nothing there.",
                 },
             },
             "required": ["run"],
@@ -1390,7 +1902,7 @@ fn task_list(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_LIST)),
     };
 
-    let matched: Vec<&Task> = all
+    let matched: Vec<&TaskRow> = all
         .iter()
         .filter(|task| {
             statuses
@@ -1405,7 +1917,7 @@ fn task_list(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         .collect();
 
     let total = matched.len();
-    let shown: Vec<&Task> = matched.into_iter().take(limit).collect();
+    let shown: Vec<&TaskRow> = matched.into_iter().take(limit).collect();
 
     // The count line is outside the fence, deliberately: it is cide speaking, and it is the one
     // line in the answer the model may take at face value. A truncation named here is a
@@ -1440,9 +1952,14 @@ fn task_get(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Ok(tasks) => tasks,
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_GET)),
     };
-    match all.iter().find(|task| task.id == id) {
-        Some(task) => ToolResult::text(fenced(&render_full(task, &all, sink.root()))),
-        None => ToolResult::error(no_such(&id)),
+    // `sink.get` for the task itself and the list for its neighbours. (M68) The two are separate
+    // reads because they answer separate questions: a task's body and log are in its own file, while
+    // an incoming link — "blocks t-7" — is on the *other* task and a link line resolves its target's
+    // status and title, both of which a row carries.
+    match sink.get(&id) {
+        Ok(Some(task)) => ToolResult::text(fenced(&render_full(&task, &all, sink.root()))),
+        Ok(None) => ToolResult::error(no_such(&id)),
+        Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_GET)),
     }
 }
 
@@ -1451,7 +1968,7 @@ fn task_get(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
 /// Failing here is next to unreachable — the same in-memory store just accepted the write — and
 /// the message says the change *was* applied, so a model reading the error does not retry a
 /// mutation that landed.
-fn board_for_render(tool: &str, sink: &dyn TaskSink) -> Result<Vec<Task>, ToolResult> {
+fn board_for_render(tool: &str, sink: &dyn TaskSink) -> Result<Vec<TaskRow>, ToolResult> {
     sink.list().map_err(|why| {
         ToolResult::error(format!(
             "{tool}: the change was applied, but the tracker could not be re-read to render the \
@@ -1718,7 +2235,9 @@ fn task_assign(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                     Some(role) => format!("{} is now for `{role}`.", task.id),
                     None => format!("{} is now unassigned.", task.id),
                 },
-                fenced(&render_summary(&task, &all))
+                // `TaskRow::of` rather than a second projection: one producer for the two counts,
+                // which is the rule its own doc states. (M68)
+                fenced(&render_summary(&TaskRow::of(&task), &all))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_ASSIGN, &id, &why)),
@@ -1886,6 +2405,10 @@ pub fn dispatch_orchestration(
         tool::AGENTS_LIST => Some(agents_list(sink)),
         tool::AGENT_CREATE => Some(agent_create(arguments, sink)),
         tool::AGENT_UPDATE => Some(agent_update(arguments, sink)),
+        tool::AGENTS_CONFIG => Some(agents_config(arguments, sink)),
+        tool::AGENT_OVERRIDE => Some(agent_override(arguments, sink)),
+        tool::LLM_PROVIDER => Some(llm_provider(arguments, sink)),
+        tool::LLM_POOL => Some(llm_pool(arguments, sink)),
         tool::AGENT_DISPATCH => Some(agent_dispatch(arguments, sink)),
         tool::AGENT_RUNS => Some(agent_runs(arguments, sink)),
         tool::AGENT_STOP => Some(agent_stop(arguments, sink)),
@@ -1951,10 +2474,23 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         }
         Ok(true) | Err(_) => "",
     };
+    // The project's own two settings, said once at the top beside the queue's state and for its
+    // reason: they are facts about the project, not properties of a role. A read failure drops
+    // the clause rather than the roster — `dispatching`'s rule, one line up. (M71)
+    let settings = match sink.config() {
+        Ok(config) => format!(" {} ({})", config_sentence(&config), tool::AGENTS_CONFIG),
+        Err(_) => String::new(),
+    };
     let header = format!(
-        "{} role(s) defined, {live} run(s) live.{ground}{queue}",
+        "{} role(s) defined, {live} run(s) live.{ground}{queue}{settings}",
         agents.len()
     );
+
+    // What each role would actually run as, from the function a dispatch resolves with. An empty
+    // answer is a roster that says only what the definitions say, which is what it said before
+    // M71 — degraded, never wrong.
+    let resolutions = sink.resolutions().unwrap_or_default();
+    let overrides = sink.overrides().unwrap_or_default();
 
     let mut body = String::new();
     for def in &agents {
@@ -1968,7 +2504,16 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         // clamp-to-1 this used to restate is gone with its premise; what `isolated` still
         // decides is the sentence below, which tells the orchestrator where the parallelism
         // lands and what a taskless dispatch costs.
-        let at_once = def.max_concurrent.max(1);
+        let resolved = resolutions
+            .iter()
+            .find(|(id, _)| *id == def.id)
+            .map(|(_, resolved)| resolved);
+        // The **resolved** number, not the declared one: a local override may raise or lower a
+        // role's concurrency, and a roster that printed the definition's answer would be telling
+        // an orchestrator it may fan out three ways while the admission gate allows one. (M71)
+        let at_once = resolved
+            .map_or(def.max_concurrent, |resolved| resolved.max_concurrent)
+            .max(1);
         // A role that opted out of the checkout is the exception to the header's ground
         // sentence, and it changes what the orchestrator does next: no worktree, no
         // `cide/<role>-<task>` branch, nothing to integrate — the run's edits land directly
@@ -1990,15 +2535,33 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         // `cide_agent_update` takes as its `scope`, so a roster that named only half of them
         // would leave a model guessing at the argument for the other half.
         let source = format!(" | {}", scope_wire(def.scope));
+        // The resolved harness and model, and whether an override supplied them. Printing
+        // `def.harness` here was correct until a role could be redirected: from M71 the row would
+        // otherwise name the CLI in the committed file while every dispatch forked another one.
+        let runs_as = match resolved {
+            Some(resolved) => resolved_sentence(resolved),
+            None => harness_wire(def.harness).to_string(),
+        };
+        let overridden = match overrides.for_role(def.id.as_str()).is_empty() {
+            true => "",
+            false => " (override)",
+        };
+        // Two refusals can be true of one role and only one can be shown, so the definition's
+        // comes first: a role whose file will not load has nothing for a pool to be resolved
+        // against, and `dispatch_refusal`'s sentence names the earlier fix.
+        let standing = match (
+            &def.unavailable,
+            resolved.and_then(|r| r.refusal.as_deref()),
+        ) {
+            (Some(why), _) => format!("cannot run: {}", one_line(why)),
+            (None, Some(why)) => format!("cannot run: {}", one_line(why)),
+            (None, None) => "ready".to_string(),
+        };
         body.push_str(&format!(
-            "{} ({}) | {} | {} | {mine} live run(s), runs up to {at_once} at once{ground}{source}\n",
+            "{} ({}) | {runs_as}{overridden} | {standing} | {mine} live run(s), runs up to \
+             {at_once} at once{ground}{source}\n",
             one_line(def.id.as_str()),
             one_line(&def.label),
-            harness_wire(def.harness),
-            match &def.unavailable {
-                Some(why) => format!("cannot run: {}", one_line(why)),
-                None => "ready".to_string(),
-            },
         ));
         if !def.description.trim().is_empty() {
             body.push_str(&indented(&def.description));
@@ -2006,12 +2569,92 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
     }
 
     ToolResult::text(format!(
-        "{header}\n{}",
-        fenced_with(agent_preamble(), &body)
+        "{header}\n{}{}",
+        fenced_with(agent_preamble(), &body),
+        llm_footer(sink)
     ))
 }
 
 /// Define a role from nothing, in this project's own `.cide/agents/`. (M33)
+/// What one role resolves to, as the roster's second column. (M71)
+///
+/// The harness first, because it decides whether the rest means anything at all: a pool is read
+/// only for an opencode run, and `crate::overrides::resolve` leaves it inert rather than refusing
+/// it elsewhere. Nothing here re-derives a value — every field is `Resolved`'s, which is the
+/// dispatch's own answer.
+fn resolved_sentence(resolved: &crate::overrides::Resolved) -> String {
+    let harness = harness_wire(resolved.harness);
+    if let Some(pool) = &resolved.pool_name {
+        return format!("{harness} pool `{}`", one_line(pool));
+    }
+    match &resolved.model {
+        Some(model) => format!("{harness} {}", one_line(model)),
+        None => format!("{harness} (its default model)"),
+    }
+}
+
+/// The machine's providers and pools, under the roster. (M71)
+///
+/// **Outside the fence**, unlike every role row, because it is cide's own settings and not
+/// project data anybody else wrote — the fence marks a span the project authored, and widening
+/// it over cide's own answer would make the marker mean less everywhere it appears.
+///
+/// Drawn only when there is something to draw: a project that never opens the Models screen is
+/// the ordinary case, and a permanent "providers: none" line would be a paragraph of nothing in
+/// every orchestration turn. A read failure is likewise nothing rather than a sentence.
+///
+/// **No credential is rendered here in any form.** `key set` is the whole of what this says about
+/// one, which is the module header's rule and the reason this is one function rather than a
+/// `format!` at the call site.
+fn llm_footer(sink: &dyn AgentSink) -> String {
+    let Ok(llm) = sink.llm() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if !llm.providers.is_empty() {
+        let listed: Vec<String> = llm
+            .providers
+            .iter()
+            .map(|provider| {
+                let mut notes = vec![provider.kind().to_string()];
+                if !provider.api_key().is_empty() {
+                    notes.push("key set".to_string());
+                }
+                if !provider.enabled() {
+                    notes.push("disabled".to_string());
+                }
+                format!("{} ({})", one_line(provider.id()), notes.join(", "))
+            })
+            .collect();
+        out.push_str(&format!("\nproviders: {}", listed.join("; ")));
+    }
+    if !llm.pools.is_empty() {
+        let listed: Vec<String> = llm
+            .pools
+            .iter()
+            .map(|pool| {
+                let entries: Vec<String> = pool
+                    .entries
+                    .iter()
+                    .map(|entry| one_line(&entry.model_flag()))
+                    .collect();
+                format!("{} [{}]", one_line(&pool.name), entries.join(", "))
+            })
+            .collect();
+        out.push_str(&format!("\npools: {}", listed.join("; ")));
+    }
+    if !out.is_empty() {
+        out.push_str(&format!(
+            "\nThese are this machine's, not this project's, and they reach an opencode run. \
+             {} and {} change them; {} points a role at one.",
+            tool::LLM_PROVIDER,
+            tool::LLM_POOL,
+            tool::AGENT_OVERRIDE
+        ));
+    }
+    out
+}
+
 fn agent_create(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
     let name = match required_role(arguments, "name", tool::AGENT_CREATE) {
         Ok(name) => name,
@@ -2315,6 +2958,781 @@ fn render_definition(draft: &AgentDraft) -> String {
     out
 }
 
+// ==========================================================================================
+// What a role runs on. (M71)
+// ==========================================================================================
+//
+// Four handlers, one table each, and every one of them is the same three steps: read the whole
+// value through the sink, fold this call's one row onto it here, hand the whole value back. The
+// fold is what is worth reading — see the module header on why the *tool* may not be shaped like
+// the command underneath it.
+
+/// Patch `.cide/config.json`'s two settable keys. (M71)
+fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    // Refused by name rather than ignored. A property this schema does not declare is still a
+    // property most clients will send, and a model that asked to enable subagents and got a
+    // cheerful answer about `maxConcurrent` would believe it had.
+    if arguments.get("enabled").is_some() {
+        return ToolResult::error(format!(
+            "{}: `enabled` is not something this tool can change. Switching subagents on is the \
+             user's own opt-in to processes that edit their repository unattended, and it is made \
+             in the Agents panel. Nothing was written.",
+            tool::AGENTS_CONFIG
+        ));
+    }
+    let max_concurrent = match nullable_u16(arguments, "maxConcurrent") {
+        Ok(field) => field.onto(None),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
+    };
+    let harness = match nullable_harness(arguments, "harness") {
+        Ok(field) => field.onto(None),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
+    };
+    // A call that names nothing is a *read*, and this vocabulary has one of those already. It is
+    // answered with the name of it rather than with the config, so there is one place a model
+    // learns this project's settings and one shape of answer to remember.
+    if max_concurrent.is_none() && harness.is_none() {
+        return ToolResult::error(format!(
+            "{}: name `maxConcurrent`, `harness`, or both. To *read* this project's settings, \
+             call {}, which reports them beside the roles they apply to.",
+            tool::AGENTS_CONFIG,
+            tool::AGENTS_LIST
+        ));
+    }
+
+    let patch = OrchestrationPatch {
+        enabled: None,
+        max_concurrent,
+        harness,
+    };
+    match sink.set_config(patch) {
+        Ok(config) => ToolResult::text(format!(
+            "Saved to .cide/config.json, which your next commit carries. {}",
+            config_sentence(&config)
+        )),
+        Err(why) => ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
+    }
+}
+
+/// One sentence describing a project's subagent settings, for both the tool above and the roster.
+///
+/// One producer, because the two would otherwise be two accounts of one file printed into the
+/// same conversation a few turns apart.
+fn config_sentence(config: &OrchestrationConfig) -> String {
+    format!(
+        "Subagents are {}, up to {} run(s) at once across the project, default harness {}.",
+        match config.enabled {
+            true => "on",
+            false => "off",
+        },
+        config.max_concurrent,
+        harness_wire(config.harness)
+    )
+}
+
+/// Patch one row of this project's local overrides — or the row every role falls back to. (M71)
+fn agent_override(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let named = match optional_string(arguments, "agent") {
+        Ok(Some(text)) if text.trim().is_empty() => {
+            return ToolResult::error(format!(
+                "{}: `agent` is blank. Name a role, or leave it out entirely to set the default \
+                 for every role that has no row of its own.",
+                tool::AGENT_OVERRIDE
+            ));
+        }
+        Ok(named) => named.map(|text| AgentId(text.trim().to_string())),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+
+    // A row is keyed by a role id, so a typo would store a redirection for a role that does not
+    // exist — no error, no effect, and nothing on any screen to explain it. The roster is checked
+    // for the same reason `agent_update` reads the definition before patching it.
+    if let Some(role) = &named {
+        let agents = match sink.agents() {
+            Ok(agents) => agents,
+            Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+        };
+        let Some(def) = agents.iter().find(|def| def.id == *role) else {
+            return ToolResult::error(format!(
+                "{}: this project defines no role called `{}`. Call {} for the ones it has.",
+                tool::AGENT_OVERRIDE,
+                one_line(role.as_str()),
+                tool::AGENTS_LIST
+            ));
+        };
+        // Refused where it is *written* as well as ignored where it is read. `overrides::resolve`
+        // drops a Claude Code role's override wholesale, so storing one would be a call that
+        // reported success and changed nothing for the rest of the project's life.
+        if def.scope.is_claude_code() {
+            return ToolResult::error(format!(
+                "{}: `{}` is a Claude Code subagent ({}), and a Claude Code subagent runs under \
+                 Claude Code — there is no second answer, so cide ignores an override on one \
+                 rather than half-applying it. Nothing was written. Change the model in its own \
+                 definition with {} instead.",
+                tool::AGENT_OVERRIDE,
+                one_line(role.as_str()),
+                scope_wire(def.scope),
+                tool::AGENT_UPDATE
+            ));
+        }
+    }
+
+    let harness = match nullable_harness(arguments, "harness") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+    let pool = match nullable_string(arguments, "pool") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+    let model = match nullable_string(arguments, "model") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+    let effort = match nullable_string(arguments, "effort") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+    let max_concurrent = match nullable_u16(arguments, "maxConcurrent") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+    if matches!(harness, Field::Absent)
+        && matches!(pool, Field::Absent)
+        && matches!(model, Field::Absent)
+        && matches!(effort, Field::Absent)
+        && matches!(max_concurrent, Field::Absent)
+    {
+        return ToolResult::error(format!(
+            "{}: name at least one of `harness`, `pool`, `model`, `effort` or `maxConcurrent` — \
+             as a value to set it, or as null to clear it. {} reports what each role resolves to \
+             now.",
+            tool::AGENT_OVERRIDE,
+            tool::AGENTS_LIST
+        ));
+    }
+    // Asked for both at once: refused, because there is no defensible winner. Setting one while
+    // the *stored* row holds the other is a different case and is handled below — there the
+    // caller's intent is unambiguous and the displacement is reported.
+    if matches!(pool, Field::Value(_)) && matches!(model, Field::Value(_)) {
+        return ToolResult::error(format!(
+            "{}: `pool` and `model` are mutually exclusive — one ordered list of models, or one \
+             model. Send whichever you meant and leave the other out. Nothing was written.",
+            tool::AGENT_OVERRIDE
+        ));
+    }
+
+    let mut overrides = match sink.overrides() {
+        Ok(overrides) => overrides,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+    let mut row = match &named {
+        Some(role) => overrides
+            .roles
+            .get(role.as_str())
+            .cloned()
+            .unwrap_or_default(),
+        None => overrides.all.clone(),
+    };
+    row.harness = harness.onto(row.harness);
+    row.effort = effort.onto(row.effort);
+    row.max_concurrent = max_concurrent.onto(row.max_concurrent);
+
+    // The displacement, said out loud. A row that silently kept a pool under a newly named model
+    // would be a row whose two halves disagree, and `resolve` reads the pool first.
+    let mut displaced = None;
+    let model_named = matches!(model, Field::Value(_));
+    row.pool = pool.onto(row.pool);
+    row.model = model.onto(row.model);
+    if row.pool.is_some() && row.model.is_some() {
+        match model_named {
+            true => {
+                displaced = row
+                    .pool
+                    .take()
+                    .map(|pool| format!("the pool `{}`", one_line(&pool)));
+            }
+            false => {
+                displaced = row
+                    .model
+                    .take()
+                    .map(|model| format!("the model `{}`", one_line(&model)));
+            }
+        }
+    }
+
+    let cleared = row.is_empty();
+    let who = match &named {
+        Some(role) => format!("`{}`", one_line(role.as_str())),
+        None => "every role that has no row of its own".to_string(),
+    };
+    match (&named, cleared) {
+        (Some(role), true) => {
+            overrides.roles.remove(role.as_str());
+        }
+        (Some(role), false) => {
+            overrides
+                .roles
+                .insert(role.as_str().to_string(), row.clone());
+        }
+        (None, _) => overrides.all = row.clone(),
+    }
+    if let Err(why) = sink.set_overrides(overrides) {
+        return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE));
+    }
+
+    let mut said = match cleared {
+        true => format!("Cleared the local override for {who}; it runs as its definition says."),
+        false => format!("{who} now runs as: {}.", override_sentence(&row)),
+    };
+    if let Some(displaced) = displaced {
+        said.push_str(&format!(
+            " {displaced} it was overridden onto was cleared — a row may name one or the other, \
+             never both."
+        ));
+    }
+    said.push_str(
+        " This is local and uncommitted; a run already going keeps what it was forked with until \
+         it is resumed.",
+    );
+    ToolResult::text(said)
+}
+
+/// What one override row says, as a phrase. Empty rows are handled by the caller.
+fn override_sentence(row: &AgentOverride) -> String {
+    let mut parts = Vec::new();
+    if let Some(harness) = row.harness {
+        parts.push(format!("harness {}", harness_wire(harness)));
+    }
+    if let Some(pool) = &row.pool {
+        parts.push(format!("pool `{}`", one_line(pool)));
+    }
+    if let Some(model) = &row.model {
+        parts.push(format!("model `{}`", one_line(model)));
+    }
+    if let Some(effort) = &row.effort {
+        parts.push(format!("effort `{}`", one_line(effort)));
+    }
+    if let Some(max) = row.max_concurrent {
+        parts.push(format!("up to {max} at once"));
+    }
+    match parts.is_empty() {
+        true => "nothing overridden".to_string(),
+        false => parts.join(", "),
+    }
+}
+
+/// Add, patch or remove one provider. (M71)
+fn llm_provider(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let id = match required_string(arguments, "id") {
+        Ok(id) if id.trim().is_empty() => {
+            return ToolResult::error(format!(
+                "{}: `id` is blank. A provider's id is the left half of every `provider/model`, \
+                 so there is nothing to store one under.",
+                tool::LLM_PROVIDER
+            ));
+        }
+        Ok(id) => id.trim().to_string(),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let remove = match optional_bool(arguments, "remove") {
+        Ok(remove) => remove.unwrap_or(false),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let mut llm = match sink.llm() {
+        Ok(llm) => llm,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let at = llm
+        .providers
+        .iter()
+        .position(|provider| provider.id() == id);
+
+    if remove {
+        let Some(at) = at else {
+            return ToolResult::error(format!(
+                "{}: no provider called `{}` is configured, so there is nothing to remove.",
+                tool::LLM_PROVIDER,
+                one_line(&id)
+            ));
+        };
+        llm.providers.remove(at);
+        // Counted *before* the write, and reported rather than repaired: an entry naming a
+        // provider that does not exist is kept everywhere else in this feature, because the
+        // provider may be the next thing somebody adds back.
+        let orphaned: Vec<String> = llm
+            .pools
+            .iter()
+            .filter(|pool| pool.entries.iter().any(|entry| entry.provider == id))
+            .map(|pool| one_line(&pool.name))
+            .collect();
+        if let Err(why) = sink.set_llm(llm) {
+            return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER));
+        }
+        let mut said = format!("Removed the provider `{}`.", one_line(&id));
+        if !orphaned.is_empty() {
+            said.push_str(&format!(
+                " {} still name(s) it and will be struck out until it is added back or the \
+                 entries are replaced: {}.",
+                match orphaned.len() {
+                    1 => "One pool",
+                    _ => "Pools",
+                },
+                orphaned.join(", ")
+            ));
+        }
+        return ToolResult::text(said);
+    }
+
+    let asked_kind = match optional_string(arguments, "kind") {
+        Ok(kind) => kind.map(|kind| kind.trim().to_string()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    if asked_kind.as_deref() == Some(EXTERNAL_PROVIDER) {
+        return ToolResult::error(format!(
+            "{}: an `{EXTERNAL_PROVIDER}` provider is one somebody else's opencode plugin \
+             installs — cide describes it and deliberately writes nothing for it, so there is \
+             nothing here to configure. {} reports one that already exists. Nothing was written.",
+            tool::LLM_PROVIDER,
+            tool::AGENTS_LIST
+        ));
+    }
+    let existing = at.map(|at| llm.providers[at].clone());
+    let kind = match (&asked_kind, &existing) {
+        (Some(kind), _) => kind.clone(),
+        (None, Some(existing)) => existing.kind().to_string(),
+        (None, None) => {
+            return ToolResult::error(format!(
+                "{}: `{}` is not configured yet, so this call is adding it and needs a `kind`: \
+                 {}.",
+                tool::LLM_PROVIDER,
+                one_line(&id),
+                writable_kinds().join(" or ")
+            ));
+        }
+    };
+    if !writable_kinds().contains(&kind.as_str()) {
+        return ToolResult::error(format!(
+            "{}: `kind` must be {}, not `{}`.",
+            tool::LLM_PROVIDER,
+            writable_kinds().join(" or "),
+            one_line(&kind)
+        ));
+    }
+    // An argument that means nothing for this kind is refused rather than dropped, which is
+    // `enabled`'s rule in a second place: a `baseUrl` sent for a catalogued provider is somebody
+    // describing an endpoint that will never be written, and a cheerful answer would hide it.
+    let belongs: &[&str] = match kind.as_str() {
+        "custom" => &["label", "enabled", "apiKey", "baseUrl", "npm", "models"],
+        _ => &["label", "enabled", "apiKey"],
+    };
+    let stray: Vec<&str> = ["label", "enabled", "apiKey", "baseUrl", "npm", "models"]
+        .into_iter()
+        .filter(|key| arguments.get(*key).is_some() && !belongs.contains(key))
+        .collect();
+    if !stray.is_empty() {
+        return ToolResult::error(format!(
+            "{}: `{}` says nothing about a `{kind}` provider, whose catalogue entry already \
+             carries the endpoint and the model list — cide supplies only the credential. \
+             Nothing was written.",
+            tool::LLM_PROVIDER,
+            stray.join("`, `")
+        ));
+    }
+
+    let label = match nullable_string(arguments, "label") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let enabled = match nullable_bool(arguments, "enabled") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let api_key = match nullable_string(arguments, "apiKey") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let base_url = match nullable_string(arguments, "baseUrl") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let npm = match nullable_string(arguments, "npm") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+    let models = match optional_models(arguments) {
+        Ok(models) => models,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER)),
+    };
+
+    // Carried forward only from a row of the *same* kind. A kind change is a replacement, and the
+    // fields do not correspond: keeping a catalogued provider's key under a custom endpoint would
+    // be cide putting one service's credential on another's URL.
+    let carried = existing.filter(|provider| provider.kind() == kind);
+    let kept = |current: &str, field: Field<String>| -> String {
+        field.onto(Some(current.to_string())).unwrap_or_default()
+    };
+    let provider = match kind.as_str() {
+        "custom" => {
+            let (was_label, was_enabled, was_npm, was_base, was_key, was_models) = match &carried {
+                Some(LlmProvider::Custom {
+                    label,
+                    enabled,
+                    npm,
+                    base_url,
+                    api_key,
+                    models,
+                    ..
+                }) => (
+                    label.clone(),
+                    *enabled,
+                    npm.clone(),
+                    base_url.clone(),
+                    api_key.clone(),
+                    models.clone(),
+                ),
+                _ => (
+                    String::new(),
+                    true,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                ),
+            };
+            LlmProvider::Custom {
+                id: id.clone(),
+                label: kept(&was_label, label),
+                enabled: enabled.onto(Some(was_enabled)).unwrap_or(true),
+                npm: kept(&was_npm, npm),
+                base_url: kept(&was_base, base_url),
+                api_key: kept(&was_key, api_key),
+                models: models.unwrap_or(was_models),
+            }
+        }
+        _ => {
+            let (was_label, was_enabled, was_key) = match &carried {
+                Some(LlmProvider::Catalog {
+                    label,
+                    enabled,
+                    api_key,
+                    ..
+                }) => (label.clone(), *enabled, api_key.clone()),
+                _ => (String::new(), true, String::new()),
+            };
+            LlmProvider::Catalog {
+                id: id.clone(),
+                label: kept(&was_label, label),
+                enabled: enabled.onto(Some(was_enabled)).unwrap_or(true),
+                api_key: kept(&was_key, api_key),
+            }
+        }
+    };
+
+    // Refused *here* and not where the value is used, which is the one place this feature departs
+    // from `LlmSettings::cleaned`'s rule — and the reason is the caller. A form has a next
+    // keystroke, so an incomplete row must survive storage or the Add button is inert; a tool call
+    // hands over a whole row at once, so an incomplete one is a mistake to report while there is
+    // still something to report it to.
+    let problems = provider.problems();
+    if !problems.is_empty() {
+        return ToolResult::error(format!(
+            "{}: {} Nothing was written.",
+            tool::LLM_PROVIDER,
+            problems.join(" ")
+        ));
+    }
+    let said = provider_sentence(&provider);
+    match at {
+        Some(at) => llm.providers[at] = provider,
+        None => llm.providers.push(provider),
+    }
+    if let Err(why) = sink.set_llm(llm) {
+        return ToolResult::error(format!("{}: {why}", tool::LLM_PROVIDER));
+    }
+    ToolResult::text(format!(
+        "{} {said} It applies from the next dispatch — a running child's environment cannot \
+         change.",
+        match at.is_some() {
+            true => "Changed.",
+            false => "Added.",
+        }
+    ))
+}
+
+/// The kinds this tool will write, which is every kind but [`EXTERNAL_PROVIDER`].
+fn writable_kinds() -> Vec<&'static str> {
+    cide_ipc::llm::PROVIDER_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| *kind != EXTERNAL_PROVIDER)
+        .collect()
+}
+
+/// One provider as a phrase, **never including the credential** — see the module header.
+fn provider_sentence(provider: &LlmProvider) -> String {
+    let mut parts = vec![format!(
+        "`{}` ({})",
+        one_line(provider.id()),
+        provider.kind()
+    )];
+    if let LlmProvider::Custom {
+        base_url, models, ..
+    } = provider
+    {
+        parts.push(format!("at {}", one_line(base_url)));
+        parts.push(format!("{} model(s)", models.len()));
+    }
+    parts.push(
+        match provider.api_key().is_empty() {
+            true => "no key stored",
+            false => "key set",
+        }
+        .to_string(),
+    );
+    if !provider.enabled() {
+        parts.push("disabled".to_string());
+    }
+    format!("{}.", parts.join(", "))
+}
+
+/// `models`, for a custom endpoint. Absent leaves the list alone; an array replaces it whole.
+fn optional_models(arguments: &Value) -> Result<Option<Vec<LlmModel>>, String> {
+    let Some(value) = arguments.get("models") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`models` must be an array of {{id, context, output}} objects, not {}",
+            kind_of(value)
+        ));
+    };
+    let mut models = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            return Err("every entry of `models` needs an `id` as a string".to_string());
+        };
+        if id.trim().is_empty() {
+            return Err("`models` contains an entry with a blank `id`".to_string());
+        }
+        let number = |key: &str| -> Result<u32, String> {
+            match item.get(key) {
+                None | Some(Value::Null) => Ok(0),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "`models` gives `{key}` as {}, which is not a whole number of tokens",
+                            kind_of(value)
+                        )
+                    }),
+            }
+        };
+        models.push(LlmModel {
+            id: id.trim().to_string(),
+            label: item
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            context: number("context")?,
+            output: number("output")?,
+        });
+    }
+    Ok(Some(models))
+}
+
+/// Add, patch or remove one pool. (M71)
+fn llm_pool(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let name = match required_string(arguments, "name") {
+        Ok(name) if name.trim().is_empty() => {
+            return ToolResult::error(format!(
+                "{}: `name` is blank. A pool's name is what an override points at, so an unnamed \
+                 one can never be reached.",
+                tool::LLM_POOL
+            ));
+        }
+        Ok(name) => name.trim().to_string(),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_POOL)),
+    };
+    let remove = match optional_bool(arguments, "remove") {
+        Ok(remove) => remove.unwrap_or(false),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_POOL)),
+    };
+    let mut llm = match sink.llm() {
+        Ok(llm) => llm,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_POOL)),
+    };
+    let at = llm.pools.iter().position(|pool| pool.name == name);
+
+    if remove {
+        let Some(at) = at else {
+            return ToolResult::error(format!(
+                "{}: no pool called `{}` is configured, so there is nothing to remove.",
+                tool::LLM_POOL,
+                one_line(&name)
+            ));
+        };
+        llm.pools.remove(at);
+        // A pool a role is overridden onto is a **refused dispatch**, not a silent default, so
+        // this is said before it is discovered by a run that will not start.
+        let pointed = match sink.overrides() {
+            Ok(overrides) => roles_on_pool(&overrides, &name),
+            Err(_) => Vec::new(),
+        };
+        if let Err(why) = sink.set_llm(llm) {
+            return ToolResult::error(format!("{}: {why}", tool::LLM_POOL));
+        }
+        let mut said = format!("Removed the pool `{}`.", one_line(&name));
+        if !pointed.is_empty() {
+            said.push_str(&format!(
+                " {} still overridden onto it, and every dispatch of {} is now refused until the \
+                 override is changed with {}: {}.",
+                match pointed.len() {
+                    1 => "One role is",
+                    _ => "Roles are",
+                },
+                match pointed.len() {
+                    1 => "it",
+                    _ => "them",
+                },
+                tool::AGENT_OVERRIDE,
+                pointed.join(", ")
+            ));
+        }
+        return ToolResult::text(said);
+    }
+
+    let description = match nullable_string(arguments, "description") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_POOL)),
+    };
+    let entries = match optional_entries(arguments) {
+        Ok(entries) => entries,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::LLM_POOL)),
+    };
+    // A pool with nothing in it refuses every dispatch that names it — `overrides::resolve` says
+    // so by name. The screen may hold one mid-edit because the next gesture adds a row; a tool
+    // call has no next gesture, so creating one here would be creating a trap.
+    if at.is_none() && entries.as_ref().is_none_or(Vec::is_empty) {
+        return ToolResult::error(format!(
+            "{}: a new pool needs at least one entry — a pool with none refuses every dispatch \
+             overridden onto it. Send `entries` as an ordered list of {{provider, model}}.",
+            tool::LLM_POOL
+        ));
+    }
+
+    let mut pool = match at {
+        Some(at) => llm.pools[at].clone(),
+        None => ModelPool {
+            name: name.clone(),
+            ..ModelPool::default()
+        },
+    };
+    pool.description = description
+        .onto(Some(pool.description.clone()))
+        .unwrap_or_default();
+    if let Some(entries) = entries {
+        pool.entries = entries;
+    }
+    let said = pool_sentence(&pool);
+    match at {
+        Some(at) => llm.pools[at] = pool,
+        None => llm.pools.push(pool),
+    }
+    if let Err(why) = sink.set_llm(llm) {
+        return ToolResult::error(format!("{}: {why}", tool::LLM_POOL));
+    }
+    ToolResult::text(format!(
+        "{} {said} A run falls down that list in order as candidates refuse it.",
+        match at.is_some() {
+            true => "Changed.",
+            false => "Added.",
+        }
+    ))
+}
+
+/// Which roles this project has overridden onto one pool, project-wide row included.
+fn roles_on_pool(overrides: &ProjectOverrides, pool: &str) -> Vec<String> {
+    let mut named = Vec::new();
+    if overrides.all.pool.as_deref() == Some(pool) {
+        named.push("the project-wide default".to_string());
+    }
+    for (role, row) in &overrides.roles {
+        if row.pool.as_deref() == Some(pool) {
+            named.push(format!("`{}`", one_line(role)));
+        }
+    }
+    named
+}
+
+/// One pool as a phrase: its order, which is the whole of what it says.
+fn pool_sentence(pool: &ModelPool) -> String {
+    let listed: Vec<String> = pool
+        .entries
+        .iter()
+        .map(|entry| one_line(&entry.model_flag()))
+        .collect();
+    format!(
+        "`{}` is {}.",
+        one_line(&pool.name),
+        match listed.is_empty() {
+            true => "empty".to_string(),
+            false => listed.join(" then "),
+        }
+    )
+}
+
+/// `entries`, ordered. Absent leaves the list alone; an array replaces it whole, which is what
+/// ordering means.
+fn optional_entries(arguments: &Value) -> Result<Option<Vec<PoolEntry>>, String> {
+    let Some(value) = arguments.get("entries") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`entries` must be an array of {{provider, model}} objects, not {}",
+            kind_of(value)
+        ));
+    };
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let text = |key: &str| -> Result<String, String> {
+            match item.get(key) {
+                Some(Value::String(text)) if !text.trim().is_empty() => Ok(text.trim().to_string()),
+                Some(Value::String(_)) | None => Err(format!(
+                    "every entry of `entries` needs a `{key}`, and one is blank or missing"
+                )),
+                Some(other) => Err(format!(
+                    "`entries` gives a `{key}` as {}, which must be a string",
+                    kind_of(other)
+                )),
+            }
+        };
+        entries.push(PoolEntry {
+            // Two fields and never one `provider/model` string: the splitter has one home, and
+            // this is not it. See the module header.
+            provider: text("provider")?,
+            model: text("model")?,
+            variant: item
+                .get("variant")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        });
+    }
+    Ok(Some(entries))
+}
+
 fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
     let agent = match required_role(arguments, "agent", tool::AGENT_DISPATCH) {
         Ok(agent) => agent,
@@ -2506,14 +3924,72 @@ fn agent_stop(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(value) => value,
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_STOP)),
     };
+    let force = match optional_bool(arguments, "force") {
+        Ok(value) => value.unwrap_or(false),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_STOP)),
+    };
 
-    match sink.stop(run, reason.as_deref()) {
-        Ok(()) => ToolResult::text(format!(
-            "Stopped run {run}. Its role is free to start the next task.\nThat reason is in \
-             cide's log only — if the project should remember it, add it with {} on the task.",
-            tool::TASK_COMMENT
-        )),
+    match sink.stop(run, reason.as_deref(), force) {
+        Ok(outcome) => ToolResult::text(stopped_text(run, &outcome)),
         Err(why) => ToolResult::error(format!("{}: {why}", tool::AGENT_STOP)),
+    }
+}
+
+/// What a stop answers, per outcome. Pure over [`Stopped`], so every sentence a model reads
+/// here is asserted in this crate's tests rather than inspected in a running app.
+///
+/// The clause that earns its place on every arm is **whether the role is free**. The old answer
+/// said it unconditionally — *"Its role is free to start the next task"* — and on the wind-down
+/// road that is false for up to a minute, which is exactly the window in which an orchestrator
+/// reading it would dispatch the next task and be refused for a run it believes it ended.
+fn stopped_text(run: RunId, outcome: &Stopped) -> String {
+    match outcome {
+        Stopped::WindingDown { secs, task } => {
+            let report = match task {
+                Some(task) => format!(
+                    "post what it finished and what it was part-way through on {task}, and exit"
+                ),
+                // M40's run with no task: there is nowhere to comment, so the instruction it was
+                // given ends differently and so must this sentence. Promising a comment on a
+                // task it does not have would send the caller looking for a line nobody wrote.
+                None => "finish the thought it is on and exit".to_string(),
+            };
+            let then = match task {
+                Some(task) => format!("read {task}'s comments for its own account"),
+                None => "its edits are in the project root".to_string(),
+            };
+            format!(
+                "Asked run {run} to wind down: it has been told why, and has {secs}s to \
+                 {report}. cide ends it if it has not gone by then. **Its role is not free \
+                 yet** — this call did not wait. When the row leaves `{}`, {then}.",
+                tool::AGENT_RUNS
+            )
+        }
+        Stopped::BeforeStart => format!(
+            "Cancelled run {run} before it started; nothing ran and nothing changed. Its role \
+             is free to start the next task."
+        ),
+        Stopped::Discarded => format!(
+            "Discarded run {run} without resuming it. Its conversation is still on disk, so \
+             its task can be dispatched again."
+        ),
+        Stopped::Killed { why, task } => {
+            let unasked = match why {
+                Some(why) => format!(" It was not asked to wind down first: {why}."),
+                None => String::new(),
+            };
+            let left = match task {
+                Some(task) => format!(
+                    " Its in-flight turn is gone; read {task}'s comments for whatever it had \
+                     already written."
+                ),
+                None => " Its in-flight turn is gone.".to_string(),
+            };
+            format!("Stopped run {run}.{unasked}{left} Its role is free to start the next task.")
+        }
+        Stopped::AlreadyOver => {
+            format!("Run {run} had already ended; there was nothing to stop.")
+        }
     }
 }
 
@@ -2629,7 +4105,11 @@ fn render_run(run: &AgentRun, now: u64) -> String {
 /// Exhaustive, so a variant added to [`RunState`] is a compile error here rather than a run the
 /// list silently describes as something else. The words are `RunState`'s own serde tags, which is
 /// what makes a state named in this answer findable in `cide-ipc` by a reader.
-fn run_state_wire(state: &RunState) -> &'static str {
+///
+/// `pub` since M66 for a second caller: `cide_app::cmd::agents`' duplicate refusal names the run
+/// it is refusing on behalf of, and a run named with a word this list does not print is a run the
+/// caller cannot then find. One producer, for `cide_git::push::preview`'s reason in a new place.
+pub fn run_state_wire(state: &RunState) -> &'static str {
     match state {
         RunState::Queued => "queued",
         RunState::Starting => "starting",
@@ -2648,7 +4128,11 @@ fn run_state_wire(state: &RunState) -> &'static str {
 /// Each of these tells the caller what it may *do*, which is the only reason a state is worth a
 /// second clause. `paused` names the user because nothing a model can call resumes it — see the
 /// module header on why there is no `cide_agent_resume`.
-fn run_state_detail(state: &RunState) -> Option<String> {
+///
+/// `pub` since M66, beside [`run_state_wire`] and for the same reason: the duplicate-dispatch
+/// refusal has to say what the run it names is doing, and "stop it" is the wrong advice for a
+/// paused one. Re-wording it there would be a second copy of this advice that drifts.
+pub fn run_state_detail(state: &RunState) -> Option<String> {
     match state {
         RunState::AwaitingPermission => {
             Some("waiting for the user to answer a permission prompt".to_string())
@@ -3249,7 +4733,7 @@ fn fenced_with(preamble: &str, body: &str) -> String {
 ///
 /// `all` is the whole board, because a summary now reads facts that live on *other* tasks: the
 /// derived "blocks" edge, above all. (M30)
-fn render_summary(task: &Task, all: &[Task]) -> String {
+fn render_summary(task: &TaskRow, all: &[TaskRow]) -> String {
     // Only the blocking pair rides the summary, and both directions of it: the list is the
     // dispatch-decision view, blocking is the one edge kind that changes that decision, and the
     // decision needs both readings — "which of these must wait" and "which of these is holding
@@ -3266,13 +4750,10 @@ fn render_summary(task: &Task, all: &[Task]) -> String {
     // Live attachments across the body and every live comment, as one count: the list is where
     // an agent decides whether a task is worth a `cide_task_get`, and "there is a file on this
     // one" changes that. Absent for the ordinary task, on `change`'s token discipline. (M39)
-    let attachments = live_attachments(&task.attachments).count()
-        + task
-            .comments
-            .iter()
-            .filter(|c| !c.deleted)
-            .flat_map(|c| live_attachments(&c.attachments))
-            .count();
+    // The row's own count since M68, not a walk over records this list no longer carries.
+    // `TaskRow::of` is the one place either number is derived; see its doc for why that matters more
+    // than the two lines it saves here.
+    let attachments = usize::try_from(task.attachment_count).unwrap_or(usize::MAX);
     format!(
         "{} [{}] {}{}{}{}{} | {} | {} comment(s)\n",
         task.id,
@@ -3304,7 +4785,7 @@ fn render_summary(task: &Task, all: &[Task]) -> String {
             format!(" | {attachments} attachment(s)")
         },
         one_line(&task.title),
-        task.comments.len(),
+        task.comment_count,
     )
 }
 
@@ -3357,7 +4838,7 @@ fn human_size(bytes: u64) -> String {
 
 /// A task's live outgoing edges — the tombstoned ones are bookkeeping for the merge, and no
 /// renderer or gate ever reads them.
-fn live_links(task: &Task) -> impl Iterator<Item = &cide_ipc::TaskLink> {
+fn live_links(task: &TaskRow) -> impl Iterator<Item = &cide_ipc::TaskLink> {
     task.links.iter().filter(|l| !l.deleted)
 }
 
@@ -3367,10 +4848,10 @@ fn live_links(task: &Task) -> impl Iterator<Item = &cide_ipc::TaskLink> {
 /// (`AgentRun::task` read backwards): one stored row per fact, so a merge can never leave the
 /// two directions disagreeing.
 fn incoming_links<'a>(
-    all: &'a [Task],
+    all: &'a [TaskRow],
     kind: LinkType,
     id: &'a TaskId,
-) -> impl Iterator<Item = &'a Task> {
+) -> impl Iterator<Item = &'a TaskRow> {
     all.iter().filter(move |t| {
         &t.id != id
             && t.links
@@ -3383,7 +4864,7 @@ fn incoming_links<'a>(
 /// to do next — the target's status and title resolved from the board. A target that is not on
 /// the board is marked rather than dropped: a reference that silently vanished is the failure
 /// mode this whole file keeps writing against.
-fn link_line(label: &str, target: &TaskId, all: &[Task]) -> String {
+fn link_line(label: &str, target: &TaskId, all: &[TaskRow]) -> String {
     match all.iter().find(|t| &t.id == target) {
         Some(t) => format!(
             "  - {label} {target} [{}] {}\n",
@@ -3400,8 +4881,14 @@ fn link_line(label: &str, target: &TaskId, all: &[Task]) -> String {
 /// every answer, and a model has no "now" to compare one against. The information they carry that
 /// an agent can actually use — what happened after what — is already in the order: `Task::comments`
 /// is oldest first, and its doc says so.
-fn render_full(task: &Task, all: &[Task], root: &Path) -> String {
-    let mut out = render_summary(task, all);
+fn render_full(task: &Task, all: &[TaskRow], root: &Path) -> String {
+    // Projected once. (M68) `render_full` is handed a whole `Task` — it draws the body and the
+    // log, which only a `Task` has — and needs the row for the three things that read one: the
+    // summary header, the outgoing link list, and the counts. `TaskRow::of` is the single producer
+    // of those counts, so asking it here is also what keeps this header agreeing with the same
+    // task's line in `cide_task_list`.
+    let row = TaskRow::of(task);
+    let mut out = render_summary(&row, all);
     /*
      * Who asked for this, on its own line. (M21)
      *
@@ -3426,7 +4913,7 @@ fn render_full(task: &Task, all: &[Task], root: &Path) -> String {
      * the same related pair, and two lines saying one fact would read as two facts.
      */
     let mut link_lines = String::new();
-    for edge in live_links(task) {
+    for edge in live_links(&row) {
         let label = match edge.link {
             LinkType::BlockedBy => "blocked by",
             LinkType::SubtaskOf => "subtask of",
@@ -3434,7 +4921,7 @@ fn render_full(task: &Task, all: &[Task], root: &Path) -> String {
         };
         link_lines.push_str(&link_line(label, &edge.target, all));
     }
-    let related_out: Vec<&TaskId> = live_links(task)
+    let related_out: Vec<&TaskId> = live_links(&row)
         .filter(|l| l.link == LinkType::Related)
         .map(|l| &l.target)
         .collect();
@@ -3583,10 +5070,13 @@ mod tests {
     }
 
     impl TaskSink for FakeSink {
-        fn list(&self) -> Result<Vec<Task>, String> {
+        fn list(&self) -> Result<Vec<TaskRow>, String> {
             match &self.broken {
                 Some(why) => Err(why.clone()),
-                None => Ok(self.tasks.lock().clone()),
+                // Projected through the one producer, exactly as `StoreSink` does — so a fake whose
+                // tasks carry comments answers the same counts the real store would, and a test that
+                // passes here is a test that passes against a disk.
+                None => Ok(self.tasks.lock().iter().map(TaskRow::of).collect()),
             }
         }
 
@@ -3922,11 +5412,11 @@ mod tests {
         // Each file on its own line with the absolute path under the *project root* — not the
         // run's worktree — because that is where the store puts it and where a `Read` finds it.
         assert!(
-            text.contains("- shot.png (image, 1 KiB) at /repo/.cide/attachments/t-1/"),
+            text.contains("- shot.png (image, 1 KiB) at /repo/.cide/tasks/t-1/attachments/"),
             "{text}"
         );
         assert!(
-            text.contains("- notes.md (file, 1 KiB) at /repo/.cide/attachments/t-1/"),
+            text.contains("- notes.md (file, 1 KiB) at /repo/.cide/tasks/t-1/attachments/"),
             "{text}"
         );
         assert_eq!(
@@ -3957,7 +5447,7 @@ mod tests {
         let text = text_of(&created);
         assert!(text.starts_with("Created t-4."), "{text}");
         assert!(
-            text.contains("- mock.png (image, 1 KiB) at /repo/.cide/attachments/t-4/"),
+            text.contains("- mock.png (image, 1 KiB) at /repo/.cide/tasks/t-4/attachments/"),
             "{text}"
         );
         assert_eq!(
@@ -4086,7 +5576,7 @@ mod tests {
         // Under the comment, one level deeper than the body's, with the absolute path.
         assert!(
             text.contains(
-                "    attachments:\n    - shot.png (image, 1 KiB) at /repo/.cide/attachments/t-1/"
+                "    attachments:\n    - shot.png (image, 1 KiB) at /repo/.cide/tasks/t-1/attachments/"
             ),
             "{text}"
         );
@@ -4108,14 +5598,824 @@ mod tests {
         );
     }
 
+    // --- what a role runs on (M71) ------------------------------------------------------------
+
+    /// One resolution as the fixture states it. See [`FakeAgents::resolutions`] for why it is
+    /// stated rather than computed.
+    fn resolved(
+        harness: Harness,
+        model: Option<&str>,
+        pool: Option<&str>,
+    ) -> crate::overrides::Resolved {
+        crate::overrides::Resolved {
+            harness,
+            pool: Vec::new(),
+            pool_name: pool.map(str::to_string),
+            model: model.map(str::to_string),
+            effort: None,
+            max_concurrent: 1,
+            refusal: None,
+        }
+    }
+
+    /// A machine with one catalogued provider carrying a key, one custom endpoint, and a pool.
+    fn configured() -> LlmSettings {
+        LlmSettings {
+            providers: vec![
+                LlmProvider::Catalog {
+                    id: "openrouter".into(),
+                    label: String::new(),
+                    enabled: true,
+                    api_key: "sk-or-v1-thekeynobodymaysee".into(),
+                },
+                LlmProvider::Custom {
+                    id: "lmstudio".into(),
+                    label: "LM Studio".into(),
+                    enabled: true,
+                    npm: "@ai-sdk/openai-compatible".into(),
+                    base_url: "http://127.0.0.1:1234/v1".into(),
+                    api_key: String::new(),
+                    models: vec![LlmModel {
+                        id: "openai/gpt-oss-20b".into(),
+                        label: String::new(),
+                        context: 0,
+                        output: 0,
+                    }],
+                },
+            ],
+            pools: vec![ModelPool {
+                name: "cheap".into(),
+                description: "The one that costs nothing".into(),
+                entries: vec![PoolEntry {
+                    provider: "lmstudio".into(),
+                    model: "openai/gpt-oss-20b".into(),
+                    variant: String::new(),
+                }],
+            }],
+        }
+    }
+
+    /// The switch is a person's, said in a sentence rather than by dropping the argument.
+    ///
+    /// The second half is the one worth having: a refusal that had already written the *other*
+    /// fields would be a call that half happened, and the caller has no way to find that out.
     #[test]
-    fn the_sixteen_are_the_only_sixteen() {
+    fn the_config_tool_refuses_the_switch_and_writes_nothing() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENTS_CONFIG,
+            json!({ "enabled": true, "maxConcurrent": 9 }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        let text = text_of(&answer);
+        assert!(
+            text.contains("`enabled` is not something this tool can change"),
+            "{text}"
+        );
+        assert!(text.contains("Agents panel"), "{text}");
+        assert!(text.contains("Nothing was written."), "{text}");
+        assert_eq!(
+            sink.config.lock().max_concurrent,
+            2,
+            "the other field was written anyway"
+        );
+    }
+
+    #[test]
+    fn the_config_tool_patches_the_cap_and_says_what_stands() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENTS_CONFIG,
+            json!({ "maxConcurrent": 3, "harness": "opencode" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        eprintln!("{text}");
+        assert!(text.contains(".cide/config.json"), "{text}");
+        // The committedness is the fact a model has to carry into its next decision.
+        assert!(text.contains("commit"), "{text}");
+        assert!(text.contains("up to 3 run(s) at once"), "{text}");
+        assert!(text.contains("default harness opencode"), "{text}");
+        assert_eq!(sink.config.lock().max_concurrent, 3);
+        assert_eq!(sink.config.lock().harness, Harness::Opencode);
+    }
+
+    /// A call that names nothing is a read, and there is already a tool for that.
+    #[test]
+    fn a_config_call_that_names_nothing_is_sent_to_the_roster() {
+        let answer = ask(tool::AGENTS_CONFIG, json!({}), &roster());
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains(tool::AGENTS_LIST),
+            "{}",
+            text_of(&answer)
+        );
+    }
+
+    /// A row is keyed by a role id, so a typo would be a redirection nothing ever reads.
+    #[test]
+    fn an_override_for_a_role_that_does_not_exist_is_refused() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "develper", "model": "sonnet" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("defines no role called `develper`"),
+            "{}",
+            text_of(&answer)
+        );
+        assert!(sink.overrides.lock().roles.is_empty());
+    }
+
+    /// Refused where it is written as well as ignored where it is read.
+    ///
+    /// `overrides::resolve` drops a Claude Code role's override wholesale, so a tool that stored
+    /// one would answer "saved" and change nothing for the rest of the project's life.
+    #[test]
+    fn a_claude_code_subagent_cannot_be_overridden_from_a_tool() {
+        let sink = FakeAgents {
+            defs: vec![AgentDef {
+                scope: AgentScope::ClaudeProject,
+                ..def("reviewer", "Reviewer", "Reads a branch.", None)
+            }],
+            ..roster()
+        };
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "reviewer", "harness": "opencode" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        let text = text_of(&answer);
+        assert!(text.contains("Claude Code subagent"), "{text}");
+        assert!(text.contains("claudeProject"), "{text}");
+        assert!(text.contains(tool::AGENT_UPDATE), "{text}");
+        assert!(sink.overrides.lock().roles.is_empty());
+    }
+
+    /// The project-wide row, a clear, and the emptied row leaving no trace behind it.
+    #[test]
+    fn an_override_patches_one_field_and_a_null_clears_it() {
+        let sink = roster();
+
+        // No `agent`: the row every role without one of its own falls back to.
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "harness": "opencode", "pool": "cheap" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        eprintln!("{text}");
+        assert!(
+            text.contains("every role that has no row of its own"),
+            "{text}"
+        );
+        assert!(text.contains("harness opencode, pool `cheap`"), "{text}");
+        assert!(text.contains("local and uncommitted"), "{text}");
+        assert_eq!(sink.overrides.lock().all.harness, Some(Harness::Opencode));
+
+        // One role, then that role's row cleared field by field until nothing is left.
+        let _ = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "model": "sonnet" }),
+            &sink,
+        );
+        assert_eq!(
+            sink.overrides.lock().roles["developer"].model.as_deref(),
+            Some("sonnet")
+        );
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "model": null }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(
+            text_of(&answer).contains("Cleared the local override"),
+            "{}",
+            text_of(&answer)
+        );
+        // Removed rather than stored empty: `for_role` falls back to `all` on absence, and a row
+        // that is present and says nothing is a row the panel draws as an override.
+        assert!(
+            !sink.overrides.lock().roles.contains_key("developer"),
+            "an emptied row was left behind"
+        );
+    }
+
+    /// One list of models or one model, never both — and the two ways that can be asked for.
+    #[test]
+    fn a_pool_and_a_model_cannot_both_be_named() {
+        let sink = roster();
+        // Asked for together: no defensible winner, so nothing is written.
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "pool": "cheap", "model": "sonnet" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("mutually exclusive"),
+            "{}",
+            text_of(&answer)
+        );
+        assert!(sink.overrides.lock().roles.is_empty());
+
+        // Asked for one over a stored other: unambiguous, so it happens — and is reported, because
+        // a row that silently kept a pool under a new model would have two halves that disagree
+        // and `resolve` reads the pool first.
+        let _ = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "pool": "cheap" }),
+            &sink,
+        );
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "model": "sonnet" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        assert!(
+            text.contains("the pool `cheap` it was overridden onto was cleared"),
+            "{text}"
+        );
+        let stored = sink.overrides.lock();
+        assert_eq!(stored.roles["developer"].model.as_deref(), Some("sonnet"));
+        assert_eq!(stored.roles["developer"].pool, None);
+    }
+
+    /// **The expensive one.** A tool shaped like the command underneath it takes a whole
+    /// `LlmSettings`, so one call from a model that had not read first would erase every provider
+    /// and every API key on the machine. This is the assertion that it cannot.
+    #[test]
+    fn patching_one_provider_leaves_every_other_one_and_its_key_alone() {
+        let sink = FakeAgents {
+            llm: Mutex::new(configured()),
+            ..roster()
+        };
+        let answer = ask(
+            tool::LLM_PROVIDER,
+            json!({ "id": "deepseek", "kind": "catalog", "apiKey": "sk-ds-another" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+
+        let llm = sink.llm.lock();
+        assert_eq!(llm.providers.len(), 3, "the other two were dropped");
+        assert_eq!(
+            llm.providers[0].api_key(),
+            "sk-or-v1-thekeynobodymaysee",
+            "an untouched provider lost its credential"
+        );
+        assert_eq!(llm.pools.len(), 1, "the pools went with them");
+        assert_eq!(llm.pools[0].entries.len(), 1);
+
+        // And a patch that names only `enabled` keeps the key of the provider it *is* editing,
+        // which is the same failure one row in.
+        drop(llm);
+        let answer = ask(
+            tool::LLM_PROVIDER,
+            json!({ "id": "openrouter", "enabled": false }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let llm = sink.llm.lock();
+        assert_eq!(llm.providers[0].api_key(), "sk-or-v1-thekeynobodymaysee");
+        assert!(!llm.providers[0].enabled());
+    }
+
+    /// A credential is written and never rendered — in any answer, by any tool.
+    #[test]
+    fn no_answer_anywhere_prints_a_credential() {
+        const KEY: &str = "sk-or-v1-thekeynobodymaysee";
+        let sink = FakeAgents {
+            llm: Mutex::new(configured()),
+            ..roster()
+        };
+        let written = ask(
+            tool::LLM_PROVIDER,
+            json!({ "id": "openrouter", "apiKey": KEY }),
+            &sink,
+        );
+        assert!(!written.is_error, "{}", text_of(&written));
+        for answer in [written, ask(tool::AGENTS_LIST, json!({}), &sink)] {
+            let text = text_of(&answer);
+            assert!(!text.contains(KEY), "a key reached a tool result: {text}");
+            assert!(text.contains("key set"), "{text}");
+        }
+    }
+
+    /// An incomplete row is refused **before** anything is stored, which is where this feature
+    /// departs from `LlmSettings::cleaned` and why.
+    #[test]
+    fn a_custom_endpoint_with_no_url_is_refused_and_nothing_is_stored() {
+        let sink = roster();
+        let answer = ask(
+            tool::LLM_PROVIDER,
+            json!({ "id": "ollama", "kind": "custom", "models": [{ "id": "qwen3:8b" }] }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        let text = text_of(&answer);
+        assert!(text.contains("needs a base URL"), "{text}");
+        assert!(text.contains("Nothing was written."), "{text}");
+        assert!(sink.llm.lock().providers.is_empty());
+    }
+
+    /// An argument that means nothing for the kind is refused, not dropped — `enabled`'s rule in
+    /// a second place.
+    #[test]
+    fn a_field_that_says_nothing_about_this_kind_is_refused() {
+        let sink = roster();
+        let answer = ask(
+            tool::LLM_PROVIDER,
+            json!({ "id": "openrouter", "kind": "catalog", "baseUrl": "http://nowhere/v1" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("`baseUrl` says nothing about a `catalog` provider"),
+            "{}",
+            text_of(&answer)
+        );
+        assert!(sink.llm.lock().providers.is_empty());
+    }
+
+    /// The kind cide describes and never writes.
+    #[test]
+    fn an_external_provider_is_reported_and_never_written() {
+        let sink = roster();
+        let answer = ask(
+            tool::LLM_PROVIDER,
+            json!({ "id": "openai", "kind": "external" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("writes nothing for it"),
+            "{}",
+            text_of(&answer)
+        );
+        assert!(sink.llm.lock().providers.is_empty());
+        // And the schema never offered it in the first place.
+        let offered = input_schema(tool::LLM_PROVIDER)["properties"]["kind"]["enum"].clone();
+        assert_eq!(offered, json!(["catalog", "custom"]));
+    }
+
+    /// The schema's kinds are `cide_ipc`'s, minus the one this tool will not write.
+    #[test]
+    fn the_provider_schema_offers_what_cide_can_write() {
+        assert!(
+            cide_ipc::llm::PROVIDER_KINDS.contains(&EXTERNAL_PROVIDER),
+            "EXTERNAL_PROVIDER is not one of the kinds it is filtering out"
+        );
+        let offered: Vec<String> = input_schema(tool::LLM_PROVIDER)["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("an enum")
+            .iter()
+            .map(|kind| kind.as_str().unwrap_or_default().to_string())
+            .collect();
+        let expected: Vec<String> = cide_ipc::llm::PROVIDER_KINDS
+            .iter()
+            .filter(|kind| **kind != EXTERNAL_PROVIDER)
+            .map(|kind| (*kind).to_string())
+            .collect();
+        assert_eq!(offered, expected);
+    }
+
+    /// The order is the whole feature, and a model id is never split.
+    #[test]
+    fn a_pool_keeps_the_order_it_was_given() {
+        let sink = FakeAgents {
+            llm: Mutex::new(configured()),
+            ..roster()
+        };
+        let answer = ask(
+            tool::LLM_POOL,
+            json!({
+                "name": "strong",
+                "entries": [
+                    { "provider": "openrouter", "model": "anthropic/claude-opus-4" },
+                    { "provider": "lmstudio", "model": "openai/gpt-oss-20b", "variant": "high" },
+                ],
+            }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        eprintln!("{text}");
+        assert!(
+            text.contains("openrouter/anthropic/claude-opus-4 then lmstudio/openai/gpt-oss-20b"),
+            "{text}"
+        );
+        let llm = sink.llm.lock();
+        let pool = llm
+            .pools
+            .iter()
+            .find(|pool| pool.name == "strong")
+            .expect("stored");
+        // The two halves stay apart: a model id carrying slashes survives as one id.
+        assert_eq!(pool.entries[0].provider, "openrouter");
+        assert_eq!(pool.entries[0].model, "anthropic/claude-opus-4");
+        assert_eq!(pool.entries[1].variant, "high");
+        assert_eq!(llm.pools.len(), 2, "the pool that was already there went");
+    }
+
+    /// A pool with nothing in it refuses every dispatch overridden onto it, and a tool call has no
+    /// next gesture to fill it — so creating one would be creating a trap.
+    #[test]
+    fn a_new_pool_with_no_entries_is_refused() {
+        let sink = roster();
+        let answer = ask(tool::LLM_POOL, json!({ "name": "empty" }), &sink);
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("needs at least one entry"),
+            "{}",
+            text_of(&answer)
+        );
+        assert!(sink.llm.lock().pools.is_empty());
+    }
+
+    /// Removing a pool is allowed and the cost is stated: the refusal it causes is a *dispatch*
+    /// that will not start, discovered later and elsewhere.
+    #[test]
+    fn removing_a_pool_names_the_roles_pointed_at_it() {
+        let sink = FakeAgents {
+            llm: Mutex::new(configured()),
+            ..roster()
+        };
+        let _ = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "pool": "cheap" }),
+            &sink,
+        );
+        let answer = ask(
+            tool::LLM_POOL,
+            json!({ "name": "cheap", "remove": true }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        eprintln!("{text}");
+        assert!(text.contains("`developer`"), "{text}");
+        assert!(text.contains("refused"), "{text}");
+        assert!(text.contains(tool::AGENT_OVERRIDE), "{text}");
+        assert!(sink.llm.lock().pools.is_empty());
+
+        // And a remove that removes nothing says so rather than reporting success.
+        let answer = ask(
+            tool::LLM_POOL,
+            json!({ "name": "cheap", "remove": true }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("nothing to remove"),
+            "{}",
+            text_of(&answer)
+        );
+    }
+
+    /// The roster prints the **resolution**, not the definition: the harness a dispatch would
+    /// fork, the model it would ask for, and the concurrency the admission gate would allow.
+    #[test]
+    fn the_roster_prints_what_each_role_resolves_to() {
+        let mut overrides = ProjectOverrides::default();
+        overrides.roles.insert(
+            "developer".to_string(),
+            AgentOverride {
+                harness: Some(Harness::Opencode),
+                pool: Some("cheap".to_string()),
+                ..AgentOverride::default()
+            },
+        );
+        let sink = FakeAgents {
+            overrides: Mutex::new(overrides),
+            llm: Mutex::new(configured()),
+            resolutions: vec![
+                (
+                    AgentId("developer".into()),
+                    crate::overrides::Resolved {
+                        max_concurrent: 3,
+                        ..resolved(Harness::Opencode, None, Some("cheap"))
+                    },
+                ),
+                (
+                    AgentId("qa".into()),
+                    resolved(Harness::Claude, Some("sonnet"), None),
+                ),
+            ],
+            ..roster()
+        };
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &sink));
+        eprintln!("{text}");
+
+        // The project's own settings, once, at the top.
+        assert!(
+            text.contains("up to 2 run(s) at once across the project"),
+            "{text}"
+        );
+        assert!(text.contains(tool::AGENTS_CONFIG), "{text}");
+
+        // The overridden role: opencode and the pool, marked as an override, and the *resolved*
+        // concurrency rather than the 1 its definition declares.
+        assert!(
+            text.contains("developer (Developer) | opencode pool `cheap` (override) | ready"),
+            "{text}"
+        );
+        assert!(text.contains("runs up to 3 at once"), "{text}");
+        // The one nothing redirects: no marker, and the model its definition names.
+        assert!(
+            text.contains("qa (QA) | claude sonnet | cannot run:"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("qa (QA) | claude sonnet (override)"),
+            "{text}"
+        );
+
+        // The machine's providers and pools, under the fence rather than inside it: this is
+        // cide's own answer, not something the project wrote.
+        assert!(
+            text.contains("providers: openrouter (catalog, key set); lmstudio (custom)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pools: cheap [lmstudio/openai/gpt-oss-20b]"),
+            "{text}"
+        );
+        let closing = text.find(FENCE_CLOSE).expect("the roles are fenced");
+        assert!(
+            text.find("providers:").is_some_and(|at| at > closing),
+            "cide's own settings are inside the fence that marks what the project wrote"
+        );
+    }
+
+    /// A pool an override names and the machine does not have is a refusal a dispatch makes.
+    /// Before M71 it was only ever discovered by dispatching; the roster carries it now.
+    #[test]
+    fn a_pool_that_is_not_configured_shows_as_a_refusal_in_the_roster() {
+        let sink = FakeAgents {
+            resolutions: vec![(
+                AgentId("developer".into()),
+                crate::overrides::Resolved {
+                    refusal: Some("The pool “gone” is not configured on this machine.".to_string()),
+                    ..resolved(Harness::Opencode, None, None)
+                },
+            )],
+            ..roster()
+        };
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &sink));
+        assert!(
+            text.contains("cannot run: The pool “gone” is not configured"),
+            "{text}"
+        );
+    }
+
+    /// A settings write that the disk refuses is a refusal the caller hears about.
+    #[test]
+    fn a_settings_write_that_fails_is_reported_and_not_swallowed() {
+        let sink = FakeAgents {
+            refuse_settings: Some(
+                "the overrides could not be written: read-only file system".to_string(),
+            ),
+            ..roster()
+        };
+        for (name, args) in [
+            (tool::AGENTS_CONFIG, json!({ "maxConcurrent": 3 })),
+            (tool::AGENT_OVERRIDE, json!({ "model": "sonnet" })),
+            (
+                tool::LLM_PROVIDER,
+                json!({ "id": "openrouter", "kind": "catalog" }),
+            ),
+            (
+                tool::LLM_POOL,
+                json!({ "name": "p", "entries": [{ "provider": "a", "model": "b" }] }),
+            ),
+        ] {
+            let answer = ask(name, args, &sink);
+            assert!(answer.is_error, "{name} reported success");
+            assert!(text_of(&answer).contains("read-only"), "{name}");
+        }
+    }
+
+    /// The two project-scoped settings tools against **real files**, and the loader reading them
+    /// back. (M71)
+    ///
+    /// Everything above runs against [`FakeAgents`], which is what makes the refusals cheap to
+    /// assert — and which cannot answer the question that matters most here: does what these
+    /// tools write land where the thing that *reads* it looks? `a_role_written_by_a_tool_is_a_role
+    /// _the_loader_runs` makes the same claim one tool over, and for the same reason.
+    ///
+    /// Two failures this is the only thing that could see. A config write that lost the file's
+    /// hand-edited keys — `config::write` merges, and a sink that serialised from scratch would
+    /// not. And an override row stored under a key `overrides::resolve` does not look up, which
+    /// every assertion made against the table this process is holding would agree with.
+    #[test]
+    fn what_the_settings_tools_write_is_what_the_loader_reads_back() {
+        struct DiskSettings {
+            root: PathBuf,
+            overrides: PathBuf,
+        }
+
+        impl DiskSettings {
+            fn stored(&self) -> ProjectOverrides {
+                match std::fs::read(&self.overrides) {
+                    Ok(bytes) => serde_json::from_slice(&bytes).expect("the file we wrote parses"),
+                    Err(_) => ProjectOverrides::default(),
+                }
+            }
+        }
+
+        impl AgentSink for DiskSettings {
+            fn agents(&self) -> Result<Vec<AgentDef>, String> {
+                Ok(crate::defs::load(&self.root, Harness::Claude)
+                    .agents
+                    .iter()
+                    .map(|loaded| loaded.def.clone())
+                    .collect())
+            }
+
+            fn config(&self) -> Result<OrchestrationConfig, String> {
+                Ok(crate::config::load(&self.root).agents.to_wire())
+            }
+
+            fn set_config(&self, patch: OrchestrationPatch) -> Result<OrchestrationConfig, String> {
+                // The command's own read-modify-write, which is what keeps the six disk-only keys.
+                let mut file = crate::config::load(&self.root);
+                file.agents.apply(patch);
+                crate::config::write(&self.root, &file).map_err(|error| error.to_string())?;
+                Ok(file.agents.to_wire())
+            }
+
+            fn overrides(&self) -> Result<ProjectOverrides, String> {
+                Ok(self.stored())
+            }
+
+            fn set_overrides(&self, overrides: ProjectOverrides) -> Result<(), String> {
+                let bytes = serde_json::to_vec_pretty(&overrides).map_err(|e| e.to_string())?;
+                std::fs::write(&self.overrides, bytes).map_err(|error| error.to_string())
+            }
+
+            fn definition(
+                &self,
+                _scope: AgentScope,
+                _name: &AgentId,
+            ) -> Result<Option<AgentDraft>, String> {
+                unreachable!("this test never reads a definition")
+            }
+
+            fn write_definition(&self, _draft: &AgentDraft) -> Result<PathBuf, String> {
+                unreachable!("this test never writes a definition")
+            }
+
+            fn runs(&self) -> Result<Vec<AgentRun>, String> {
+                Ok(Vec::new())
+            }
+
+            fn dispatch(
+                &self,
+                _agent: &AgentId,
+                _task: Option<&TaskId>,
+                _instructions: Option<&str>,
+                _notify: Notify,
+            ) -> Result<RunId, String> {
+                unreachable!("this test never dispatches")
+            }
+
+            fn stop(
+                &self,
+                _run: RunId,
+                _reason: Option<&str>,
+                _force: bool,
+            ) -> Result<Stopped, String> {
+                unreachable!("this test never stops a run")
+            }
+
+            fn integrate(
+                &self,
+                _agent: &AgentId,
+                _task: Option<&TaskId>,
+            ) -> Result<Integrated, String> {
+                unreachable!("this test never integrates")
+            }
+
+            fn now_unix_ms(&self) -> u64 {
+                NOW
+            }
+
+            fn isolated(&self) -> Result<bool, String> {
+                Ok(true)
+            }
+
+            fn dispatching(&self) -> Result<bool, String> {
+                Ok(true)
+            }
+
+            fn llm(&self) -> Result<LlmSettings, String> {
+                Ok(LlmSettings::default())
+            }
+
+            fn set_llm(&self, _llm: LlmSettings) -> Result<(), String> {
+                unreachable!("`Settings` is cide-app's; the tool's fold is asserted above")
+            }
+
+            fn resolutions(&self) -> Result<Vec<(AgentId, crate::overrides::Resolved)>, String> {
+                Ok(Vec::new())
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("cide-tools-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".cide")).expect("temp dir");
+        // A file with subagents already on and a **disk-only** key set by hand, which is the half
+        // a from-scratch serialisation would silently drop.
+        std::fs::write(
+            root.join(".cide/config.json"),
+            br#"{"version":1,"agents":{"enabled":true,"maxConcurrent":1,"nudgeOrchestrator":false}}"#,
+        )
+        .expect("config");
+        // One role for the override to name, written the way `agent_create` writes one.
+        std::fs::create_dir_all(root.join(".cide/agents")).expect("roles dir");
+        std::fs::write(
+            root.join(".cide/agents/developer.md"),
+            "---\nname: developer\ndescription: Implements one task.\n---\n\nYou implement.\n",
+        )
+        .expect("role");
+
+        let sink = DiskSettings {
+            overrides: root.join("agent-overrides.json"),
+            root: root.clone(),
+        };
+
+        let answer = ask(tool::AGENTS_CONFIG, json!({ "maxConcurrent": 4 }), &sink);
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let reloaded = crate::config::load(&root);
+        assert_eq!(reloaded.agents.max_concurrent, 4);
+        assert!(
+            reloaded.agents.enabled,
+            "the switch was written by the patch"
+        );
+        assert!(
+            !reloaded.agents.nudge_orchestrator,
+            "a hand-edited disk-only key did not survive a tool's write"
+        );
+
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "harness": "opencode", "model": "anthropic/x" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+
+        // The claim: the row lands where `resolve` looks it up, through a serde round trip that a
+        // missing `skip_serializing_if` would have turned into a table of nulls.
+        let loaded = crate::defs::load(&root, Harness::Claude);
+        let developer = loaded
+            .get(&AgentId("developer".into()))
+            .expect("the loader lists it");
+        let resolved =
+            crate::overrides::resolve(developer, &sink.stored(), &LlmSettings::default());
+        assert_eq!(resolved.harness, Harness::Opencode);
+        assert_eq!(resolved.model.as_deref(), Some("anthropic/x"));
+        assert!(resolved.refusal.is_none());
+
+        // And clearing it puts the role back on what its definition says, with no row left over.
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "harness": null, "model": null }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let resolved =
+            crate::overrides::resolve(developer, &sink.stored(), &LlmSettings::default());
+        assert_eq!(resolved.harness, Harness::Claude);
+        assert_eq!(resolved.model, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_twenty_are_the_only_twenty() {
         assert_eq!(
             tool::ORCHESTRATION,
             [
                 "cide_agents_list",
                 "cide_agent_create",
                 "cide_agent_update",
+                // The four settings tools sit with the two that author a role, not after the
+                // integrate: what a role runs on is part of defining it. (M71)
+                "cide_agents_config",
+                "cide_agent_override",
+                "cide_llm_provider",
+                "cide_llm_pool",
                 "cide_agent_dispatch",
                 "cide_agent_runs",
                 "cide_agent_stop",
@@ -4144,10 +6444,31 @@ mod tests {
         // is exactly the asymmetry a later reader would "tidy up".
         assert!(!tool::EVERY.contains(&"cide_agent_delete"));
 
+        // The probe behind the Models screen's Test button spends a real turn of the user's
+        // quota, which is why it is a button a person presses — see the module header. A tool
+        // would make it something a model does in a loop over candidates. (M71)
+        assert!(!tool::EVERY.contains(&"cide_llm_test_model"));
+
         // Every advertised name is in exactly one family, which is what makes a connection's
         // allow-list a slice comparison rather than a policy.
         for name in tool::ORCHESTRATION {
             assert!(!tool::ALL.contains(name));
+        }
+        // And the settings four are in the *orchestration* family by name, which is the claim
+        // that a dispatched run can never reach them: `agent_rpc` serves a run `ALL` and nothing
+        // else, so a subagent that could re-point its siblings' models would have to have been
+        // put in the wrong list here first. (M71)
+        for name in [
+            tool::AGENTS_CONFIG,
+            tool::AGENT_OVERRIDE,
+            tool::LLM_PROVIDER,
+            tool::LLM_POOL,
+        ] {
+            assert!(
+                !tool::ALL.contains(&name),
+                "{name} must not be served to a run"
+            );
+            assert!(tool::ORCHESTRATION.contains(&name));
         }
     }
 
@@ -4707,7 +7028,12 @@ mod tests {
         refuse_write: Option<String>,
         /// Every dispatch the handler asked for. See [`Dispatched`].
         dispatched: Mutex<Vec<Dispatched>>,
-        stopped: Mutex<Vec<(RunId, Option<String>)>>,
+        /// Every stop the handler asked for: the run, the reason and whether it forced.
+        stopped: Mutex<Vec<(RunId, Option<String>, bool)>>,
+        /// What [`AgentSink::stop`] answers. Behind a `Mutex` rather than a plain field so
+        /// a test can set it after `roster()` built the fixture, which is the shape every
+        /// other after-the-fact knob here would want and the only one that needs it.
+        stop_answer: Mutex<Stopped>,
         integration: Integrated,
         /// When set, every call fails with this sentence — "subagents are off for this project"
         /// is the one that matters, and it must not read as an empty roster.
@@ -4718,6 +7044,21 @@ mod tests {
         /// fixture built with `..roster()` is a *dispatching* project unless it says otherwise —
         /// see `dispatching` below for why the field is inverted.
         paused: bool,
+        /// The three tables the settings tools patch, behind `Mutex` for `written`'s reason: a
+        /// handler writes one and the assertion is what is in it afterwards. (M71)
+        config: Mutex<OrchestrationConfig>,
+        overrides: Mutex<ProjectOverrides>,
+        llm: Mutex<LlmSettings>,
+        /// What each role resolves to, **stated by the fixture** rather than computed.
+        ///
+        /// `crate::overrides::resolve` needs a `LoadedAgent`, which is a file on disk; and its own
+        /// rules are already covered by its own tests. What is under test here is the *rendering*
+        /// — that the roster prints the resolution rather than the definition — so the fixture
+        /// hands over the answer and the row is asserted against it.
+        resolutions: Vec<(AgentId, crate::overrides::Resolved)>,
+        /// When set, a settings write fails with this sentence: the disk-refused road, which no
+        /// argument can provoke.
+        refuse_settings: Option<String>,
     }
 
     const NOW: u64 = 1_700_000_000_000;
@@ -4807,12 +7148,16 @@ mod tests {
             Ok(RunId::new())
         }
 
-        fn stop(&self, run: RunId, reason: Option<&str>) -> Result<(), String> {
+        fn stop(&self, run: RunId, reason: Option<&str>, force: bool) -> Result<Stopped, String> {
             if let Some(why) = &self.broken {
                 return Err(why.clone());
             }
-            self.stopped.lock().push((run, reason.map(str::to_string)));
-            Ok(())
+            self.stopped
+                .lock()
+                .push((run, reason.map(str::to_string), force));
+            // The wind-down arm by default, because it is the road M67 added and the one whose
+            // sentence is worth asserting; a test that wants another arm sets `stop_answer`.
+            Ok(self.stop_answer.lock().clone())
         }
 
         fn integrate(
@@ -4844,6 +7189,69 @@ mod tests {
             match &self.broken {
                 Some(why) => Err(why.clone()),
                 None => Ok(!self.paused),
+            }
+        }
+
+        fn config(&self) -> Result<OrchestrationConfig, String> {
+            match &self.broken {
+                Some(why) => Err(why.clone()),
+                None => Ok(*self.config.lock()),
+            }
+        }
+
+        fn set_config(&self, patch: OrchestrationPatch) -> Result<OrchestrationConfig, String> {
+            if let Some(why) = &self.refuse_settings {
+                return Err(why.clone());
+            }
+            let mut config = self.config.lock();
+            // The real writer is `AgentsConfig::apply`, which clamps rather than refuses; the
+            // clamp is repeated here because a handler that sent a 0 would otherwise look fine.
+            if let Some(max) = patch.max_concurrent {
+                config.max_concurrent = max.max(1);
+            }
+            if let Some(harness) = patch.harness {
+                config.harness = harness;
+            }
+            if let Some(enabled) = patch.enabled {
+                config.enabled = enabled;
+            }
+            Ok(*config)
+        }
+
+        fn overrides(&self) -> Result<ProjectOverrides, String> {
+            match &self.broken {
+                Some(why) => Err(why.clone()),
+                None => Ok(self.overrides.lock().clone()),
+            }
+        }
+
+        fn set_overrides(&self, overrides: ProjectOverrides) -> Result<(), String> {
+            if let Some(why) = &self.refuse_settings {
+                return Err(why.clone());
+            }
+            *self.overrides.lock() = overrides;
+            Ok(())
+        }
+
+        fn llm(&self) -> Result<LlmSettings, String> {
+            match &self.broken {
+                Some(why) => Err(why.clone()),
+                None => Ok(self.llm.lock().clone()),
+            }
+        }
+
+        fn set_llm(&self, llm: LlmSettings) -> Result<(), String> {
+            if let Some(why) = &self.refuse_settings {
+                return Err(why.clone());
+            }
+            *self.llm.lock() = llm;
+            Ok(())
+        }
+
+        fn resolutions(&self) -> Result<Vec<(AgentId, crate::overrides::Resolved)>, String> {
+            match &self.broken {
+                Some(why) => Err(why.clone()),
+                None => Ok(self.resolutions.clone()),
             }
         }
     }
@@ -4936,11 +7344,27 @@ mod tests {
             refuse_write: None,
             dispatched: Mutex::new(Vec::new()),
             stopped: Mutex::new(Vec::new()),
+            stop_answer: Mutex::new(Stopped::WindingDown {
+                secs: 60,
+                task: Some(TaskId::from("t-1".to_string())),
+            }),
             integration: Integrated::UpToDate,
             broken: None,
             now: NOW,
             // The default project shape; `the_list_prints_the_effective_concurrency` flips it.
             isolated: true,
+            // A project on this build's defaults, nothing overridden and no provider configured
+            // — which is what every test written before M71 assumes, and what makes the roster's
+            // new footer absent unless a fixture asks for it.
+            config: Mutex::new(OrchestrationConfig {
+                enabled: true,
+                max_concurrent: 2,
+                harness: Harness::Claude,
+            }),
+            overrides: Mutex::new(ProjectOverrides::default()),
+            llm: Mutex::new(LlmSettings::default()),
+            resolutions: Vec::new(),
+            refuse_settings: None,
         }
     }
 
@@ -5137,6 +7561,54 @@ mod tests {
         // The default is said back, so a caller that never thought about `notify` still knows
         // where to expect the knock.
         assert!(text.contains("announced here"), "{text}");
+    }
+
+    /// The negative twin of [`a_dispatch_answers_with_a_run_and_never_claims_it_started`]. (M66)
+    ///
+    /// A role already on the task is refused by the app, and what matters here is that the
+    /// refusal survives the trip: `AgentSink::dispatch` flattens to `Result<RunId, String>`, so
+    /// the run id and the state word have to come through as prose or the model is told it may
+    /// not dispatch without being told which run it already has.
+    #[test]
+    fn a_dispatch_refused_as_a_duplicate_reaches_the_model_naming_the_run_it_already_started() {
+        let run = RunId::new();
+        let sink = FakeAgents::broken(&format!(
+            "`game-designer` is already on t-904: run {run} [running]. A role gets one run per \
+             task, because a second wants the same worktree. Stop that run if it is going the \
+             wrong way, or wait for it to end and read the task's comments; the Agents panel \
+             shows it, and so does {}.",
+            tool::AGENT_RUNS
+        ));
+        let answer = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "game-designer", "task": "t-904" }),
+            &sink,
+        );
+
+        assert!(answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        assert!(
+            text.starts_with(&format!("{}: ", tool::AGENT_DISPATCH)),
+            "{text}"
+        );
+        assert!(text.contains(&run.to_string()), "{text}");
+        assert!(text.contains("[running]"), "{text}");
+        assert!(text.contains("one run per task"), "{text}");
+        assert!(
+            sink.dispatched.lock().is_empty(),
+            "a refused dispatch reached the queue"
+        );
+    }
+
+    /// The rule is in the tool's own description, because that is the only place a model reads
+    /// it before acting. (M66) Nothing had ever told the orchestrator that assigning and then
+    /// dispatching were one act asked for twice, and it did both in the same breath.
+    #[test]
+    fn the_dispatch_tool_says_a_role_gets_one_run_per_task() {
+        let text = description(tool::AGENT_DISPATCH);
+        assert!(text.contains("one run per task"), "{text}");
+        assert!(text.contains("is refused"), "{text}");
+        assert!(text.contains(tool::AGENT_STOP), "{text}");
     }
 
     /// The two roads, and the refusal between them. A role and nothing else is refused naming
@@ -5362,16 +7834,118 @@ mod tests {
             &sink,
         );
         assert!(!ok.is_error, "{}", text_of(&ok));
-        // The reason is not durable, and the answer says which tool is.
+        // **The inversion M67 is.** This assertion used to read "the reason is not durable, and
+        // the answer says which tool is" and required `tool::TASK_COMMENT` in the text. The
+        // reason is durable now — it is typed into the run and written onto the task — so an
+        // answer that still redirected the caller to write it a second time would be the
+        // description's old promise surviving in the one place a model actually reads.
+        let text = text_of(&ok);
         assert!(
-            text_of(&ok).contains(tool::TASK_COMMENT),
-            "{}",
-            text_of(&ok)
+            !text.contains(tool::TASK_COMMENT),
+            "no redirect to a second tool: {text}"
         );
+        assert!(text.contains("wind down"), "{text}");
+        // And the clause an orchestrator acts on: the role is *not* free yet.
+        assert!(text.contains("not free yet"), "{text}");
         assert_eq!(
             *sink.stopped.lock(),
-            vec![(id, Some("wrong approach".to_string()))]
+            vec![(id, Some("wrong approach".to_string()), false)],
+            "no `force` argument means it was not forced"
         );
+
+        // `force: true` takes the other road, and says so without being asked a second time.
+        let forced_sink = FakeAgents {
+            stop_answer: Mutex::new(Stopped::Killed {
+                why: None,
+                task: Some(TaskId::from("t-1".to_string())),
+            }),
+            ..roster()
+        };
+        let forced = ask(
+            tool::AGENT_STOP,
+            json!({ "run": id.to_string(), "force": true }),
+            &forced_sink,
+        );
+        assert!(!forced.is_error, "{}", text_of(&forced));
+        let text = text_of(&forced);
+        assert!(text.contains("in-flight turn is gone"), "{text}");
+        assert!(
+            text.contains("free to start the next task"),
+            "a forced stop really does free the role: {text}"
+        );
+        assert_eq!(*forced_sink.stopped.lock(), vec![(id, None, true)]);
+    }
+
+    /// Every arm of [`Stopped`] says whether the role is free, and only one of them says no.
+    ///
+    /// The clause is the whole reason [`AgentSink::stop`] stopped answering `()`. The old
+    /// sentence promised the role was free unconditionally, and on the wind-down road that is
+    /// false for up to a minute — the window in which an orchestrator reading it dispatches the
+    /// next task and is refused for a run it believes it ended.
+    #[test]
+    fn only_a_wind_down_says_the_role_is_not_free_yet() {
+        let run = RunId::new();
+        let task = || Some(TaskId::from("t-9".to_string()));
+
+        let winding = stopped_text(
+            run,
+            &Stopped::WindingDown {
+                secs: 60,
+                task: task(),
+            },
+        );
+        assert!(winding.contains("not free yet"), "{winding}");
+        assert!(
+            winding.contains("60s"),
+            "the grace is a number, not a word: {winding}"
+        );
+        assert!(winding.contains("t-9"), "{winding}");
+
+        // A run with no task (M40) is promised no comment, because there is nowhere to put one.
+        let rootless = stopped_text(
+            run,
+            &Stopped::WindingDown {
+                secs: 30,
+                task: None,
+            },
+        );
+        assert!(rootless.contains("not free yet"), "{rootless}");
+        assert!(
+            !rootless.contains("comments"),
+            "nothing may promise a comment on a task this run has not got: {rootless}"
+        );
+        assert!(rootless.contains("project root"), "{rootless}");
+
+        for free in [
+            Stopped::BeforeStart,
+            Stopped::Discarded,
+            Stopped::Killed {
+                why: None,
+                task: task(),
+            },
+            Stopped::AlreadyOver,
+        ] {
+            let text = stopped_text(run, &free);
+            assert!(
+                !text.contains("not free yet"),
+                "{free:?} is over by the time this is read: {text}"
+            );
+        }
+
+        // An unasked kill names the obstacle. A stop that silently declined to ask first is a
+        // feature that appears not to work, which is the failure this clause exists to prevent.
+        let blocked = stopped_text(
+            run,
+            &Stopped::Killed {
+                why: Some("it was waiting on a permission prompt".to_string()),
+                task: task(),
+            },
+        );
+        assert!(
+            blocked.contains("not asked to wind down first"),
+            "{blocked}"
+        );
+        assert!(blocked.contains("permission prompt"), "{blocked}");
     }
 
     #[test]
@@ -5950,7 +8524,12 @@ mod tests {
                 unreachable!("this test never dispatches")
             }
 
-            fn stop(&self, _run: RunId, _reason: Option<&str>) -> Result<(), String> {
+            fn stop(
+                &self,
+                _run: RunId,
+                _reason: Option<&str>,
+                _force: bool,
+            ) -> Result<Stopped, String> {
                 unreachable!("this test never stops a run")
             }
 
@@ -5972,6 +8551,45 @@ mod tests {
 
             fn dispatching(&self) -> Result<bool, String> {
                 Ok(true)
+            }
+
+            // This test is about the two tools that write a definition file; the settings tables
+            // are somewhere else entirely and nothing here reads them. `unreachable!` rather than
+            // a default, so a handler that grew a settings read would say so here rather than
+            // quietly resolving against an empty machine.
+            fn config(&self) -> Result<OrchestrationConfig, String> {
+                Ok(OrchestrationConfig {
+                    enabled: true,
+                    max_concurrent: 2,
+                    harness: Harness::Claude,
+                })
+            }
+
+            fn set_config(
+                &self,
+                _patch: OrchestrationPatch,
+            ) -> Result<OrchestrationConfig, String> {
+                unreachable!("this test never writes the project's config")
+            }
+
+            fn overrides(&self) -> Result<ProjectOverrides, String> {
+                Ok(ProjectOverrides::default())
+            }
+
+            fn set_overrides(&self, _overrides: ProjectOverrides) -> Result<(), String> {
+                unreachable!("this test never writes an override")
+            }
+
+            fn llm(&self) -> Result<LlmSettings, String> {
+                Ok(LlmSettings::default())
+            }
+
+            fn set_llm(&self, _llm: LlmSettings) -> Result<(), String> {
+                unreachable!("this test never writes the machine's providers")
+            }
+
+            fn resolutions(&self) -> Result<Vec<(AgentId, crate::overrides::Resolved)>, String> {
+                Ok(Vec::new())
             }
         }
 

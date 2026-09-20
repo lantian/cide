@@ -28,12 +28,24 @@
  * Run: `pnpm --dir ui run check:push`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const UI = resolve(import.meta.dirname, '..')
 const out = mkdtempSync(join(tmpdir(), 'cide-push-'))
+
+/*
+ * A second output directory, and it has to be **inside `ui`**.
+ *
+ * `gitOpStore.ts` is driven below as well as read, and unlike the two models it is not
+ * import-free: it imports `zustand`. A bare `import { create } from 'zustand'` is resolved
+ * relative to the emitted file's own path, so from `tmpdir()` there is no `node_modules` above
+ * it and the import dies with ERR_MODULE_NOT_FOUND before an assertion runs.
+ * `check-docker-render.mjs` places its bundle here for exactly this reason.
+ */
+mkdirSync(join(UI, 'node_modules/.cache'), { recursive: true })
+const storeOut = mkdtempSync(join(UI, 'node_modules/.cache', 'cide-push-store-'))
 
 let failed = 0
 const fail = (what, detail) => {
@@ -188,7 +200,12 @@ try {
         paths: { '@/*': ['src/*'] },
         types: [],
       },
-      files: [join(UI, 'src', 'chrome', 'pushModel.ts')],
+      // Two models in one compile, the shape `check-log-actions.mjs` uses. Both are import-free,
+      // which is what makes `types: []` survivable.
+      files: [
+        join(UI, 'src', 'chrome', 'pushModel.ts'),
+        join(UI, 'src', 'chrome', 'gitOpModel.ts'),
+      ],
     }),
   )
   execFileSync('node', ['node_modules/typescript/bin/tsc', '--project', tsconfig], {
@@ -197,6 +214,7 @@ try {
   })
 
   const m = await import(`file://${join(out, 'chrome', 'pushModel.js')}`)
+  const g = await import(`file://${join(out, 'chrome', 'gitOpModel.js')}`)
 
   // --- fixtures ------------------------------------------------------------------------------
 
@@ -421,6 +439,233 @@ try {
     )
   }
 
+  // --- the in-flight indicator (M65) -------------------------------------------------------
+  //
+  // Between pressing Push and the toast there was nothing at all, and `git_push` is one blocking
+  // round trip its own doc says can sit on the network "for minutes". These pin the parts of the
+  // answer that fail silently.
+
+  const gitOpModel = read('../src/chrome/gitOpModel.ts')
+  ok(
+    !/^\s*import\b/m.test(gitOpModel),
+    'gitOpModel.ts imports nothing either — same rule as pushModel.ts above, and the same ' +
+      'reason: one import and this script becomes a module-resolution error',
+  )
+
+  const running = (over = {}) => ({
+    id: 0,
+    project: 'p1',
+    kind: 'push',
+    done: 0,
+    total: 1,
+    ...over,
+  })
+
+  ok(g.gitOpLabel([], 'p1') === '', 'nothing running is the empty string, which draws nothing')
+  ok(
+    g.gitOpLabel([running({ project: 'other' })], 'p1') === '',
+    "and another project's push draws nothing HERE — the indicator is scoped exactly as a " +
+      'notice is, because in Stacked window mode one window holds every open project',
+  )
+  for (const [kind, verb] of [
+    ['push', 'Pushing…'],
+    ['pull', 'Pulling…'],
+    ['fetch', 'Fetching…'],
+    ['merge', 'Merging…'],
+  ]) {
+    ok(
+      g.gitOpLabel([running({ kind })], 'p1') === verb,
+      `${kind} says ${verb} — four verbs, because "Working…" over four different operations is ` +
+        'the readout saying less than the button that started it',
+    )
+  }
+  ok(
+    g.gitOpLabel([running({ total: 3 })], 'p1') === 'Pushing 0/3…',
+    'a fan-out over three repositories opens at 0/3 — `done` counts answers RECEIVED, so the ' +
+      'honest opening number is zero and it is the one that moves',
+  )
+  ok(
+    g.gitOpLabel([running({ total: 3, done: 2 })], 'p1') === 'Pushing 2/3…',
+    'and climbs as they land',
+  )
+  ok(
+    g.gitOpLabel([running({ id: 0, kind: 'push' }), running({ id: 1, kind: 'fetch' })], 'p1')
+      === 'Pushing…',
+    'two overlapping gestures: the OLDEST wins the label. Summing across kinds gives a ' +
+      'fraction whose halves count different things, and showing the newest makes the label ' +
+      'jump backwards the moment a second one starts — which reads as the first having failed',
+  )
+  ok(
+    g.gitOpTitle([running({ id: 0 }), running({ id: 1, kind: 'fetch' })], 'p1')
+      === 'Pushing · Fetching',
+    'the TOOLTIP is where the second gesture becomes visible — it has the room the 26px bar ' +
+      'does not, and it is the only surface that admits to more than one',
+  )
+  ok(g.gitOpTitle([], 'p1') === '', 'and it is empty when nothing is running')
+
+  // The store's two traps, both of which are invisible on a push that succeeds.
+  const store = stripComments(read('../src/chrome/gitOpStore.ts'))
+  ok(
+    /work\.then\(settle, settle\)/.test(store) && !/work\.finally\(/.test(store),
+    'trackGitOp attaches `then(settle, settle)` and never `.finally`. `.finally` returns a NEW ' +
+      'promise that rejects when the original does, with nothing attached to it — so one failed ' +
+      'fetch fires a second unhandledrejection and Failures raises a second toast, whose text ' +
+      'is the bare word `fetch` because describe() falls through a GitError with no message',
+  )
+  ok(
+    /return work\b/.test(store),
+    'and it hands back the ORIGINAL promise, not the derived one — otherwise whether a failure ' +
+      'is reported at all depends on every call site using the return value',
+  )
+
+  ok(
+    /beginGitOp\(project, 'push', previews\.length\)/.test(run),
+    'the push gesture is begun with previews.length, so four repositories draw `Pushing 0/4…` ' +
+      'and count up rather than one undifferentiated spinner for the lot',
+  )
+  ok(
+    /void sent\.then\(settle, settle\)/.test(run) && !/\.finally\(settle\)/.test(run),
+    'and pushPass settles the same way, for the same reason — this one is on top of an error ' +
+      'path that already toasts, so the symptom is two toasts for one failed push',
+  )
+
+  // Comments stripped, and in this repository that is mandatory rather than tidy: the house
+  // style is to name the failure a rule prevents, so this stylesheet's own prose spells
+  // `prefers-reduced-motion` and `font-size` while stating that it declares neither. Both
+  // assertions below passed by matching their own explanation the first time they ran.
+  const indicatorCss = stripComments(read('../src/chrome/GitOpIndicator.module.css'))
+  ok(
+    /animation-play-state:\s*var\(--motion-loop/.test(indicatorCss),
+    'the spinner answers reduced motion through --motion-loop. Nothing else in the suite can ' +
+      'see this: check:motion fences `transition` and is completely blind to `animation`. And ' +
+      'the tokens block deliberately does NOT zero --dur-sweep, because an infinite animation ' +
+      'at 0.01ms strobes — which is the opposite of what the setting asks for',
+  )
+  ok(
+    !/prefers-reduced-motion/.test(indicatorCss),
+    'and it does NOT declare its own media query — check:motion asserts exactly one such block ' +
+      'exists in ui/src and that it is in styles/tokens.css',
+  )
+  ok(
+    /animation:\s*statusbar-spin var\(--dur-sweep\)/.test(indicatorCss)
+      && /@keyframes statusbar-spin/.test(indicatorCss),
+    'the loop runs for --dur-sweep, the token that exists for exactly this',
+  )
+  ok(
+    !/font-size/.test(indicatorCss),
+    'and states no font-size — it inherits --fs-ui-12 from .bar, and a bare px value is a ' +
+      'label that silently stops following the UI font size',
+  )
+
+  /*
+   * The settle arithmetic, driven. (M65)
+   *
+   * The source rules above pin the *shape* of `trackGitOp`; this drives the counter, because
+   * every way it can be wrong is silent and permanent in one direction or the other. Settle once
+   * too few and the bar turns for the rest of the session over a push that finished; settle once
+   * too many and it goes clean while commits are still leaving the machine, which is the exact
+   * claim the indicator exists to make honestly.
+   */
+  const storeTsconfig = join(storeOut, 'tsconfig.json')
+  writeFileSync(
+    storeTsconfig,
+    JSON.stringify({
+      compilerOptions: {
+        target: 'es2022',
+        module: 'esnext',
+        moduleResolution: 'bundler',
+        strict: true,
+        exactOptionalPropertyTypes: true,
+        noUncheckedIndexedAccess: true,
+        verbatimModuleSyntax: true,
+        skipLibCheck: true,
+        noEmitOnError: true,
+        outDir: storeOut,
+        rootDir: join(UI, 'src'),
+        baseUrl: UI,
+        paths: { '@/*': ['src/*'] },
+        types: [],
+      },
+      // `gitOpStore.ts`'s other two imports are `import type`, which `verbatimModuleSyntax`
+      // erases — so the emitted file's only real dependency is zustand.
+      files: [join(UI, 'src', 'chrome', 'gitOpStore.ts')],
+    }),
+  )
+  execFileSync('node', ['node_modules/typescript/bin/tsc', '--project', storeTsconfig], {
+    stdio: 'inherit',
+    cwd: UI,
+  })
+  const live = await import(`file://${join(storeOut, 'chrome', 'gitOpStore.js')}`)
+  const label = () => g.gitOpLabel(live.useGitOps.getState().running, 'p1')
+
+  const oneUnit = live.beginGitOp('p1', 'push')
+  ok(label() === 'Pushing…', 'beginGitOp puts a gesture on the bar')
+  oneUnit()
+  ok(label() === '', 'and its settle takes it off again')
+  oneUnit()
+  ok(
+    label() === '',
+    'settling twice is a no-op. `then(settle, settle)` is the cheapest correct way to catch ' +
+      'both outcomes, so the guard is what makes that spelling safe',
+  )
+
+  const three = live.beginGitOp('p1', 'push', 3)
+  ok(label() === 'Pushing 0/3…', 'a fan-out over three repositories opens at 0/3')
+  three()
+  three()
+  ok(label() === 'Pushing 2/3…', 'and counts answers as they land')
+  three()
+  ok(label() === '', 'the last answer clears it')
+  three()
+  three()
+  ok(label() === '', 'and further settles can neither resurrect it nor drive `done` past `total`')
+
+  const elsewhere = live.beginGitOp('p2', 'fetch')
+  ok(
+    label() === '' && g.gitOpLabel(live.useGitOps.getState().running, 'p2') === 'Fetching…',
+    'a gesture is drawn only in its own project — the scope a notice has, for the reason a ' +
+      'notice has it',
+  )
+  elsewhere()
+
+  const zero = live.beginGitOp('p1', 'push', 0)
+  ok(
+    label() === '',
+    'a gesture with nothing to wait for never appears at all. Without this guard a zero-total ' +
+      'row sits in `running` for ever, because nothing will ever arrive to settle it',
+  )
+  zero()
+
+  const boom = new Error('boom')
+  const rejected = Promise.reject(boom)
+  const handed = live.trackGitOp('p1', 'pull', rejected)
+  ok(handed === rejected, 'trackGitOp hands back the ORIGINAL promise, not a derived one')
+  ok(label() === 'Pulling…', 'and marks it running')
+  let reached = null
+  try {
+    await handed
+  } catch (error) {
+    reached = error
+  }
+  ok(reached === boom, 'the rejection still reaches the caller untouched')
+  await new Promise((r) => setTimeout(r, 0))
+  ok(
+    label() === '',
+    'and a REJECTED promise clears the indicator too — the failure path is the one a naive ' +
+      '`await work; settle()` leaves turning for ever',
+  )
+
+  const bar = stripComments(read('../src/chrome/StatusBar.tsx'))
+  const branchAt = bar.indexOf('<BranchSelector />')
+  const indicatorAt = bar.indexOf('<GitOpIndicator />')
+  const trailAt = bar.indexOf('styles.path')
+  ok(
+    branchAt >= 0 && indicatorAt > branchAt && trailAt > indicatorAt,
+    'and the indicator sits between the branch and the file trail — it is the branch\'s news, ' +
+      'and it is the one slot on the bar that appears and disappears, so it goes beside the ' +
+      'item that is `flex: none` and ahead of the one that gives way',
+  )
+
   const commands = read('../../crates/cide-core/src/commands.rs')
   ok(
     /Command::new\("git\.push", "Push to remote…"/.test(commands),
@@ -429,6 +674,7 @@ try {
   )
 } finally {
   rmSync(out, { recursive: true, force: true })
+  rmSync(storeOut, { recursive: true, force: true })
 }
 
 if (failed > 0) {

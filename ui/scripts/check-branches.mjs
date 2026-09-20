@@ -1225,6 +1225,40 @@ try {
   ]) {
     ok(popup.includes(call), `BranchSelector.tsx actually calls ${call} — the merge action is wired up`)
   }
+
+  /*
+   * Every long operation in this popup reports itself to the status bar. (M65)
+   *
+   * Fetch, Pull and Merge are each a network round trip on a blocking Tauri command, and until
+   * M65 the only thing that said so was `disabled` on the buttons of a popup that is shut by
+   * then. An untracked road is invisible in exactly the way the feature exists to fix, and
+   * nothing else in the suite can see one — so each is pinned to the *call it wraps*.
+   *
+   * `trackGitOp` goes round `branchApi.*` and deliberately not round `store.run`: `run`'s
+   * promise resolves only after its `finally` re-runs `load()`, so wrapping it would leave the
+   * bar saying `Pulling…` through a status walk of every repository in the project.
+   */
+  for (const [call, verb] of [
+    ["trackGitOp(p, 'fetch', branchApi.fetch(p, r))", 'Fetch'],
+    ["trackGitOp(p, 'pull', branchApi.pull(p, r, request))", 'the pull the divergence dialog re-issues'],
+    ["trackGitOp(p, 'pull', branchApi.pull(p, r, { skipFetch: false, remember: false }))", 'the opening pull'],
+    ["trackGitOp(p, 'merge', branchApi.merge(p, r, name))", 'Merge'],
+  ]) {
+    ok(
+      popup.includes(call),
+      `${verb} tells the status bar it is running. The second pull road is the one that hides: ` +
+        '`one()` is re-issued from the strategy dialog long after tryPull’s finally has run, ' +
+        'and it is the SLOWER road, because it is the one that actually merges or rebases',
+    )
+  }
+  ok(
+    !/GitOp\s*=\s*'checkout' \| 'pull' \| 'merge' \| 'push' \| 'fetch'/.test(
+      stripComments(read('../src/chrome/branchModel.ts')),
+    ),
+    "and branchModel's GitOp gained no `fetch` arm — that type exists for a refusal shared by " +
+      'the operations that move the working tree onto another commit, and widening it to label ' +
+      'a spinner would put which-button-was-pressed into a type that exists for a sentence',
+  )
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

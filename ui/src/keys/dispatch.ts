@@ -72,6 +72,7 @@ import {
   type RepoDivergence,
 } from '@/chrome/pullStrategyModel'
 import { requestPullStrategy } from '@/chrome/pullStrategyStore'
+import { openFileProperties } from '@/chrome/filePropertiesOpen'
 import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { notify, notifyFailure } from '@/chrome/notices'
@@ -1467,6 +1468,39 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         withRepos(command, (project) => {
           void toolWindowApi.activate(project, null).catch(() => {})
         })
+        return
+      }
+
+      case 'file.properties': {
+        /*
+         * No window guard, deliberately — `file.properties`' clause omits `shellWindow` on
+         * `git.blame`'s precedent, because the card is an overlay and any window can raise one.
+         * The one control that needs a tool window is simply not drawn where there is not one;
+         * see `FileProperties.tsx`'s `onOpenHistory` prop.
+         *
+         * `args.path` wins so the two context menus name the row they were opened on, with
+         * `focusedTabPath` as the palette's fallback — `file.reveal`'s order and its two
+         * functions exactly. The path arrives **absolute**, which is what the tree, the tab
+         * strip and the editor all have.
+         *
+         * A *sentence* on every refusal rather than `unmet`, which writes to the diagnostic log
+         * and nothing to the screen: this command is bindable, and a key that does nothing is
+         * the defect this file has now found more than a dozen times.
+         */
+        const path = pathArg(args) ?? focusedTabPath(boot())
+        if (path === null) {
+          notify('No file tab is active, so there is nothing to describe.', {
+            kind: 'warn',
+            hint: 'Right-click a row in the file tree to see any file\u2019s properties.',
+          })
+          return
+        }
+        const project = activeProjectOf(boot())
+        if (project === null) {
+          notify('No project is open, so there is nothing to describe.', { kind: 'warn' })
+          return
+        }
+        openFileProperties(project.id, path)
         return
       }
 

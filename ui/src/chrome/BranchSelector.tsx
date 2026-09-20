@@ -39,6 +39,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { notify } from '@/chrome/notices'
 import { openPushDialog } from '@/chrome/pushRun'
+import { trackGitOp } from '@/chrome/gitOpStore'
 import { create } from 'zustand'
 import {
   branch as branchApi,
@@ -453,13 +454,27 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
     if (project === null || repo === null || busy) return
     const p = project
     const r = repo
+    /*
+     * **Both** pull roads are tracked, and the second is the one that is easy to miss. (M65)
+     *
+     * `one` is re-issued from the divergence dialog's `proceed` below, long after the `finally`
+     * at the foot of this function has run — and it is the *slower* road, because it is the one
+     * that actually merges or rebases. Tracking only the opening fetch-and-fast-forward would
+     * leave the bar silent for exactly the pull worth showing.
+     *
+     * The wrap goes round `branchApi.pull` and not round `store.run`, so the indicator clears
+     * when the pull answers rather than when the refresh walk that follows it does. `run`'s
+     * promise never rejects — it catches into `note` — and resolves only after `load()`, so
+     * wrapping it would have said *Pulling* through a status walk of every repository.
+     */
     const one = (request: Parameters<typeof branchApi.pull>[2]) =>
-      useBranches.getState().run(async () => fetchNote(await branchApi.pull(p, r, request)), 'pull')
+      useBranches
+        .getState()
+        .run(async () => fetchNote(await trackGitOp(p, 'pull', branchApi.pull(p, r, request))), 'pull')
 
     search.current?.focus()
     try {
-      await branchApi
-        .pull(p, r, { skipFetch: false, remember: false })
+      await trackGitOp(p, 'pull', branchApi.pull(p, r, { skipFetch: false, remember: false }))
         .then((outcome) => useBranches.getState().say(fetchNote(outcome)))
     } catch (error) {
       const diverged = divergenceOf(error)
@@ -562,7 +577,11 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
     useBranches.setState({ busy: true, note: null })
     void (async () => {
       try {
-        const outcome = await branchApi.merge(p, r, name)
+        // Tracked round the call itself rather than through the `finally` below, so the
+        // indicator clears when the merge answers and not when the refresh walk after it does.
+        // The conflict path returns from inside this `try`, and an awaited wrap has already
+        // settled by then. (M65)
+        const outcome = await trackGitOp(p, 'merge', branchApi.merge(p, r, name))
         if (outcome.conflicts.length > 0) {
           onDismiss()
           const state = await branchApi.conflicts(p, r)
@@ -684,8 +703,13 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   type="button"
                   className={styles.action}
                   disabled={busy || project === null || repo === null}
+                  // Tracked, so the bar says `Fetching…` for the whole network round trip.
+                  // `act` routes this through `store.run` as a `'checkout'` — `GitOp` has no
+                  // `fetch` arm and deliberately gains none, because that type exists for a
+                  // refusal shared by the operations that move the working tree. Which verb the
+                  // indicator says is a separate question, asked here. (M65)
                   onClick={() =>
-                    act(async (p, r) => fetchNote(await branchApi.fetch(p, r)))
+                    act(async (p, r) => fetchNote(await trackGitOp(p, 'fetch', branchApi.fetch(p, r))))
                   }
                 >
                   Fetch

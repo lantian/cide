@@ -136,6 +136,20 @@ export interface TasksPanelViewProps {
    * two narrowings compose: `groups` takes both and draws the intersection.
    */
   query?: string | undefined
+  /**
+   * Which task ids the query matched, or `null` for **no query at all**. (M68)
+   *
+   * A second prop beside `query` because the two answer different questions, and since M68 they
+   * come from different places: `query` is the text in the box, which this component draws and
+   * offers to clear, and this is `task_search`'s answer, which is the only thing that knows
+   * whether a task's *body* contains it. The board stopped carrying bodies, so the filter cannot
+   * be computed here any more — `matchesQuery`'s doc has the argument.
+   *
+   * `null` while an answer is outstanding, deliberately: a keystroke invalidates the previous
+   * answer, and narrowing to nothing for that frame would flash an empty board. A stale-but-whole
+   * list is a worse filter and a far better claim than an empty one.
+   */
+  matched?: ReadonlySet<string> | null | undefined
   /** Narrow the list to tasks matching this text, or (with `''`) stop narrowing. */
   onQuery?: ((query: string) => void) | undefined
   /**
@@ -161,6 +175,7 @@ export function TasksPanelView({
   filter = null,
   onFilter,
   query = '',
+  matched = null,
   onQuery,
   deleteArmed = null,
   onDeleteArm,
@@ -175,7 +190,7 @@ export function TasksPanelView({
    * offer a write" is how an `unreadable` board grows a New task button in a later edit.
    */
   const writable = canWrite(board)
-  const list = groups(board, filter, query)
+  const list = groups(board, filter, matched)
   /*
    * Why the list is empty, when it is — and the three answers are different screens.
    * `'tracker'` is the one that already existed; `'filter'` and `'search'` are a board with
@@ -184,7 +199,7 @@ export function TasksPanelView({
    * way out it offers. `null` when there is something to draw, and for every board arm that
    * has its own designed screen.
    */
-  const empty = listEmpty(board, filter, query)
+  const empty = listEmpty(board, filter, query, matched)
   /*
    * Resolved **once**, here, and handed down as a boolean. `armedDelete` refuses an arming whose
    * board has moved on, and doing that in one place is what stops the row and the card from

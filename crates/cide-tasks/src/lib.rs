@@ -49,6 +49,7 @@
 //! the model), for the same reason `cide_core::persist` owns none: a timer here would mean an
 //! async runtime in a domain crate.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -57,8 +58,8 @@ use cide_core::persist::{self, Debouncer};
 use cide_core::{CoreError, Result, document};
 use cide_ipc::{
     AttachTarget, ChangeName, CommentId, FileStamp, LinkType, Task, TaskAttachment,
-    TaskAttachmentId, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskId, TaskLink,
-    TaskLinkSpec, TaskNew, TaskStatusChange,
+    TaskAttachmentId, TaskAuthor, TaskBoard, TaskComment, TaskContent, TaskDetail, TaskEdit,
+    TaskFile, TaskId, TaskLink, TaskLinkSpec, TaskNew, TaskRow, TaskStatusChange,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -73,6 +74,19 @@ pub mod attachments;
 /// matcher runs, so this file is invisible to cide's own tree and watcher until that filter grows
 /// a seam for it; nothing in this crate depends on the watcher, and that is deliberate.
 pub const TASKS_RELATIVE: &str = ".cide/tasks.json";
+
+/// The directory holding one subdirectory per task: `.cide/tasks`. (M68)
+///
+/// A sibling of [`TASKS_RELATIVE`] rather than a parent of it, so the index keeps the path every
+/// existing project, every doc and `cide-hook`'s own matcher already know. Moving the index into
+/// this directory would make an older cide build see **no tracker at all** — and then offer *New
+/// task*, and write a fresh schema-1 file beside the new one. Two trackers in one repository is a
+/// worse failure than the one the move would tidy, and a v2 file at the old path already produces
+/// the right behaviour from an old build: `unreadable`, with nothing that writes.
+pub const TASKS_DIR: &str = ".cide/tasks";
+
+/// One task's content, inside its own directory: `task.json`.
+pub const CONTENT_FILE: &str = "task.json";
 
 /// `<root>/.cide/tasks.json`.
 pub fn tasks_path(project_root: &Path) -> PathBuf {
@@ -217,38 +231,49 @@ pub fn validate(file: &TaskFile) -> Result<()> {
                 )));
             }
         }
+    }
+    Ok(())
+}
 
-        // Attachment ids are unique **within the task, across the body and every comment**:
-        // an id is a path component under the task's own directory, so two records sharing
-        // one would alias two files onto one path — a stronger claim than a duplicate comment
-        // id, which only breaks a merge key. Tombstoned records count, as with links. (M39)
-        let mut seen_attachments: Vec<&str> = Vec::new();
-        for attachment in task
-            .attachments
-            .iter()
-            .chain(task.comments.iter().flat_map(|c| c.attachments.iter()))
-        {
-            if !well_formed_attachment_id(&attachment.id) {
-                return Err(CoreError::Invariant(format!(
-                    "task {} carries an attachment whose id {:?} is not usable as a path",
-                    task.id,
-                    attachment.id.as_str()
-                )));
-            }
-            if !well_formed_attachment_name(&attachment.name) {
-                return Err(CoreError::Invariant(format!(
-                    "task {} carries an attachment whose name {:?} is not one path component",
-                    task.id, attachment.name
-                )));
-            }
-            if seen_attachments.contains(&attachment.id.as_str()) {
-                return Err(CoreError::Invariant(format!(
-                    "task {} carries two attachments with the id {}",
-                    task.id, attachment.id
-                )));
-            }
-            seen_attachments.push(attachment.id.as_str());
+/// The invariants one task's [`TaskContent`] must hold for this build to write it. (M68)
+///
+/// `validate`'s rule 4, moved to the side of the split that can see the records. It runs where the
+/// content does: at load, and after any mutation that touches it — never over the index, which no
+/// longer carries an attachment anywhere and so cannot be asked.
+///
+/// The task's id is a parameter purely so the message can name it. Everything asserted here is a
+/// fact about one file.
+pub fn validate_content(id: &TaskId, content: &TaskContent) -> Result<()> {
+    // Attachment ids are unique **within the task, across the body and every comment**: an id is a
+    // path component under the task's own directory, so two records sharing one would alias two
+    // files onto one path — a stronger claim than a duplicate comment id, which only breaks a merge
+    // key. Tombstoned records count, as with links. (M39)
+    let mut seen: Vec<&str> = Vec::new();
+    for attachment in content
+        .attachments
+        .iter()
+        .chain(content.comments.iter().flat_map(|c| c.attachments.iter()))
+    {
+        if !well_formed_attachment_id(&attachment.id) {
+            return Err(CoreError::Invariant(format!(
+                "task {} carries an attachment whose id {:?} is not usable as a path",
+                id,
+                attachment.id.as_str()
+            )));
         }
+        if !well_formed_attachment_name(&attachment.name) {
+            return Err(CoreError::Invariant(format!(
+                "task {} carries an attachment whose name {:?} is not one path component",
+                id, attachment.name
+            )));
+        }
+        if seen.contains(&attachment.id.as_str()) {
+            return Err(CoreError::Invariant(format!(
+                "task {} carries two attachments with the id {}",
+                id, attachment.id
+            )));
+        }
+        seen.push(attachment.id.as_str());
     }
     Ok(())
 }
@@ -331,7 +356,7 @@ fn repair(file: &mut TaskFile) {
     // that is a field can follow the rename that a reference in prose never could.
     let mut reminted: Vec<(TaskId, TaskId)> = Vec::new();
 
-    let mut kept: Vec<Task> = Vec::with_capacity(file.tasks.len());
+    let mut kept: Vec<TaskRow> = Vec::with_capacity(file.tasks.len());
     for mut task in std::mem::take(&mut file.tasks) {
         if !well_formed_id(&task.id) {
             // A re-mint is a mint: it spends the counter, or the next create would hand out the
@@ -353,95 +378,6 @@ fn repair(file: &mut TaskFile) {
         if task.title.trim().is_empty() {
             tracing::warn!(id = %task.id, "task has no title; showing it as (untitled)");
             task.title = "(untitled)".to_string();
-        }
-        /*
-         * Every comment leaves this function with an id. (M21)
-         *
-         * A file written before `TaskComment::id` existed has none, and `#[serde(default)]` gives
-         * the empty string. An empty id must never reach `union_comments`, which merges *by* id:
-         * every comment in the file would be "the same comment" and the merge would collapse the
-         * whole log to one line. Repair is the seam that guarantees it cannot happen, which is
-         * the job this function already has for task ids one field up.
-         *
-         * Derived and not minted. `legacy_id` is a pure function of the old merge key, so two
-         * readers of the same file agree without either of them writing — and the file is not
-         * rewritten just for having been read by a newer build. A minted uuid here would be a
-         * different id per reader, which is a merge that duplicates every comment it touches:
-         * exactly the bug ids were added to prevent, introduced by the fix for it.
-         */
-        for comment in &mut task.comments {
-            if comment.id.is_empty() {
-                comment.id =
-                    TaskComment::legacy_id(&comment.author, comment.at_unix_ms, &comment.text);
-            }
-        }
-        /*
-         * An attachment record that cannot stand is **dropped, never re-minted.** (M39)
-         *
-         * The task and comment passes above re-mint or derive an id, because a task id or a
-         * comment id is only a key. An attachment id is a *directory name*: the bytes are filed
-         * under it. Re-minting the record would leave the file under the old name — an orphan
-         * with no symptom but a thumbnail that never loads, since `task_attachment_image` would
-         * look under the new one. Dropping the record leaves the bytes where they are for a
-         * person to find with `ls`, and says so in the log.
-         */
-        {
-            let task_id = task.id.clone();
-            let mut seen: Vec<String> = Vec::new();
-            let mut keep = |list: &mut Vec<TaskAttachment>| {
-                list.retain(|attachment| {
-                    if !well_formed_attachment_id(&attachment.id)
-                        || !well_formed_attachment_name(&attachment.name)
-                    {
-                        tracing::warn!(
-                            id = %task_id,
-                            attachment = %attachment.id,
-                            name = %attachment.name,
-                            "attachment record is not usable as a path; dropped it (its bytes, if any, are left on disk)"
-                        );
-                        return false;
-                    }
-                    if seen.contains(&attachment.id.0) {
-                        tracing::warn!(id = %task_id, attachment = %attachment.id, "duplicate attachment id; keeping the first");
-                        return false;
-                    }
-                    seen.push(attachment.id.0.clone());
-                    true
-                });
-            };
-            keep(&mut task.attachments);
-            for comment in &mut task.comments {
-                keep(&mut comment.attachments);
-            }
-        }
-        /*
-         * The creator of a task written before `Task::created_by` existed. (M21)
-         *
-         * That build recorded the answer by *seeding the log*: an agent-made task opened with one
-         * comment saying `created this task`, stamped at the same millisecond as the task, and a
-         * user-made one opened with nothing. So the fact is still in the file, and this reads it
-         * back rather than letting every such task decay to `User` — which is what the serde
-         * default gives, and which would credit the user with six subagents' work.
-         *
-         * Three conditions, all three needed. `User` on the left means *either* a file that had no
-         * field or a task genuinely created by the user, and the seeding rule says those two are
-         * the same set — a task this build wrote with a real creator is never overwritten. The
-         * text and the timestamp together are what stop an ordinary comment being adopted: an
-         * agent would have to write those exact three words in the millisecond the task was
-         * created, which is the same shape of coincidence `TaskComment::legacy_id` already accepts.
-         *
-         * Derived rather than defaulted, and derived *in memory*: opening a project does not
-         * rewrite the file, so a newer build reading a teammate's tracker leaves no diff. The next
-         * real mutation persists `created_by` along with everything else, and from then on this
-         * finds nothing to do.
-         */
-        if task.created_by == TaskAuthor::User
-            && let Some(seed) = task.comments.first()
-            && seed.author != TaskAuthor::User
-            && seed.text == LEGACY_CREATE_NOTE
-            && seed.at_unix_ms == task.created_unix_ms
-        {
-            task.created_by = seed.author.clone();
         }
         kept.push(task);
     }
@@ -489,6 +425,114 @@ fn repair(file: &mut TaskFile) {
     }
 
     file.tasks = kept;
+}
+
+/// [`repair`]'s content half: the passes that need a task's own file. (M68)
+///
+/// Called wherever content is loaded, before anything reads it — the same posture `repair` has for
+/// the index, and for the same reason: everything downstream of here, the merge above all, is
+/// entitled to assume these invariants hold.
+///
+/// **In memory only.** It does not mark the content dirty and does not cause a write. Opening a
+/// project must not rewrite a teammate's tracker for having been read by a newer build, and
+/// `the_creator_of_a_task_from_an_older_build_is_recovered_from_its_seeded_comment` asserts exactly
+/// that byte-for-byte. The next real mutation persists whatever this derived, along with everything
+/// else, and from then on it finds nothing to do.
+pub fn repair_content(id: &TaskId, content: &mut TaskContent) {
+    /*
+     * Every comment leaves this function with an id. (M21)
+     *
+     * A file written before `TaskComment::id` existed has none, and `#[serde(default)]` gives the
+     * empty string. An empty id must never reach `union_comments`, which merges *by* id: every
+     * comment in the file would be "the same comment" and the merge would collapse the whole log to
+     * one line. Repair is the seam that guarantees it cannot happen, which is the job it already has
+     * for task ids on the index side.
+     *
+     * Derived and not minted. `legacy_id` is a pure function of the old merge key, so two readers of
+     * the same file agree without either of them writing — and the file is not rewritten just for
+     * having been read by a newer build. A minted uuid here would be a different id per reader,
+     * which is a merge that duplicates every comment it touches: exactly the bug ids were added to
+     * prevent, introduced by the fix for it.
+     */
+    for comment in &mut content.comments {
+        if comment.id.is_empty() {
+            comment.id = TaskComment::legacy_id(&comment.author, comment.at_unix_ms, &comment.text);
+        }
+    }
+    /*
+     * An attachment record that cannot stand is **dropped, never re-minted.** (M39)
+     *
+     * The task and comment passes re-mint or derive an id, because a task id or a comment id is only
+     * a key. An attachment id is a *directory name*: the bytes are filed under it. Re-minting the
+     * record would leave the file under the old name — an orphan with no symptom but a thumbnail
+     * that never loads, since `task_attachment_image` would look under the new one. Dropping the
+     * record leaves the bytes where they are for a person to find with `ls`, and says so in the log.
+     */
+    let mut seen: Vec<String> = Vec::new();
+    let mut keep = |list: &mut Vec<TaskAttachment>| {
+        list.retain(|attachment| {
+            if !well_formed_attachment_id(&attachment.id)
+                || !well_formed_attachment_name(&attachment.name)
+            {
+                tracing::warn!(
+                    id = %id,
+                    attachment = %attachment.id,
+                    name = %attachment.name,
+                    "attachment record is not usable as a path; dropped it (its bytes, if any, are left on disk)"
+                );
+                return false;
+            }
+            if seen.contains(&attachment.id.0) {
+                tracing::warn!(id = %id, attachment = %attachment.id, "duplicate attachment id; keeping the first");
+                return false;
+            }
+            seen.push(attachment.id.0.clone());
+            true
+        });
+    };
+    keep(&mut content.attachments);
+    for comment in &mut content.comments {
+        keep(&mut comment.attachments);
+    }
+}
+
+/// The creator of a task written before `Task::created_by` existed, read back out of its log. (M21)
+///
+/// # Why this is its own function now
+///
+/// It is the one repair that needs **both halves** of a task: the row carries `created_by` and
+/// `created_unix_ms`, the content carries the seeded comment. Before M68 both were in one struct and
+/// this was six lines inside `repair`; the split makes it a join, and a join with one caller is a
+/// function rather than a comment explaining which loop it has to live in.
+///
+/// That build recorded the answer by *seeding the log*: an agent-made task opened with one comment
+/// saying `created this task`, stamped at the same millisecond as the task, and a user-made one
+/// opened with nothing. So the fact is still in the file, and this reads it back rather than letting
+/// every such task decay to `User` — which is what the serde default gives, and which would credit
+/// the user with six subagents' work.
+///
+/// Three conditions, all three needed. `User` on the row means *either* a file that had no field or
+/// a task genuinely created by the user, and the seeding rule says those two are the same set — so a
+/// task this build wrote with a real creator is never overwritten. The text and the timestamp
+/// together are what stop an ordinary comment being adopted: an agent would have to write those
+/// exact three words in the millisecond the task was created, which is the same shape of coincidence
+/// [`TaskComment::legacy_id`] already accepts.
+///
+/// `None` means *nothing to recover*, which is the overwhelmingly common answer. The caller applies
+/// it to the row **in memory** and marks nothing dirty; see [`repair_content`].
+#[must_use]
+pub fn recovered_creator(row: &TaskRow, content: &TaskContent) -> Option<TaskAuthor> {
+    if row.created_by != TaskAuthor::User {
+        return None;
+    }
+    let seed = content.comments.first()?;
+    if seed.author != TaskAuthor::User
+        && seed.text == LEGACY_CREATE_NOTE
+        && seed.at_unix_ms == row.created_unix_ms
+    {
+        return Some(seed.author.clone());
+    }
+    None
 }
 
 /// The largest `n` across every `t-<n>` in the file.
@@ -558,12 +602,130 @@ fn mint_id(file: &mut TaskFile) -> TaskId {
 }
 
 /// Look one task up by id.
-pub fn find<'a>(file: &'a TaskFile, id: &TaskId) -> Option<&'a Task> {
+pub fn find<'a>(file: &'a TaskFile, id: &TaskId) -> Option<&'a TaskRow> {
     file.tasks.iter().find(|task| &task.id == id)
 }
 
-fn find_mut<'a>(file: &'a mut TaskFile, id: &TaskId) -> Option<&'a mut Task> {
+fn find_mut<'a>(file: &'a mut TaskFile, id: &TaskId) -> Option<&'a mut TaskRow> {
     file.tasks.iter_mut().find(|task| &task.id == id)
+}
+
+/// The other half of [`TaskRow::of`]: a task's content, projected out of it. (M68)
+///
+/// The pair is what lets every mutation go on operating on a whole [`Task`] — the shape each arm of
+/// `TaskEdit` was written against — while the store keeps the two halves in two files. `TaskRow::of` and
+/// this together are a lossless split, and [`task_of`] is the join; the round trip is asserted.
+#[must_use]
+pub fn content_of(task: &Task) -> TaskContent {
+    TaskContent {
+        body: task.body.clone(),
+        comments: task.comments.clone(),
+        history: task.history.clone(),
+        attachments: task.attachments.clone(),
+    }
+}
+
+/// A row and its content, joined back into the [`Task`] every mutation is written against. (M68)
+///
+/// The counts on the row are **not** consulted: they are a cache of what the content says, and the
+/// content is here. Reading them instead would be the one way this join could hand back a `Task`
+/// that disagrees with itself — and `TaskRow::of` on the result recomputes them, which is what makes the
+/// round trip lossless rather than merely reversible.
+#[must_use]
+pub fn task_of(row: &TaskRow, content: &TaskContent) -> Task {
+    Task {
+        id: row.id.clone(),
+        title: row.title.clone(),
+        status: row.status,
+        agent: row.agent.clone(),
+        session: row.session,
+        change: row.change.clone(),
+        links: row.links.clone(),
+        created_by: row.created_by.clone(),
+        created_unix_ms: row.created_unix_ms,
+        updated_unix_ms: row.updated_unix_ms,
+        body: content.body.clone(),
+        comments: content.comments.clone(),
+        attachments: content.attachments.clone(),
+        history: content.history.clone(),
+    }
+}
+
+/// One whole task as `task_get` answers it: its row, joined to everything the row leaves out. (M68)
+///
+/// The row comes from [`TaskRow::of`] rather than being spelled again here, which is the point of the
+/// nesting [`TaskDetail`] documents: the two counts have one producer, and a task's card and a
+/// task's row can never disagree about how many comments it has.
+///
+/// Everything below the row is copied verbatim, tombstones included. Dropping them here was
+/// considered and rejected: `adapt.ts` is where a tombstone stops existing, deliberately — it is
+/// the one seam that knows the panel has no use for one, and a second filter in Rust would mean two
+/// answers to *what is a live comment* with the merge's correctness resting on the other one.
+#[must_use]
+pub fn detail_of(task: &Task) -> TaskDetail {
+    TaskDetail {
+        row: TaskRow::of(task),
+        body: task.body.clone(),
+        comments: task.comments.clone(),
+        attachments: task.attachments.clone(),
+        history: task.history.clone(),
+    }
+}
+
+/// Which tasks match a search box's query: the ids, in the file's own order. (M68)
+///
+/// # Why this is in Rust, when it was a `filter` in the webview
+///
+/// Because the text it searches stopped being in the webview. The rule is the one
+/// `ui/src/sidebar/TasksPanel/model.ts`'s `matchesQuery` documents and it is deliberate on both
+/// counts: the **id, the title and the body**, because that is what somebody half-remembering a
+/// task recalls — and **not the comments**, because a query would then match a task on a word an
+/// agent used in a progress note, which is not what the person asking meant.
+///
+/// The body is the reason it moved. A board that carried every body was a 2.19 MB payload
+/// `eval`ed per window per mutation (see [`TaskRow`]); a board that does not carry them cannot
+/// filter on them, and a search box that quietly stopped matching bodies would answer *nothing
+/// matched* — a confident false negative, which is precisely the "my tasks are gone" reading the
+/// panel's empty screens are written to avoid.
+///
+/// A free function over a whole [`TaskFile`] so it is testable without a disk, on this section's
+/// stated idiom. Case-insensitive, and an empty or whitespace-only query matches **everything**:
+/// the caller's "no filter" state must not be spelled as a query that matches nothing.
+///
+/// # Why the body arrives through a closure
+///
+/// Because since M68 it is in another file, and this function must not be the thing that decides
+/// how many of them to open. `body_of` lets the **store** own that policy — it loads and caches
+/// content, and a search is the one operation that genuinely wants all of it — while the rule
+/// itself stays a pure function over injected text, which is what keeps the corpus test able to
+/// state *id, title, body, never the comments* without a disk anywhere near it.
+///
+/// `None` from `body_of` means *that body could not be read*, and it is treated as a miss rather
+/// than as an error: one unreadable content file must not turn a search into a refusal, because the
+/// refusal would be indistinguishable from "nothing matched" at the only place it is seen.
+#[must_use]
+pub fn search(
+    file: &TaskFile,
+    body_of: &dyn Fn(&TaskId) -> Option<String>,
+    query: &str,
+) -> Vec<TaskId> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return file.tasks.iter().map(|task| task.id.clone()).collect();
+    }
+    file.tasks
+        .iter()
+        .filter(|task| {
+            let hit = |text: &str| text.to_lowercase().contains(&needle);
+            hit(task.id.as_str())
+                || hit(task.title.as_str())
+                // Asked **last**, and only when the row itself missed: the body is in another file,
+                // so every call to this is a read. Two thirds of a real query's hits are on the id
+                // or the title, and the cheap half of the rule is free.
+                || body_of(&task.id).is_some_and(|body| hit(&body))
+        })
+        .map(|task| task.id.clone())
+        .collect()
 }
 
 /// The tagged refusal every "no such X" in the domain gets — `NoSuchTab` and `NoSuchPane`'s
@@ -795,7 +957,7 @@ fn apply_link(
     link: LinkType,
     target: &TaskId,
     now: u64,
-) -> Result<Task> {
+) -> Result<TaskRow> {
     if find(file, id).is_none() {
         return Err(no_such_task(id));
     }
@@ -807,7 +969,7 @@ fn apply_link(
     }
 
     let wire = link_wire(link);
-    let live = |task: &Task, kind: LinkType, to: &TaskId| {
+    let live = |task: &TaskRow, kind: LinkType, to: &TaskId| {
         task.links
             .iter()
             .any(|l| l.link == kind && &l.target == to && !l.deleted)
@@ -886,12 +1048,12 @@ fn apply_unlink(
     link: LinkType,
     target: &TaskId,
     now: u64,
-) -> Result<Task> {
+) -> Result<TaskRow> {
     if find(file, id).is_none() {
         return Err(no_such_task(id));
     }
 
-    let tombstone = |task: &mut Task, kind: LinkType, to: &TaskId| -> bool {
+    let tombstone = |task: &mut TaskRow, kind: LinkType, to: &TaskId| -> bool {
         let Some(edge) = task
             .links
             .iter_mut()
@@ -1018,11 +1180,11 @@ fn validated_links(specs: &[TaskLinkSpec], file: &TaskFile, now: u64) -> Result<
 /// their cursor because a teammate pushed is the visible harm, and an adopted task is new to this
 /// process, so it goes where new things go.
 pub fn merge(mine: &TaskFile, theirs: &TaskFile) -> TaskFile {
-    let mut tasks: Vec<Task> = Vec::with_capacity(mine.tasks.len() + theirs.tasks.len());
+    let mut tasks: Vec<TaskRow> = Vec::with_capacity(mine.tasks.len() + theirs.tasks.len());
 
     for ours in &mine.tasks {
         match find(theirs, &ours.id) {
-            Some(disk) => tasks.push(merge_task(ours, disk)),
+            Some(disk) => tasks.push(merge_row(ours, disk)),
             // Only in memory: created here since the last read, or deleted there. Kept, see above.
             None => tasks.push(ours.clone()),
         }
@@ -1052,24 +1214,25 @@ pub fn merge(mine: &TaskFile, theirs: &TaskFile) -> TaskFile {
     }
 }
 
-/// One task that exists on both sides.
+/// One task's **row**, where the task exists on both sides. (M68)
 ///
-/// The scalar fields come from the newer of the two and the comments come from both, which is the
-/// asymmetry worth stating out loud: a status change and a comment are different kinds of edit,
-/// and a subagent that comments while the orchestrator moves the task to `Review` must not lose
-/// either. Ties go to `mine` — an arbitrary choice, but a *stable* one, so the same two files
-/// merge to the same result whichever side reads first.
-fn merge_task(mine: &Task, theirs: &Task) -> Task {
+/// The scalar fields come from the newer of the two and the *links* come from both, which is the
+/// asymmetry worth stating out loud: a status change and a link are different kinds of edit, and a
+/// subagent that links while the orchestrator moves the task to `Review` must not lose either. Ties
+/// go to `mine` — an arbitrary choice, but a *stable* one, so the same two files merge to the same
+/// result whichever side reads first.
+///
+/// The comments, the history and the attachment records used to be merged here too. They live in the
+/// task's own file now, so [`merge_content`] has them — and the split is what bounds the work:
+/// `reconcile` merges the index always and content only for tasks this process actually touched.
+fn merge_row(mine: &TaskRow, theirs: &TaskRow) -> TaskRow {
     let mut winner = if theirs.updated_unix_ms > mine.updated_unix_ms {
         theirs.clone()
     } else {
         mine.clone()
     };
 
-    winner.comments = union_comments(&mine.comments, &theirs.comments);
-    winner.history = union_history(&mine.history, &theirs.history);
     winner.links = union_links(&mine.links, &theirs.links);
-    winner.attachments = union_attachments(&mine.attachments, &theirs.attachments);
     // The creation stamp is the earlier of the two by definition: a task cannot have been created
     // twice, and if the two disagree one of them was hand-edited. The earlier is the safer read.
     winner.created_unix_ms = mine.created_unix_ms.min(theirs.created_unix_ms);
@@ -1090,33 +1253,78 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
     } else {
         mine.created_by.clone()
     };
-    // `updated_unix_ms` follows the winner already, but a comment adopted from the loser is itself
-    // an update, and a merged task whose stamp predates its own newest comment would lose the next
-    // merge it takes part in. A history row adopted from the loser is an update by the identical
-    // argument.
-    if let Some(newest) = winner.comments.iter().map(|c| c.at_unix_ms).max() {
-        winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
-    }
-    if let Some(newest) = winner.history.iter().map(|c| c.at_unix_ms).max() {
-        winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
-    }
-    // A link edge adopted from the loser is an update by the same argument — and here it is
-    // load-bearing twice over, because an adopted edge's stamp is what wins it the *next* merge.
+    // A link edge adopted from the loser is itself an update, and a merged row whose stamp predates
+    // its own newest edge would lose the next merge it takes part in — load-bearing twice over,
+    // because an adopted edge's stamp is what wins it that next merge.
     if let Some(newest) = winner.links.iter().map(|l| l.at_unix_ms).max() {
         winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
     }
-    // An attachment adopted from the loser — on the body or on a comment — is an update by the
-    // same argument.
-    if let Some(newest) = winner
-        .attachments
-        .iter()
-        .chain(winner.comments.iter().flat_map(|c| c.attachments.iter()))
-        .map(|a| a.added_unix_ms)
-        .max()
-    {
-        winner.updated_unix_ms = winner.updated_unix_ms.max(newest);
-    }
+    /*
+     * The two counts follow the **winner** and are not recomputed here, which is the one place this
+     * function knowingly hands back a row that may disagree with the content beside it.
+     *
+     * It cannot do better: the content is in another file that this merge has deliberately not
+     * opened, so there is nothing to count. Both alternatives are worse. Taking the *larger* of the
+     * two would invent a number neither side ever held. Loading the content to count it would make
+     * every index merge open every task's file, which is the cost the split removed — and it would
+     * do so on the write path, where the merge already holds the store's lock.
+     *
+     * The disagreement is bounded and self-healing: it can only exist for a task whose content this
+     * process has not loaded, and the moment anything loads it — `compose`, a search, a card opening
+     * — `TaskRow::of` recomputes both numbers from the file. Invariant 2 in one sentence: the counts are
+     * a cache, and the content is the truth.
+     */
     winner
+}
+
+/// One task's **content**, where both sides have a copy. (M68)
+///
+/// Every rule here predates the split and none of them changed: the four unions are per-vector, and
+/// what they defend against — a tombstone that must not be resurrected, a comment edited on one side
+/// while a file was attached on the other — is a property of the vectors rather than of the file they
+/// happened to be stored in. That is the reason this is a new *caller* and not new logic.
+///
+/// The row's `updated_unix_ms` is **not** set here, because a row is not in scope. The caller raises
+/// it through [`newest_content_stamp`]; skipping that is invariant 4, and breaking it makes a merged
+/// task quietly lose the next merge it takes part in and quietly stop sorting to the top of its group.
+#[must_use]
+pub fn merge_content(mine: &TaskContent, theirs: &TaskContent) -> TaskContent {
+    // The body follows neither side by stamp, because content carries no stamp of its own: the row
+    // does. `mine` wins, which is this module's standing convention for a tie — and the case where
+    // the two bodies genuinely differ is a concurrent edit of the same prose, which no rule can
+    // resolve well and which `TaskEdit::SetBody` makes a deliberate, visible gesture on both sides.
+    TaskContent {
+        body: mine.body.clone(),
+        comments: union_comments(&mine.comments, &theirs.comments),
+        history: union_history(&mine.history, &theirs.history),
+        attachments: union_attachments(&mine.attachments, &theirs.attachments),
+    }
+}
+
+/// The newest moment anything in a task's content happened, for invariant 4. (M68)
+///
+/// A comment, a history row or an attachment adopted from the losing side of a merge is *an update*,
+/// and a row whose `updated_unix_ms` predates its own newest comment loses the next merge it takes
+/// part in — and sorts below tasks nothing has happened to, since that field is also the panel's
+/// in-group order. Before the split `merge_task` raised the stamp itself; now the row and the content
+/// are merged in different places, so the fact has to travel.
+///
+/// `None` for content with nothing in it at all, which is an ordinary task nobody has commented on.
+#[must_use]
+pub fn newest_content_stamp(content: &TaskContent) -> Option<u64> {
+    content
+        .comments
+        .iter()
+        .map(|c| c.at_unix_ms)
+        .chain(content.history.iter().map(|h| h.at_unix_ms))
+        .chain(
+            content
+                .attachments
+                .iter()
+                .chain(content.comments.iter().flat_map(|c| c.attachments.iter()))
+                .map(|a| a.added_unix_ms),
+        )
+        .max()
 }
 
 /// Both sides' comments, oldest first, with exact duplicates collapsed.
@@ -1296,6 +1504,14 @@ pub enum ReadOutcome {
     /// Read, understood, and already through `repair`.
     Ready {
         file: TaskFile,
+        /// The content a schema-1 → 2 migration lifted out of the index, or `None` for a file that
+        /// was already current. (M68)
+        ///
+        /// `Some` means **this content exists in memory and nowhere on disk**, so the store's `open`
+        /// has to flush it rather than wait for a mutation. It travels here rather than as a field of
+        /// [`TaskFile`] because a field would be a second, permanent place a task's content could
+        /// live, and the first hand-edited file that used it would have two answers for one task.
+        migrated: Option<HashMap<TaskId, TaskContent>>,
         /// Stamped **before** the bytes were read, deliberately. See [`read`].
         stamp: Option<FileStamp>,
     },
@@ -1363,32 +1579,154 @@ pub fn read(path: &Path) -> ReadOutcome {
         };
     };
     let current = u64::from(TaskFile::CURRENT_SCHEMA);
-    if version != current {
-        // Both directions refuse, and neither renames. A **newer** schema is a teammate on a newer
-        // build whose file this one would silently downgrade on the next flush, dropping every
-        // field it does not know — the failure is total and it lands in their repository. An
-        // **older** one has no migration ladder yet; when schema 2 arrives, the ladder goes here,
-        // modelled on `persist::migrate`, and this arm shrinks to the `v > current` half.
-        let direction = if version > current {
-            "newer than this build's"
-        } else {
-            "older than this build's, and no migration exists for it:"
-        };
+    // A **newer** schema refuses, and does not rename. It is a teammate on a newer build whose file
+    // this one would silently downgrade on the next flush, dropping every field it does not know —
+    // the failure is total and it lands in their repository.
+    if version > current {
         return ReadOutcome::Refused {
-            error: format!("task file schema {version} is {direction} {current}"),
+            error: format!("task file schema {version} is newer than this build's {current}"),
+        };
+    }
+    if version < u64::from(TaskFile::OLDEST_READABLE_SCHEMA) {
+        return ReadOutcome::Refused {
+            error: format!(
+                "task file schema {version} is older than this build can read ({})",
+                TaskFile::OLDEST_READABLE_SCHEMA
+            ),
         };
     }
 
-    match serde_json::from_str::<TaskFile>(&raw) {
+    // An **older** one is migrated. (M68) One arm per step, each rewriting the document one version
+    // forward — `persist::migrate`'s ladder, and the reason it works on a `Value`: the document no
+    // longer has the shape the current `TaskFile` describes, and the version has to be readable
+    // before anything commits to a shape.
+    let (value, migrated) = match migrate(value, version) {
+        Ok(answer) => answer,
+        Err(error) => {
+            return ReadOutcome::Refused {
+                error: format!("task file schema {version} could not be migrated: {error}"),
+            };
+        }
+    };
+
+    // From the migrated `Value` when there was a migration, from the raw text when there was not.
+    // The text path is not an optimisation — it is what keeps an unmigrated read byte-exact about
+    // field order and numeric spelling, which `serde_json::Value` does not promise.
+    let parsed = if migrated.is_some() {
+        serde_json::from_value::<TaskFile>(value).map_err(|e| e.to_string())
+    } else {
+        serde_json::from_str::<TaskFile>(&raw).map_err(|e| e.to_string())
+    };
+    match parsed {
         Ok(mut file) => {
             repair(&mut file);
-            ReadOutcome::Ready { file, stamp }
+            ReadOutcome::Ready {
+                file,
+                stamp,
+                // A migrated file's content is in memory and **nowhere on disk yet**, so the store
+                // must flush it rather than wait for a mutation. This flag is how `open` knows;
+                // without it a converted tracker would sit with an index in memory and no content
+                // files until somebody happened to edit something.
+                migrated,
+            }
         }
-        Err(error) => ReadOutcome::Unparseable {
-            error: error.to_string(),
-            conflicted,
-        },
+        Err(error) => ReadOutcome::Unparseable { error, conflicted },
     }
+}
+
+/// Bring a raw tracker document up to [`TaskFile::CURRENT_SCHEMA`]. (M68)
+///
+/// A ladder: one arm per supported older schema, each rewriting the document one step forward and
+/// re-entering. Adding version 3 is an arm, not a restructuring — `cide_core::persist::migrate` is
+/// the model and its doc carries the argument for taking JSON rather than a typed value.
+///
+/// Answers `(document, migrated)`, where `migrated` is false only for a document that was already
+/// current. The caller needs to know, because a migrated tracker's content exists **in memory only**
+/// and has to be flushed before anything else reads it.
+type Migrated = Option<HashMap<TaskId, TaskContent>>;
+
+fn migrate(value: Value, version: u64) -> std::result::Result<(Value, Migrated), String> {
+    let current = u64::from(TaskFile::CURRENT_SCHEMA);
+    if version == current {
+        return Ok((value, None));
+    }
+    let mut value = value;
+    let mut version = version;
+    let mut content: HashMap<TaskId, TaskContent> = HashMap::new();
+    while version < current {
+        let (next, lifted) = match version {
+            1 => v1_to_v2(value)?,
+            other => return Err(format!("no migration from schema {other}")),
+        };
+        value = next;
+        // Later steps win, because a step that touched a task's content produced the newer answer for
+        // it. There are no later steps yet; the `extend` is what makes adding one an arm rather than
+        // a rethink.
+        content.extend(lifted);
+        version += 1;
+    }
+    Ok((value, Some(content)))
+}
+
+/// Schema 1 → 2: lift each task's body, log, history and files out of the index. (M68)
+///
+/// Schema 1 held every task whole inside `.cide/tasks.json`. Schema 2 keeps a [`TaskRow`] there and
+/// puts the rest in `.cide/tasks/<id>/task.json`, so this rewrites each element of `tasks` into a row
+/// — and hands the content back **inside the same document**, under a key the current `TaskFile` does
+/// not have, so that `read` can hand it to the store in one piece.
+///
+/// # Why the content rides in the document rather than being written here
+///
+/// Because `read` is a *read*. It is called by `reload`, by `refresh_from_disk`, by
+/// `cide-headless tasks` and by tests, and a function that wrote 135 files as a side effect of being
+/// asked what a file says would be a surprise in every one of those places. The store's `open` is the
+/// one caller that owns the conversion, and it is the one that flushes.
+///
+/// The two counts are computed here through [`TaskRow::of`] — the single producer, as everywhere else — by
+/// parsing each element as a whole `Task` first. That is also the migration's validation: an element
+/// that will not parse as a `Task` is a tracker this build cannot convert, and it says so rather than
+/// silently dropping the task.
+fn v1_to_v2(value: Value) -> std::result::Result<(Value, HashMap<TaskId, TaskContent>), String> {
+    let mut root = match value {
+        Value::Object(map) => map,
+        _ => return Err("a task file must be a JSON object".to_string()),
+    };
+    let tasks = root
+        .get("tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut rows = Vec::with_capacity(tasks.len());
+    let mut content = HashMap::with_capacity(tasks.len());
+    for element in tasks {
+        let mut task: Task = serde_json::from_value(element)
+            .map_err(|error| format!("a schema 1 task will not parse: {error}"))?;
+        /*
+         * The creator recovery happens **here**, and this is the right moment for it. (M21, M68)
+         *
+         * A task written before `Task::created_by` existed records its creator by having a seeded
+         * first comment, and `recovered_creator` reads it back. Before M68 that ran on every read
+         * and was deliberately never persisted, because reading a teammate's tracker must not
+         * rewrite it.
+         *
+         * A migration is the one read that *is* a rewrite, and it is the only read that has both
+         * halves of a legacy task in hand at once — the row's `created_by` and the log that answers
+         * it. So the answer is written down once, here, instead of being re-derived by every
+         * content load for the rest of the file's life. After this, `t-1` simply says who asked.
+         */
+        if let Some(author) = recovered_creator(&TaskRow::of(&task), &content_of(&task)) {
+            task.created_by = author;
+        }
+        let row = serde_json::to_value(TaskRow::of(&task))
+            .map_err(|error| format!("could not encode a migrated row: {error}"))?;
+        content.insert(task.id.clone(), content_of(&task));
+        rows.push(row);
+    }
+
+    root.insert("schemaVersion".to_string(), Value::from(2u32));
+    root.insert("tasks".to_string(), Value::Array(rows));
+    Ok((Value::Object(root), content))
 }
 
 /// Whether the file still has both sides of a merge in it.
@@ -1449,10 +1787,14 @@ enum DiskState {
 /// user with a deletion plus an untracked file at the exact moment they are least able to reason
 /// about it. `TaskBoard::Unreadable`'s doc names this case by name; the conflict check is what
 /// makes both that doc and `persist::load`'s discipline true at once.
-fn load(path: &Path) -> (TaskFile, DiskState, Option<FileStamp>) {
+fn load(path: &Path) -> (TaskFile, DiskState, Option<FileStamp>, Migrated) {
     match read(path) {
-        ReadOutcome::Absent => (TaskFile::default(), DiskState::Absent, None),
-        ReadOutcome::Ready { file, stamp } => (file, DiskState::Ready, stamp),
+        ReadOutcome::Absent => (TaskFile::default(), DiskState::Absent, None, None),
+        ReadOutcome::Ready {
+            file,
+            stamp,
+            migrated,
+        } => (file, DiskState::Ready, stamp, migrated),
         ReadOutcome::Refused { error } => {
             tracing::warn!(path = %path.display(), %error, "task file left untouched");
             (
@@ -1461,6 +1803,8 @@ fn load(path: &Path) -> (TaskFile, DiskState, Option<FileStamp>) {
                 // Deliberately no stamp. A `None` here means the next write preflight sees a
                 // mismatch against anything and re-reads, which is what should happen: the file is
                 // one this build refused, and the moment it changes is the moment to look again.
+                None,
+                // Nothing was migrated: the file was not read.
                 None,
             )
         }
@@ -1479,6 +1823,7 @@ fn load(path: &Path) -> (TaskFile, DiskState, Option<FileStamp>) {
                     error: format!("{error} (the file still contains merge conflict markers)"),
                 },
                 None,
+                None,
             )
         }
         ReadOutcome::Unparseable {
@@ -1490,7 +1835,12 @@ fn load(path: &Path) -> (TaskFile, DiskState, Option<FileStamp>) {
                 Some(to) => format!("{error} — the file was moved aside to {}", to.display()),
                 None => error,
             };
-            (TaskFile::default(), DiskState::Quarantined { error }, None)
+            (
+                TaskFile::default(),
+                DiskState::Quarantined { error },
+                None,
+                None,
+            )
         }
     }
 }
@@ -1599,8 +1949,275 @@ fn quarantine_path(path: &Path, n: u32) -> PathBuf {
 /// The temp file it publishes through is a dot-prefixed sibling, which matters more here than it
 /// does for `workspace.json`: this one lands in the user's working tree, where a visible
 /// `tasks.json.12345.0.tmp` would sit in `git status` for as long as a failed write left it behind.
+/// Write one task's content, creating its directory. Answers with the stamp of what landed. (M68)
+///
+/// `write_shared`'s mode, for its reason: the file is committed, a teammate reads it, and 0600 would
+/// make a tracker one developer could read and another could not. The **directory** gets the same
+/// treatment by being created with the process umask rather than a tightened mode — a 0700 directory
+/// holding 0644 files is a file nobody but the owner can reach, which is the mode question asked one
+/// level up and got wrong the first time somebody writes `create_dir` with explicit permissions.
+fn write_content(root: &Path, id: &TaskId, content: &TaskContent) -> Result<Option<FileStamp>> {
+    let dir = content_dir(root, id);
+    fs::create_dir_all(&dir)
+        .map_err(|error| CoreError::Io(format!("could not create {}: {error}", dir.display())))?;
+    let path = content_path(root, id);
+    let mut bytes = serde_json::to_vec_pretty(content)
+        .map_err(|error| CoreError::Serde(format!("could not encode task content: {error}")))?;
+    // `to_vec_pretty` stops at the closing brace. A committed text file without a trailing newline
+    // makes `git diff` print "\ No newline at end of file" on every hunk that reaches the end, for
+    // ever — and these files' diffs are read by people exactly as the index's are.
+    bytes.push(b'\n');
+    write_shared(&path, &bytes)?;
+    Ok(document::stamp_at(&path))
+}
+
+/// Remove one task's whole directory: its content **and** its attachments. (M68)
+///
+/// Best effort and never an error, on `attachments::remove`'s terms and for its reason: this runs
+/// after the tombstone has landed, so a failure here leaves bytes on disk that nothing points at —
+/// untidy, recoverable with `ls`, and not worth failing a delete the user has already seen succeed.
+///
+/// `remove_dir_all`, which takes `attachments/` with it. That is the whole argument for putting a
+/// task's files under the task rather than beside it: deleting a task used to leave
+/// `.cide/attachments/<id>/` behind, because the two lived in different trees and only one of them
+/// was being cleaned up.
+///
+/// The parent `.cide/tasks` is then pruned **non-recursively**, so it disappears only when it is
+/// empty — `attachments::remove`'s own last line, for the same reason: a tracker whose last task was
+/// deleted should not leave an empty directory in somebody's repository.
+fn remove_content(root: &Path, id: &TaskId) {
+    let dir = content_dir(root, id);
+    if let Err(error) = fs::remove_dir_all(&dir)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %dir.display(),
+            %error,
+            "could not remove a deleted task's directory; its files are left on disk"
+        );
+    }
+    let _ = fs::remove_dir(root.join(TASKS_DIR));
+}
+
 pub fn write_shared(path: &Path, json: &[u8]) -> Result<()> {
     persist::write_atomic_with_mode(path, json, persist::SHARED_MODE)
+}
+
+/// Where one task's content file lives, relative to the project root: `.cide/tasks/<id>`. (M68)
+///
+/// The task's own directory, holding `task.json` **and** `attachments/`. One directory per task is
+/// what makes `git rm -r .cide/tasks/t-17` take a task's description, its whole conversation and
+/// every file anybody attached to it, in one gesture — which is the reason
+/// [`cide_ipc::TaskAttachment::relative_path`] already gave for putting the task id in the
+/// attachment path, now applied to the whole task.
+///
+/// `well_formed_id` is what makes this safe: ASCII alphanumerics plus `-` and `_`, so an id can be
+/// neither a separator nor `..`. That function's doc records this as its second reason.
+#[must_use]
+pub fn content_dir(project_root: &Path, id: &TaskId) -> PathBuf {
+    project_root.join(TASKS_DIR).join(id.as_str())
+}
+
+/// `<root>/.cide/tasks/<id>/task.json`.
+#[must_use]
+pub fn content_path(project_root: &Path, id: &TaskId) -> PathBuf {
+    content_dir(project_root, id).join(CONTENT_FILE)
+}
+
+/// One task's content as this process holds it, and whether it owes the disk a write.
+#[derive(Clone)]
+struct Held {
+    content: TaskContent,
+    /// The stamp of the bytes this store last wrote or read **for this task**.
+    ///
+    /// Per task rather than one for the tracker, because that is the unit that is now written: a
+    /// comment on `t-14` must not make the store think `t-15`'s file moved under it.
+    stamp: Option<FileStamp>,
+}
+
+/// The content this process has loaded, and the subset of it that is dirty. (M68)
+///
+/// # The invariant that makes lazy loading safe
+///
+/// **A content file this process has not loaded is never written.** Nothing else in this module has
+/// to reason about a partially-known board, because an absent entry here is not "empty" — it is "not
+/// ours to touch". A `git pull` that brings new comments for a task nobody opened therefore needs no
+/// merge at all: theirs is simply still on disk, and the next reader loads it.
+///
+/// It is also what bounds the merge. Before M68 every write re-read and merged the whole tracker;
+/// now `reconcile` walks the index plus exactly the tasks in `dirty`, which on an ordinary afternoon
+/// is one.
+#[derive(Default)]
+struct ContentCache {
+    loaded: HashMap<TaskId, Held>,
+    /// Ids whose content differs from what is on disk. A `BTreeSet` so a flush writes in a stable
+    /// order — not for correctness, but so two runs of the same mutations touch files in the same
+    /// sequence and a `strace` or a filesystem watcher reads the same either time.
+    dirty: BTreeSet<TaskId>,
+    /// Ids whose directory the next flush should remove: tasks deleted since the last one.
+    ///
+    /// Recorded rather than removed on the spot because [`TaskStore::update`]'s closure does no I/O —
+    /// the rule `TaskEdit::DetachAttachment` already follows, and what keeps a rollback from having
+    /// to put a directory back.
+    removed: BTreeSet<TaskId>,
+    /// The undo log for the mutation in flight, or `None` outside one.
+    ///
+    /// # Why an undo log and not a clone
+    ///
+    /// `TaskStore::update` restores the index by cloning it, which costs ~50 KiB and is the right
+    /// trade for a structure that small. The same move here would clone every body and every comment
+    /// this process has loaded — on a board whose content is warm, the entire tracker, per mutation.
+    /// That is precisely the cost the split was done to remove, and it would have arrived back
+    /// through the rollback path where nothing would have measured it.
+    ///
+    /// So only what a mutation actually touches is remembered. One entry per `put`, holding the
+    /// previous [`Held`] (or `None` for a task whose content this process had not loaded) and whether
+    /// it was already dirty — because a rollback must not leave a task dirty that only this failed
+    /// mutation made so, and must not clear a dirt an *earlier* accepted mutation created.
+    journal: Option<Vec<Undo>>,
+}
+
+/// One `put`, remembered so it can be taken back.
+struct Undo {
+    id: TaskId,
+    /// What was held before, or `None` if nothing was.
+    was: Option<Held>,
+    /// Whether the id was already in `dirty`.
+    was_dirty: bool,
+    /// Whether the id was already marked for removal.
+    ///
+    /// Without this a `delete` whose `validate` then failed would leave its id in `removed`, and the
+    /// next flush would delete the directory of a task that is still in the index — the content of a
+    /// live task, gone, with the row still drawing it. The narrowest possible window and the widest
+    /// possible consequence, which is exactly the shape of thing this journal exists for.
+    was_removed: bool,
+}
+
+impl ContentCache {
+    /// Start remembering. Called by [`TaskStore::update`] under the lock.
+    fn begin(&mut self) {
+        self.journal = Some(Vec::new());
+    }
+
+    /// Accept the mutation: forget the undo log.
+    fn commit(&mut self) {
+        self.journal = None;
+    }
+
+    /// Put every touched task back exactly as it was, newest first.
+    fn rollback(&mut self) {
+        let Some(journal) = self.journal.take() else {
+            return;
+        };
+        for undo in journal.into_iter().rev() {
+            match undo.was {
+                Some(held) => {
+                    self.loaded.insert(undo.id.clone(), held);
+                }
+                None => {
+                    self.loaded.remove(&undo.id);
+                }
+            }
+            if undo.was_dirty {
+                self.dirty.insert(undo.id.clone());
+            } else {
+                self.dirty.remove(&undo.id);
+            }
+            // A `delete` that was rolled back must not leave its directory marked for removal: the
+            // task is still in the index, and the next flush would take its content away underneath
+            // it. `delete` journals through `note` for exactly this line.
+            if undo.was_removed {
+                self.removed.insert(undo.id);
+            } else {
+                self.removed.remove(&undo.id);
+            }
+        }
+    }
+
+    /// Record the state of one task before it is overwritten.
+    fn note(&mut self, id: &TaskId) {
+        if self.journal.is_some() {
+            let was = self.loaded.get(id).cloned();
+            let was_dirty = self.dirty.contains(id);
+            let was_removed = self.removed.contains(id);
+            if let Some(journal) = self.journal.as_mut() {
+                journal.push(Undo {
+                    id: id.clone(),
+                    was,
+                    was_dirty,
+                    was_removed,
+                });
+            }
+        }
+    }
+}
+
+impl ContentCache {
+    /// Read one task's content off disk, repairing it, and remember it.
+    ///
+    /// Total: a file that is absent, unreadable or unparseable yields [`TaskContent::default`] and a
+    /// log line, never an error. That is `load`'s discipline for the index applied one level down,
+    /// and here it matters more rather than less — a card that will not open because one comment
+    /// file has a stray brace is a task the user cannot reach, and the honest failure is an empty
+    /// log they can see is wrong.
+    ///
+    /// **A file that failed to read gets no stamp** (`None`), which compares unequal to everything,
+    /// so the next write preflight re-reads rather than assuming its own empty copy is current. The
+    /// alternative — stamping the failure — would let an empty in-memory content overwrite a file
+    /// that was merely locked or mid-write when we looked.
+    fn read(root: &Path, id: &TaskId) -> Held {
+        let path = content_path(root, id);
+        // Stamped **before** the bytes are read, on `read`'s own argument for the index: a stamp
+        // taken afterwards can be newer than the bytes in hand, and the preflight would then see
+        // agreement and quietly overwrite somebody's write. Stamping first costs at worst one
+        // redundant merge.
+        let stamp = document::stamp_at(&path);
+        let mut content = match fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<TaskContent>(&raw) {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        %error,
+                        "task content will not parse; treating it as empty (the file is left alone)"
+                    );
+                    return Held {
+                        content: TaskContent::default(),
+                        stamp: None,
+                    };
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // The ordinary answer for a task whose row exists and whose content does not: a
+                // task created and never given a body, or a row a merge adopted from a side whose
+                // content file has not arrived. Not a warning — it is a legal state of the tracker.
+                TaskContent::default()
+            }
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(),
+                    %error,
+                    "could not read task content; treating it as empty (the file is left alone)"
+                );
+                return Held {
+                    content: TaskContent::default(),
+                    stamp: None,
+                };
+            }
+        };
+        repair_content(id, &mut content);
+        // The same posture `open` takes for the index: `repair_content` is total so this cannot
+        // fire, and the line exists because if it ever does, every mutation of this task would roll
+        // back and the card would refuse every edit with no other symptom.
+        if let Err(error) = validate_content(id, &content) {
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                "repaired task content still fails validation — this is a bug in repair_content"
+            );
+        }
+        Held { content, stamp }
+    }
 }
 
 // --- layer 1: the single owning actor --------------------------------------------------------
@@ -1614,9 +2231,10 @@ pub fn write_shared(path: &Path, json: &[u8]) -> Result<()> {
 ///
 /// # Locks, and the order they are taken in
 ///
-/// Three, and the order is always `inner` → `state` → `stamp`. Nothing here calls back into the
-/// store, and [`Self::update`]'s closure must not either — it runs under `inner`, so anything that
-/// re-enters deadlocks, which is the same contract `WorkspaceState::with` states.
+/// Four since M68, and the order is always `inner` → `content` → `state` → `stamp`. Nothing here
+/// calls back into the store, and [`Self::update`]'s closure must not either — it runs under
+/// `inner`, so anything that re-enters deadlocks, which is the same contract
+/// `WorkspaceState::with` states.
 ///
 /// `state` is the field the four-field sketch of this struct did not have, and it is here because
 /// [`TaskBoard`] has three variants. `Absent` and `Ready` can be derived from a `stat` and the
@@ -1626,6 +2244,12 @@ pub fn write_shared(path: &Path, json: &[u8]) -> Result<()> {
 pub struct TaskStore {
     path: PathBuf,
     inner: Mutex<TaskFile>,
+    /// The content this process has loaded, and what of it is dirty. (M68)
+    ///
+    /// Fourth in the lock order, always taken after `inner` — see the struct's doc. A mutation holds
+    /// both, because a content change has to move its row's `updated_unix_ms` in the same breath or
+    /// the board silently stops reordering.
+    content: Mutex<ContentCache>,
     debounce: Debouncer,
     /// The stamp of the bytes this store last wrote or read.
     ///
@@ -1651,7 +2275,7 @@ impl TaskStore {
     /// become a project that cannot open.
     pub fn open(project_root: &Path) -> Self {
         let path = tasks_path(project_root);
-        let (file, state, stamp) = load(&path);
+        let (file, state, stamp, migrated) = load(&path);
 
         // `repair` is total, so this cannot fire; it is here because if it ever does, every
         // subsequent `update` would roll back and the tracker would silently refuse every edit,
@@ -1664,14 +2288,73 @@ impl TaskStore {
             );
         }
 
-        Self {
+        let mut cache = ContentCache::default();
+        let converting = migrated.is_some();
+        if let Some(content) = migrated {
+            /*
+             * A schema 1 tracker, converted. (M68)
+             *
+             * The content is in memory and nowhere on disk, so every task is seeded **and marked
+             * dirty**: the flush below is what writes `.cide/tasks/<id>/task.json` for each of them.
+             * The stamp is `None` because there is no file behind any of it yet, which is also what
+             * stops the preflight in `write_now` from deciding these are somebody else's writes.
+             */
+            for (id, body) in content {
+                cache.dirty.insert(id.clone());
+                cache.loaded.insert(
+                    id,
+                    Held {
+                        content: body,
+                        stamp: None,
+                    },
+                );
+            }
+        }
+
+        let store = Self {
             path,
             inner: Mutex::new(file),
+            content: Mutex::new(cache),
             debounce: Debouncer::new(persist::SAVE_DEBOUNCE),
             stamp: Mutex::new(stamp),
             state: Mutex::new(state),
             root: project_root.to_path_buf(),
+        };
+
+        if converting {
+            /*
+             * **Converted on start, outright, before anything else touches the tracker.**
+             *
+             * The alternative was to let the conversion ride the first mutation, which is where a
+             * lazy design naturally puts it and which preserved cide's *opening a project rewrites
+             * nothing* promise. It was rejected: it makes the moment of conversion unpredictable —
+             * some later edit, possibly while several agents are writing — and leaves `git status`
+             * clean until it suddenly is not. Here it is one observable event at a known time, and
+             * `git checkout .cide` undoes all of it.
+             *
+             * What that costs, knowingly: merely *opening* a schema 1 project rewrites its committed
+             * files, which is the surprise commit `TaskBoard::Absent`'s own hint text argues against.
+             * For a project of the user's own that is what they want; for a repository they opened to
+             * look at it is a diff they did not ask for. The alternatives were worse — asking first
+             * leaves the tracker read-only, which refuses a dispatched agent's `cide_task_update`
+             * until somebody notices a banner, and converting only for "projects of mine" invents a
+             * distinction nothing else in cide draws.
+             *
+             * The attachment relocation rides along, and is the one part that touches bytes rather
+             * than JSON.
+             */
+            let moved = attachments::relocate(project_root, &store.snapshot());
+            let written = store.write_now();
+            tracing::info!(
+                path = %store.path.display(),
+                tasks = store.snapshot().tasks.len(),
+                attachments_moved = moved,
+                converged = written.is_some(),
+                "converted this project's task tracker from schema 1 to schema 2"
+            );
         }
+
+        store
     }
 
     /// The project root this tracker belongs to — the base of every attachment's path.
@@ -1691,12 +2374,57 @@ impl TaskStore {
 
     /// One task, by id.
     pub fn get(&self, id: &TaskId) -> Option<Task> {
-        find(&self.inner.lock(), id).cloned()
+        let guard = self.inner.lock();
+        let mut cache = self.content.lock();
+        self.compose(&guard, &mut cache, id).ok()
     }
 
-    /// Every task, in file order — which is the order the panel renders and an agent reads.
-    pub fn list(&self) -> Vec<Task> {
+    /// Every task's **row**, in file order — the order the panel renders and an agent reads. (M68)
+    ///
+    /// Rows and not whole tasks, which is what keeps this callable on a hot path. Its three callers
+    /// want exactly what a row carries: `TaskSink::list` renders `cide_task_list`'s summaries,
+    /// `task_triggers` reads blockers' statuses once per burst, and `cmd::agents` checks the
+    /// dispatch gate. None of them reads a body or a log — `cide_task_get` is the road for that, and
+    /// `render_summary`'s doc says why the split is what makes the list affordable.
+    ///
+    /// A version of this that composed every task would open one file per task on every trigger
+    /// burst, which is the cost the whole split exists to avoid.
+    pub fn list(&self) -> Vec<TaskRow> {
         self.inner.lock().tasks.clone()
+    }
+
+    /// One task's content, loaded if need be — for a caller that has the row already. (M68)
+    ///
+    /// The seam `search` reaches through, and the reason it takes a closure: this is where the policy
+    /// about *how many* content files to open lives, and a search is the one operation that wants all
+    /// of them.
+    fn body_of(&self, cache: &mut ContentCache, id: &TaskId) -> String {
+        cache
+            .loaded
+            .entry(id.clone())
+            .or_insert_with(|| ContentCache::read(&self.root, id))
+            .content
+            .body
+            .clone()
+    }
+
+    /// Which tasks match a query: `cide_tasks::search`, over this store's content. (M68)
+    ///
+    /// Loads and caches whatever bodies it has not got, which is the documented cost of searching:
+    /// the first query in a session pays for the board, and every later one is served from memory.
+    /// The rule itself is the free function's — this only supplies the text.
+    pub fn search(&self, query: &str) -> Vec<TaskId> {
+        let guard = self.inner.lock();
+        let mut cache = self.content.lock();
+        // Collected first, because `search`'s closure cannot borrow the cache mutably while the
+        // index is being walked — and because a body read is a file read, which should not happen
+        // inside a matcher.
+        let ids: Vec<TaskId> = guard.tasks.iter().map(|task| task.id.clone()).collect();
+        let bodies: HashMap<TaskId, String> = ids
+            .iter()
+            .map(|id| (id.clone(), self.body_of(&mut cache, id)))
+            .collect();
+        search(&guard, &|id| bodies.get(id).cloned(), query)
     }
 
     /// What the panel should say, in one of three shapes.
@@ -1730,6 +2458,12 @@ impl TaskStore {
                     .to_string(),
                 path: self.path.clone(),
             },
+            // Rows, not whole tasks (M68) — `TaskRow::of`'s doc and [`TaskRow`]'s carry the reason. This
+            // is a `map` and not a `clone` on purpose: the board is broadcast to every window on
+            // every mutation, so what it does *not* carry is the whole point of it.
+            // The index *is* the board since M68: `TaskFile::tasks` is already `Vec<TaskRow>`, so
+            // this is one clone of ~50 KiB rather than the 2.25 MB it used to be. [`TaskRow`]'s doc
+            // has the measurement and `emit::tasks_changed`'s has what it was costing.
             _ => TaskBoard::Ready {
                 tasks: file.tasks.clone(),
                 rev: file.rev,
@@ -1747,8 +2481,37 @@ impl TaskStore {
     pub fn reload(&self) -> TaskBoard {
         {
             let mut file = self.inner.lock();
+            let mut cache = self.content.lock();
             let mut state = self.state.lock();
-            let (disk, disk_state, stamp) = load(&self.path);
+            let (disk, disk_state, stamp, migrated) = load(&self.path);
+            /*
+             * A *Retry* that finds a schema 1 file converts it, exactly as `open` does. (M68)
+             *
+             * The path is reachable: a `git checkout` of a branch that predates the conversion puts a
+             * schema 1 tracker back under a running cide, the panel says the board changed, and Retry
+             * is what the user presses. Seeding without marking dirty would leave the content in
+             * memory and never on disk — and the index, which *is* written, would then name content
+             * files that do not exist.
+             */
+            if let Some(content) = migrated {
+                for (id, body) in content {
+                    cache.dirty.insert(id.clone());
+                    cache.loaded.insert(
+                        id,
+                        Held {
+                            content: body,
+                            stamp: None,
+                        },
+                    );
+                }
+                let moved = attachments::relocate(&self.root, &disk);
+                tracing::info!(
+                    path = %self.path.display(),
+                    attachments_moved = moved,
+                    "a reload found a schema 1 tracker; converted it"
+                );
+                self.debounce.note_change();
+            }
             if matches!(disk_state, DiskState::Ready) {
                 *file = if *file == TaskFile::default() {
                     disk
@@ -1780,8 +2543,80 @@ impl TaskStore {
     ///
     /// The closure runs under the lock and must not block, mutate anything else that could take
     /// this lock, or call back into the store.
-    pub fn update<T>(&self, f: impl FnOnce(&mut TaskFile) -> Result<T>) -> Result<T> {
+    /// One task, composed out of its row and its content — loading the content if this process
+    /// has not seen it. (M68)
+    ///
+    /// # Why every mutation still works on a whole `Task`
+    ///
+    /// Each arm of [`TaskEdit`] was written against a `&mut Task`, and every one of them carries a
+    /// comment explaining a decision that was paid for. Rewriting twelve arms to reach into two
+    /// structures would have moved all of that prose and risked all of those decisions, to save what
+    /// turns out to be one small file read on the arms that do not touch content.
+    ///
+    /// So the split lives here and in [`Self::put`], and nothing above them changed. The cost is
+    /// paid honestly: a `SetTitle` loads the task's content, `put` finds it unchanged, and only the
+    /// index is written. The *benefit* invariant still holds either way — content this process has
+    /// loaded is content it is allowed to write, and content it has not loaded it never touches.
+    ///
+    /// Must be called with `inner` and `content` already held, which is why it takes them rather
+    /// than locking: re-entering the store under its own lock is the deadlock [`Self::update`]'s
+    /// contract forbids.
+    fn compose(&self, index: &TaskFile, cache: &mut ContentCache, id: &TaskId) -> Result<Task> {
+        let row = find(index, id).ok_or_else(|| no_such_task(id))?.clone();
+        let held = cache
+            .loaded
+            .entry(id.clone())
+            .or_insert_with(|| ContentCache::read(&self.root, id));
+        /*
+         * The creator recovery, applied here rather than in `repair_content`. (M21, M68)
+         *
+         * It is the one repair that needs both halves, and this is the first moment both are in
+         * hand. **In memory only**: nothing is marked dirty, so opening a project and reading a task
+         * still rewrites nothing — `the_creator_of_a_task_from_an_older_build_is_recovered_from_its_seeded_comment`
+         * asserts that byte for byte. The next real mutation persists it with everything else.
+         */
+        let mut task = task_of(&row, &held.content);
+        if let Some(author) = recovered_creator(&row, &held.content) {
+            task.created_by = author;
+        }
+        Ok(task)
+    }
+
+    /// Write a composed task back: its row into the index, its content into the cache. (M68)
+    ///
+    /// **Dirty only when the content actually changed.** That comparison is what keeps a title edit
+    /// from rewriting a task's whole conversation — `TaskContent` derives `PartialEq`, the check is
+    /// one memcmp-ish walk over data already in cache, and without it every status flip would touch
+    /// two files and put a no-op diff in a committed file somebody reviews.
+    ///
+    /// The row is re-derived through [`TaskRow::of`], never assembled by hand, so the two counts are
+    /// recomputed from the content that was just written and cannot drift from it — the single
+    /// producer rule that [`cide_ipc::TaskDetail`]'s nesting exists to protect.
+    fn put(&self, index: &mut TaskFile, cache: &mut ContentCache, task: &Task) {
+        cache.note(&task.id);
+        let row = TaskRow::of(task);
+        if let Some(slot) = find_mut(index, &task.id) {
+            *slot = row;
+        } else {
+            index.tasks.push(row);
+        }
+        let content = content_of(task);
+        let held = cache
+            .loaded
+            .entry(task.id.clone())
+            .or_insert_with(|| ContentCache::read(&self.root, &task.id));
+        if held.content != content {
+            held.content = content;
+            cache.dirty.insert(task.id.clone());
+        }
+    }
+
+    fn update<T>(
+        &self,
+        f: impl FnOnce(&mut TaskFile, &mut ContentCache) -> Result<T>,
+    ) -> Result<T> {
         let mut guard = self.inner.lock();
+        let mut cache = self.content.lock();
 
         if let DiskState::Unreadable { error } = &*self.state.lock() {
             return Err(CoreError::Io(format!(
@@ -1791,12 +2626,18 @@ impl TaskStore {
         }
 
         let before = guard.clone();
+        // The content half of the rollback. (M68) The index is restored by clone — it is ~50 KiB —
+        // while content is restored from an undo log, because cloning it would copy every body and
+        // comment this process has loaded on every mutation, which is the cost the whole split
+        // removed. `ContentCache::journal`'s doc has the argument.
+        cache.begin();
 
-        let outcome = f(&mut guard);
+        let outcome = f(&mut guard, &mut cache);
         if outcome.is_ok()
             && let Err(error) = validate(&guard)
         {
             *guard = before;
+            cache.rollback();
             tracing::error!(%error, "rejected a mutation that broke a task file invariant");
             return Err(error);
         }
@@ -1804,10 +2645,13 @@ impl TaskStore {
             // An operation that reports failure should not have changed anything, but restoring
             // costs one clone and removes the question.
             *guard = before;
+            cache.rollback();
             return outcome;
         }
 
+        cache.commit();
         guard.rev += 1;
+        drop(cache);
         drop(guard);
         self.debounce.note_change();
         outcome
@@ -1837,7 +2681,7 @@ impl TaskStore {
         // Before the lock and before the write: a refusal must not be able to leave a
         // half-created task behind, and the caller wants the sentence, not a poisoned file.
         let change = validated_change(req.change.as_ref())?;
-        self.update(move |file| {
+        self.update(move |file, cache| {
             // Inside the closure, unlike `change` above, because two of its refusals need the
             // file (existence) — and a refusal from in here rolls the update back whole, so
             // nothing half-creates either way. Landing the edges *in* the create matters beyond
@@ -1882,9 +2726,18 @@ impl TaskStore {
                 created_unix_ms: now,
                 updated_unix_ms: now,
             };
-            // At the end: the array *is* the order, and new work goes at the bottom of the list
-            // rather than jumping the queue the user is reading top to bottom.
-            file.tasks.push(task.clone());
+            // Through `put` (M68): the row appends to the index — at the end, because the array
+            // *is* the order and new work goes at the bottom of the list rather than jumping the
+            // queue the user is reading top to bottom — and the content lands in the cache, dirty,
+            // so the flush writes `.cide/tasks/<id>/task.json` beside the index.
+            //
+            // A fresh task's content is `TaskContent::default()` in all but the body, and `put`
+            // marks it dirty only if it differs from what is held. For a brand-new id nothing is
+            // held, so `ContentCache::read` is asked and answers the default — which is equal to a
+            // new task's content whenever the body is empty. That is correct and deliberate: a task
+            // created with no description has no content file until it gets one, and a row with no
+            // content file is a state the reader already treats as ordinary.
+            self.put(file, cache, &task);
             Ok(task)
         })
     }
@@ -1910,23 +2763,39 @@ impl TaskStore {
             TaskEdit::DeleteComment { id } => Some(id.clone()),
             _ => None,
         };
-        let task = self.update(move |file| {
-            // The two link arms route through free functions over the whole file before the
-            // single-task borrow below is taken: the rules they enforce — the target's
-            // existence, the cycle walk, `related`'s inverse edge — live on *other* tasks.
+        let task = self.update(move |file, cache| {
+            // The two link arms route through free functions over the whole index before the task
+            // is composed below: the rules they enforce — the target's existence, the cycle walk,
+            // `related`'s inverse edge — live on *other* tasks, and all three read only the links a
+            // row carries.
             // No author gate, unlike the comment arms: an edge is recorded intent, not a
             // rewrite of the record, and what keeps a run's `blockedBy` from dispatching
             // anything is `autodispatch`'s author gate downstream, not ownership here.
             let edit = match edit {
                 TaskEdit::Link { link, target } => {
-                    return apply_link(file, id, link, &target, now);
+                    let row = apply_link(file, id, link, &target, now)?;
+                    // Composed on the way out because the caller is promised a whole `Task` — and
+                    // `apply_link` answers with a row, which is all it has and all it needs.
+                    return self.compose(file, cache, &row.id);
                 }
                 TaskEdit::Unlink { link, target } => {
-                    return apply_unlink(file, id, link, &target, now);
+                    let row = apply_unlink(file, id, link, &target, now)?;
+                    return self.compose(file, cache, &row.id);
                 }
                 other => other,
             };
-            let task = find_mut(file, id).ok_or_else(|| no_such_task(id))?;
+            /*
+             * Composed, so every arm below still operates on a whole `&mut Task`. (M68)
+             *
+             * Each of these twelve arms carries a comment recording a decision that was paid for —
+             * the assignee/session exclusion, the no-op `SetStatus`, the author gates on the comment
+             * arms. Rewriting them to reach into a row and a content struct separately would have
+             * moved all of that prose and risked all of those decisions, to save one small file read
+             * on the arms that touch no content. `compose`'s doc has the argument; `put` below is
+             * what splits the result back, and it marks the content dirty only if it changed, so a
+             * `SetTitle` still writes one file.
+             */
+            let task = &mut self.compose(file, cache, id)?;
             match edit {
                 TaskEdit::SetTitle { title } => task.title = title.trim().to_string(),
                 TaskEdit::SetBody { body } => task.body = body,
@@ -2036,6 +2905,8 @@ impl TaskStore {
                 }
             }
             task.updated_unix_ms = now;
+            self.put(file, cache, task);
+            validate_content(&task.id, &content_of(task))?;
             Ok(task.clone())
         })?;
         if let Some(attachment) = detaching
@@ -2092,7 +2963,11 @@ impl TaskStore {
     /// The refusals `attach` can give without touching the disk.
     fn check_target(&self, id: &TaskId, target: &AttachTarget) -> Result<()> {
         let guard = self.inner.lock();
-        let task = find(&guard, id).ok_or_else(|| no_such_task(id))?;
+        let mut cache = self.content.lock();
+        // Composed rather than read off the row, because the comment this may be naming is content.
+        // The load is the point of the check: it happens *before* `attachments::import` copies a
+        // byte, which is the ordering `attach`'s doc states — a refusal here costs nothing on disk.
+        let task = self.compose(&guard, &mut cache, id)?;
         if let AttachTarget::Comment { id: comment } = target
             && !task.comments.iter().any(|c| c.id == *comment && !c.deleted)
         {
@@ -2111,8 +2986,8 @@ impl TaskStore {
     ) -> Result<Task> {
         let now = persist::now_ms();
         let written = records.clone();
-        let outcome = self.update(move |file| {
-            let task = find_mut(file, id).ok_or_else(|| no_such_task(id))?;
+        let outcome = self.update(move |file, cache| {
+            let task = &mut self.compose(file, cache, id)?;
             match target {
                 AttachTarget::Task => task.attachments.extend(records),
                 AttachTarget::Comment { id: comment } => {
@@ -2130,6 +3005,8 @@ impl TaskStore {
                 }
             }
             task.updated_unix_ms = now;
+            self.put(file, cache, task);
+            validate_content(&task.id, &content_of(task))?;
             Ok(task.clone())
         });
         if outcome.is_err() {
@@ -2149,12 +3026,32 @@ impl TaskStore {
     /// Links pointing at the removed task are left **dangling, deliberately** — see [`validate`]
     /// for why a scrub could not survive the merge and why a dangling edge is safe to keep.
     pub fn delete(&self, id: &TaskId) -> Result<()> {
-        self.update(|file| {
+        self.update(|file, cache| {
             let before = file.tasks.len();
             file.tasks.retain(|task| &task.id != id);
             if file.tasks.len() == before {
                 return Err(no_such_task(id));
             }
+            /*
+             * The content goes with the row, and the directory with it. (M68)
+             *
+             * Forgotten from the cache *and* removed from disk — `write_now` does the removal, which
+             * is where every other write happens; recording the intent here keeps the closure free of
+             * I/O, which is `update`'s standing rule and what `TaskEdit::DetachAttachment` already
+             * follows.
+             *
+             * The tempting symmetry with `merge` is a bug, and it is worth naming. A merge *adopts* a
+             * row that exists only on disk, because a task nobody deleted must not vanish. A content
+             * directory that no row names is the opposite: there is no task tombstone in this format
+             * (see `merge`'s own doc on why a delete does not survive a concurrent write), so an
+             * orphan directory is overwhelmingly a deleted task's leftovers — and adopting one would
+             * resurrect every task anybody had ever deleted, at the next open. So orphans are ignored
+             * by the reader and removed here, by the delete that made them.
+             */
+            cache.note(id);
+            cache.loaded.remove(id);
+            cache.dirty.remove(id);
+            cache.removed.insert(id.clone());
             Ok(())
         })
     }
@@ -2182,11 +3079,12 @@ impl TaskStore {
     /// written over by bytes encoded before it existed, and it would be written over silently.
     pub fn write_now(&self) -> Option<TaskFile> {
         let mut guard = self.inner.lock();
+        let mut cache = self.content.lock();
         let mut state = self.state.lock();
 
         // Layer 3, before every write and not only on the debounced path: a `git pull` between two
         // explicit saves is the same race as one between two ticks.
-        let merged = self.reconcile(&mut guard, &mut state);
+        let merged = self.reconcile(&mut guard, &mut cache, &mut state);
 
         if let DiskState::Unreadable { error } = &*state {
             tracing::warn!(
@@ -2239,6 +3137,52 @@ impl TaskStore {
         // the end, for ever, in a file whose diffs people read.
         bytes.push(b'\n');
 
+        /*
+         * Content first, then the index. (M68)
+         *
+         * The order is the one that survives being interrupted. Two files is two publishes with no
+         * transaction between them, so a crash, a SIGKILL or a `git add -A` can land between them —
+         * and the pair has to be readable either way round.
+         *
+         * Content-then-index means the worst interrupted state is an index that does not yet mention
+         * a task whose content file is already on disk: an **orphan directory**, which the reader
+         * ignores and the next successful flush overwrites. Index-first would instead leave a row
+         * pointing at content that was never written — a task whose body and whole conversation read
+         * as empty, which is the one failure here that looks like data loss to the person reading it.
+         *
+         * A content write that fails does **not** abort the index write. The row is still the truth
+         * about the task's existence and its status, and refusing to record that because one comment
+         * file could not be written would turn a disk hiccup into a lost status change. The failure
+         * is logged and the debounce re-armed, so the next tick tries the content again.
+         */
+        let mut content_failed = false;
+        for id in std::mem::take(&mut cache.dirty) {
+            let Some(held) = cache.loaded.get_mut(&id) else {
+                // Dirty with nothing loaded cannot happen — `put` inserts before it marks — and if
+                // it ever does, writing nothing is the safe half: invariant 1 says a file this
+                // process has not loaded is a file it must not write.
+                tracing::error!(id = %id, "a task was dirty with no content held; not writing it");
+                continue;
+            };
+            match write_content(&self.root, &id, &held.content) {
+                Ok(stamp) => held.stamp = stamp,
+                Err(error) => {
+                    tracing::error!(
+                        id = %id,
+                        %error,
+                        "failed to save a task's content; the index is still written and the next tick retries"
+                    );
+                    // Re-dirtied so the retry has something to find. `std::mem::take` above cleared
+                    // the set, which is what makes this the only way back in.
+                    cache.dirty.insert(id);
+                    content_failed = true;
+                }
+            }
+        }
+        for id in std::mem::take(&mut cache.removed) {
+            remove_content(&self.root, &id);
+        }
+
         match write_shared(&self.path, &bytes) {
             Ok(()) => {
                 *state = DiskState::Ready;
@@ -2253,6 +3197,9 @@ impl TaskStore {
                 tracing::error!(path = %self.path.display(), %error, "failed to save the task file");
                 self.debounce.note_change();
             }
+        }
+        if content_failed {
+            self.debounce.note_change();
         }
         merged
     }
@@ -2276,8 +3223,9 @@ impl TaskStore {
     /// quit, here left to the ordinary flusher tick rather than done inline on a watcher thread.
     pub fn refresh_from_disk(&self) -> Option<TaskFile> {
         let mut guard = self.inner.lock();
+        let mut cache = self.content.lock();
         let mut state = self.state.lock();
-        let merged = self.reconcile(&mut guard, &mut state);
+        let merged = self.reconcile(&mut guard, &mut cache, &mut state);
         if merged.is_some() {
             self.debounce.note_change();
         }
@@ -2288,7 +3236,91 @@ impl TaskStore {
     ///
     /// Returns the merged file when the in-memory copy actually changed, and `None` when there was
     /// nothing to do — which is the overwhelmingly common case, one `stat` per write.
-    fn reconcile(&self, file: &mut TaskFile, state: &mut DiskState) -> Option<TaskFile> {
+    /// Merge in whatever happened to a dirty task's content file behind our back. (M68)
+    ///
+    /// The per-task half of [`Self::reconcile`], and the shape is the index's rule applied one level
+    /// down: compare the stamp we recorded when we last read or wrote the file, and if it moved,
+    /// re-read and [`merge_content`] rather than overwrite.
+    ///
+    /// Three things here are load-bearing.
+    ///
+    /// **A file that will not read is not merged as empty.** `ContentCache::read` answers
+    /// `TaskContent::default()` for an unreadable file, and unioning *that* as `theirs` would read as
+    /// the other side having deleted every comment — and `union_comments` keeps whatever either side
+    /// has, so the damage would not even be visible as a loss until the next write persisted our copy
+    /// over theirs. The `stamp.is_none()` guard is what keeps such a read out of the merge: no stamp
+    /// means the read failed, and a failed read has nothing to say about what is on disk.
+    ///
+    /// **The row's `updated_unix_ms` is raised** from the merged content, through
+    /// [`newest_content_stamp`]. That is invariant 4: a comment adopted from the losing side is an
+    /// update, and a row that predates its own newest comment loses the next merge it takes part in
+    /// and sorts below tasks nothing has happened to.
+    ///
+    /// **The counts are recomputed** from the merged content, because the row is re-derived through
+    /// `TaskRow::of`. This is where the one knowing inaccuracy `merge_row` leaves behind gets corrected.
+    fn reconcile_content(&self, file: &mut TaskFile, cache: &mut ContentCache) {
+        let dirty: Vec<TaskId> = cache.dirty.iter().cloned().collect();
+        for id in dirty {
+            let Some(held) = cache.loaded.get(&id) else {
+                continue;
+            };
+            let path = content_path(&self.root, &id);
+            let current = document::stamp_at(&path);
+            if current == held.stamp {
+                continue;
+            }
+            let disk = ContentCache::read(&self.root, &id);
+            if disk.stamp.is_none() {
+                // The read failed. Leaving ours dirty and untouched is the conservative answer: the
+                // next tick tries again, and nothing was merged against a copy we could not trust.
+                continue;
+            }
+            let merged = merge_content(&held.content, &disk.content);
+            if let Some(held) = cache.loaded.get_mut(&id) {
+                held.content = merged;
+                // Deliberately **not** stamped with what we just read: our merged copy is not what is
+                // on disk, and claiming otherwise would let the flush skip writing it. The stamp
+                // moves when `write_content` succeeds.
+                held.stamp = None;
+            }
+            let Some(content) = cache.loaded.get(&id).map(|h| h.content.clone()) else {
+                continue;
+            };
+            if let Some(row) = find_mut(file, &id) {
+                let stamp = newest_content_stamp(&content);
+                let joined = task_of(row, &content);
+                *row = TaskRow::of(&joined);
+                if let Some(newest) = stamp {
+                    row.updated_unix_ms = row.updated_unix_ms.max(newest);
+                }
+            }
+            tracing::info!(
+                id = %id,
+                path = %path.display(),
+                "a task's content changed outside this process; merged it"
+            );
+        }
+    }
+
+    fn reconcile(
+        &self,
+        file: &mut TaskFile,
+        cache: &mut ContentCache,
+        state: &mut DiskState,
+    ) -> Option<TaskFile> {
+        // The content half, first and unconditionally. (M68)
+        //
+        // Unconditionally because it is keyed on each dirty task's own stamp rather than on the
+        // index's: a teammate can push a comment on `t-14` without the index moving at all — a
+        // content file changed and the row did not — and a preflight that only watched
+        // `.cide/tasks.json` would overwrite it without ever looking.
+        //
+        // **Dirty tasks only**, which is invariant 1 paying for itself: a task this process never
+        // loaded is a task it will never write, so there is nothing to merge and theirs is simply
+        // still on disk. Before the split every write re-read and merged the whole tracker; on an
+        // ordinary afternoon this loop now runs once.
+        self.reconcile_content(file, cache);
+
         let known = *self.stamp.lock();
         let current = document::stamp_at(&self.path);
 
@@ -2310,7 +3342,40 @@ impl TaskStore {
                 *self.stamp.lock() = None;
                 None
             }
-            ReadOutcome::Ready { file: disk, stamp } => {
+            ReadOutcome::Ready {
+                file: disk,
+                stamp,
+                migrated,
+            } => {
+                /*
+                 * A schema 1 file appeared under a running cide. (M68)
+                 *
+                 * Reachable, and a silent loss if ignored: `git checkout` of a branch that predates
+                 * the conversion puts one back while the store is open, and the content the ladder
+                 * lifted out of it would then exist only in a value this arm dropped on the floor.
+                 * The index would merge fine and every one of those tasks would read as having no
+                 * body and no conversation.
+                 *
+                 * So it is seeded and marked dirty, exactly as `open` and `reload` do — and
+                 * **merged**, not overwritten, for anything this process already holds: our copy is
+                 * the one with the edits that have not been flushed yet.
+                 */
+                if let Some(lifted) = migrated {
+                    for (id, body) in lifted {
+                        let merged = match cache.loaded.get(&id) {
+                            Some(held) => merge_content(&held.content, &body),
+                            None => body,
+                        };
+                        cache.dirty.insert(id.clone());
+                        cache.loaded.insert(
+                            id,
+                            Held {
+                                content: merged,
+                                stamp: None,
+                            },
+                        );
+                    }
+                }
                 *self.stamp.lock() = stamp;
                 *state = DiskState::Ready;
                 if disk == *file {
@@ -2472,23 +3537,116 @@ mod tests {
         }
     }
 
-    fn a_file(rev: u64, tasks: Vec<Task>) -> TaskFile {
-        let mut file = TaskFile {
+    /// A whole tracker as these tests think of one: the index, and the content beside it. (M68)
+    ///
+    /// # Why the tests keep a shape the store does not have
+    ///
+    /// Because every rule in the merge table is a rule about a **task** — "a tombstone wins
+    /// whichever side it is on", "the stale side's comment is kept" — and none of them is a rule
+    /// about which file the bytes happened to be in. Splitting the table along the storage seam
+    /// would have rewritten thirteen cases and every `why` string in them to say something narrower
+    /// than what they are actually asserting.
+    ///
+    /// So the tests hold both halves and [`Tracker::merge`] does exactly what `TaskStore` does:
+    /// `merge_row` over the index, `merge_content` per task, and the row's stamp raised from the
+    /// merged content. If those three ever stop composing the way the store composes them, every
+    /// row of the table fails at once — which is the property that makes this shape a test helper
+    /// rather than a second implementation.
+    struct Tracker {
+        index: TaskFile,
+        content: HashMap<TaskId, TaskContent>,
+    }
+
+    impl Tracker {
+        /// One task, composed — what an assertion reads.
+        fn task(&self, id: &str) -> Task {
+            let id = TaskId(id.to_string());
+            let row = find(&self.index, &id).expect("no such task in this tracker");
+            task_of(
+                &row.clone(),
+                self.content.get(&id).unwrap_or(&EMPTY_CONTENT),
+            )
+        }
+
+        /// Every task, in the index's order.
+        fn tasks(&self) -> Vec<Task> {
+            self.index
+                .tasks
+                .iter()
+                .map(|row| task_of(row, self.content.get(&row.id).unwrap_or(&EMPTY_CONTENT)))
+                .collect()
+        }
+
+        /// The store's own merge, both halves, in the store's own order.
+        fn merge(&self, theirs: &Tracker) -> Tracker {
+            let mut index = merge(&self.index, &theirs.index);
+            let mut content = HashMap::new();
+            for row in &mut index.tasks {
+                let mine = self.content.get(&row.id).unwrap_or(&EMPTY_CONTENT);
+                let disk = theirs.content.get(&row.id).unwrap_or(&EMPTY_CONTENT);
+                let merged = merge_content(mine, disk);
+                // Invariant 4, applied exactly where `TaskStore::reconcile_content` applies it: a
+                // comment adopted from the losing side is an update, and a row that predates its own
+                // newest comment loses the next merge it takes part in.
+                if let Some(newest) = newest_content_stamp(&merged) {
+                    row.updated_unix_ms = row.updated_unix_ms.max(newest);
+                }
+                let joined = task_of(row, &merged);
+                *row = TaskRow::of(&joined);
+                content.insert(row.id.clone(), merged);
+            }
+            Tracker { index, content }
+        }
+    }
+
+    /// A task with nothing in its content file, which is also a task with no content file at all.
+    static EMPTY_CONTENT: TaskContent = TaskContent {
+        body: String::new(),
+        comments: Vec::new(),
+        history: Vec::new(),
+        attachments: Vec::new(),
+    };
+
+    /// Read a whole tracker off disk the way `TaskStore::open` does: the index, then each task's
+    /// own file. (M68)
+    ///
+    /// The tests that use this are the layer-3 and layer-4 ones — the ones whose whole point is that
+    /// what ended up *on disk* is right. Reading only the index would leave them asserting about the
+    /// half of the tracker that was never in question.
+    fn read_tracker(root: &Path) -> Tracker {
+        let index = match read(&tasks_path(root)) {
+            ReadOutcome::Ready { file, .. } => file,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        let content = index
+            .tasks
+            .iter()
+            .map(|row| (row.id.clone(), ContentCache::read(root, &row.id).content))
+            .collect();
+        Tracker { index, content }
+    }
+
+    fn a_file(rev: u64, tasks: Vec<Task>) -> Tracker {
+        let mut index = TaskFile {
             schema_version: TaskFile::CURRENT_SCHEMA,
             rev,
             next_id: 0,
-            tasks,
+            tasks: tasks.iter().map(TaskRow::of).collect(),
         };
-        settle_next_id(&mut file);
-        file
+        settle_next_id(&mut index);
+        let content = tasks
+            .iter()
+            .map(|task| (task.id.clone(), content_of(task)))
+            .collect();
+        Tracker { index, content }
     }
 
-    fn titles(file: &TaskFile) -> Vec<&str> {
-        file.tasks.iter().map(|t| t.title.as_str()).collect()
+    fn titles(file: &Tracker) -> Vec<&str> {
+        file.index.tasks.iter().map(|t| t.title.as_str()).collect()
     }
 
-    fn ids(file: &TaskFile) -> Vec<&str> {
-        file.tasks.iter().map(|t| t.id.as_str()).collect()
+    fn ids(file: &Tracker) -> Vec<&str> {
+        file.index.tasks.iter().map(|t| t.id.as_str()).collect()
     }
 
     // --- layer 3: the merge, one documented row per rule -------------------------------------
@@ -2501,9 +3659,9 @@ mod tests {
     struct Case {
         name: &'static str,
         why: &'static str,
-        mine: TaskFile,
-        theirs: TaskFile,
-        check: fn(&TaskFile),
+        mine: Tracker,
+        theirs: Tracker,
+        check: fn(&Tracker),
     }
 
     // --- the user may edit and delete; agents may not (M21) ----------------------------------
@@ -2522,8 +3680,8 @@ mod tests {
         edited.edited_at_unix_ms = Some(20);
         let mine = a_file(2, vec![with_comments("t-1", 1, vec![edited.clone()])]);
 
-        let merged = merge(&mine, &stale);
-        let comments = &merged.tasks[0].comments;
+        let merged = mine.merge(&stale);
+        let comments = &merged.task("t-1").comments;
         assert_eq!(
             comments.len(),
             1,
@@ -2542,11 +3700,8 @@ mod tests {
         gone.deleted = true;
         gone.text = String::new();
         gone.edited_at_unix_ms = Some(30);
-        let after = merge(
-            &a_file(3, vec![with_comments("t-1", 1, vec![gone])]),
-            &stale,
-        );
-        let comments = &after.tasks[0].comments;
+        let after = a_file(3, vec![with_comments("t-1", 1, vec![gone])]).merge(&stale);
+        let comments = &after.task("t-1").comments;
         assert_eq!(comments.len(), 1, "the tombstone is kept, not the comment");
         assert!(
             comments[0].deleted,
@@ -2565,12 +3720,11 @@ mod tests {
         dead.text = String::new();
 
         for (mine, theirs) in [(&live, &dead), (&dead, &live)] {
-            let merged = merge(
-                &a_file(1, vec![with_comments("t-1", 1, vec![mine.clone()])]),
+            let merged = a_file(1, vec![with_comments("t-1", 1, vec![mine.clone()])]).merge(
                 &a_file(1, vec![with_comments("t-1", 1, vec![theirs.clone()])]),
             );
             assert!(
-                merged.tasks[0].comments[0].deleted,
+                merged.task("t-1").comments[0].deleted,
                 "`deleted` only ever goes false to true, so neither side can un-delete"
             );
         }
@@ -2589,15 +3743,21 @@ mod tests {
             deleted: false,
             attachments: Vec::new(),
         };
-        let mut a = a_file(1, vec![with_comments("t-1", 1, vec![raw.clone()])]);
-        let mut b = a_file(1, vec![with_comments("t-1", 1, vec![raw])]);
-        repair(&mut a);
-        repair(&mut b);
+        // `repair_content` rather than `repair` since M68: a comment's id is content, and the index
+        // half of repair has no comment to look at. The claim is unchanged — two readers of one
+        // legacy file derive the *same* id without either of them writing.
+        let id_of = |raw: &TaskComment| {
+            let mut content = content_of(&with_comments("t-1", 1, vec![raw.clone()]));
+            repair_content(&TaskId("t-1".into()), &mut content);
+            content.comments[0].id.clone()
+        };
+        let a_id = id_of(&raw);
+        let b_id = id_of(&raw);
 
-        let id = &a.tasks[0].comments[0].id;
+        let id = &a_id;
         assert!(!id.is_empty(), "repair fills in every empty id");
         assert_eq!(
-            id, &b.tasks[0].comments[0].id,
+            id, &b_id,
             "and derives the SAME one in two processes. A minted uuid here would give each \
              reader a different id, which is a merge that duplicates every comment it touches — \
              the bug ids were added to prevent, reintroduced by the fix for it"
@@ -2610,9 +3770,16 @@ mod tests {
         );
 
         // And the merge is unchanged for a file that never had ids.
-        let merged = merge(&a, &b);
+        let repaired = |raw: &TaskComment| {
+            let mut task = with_comments("t-1", 1, vec![raw.clone()]);
+            let mut content = content_of(&task);
+            repair_content(&task.id, &mut content);
+            task.comments = content.comments;
+            a_file(1, vec![task])
+        };
+        let merged = repaired(&raw).merge(&repaired(&raw));
         assert_eq!(
-            merged.tasks[0].comments.len(),
+            merged.task("t-1").comments.len(),
             1,
             "two readings of one legacy file merge to one comment, as they always did"
         );
@@ -2795,7 +3962,7 @@ mod tests {
                         vec![a_comment("merged clean", 50)],
                     )],
                 ),
-                check: |out| assert_eq!(out.tasks[0].comments.len(), 1),
+                check: |out| assert_eq!(out.task("t-1").comments.len(), 1),
             },
             Case {
                 name: "a different comment added on each side: both survive",
@@ -2815,11 +3982,8 @@ mod tests {
                     vec![with_comments("t-1", 200, vec![a_comment("from disk", 200)])],
                 ),
                 check: |out| {
-                    let texts: Vec<&str> = out.tasks[0]
-                        .comments
-                        .iter()
-                        .map(|c| c.text.as_str())
-                        .collect();
+                    let task = out.task("t-1");
+                    let texts: Vec<&str> = task.comments.iter().map(|c| c.text.as_str()).collect();
                     // Oldest first, which is the order the panel renders and an agent reads —
                     // so the comment from the *losing* side still sorts into its right place.
                     assert_eq!(texts, ["from disk", "from memory"]);
@@ -2845,11 +4009,11 @@ mod tests {
                 ),
                 check: |out| {
                     assert_eq!(
-                        out.tasks[0].status,
+                        out.task("t-1").status,
                         TaskStatus::Review,
                         "the newer side's status"
                     );
-                    assert_eq!(out.tasks[0].comments.len(), 2, "both comments");
+                    assert_eq!(out.task("t-1").comments.len(), 2, "both comments");
                 },
             },
             Case {
@@ -2885,7 +4049,7 @@ mod tests {
                         ["mine, newer"],
                         "the scalar fields still follow the newer side"
                     );
-                    assert_eq!(out.tasks[0].created_by, TaskAuthor::Orchestrator);
+                    assert_eq!(out.task("t-1").created_by, TaskAuthor::Orchestrator);
                 },
             },
             Case {
@@ -2901,7 +4065,7 @@ mod tests {
                 theirs: a_file(4, vec![a_task("t-1", "theirs, newer", 200)]),
                 check: |out| {
                     assert_eq!(titles(out), ["theirs, newer"]);
-                    assert_eq!(out.tasks[0].created_by, TaskAuthor::Orchestrator);
+                    assert_eq!(out.task("t-1").created_by, TaskAuthor::Orchestrator);
                 },
             },
             Case {
@@ -2933,7 +4097,7 @@ mod tests {
                     }],
                 ),
                 check: |out| {
-                    let task = &out.tasks[0];
+                    let task = &out.task("t-1");
                     assert_eq!(task.comments.len(), 1, "the stale side's comment is kept");
                     assert!(
                         task.links[0].deleted,
@@ -2963,7 +4127,7 @@ mod tests {
                         vec![an_edge(LinkType::Related, "t-2", true, 50)],
                     )],
                 ),
-                check: |out| assert!(!out.tasks[0].links[0].deleted),
+                check: |out| assert!(!out.task("t-1").links[0].deleted),
             },
             Case {
                 name: "a link added on each side: both survive",
@@ -2986,29 +4150,29 @@ mod tests {
                         vec![an_edge(LinkType::BlockedBy, "t-3", false, 200)],
                     )],
                 ),
-                check: |out| assert_eq!(out.tasks[0].links.len(), 2),
+                check: |out| assert_eq!(out.task("t-1").links.len(), 2),
             },
         ];
 
         for case in cases {
-            let out = merge(&case.mine, &case.theirs);
+            let out = case.mine.merge(&case.theirs);
             (case.check)(&out);
             assert_eq!(
-                out.rev,
-                case.mine.rev.max(case.theirs.rev) + 1,
+                out.index.rev,
+                case.mine.index.rev.max(case.theirs.index.rev) + 1,
                 "{}: rev must land past both sides, or a window holding either one keeps its \
                  stale snapshot ({})",
                 case.name,
                 case.why
             );
             assert_eq!(
-                out.schema_version,
+                out.index.schema_version,
                 TaskFile::CURRENT_SCHEMA,
                 "{}: the merge writes this build's schema",
                 case.name
             );
             assert!(
-                validate(&out).is_ok(),
+                validate(&out.index).is_ok(),
                 "{}: a merge must never produce a file this build refuses to write ({})",
                 case.name,
                 case.why
@@ -3055,13 +4219,14 @@ mod tests {
             vec![with_comments("t-1", 200, vec![a_comment("b", 200)])],
         );
 
-        let once = merge(&mine, &theirs);
-        let twice = merge(&once, &theirs);
+        let once = mine.merge(&theirs);
+        let twice = once.merge(&theirs);
         assert_eq!(
-            once.tasks, twice.tasks,
+            once.tasks(),
+            twice.tasks(),
             "the merge is idempotent over content"
         );
-        assert!(twice.rev > once.rev);
+        assert!(twice.index.rev > once.index.rev);
     }
 
     /// The in-memory order survives, because the user is looking at it.
@@ -3075,7 +4240,165 @@ mod tests {
             1,
             vec![a_task("t-1", "first", 10), a_task("t-7", "pulled", 10)],
         );
-        assert_eq!(ids(&merge(&mine, &theirs)), ["t-3", "t-1", "t-7"]);
+        assert_eq!(ids(&mine.merge(&theirs)), ["t-3", "t-1", "t-7"]);
+    }
+
+    // --- the board's row, and searching what it no longer carries (M68) -----------------------
+
+    #[test]
+    fn a_row_counts_what_is_live_and_nothing_else() {
+        let mut task = a_task("t-1", "counted", 10);
+
+        // Body attachments: one live, one tombstoned.
+        task.attachments = vec![an_attachment("a-1", "keep.png", 10), {
+            let mut gone = an_attachment("a-2", "gone.png", 11);
+            gone.deleted = true;
+            gone
+        }];
+
+        // Three comments: one plain, one tombstoned, one live and carrying two files of which one
+        // is itself tombstoned.
+        let mut tombstoned = a_comment("removed", 20);
+        tombstoned.deleted = true;
+        // A tombstoned comment's own attachments are tombstoned with it by `DeleteComment`, but the
+        // count must not depend on that having happened: a hand-edited file can carry a live record
+        // under a dead comment, and the comment is what decides.
+        tombstoned.attachments = vec![an_attachment("a-3", "orphan.png", 21)];
+        let mut carrying = a_comment("has files", 30);
+        carrying.attachments = vec![an_attachment("a-4", "one.png", 31), {
+            let mut gone = an_attachment("a-5", "two.png", 32);
+            gone.deleted = true;
+            gone
+        }];
+        task.comments = vec![a_comment("plain", 10), tombstoned, carrying];
+
+        let row = TaskRow::of(&task);
+        assert_eq!(
+            row.comment_count, 2,
+            "a tombstoned comment is one the user removed and `adapt.ts` drops it at the seam, so \
+             counting it puts a `3 comment(s)` on a card showing two"
+        );
+        assert_eq!(
+            row.attachment_count, 2,
+            "one live on the body and one on a live comment — the dead comment's record does not \
+             count however it is spelled, because the comment is what the panel drew"
+        );
+    }
+
+    #[test]
+    fn a_row_carries_every_field_a_list_reads_and_none_it_does_not() {
+        let mut task = a_task("t-9", "titled", 77);
+        task.body = "a whole statement of work".into();
+        task.status = TaskStatus::Doing;
+        task.agent = Some(AgentId("developer".into()));
+        task.change = Some(ChangeName("add-dark-mode".into()));
+        task.links = vec![TaskLink {
+            link: LinkType::BlockedBy,
+            target: TaskId("t-3".into()),
+            deleted: false,
+            at_unix_ms: 5,
+        }];
+        task.created_by = TaskAuthor::Orchestrator;
+
+        let row = TaskRow::of(&task);
+        assert_eq!(row.id, task.id);
+        assert_eq!(row.title, task.title);
+        assert_eq!(row.status, task.status);
+        assert_eq!(row.agent, task.agent);
+        assert_eq!(row.change, task.change);
+        assert_eq!(row.created_by, task.created_by);
+        assert_eq!(row.created_unix_ms, task.created_unix_ms);
+        assert_eq!(
+            row.updated_unix_ms, task.updated_unix_ms,
+            "the merge tiebreak and the panel's in-group sort key — a row that dropped it would \
+             quietly stop reordering"
+        );
+        assert_eq!(
+            row.links, task.links,
+            "links stay on the row because `blocks` is derived by scanning every other task's \
+             list, and auto-dispatch reads a blocker's status: a reader that had to open a file \
+             per task to answer `is this blocked` would load the whole board to draw a list"
+        );
+    }
+
+    #[test]
+    fn the_board_hands_out_rows_and_keeps_its_revision() {
+        let dir = TempDir::new("board-rows");
+        let store = TaskStore::open(&dir.0);
+        let mut req = new_task("Add dark mode");
+        req.body = Some("the long version".into());
+        let task = store.create(&req, TaskAuthor::User).expect("created");
+        store
+            .edit(
+                &task.id,
+                TaskEdit::Comment {
+                    text: "started".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("commented");
+
+        let TaskBoard::Ready { tasks, rev } = store.board() else {
+            panic!("a tracker with a task in it is ready");
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, task.id);
+        assert_eq!(tasks[0].comment_count, 1);
+        assert!(
+            rev > 0,
+            "`rev` must stay on the ready arm: the receiving store's drop rule is \
+             `Number.isFinite(next.rev) && next.rev > current.rev`, so a missing one judges every \
+             snapshot not-newer and freezes the panel for the rest of the session"
+        );
+    }
+
+    #[test]
+    fn search_reads_the_id_the_title_and_the_body_but_never_the_comments() {
+        let mut body = a_task("t-1", "nothing in the title", 10);
+        body.body = "the retry ladder".into();
+        let mut commented = a_task("t-2", "also nothing", 10);
+        commented.comments = vec![a_comment("the retry ladder again", 20)];
+        let tracker = a_file(1, vec![body, a_task("t-3", "the RETRY bar", 10), commented]);
+        let file = &tracker.index;
+        /*
+         * The bodies arrive through a closure. (M68)
+         *
+         * That is the seam the store reaches through — it owns the policy about how many content
+         * files to open, and a search is the one operation that wants all of them — and it is what
+         * keeps this test able to state *id, title, body, never the comments* with no disk anywhere
+         * near it. The closure below is the whole of what a content file contributes.
+         */
+        let bodies = &tracker.content;
+        let body_of = |id: &TaskId| bodies.get(id).map(|c| c.body.clone());
+        let search = |query: &str| search(file, &body_of, query);
+
+        assert_eq!(
+            search("retry"),
+            [TaskId("t-1".into()), TaskId("t-3".into())],
+            "the body and the title match, case-insensitively; a comment does not — a query would \
+             otherwise match on a word an agent used in a progress note, which is not what the \
+             person asking meant"
+        );
+        assert_eq!(
+            search("t-3"),
+            [TaskId("t-3".into())],
+            "the id matches, because quoting one back is how a task is found after an agent named it"
+        );
+        assert_eq!(
+            search("   "),
+            [
+                TaskId("t-1".into()),
+                TaskId("t-3".into()),
+                TaskId("t-2".into())
+            ],
+            "an empty or blank query matches everything, in the file's own order: the panel's `no \
+             filter` state must never be spelled as a query that matches nothing, which would draw \
+             `nothing matched` over a full board"
+        );
+        assert!(
+            search("absent").is_empty(),
+            "and a real miss is still a miss"
+        );
     }
 
     // --- layer 2: reading, repairing, never failing -------------------------------------------
@@ -3172,7 +4495,15 @@ mod tests {
         );
 
         let store = TaskStore::open(dir.root());
-        assert_eq!(titles(&store.snapshot()), ["first"]);
+        assert_eq!(
+            store
+                .snapshot()
+                .tasks
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
         assert!(validate(&store.snapshot()).is_ok());
     }
 
@@ -3294,14 +4625,148 @@ mod tests {
     fn a_task_file_written_before_the_change_link_still_parses() {
         // `.cide/tasks.json` is committed. A build that refused last week's file over a field it
         // added would be the tracker locking the team out of its own repository.
+        //
+        // Through the ladder since M68 rather than straight into `TaskFile`: a schema 1 document no
+        // longer *has* the current shape, and the claim this test makes — that an older file still
+        // opens, with the fields it never had at their defaults — is now a claim about the migration.
         let json = r#"{"schemaVersion":1,"rev":3,"tasks":[{"id":"t-1","title":"old",
             "body":"","status":"todo","agent":null,"comments":[],
             "createdUnixMs":1,"updatedUnixMs":1}]}"#;
-        let file: TaskFile = serde_json::from_str(json).expect("an older file still parses");
+        let value: Value = serde_json::from_str(json).expect("valid JSON");
+        let (migrated, content) = migrate(value, 1).expect("an older file still migrates");
+        let file: TaskFile = serde_json::from_value(migrated).expect("and parses");
+        assert_eq!(file.schema_version, TaskFile::CURRENT_SCHEMA);
         assert_eq!(file.tasks[0].change, None);
         assert!(
             file.tasks[0].links.is_empty(),
             "and no links, same posture (M30)"
+        );
+        assert_eq!(
+            file.tasks[0].comment_count, 0,
+            "the counts are derived from the content the migration lifted, not invented"
+        );
+        let content = content.expect("a migrated file hands back its content");
+        assert_eq!(
+            content[&TaskId("t-1".into())],
+            TaskContent::default(),
+            "a task that had nothing but a title migrates to empty content"
+        );
+    }
+
+    /// A schema 1 tracker becomes an index plus one file per task, and nothing is lost on the way.
+    #[test]
+    fn a_schema_1_tracker_migrates_to_an_index_and_a_file_per_task() {
+        let json = r#"{"schemaVersion":1,"rev":9,"nextId":3,"tasks":[
+            {"id":"t-1","title":"with a log","body":"the long version","status":"doing",
+             "agent":"developer","createdUnixMs":1,"updatedUnixMs":2,
+             "comments":[
+               {"id":"c-1","author":{"kind":"user"},"text":"first","atUnixMs":10},
+               {"id":"c-2","author":{"kind":"user"},"text":"gone","atUnixMs":11,"deleted":true}],
+             "history":[{"from":"todo","to":"doing","by":{"kind":"user"},"atUnixMs":12}],
+             "attachments":[{"id":"a-1","name":"shot.png","bytes":10,"kind":"image",
+                             "addedBy":{"kind":"user"},"addedUnixMs":13}]},
+            {"id":"t-2","title":"bare","body":"","status":"todo","agent":null,
+             "comments":[],"createdUnixMs":1,"updatedUnixMs":1}]}"#;
+        let value: Value = serde_json::from_str(json).expect("valid JSON");
+        let (migrated, content) = migrate(value, 1).expect("migrates");
+        let file: TaskFile = serde_json::from_value(migrated).expect("parses");
+        let content = content.expect("content was lifted");
+
+        assert_eq!(file.rev, 9, "the revision is carried, not reset");
+        assert_eq!(file.next_id, 3, "and so is the id counter");
+        assert_eq!(
+            ids(&Tracker {
+                index: file.clone(),
+                content: content.clone(),
+            }),
+            ["t-1", "t-2"],
+            "in the file's own order"
+        );
+
+        let row = &file.tasks[0];
+        assert_eq!(
+            row.comment_count, 1,
+            "the tombstoned comment is not counted — `TaskRow::of`'s rule, applied by the migration              rather than restated by it"
+        );
+        assert_eq!(row.attachment_count, 1);
+        assert_eq!(row.status, TaskStatus::Doing);
+        assert_eq!(row.agent.as_ref().map(|a| a.as_str()), Some("developer"));
+
+        let lifted = &content[&TaskId("t-1".into())];
+        assert_eq!(lifted.body, "the long version");
+        assert_eq!(
+            lifted.comments.len(),
+            2,
+            "the tombstone is LIFTED even though it is not counted: it stays in the file so a merge              against a stale copy cannot resurrect the comment"
+        );
+        assert_eq!(lifted.history.len(), 1);
+        assert_eq!(lifted.attachments.len(), 1);
+
+        assert_eq!(
+            content[&TaskId("t-2".into())],
+            TaskContent::default(),
+            "a task with nothing in it lifts to nothing, and writes no file"
+        );
+    }
+
+    /// The conversion happens **on open**, writes both halves, and moves the attachment bytes.
+    #[test]
+    fn opening_a_schema_1_project_converts_it_and_moves_its_attachments() {
+        let dir = TempDir::new("migrate-open");
+        dir.plant(
+            r#"{"schemaVersion":1,"rev":4,"nextId":2,"tasks":[
+                {"id":"t-1","title":"has a file","body":"b","status":"todo","agent":null,
+                 "comments":[{"id":"c-1","author":{"kind":"user"},"text":"hi","atUnixMs":10}],
+                 "createdUnixMs":1,"updatedUnixMs":2,
+                 "attachments":[{"id":"a-1","name":"shot.png","bytes":3,"kind":"image",
+                                 "addedBy":{"kind":"user"},"addedUnixMs":13}]}]}"#,
+        );
+        // The bytes, where a schema 1 build would have put them.
+        let old_dir = dir.root().join(".cide/attachments/t-1/a-1");
+        fs::create_dir_all(&old_dir).expect("plant the old layout");
+        fs::write(old_dir.join("shot.png"), b"png").expect("plant the bytes");
+
+        let store = TaskStore::open(dir.root());
+
+        let raw = fs::read_to_string(dir.tasks()).expect("the index was rewritten");
+        assert!(
+            raw.contains("\"schemaVersion\": 2"),
+            "the index is converted on open, not on the first mutation: {raw}"
+        );
+        let on_disk = read_tracker(dir.root());
+        let task = on_disk.task("t-1");
+        assert_eq!(task.body, "b", "the body landed in the task's own file");
+        assert_eq!(task.comments.len(), 1, "and so did the log");
+        assert_eq!(store.snapshot().rev, 4, "conversion is not a mutation");
+
+        let moved = dir.root().join(".cide/tasks/t-1/attachments/a-1/shot.png");
+        assert!(moved.is_file(), "the bytes moved under the task");
+        assert!(
+            !dir.root().join(".cide/attachments").exists(),
+            "and the old tree was pruned once it emptied"
+        );
+        assert_eq!(
+            attachments::path_of(dir.root(), &task.id, &task.attachments[0]),
+            moved,
+            "and `path_of` finds them where they now are"
+        );
+    }
+
+    /// An interrupted relocation is harmless: the reader tries the new path, then the old.
+    #[test]
+    fn an_attachment_left_in_the_old_layout_is_still_found() {
+        let dir = TempDir::new("legacy-attachment");
+        let task = TaskId("t-1".into());
+        let record = an_attachment("a-1", "shot.png", 10);
+        let old = dir.root().join(".cide/attachments/t-1/a-1");
+        fs::create_dir_all(&old).expect("plant");
+        fs::write(old.join("shot.png"), b"png").expect("plant");
+
+        assert_eq!(
+            attachments::path_of(dir.root(), &task, &record),
+            old.join("shot.png"),
+            "a file the conversion did not reach is still read where it is — a move interrupted by \
+             a crash or a full disk must not read as a missing attachment"
         );
     }
 
@@ -3818,14 +5283,8 @@ mod tests {
         let mut theirs = a_task("t-1", "merge me", 4_000);
         theirs.history = vec![hop(TaskStatus::Todo, TaskStatus::Doing, 2_000)];
 
-        let file = |task: &Task| TaskFile {
-            schema_version: TaskFile::CURRENT_SCHEMA,
-            rev: 1,
-            next_id: 2,
-            tasks: vec![task.clone()],
-        };
-        let merged = merge(&file(&mine), &file(&theirs));
-        let task = &merged.tasks[0];
+        let merged = a_file(1, vec![mine.clone()]).merge(&a_file(1, vec![theirs.clone()]));
+        let task = &merged.task("t-1");
         assert_eq!(
             task.history, mine.history,
             "the shared hop collapsed, the newer one adopted, oldest first"
@@ -3988,10 +5447,10 @@ mod tests {
     #[test]
     fn a_counter_behind_a_live_id_is_refused_by_validate() {
         let mut file = a_file(1, vec![a_task("t-4", "four", 1)]);
-        assert!(validate(&file).is_ok());
-        file.next_id = 4;
+        assert!(validate(&file.index).is_ok());
+        file.index.next_id = 4;
         assert!(
-            validate(&file).is_err(),
+            validate(&file.index).is_err(),
             "a counter that is not past every id will mint one of them again"
         );
     }
@@ -4000,10 +5459,10 @@ mod tests {
     fn the_merge_takes_the_higher_counter_from_either_side() {
         let mut mine = a_file(5, vec![a_task("t-1", "one", 1)]);
         let mut theirs = a_file(5, vec![a_task("t-1", "one", 1)]);
-        mine.next_id = 7;
-        theirs.next_id = 40;
-        assert_eq!(merge(&mine, &theirs).next_id, 40);
-        assert_eq!(merge(&theirs, &mine).next_id, 40);
+        mine.index.next_id = 7;
+        theirs.index.next_id = 40;
+        assert_eq!(mine.merge(&theirs).index.next_id, 40);
+        assert_eq!(theirs.merge(&mine).index.next_id, 40);
     }
 
     #[test]
@@ -4109,13 +5568,203 @@ mod tests {
              is what stops an ordinary line being adopted as provenance"
         );
 
-        // Reading does not rewrite. Deriving the creator happens in memory, so a teammate who
-        // merely opens the project produces no diff in a file their repository tracks; the field
-        // reaches disk with the next real mutation, like every other repair this function makes.
+        /*
+         * Opening a schema 1 project **does** rewrite it, and that is the M68 change. (M68)
+         *
+         * This assertion used to be the reverse — that reading derived the creator in memory and
+         * left the file byte-identical, so a teammate who merely opened the project produced no
+         * diff. That promise cannot survive a format conversion, and the conversion was made
+         * deliberate rather than lazy: one observable event at a known time, before anything else
+         * touches the tracker, undone by one `git checkout .cide`. `TaskStore::open` carries the
+         * argument and what it costs.
+         *
+         * The half of the promise that *does* survive is pinned by
+         * `opening_a_schema_2_project_rewrites_nothing` below: once converted, opening a project
+         * writes nothing at all — which is the property teammates actually feel, since after the
+         * first conversion every subsequent open is one.
+         */
+        let now = fs::read_to_string(dir.tasks()).expect("read");
+        assert_ne!(now, planted, "a schema 1 tracker is converted on open");
+        assert!(
+            now.contains("\"schemaVersion\": 2"),
+            "and the conversion is what rewrote it: {now}"
+        );
+        assert!(
+            now.contains("\"agent\": \"qa\""),
+            "with the recovered creator written down once, rather than re-derived for ever: {now}"
+        );
+    }
+
+    /// A **real** schema 1 tracker converts, against whatever is at `CIDE_TRACKER`.
+    ///
+    /// # Why this exists when the synthetic migration tests pass
+    ///
+    /// Because every fixture in this file was written by somebody who already knew the format. A
+    /// four-month-old board has tasks from four different builds of cide in it — comments with no
+    /// ids, tasks with no `createdBy`, a `nextId` that predates the field, attachment records whose
+    /// bytes were moved by hand — and the conversion has to survive all of it at once. `cide-core`'s
+    /// `a_real_package` takes the same shape for the same reason, and names its input the same way.
+    ///
+    /// Ignored, because it needs a tracker nobody's CI has:
+    ///
+    /// ```sh
+    /// CIDE_TRACKER=/path/to/project cargo test -p cide-tasks a_real_tracker -- --ignored --nocapture
+    /// ```
+    ///
+    /// It **copies** the project's `.cide/` into a scratch directory and converts the copy. Pointing
+    /// a migration at somebody's live tracker to find out whether it works is the one way this test
+    /// could cost more than it proves.
+    #[test]
+    #[ignore = "needs CIDE_TRACKER pointing at a real project"]
+    fn a_real_tracker_converts() {
+        let Ok(source) = std::env::var("CIDE_TRACKER") else {
+            eprintln!("set CIDE_TRACKER to a project directory");
+            return;
+        };
+        let source = PathBuf::from(source);
+        let dir = TempDir::new("real-tracker");
+        copy_tree(&source.join(".cide"), &dir.root().join(".cide"));
+
+        let before = read(&tasks_path(dir.root()));
+        let ReadOutcome::Ready { file: planned, .. } = before else {
+            panic!("the copied tracker does not read: {before:?}");
+        };
+        let expected: Vec<TaskId> = planned.tasks.iter().map(|t| t.id.clone()).collect();
+        eprintln!("{} task(s) to convert", expected.len());
+
+        let store = TaskStore::open(dir.root());
+
+        let after = read_tracker(dir.root());
         assert_eq!(
-            fs::read_to_string(dir.tasks()).expect("read"),
-            planted,
-            "opening a project rewrote a tracked file"
+            after.index.schema_version,
+            TaskFile::CURRENT_SCHEMA,
+            "the index on disk is converted"
+        );
+        assert_eq!(
+            after
+                .index
+                .tasks
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "every task survived, in the file's own order"
+        );
+        assert_eq!(
+            after.index.rev, planned.rev,
+            "a conversion is not a mutation and does not move the revision"
+        );
+
+        // Every count on disk agrees with the content file beside it. This is invariant 2 asked of
+        // real data: the numbers were derived by the migration and the files were written by the
+        // flush, and nothing after this point re-derives them.
+        for row in &after.index.tasks {
+            let content = &after.content[&row.id];
+            let recomputed = TaskRow::of(&task_of(row, content));
+            assert_eq!(
+                (row.comment_count, row.attachment_count),
+                (recomputed.comment_count, recomputed.attachment_count),
+                "{}: the index's counts disagree with its content file",
+                row.id
+            );
+        }
+
+        // No attachment record points at bytes that are not there — through `path_of`, so a record
+        // whose file the relocation did not reach still resolves to where it actually is.
+        let mut files = 0;
+        for row in &after.index.tasks {
+            let task = after.task(row.id.as_str());
+            for record in task
+                .attachments
+                .iter()
+                .chain(task.comments.iter().flat_map(|c| c.attachments.iter()))
+                .filter(|a| !a.deleted)
+            {
+                let path = attachments::path_of(dir.root(), &row.id, record);
+                assert!(
+                    path.is_file(),
+                    "{}: {} is recorded but not on disk at {}",
+                    row.id,
+                    record.name,
+                    path.display()
+                );
+                files += 1;
+            }
+        }
+        eprintln!("{files} attachment(s) resolve");
+
+        // And opening the converted copy again writes nothing at all.
+        let index = fs::read_to_string(dir.tasks()).expect("index");
+        drop(store);
+        let _again = TaskStore::open(dir.root());
+        assert_eq!(
+            fs::read_to_string(dir.tasks()).expect("index"),
+            index,
+            "a second open rewrote the converted index"
+        );
+    }
+
+    /// `cp -r`, for [`a_real_tracker_converts`]. Recursive, symlink-free, and good enough for a
+    /// directory this test made a copy of on purpose.
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).expect("make the copy's directory");
+        for entry in fs::read_dir(from).expect("read the source") {
+            let entry = entry.expect("an entry");
+            let kind = entry.file_type().expect("a file type");
+            let target = to.join(entry.file_name());
+            if kind.is_dir() {
+                // `worktrees/` is one whole checkout per agent and has nothing to do with the
+                // tracker; copying it would turn a 2 MB test into a 6 GB one.
+                if entry.file_name() == "worktrees" {
+                    continue;
+                }
+                copy_tree(&entry.path(), &target);
+            } else if kind.is_file() {
+                fs::copy(entry.path(), &target).expect("copy a file");
+            }
+        }
+    }
+
+    /// The surviving half of *reading does not rewrite*: an already-converted project is untouched.
+    #[test]
+    fn opening_a_schema_2_project_rewrites_nothing() {
+        let dir = TempDir::new("open-idempotent");
+        {
+            let store = TaskStore::open(dir.root());
+            let mut req = new_task("has a body");
+            req.body = Some("and a conversation".into());
+            let task = store.create(&req, TaskAuthor::User).expect("create");
+            store
+                .edit(
+                    &task.id,
+                    TaskEdit::Comment {
+                        text: "a line".into(),
+                    },
+                    TaskAuthor::User,
+                )
+                .expect("comment");
+            store.write_now();
+        }
+
+        let index = fs::read_to_string(dir.tasks()).expect("index");
+        let content =
+            fs::read_to_string(content_path(dir.root(), &TaskId("t-1".into()))).expect("content");
+
+        // Opened again, and again — the repeat matters, because a conversion that ran every time
+        // would still produce identical bytes on the second open and differ only on the first.
+        for _ in 0..2 {
+            let _store = TaskStore::open(dir.root());
+        }
+
+        assert_eq!(
+            fs::read_to_string(dir.tasks()).expect("index"),
+            index,
+            "opening a converted project rewrote its index"
+        );
+        assert_eq!(
+            fs::read_to_string(content_path(dir.root(), &TaskId("t-1".into()))).expect("content"),
+            content,
+            "opening a converted project rewrote a task's content"
         );
     }
 
@@ -4159,29 +5808,23 @@ mod tests {
             "the caller is told the board moved under it"
         );
 
-        let on_disk = match read(&dir.tasks()) {
-            ReadOutcome::Ready { file, .. } => file,
-            other => panic!("expected Ready, got {other:?}"),
-        };
+        let on_disk = read_tracker(dir.root());
         assert_eq!(
             titles(&on_disk),
             ["ours", "theirs"],
             "the pulled task was adopted"
         );
-        let texts: Vec<&str> = on_disk.tasks[0]
-            .comments
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect();
+        let task = on_disk.task("t-1");
+        let texts: Vec<&str> = task.comments.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
             texts,
             ["from the teammate", "from this process"],
             "neither side's comment was lost"
         );
         assert!(
-            on_disk.rev > 40,
+            on_disk.index.rev > 40,
             "rev landed past both sides: {}",
-            on_disk.rev
+            on_disk.index.rev
         );
     }
 
@@ -4209,7 +5852,14 @@ mod tests {
         let merged = store
             .refresh_from_disk()
             .expect("the change is reported so the caller can broadcast it");
-        assert_eq!(titles(&merged), ["ours", "theirs"]);
+        assert_eq!(
+            merged
+                .tasks
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            ["ours", "theirs"]
+        );
         assert!(
             store.refresh_from_disk().is_none(),
             "asked twice, the second look found something new in an unchanged file"
@@ -4220,14 +5870,11 @@ mod tests {
         // not the watcher thread — writes the convergence.
         std::thread::sleep(persist::SAVE_DEBOUNCE);
         store.flush_if_due();
-        let on_disk = match read(&dir.tasks()) {
-            ReadOutcome::Ready { file, .. } => file,
-            other => panic!("expected Ready, got {other:?}"),
-        };
+        let on_disk = read_tracker(dir.root());
         assert_eq!(
-            on_disk,
+            on_disk.index,
             store.snapshot(),
-            "the flusher converged the file to the merged board"
+            "the flusher converged the index to the merged board"
         );
     }
 
@@ -4281,16 +5928,42 @@ mod tests {
         );
 
         let merged = store.refresh_from_disk().expect("merged");
-        assert_eq!(titles(&merged), ["ours", "theirs"]);
-        let texts: Vec<&str> = merged.tasks[0]
-            .comments
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect();
+        assert_eq!(
+            merged
+                .tasks
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            ["ours", "theirs"]
+        );
+        // Asked of the **store**, not of the disk: `refresh_from_disk` merges in memory and re-arms
+        // the debounce, deliberately leaving the write to the ordinary flusher tick rather than
+        // doing it on a watcher thread. The comments it merged are in the store's cache; the task's
+        // file on disk is still the one `write_now` left, which is exactly the state this test is
+        // about. (M68)
+        let task = store.get(&TaskId("t-1".into())).expect("still there");
+        let texts: Vec<&str> = task.comments.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
             texts,
             ["from the teammate", "pending"],
             "one of the two comments was lost to the refresh"
+        );
+
+        // And the convergence reaches disk on the next tick, which is the other half of the
+        // arrangement: a merge that only ever lived in memory would be lost to a crash.
+        std::thread::sleep(persist::SAVE_DEBOUNCE);
+        store.flush_if_due();
+        let on_disk = read_tracker(dir.root());
+        let written: Vec<String> = on_disk
+            .task("t-1")
+            .comments
+            .iter()
+            .map(|c| c.text.clone())
+            .collect();
+        assert_eq!(
+            written,
+            ["from the teammate", "pending"],
+            "the flusher converged the task's own file too"
         );
     }
 
@@ -4377,13 +6050,42 @@ mod tests {
             .expect("create");
         store.write_now();
 
+        // A task with nothing in it has **no content file**, which is deliberate and is what
+        // `TaskStore::create` documents: content that equals the default is not dirty, so nothing is
+        // written, and a row with no content file is a state the reader already treats as ordinary.
+        // The alternative — a `task.json` of four empty fields per task — would put a file in
+        // somebody's repository for every task they ever created without describing.
+        assert!(
+            !content_path(dir.root(), &TaskId("t-1".into())).exists(),
+            "an empty task wrote a content file"
+        );
+
+        let mut described = new_task("described");
+        described.body = Some("the long version".into());
+        store.create(&described, TaskAuthor::User).expect("create");
+        store.write_now();
+
         let raw = fs::read_to_string(dir.tasks()).expect("read");
         assert!(raw.ends_with("}\n"), "no trailing newline: {raw:?}");
         assert!(
             raw.lines().count() > 5,
             "one-line JSON makes every change a whole-file diff"
         );
-        assert!(raw.contains("\"schemaVersion\": 1"));
+        assert!(raw.contains("\"schemaVersion\": 2"));
+
+        // The same two promises for a task's own file, which is committed and diffed exactly as the
+        // index is. (M68) Asserted here rather than in a test of its own because it is the same
+        // claim about the same reader — a person looking at a pull request.
+        let content = fs::read_to_string(content_path(dir.root(), &TaskId("t-2".into())))
+            .expect("a task with a body has a content file");
+        assert!(
+            content.ends_with("}\n"),
+            "no trailing newline on a task's file: {content:?}"
+        );
+        assert!(
+            content.lines().count() > 3,
+            "one-line JSON makes every comment a whole-file diff"
+        );
     }
 
     /// A starting status the user chose in the compose dialog is honoured; absence is `Todo`.
@@ -4533,8 +6235,8 @@ mod tests {
         let on_disk = attachments::path_of(dir.root(), &id, shot);
         assert_eq!(fs::read(&on_disk).expect("copied"), png_bytes());
         assert!(
-            on_disk.starts_with(dir.root().join(".cide/attachments").join(id.as_str())),
-            "{}",
+            on_disk.starts_with(attachments::dir(dir.root(), &id)),
+            "since M68 a task's files live under the task: {}",
             on_disk.display()
         );
         // The source is a copy's source, not a move's: it is still where it was.
@@ -4659,7 +6361,7 @@ mod tests {
         assert!(text.contains("gone.txt"), "{text}");
         assert!(text.contains("no such file"), "{text}");
         assert!(
-            !dir.root().join(".cide/attachments").exists(),
+            !attachments::dir(dir.root(), &id).exists(),
             "nothing may have been copied"
         );
         let task = store.get(&id).unwrap();
@@ -4707,7 +6409,7 @@ mod tests {
             .expect_err("no such comment")
             .to_string();
         assert!(text.contains("no such comment"), "{text}");
-        assert!(!dir.root().join(".cide/attachments").exists());
+        assert!(!attachments::dir(dir.root(), &id).exists());
     }
 
     /// A source under the staging root is consumed — copied under the task and then gone, with
@@ -4753,41 +6455,37 @@ mod tests {
             .attachments
             .push(an_attachment("a-1", "two.txt", 20));
         task.comments.push(comment);
-        let file = a_file(1, vec![task.clone()]);
-        let text = validate(&file)
+        // `validate_content`/`repair_content` since M68: an attachment record is content, and the
+        // index half of either has no record to look at. Every rule asserted below is unchanged.
+        let id = TaskId("t-1".into());
+        let content = content_of(&task);
+        let text = validate_content(&id, &content)
             .expect_err("duplicate across body and comment")
             .to_string();
         assert!(text.contains("two attachments"), "{text}");
 
-        let mut repaired = file.clone();
-        repair(&mut repaired);
-        assert!(validate(&repaired).is_ok());
+        let mut repaired = content.clone();
+        repair_content(&id, &mut repaired);
+        assert!(validate_content(&id, &repaired).is_ok());
+        assert_eq!(repaired.attachments.len(), 1, "the first copy is kept");
         assert_eq!(
-            repaired.tasks[0].attachments.len(),
-            1,
-            "the first copy is kept"
-        );
-        assert_eq!(
-            repaired.tasks[0].attachments[0].id.as_str(),
+            repaired.attachments[0].id.as_str(),
             "a-1",
             "and keeps its id"
         );
-        assert!(repaired.tasks[0].comments[0].attachments.is_empty());
+        assert!(repaired.comments[0].attachments.is_empty());
 
         // A malformed id or name is dropped, and the surviving record keeps the id it had.
         let mut task = a_task("t-2", "files", 100);
         task.attachments.push(an_attachment("", "no-id.txt", 10));
         task.attachments.push(an_attachment("a-2", "../escape", 20));
         task.attachments.push(an_attachment("a-3", "fine.txt", 30));
-        let mut file = a_file(1, vec![task]);
-        assert!(validate(&file).is_err());
-        repair(&mut file);
-        assert!(validate(&file).is_ok());
-        let kept: Vec<&str> = file.tasks[0]
-            .attachments
-            .iter()
-            .map(|a| a.id.as_str())
-            .collect();
+        let id = TaskId("t-2".into());
+        let mut content = content_of(&task);
+        assert!(validate_content(&id, &content).is_err());
+        repair_content(&id, &mut content);
+        assert!(validate_content(&id, &content).is_ok());
+        let kept: Vec<&str> = content.attachments.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(kept, ["a-3"]);
     }
 
@@ -4818,9 +6516,9 @@ mod tests {
                 ),
                 check: |out| {
                     assert_eq!(titles(out), ["mine, newer"]);
-                    assert_eq!(out.tasks[0].attachments.len(), 1);
+                    assert_eq!(out.task("t-1").attachments.len(), 1);
                     assert!(
-                        out.tasks[0].updated_unix_ms >= 150,
+                        out.task("t-1").updated_unix_ms >= 150,
                         "an adopted attachment is an update"
                     );
                 },
@@ -4845,7 +6543,7 @@ mod tests {
                     )],
                 ),
                 check: |out| {
-                    assert!(out.tasks[0].attachments[0].deleted, "deleted wins");
+                    assert!(out.task("t-1").attachments[0].deleted, "deleted wins");
                 },
             },
             Case {
@@ -4870,17 +6568,17 @@ mod tests {
                     })],
                 ),
                 check: |out| {
-                    let comment = &out.tasks[0].comments[0];
+                    let comment = &out.task("t-1").comments[0];
                     assert_eq!(comment.text, "report, corrected", "the edit wins the text");
                     assert_eq!(comment.attachments.len(), 1, "and the attachment survives");
                 },
             },
         ];
         for case in cases {
-            let out = merge(&case.mine, &case.theirs);
+            let out = case.mine.merge(&case.theirs);
             (case.check)(&out);
             assert!(
-                validate(&out).is_ok(),
+                validate(&out.index).is_ok(),
                 "{}: the merge must produce a file this build can write ({})",
                 case.name,
                 case.why

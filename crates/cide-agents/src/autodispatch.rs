@@ -3,8 +3,10 @@
 //! This is the policy behind "assigning a task starts the agent" and "@mentioning a role starts
 //! it on the task" — pure, so every rule below is a table row in the tests rather than a claim
 //! about a live registry. The app side (`cide-app`'s task triggers) supplies the mutation and
-//! acts on the answer; nothing here spawns, reads disk, or knows whether a run already exists
-//! (deduplication against live runs is the registry's fact and is checked there).
+//! acts on the answer; nothing here spawns, reads disk, or knows whether a run already exists.
+//! Deduplication against live runs is the registry's fact and is decided at the dispatch funnel
+//! — `cide_app::cmd::agents::plan_dispatch` and `AgentRegistry::enqueue_unique`. This function
+//! has no memory of a previous mutation at all, which the table below asserts outright.
 //!
 //! The rules, each of which earned its place:
 //!
@@ -38,8 +40,12 @@
 //!   So the caller now says *which* mutations were assignment gestures (`assign_gesture`: the
 //!   dropdown, `cide_task_assign`, a creation naming an assignee), and those dispatch even with
 //!   no change; a status flip or comment that happens to carry the assignee still fires nothing.
-//!   Stacking is not a risk this reopens — the registry's `has_open_run` dedupe downstream is
-//!   what refuses a duplicate while a run lives, and it always was.
+//!   Stacking is refused downstream and not here: `cide_app::cmd::agents::plan_dispatch` names
+//!   the run already holding the task in a sentence, and `AgentRegistry::enqueue_unique` refuses
+//!   it again under the lock that mints the id. Until M66 this line claimed the registry "always"
+//!   did so, which was true of the auto-dispatch road alone — the panel's button and
+//!   `cide_agent_dispatch` asked nothing, and the auto road's own check was not atomic. One
+//!   assignment plus one @mention of the same role really did produce two runs on one task.
 //! * **Mentions are scanned only in the text the mutation introduced** (`fresh_text`: a new
 //!   comment, a rewritten body, a creation body) — never in the stored task, or the mention in
 //!   the body would re-fire on every later status flip.
@@ -56,7 +62,7 @@
 //!   change would be a destructive act with no confirm; `agents_stop` and the Stop button stay
 //!   the only ways to end a run, and the run-end nudge is what surfaces any work left orphaned.
 
-use cide_ipc::{AgentId, LinkType, Task, TaskAuthor, TaskStatus};
+use cide_ipc::{AgentId, LinkType, Task, TaskAuthor, TaskRow, TaskStatus};
 
 use crate::mentions;
 
@@ -67,7 +73,7 @@ use crate::mentions;
 /// [`TaskStatus::Done`] and its id is never reused, so an edge to one must not gate for ever —
 /// see the module header. Tombstoned edges are not blockers at all.
 #[must_use]
-pub fn blocker_statuses(task: &Task, board: &[Task]) -> Vec<TaskStatus> {
+pub fn blocker_statuses(task: &Task, board: &[TaskRow]) -> Vec<TaskStatus> {
     task.links
         .iter()
         .filter(|l| l.link == LinkType::BlockedBy && !l.deleted)
@@ -261,7 +267,10 @@ mod tests {
                 at_unix_ms: 2,
             },
         ];
-        let board = vec![task(TaskStatus::Doing, None), blocked.clone()];
+        let board: Vec<TaskRow> = [task(TaskStatus::Doing, None), blocked.clone()]
+            .iter()
+            .map(TaskRow::of)
+            .collect();
         assert_eq!(blocker_statuses(&blocked, &board), vec![TaskStatus::Doing]);
     }
 
@@ -453,6 +462,53 @@ mod tests {
             ),
             None,
             "a typo in prose rewrote the assignee field or reached the spawn path"
+        );
+    }
+
+    /// **Where the dedupe is not.** (M66)
+    ///
+    /// [`an_edge_and_a_mention_in_one_mutation_deduplicate`] below proves the within-mutation
+    /// dedupe, and to a hurried eye it reads like the whole story. It is not: this function is
+    /// pure over *one* mutation and remembers nothing, so the same gesture arriving twice — a
+    /// creation naming an assignee, then a comment @mentioning the same role — answers twice,
+    /// deliberately and correctly. That pair is what produced the report of two runs on one
+    /// task. The refusal lives downstream, in `cide_app::cmd::agents::plan_dispatch` and
+    /// `AgentRegistry::enqueue_unique`; this row exists so that nobody reading only the file
+    /// below concludes it lives here.
+    #[test]
+    fn nothing_here_remembers_a_previous_mutation_so_the_dedupe_must_live_downstream() {
+        let after = task(TaskStatus::Todo, Some("game-designer"));
+        let names = roles(&["game-designer"]);
+
+        // The creation, naming an assignee.
+        let first = trigger(
+            None,
+            &after,
+            &[],
+            &TaskAuthor::Orchestrator,
+            true,
+            &[],
+            &names,
+        )
+        .expect("the assignment edge");
+        assert_eq!(ids(&first), ["game-designer"]);
+
+        // A separate mutation a moment later: a comment mentioning the same role. Nothing about
+        // the first call is visible from here, and that is the design.
+        let second = trigger(
+            Some(&after),
+            &after,
+            &[],
+            &TaskAuthor::Orchestrator,
+            false,
+            &["@game-designer ship the rosters"],
+            &names,
+        )
+        .expect("the mention");
+        assert_eq!(
+            ids(&second),
+            ["game-designer"],
+            "this function must go on answering; the registry is what refuses the second run"
         );
     }
 

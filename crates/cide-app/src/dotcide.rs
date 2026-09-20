@@ -135,6 +135,25 @@ fn classify(path: &Path, root: &Path) -> Route {
         },
         // Only the file itself, not e.g. an editor's `tasks.json.swp` beside it.
         Some((next, None)) if next == "tasks.json" => Route::Tasks,
+        /*
+         * Anything under `.cide/tasks/` — a task's own content file, and the attachment bytes
+         * beside it. (M68)
+         *
+         * The tracker is two things now: an index at `.cide/tasks.json` and one file per task. A
+         * `git pull` can move a task's comments without touching the index at all — a teammate
+         * commented and nothing about the row changed — and before this arm existed that landed as
+         * `Route::Nothing`: no `refresh_from_disk`, no broadcast, and a card showing yesterday's
+         * conversation until something unrelated happened to move the index.
+         *
+         * Deliberately **not** narrowed to `<id>/task.json`. An attachment's bytes arriving is also
+         * a change the panel should see — a thumbnail that was `Loading…` can now load — and the
+         * store's own reconcile decides what actually moved. The cost of being wide here is a
+         * `stat` per dirty task on a burst the watcher already coalesced.
+         *
+         * Below the `worktrees` arm, so an agent's checkout cannot reach it: that arm returns
+         * before this one is consulted, which is what keeps a run's `cargo build` out of here.
+         */
+        Some((next, _)) if next == "tasks" => Route::Tasks,
         Some((next, None)) if next == "config.json" => Route::Agents,
         Some((next, _)) if next == "agents" => Route::Agents,
         _ => Route::Nothing,

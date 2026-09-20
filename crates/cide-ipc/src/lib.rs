@@ -29,6 +29,8 @@ pub mod overrides;
 /// Per-file view memory. Its own module, and deliberately not part of [`workspace`] — the
 /// header of `positions.rs` says why at length.
 pub mod positions;
+/// What a path *is* — the properties card's OS stat, text facts and git summary. (M70)
+pub mod properties;
 pub mod settings;
 pub mod settings_ops;
 /// Editor colour schemes — the `--tk-*` palette, as data. A different axis from [`Theme`],
@@ -43,6 +45,9 @@ pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
 pub use llm::{LlmModel, LlmProvider, LlmSettings, ModelPool, PoolChoice, PoolEntry};
 pub use overrides::{AgentOverride, AgentOverrides, ProjectOverrides};
 pub use positions::{MarkdownView, ViewPosition};
+pub use properties::{
+    DirSummary, FileProperties, FilePropertiesGit, LineEnding, Owner, PathKind, TextFacts,
+};
 pub use settings::{
     ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
     DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,
@@ -113,9 +118,10 @@ pub use agents::{
     OrchestrationPatch, RunNotify, RunOpen, RunState,
 };
 pub use tasks::{
-    ATTACHMENTS_DIR, AttachTarget, AttachmentKind, LinkType, StagedFile, Task, TaskAttachment,
-    TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskLink, TaskLinkSpec, TaskNew,
-    TaskStatus, TaskStatusChange,
+    ATTACHMENTS_DIR, ATTACHMENTS_LEAF, AttachTarget, AttachmentKind, LinkType, StagedFile,
+    TASKS_DIR_RELATIVE, Task, TaskAttachment, TaskAuthor, TaskBoard, TaskComment, TaskContent,
+    TaskDetail, TaskEdit, TaskFile, TaskLink, TaskLinkSpec, TaskNew, TaskRow, TaskStatus,
+    TaskStatusChange,
 };
 
 // --- M22: extensions, and the marketplaces they come from ---

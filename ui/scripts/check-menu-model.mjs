@@ -235,8 +235,9 @@ try {
         '--',
         'copy-path',
         'history',
+        'properties',
       ],
-      'the workspace tab menu is the eight items, in three groups, with left before right',
+      'the workspace tab menu is the nine items, in three groups, with left before right',
     )
     item(entries, 'close-right').run()
     eq(bulk.calls, [['t2']], 'Close to the right closes only what follows this tab, in one call')
@@ -260,6 +261,24 @@ try {
     })
     item(withHistory, 'history').run()
     eq(asked, '/repo/src/main.rs', 'on a file tab it hands over the absolute path')
+
+    // --- Properties (M70) -------------------------------------------------------------
+    //
+    // The same absolute-path rule as `history` directly above, and for the same reason: the card
+    // stats the path and asks `git_locate` about it, and a repo-relative string is neither.
+    eq(
+      item(entries, 'properties').command,
+      'file.properties',
+      'the item names its command, so the row draws whatever chord the live keymap has',
+    )
+    let described = null
+    const withProperties = tabMenuEntries(tabs, file, 't1', {
+      properties: (path) => {
+        described = path
+      },
+    })
+    item(withProperties, 'properties').run()
+    eq(described, '/repo/src/main.rs', 'on a file tab it hands over the absolute path')
 
     // A git diff tab's `newPath` is repo-relative, so the item is refused — and refused with its
     // own sentence, because "this tab is not a file" would be false: it plainly is about one.

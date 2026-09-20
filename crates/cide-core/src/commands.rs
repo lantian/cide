@@ -925,6 +925,39 @@ fn build() -> Vec<Command> {
             .when("shellWindow && fileTabActive")
             .keywords(&["reveal", "locate", "show", "sidebar", "explorer", "tree"]),
         /*
+         * What a file *is*: OS stat, text facts and the git summary, in one card. (M70)
+         *
+         * **No `shellWindow`**, unlike `file.reveal` directly above, and the asymmetry is
+         * deliberate — it is `git.blame`'s rule. That command's clause omits it because the
+         * gutter is a property of the *buffer* and a detached-pane window can hold one; this one
+         * omits it because the card is an **overlay**, any window can raise one, and a command
+         * that works in a window has to be listable in it. The card's one window-dependent
+         * control, *Open full history*, is simply not drawn where there is no tool window
+         * (`FileProperties.tsx`'s `onOpenHistory` prop), rather than the whole command
+         * disappearing from the palette of the window it works in.
+         *
+         * `fileTabActive` and not `editorFocused`, `file.reveal`'s distinction exactly: this is
+         * about the tab rather than the focused pane, so a file tab split with a shell pane
+         * still answers. Both context menus pass an explicit path and never rely on the clause.
+         *
+         * No default binding. `alt+enter` is the IDE convention for this and is already
+         * `pane.maximize` (see `keymap::defaults`); displacing it to shave a right-click off a
+         * command nobody runs hourly is the wrong trade, and `git.history.file` — the command
+         * this one sits beside in every menu — ships with no chord for the same reason.
+         */
+        Command::new("file.properties", "File properties", FILE)
+            .when("projectOpen && fileTabActive")
+            .keywords(&[
+                "info",
+                "stat",
+                "size",
+                "permissions",
+                "metadata",
+                "details",
+                "owner",
+                "mode",
+            ]),
+        /*
          * A scratch file: a buffer that is not part of the project, in a drawer cide owns.
          *
          * `shellWindow && projectOpen`. The project is what keys the drawer, and the shell

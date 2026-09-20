@@ -65,6 +65,7 @@
     "check:picker": "node scripts/check-picker.mjs",
     "check:pools": "node scripts/check-pools.mjs",
     "check:problems": "node scripts/check-problems.mjs",
+    "check:properties": "node scripts/check-properties.mjs",
     "check:proxy": "node scripts/check-proxy.mjs",
     "check:pull-strategy": "node scripts/check-pull-strategy.mjs",
     "check:push": "node scripts/check-push.mjs",

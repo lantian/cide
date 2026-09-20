@@ -37,6 +37,7 @@
 //! draft is the only way a staged file outlives its gesture — and [`sweep_staging`] collects
 //! those at launch.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -59,15 +60,97 @@ const _: () = assert!(MAX_ATTACHMENT_BYTES == image::MAX_IMAGE_BYTES);
 /// How much of a file [`import`] looks at to decide its kind. `image::sniff`'s own reach.
 const HEADER_BYTES: usize = 8 * 1024;
 
-/// `<root>/.cide/attachments/<task>`.
+/// `<root>/.cide/tasks/<task>/attachments` — where a task's files live since M68.
 pub fn dir(root: &Path, task: &TaskId) -> PathBuf {
+    root.join(cide_ipc::TASKS_DIR_RELATIVE)
+        .join(task.as_str())
+        .join(cide_ipc::ATTACHMENTS_LEAF)
+}
+
+/// `<root>/.cide/attachments/<task>` — the pre-M68 layout. Read, never written.
+pub fn legacy_dir(root: &Path, task: &TaskId) -> PathBuf {
     root.join(cide_ipc::ATTACHMENTS_DIR).join(task.as_str())
 }
 
-/// Where one attachment's bytes are. The one formula, from the record — see
-/// [`TaskAttachment::relative_path`].
+/// Where one attachment's bytes are, **as they are actually on disk**.
+///
+/// The current path when it exists, the pre-M68 one when only that does, and the current one when
+/// neither does — so a caller that is about to *write* gets the right answer and a caller that is
+/// about to read gets the file. [`TaskAttachment::legacy_relative_path`] carries the argument for why
+/// the fallback exists: a conversion that was interrupted leaves some files moved and some not, and a
+/// reader that knew only the new path would answer *no such attachment* for the remainder while the
+/// bytes sat safely on disk.
+///
+/// One extra `stat` on a path that is normally absent, on the read of a thumbnail. That is the whole
+/// cost of making a partial move harmless.
 pub fn path_of(root: &Path, task: &TaskId, attachment: &TaskAttachment) -> PathBuf {
-    root.join(attachment.relative_path(task))
+    let current = root.join(attachment.relative_path(task));
+    if current.exists() {
+        return current;
+    }
+    let legacy = root.join(attachment.legacy_relative_path(task));
+    if legacy.exists() {
+        return legacy;
+    }
+    current
+}
+
+/// Move every task's attachment directory into the task's own directory. Answers how many moved.
+///
+/// The bytes half of the schema 1 → 2 conversion, and the only part of it that is not JSON. Called by
+/// `TaskStore::open` when the ladder ran, once, before the index is flushed.
+///
+/// # Every failure here is survivable, and none of them aborts the conversion
+///
+/// A rename that fails is logged and skipped, and the file stays exactly where it was — which
+/// [`path_of`] still finds. That is the whole reason the fallback exists: the honest outcome of a
+/// half-finished move is a tracker where some attachments are in the new place and some in the old,
+/// all of them readable, converging on the next open.
+///
+/// `rename` and not copy-then-delete: it is atomic per directory within a filesystem, and both paths
+/// are inside `.cide/` so there is no cross-device case to handle. If one ever arises the rename fails
+/// with `EXDEV`, which lands in the skip-and-log path above rather than half-copying anything.
+pub fn relocate(root: &Path, file: &cide_ipc::TaskFile) -> usize {
+    let mut moved = 0;
+    for row in &file.tasks {
+        let from = legacy_dir(root, &row.id);
+        if !from.is_dir() {
+            continue;
+        }
+        let to = dir(root, &row.id);
+        if to.exists() {
+            // Already there. Either a previous conversion got this far, or a hand-arranged tree
+            // already used the new layout; either way the old directory is not ours to merge in, so
+            // it is left for a person to look at.
+            tracing::warn!(
+                from = %from.display(),
+                to = %to.display(),
+                "both attachment layouts exist for this task; left the old one alone"
+            );
+            continue;
+        }
+        if let Some(parent) = to.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            tracing::warn!(path = %parent.display(), %error, "could not make a task's directory; its attachments stay where they are");
+            continue;
+        }
+        match fs::rename(&from, &to) {
+            Ok(()) => moved += 1,
+            Err(error) => {
+                tracing::warn!(
+                    from = %from.display(),
+                    to = %to.display(),
+                    %error,
+                    "could not move a task's attachments; they stay where they are and are still read"
+                );
+            }
+        }
+    }
+    // Non-recursive, so it disappears only once every task's directory has moved out of it — and
+    // never takes anything with it if one did not.
+    let _ = fs::remove_dir(root.join(cide_ipc::ATTACHMENTS_DIR));
+    moved
 }
 
 /// Where a file waits between a paste and the comment or task it will belong to.

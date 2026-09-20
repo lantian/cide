@@ -119,6 +119,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cide_agents::tools::Stopped;
 use cide_agents::{Delivery, Observation, RenderState, RunPlan, SessionBinding};
 use cide_claude::HookFrame;
 use cide_core::CoreError;
@@ -283,7 +284,29 @@ struct LiveRun {
     ///
     /// Set by [`AgentRegistry::stop`] and read by [`AgentRegistry::plan_failover`]: without it, a
     /// user pressing Stop on a run would spend a pool candidate and restart it.
+    ///
+    /// Still a bare `bool` after M67, and deliberately: it answers *whose hand this was*, which
+    /// is true from the instant Stop is pressed however the stop then proceeds. [`Self::stop`]
+    /// is the second fact beside it — see that field for why the two must not be one.
     stopping: bool,
+    /// What was asked for when this run was stopped, and how far it got. (M67)
+    ///
+    /// # Why this is not just a widened `stopping`
+    ///
+    /// [`AgentRegistry::plan_restart`] reads `stopping` and **fails the run** on it, which is
+    /// right for *a person ended this* and catastrophic for *the agent has been asked to write
+    /// down where it got to* — it would end the run at the exact moment it was being asked for
+    /// its record. Two facts, two fields.
+    ///
+    /// Written by [`AgentRegistry::plan_stop`] on every road, including the ones that never ask
+    /// (a force, a queued cancel, an interrupted discard), so [`AgentRegistry::death_facts`] has
+    /// one field to read rather than a bool and a maybe.
+    ///
+    /// **Not persisted** in [`SavedRun`], for `death_noted`'s and `provider_failure`'s reason: a
+    /// restored row is [`RunState::Interrupted`] with no child, and a latch about a dead
+    /// process's pending politeness is a claim about nothing. The cost is named in the journal —
+    /// a cide that quits mid-wind-down loses the epitaph, though not the stop-time comment.
+    stop: Option<StopRecord>,
     /// How many prompts this run has been given — the opening one, plus each follow-up.
     ///
     /// Not a count of *forks*: a failover re-sends the same prompt to a new child and does not
@@ -347,6 +370,124 @@ struct LiveRun {
     reopenable: bool,
 }
 
+/// What was asked for when a run was stopped. See [`LiveRun::stop`]. (M67)
+#[derive(Debug, Clone)]
+pub struct StopRecord {
+    /// Whose hand it was, for the sentence on the task.
+    pub by: StopBy,
+    /// The stopper's own words, already flattened to one line at the door.
+    ///
+    /// Three destinations, in descending order of value: **typed into the child** as part of
+    /// the wind-down instruction, which is what lets the run's own final comment answer the
+    /// objection rather than merely describe where it got to; written **onto the task**; and
+    /// the log. Until M67 only the last was true.
+    pub reason: Option<String>,
+    /// How it went. Moves from [`StopHow::WindingDown`] to one of the terminal spellings.
+    pub how: StopHow,
+    /// The grace this project allows, for the forced sentence's number. Zero on every road that
+    /// never asked.
+    pub grace_secs: u64,
+}
+
+/// What a caller asked for when it stopped a run. (M67)
+pub struct StopRequest {
+    /// Whose hand. Set by the command from its caller, never inferred here.
+    pub by: StopBy,
+    /// The caller's own words. Flattened at the door by the command.
+    pub reason: Option<String>,
+    /// Skip the asking and kill now.
+    pub force: bool,
+    /// This project's grace, **read from `.cide/config.json` at the door and passed in**.
+    ///
+    /// A value and not a read, for the rule this module states twice over: the registry
+    /// takes a lock the hook applier also takes, and nothing under it may touch a disk. It
+    /// is read fresh per stop rather than cached at dispatch, because that file is committed
+    /// and a teammate's commit or a `git checkout` can change it under a running app — a
+    /// deadline computed at dispatch would honour a number nobody now has.
+    pub grace: Duration,
+}
+
+/// What [`AgentRegistry::stop`] needs after it has let the lock go. (M67)
+///
+/// Read once, under the lock that decided the route, because every one of these can change
+/// while a stop is acting: a run can be rebound to a new session by the very `respawn` the ask
+/// triggers, and a task can be deleted by anybody.
+struct StopFacts {
+    session: Option<SessionId>,
+    task: Option<TaskId>,
+    harness: Harness,
+}
+
+/// Whose stop it was. (M67)
+///
+/// Not a [`cide_ipc::TaskAuthor`]: cide's own writes have exactly one voice
+/// ([`cide_ipc::TaskAuthor::Orchestrator`] — see `TaskEdit::Comment`'s doc), so the hand is
+/// named *inside* the sentence instead. Minting an author variant for one clause would put a
+/// new author into a committed, hand-editable file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopBy {
+    /// `cide_agent_stop`, from an orchestrating session.
+    Orchestrator,
+    /// The Stop button in the Agents panel.
+    User,
+}
+
+impl StopBy {
+    /// How the epitaph names the hand. Lower case: it is spliced into a sentence.
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::Orchestrator => "the orchestrator",
+            Self::User => "the user",
+        }
+    }
+}
+
+/// What became of a stop. (M67)
+///
+/// Five spellings and not three, because every pair this collapses is a pair somebody later
+/// needs apart: *we asked and it went* against *we asked and it would not*, and both of those
+/// against *we never asked* — which is this milestone's own bug, one level down, and exactly
+/// what `exit 129` meaning both a stop and a crash was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopHow {
+    /// Asked, and the child is still alive. The only non-terminal spelling.
+    WindingDown {
+        /// Whether the wind-down turn has been *seen to start*. See [`plan_wind_down_end`].
+        saw_a_turn: bool,
+        /// Wall clock, not an `Instant`: a laptop suspended for an hour has elapsed the grace
+        /// however little a monotonic clock moved, and the run should not come back to a
+        /// deadline that is still politely waiting.
+        deadline_unix_ms: u64,
+    },
+    /// Asked, and it left on its own inside the grace.
+    WoundDown,
+    /// Asked, and the grace ran out — or the ask could not be delivered after all, which is the
+    /// same outcome and carries its own sentence.
+    Forced { why: &'static str },
+    /// Killed without being asked. `why` is `None` for an explicit `force` and names the
+    /// obstacle otherwise; it is never left implicit, because a stop that silently declined to
+    /// ask first is a feature that appears not to work.
+    Immediate { why: Option<&'static str> },
+    /// Cancelled in the queue. There was never a child to speak to.
+    BeforeStart,
+    /// An interrupted row discarded. The conversation stays on disk.
+    Discarded,
+    /// Wound down to give its worktree to another task, which is not a stop anybody asked for.
+    ///
+    /// `bring_up` kills an idle child to reclaim its checkout (`idle_children_in`), and until
+    /// M67 that produced `ended with exit 129 before finishing this task` — a crash report about
+    /// a run whose turn had *already ended*. Harmless while that sentence meant nothing in
+    /// particular; a lie the moment it came to mean **nobody asked**.
+    Reclaimed,
+}
+
+impl StopHow {
+    /// Is this stop still waiting on the child?
+    pub fn is_winding_down(&self) -> bool {
+        matches!(self, Self::WindingDown { .. })
+    }
+}
+
 /// What an abnormal end leaves for its task's comment. See [`AgentRegistry::death_facts`],
 /// which is the only producer and holds the rules; the consumer in `agent_rpc` only formats.
 #[derive(Debug, Clone)]
@@ -358,7 +499,24 @@ pub struct DeathFacts {
     /// `Some(code)` for a child that exited nonzero, `None` for a run that failed before or
     /// beside its child — the two produce different sentences because "exit 129" is a lead
     /// worth printing and a spawn failure has no number to offer.
+    ///
+    /// Since M67 it is also `Some(0)` for a run that was **stopped** and wound down as asked,
+    /// which is the one clean exit worth a line. See [`AgentRegistry::death_facts`].
     pub code: Option<i32>,
+    /// What was asked of this run, if anything was. `None` is a death nobody ordered — a crash,
+    /// a spawn failure, an exhausted pool — and is the only case whose sentence is unchanged
+    /// from before M67. (M67)
+    pub stop: Option<StopRecord>,
+}
+
+/// What the stop-time comment says. See [`AgentRegistry::stop_asked_facts`]. (M67)
+#[derive(Debug, Clone)]
+pub struct StopAsked {
+    pub task: TaskId,
+    pub agent_label: String,
+    pub by: StopBy,
+    pub reason: Option<String>,
+    pub grace_secs: u64,
 }
 
 /// Where a run's conversation is filed: the directory its child ran in, or — for a row restored
@@ -400,6 +558,115 @@ fn conversation_of(live: &LiveRun, cwd: &std::path::Path) -> Option<HarnessSessi
         id,
         cwd: cwd.to_path_buf(),
     })
+}
+
+/// Mint a run and put it on its agent's queue, with the caller's lock already held. (M66)
+///
+/// The body of what used to be `AgentRegistry::enqueue`, lifted out so that the checking door
+/// ([`AgentRegistry::enqueue_unique`]) can ask its question and insert without unlocking in
+/// between — the same argument [`admit_a_pass`] makes for deciding an admission and taking its
+/// slot under one lock.
+fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
+    let run = RunId::new();
+    inner.seq += 1;
+    let seq = inner.seq;
+    let key = (spec.project, spec.agent.clone());
+    let ahead = inner.queues.get(&key).map_or(0, VecDeque::len);
+    inner.runs.insert(
+        run,
+        LiveRun {
+            run,
+            agent: spec.agent,
+            agent_label: spec.agent_label,
+            harness: spec.harness,
+            project: spec.project,
+            session: None,
+            task: spec.task,
+            task_title: spec.task_title,
+            change: spec.change,
+            state: RunState::Queued,
+            started_unix_ms: now_unix_ms(),
+            prompt: spec.prompt,
+            note: (ahead > 0).then(|| {
+                format!("{ahead} ahead of it in this role's queue; runs start as slots free")
+            }),
+            // Stamped at the first fork, not here: resolving needs the settings and the
+            // overrides, which `facts` reads on the forking thread. See `LiveRun::pool`.
+            pool: Vec::new(),
+            pool_index: 0,
+            provider_failure: None,
+            spent: Vec::new(),
+            pool_note: None,
+            forked_with: None,
+            stopping: false,
+            stop: None,
+            // The opening prompt is turn one, so a provider failure before any answer is a
+            // first-turn failure — the case that can abandon its conversation for free.
+            turns: 1,
+            slot: false,
+            agent_limit: spec.agent_limit.max(1),
+            project_limit: spec.project_limit.max(1),
+            checkout: spec.checkout,
+            notify: spec.notify,
+            cwd: None,
+            seq,
+            frozen: None,
+            stale_turn: false,
+            harness_session: None,
+            continuing: false,
+            death_noted: false,
+            reopenable: false,
+        },
+    );
+    inner.queues.entry(key).or_default().push_back(run);
+    run
+}
+
+/// The run holding `(project, agent, task)`, read from an `Inner` the caller already has. (M66)
+///
+/// A free function over `Inner` rather than a method, so the lock-holding
+/// [`AgentRegistry::enqueue_unique`] can ask the same question the public
+/// [`AgentRegistry::run_holding`] asks without taking the lock a second time — and so the two
+/// answers are one definition. The state table and the argument for it are on `run_holding`.
+fn holder_in(
+    inner: &Inner,
+    project: ProjectId,
+    agent: &AgentId,
+    task: &TaskId,
+) -> Option<HeldPair> {
+    inner
+        .runs
+        .values()
+        .find(|run| {
+            run.project == project
+                && &run.agent == agent
+                && run.task.as_ref() == Some(task)
+                && holds_a_pair(&run.state)
+        })
+        .map(|run| HeldPair {
+            run: run.run,
+            state: run.state.clone(),
+        })
+}
+
+/// Whether a run in this state holds its (role, task) pair against a new dispatch. (M66)
+///
+/// Written as an exhaustive match rather than a negated `matches!` of the three that do not:
+/// a state added later must be classified by whoever adds it, and the compiler is the only
+/// reviewer that never forgets to ask. Getting it wrong in the permissive direction spawns a
+/// second process; in the strict direction it wedges a task nobody can dispatch.
+fn holds_a_pair(state: &RunState) -> bool {
+    match state {
+        RunState::Queued
+        | RunState::Starting
+        | RunState::Running
+        | RunState::AwaitingPermission
+        | RunState::Idle
+        | RunState::Paused { .. } => true,
+        // Its child died with a previous cide — nothing is running, so nothing is doubled.
+        RunState::Interrupted => false,
+        RunState::Finished { .. } | RunState::Failed { .. } => false,
+    }
 }
 
 /// The pane session driving `live`'s conversation right now, if a person has one open and its
@@ -450,14 +717,13 @@ impl LiveRun {
             started_unix_ms: self.started_unix_ms,
             notify: self.notify.clone(),
             stale_turn: self.stale_turn,
-            // The pool's sentence and the run's, in that order: which model this run is actually
-            // on outranks which worktree it holds. Composed here rather than by overwriting
-            // `note`, because `note_cwd` rewrites that field whenever a child comes up.
-            note: match (&self.pool_note, &self.note) {
-                (Some(pool), Some(note)) => Some(format!("{pool} — {note}")),
-                (Some(pool), None) => Some(pool.clone()),
-                (None, note) => note.clone(),
-            },
+            // The stop's sentence, then the pool's, then the run's: a run that has been asked
+            // to wind down outranks which model it is on, which outranks which worktree it
+            // holds. All three are composed here rather than by overwriting `note`, because
+            // `note_cwd` rewrites that field whenever a child comes up — and a `Delivery::
+            // Respawn` wind-down brings one up, so a stop sentence written into `note` would be
+            // clobbered by its own successor with nothing to say it had gone.
+            note: compose_note(stop_note(self.stop.as_ref()), &self.pool_note, &self.note),
             openable: self.session.is_some() || self.reopenable,
         }
     }
@@ -508,6 +774,18 @@ pub struct DispatchSpec {
     pub checkout: Option<String>,
     /// Where the run's turn endings are announced. (M40) See [`cide_ipc::RunNotify`].
     pub notify: RunNotify,
+}
+
+/// A run that a new dispatch of the same role onto the same task would double. (M66)
+///
+/// Carries the state as well as the id because the refusal has to say *which kind* of live this
+/// is: "stop it" is the right advice for a running run and the wrong advice for a paused one,
+/// and a sentence that names a run without saying what it is doing is one the caller cannot act
+/// on. See [`AgentRegistry::run_holding`] for which states hold and which do not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldPair {
+    pub run: RunId,
+    pub state: RunState,
 }
 
 /// One run the queue has decided to start. Produced under the lock, acted on outside it.
@@ -632,67 +910,47 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    /// Put a run on its agent's queue and answer with its id.
+    /// Enqueue unless this role already has a run holding this task — **decided and inserted
+    /// under one lock**, which is the half of the duplicate guard a check at the call site
+    /// cannot be. (M66)
+    ///
+    /// [`crate::cmd::agents::plan_dispatch`] refuses the same thing earlier and with a whole
+    /// sentence about it; this is the backstop for the window between that answer and this
+    /// insert. That window is not theoretical: `task_triggers::dispatch` spawns, so two task
+    /// mutations in one burst — a creation naming an assignee and a comment @mentioning the same
+    /// role — genuinely can both pass a check before either reaches here. That is the pair that
+    /// produced the report.
+    ///
+    /// A spec with `task: None` never duplicates: such a run stands in the project root with no
+    /// worktree to contend for (M40), and N of them is what that road says on its face.
+    pub fn enqueue_unique(&self, spec: DispatchSpec) -> std::result::Result<RunId, HeldPair> {
+        let mut inner = self.inner.lock();
+        if let Some(task) = spec.task.as_ref()
+            && let Some(held) = holder_in(&inner, spec.project, &spec.agent, task)
+        {
+            return Err(held);
+        }
+        Ok(insert_run(&mut inner, spec))
+    }
+
+    /// Put a run on its agent's queue and answer with its id, **without asking whether one is
+    /// already there**.
     ///
     /// **Never spawns and never blocks**, which is this whole module's version of the
     /// `openDiff` rule: that tool blocking an agent's turn is a documented invariant precisely
     /// because it is dangerous, and a dispatch that waited on the run would let one wedged
     /// subagent freeze whoever called it — including the orchestrating session, over the MCP
     /// socket, in the middle of its own turn.
-    pub fn enqueue(&self, spec: DispatchSpec) -> RunId {
-        let run = RunId::new();
-        let mut inner = self.inner.lock();
-        inner.seq += 1;
-        let seq = inner.seq;
-        let key = (spec.project, spec.agent.clone());
-        let ahead = inner.queues.get(&key).map_or(0, VecDeque::len);
-        inner.runs.insert(
-            run,
-            LiveRun {
-                run,
-                agent: spec.agent,
-                agent_label: spec.agent_label,
-                harness: spec.harness,
-                project: spec.project,
-                session: None,
-                task: spec.task,
-                task_title: spec.task_title,
-                change: spec.change,
-                state: RunState::Queued,
-                started_unix_ms: now_unix_ms(),
-                prompt: spec.prompt,
-                note: (ahead > 0).then(|| {
-                    format!("{ahead} ahead of it in this role's queue; runs start as slots free")
-                }),
-                // Stamped at the first fork, not here: resolving needs the settings and the
-                // overrides, which `facts` reads on the forking thread. See `LiveRun::pool`.
-                pool: Vec::new(),
-                pool_index: 0,
-                provider_failure: None,
-                spent: Vec::new(),
-                pool_note: None,
-                forked_with: None,
-                stopping: false,
-                // The opening prompt is turn one, so a provider failure before any answer is a
-                // first-turn failure — the case that can abandon its conversation for free.
-                turns: 1,
-                slot: false,
-                agent_limit: spec.agent_limit.max(1),
-                project_limit: spec.project_limit.max(1),
-                checkout: spec.checkout,
-                notify: spec.notify,
-                cwd: None,
-                seq,
-                frozen: None,
-                stale_turn: false,
-                harness_session: None,
-                continuing: false,
-                death_noted: false,
-                reopenable: false,
-            },
-        );
-        inner.queues.entry(key).or_default().push_back(run);
-        run
+    ///
+    /// **`#[cfg(test)]` since M66, and that is the guard.** The duplicate that put two runs on
+    /// one task got in because the one non-test caller of this function did not check first, and
+    /// a check that lives at the call site is a check the next call site forgets. So the shipped
+    /// binary now has exactly one door onto the queue, [`Self::enqueue_unique`], and this insert
+    /// survives only for the tests below — most of which are about slots and ordering rather than
+    /// about duplication, and have no business minting a task id to say so.
+    #[cfg(test)]
+    fn enqueue(&self, spec: DispatchSpec) -> RunId {
+        insert_run(&mut self.inner.lock(), spec)
     }
 
     /// Take every queued run that may start now, marking each `Starting` and holding its slot.
@@ -769,13 +1027,7 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
                     other.run != run
                         && other.project == project
                         && other.checkout.as_deref() == Some(name)
-                        && matches!(
-                            other.state,
-                            RunState::Starting
-                                | RunState::Running
-                                | RunState::AwaitingPermission
-                                | RunState::Paused { .. }
-                        )
+                        && holds_its_checkout(other)
                 })
             });
             if occupied {
@@ -799,6 +1051,16 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
                 false => None,
             };
             live.continuing = false;
+            if let Some(point) = resume.as_ref() {
+                // The other half of `requeue_interrupted`'s trace: this is the line that says
+                // *which conversation* a continuing child was pointed at, so two of them for one
+                // run is visible in the log rather than only in the harness's own store.
+                tracing::info!(
+                    %run,
+                    conversation = %point.conversation,
+                    "resume: admitting a continuing child on an existing conversation"
+                );
+            }
             let prompt = match resume.is_some() {
                 true => continuation_prompt(
                     live.task.as_ref(),
@@ -875,6 +1137,37 @@ fn settings_now(app: &AppHandle, project: ProjectId) -> Box<SettingsNow<'static>
         }
         Some(facts.child_settings(&resolved))
     })
+}
+
+/// What every role of `project` would run as, right now. (M71)
+///
+/// The roster's second column, and the answer `cide_agents_config`'s neighbours are read against.
+/// It is [`facts`] plus `load_project` — the same two reads a fork makes, so the overrides and the
+/// providers it resolves against are the ones a dispatch would resolve against.
+///
+/// **`overrides::resolve` directly, not [`Facts::resolve`]**, and the difference is one probe:
+/// `Facts::resolve` folds opencode's *own* default model in, which runs `opencode debug config`.
+/// That is right at a fork, which happens once per run, and wrong here, where the roster is read
+/// on most orchestration turns — a subprocess per read for a value the row states as "its default
+/// model" either way. The two therefore differ only in the case where nothing in cide names a
+/// model at all, and the row says so rather than naming an id that might be another one.
+pub(crate) fn resolutions_for(
+    app: &AppHandle,
+    project: ProjectId,
+) -> Result<Vec<(cide_ipc::AgentId, cide_agents::overrides::Resolved)>> {
+    let facts = facts(app, project)?;
+    let loaded = cide_agents::load_project(&facts.root);
+    Ok(loaded
+        .catalog
+        .agents
+        .iter()
+        .map(|agent| {
+            (
+                agent.id().clone(),
+                cide_agents::overrides::resolve(agent, &facts.overrides, &facts.llm),
+            )
+        })
+        .collect())
 }
 
 /// Clear a run's pool stamp so its next fork stamps the pool as configured now. The one place
@@ -957,6 +1250,311 @@ fn continuation_prompt(
              continue from where the conversation left off."
         ),
     }
+}
+
+/// The row's sentence for a run that has been stopped, or `None` for every other run. (M67)
+///
+/// Only the wind-down says anything: it is the one state that persists long enough for a person
+/// to read it and the one where *not knowing* is confusing — a row that says `running` while
+/// its agent is writing a farewell is a row nobody can act on. Every terminal spelling is the
+/// row's own phase a moment later, and the durable account is the task's comments.
+fn stop_note(stop: Option<&StopRecord>) -> Option<String> {
+    let stop = stop?;
+    if !stop.how.is_winding_down() {
+        return None;
+    }
+    Some(format!(
+        "winding down — asked by {} to post a final comment and exit; cide ends it within {}s",
+        stop.by.phrase(),
+        stop.grace_secs
+    ))
+}
+
+/// Join the row's three sentence sources, most urgent first, dropping the ones with nothing.
+fn compose_note(
+    stop: Option<String>,
+    pool: &Option<String>,
+    note: &Option<String>,
+) -> Option<String> {
+    let parts: Vec<&str> = [stop.as_deref(), pool.as_deref(), note.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" — "))
+}
+
+/// Might this run's child still be standing in its checkout? (M67)
+///
+/// **One function for two readers** — `admit_a_pass`'s occupancy gate and `idle_children_in`'s
+/// reclaim — because they are two spellings of one question, and a run that one of them thinks
+/// has left the directory while the other thinks is still in it is two processes in one
+/// worktree. They were separate before M67 and agreed by coincidence.
+///
+/// `Idle` does **not** hold a checkout: the parked child is `bring_up`'s to wind down at the
+/// moment the directory is actually claimed, which is the trade `RunState::Idle`'s own doc
+/// argues for. The exception is a run that has been **asked to wind down**: its child has been
+/// told to write one last comment and will be dead within the grace, so taking the directory
+/// out from under it buys a few seconds and costs the whole point of asking. Bounded, unlike
+/// the idle `claude` the exclusion exists for.
+///
+/// The concurrency **slot** is deliberately not held by any of this. Releasing it on the
+/// hand-back edge stays right, and a sibling admitted into a *different* checkout is exactly
+/// what should happen — holding a checkout and holding a slot are two decisions, which is the
+/// distinction `RunState::Idle`'s doc draws.
+fn holds_its_checkout(live: &LiveRun) -> bool {
+    if live
+        .stop
+        .as_ref()
+        .is_some_and(|stop| stop.how.is_winding_down())
+    {
+        return true;
+    }
+    matches!(
+        live.state,
+        RunState::Starting
+            | RunState::Running
+            | RunState::AwaitingPermission
+            | RunState::Paused { .. }
+    )
+}
+
+/// What a state change means for a wind-down in flight. See [`wind_down_step`]. (M67)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindDownStep {
+    /// Nothing to do — the commonest answer by far.
+    Wait,
+    /// The wind-down turn has begun. Remember it, so the hand-back that follows is the one.
+    Arm,
+    /// That hand-back was the wind-down turn's own end. Mark it, then kill the child.
+    Over,
+    /// The child left on its own, cleanly. Mark it wound down; there is nothing to kill.
+    Completed,
+}
+
+/// Has the wind-down turn ended? Pure over one transition. (M67)
+///
+/// # Two edges, never one, and the difference is a lost turn
+///
+/// The obvious rule — *kill on the next hand-back* — is wrong, and wrong in the direction that
+/// destroys the thing the feature exists to save. A stop pressed mid-turn types into a composer
+/// whose CLI queues the line and submits it when the **current** turn ends, so the first
+/// `→ Idle` after the ask usually belongs to the turn being stopped. Killing there would end
+/// the child a beat *before* it was told anything.
+///
+/// So the run must be seen to start a turn ([`WindDownStep::Arm`]) before a hand-back counts.
+/// A run asked while already `Idle` takes the identical path: nothing has been seen, the ask
+/// starts a turn, that turn ends. One rule, both cases, and the Esc that precedes the line only
+/// makes the first edge arrive sooner.
+///
+/// If the line is never taken up no edge arrives at all, and the grace is what ends the run —
+/// which is exactly what a grace is for.
+///
+/// Only a `Delivery::Stdin` harness reaches this: opencode's and codex's wind-down is a whole
+/// new child that exits when its turn is done, and `Observation::Exit` ends those runs the way
+/// it always did.
+pub(crate) fn wind_down_step(how: &StopHow, handed_back: bool, next: &RunState) -> WindDownStep {
+    let StopHow::WindingDown { saw_a_turn, .. } = how else {
+        return WindDownStep::Wait;
+    };
+    // **The `Delivery::Respawn` ending, and it is not the same shape as the other one.** An
+    // opencode or codex wind-down is a whole new child: it answers the instruction, writes its
+    // comment and *exits*. There is no hand-back, so the `Over` road below never fires and
+    // nothing would ever mark the stop complete — the run would die still flagged
+    // `WindingDown`, and its epitaph would say it *died before it could wind down* about the
+    // one case where everything worked.
+    //
+    // Clean exits only. A child that crashed or was killed mid-wind-down really did die before
+    // it could finish, and the sentence for that is already correct.
+    if let RunState::Finished { code } = next {
+        return if *code == 0 {
+            WindDownStep::Completed
+        } else {
+            WindDownStep::Wait
+        };
+    }
+    if handed_back {
+        return if *saw_a_turn {
+            WindDownStep::Over
+        } else {
+            // The interrupted turn handing back. Not ours, and not a reason to do anything:
+            // `Arm` below fires when the wind-down turn actually starts.
+            WindDownStep::Wait
+        };
+    }
+    // `AwaitingPermission` counts as a turn having started, and must: a wind-down turn that
+    // stops to ask permission has plainly begun, and refusing to arm on it would mean the
+    // hand-back that follows is read as the interrupted turn's and the run is never ended by
+    // anything but the grace.
+    if matches!(next, RunState::Running | RunState::AwaitingPermission) && !*saw_a_turn {
+        return WindDownStep::Arm;
+    }
+    WindDownStep::Wait
+}
+
+/// Which road a stop takes. See [`stop_route`]. (M67)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StopRoute {
+    /// Off the queue, and failed. Nothing was ever forked.
+    Cancel,
+    /// An interrupted row discarded; the conversation stays on disk.
+    Discard,
+    /// It had already ended. Idempotent, deliberately.
+    Nothing,
+    /// Kill the child now, saying why it was not asked first.
+    Kill { why: Option<&'static str> },
+    /// Ask it to wind down, then watch.
+    Ask,
+}
+
+/// Obstacles to asking, spelled once so the route and the record cannot word them differently.
+///
+/// Each is a full sentence fragment in the past tense, because both readers splice it after
+/// "It was not asked to wind down first:" — the tool's answer to the caller, and the epitaph on
+/// the task. One string, two readers, no chance of the board and the orchestrator disagreeing
+/// about why a stop was not the polite kind.
+const PAUSED: &str = "it was paused, and a stopped process neither answers a signal nor reads \
+                      its input, so the line would have been read on resume, out of order with \
+                      whatever it was doing";
+const AWAITING_PERMISSION: &str = "it was waiting on a permission prompt, where a typed line and its Enter would have \
+     answered that prompt instead, approving the very tool call the stop was meant to prevent";
+const RESTARTING: &str = "its child was already being wound down for a settings restart, so \
+                          there was nothing to speak to";
+const NO_CHILD: &str = "it had no child to speak to";
+const SEALED: &str =
+    "cide is shutting down, and there would have been nobody left to read what it wrote";
+const ALREADY_ASKED: &str = "it had already been asked once and had not gone";
+const NO_CONVERSATION: &str = "it never reported a conversation id, so there was nothing to \
+                               continue it from";
+/// Not an obstacle the route saw coming: the ask itself was refused at delivery. See
+/// `AgentRegistry::stop`'s `Err` arm.
+const COULD_NOT_ASK: &str = "its harness refused the message";
+/// The grace ran out. The only `StopHow::Forced` reason that is not a surprise.
+const RAN_OUT_OF_TIME: &str = "it did not wind down in time";
+
+/// What a stop should do, decided from facts alone. (M67)
+///
+/// Pure, and pure *of the registry* rather than merely of an `AppHandle`: every input is a value
+/// the caller resolved, so the whole table below is a test row rather than a claim about a live
+/// lock. `plan_respawn`'s and `plan_failover`'s split, taken one step further because this
+/// decision has more arms than either.
+///
+/// # The two arms nobody would guess, and both are real bugs
+///
+/// **`AwaitingPermission` must never be asked.** The permission prompt is a selection list, and
+/// a wind-down is delivered as text followed by a lone `\r` (`type_submitted_line`) — the `\r`
+/// is what the dialog reads. A graceful stop there would *approve the tool call it was meant to
+/// prevent*, which is the single worst thing in this milestone's blast radius.
+///
+/// **`Paused` must never be asked**, for the rule `AgentRegistry::resume` already states: a
+/// `SIGSTOP`ped process does not act on a signal, and the bytes sit in the kernel buffer to be
+/// read on resume, out of order with whatever it was doing.
+///
+/// And **`sealed`** — `lifecycle::shutdown` sets `snapshot_sealed` before the ladder. A grace
+/// per run would turn quitting cide into a minutes-long wait, and there would be nobody left to
+/// read the comment it bought.
+///
+/// A **second** stop on a run already winding down is the escalation: it is how `force` is
+/// reached without a second argument, and it is why the tool's answer says so.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stop_route(
+    state: &RunState,
+    session: Option<SessionId>,
+    already_asked: bool,
+    restart_pending: bool,
+    sealed: bool,
+    can_continue: bool,
+    grace: Duration,
+    force: bool,
+) -> StopRoute {
+    match state {
+        RunState::Queued => StopRoute::Cancel,
+        RunState::Finished { .. } | RunState::Failed { .. } => StopRoute::Nothing,
+        RunState::Interrupted => StopRoute::Discard,
+        _ => {
+            let Some(_session) = session else {
+                return StopRoute::Kill {
+                    why: Some(NO_CHILD),
+                };
+            };
+            let why = if force || grace.is_zero() {
+                // The caller asked for this, or the project did. Not an obstacle, so no
+                // sentence: `Immediate { why: None }` is what "we never asked, on purpose"
+                // looks like, and inventing a reason for it would read as an apology.
+                None
+            } else if already_asked {
+                Some(ALREADY_ASKED)
+            } else if sealed {
+                Some(SEALED)
+            } else if restart_pending {
+                Some(RESTARTING)
+            } else if matches!(state, RunState::Paused { .. }) {
+                Some(PAUSED)
+            } else if matches!(state, RunState::AwaitingPermission) {
+                Some(AWAITING_PERMISSION)
+            } else if !can_continue {
+                Some(NO_CONVERSATION)
+            } else {
+                return StopRoute::Ask;
+            };
+            StopRoute::Kill { why }
+        }
+    }
+}
+
+/// The line a run is given when it is stopped and asked to wind down. (M67)
+///
+/// # One line, and the harness's own dialect — both scars, both [`continuation_prompt`]'s
+///
+/// **One line**, because this is typed into a TUI and the harness ends it with `\r`: an embedded
+/// newline is another Enter, so a two-paragraph instruction would submit its first line as a
+/// turn and feed the rest in as further turns. Everything that can carry a newline — the
+/// caller's `reason`, the task title — goes through `one_line` before it gets here.
+///
+/// **The comment tool is spelled by the harness** (`mcp__cide__cide_task_comment` under Claude
+/// Code, `cide_cide_task_comment` under opencode). [`continuation_prompt`] carries the scar: it
+/// hard-coded Claude's spelling and was gated on nothing, so every opencode run was told to
+/// call a tool it did not have. `tools: None` — a run with no bridge — drops the clause rather
+/// than naming a tool that is not attached.
+///
+/// **A run with no task is asked for no comment.** M40's task-less dispatch works in the
+/// project root and has nowhere to report; telling it to comment on a task it has not got would
+/// send it looking for one. It is asked to stop and to say where it got to, and the tree is the
+/// record.
+///
+/// The `reason` is handed over **because a run told why writes a better handover**. That is the
+/// one place in this feature where prose written by one model becomes prose read by another, so
+/// it is quoted as the stopper's words rather than restated as cide's.
+fn wind_down_prompt(
+    task: Option<&TaskId>,
+    tools: Option<&dyn cide_agents::harness::Harness>,
+    reason: Option<&str>,
+) -> String {
+    let because = match reason
+        .map(crate::cmd::agents::one_line)
+        .filter(|why| !why.is_empty())
+    {
+        Some(why) => format!(" The reason given: {why}"),
+        None => String::new(),
+    };
+    let report = match (task, tools) {
+        (Some(id), Some(harness)) => format!(
+            " Post one final comment on task {id} with {} saying what you finished, what you \
+             were part-way through, and anything you learned that is not written down anywhere \
+             yet — then exit.",
+            harness.tool_name("cide_task_comment")
+        ),
+        // A task it cannot comment on is a task it can still be told about; the useful half of
+        // the instruction — say where you got to, then exit — needs no bridge.
+        (Some(id), None) => format!(
+            " You were on task {id}. Say what you finished, what you were part-way through, and \
+             anything you learned that is not written down anywhere yet — then exit."
+        ),
+        (None, _) => " Say what you finished, what you were part-way through, and anything you \
+             learned that is not written down anywhere yet — then exit."
+            .to_string(),
+    };
+    format!("cide is stopping this run.{because} Stop work now and start nothing new.{report}")
 }
 
 /// Why a run is being told to pick up where it left off — the first clause of
@@ -1099,6 +1697,34 @@ impl AgentRegistry {
         // takes the session registry and writes into a PTY, none of which may happen with this
         // mutex held while the hook applier thread is the one holding it.
         let mut nudge = None;
+        // A wind-down in flight ends its run on the hand-back that belongs to *its own* turn,
+        // and `wind_down_step` is the whole of that rule. Decided here, where the edge is
+        // already computed, and acted on after `drop(inner)` beside the nudge — this method is
+        // reached on the hook applier thread, whose ordering is a correctness requirement, and
+        // reaching into the session registry with this mutex held is what the module header
+        // forbids.
+        //
+        // The app-free caller (`watch_exit_with`'s reaper) can never be the hand-back edge — a
+        // harness answers `Finished` and nothing else to an `Exit` — so no wind-down end is
+        // ever lost to it.
+        let mut wind_down_kill = None;
+        if let Some(stop) = live.stop.as_mut() {
+            match wind_down_step(&stop.how, handed_back, &live.state) {
+                WindDownStep::Wait => {}
+                WindDownStep::Arm => {
+                    if let StopHow::WindingDown { saw_a_turn, .. } = &mut stop.how {
+                        *saw_a_turn = true;
+                    }
+                }
+                WindDownStep::Over => {
+                    stop.how = StopHow::WoundDown;
+                    wind_down_kill = live.session;
+                }
+                // Already gone: the child that answered is the child that exited. Nothing to
+                // kill, and `wind_down_kill` stays `None`.
+                WindDownStep::Completed => stop.how = StopHow::WoundDown,
+            }
+        }
         if handed_back || over {
             let key = live.key();
             let project = live.project;
@@ -1114,6 +1740,13 @@ impl AgentRegistry {
         }
         drop(inner);
         self.forget_old();
+        // Before the nudge, because this is what *makes* the run over: the child is still alive
+        // at this point — it handed its turn back and is sitting at its prompt — and the run's
+        // end is the exit that follows.
+        if let (Some(app), Some(session)) = (app, wind_down_kill) {
+            tracing::info!(%run, "a run wound down as asked; ending it");
+            self.kill_child(app, Some(session));
+        }
         if let (Some(app), Some(project)) = (app, nudge) {
             crate::agent_rpc::note_run_over(app, project, run);
         }
@@ -1206,24 +1839,32 @@ impl AgentRegistry {
         !self.inner.lock().paused_projects.contains(&project)
     }
 
-    /// Whether any run of `agent` on `task` is still open — queued, starting, live, idle or
-    /// paused. Only `Finished` and `Failed` close a run for this question.
+    /// The run of `agent` on `task` that would be doubled by a new dispatch, if there is one.
     ///
-    /// The auto-dispatch dedupe (see [`crate::task_triggers`]): a repeated assignment or a
-    /// second mention of a role while its run lives must not stack a second queue entry for the
-    /// same pair. `Idle` counts as open on purpose — an idle run still holds a live child in the
-    /// role's only worktree, and the way to re-engage it is a retry or a prompt, not a duplicate
-    /// run queued behind it.
-    pub fn has_open_run(&self, project: ProjectId, agent: &AgentId, task: &TaskId) -> bool {
-        self.inner.lock().runs.values().any(|run| {
-            run.project == project
-                && &run.agent == agent
-                && run.task.as_ref() == Some(task)
-                && !matches!(
-                    run.state,
-                    RunState::Finished { .. } | RunState::Failed { .. }
-                )
-        })
+    /// **The duplicate rule, and it is narrower than "has not ended".** (M66) A pair is held by
+    /// a run that has a child or is about to get one — `Queued`, `Starting`, `Running`,
+    /// `AwaitingPermission`, `Idle`, `Paused` — and by nothing else. `Idle` holds on purpose: an
+    /// idle run still owns a live child in the role's only worktree, and the way to re-engage it
+    /// is a retry or a prompt, not a second run queued behind it. `Paused` holds because a
+    /// frozen child has not let go of the checkout.
+    ///
+    /// `Interrupted` deliberately does **not** hold, and that is a change from the predicate this
+    /// replaced. Its child died with a previous cide; nothing is running, so nothing would be
+    /// doubled — and while it counted, a row left behind by a restart silently swallowed every
+    /// re-assignment of that role to that task with a debug line and no way to see why. The cost
+    /// of excluding it is that Resume could requeue such a row beside a run dispatched in the
+    /// meantime, which is why [`AgentRegistry::requeue_interrupted`] asks this question too.
+    ///
+    /// Not spelled `is_live`: [`cide_agents::tools`] uses that word for "not `Finished`/`Failed`"
+    /// on the run list, which is a different set, and two notions of *open* under one word is how
+    /// a rule like this rots.
+    pub fn run_holding(
+        &self,
+        project: ProjectId,
+        agent: &AgentId,
+        task: &TaskId,
+    ) -> Option<HeldPair> {
+        holder_in(&self.inner.lock(), project, agent, task)
     }
 
     /// Whether `session` belongs to a run that has not ended — the guard `session_kill` asks.
@@ -1283,9 +1924,23 @@ impl AgentRegistry {
         if live.death_noted {
             return None;
         }
+        // **The arm M67 added, and the feature does not work without it.** A run that wound
+        // down as it was asked to exits **0** — an opencode or codex wind-down turn is a whole
+        // process that finishes and leaves — and the rule above read that as "it believes it
+        // finished" and said nothing at all. So the best outcome of a graceful stop would have
+        // left no trace on the board whatsoever.
+        //
+        // Widened for a *stopped* run only, deliberately. The exit-0 refusal is about a run that
+        // decided for itself that it was done, and second-guessing that judgement belongs to the
+        // orchestrator's own review; a run cide stopped decided nothing, and its clean exit is
+        // the success of the wind-down rather than a verdict to leave unremarked. Widening the
+        // gate generally would put an automatic line on every clean run, and a board where every
+        // run carries one is a board where the lines that matter are buried.
+        let stopped = live.stop.clone();
         let code = match live.state {
             RunState::Failed { .. } => None,
             RunState::Finished { code } if code != 0 => Some(code),
+            RunState::Finished { code } if stopped.is_some() => Some(code),
             _ => return None,
         };
         let task = live.task.clone()?;
@@ -1314,6 +1969,33 @@ impl AgentRegistry {
             task,
             agent_label,
             code,
+            stop: stopped,
+        })
+    }
+
+    /// What the stop-time comment needs: the run's task, its label, and what was asked. (M67)
+    ///
+    /// `death_facts`' shape — the decision half here, the sentence and the write in
+    /// `agent_rpc` — and the same reason: the caller should do no registry reasoning of its own.
+    ///
+    /// `None` for a run with no task (there is nowhere to write) and for any stop that is not a
+    /// wind-down, because every other road is over by the time it returns and says everything it
+    /// has to say in one epitaph. This comment exists **only** for the road with a window: up to
+    /// the whole grace passes before anything else is written, and a cide that quits inside it
+    /// would otherwise take the caller's reason with it.
+    pub fn stop_asked_facts(&self, run: RunId) -> Option<StopAsked> {
+        let inner = self.inner.lock();
+        let live = inner.runs.get(&run)?;
+        let stop = live.stop.as_ref()?;
+        if !stop.how.is_winding_down() {
+            return None;
+        }
+        Some(StopAsked {
+            task: live.task.clone()?,
+            agent_label: live.agent_label.clone(),
+            by: stop.by,
+            reason: stop.reason.clone(),
+            grace_secs: stop.grace_secs,
         })
     }
 
@@ -1490,6 +2172,13 @@ impl AgentRegistry {
                     && run.checkout.as_deref() == Some(checkout)
                     && run.run != except
                     && run.state == RunState::Idle
+                    // The same predicate the admission gate uses, negated: a run that still
+                    // holds its checkout is not one to reclaim it from. Without this, a run
+                    // stopped mid-turn is killed here in the window between the interrupted
+                    // turn handing back and its wind-down turn starting — the graceful stop
+                    // becomes a hard kill, the final comment is never written, and nothing
+                    // anywhere says why.
+                    && !holds_its_checkout(run)
             })
             .filter_map(|run| run.session)
             .collect()
@@ -2131,6 +2820,18 @@ impl AgentRegistry {
                     .get(&run)
                     .is_some_and(|live| viewed_by(&inner, sessions, live).is_some())
             });
+            /*
+             * The second skip, and it exists because `Interrupted` stopped holding its pair in
+             * M66. A run whose child died with a previous cide no longer blocks a dispatch — so
+             * the user can perfectly well have started this role on this task again in the
+             * meantime, and requeueing the old row would put the second run on the board that
+             * the whole of M66 is about. The live one is the one that is actually going; this
+             * one is history, and says so.
+             */
+            let held = inner.runs.get(&run).and_then(|live| {
+                let task = live.task.as_ref()?;
+                holder_in(&inner, live.project, &live.agent, task)
+            });
             let Some(live) = inner.runs.get_mut(&run) else {
                 continue;
             };
@@ -2141,12 +2842,34 @@ impl AgentRegistry {
                 live.note = Some(VIEWED_IN_A_PANE.to_string());
                 continue;
             }
+            if let Some(held) = held {
+                let why = format!(
+                    "{} is already going on this task again (run {}); this row is the \
+                     conversation the restart ended, and resuming it would put two runs on one \
+                     task.",
+                    live.agent, held.run
+                );
+                if one_run {
+                    return Err(CoreError::Io(why));
+                }
+                live.note = Some(why);
+                continue;
+            }
             live.state = RunState::Queued;
             live.continuing = true;
             live.note = Some(
                 "resuming after a cide restart; a new child continues the same conversation"
                     .to_string(),
             );
+            // Logged because one restart on the reporting machine put the continuation line
+            // into three conversations **twice**, 17.6 seconds apart, with nothing between the
+            // two in any of them — two children forked for one run. It cannot come from a
+            // double press through here (this arm matches `Interrupted` only and leaves the run
+            // `Queued` under the lock), and `restore_snapshot_from` is the only other writer of
+            // `Interrupted`, so the second one arrived by a road nobody has named yet. These
+            // two lines and `admit_a_pass`'s are what will name it; the guard comes after the
+            // trace, not before it.
+            tracing::info!(%run, agent = %live.agent, "resume: requeued an interrupted run to continue its conversation");
             if !live.pool.is_empty()
                 && settings_now(&live.agent).is_some_and(|now| now.pool != live.pool)
             {
@@ -3016,6 +3739,176 @@ fn saved_screen(run: RunId) -> Option<Vec<u8>> {
     std::fs::read(screens_dir().join(format!("{run}.screen"))).ok()
 }
 
+/// How many of a run log's trailing lines a resumed run's pane is seeded with.
+///
+/// [`crate::logring`]'s own `CAP`, deliberately and not a number of its own: every replayed
+/// line the harness says a person may click is recorded into the new session's ring **as it is
+/// drawn**, so a budget larger than the ring's would draw `#7` handles the ring had already
+/// evicted before the replay finished — a row on screen whose click answers *gone*, which is
+/// the one thing the handle exists not to do.
+const REPLAY_LINES: usize = 2_000;
+
+/// What a resumed run's mirror is seeded with: the run's own earlier output, re-rendered.
+///
+/// # Why the saved screen was not enough
+///
+/// A resumed `opencode` or `codex` run is a **new cide session** — `resume_point` answers
+/// `rebind: None` for those two, because their conversation id is the CLI's own and cide's is
+/// free to move. So the mirror, the sinks and the [`crate::logring`] ring the old child filled
+/// are all gone, and the only bridge was `run-screens/<run>.screen`, which has two holes: it is
+/// written at teardown only (`save_screens_for_snapshot` says so — a crash keeps the runs and
+/// loses the screens), and on this machine every file it last wrote was ten bytes, the
+/// `full_state` lead-in over a mirror with nothing in it. Either way the pane came back holding
+/// one separator and the next turn, which is what "it started from zero" looked like from the
+/// outside while the conversation itself was entirely intact.
+///
+/// The log has neither hole. It is teed line by line in [`AgentRegistry::stream_hook`], keyed
+/// by **run** rather than by session, so it already spans every child the run has had *and*
+/// every restart between them — measured on run `e43e6c3b`: 431 events from 13:13 to 13:34,
+/// straight through the 13:25 restart that ended the process which wrote the first half.
+///
+/// # The rows must be the rows the live stream would have drawn
+///
+/// So this replays through the *same* two function pointers the live hook installs —
+/// [`SessionBinding::Harness`]'s `keep` and `render`, handed in by `start_child` from the very
+/// binding it is about to give the session — and records each kept line into the new session's
+/// ring in the same pass, which is what makes a replayed row's handle resolve through
+/// `session_log_detail` like a live one's. Two passes, or a second rendering written here,
+/// would be a second spelling of the row format that `check:json-log` pins in one place.
+///
+/// `None` for anything that would draw nothing: no log (a `claude` or `qwen` run is not teed —
+/// see [`run_logs_dir`]), an unreadable one, an empty one, or a log whose every line the
+/// rendering drops. The caller falls back to [`saved_screen`] and then to no preload at all;
+/// nothing here may fail a fork.
+fn replayed_run_log(
+    app: &AppHandle,
+    run: RunId,
+    session: SessionId,
+    keep: fn(&str) -> bool,
+    render: fn(&mut RenderState, &str, Option<u64>) -> cide_pty::Rendered,
+) -> Option<Vec<u8>> {
+    let ring = app.try_state::<Arc<crate::logring::JsonLogRing>>();
+    replayed_log_at(
+        &run_logs_dir().join(format!("{run}.log")),
+        keep,
+        render,
+        |line, stamp| {
+            ring.as_ref()
+                .map(|ring| ring.record_at(session, line, stamp))
+        },
+    )
+}
+
+/// The read, path-parameterised and with the ring injected, for the same reason
+/// [`AgentRegistry::write_snapshot_to`] takes a path: so a test never touches the real state
+/// directory, and so the budget and the skipped-events rule are assertable without a run.
+fn replayed_log_at(
+    path: &std::path::Path,
+    keep: fn(&str) -> bool,
+    render: fn(&mut RenderState, &str, Option<u64>) -> cide_pty::Rendered,
+    record: impl FnMut(&str, u64) -> Option<u64>,
+) -> Option<Vec<u8>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    // When a line carries no clock of its own — codex records none on any item — the moment the
+    // log was last written stands in. It is a bound rather than a measurement, and it is the
+    // honest half of a bad pair: the alternative is `now`, which would make every replayed
+    // card claim its command ran at the instant somebody pressed Resume.
+    let last_written = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(crate::logring::now_unix_ms, |since| {
+            since.as_millis() as u64
+        });
+
+    let skipped = lines.len().saturating_sub(REPLAY_LINES);
+    let rows = replay_rows(&lines[skipped..], keep, render, last_written, record);
+    if rows.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    if skipped > 0 {
+        // Said rather than silently dropped, and it names the file: the budget is a mirror and
+        // a ring decision, not a claim that the earlier events are gone.
+        out.extend_from_slice(
+            format!(
+                "\x1b[2m— {skipped} earlier event(s) not replayed; the whole log is {} —\x1b[0m\r\n",
+                path.display()
+            )
+            .as_bytes(),
+        );
+    }
+    out.extend_from_slice(&rows);
+    Some(out)
+}
+
+/// The replay itself, pure over its inputs so the table below can drive it with no repository,
+/// no app handle and no ring.
+///
+/// It is `cide_pty`'s own `render_lines` loop with the plumbing removed: the log holds one event
+/// per line with its terminator already stripped by `writeln!`, so there is no partial-line
+/// hazard to carry and nothing to resync. Every emitted row is terminated `\r\n` — including a
+/// [`cide_pty::Rendered::Keep`], which the live path re-emits byte for byte instead. The
+/// difference is deliberate and safe here for the same reason the live rule exists: `Keep`'s
+/// warning is about a raw-mode TUI whose own `\n`-only lines must not be walked back to column
+/// 0, and a `SessionBinding::Harness` stream is machine events and the CLI's own prose, never
+/// a TUI — the binding is what *makes* it a line stream.
+///
+/// `record` answers the ring handle for a line `keep` accepted, or `None` where there is no
+/// ring; `fallback_stamp` is used for a line that carries no clock of its own.
+fn replay_rows(
+    lines: &[&str],
+    keep: fn(&str) -> bool,
+    render: fn(&mut RenderState, &str, Option<u64>) -> cide_pty::Rendered,
+    fallback_stamp: u64,
+    mut record: impl FnMut(&str, u64) -> Option<u64>,
+) -> Vec<u8> {
+    let mut state = RenderState::default();
+    let mut out = Vec::new();
+    for line in lines {
+        let stamp = line_stamp(line).unwrap_or(fallback_stamp);
+        let handle = keep(line).then(|| record(line, stamp)).flatten();
+        state.now_unix_ms = Some(stamp);
+        match render(&mut state, line, handle) {
+            cide_pty::Rendered::Drop => {}
+            cide_pty::Rendered::Keep => {
+                out.extend_from_slice(line.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+            cide_pty::Rendered::Replace(text) => {
+                out.extend_from_slice(text.replace('\n', "\r\n").as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+    // A log that ended mid-step ends with the live marker drawn and nothing coming to erase it
+    // — the next thing written here is cide's own separator, which would then sit under a row
+    // claiming the run is working. See `cide_agents::ERASE_MARKER`.
+    if state.marker {
+        out.extend_from_slice(cide_agents::ERASE_MARKER.as_bytes());
+    }
+    out
+}
+
+/// The moment one logged event says it happened, where its harness records one.
+///
+/// opencode stamps every event line (`"timestamp"`, milliseconds); codex records no clock on
+/// any item, which is the `None` [`RenderState::now_unix_ms`] is an `Option` for. A line that
+/// is not JSON at all — the CLI's own prose, or [`RUN_LOG_CAPPED`] — answers `None` too.
+fn line_stamp(line: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("timestamp")?
+        .as_u64()
+}
+
 /// Where each harness-bound run's raw output is teed, line by line, for a post-mortem.
 ///
 /// The debug report's first ask, in its own words: *"e83a75fe ran 9 minutes and left literally
@@ -3337,6 +4230,9 @@ impl AgentRegistry {
                     // could be compared against.
                     forked_with: None,
                     stopping: false,
+                    // Not persisted — see `LiveRun::stop`. A restored row is `Interrupted` with
+                    // no child, and a pending wind-down is a promise about a process that is gone.
+                    stop: None,
                     // A resumed run has had at least one prompt, so its next failure is a
                     // mid-conversation one and must not abandon the transcript.
                     turns: 1,
@@ -3388,8 +4284,16 @@ impl AgentRegistry {
     /// screens and keeps the runs, which is the right half to keep. The directory is pruned to
     /// the runs written, so it cannot grow past [`RECENT_KEPT`]-ish per project ever.
     fn save_screens_for_snapshot(&self, sessions: &SessionRegistry) {
-        let dir = screens_dir();
-        if let Err(error) = std::fs::create_dir_all(&dir) {
+        self.save_screens_to(&screens_dir(), sessions);
+    }
+
+    /// The write, path-parameterised for the same reason [`Self::write_snapshot_to`] is: so a
+    /// test never touches the real state directory — and so *what this actually produces* is
+    /// assertable at all. Every screen the last teardown on the reporting machine wrote was ten
+    /// bytes, `full_state`'s lead-in over a mirror with nothing in it, and nothing in the suite
+    /// could have seen that: this function had no test, because it had no seam.
+    fn save_screens_to(&self, dir: &std::path::Path, sessions: &SessionRegistry) {
+        if let Err(error) = std::fs::create_dir_all(dir) {
             tracing::warn!(%error, "no run-screens directory; resumed panes will start blank");
             return;
         }
@@ -3423,7 +4327,7 @@ impl AgentRegistry {
             }
         }
         // The prune: whatever an earlier process left for runs this one no longer holds.
-        if let Ok(entries) = std::fs::read_dir(&dir) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !kept.contains(&name) {
@@ -4046,27 +4950,270 @@ impl AgentRegistry {
         self.inner.lock().runs.get(&run).map(|live| live.project)
     }
 
-    /// Stop a run: cancel it if it is queued, kill its child if it has one.
+    /// Decide a stop and write it down, under the lock. The half a test can drive. (M67)
+    ///
+    /// `plan_respawn`'s split, and it carries the same weight: everything that *decides* is here
+    /// and in [`stop_route`] beneath it, everything that signals, types or spawns is in
+    /// [`AgentRegistry::stop`]. The registry never reads a disk from here — the grace arrives in
+    /// the [`StopRequest`], already read at the door.
+    fn plan_stop(
+        &self,
+        project: ProjectId,
+        run: RunId,
+        request: &StopRequest,
+    ) -> Result<(StopRoute, StopFacts)> {
+        let sealed = self.snapshot_sealed.load(Ordering::SeqCst);
+        let mut inner = self.inner.lock();
+        let restart_pending = inner.restarts.values().any(|failover| failover.run == run);
+        let live = inner
+            .runs
+            .get_mut(&run)
+            .filter(|live| live.project == project)
+            .ok_or_else(|| CoreError::Io(format!("no such run in this project: {run}")))?;
+
+        let facts = StopFacts {
+            session: live.session,
+            task: live.task.clone(),
+            harness: live.harness,
+        };
+        // A `Delivery::Respawn` harness continues a conversation it has to be able to name, so
+        // for those the ask is only possible once the child has said what it calls itself. A
+        // `Stdin` harness is typed into and needs nothing. Asked here rather than inside
+        // `stop_route`, which must stay pure of the registry.
+        let can_continue = match cide_agents::for_kind(live.harness) {
+            Some(harness) => match harness.deliver("") {
+                Delivery::Stdin(_) => true,
+                Delivery::Respawn => live.harness_session.is_some(),
+            },
+            // No implementation for this harness in this build: nothing to ask, and the kill
+            // road works for any child whatever forked it.
+            None => false,
+        };
+
+        let route = stop_route(
+            &live.state,
+            live.session,
+            live.stop
+                .as_ref()
+                .is_some_and(|stop| stop.how.is_winding_down()),
+            restart_pending,
+            sealed,
+            can_continue,
+            request.grace,
+            request.force,
+        );
+
+        // Latched **before any signal**, so the exit this is about to cause cannot be read as a
+        // provider's fault and spend a pool candidate restarting the run underneath the person
+        // who just pressed Stop. (M45) It stays a bare bool and stays set on every road,
+        // including the ask — a provider error raised *during* a wind-down turn must not fork a
+        // successor either.
+        live.stopping = true;
+
+        let how = match &route {
+            StopRoute::Cancel => StopHow::BeforeStart,
+            StopRoute::Discard => StopHow::Discarded,
+            // Nothing to record: the run has ended and its epitaph, if it had one, is written.
+            // Writing a stop record here would be a second claim about a settled death.
+            StopRoute::Nothing => return Ok((route, facts)),
+            StopRoute::Kill { why } => StopHow::Immediate { why: *why },
+            StopRoute::Ask => StopHow::WindingDown {
+                saw_a_turn: false,
+                deadline_unix_ms: now_unix_ms().saturating_add(request.grace.as_millis() as u64),
+            },
+        };
+        // The *first* stop's words are kept. A second press is an escalation of the first
+        // request, not a new one, and its (usually absent) reason must not blank the sentence
+        // the caller gave when they first asked.
+        let reason = live
+            .stop
+            .as_ref()
+            .and_then(|stop| stop.reason.clone())
+            .or_else(|| request.reason.clone());
+        live.stop = Some(StopRecord {
+            by: request.by,
+            reason,
+            how,
+            grace_secs: request.grace.as_secs(),
+        });
+        Ok((route, facts))
+    }
+
+    /// Ask a run to wind down: interrupt whatever it is doing, then give it the instruction.
+    ///
+    /// The interrupt is the harness's ([`cide_agents::Harness::interrupt`]) and goes in **before**
+    /// the line, so "stop work now" means now rather than "once you have finished the thing I am
+    /// stopping you for". It is written straight at the PTY rather than through
+    /// `type_submitted_line`, which owes an Enter and would submit an empty composer.
+    ///
+    /// `send_prompt` then does the rest, unchanged, down whichever road the harness declares —
+    /// typed into a live TUI, or a fresh child continuing the same conversation.
+    fn ask_to_wind_down(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        run: RunId,
+        facts: &StopFacts,
+        request: &StopRequest,
+    ) -> Result<()> {
+        let session = facts
+            .session
+            .ok_or_else(|| CoreError::Io("this run has no child to ask".into()))?;
+        let harness = cide_agents::for_kind(facts.harness).ok_or_else(|| {
+            CoreError::Io(format!(
+                "this build has no implementation for the `{:?}` harness",
+                facts.harness
+            ))
+        })?;
+
+        // The bridge is what decides whether the line may name a tracker tool — `None` drops
+        // that clause rather than telling a run to call something that was never attached.
+        // `continuation_prompt`'s scar, in a third place.
+        let bridged = app
+            .try_state::<crate::agent_rpc::AgentRpcServer>()
+            .is_some()
+            .then_some(harness);
+        let prompt = wind_down_prompt(facts.task.as_ref(), bridged, request.reason.as_deref());
+
+        if let Some(bytes) = harness.interrupt()
+            && let Some(sessions) = app.try_state::<SessionRegistry>()
+            && let Some(pty) = sessions.get(session)
+        {
+            tracing::debug!(%run, "interrupting a run's turn before asking it to wind down");
+            pty.write(bytes);
+        }
+
+        self.send_prompt(app, project, run, session, &prompt, facts.harness)
+    }
+
+    /// Watch a winding-down run for its grace, and end it if it is still here. (M67)
+    ///
+    /// `watch_thaw`'s shape exactly — one named short-lived thread per stop, a sleep, then one
+    /// decision under the lock and an act outside it. Not a timer wheel and not a poll: this
+    /// happens at the rate somebody presses Stop, and a process with no runs in it must not wake
+    /// up for ever.
+    fn watch_wind_down(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        run: RunId,
+        grace: Duration,
+    ) {
+        let registry = Arc::clone(self);
+        let for_thread = app.clone();
+        let spawned = std::thread::Builder::new()
+            .name("cide-agents-winddown".into())
+            .spawn(move || {
+                std::thread::sleep(grace);
+                if let Some(session) = registry.plan_forced_stop(run) {
+                    tracing::info!(%run, "a run did not wind down in its grace; ending it");
+                    registry.kill_child(&for_thread, Some(session));
+                    registry.mark_changed(&for_thread, project);
+                }
+            });
+        if let Err(error) = spawned {
+            // Unlike `watch_thaw`'s equivalent, the fallback here cannot be "the offer is lost":
+            // a wind-down with nothing watching it is a run that never ends, holding its role's
+            // worktree under a row that says it is stopping. Kill now and say so.
+            tracing::warn!(%error, %run, "no thread to watch a wind-down; ending the run now");
+            self.record_forced(run, COULD_NOT_ASK);
+            let session = self
+                .inner
+                .lock()
+                .runs
+                .get(&run)
+                .and_then(|live| live.session);
+            self.kill_child(app, session);
+        }
+    }
+
+    /// The grace expired. Answers the session to kill, or `None` — every other outcome. (M67)
+    ///
+    /// `None` is the ordinary answer: the run wound down in time, and its record already says
+    /// so. Under the lock, so the forced record is written by whatever decided to force.
+    fn plan_forced_stop(&self, run: RunId) -> Option<SessionId> {
+        let mut inner = self.inner.lock();
+        let live = inner.runs.get_mut(&run)?;
+        // A run that ended on its own is not forced, whatever the clock says — and a row whose
+        // stop was already escalated by a second press has had its sentence written once.
+        if !live
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.how.is_winding_down())
+        {
+            return None;
+        }
+        if matches!(
+            live.state,
+            RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+        ) {
+            return None;
+        }
+        if let Some(stop) = live.stop.as_mut() {
+            stop.how = StopHow::Forced {
+                why: RAN_OUT_OF_TIME,
+            };
+        }
+        live.session
+    }
+
+    /// Write down that this child is being killed to give its worktree away. (M67)
+    ///
+    /// Not a stop anybody asked for, and the record says so rather than borrowing the crash
+    /// sentence. Keyed by session because that is what the reclaim loop holds.
+    fn mark_reclaimed(&self, session: SessionId) {
+        if let Some(live) = self
+            .inner
+            .lock()
+            .runs
+            .values_mut()
+            .find(|live| live.session == Some(session))
+            && live.stop.is_none()
+        {
+            live.stop = Some(StopRecord {
+                // The one arm with no hand behind it — the queue did this, not a person and
+                // not an orchestrator — and `epitaph`'s `Reclaimed` sentence names nobody for
+                // that reason. The field is filled because the struct requires it and read by
+                // nothing here; do not start reading it without giving `StopBy` a third
+                // variant that tells the truth.
+                by: StopBy::User,
+                reason: None,
+                how: StopHow::Reclaimed,
+                grace_secs: 0,
+            });
+        }
+    }
+
+    /// Write down that a wind-down ended in a kill after all. See `stop`'s `Err` arm.
+    fn record_forced(&self, run: RunId, why: &'static str) {
+        if let Some(live) = self.inner.lock().runs.get_mut(&run)
+            && let Some(stop) = live.stop.as_mut()
+            && stop.how.is_winding_down()
+        {
+            stop.how = StopHow::Forced { why };
+        }
+    }
+
+    /// Stop a run: cancel it if it is queued, **ask its child to wind down** if it has one, and
+    /// kill it if the grace runs out. (M67)
     ///
     /// Idempotent on a run that has already ended, deliberately — a second press of a Stop button
     /// on a row that finished while the pointer was travelling is not an error to show anybody.
-    pub fn stop(self: &Arc<Self>, app: &AppHandle, project: ProjectId, run: RunId) -> Result<()> {
-        let (state, session) = {
-            let mut inner = self.inner.lock();
-            let live = inner
-                .runs
-                .get_mut(&run)
-                .filter(|live| live.project == project)
-                .ok_or_else(|| CoreError::Io(format!("no such run in this project: {run}")))?;
-            // Latched **before** any signal, so the exit this is about to cause cannot be read as
-            // a provider's fault and spend a pool candidate restarting the run underneath the
-            // person who just pressed Stop. (M45)
-            live.stopping = true;
-            (live.state.clone(), live.session)
-        };
+    /// A second press on a row that is *winding down* is not idempotent and is not meant to be:
+    /// it is the escalation, and [`stop_route`] says so.
+    ///
+    /// The decision is [`stop_route`]'s, resolved here under the lock and acted on after it.
+    pub fn stop(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        run: RunId,
+        request: &StopRequest,
+    ) -> Result<Stopped> {
+        let (route, facts) = self.plan_stop(project, run, request)?;
 
-        match state {
-            RunState::Queued => {
+        let outcome = match route {
+            StopRoute::Cancel => {
                 {
                     let mut inner = self.inner.lock();
                     if let Some(live) = inner.runs.get(&run) {
@@ -4077,31 +5224,78 @@ impl AgentRegistry {
                     }
                 }
                 self.fail(Some(app), run, "stopped before it started");
+                Stopped::BeforeStart
             }
-            RunState::Finished { .. } | RunState::Failed { .. } => {}
-            // No child to kill and no reaper to report one, so the fall-through below would
-            // move nothing and the row would be unstoppable, silently. Stopping an interrupted
-            // run means "do not resume this": the row closes into Recent, the conversation
-            // stays on disk, and a fresh dispatch remains available.
-            RunState::Interrupted => {
+            StopRoute::Nothing => Stopped::AlreadyOver,
+            // No child to kill and no reaper to report one, so the kill arm below would move
+            // nothing and the row would be unstoppable, silently. Stopping an interrupted run
+            // means "do not resume this": the row closes into Recent, the conversation stays on
+            // disk, and a fresh dispatch remains available.
+            StopRoute::Discard => {
                 self.fail(Some(app), run, "discarded without resuming");
+                Stopped::Discarded
             }
-            _ => {
+            StopRoute::Kill { why } => {
                 // The child, through the one registry that owns it. The run's own state moves
                 // when the reaper reports, not here: a state written on the way *into* a kill
                 // would be a claim about a process that is still running.
-                if let (Some(session), Some(sessions)) =
-                    (session, app.try_state::<SessionRegistry>())
-                    && let Some(pty) = sessions.get(session)
-                {
-                    pty.kill();
+                self.kill_child(app, facts.session);
+                Stopped::Killed {
+                    why: why.map(str::to_string),
+                    task: facts.task.clone(),
                 }
             }
-        }
+            StopRoute::Ask => {
+                // The reason reaches the board here and not at the end, because this is the one
+                // road with a window: up to the whole grace passes before anything else is
+                // written, and a cide that quits inside it would otherwise lose the reason
+                // entirely. Every other road is over by the time this function returns and says
+                // everything it has to say in its epitaph.
+                crate::agent_rpc::note_stop_asked(app, project, run);
+
+                match self.ask_to_wind_down(app, project, run, &facts, request) {
+                    Ok(()) => {
+                        self.watch_wind_down(app, project, run, request.grace);
+                        Stopped::WindingDown {
+                            secs: request.grace.as_secs(),
+                            task: facts.task.clone(),
+                        }
+                    }
+                    // The ask could not be delivered after all — a conversation somebody has
+                    // open in a pane, a child that died between the decision and the write. A
+                    // graceful stop that silently fails to stop is the worst outcome available
+                    // here, so it becomes the outcome it would have had without the asking.
+                    Err(error) => {
+                        tracing::warn!(%run, %error, "a run could not be asked to wind down; ending it now");
+                        self.record_forced(run, COULD_NOT_ASK);
+                        self.kill_child(app, facts.session);
+                        // The caller gets the refusal's own words — most often
+                        // `VIEWED_IN_A_PANE`, which names something they can act on (close the
+                        // pane) rather than the generic sentence the epitaph settles for. The
+                        // record keeps the short form because `StopHow::Forced` carries a
+                        // `&'static str` and a run's epitaph is not the place for a stack of
+                        // somebody else's error text.
+                        Stopped::Killed {
+                            why: Some(format!("{COULD_NOT_ASK} — {error}")),
+                            task: facts.task.clone(),
+                        }
+                    }
+                }
+            }
+        };
 
         self.mark_changed(app, project);
         self.pump(app);
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// Kill a run's child, if it still has one. The one spelling, for `stop`'s three callers.
+    fn kill_child(&self, app: &AppHandle, session: Option<SessionId>) {
+        if let (Some(session), Some(sessions)) = (session, app.try_state::<SessionRegistry>())
+            && let Some(pty) = sessions.get(session)
+        {
+            pty.kill();
+        }
     }
 
     /// Note that this project's roster changed. Coalesced; see the module header.
@@ -4226,6 +5420,12 @@ fn start_child(
                 for idle in registry.idle_children_in(admission.project, &name, admission.run) {
                     if let Some(pty) = sessions.get(idle) {
                         tracing::info!(session = %idle, checkout = %name, "winding down an idle run to reclaim its worktree");
+                        // Marked before the signal, so the epitaph this causes says what it
+                        // was. Until M67 a reclaim produced `ended with exit 129 before
+                        // finishing this task` — a crash report about a run whose turn had
+                        // *already* ended. That was merely odd while the sentence meant nothing
+                        // in particular; it is a lie now that it means **nobody asked**.
+                        registry.mark_reclaimed(idle);
                         pty.kill();
                     }
                 }
@@ -4353,6 +5553,16 @@ fn start_child(
     // over: a run whose whole liveness channel is its own output cannot afford to have its
     // first lines delivered to nobody, and the hook is also the display renderer — a line that
     // reached the mirror before it was installed would sit on screen as raw ndjson for ever.
+    // Captured before the `match` below reads the binding for the hook, and the reason is the
+    // seed a few lines down: a resumed run's mirror is filled by replaying its own log through
+    // **these** two functions, so the rows it opens onto are the rows the live stream would
+    // have drawn for the same lines. `SessionBinding` is `Copy`, so this costs a move of two
+    // function pointers and nothing else. `None` for `Caller` — a claude or qwen run is not
+    // teed at all (see `run_logs_dir`) and keeps the saved-screen road.
+    let rendering = match binding {
+        SessionBinding::Harness { keep, render, .. } => Some((keep, render)),
+        SessionBinding::Caller => None,
+    };
     let spec = match binding {
         SessionBinding::Harness {
             capture,
@@ -4371,10 +5581,20 @@ fn start_child(
         )),
         SessionBinding::Caller => spec,
     };
-    // A resumed run's pane opens onto what the old child last showed, above the continuation —
+    // A resumed run's pane opens onto what the run itself last showed, above the continuation —
     // the same mechanism a restored shell pane uses (`SpawnSpec::preload`: mirror only, never
-    // the child), fed from the screen the last teardown saved. Absent file, absent preload:
-    // a crash keeps the runs and loses the screens, and blank-above-continuation is honest.
+    // the child).
+    //
+    // **Its own log first, the saved screen second**, and the order is the fix rather than a
+    // preference. A resumed opencode or codex run is a new cide session, so the old mirror, the
+    // old sinks and the old ring are all gone; the screen file was the only bridge and it is
+    // written at teardown only, so a crash loses it — and on the machine this was reported from
+    // every screen the last teardown wrote was ten bytes of `full_state` lead-in over an empty
+    // mirror. The pane therefore came back holding one separator and the next turn, which is
+    // exactly what "the agent started from zero" looks like from outside a conversation that
+    // was in fact intact. `replayed_run_log` re-renders the run's own tee, which is keyed by
+    // run and spans every child *and* every restart. Absent both, absent preload: a run with
+    // nothing recorded has nothing to show, and blank-above-continuation is honest.
     //
     // A failover's or a settings restart's screen is handed in directly (`preload`) and is the
     // *live* mirror of the child that just died, read before this fork; a cide restart's comes
@@ -4386,7 +5606,13 @@ fn start_child(
         None => admission
             .resume
             .as_ref()
-            .and_then(|_| saved_screen(admission.run))
+            .and_then(|_| {
+                rendering
+                    .and_then(|(keep, render)| {
+                        replayed_run_log(app, admission.run, session, keep, render)
+                    })
+                    .or_else(|| saved_screen(admission.run))
+            })
             .map(|screen| (screen, RESTART_SEPARATOR)),
     };
     let spec = match carried {
@@ -4777,6 +6003,453 @@ mod tests {
             ),
             "a child ran and exited; `Failed` is for a run that never reached one"
         );
+    }
+
+    // ==========================================================================================
+    // Stopping a run is a request before it is a kill (M67). Everything that decides is pure or
+    // under the lock and app-free, so all of it is driven directly here; everything that
+    // signals, types or spawns is `AgentRegistry::stop`'s.
+    // ==========================================================================================
+
+    fn route(state: RunState, force: bool) -> StopRoute {
+        stop_route(
+            &state,
+            Some(SessionId::new()),
+            false,
+            false,
+            false,
+            true,
+            Duration::from_secs(60),
+            force,
+        )
+    }
+
+    /// The states that cannot be asked, each for its own reason and each naming it.
+    ///
+    /// The two that matter are `AwaitingPermission` and `Paused`, and both are bugs rather than
+    /// taste. Do not "simplify" this table into `matches!(state, terminal) else Ask`.
+    #[test]
+    fn a_run_that_cannot_be_asked_is_killed_and_the_route_says_why() {
+        // **The worst thing in this feature's blast radius.** The permission prompt is a
+        // selection list, and a wind-down is text followed by a lone `\r` — the `\r` is what
+        // the dialog reads. Asking here would approve the very tool call the stop was meant to
+        // prevent.
+        assert_eq!(
+            route(RunState::AwaitingPermission, false),
+            StopRoute::Kill {
+                why: Some(AWAITING_PERMISSION)
+            }
+        );
+        // A `SIGSTOP`ped process does not act on a signal and does not read its input; the line
+        // would sit in the kernel buffer and be read on resume, out of order with whatever it
+        // was doing. `AgentRegistry::resume` states the same rule for the queue's follow-ups.
+        assert_eq!(
+            route(RunState::Paused { since_unix_ms: 1 }, false),
+            StopRoute::Kill { why: Some(PAUSED) }
+        );
+
+        // A force is not an obstacle, so it names none: `why: None` is what "we never asked, on
+        // purpose" looks like, and inventing a sentence for it would read as an apology.
+        assert_eq!(
+            route(RunState::Running, true),
+            StopRoute::Kill { why: None }
+        );
+        // A project that set the grace to zero has said the same thing, once, in its config.
+        assert_eq!(
+            stop_route(
+                &RunState::Running,
+                Some(SessionId::new()),
+                false,
+                false,
+                false,
+                true,
+                Duration::ZERO,
+                false
+            ),
+            StopRoute::Kill { why: None }
+        );
+
+        // Shutting down: `lifecycle::shutdown` seals before the ladder. A grace per run would
+        // turn quitting cide into a minutes-long wait, and there would be nobody left to read
+        // the comment it bought.
+        assert_eq!(
+            stop_route(
+                &RunState::Running,
+                Some(SessionId::new()),
+                false,
+                false,
+                true,
+                true,
+                Duration::from_secs(60),
+                false
+            ),
+            StopRoute::Kill { why: Some(SEALED) }
+        );
+        // A second press is the escalation — it is how a caller reaches a kill without a second
+        // argument, and why the tool's answer tells them so.
+        assert_eq!(
+            stop_route(
+                &RunState::Running,
+                Some(SessionId::new()),
+                true,
+                false,
+                false,
+                true,
+                Duration::from_secs(60),
+                false
+            ),
+            StopRoute::Kill {
+                why: Some(ALREADY_ASKED)
+            }
+        );
+        // A restart already has this child on the way out; there is nothing to speak to.
+        assert_eq!(
+            stop_route(
+                &RunState::Running,
+                Some(SessionId::new()),
+                false,
+                true,
+                false,
+                true,
+                Duration::from_secs(60),
+                false
+            ),
+            StopRoute::Kill {
+                why: Some(RESTARTING)
+            }
+        );
+        // A `Delivery::Respawn` harness whose child died before naming its conversation: there
+        // is nothing to continue it from, which is `plan_respawn`'s own refusal, hoisted so the
+        // stop says it rather than failing downstream.
+        assert_eq!(
+            stop_route(
+                &RunState::Running,
+                Some(SessionId::new()),
+                false,
+                false,
+                false,
+                false,
+                Duration::from_secs(60),
+                false
+            ),
+            StopRoute::Kill {
+                why: Some(NO_CONVERSATION)
+            }
+        );
+        // And a live run with no session at all.
+        assert_eq!(
+            stop_route(
+                &RunState::Running,
+                None,
+                false,
+                false,
+                false,
+                true,
+                Duration::from_secs(60),
+                false
+            ),
+            StopRoute::Kill {
+                why: Some(NO_CHILD)
+            }
+        );
+    }
+
+    /// The three roads that were never a kill, and the one that now asks.
+    #[test]
+    fn the_queue_the_history_and_a_working_run_each_take_their_own_road() {
+        assert_eq!(route(RunState::Queued, false), StopRoute::Cancel);
+        assert_eq!(
+            route(RunState::Queued, true),
+            StopRoute::Cancel,
+            "force changes nothing here"
+        );
+        assert_eq!(route(RunState::Interrupted, false), StopRoute::Discard);
+        assert_eq!(
+            route(RunState::Finished { code: 0 }, false),
+            StopRoute::Nothing
+        );
+        assert_eq!(
+            route(RunState::Failed { reason: "x".into() }, false),
+            StopRoute::Nothing
+        );
+        assert_eq!(route(RunState::Running, false), StopRoute::Ask);
+        assert_eq!(route(RunState::Idle, false), StopRoute::Ask);
+        assert_eq!(route(RunState::Starting, false), StopRoute::Ask);
+    }
+
+    fn winding() -> StopHow {
+        StopHow::WindingDown {
+            saw_a_turn: false,
+            deadline_unix_ms: 0,
+        }
+    }
+
+    /// **Two edges, never one.** The rule that decides whether the agent gets its turn at all.
+    #[test]
+    fn a_stop_mid_turn_does_not_kill_on_the_turn_it_interrupted() {
+        // The interrupted turn handing back. Killing here would end the child a beat *before*
+        // it was told anything, which is the whole failure this feature exists to prevent.
+        assert_eq!(
+            wind_down_step(&winding(), true, &RunState::Idle),
+            WindDownStep::Wait
+        );
+        // The wind-down turn starting.
+        assert_eq!(
+            wind_down_step(&winding(), false, &RunState::Running),
+            WindDownStep::Arm
+        );
+        // A wind-down turn that stops to ask permission has plainly begun. Refusing to arm on
+        // it would make the hand-back that follows read as the interrupted turn's, and nothing
+        // but the grace would ever end the run.
+        assert_eq!(
+            wind_down_step(&winding(), false, &RunState::AwaitingPermission),
+            WindDownStep::Arm
+        );
+
+        let armed = StopHow::WindingDown {
+            saw_a_turn: true,
+            deadline_unix_ms: 0,
+        };
+        assert_eq!(
+            wind_down_step(&armed, true, &RunState::Idle),
+            WindDownStep::Over
+        );
+        // Armed once. A second `Running` is not a second arming, and must not be an `Over`.
+        assert_eq!(
+            wind_down_step(&armed, false, &RunState::Running),
+            WindDownStep::Wait
+        );
+
+        // **The `Delivery::Respawn` ending.** opencode's and codex's wind-down is a whole new
+        // child that answers, comments and exits — there is no hand-back at all, so without
+        // this the run would die still flagged `WindingDown` and its epitaph would say it died
+        // before it could wind down about the one case where everything worked.
+        assert_eq!(
+            wind_down_step(&winding(), false, &RunState::Finished { code: 0 }),
+            WindDownStep::Completed
+        );
+        // It is armed or not; the clean exit is the answer either way, because a `Respawn`
+        // harness's wind-down child may exit before any observation moved the row to `Running`.
+        assert_eq!(
+            wind_down_step(&armed, false, &RunState::Finished { code: 0 }),
+            WindDownStep::Completed
+        );
+        // A child that crashed or was killed mid-wind-down really did die before it could
+        // finish, and `epitaph`'s `WindingDown` arm is the correct sentence for that.
+        assert_eq!(
+            wind_down_step(&winding(), false, &RunState::Finished { code: 129 }),
+            WindDownStep::Wait
+        );
+        assert_eq!(
+            wind_down_step(
+                &winding(),
+                false,
+                &RunState::Failed {
+                    reason: "no child".into()
+                }
+            ),
+            WindDownStep::Wait
+        );
+
+        // Nothing outstanding: every other run in the process takes this branch on every edge,
+        // so it is the one that has to be cheap and the one that must never act.
+        for how in [
+            StopHow::WoundDown,
+            StopHow::Forced {
+                why: RAN_OUT_OF_TIME,
+            },
+            StopHow::Immediate { why: None },
+            StopHow::BeforeStart,
+            StopHow::Discarded,
+            StopHow::Reclaimed,
+        ] {
+            assert_eq!(
+                wind_down_step(&how, true, &RunState::Idle),
+                WindDownStep::Wait,
+                "{how:?}"
+            );
+        }
+    }
+
+    /// The line is one line, names the harness's own tool, and asks for no comment it cannot get.
+    #[test]
+    fn the_wind_down_line_is_one_line_in_the_harnesss_own_dialect() {
+        let task = TaskId::from("t-7".to_string());
+        let claude = cide_agents::for_kind(Harness::Claude).expect("claude");
+        let opencode = cide_agents::for_kind(Harness::Opencode).expect("opencode");
+
+        let line = wind_down_prompt(Some(&task), Some(claude), Some("going the wrong way"));
+        // An embedded newline is another Enter into a TUI: it would submit the first line as a
+        // turn and feed the rest in as further turns. `opening_prompt`'s rule.
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains("mcp__cide__cide_task_comment"), "{line}");
+        assert!(line.contains("t-7"), "{line}");
+        assert!(line.contains("going the wrong way"), "{line}");
+
+        // The scar `continuation_prompt` carries: a hard-coded Claude spelling made every
+        // opencode run call a tool it did not have.
+        let other = wind_down_prompt(Some(&task), Some(opencode), None);
+        assert!(
+            other.contains(&opencode.tool_name("cide_task_comment")),
+            "{other}"
+        );
+        assert!(!other.contains("mcp__cide__"), "{other}");
+        // No reason given: the clause comes off rather than printing a placeholder.
+        assert!(!other.contains("reason given"), "{other}");
+
+        // No bridge: the clause naming a tool comes off, and the useful half stays.
+        let unbridged = wind_down_prompt(Some(&task), None, None);
+        assert!(!unbridged.contains("cide_task_comment"), "{unbridged}");
+        assert!(unbridged.contains("t-7"), "{unbridged}");
+        assert!(unbridged.contains("then exit"), "{unbridged}");
+
+        // M40's run with no task works in the project root and has nowhere to report. Telling
+        // it to comment on a task it has not got would send it looking for one.
+        let rootless = wind_down_prompt(None, Some(claude), None);
+        assert!(!rootless.contains("task"), "{rootless}");
+        assert!(rootless.contains("then exit"), "{rootless}");
+
+        // A multi-line reason is flattened rather than truncated or refused.
+        let messy = wind_down_prompt(None, None, Some("one\ntwo\n\nthree"));
+        assert!(!messy.contains('\n'), "{messy}");
+        assert!(messy.contains("one two three"), "{messy}");
+    }
+
+    /// The admission gate and the reclaim ask one question, and it is this one.
+    #[test]
+    fn a_winding_down_run_holds_its_checkout_and_an_idle_one_does_not() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 4, 4));
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&run).expect("the run");
+            live.state = RunState::Idle;
+            live.checkout = Some("developer-t1".into());
+            live.session = Some(SessionId::new());
+        }
+        // The trade `RunState::Idle`'s doc argues for: a parked child is `bring_up`'s to wind
+        // down when the directory is actually claimed.
+        assert!(!holds_its_checkout(&registry.inner.lock().runs[&run]));
+        assert_eq!(
+            registry
+                .idle_children_in(project, "developer-t1", RunId::new())
+                .len(),
+            1
+        );
+
+        // Asked to wind down: its child has been told to write one last comment and will be
+        // dead within the grace. Reclaiming the directory now buys seconds and costs the whole
+        // point of asking — and the run's final comment is never written, with nothing anywhere
+        // saying why.
+        registry.inner.lock().runs.get_mut(&run).unwrap().stop = Some(StopRecord {
+            by: StopBy::Orchestrator,
+            reason: None,
+            how: winding(),
+            grace_secs: 60,
+        });
+        assert!(holds_its_checkout(&registry.inner.lock().runs[&run]));
+        assert!(
+            registry
+                .idle_children_in(project, "developer-t1", RunId::new())
+                .is_empty(),
+            "the reclaim and the gate must never disagree about one run"
+        );
+    }
+
+    /// The row says a run is winding down, and says nothing once it is not.
+    #[test]
+    fn the_row_names_a_wind_down_and_only_a_wind_down() {
+        let winding = stop_note(Some(&StopRecord {
+            by: StopBy::Orchestrator,
+            reason: Some("going the wrong way".into()),
+            how: winding(),
+            grace_secs: 60,
+        }))
+        .expect("a wind-down says so");
+        assert!(winding.contains("winding down"), "{winding}");
+        assert!(winding.contains("the orchestrator"), "{winding}");
+        assert!(winding.contains("60s"), "{winding}");
+
+        // Every terminal spelling is the row's own phase a moment later, and the durable
+        // account is the task's comments — a second copy here would be one that drifts.
+        for how in [
+            StopHow::WoundDown,
+            StopHow::Forced {
+                why: RAN_OUT_OF_TIME,
+            },
+            StopHow::Immediate { why: None },
+            StopHow::BeforeStart,
+            StopHow::Discarded,
+            StopHow::Reclaimed,
+        ] {
+            assert!(
+                stop_note(Some(&StopRecord {
+                    by: StopBy::User,
+                    reason: None,
+                    how: how.clone(),
+                    grace_secs: 0,
+                }))
+                .is_none(),
+                "{how:?}"
+            );
+        }
+        assert!(stop_note(None).is_none());
+
+        // The three sources join in order and the empty ones vanish — a run with nothing to say
+        // must not draw a row of dangling dashes.
+        assert_eq!(
+            compose_note(Some("a".into()), &Some("b".into()), &Some("c".into())).as_deref(),
+            Some("a — b — c")
+        );
+        assert_eq!(
+            compose_note(None, &None, &Some("c".into())).as_deref(),
+            Some("c")
+        );
+        assert_eq!(compose_note(None, &None, &None), None);
+        assert_eq!(compose_note(None, &Some(String::new()), &None), None);
+    }
+
+    /// A wound-down run exits 0, and that is the one clean exit worth a line on the board.
+    #[test]
+    fn death_facts_speaks_for_a_stopped_run_that_exited_cleanly() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+
+        // Unchanged: a run that decided for itself that it was done says nothing. Widening the
+        // gate generally would put a line on every clean run and bury the ones that matter.
+        let quiet = registry.enqueue(spec(project, "developer", 4, 4));
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&quiet).expect("the run");
+            live.task = Some(TaskId::from("t-1".to_string()));
+            live.state = RunState::Finished { code: 0 };
+        }
+        assert!(registry.death_facts(quiet).is_none());
+
+        // Stopped and wound down. Without this arm the *best* outcome of the whole feature
+        // leaves no trace at all.
+        let stopped = registry.enqueue(spec(project, "developer", 4, 4));
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&stopped).expect("the run");
+            live.task = Some(TaskId::from("t-2".to_string()));
+            live.state = RunState::Finished { code: 0 };
+            live.stop = Some(StopRecord {
+                by: StopBy::Orchestrator,
+                reason: Some("the assumption was wrong".into()),
+                how: StopHow::WoundDown,
+                grace_secs: 60,
+            });
+        }
+        let facts = registry.death_facts(stopped).expect("a stopped run speaks");
+        assert_eq!(facts.code, Some(0));
+        assert!(matches!(
+            facts.stop.as_ref().map(|stop| &stop.how),
+            Some(StopHow::WoundDown)
+        ));
+        // Still once, however many times the end edge fires.
+        assert!(registry.death_facts(stopped).is_none());
     }
 
     /// Four deaths that are not a provider's fault, each of which must not spend a candidate.
@@ -5227,11 +6900,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The auto-dispatch dedupe: a `(agent, task)` pair with a run in any not-yet-closed state
-    /// answers open, so a repeated assignment or mention stacks nothing — and only `Finished`/
-    /// `Failed` reopen it.
+    /// **The duplicate rule's truth table.** (M66) A pair is held by a run that has a child or
+    /// is about to get one, and by nothing else.
+    ///
+    /// `Interrupted` is the row that changed, and it is the reason this test is not called
+    /// `an_open_run_is_any_run_that_has_not_ended` any more: a run whose child died with a
+    /// previous cide is not running, so it doubles nothing — and while it counted, a row left
+    /// behind by a restart silently swallowed every re-assignment of that role to that task.
+    /// `holds_a_pair` is an exhaustive match so that a state added later is classified by
+    /// whoever adds it; this walks all nine so the classification is also *asserted* somewhere a
+    /// reader can see the whole set at once.
     #[test]
-    fn an_open_run_is_any_run_that_has_not_ended() {
+    fn an_interrupted_run_does_not_hold_its_pair_but_every_live_state_does() {
+        let holds: &[(RunState, bool)] = &[
+            (RunState::Queued, true),
+            (RunState::Starting, true),
+            (RunState::Running, true),
+            (RunState::AwaitingPermission, true),
+            // The child lives and holds the role's only worktree; the way to re-engage it is a
+            // retry or a prompt, not a second run queued behind it.
+            (RunState::Idle, true),
+            // A frozen child has not let go of the checkout either.
+            (RunState::Paused { since_unix_ms: 1 }, true),
+            (RunState::Interrupted, false),
+            (RunState::Finished { code: 0 }, false),
+            (
+                RunState::Failed {
+                    reason: "spawn failed".into(),
+                },
+                false,
+            ),
+        ];
+        for (state, expected) in holds {
+            assert_eq!(
+                holds_a_pair(state),
+                *expected,
+                "{state:?} must {}hold its pair",
+                if *expected { "" } else { "not " }
+            );
+        }
+
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
         let task = TaskId("t-7".into());
@@ -5240,20 +6948,214 @@ mod tests {
         let run = registry.enqueue(with_task);
         let agent = AgentId("developer".into());
 
-        // Queued counts: the whole point is not stacking a second entry behind it.
-        assert!(registry.has_open_run(project, &agent, &task));
-        // A different task, and a different role, do not.
-        assert!(!registry.has_open_run(project, &agent, &TaskId("t-8".into())));
-        assert!(!registry.has_open_run(project, &AgentId("qa".into()), &task));
+        // Queued holds: the whole point is not stacking a second entry behind it. And the
+        // answer carries the state, because the refusal's sentence is spelled from it.
+        let held = registry
+            .run_holding(project, &agent, &task)
+            .expect("queued");
+        assert_eq!(held.run, run);
+        assert_eq!(held.state, RunState::Queued);
+        // A different task, and a different role, hold nothing.
+        assert!(
+            registry
+                .run_holding(project, &agent, &TaskId("t-8".into()))
+                .is_none()
+        );
+        assert!(
+            registry
+                .run_holding(project, &AgentId("qa".into()), &task)
+                .is_none()
+        );
 
-        // Idle still counts — the child lives and holds the role's worktree.
         let _ = registry.take_admissions();
         registry.set_state(None, run, RunState::Idle);
-        assert!(registry.has_open_run(project, &agent, &task));
+        let held = registry.run_holding(project, &agent, &task).expect("idle");
+        assert_eq!(
+            held.state,
+            RunState::Idle,
+            "the word the refusal will print"
+        );
 
-        // Failed closes it: the pair may be dispatched again.
+        // An interrupted row is history, not a holder — this is the M66 change, through the
+        // public road as well as the table above.
+        registry.set_state(None, run, RunState::Interrupted);
+        assert!(registry.run_holding(project, &agent, &task).is_none());
+
+        // Failed closes it too: the pair may be dispatched again.
         registry.fail(None, run, "spawn failed");
-        assert!(!registry.has_open_run(project, &agent, &task));
+        assert!(registry.run_holding(project, &agent, &task).is_none());
+    }
+
+    /// **The race, at the only seam that can win it.** (M66)
+    ///
+    /// No `plan_dispatch` anywhere: this is the atomic door on its own, which is what
+    /// `task_triggers`' pre-check cannot be because it spawns between asking and enqueueing.
+    #[test]
+    fn a_second_run_for_the_same_role_and_task_is_refused_under_the_lock_that_mints_the_id() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let task = TaskId("t-904".into());
+        let agent = AgentId("developer".into());
+
+        let mut first = spec(project, "developer", 8, 8);
+        first.task = Some(task.clone());
+        let run = registry
+            .enqueue_unique(first)
+            .expect("the first one starts");
+
+        let mut second = spec(project, "developer", 8, 8);
+        second.task = Some(task.clone());
+        let held = registry
+            .enqueue_unique(second)
+            .expect_err("the second one is refused");
+        assert_eq!(held.run, run, "the refusal names the run already going");
+        assert_eq!(held.state, RunState::Queued);
+
+        // And it is refused by *not being there*, which is the only assertion that matters: a
+        // guard that answered Err and inserted anyway would pass every other check here.
+        assert_eq!(registry.runs_for(project).len(), 1);
+
+        // A different role on the same task is not a duplicate — a mention starting `qa`
+        // alongside `developer` is the documented semantics, not an accident.
+        let mut other = spec(project, "qa", 8, 8);
+        other.task = Some(task.clone());
+        assert!(registry.enqueue_unique(other).is_ok());
+        assert!(registry.run_holding(project, &agent, &task).is_some());
+    }
+
+    /// The guard is not a permanent ban: an ended run frees its pair.
+    #[test]
+    fn a_run_that_ended_frees_its_pair_for_a_fresh_dispatch() {
+        for close in [0u8, 1] {
+            let registry = AgentRegistry::default();
+            let project = ProjectId::new();
+            let task = TaskId("t-7".into());
+            let mut first = spec(project, "developer", 8, 8);
+            first.task = Some(task.clone());
+            let run = registry.enqueue_unique(first).expect("first");
+            let _ = registry.take_admissions();
+            if close == 0 {
+                registry.set_state(None, run, RunState::Finished { code: 0 });
+            } else {
+                registry.fail(None, run, "spawn failed");
+            }
+
+            let mut again = spec(project, "developer", 8, 8);
+            again.task = Some(task);
+            assert!(
+                registry.enqueue_unique(again).is_ok(),
+                "a finished run must not wedge its task"
+            );
+        }
+    }
+
+    /// M40's road is untouched: a dispatch with no task contends for nothing.
+    ///
+    /// Such a run stands in the project root with no worktree, so N of them is what that road
+    /// says on its face — and a guard that keyed on the role alone would have quietly closed it.
+    #[test]
+    fn two_runs_with_no_task_are_never_duplicates_of_each_other() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        assert!(
+            registry
+                .enqueue_unique(spec(project, "developer", 8, 8))
+                .is_ok()
+        );
+        assert!(
+            registry
+                .enqueue_unique(spec(project, "developer", 8, 8))
+                .is_ok()
+        );
+        assert_eq!(registry.runs_for(project).len(), 2);
+    }
+
+    /// **The duplicate was destructive, not merely wasteful** — the regression this guards. (M66)
+    ///
+    /// `Idle` does not hold the *checkout* gate (see `admit_a_pass`), deliberately, so before
+    /// M66 a second dispatch of the same pair was admitted *beside* an idle first run and
+    /// `start_child` then killed that idle child to reclaim the directory. The second run did
+    /// not queue behind the first; it ended it.
+    #[test]
+    fn an_idle_first_run_is_not_displaced_by_a_second_dispatch_of_its_pair() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let task = TaskId("t-904".into());
+        let agent = AgentId("developer".into());
+
+        let mut first = spec(project, "developer", 8, 8);
+        first.task = Some(task.clone());
+        first.checkout = Some("developer-t-904".into());
+        let run = registry.enqueue_unique(first).expect("first");
+        let _ = registry.take_admissions();
+        registry.set_state(None, run, RunState::Idle);
+
+        let mut second = spec(project, "developer", 8, 8);
+        second.task = Some(task.clone());
+        second.checkout = Some("developer-t-904".into());
+        assert!(registry.enqueue_unique(second).is_err());
+
+        // Nothing was admitted, so nothing reached `idle_children_in`, so the first run's child
+        // is still the first run's child.
+        assert!(registry.take_admissions().is_empty());
+        assert_eq!(state_of(&registry, run), RunState::Idle);
+        assert_eq!(registry.runs_for(project).len(), 1);
+        assert!(registry.run_holding(project, &agent, &task).is_some());
+    }
+
+    /// Resume does not recreate the duplicate that excluding `Interrupted` made possible. (M66)
+    ///
+    /// The whole of that exclusion's cost, in one place: because an interrupted row no longer
+    /// holds its pair, the user can start the role on that task again — and a Resume that then
+    /// requeued the old row would put the second run on the board that M66 exists to keep off
+    /// it. The live run is the one that is going; this row is the conversation the restart
+    /// ended, and it says so in its note rather than silently doing nothing.
+    #[test]
+    fn a_resume_does_not_requeue_an_interrupted_run_whose_pair_is_already_going() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let task = TaskId("t-904".into());
+
+        let mut old = spec(project, "developer", 8, 8);
+        old.task = Some(task.clone());
+        let stale = registry.enqueue(old);
+        registry.set_state(None, stale, RunState::Interrupted);
+
+        // Allowed, and that is the point of the exclusion.
+        let mut fresh_spec = spec(project, "developer", 8, 8);
+        fresh_spec.task = Some(task.clone());
+        let fresh = registry
+            .enqueue_unique(fresh_spec)
+            .expect("an interrupted row holds nothing");
+
+        registry
+            .requeue_interrupted(project, None, None, &|_| None)
+            .expect("the project scope skips rather than refuses");
+        assert_eq!(
+            state_of(&registry, stale),
+            RunState::Interrupted,
+            "the old row was requeued beside a live run of its own pair"
+        );
+        let note = registry.inner.lock().runs[&stale]
+            .note
+            .clone()
+            .expect("a skip without a sentence is a button that does nothing");
+        assert!(note.contains(&fresh.to_string()), "{note}");
+        assert!(note.contains("two runs on one task"), "{note}");
+
+        // The single-run press gets the same fact as a refusal, like the viewed-in-a-pane arm.
+        let why = registry
+            .requeue_interrupted(project, Some(stale), None, &|_| None)
+            .expect_err("resuming one run says why it cannot")
+            .to_string();
+        assert!(why.contains("already going on this task"), "{why}");
+
+        // And once the live one ends, the old row resumes as it always did.
+        registry.set_state(None, fresh, RunState::Finished { code: 0 });
+        registry
+            .requeue_interrupted(project, Some(stale), None, &|_| None)
+            .expect("nothing holds the pair now");
+        assert_eq!(state_of(&registry, stale), RunState::Queued);
     }
 
     /// **P0's truth table**: the registry owns a session for as long as its run has not ended.
@@ -6119,6 +8021,71 @@ mod tests {
         );
     }
 
+    /// **A live run's saved screen holds what the mirror held — and this is the seam that says
+    /// so.**
+    ///
+    /// The reason it exists: on the machine this was reported from, every `run-screens` file the
+    /// last teardown wrote was ten bytes — `full_state`'s `ESC \` + leave-alt-screen lead-in
+    /// over a mirror with no scrollback and no non-blank row — so a resumed run's pane came back
+    /// holding nothing but a separator. Nothing in the suite could have caught it: the write had
+    /// no path seam and therefore no test at all.
+    ///
+    /// What this pins is the *mechanism*: a run whose session mirror holds rendered rows writes
+    /// them, and the prune leaves only the runs this registry still holds. A ten-byte file in
+    /// the wild is therefore a statement about the mirror at that moment rather than about this
+    /// code — which is precisely why `replayed_run_log` is the primary seed now and this is the
+    /// fallback: the log is written as the run goes, and cannot be empty for a run that spoke.
+    #[test]
+    fn a_live_runs_saved_screen_holds_what_its_mirror_held() {
+        let dir = std::env::temp_dir().join(format!("cide-run-screens-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = Arc::new(AgentRegistry::default());
+        let sessions = SessionRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+
+        let pty = PtySession::spawn(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("printf 'alpha\\nbeta\\n'; sleep 30")
+                .render(cide_pty::LineRender::new(Arc::new(|line: &str| {
+                    cide_pty::Rendered::Replace(format!("[{line}]"))
+                }))),
+        )
+        .expect("spawn sh");
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry.set_state(None, run, RunState::Running);
+        sessions.insert(session, Arc::clone(&pty));
+
+        // The mirror is fed on the coalescer thread, so wait for it rather than for the child.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && !String::from_utf8_lossy(&pty.screen_state()).contains("[beta]")
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        registry.save_screens_to(&dir, &sessions);
+        let saved = std::fs::read(dir.join(format!("{run}.screen"))).expect("a screen was written");
+        let text = String::from_utf8_lossy(&saved);
+        assert!(
+            text.contains("[alpha]") && text.contains("[beta]"),
+            "the saved screen lost the rendered rows the mirror held: {text:?}"
+        );
+
+        // A run this registry no longer holds leaves nothing behind — the prune, which is also
+        // what keeps the directory from growing one file per run for ever.
+        let stale = dir.join("11111111-1111-4111-8111-111111111111.screen");
+        std::fs::write(&stale, b"old").expect("write a stale screen");
+        registry.save_screens_to(&dir, &sessions);
+        assert!(!stale.exists(), "a screen for a run nobody holds was kept");
+
+        pty.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **`thaw_for_shutdown` is what keeps the ladder's first two rungs meaningful.**
     ///
     /// The ladder's first two rungs are the **catchable** ones — that is their whole purpose, so a
@@ -6277,6 +8244,225 @@ mod tests {
     fn test_capture(line: &str) -> Option<String> {
         let event: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
         Some(event.get("sessionID")?.as_str()?.to_string())
+    }
+
+    // ======================================================================================
+    // Seeding a resumed run's pane from its own log.
+    // ======================================================================================
+
+    /// A renderer that exercises all three [`cide_pty::Rendered`] answers and the marker, so
+    /// the replay's loop is asserted over the whole vocabulary rather than the easy third of
+    /// it. `drop` draws nothing, `step` puts the live marker up, `end` takes it down, anything
+    /// else is replaced with its own text and the handle it was given.
+    fn row_render(state: &mut RenderState, line: &str, handle: Option<u64>) -> cide_pty::Rendered {
+        match line {
+            "drop" => cide_pty::Rendered::Drop,
+            "keep" => cide_pty::Rendered::Keep,
+            "step" => {
+                state.in_step = true;
+                state.marker = true;
+                cide_pty::Rendered::Replace("▸ working…".into())
+            }
+            "end" => {
+                state.in_step = false;
+                state.marker = false;
+                cide_pty::Rendered::Replace("done".into())
+            }
+            "two" => cide_pty::Rendered::Replace("first\nsecond".into()),
+            _ => cide_pty::Rendered::Replace(match handle {
+                Some(handle) => format!("{line} #{handle}"),
+                None => line.to_string(),
+            }),
+        }
+    }
+
+    /// Everything but `drop` is worth keeping, so the handle rule is exercised on most rows.
+    fn row_keep(line: &str) -> bool {
+        line != "drop"
+    }
+
+    /// **Every row the replay emits is terminated, and a dropped line emits nothing.**
+    ///
+    /// The three `Rendered` answers are the whole contract with `cide_pty::render_lines`, which
+    /// this loop is a copy of minus the partial-line plumbing. `Replace`'s own newlines become
+    /// `\r\n` because these bytes bypass the pty's output post-processing — the same rule, and
+    /// for the same reason, as the live path's.
+    #[test]
+    fn a_replay_terminates_every_row_and_draws_nothing_for_a_dropped_line() {
+        let rows = replay_rows(
+            &["alpha", "drop", "keep", "two"],
+            row_keep,
+            row_render,
+            7,
+            |_, _| None,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rows),
+            "alpha\r\nkeep\r\nfirst\r\nsecond\r\n",
+            "a row went out unterminated, or a dropped line drew something"
+        );
+    }
+
+    /// **A log that stops mid-step does not leave the marker claiming the run is working.**
+    ///
+    /// The marker is erased by the *next* line's rendering, and after a replay the next thing
+    /// written is cide's own `— resumed after a cide restart —`. Without the erase that
+    /// separator lands under a live marker from a child that died minutes ago.
+    #[test]
+    fn a_replay_that_ends_mid_step_takes_the_marker_off() {
+        let ended = replay_rows(&["step", "end"], row_keep, row_render, 7, |_, _| None);
+        assert!(
+            !String::from_utf8_lossy(&ended).ends_with(cide_agents::ERASE_MARKER),
+            "a replay that ended cleanly erased a marker that was not there"
+        );
+
+        let cut = replay_rows(&["alpha", "step"], row_keep, row_render, 7, |_, _| None);
+        assert!(
+            String::from_utf8_lossy(&cut).ends_with(cide_agents::ERASE_MARKER),
+            "a replay that ended mid-step left the marker drawn: {:?}",
+            String::from_utf8_lossy(&cut)
+        );
+    }
+
+    /// **A kept line is recorded once, and the handle the ring minted reaches the rendering.**
+    ///
+    /// This is what makes a replayed `● bash  …  #7` row's click resolve through
+    /// `session_log_detail`: the row and the ring entry are filled in one pass, so the number
+    /// on screen is the number the ring answers to. A line `keep` refuses is never recorded.
+    #[test]
+    fn a_replayed_kept_line_is_recorded_and_carries_its_handle() {
+        let recorded = std::cell::RefCell::new(Vec::new());
+        let rows = replay_rows(
+            &["alpha", "drop", "beta"],
+            row_keep,
+            row_render,
+            7,
+            |line, stamp| {
+                recorded.borrow_mut().push((line.to_string(), stamp));
+                Some(recorded.borrow().len() as u64 - 1)
+            },
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rows),
+            "alpha #0\r\nbeta #1\r\n",
+            "the ring's handle did not reach the rendering"
+        );
+        assert_eq!(
+            recorded
+                .borrow()
+                .iter()
+                .map(|(line, _)| line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"],
+            "a line `keep` refused was recorded anyway"
+        );
+    }
+
+    /// **A line is stamped with its own clock; a line that has none takes the log's.**
+    ///
+    /// opencode stamps every event and codex stamps none, so both arms are real. The fallback
+    /// is the moment the log was last written — a bound, and the honest half of a bad pair:
+    /// stamping `now` would make every replayed card claim its command ran at the instant
+    /// somebody pressed Resume.
+    #[test]
+    fn a_replayed_line_takes_its_own_clock_or_the_logs() {
+        assert_eq!(
+            line_stamp(r#"{"type":"text","timestamp":1755402000000}"#),
+            Some(1755402000000)
+        );
+        assert_eq!(
+            line_stamp(r#"{"type":"text"}"#),
+            None,
+            "a clock was invented"
+        );
+        assert_eq!(line_stamp("not json at all"), None);
+        assert_eq!(line_stamp(RUN_LOG_CAPPED), None);
+
+        let stamps = std::cell::RefCell::new(Vec::new());
+        replay_rows(
+            &[r#"{"type":"text","timestamp":1755402000000}"#, "beta"],
+            row_keep,
+            row_render,
+            999,
+            |_, stamp| {
+                stamps.borrow_mut().push(stamp);
+                None
+            },
+        );
+        assert_eq!(
+            *stamps.borrow(),
+            vec![1755402000000, 999],
+            "a line's own clock was ignored, or the fallback was not the log's"
+        );
+    }
+
+    /// **The replay is the log's tail, and it says how much it left behind.**
+    ///
+    /// The budget is [`REPLAY_LINES`], which is the ring's `CAP`: a larger one would draw
+    /// handles the ring had already evicted. Saying so — and naming the file — is what keeps
+    /// the cut a mirror-and-ring decision rather than a claim that the earlier work is gone.
+    #[test]
+    fn a_long_log_is_replayed_from_its_tail_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("cide-replay-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("run.log");
+        let lines: Vec<String> = (0..REPLAY_LINES + 3).map(|n| format!("line{n}")).collect();
+        std::fs::write(&path, lines.join("\n")).expect("write the log");
+
+        let replayed = replayed_log_at(&path, row_keep, row_render, |_, _| None)
+            .expect("a log with content replays");
+        let text = String::from_utf8_lossy(&replayed);
+        assert!(
+            text.starts_with("\x1b[2m— 3 earlier event(s) not replayed"),
+            "the tail did not say what it left behind: {:?}",
+            &text[..text.len().min(120)]
+        );
+        assert!(
+            text.contains(&path.display().to_string()),
+            "the note did not name the file"
+        );
+        assert!(
+            !text.contains("line2\r\n"),
+            "a line past the budget was replayed"
+        );
+        assert!(
+            text.ends_with("line2002\r\n"),
+            "the tail did not reach the last line"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Nothing to show is `None`, never an empty preload.**
+    ///
+    /// Four ways a run has no recorded output: no file at all (a `claude` or `qwen` run, which
+    /// is not teed), an empty one, one of only blank lines, and one whose every line the
+    /// rendering drops. Each must fall through to the saved screen rather than seeding the
+    /// mirror with a bare separator.
+    #[test]
+    fn a_run_with_nothing_recorded_seeds_nothing() {
+        let dir = std::env::temp_dir().join(format!("cide-replay-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let missing = dir.join("absent.log");
+        assert!(replayed_log_at(&missing, row_keep, row_render, |_, _| None).is_none());
+
+        for (name, body) in [("empty.log", ""), ("blank.log", "\n\n   \n")] {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("write");
+            assert!(
+                replayed_log_at(&path, row_keep, row_render, |_, _| None).is_none(),
+                "{name} seeded a mirror with nothing in it"
+            );
+        }
+
+        let dropped = dir.join("dropped.log");
+        std::fs::write(&dropped, "drop\ndrop\n").expect("write");
+        assert!(
+            replayed_log_at(&dropped, row_keep, row_render, |_, _| None).is_none(),
+            "a log the rendering draws nothing for still seeded the mirror"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn opencode_spec(project: ProjectId, agent: &str) -> DispatchSpec {

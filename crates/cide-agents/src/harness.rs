@@ -349,6 +349,30 @@ pub trait Harness: Send + Sync + 'static {
     /// *how*.
     fn deliver(&self, text: &str) -> Delivery;
 
+    /// The bytes that end a turn **already in flight**, for a harness hosting a live TUI.
+    ///
+    /// [`Self::deliver`] answers *how* to say something to a run; this answers how to make it
+    /// stop saying something first. The two are separate questions because only one harness
+    /// shape has the second one: a `Delivery::Stdin` harness is a terminal somebody could have
+    /// pressed a key in, and interrupting it is pressing that key.
+    ///
+    /// # Why it is defaulted to `None`, and why that is an answer rather than a gap
+    ///
+    /// A [`Delivery::Respawn`] harness has **nothing to interrupt**. Its turn is a whole
+    /// process, its follow-up is a *new child* on the same conversation, and the old child is
+    /// killed by `respawn` on the way — so bytes written at it would land in a process that is
+    /// about to die, in a CLI that is not reading a keyboard. `None` says exactly that, and a
+    /// required method would have made each of those two write a refusal by hand, which is how
+    /// one of them eventually writes a plausible-looking escape sequence instead.
+    ///
+    /// It lives on the harness and not at the call site because **what ends a turn is a
+    /// property of the CLI**, the same argument [`Delivery`] itself is made of. Here it is one
+    /// row of a `cargo test -p cide-agents` table; at the call site it would have been a claim
+    /// only a running app could check.
+    fn interrupt(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// The child that **continues** an existing conversation, for a harness whose [`Self::deliver`]
     /// answers [`Delivery::Respawn`].
     ///
@@ -664,6 +688,21 @@ pub struct HarnessSpawn {
     pub events: Option<PathBuf>,
 }
 
+/// What takes a live marker off the screen, for a caller replaying a rendered stream from
+/// outside this crate.
+///
+/// [`SessionBinding::Harness`]'s rendering draws its `▸ working…` marker under the last line of
+/// a step and erases it from the *next* line's rendering — so a stream that simply stops
+/// mid-step leaves the marker drawn with nothing coming to take it off. The live path never
+/// notices: a child that stops has nothing after it either. A **replay** does, because
+/// `cide_app::agents` re-renders a run's own log into a resumed child's mirror and follows it
+/// immediately with cide's separator, which would otherwise be written under a marker claiming
+/// the run is working.
+///
+/// One producer, here rather than a second spelling in the app: the erase goes up exactly one
+/// row and is only correct while the marker it erases is the one row `render` draws.
+pub const ERASE_MARKER: &str = render::ERASE_MARKER;
+
 /// How a run's identity becomes known. **This enum is the claude/opencode difference.**
 ///
 /// It is not an abstraction looking for a second case: the two CLIs genuinely answer "who is this
@@ -759,6 +798,14 @@ impl std::fmt::Debug for SessionBinding {
         }
     }
 }
+
+/// Esc: the one byte that ends a turn in a TUI harness. See [`Harness::interrupt`].
+///
+/// Here rather than in each harness module because two of them answer with it and a third
+/// would, and a byte spelled twice is a byte one of the copies eventually gets wrong — the
+/// difference between `0x1b` and `0x1B` is nothing, the difference between one of them and
+/// `0x03` is a `SIGINT` that kills the CLI instead of ending its turn.
+pub const ESC: u8 = 0x1b;
 
 /// How a follow-up reaches a run that is already alive. See the module header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -961,6 +1008,34 @@ pub fn for_kind(kind: cide_ipc::Harness) -> Option<&'static dyn Harness> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exactly the harnesses that can be typed into have something to interrupt, and it is Esc.
+    ///
+    /// Written against [`Self::deliver`]'s answer rather than against a list of names, because
+    /// the two are one fact: a harness cide can send a follow-up to by writing bytes is a
+    /// harness cide can interrupt by writing bytes, and one that needs a whole new child has
+    /// nothing to interrupt — its old child is killed on the way. A harness that answered
+    /// `Stdin` and `None`, or `Respawn` and `Some`, would be a stop that quietly could not stop
+    /// or bytes written at a process about to die.
+    #[test]
+    fn a_harness_can_be_interrupted_exactly_when_it_can_be_typed_into() {
+        for harness in registry() {
+            match (harness.deliver("carry on"), harness.interrupt()) {
+                (Delivery::Stdin(_), Some(bytes)) => assert_eq!(
+                    bytes,
+                    vec![ESC],
+                    "{:?} interrupts with something other than Esc",
+                    harness.kind()
+                ),
+                (Delivery::Respawn, None) => {}
+                (delivery, interrupt) => panic!(
+                    "{:?} answers {delivery:?} to a follow-up and {interrupt:?} to an interrupt, \
+                     which cannot both be true",
+                    harness.kind()
+                ),
+            }
+        }
+    }
 
     /// Every variant of the wire enum has an implementation, and each answers for itself.
     ///

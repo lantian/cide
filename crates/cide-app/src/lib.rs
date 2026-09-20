@@ -422,6 +422,7 @@ pub fn run() {
             cmd::git::git_status,
             cmd::git::git_repos,
             cmd::git::git_locate,
+            cmd::git::file_properties_git,
             cmd::git::git_blame,
             cmd::git::git_blame_parent,
             cmd::git::git_log,
@@ -493,6 +494,8 @@ pub fn run() {
             cmd::file::image_read,
             cmd::file::file_write,
             cmd::file::file_stat,
+            cmd::file::file_properties,
+            cmd::file::file_properties_dir,
             cmd::file::file_read_bytes,
             cmd::file::file_write_bytes,
             cmd::file::file_note_position,
@@ -635,6 +638,10 @@ pub fn run() {
             cmd::toolwindow::tool_window_close_history,
             // --- M18: the task tracker ---
             cmd::tasks::tasks_board,
+            // M68: the board carries rows, so a body and a log are fetched, and searching them
+            // happens where they live.
+            cmd::tasks::task_get,
+            cmd::tasks::task_search,
             cmd::tasks::task_new,
             cmd::tasks::task_edit,
             cmd::tasks::task_delete,

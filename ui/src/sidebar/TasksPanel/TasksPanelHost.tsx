@@ -74,7 +74,12 @@
  * different door.
  */
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
-import { attachments as attachmentsApi, fsReveal, type ProjectId } from '@/ipc/client'
+import {
+  attachments as attachmentsApi,
+  tasks as tasksApi,
+  fsReveal,
+  type ProjectId,
+} from '@/ipc/client'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { onFileDrop, useDropHot } from './fileDrop'
 import { basename, type StagedAttachment } from './model'
@@ -229,6 +234,48 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
   const [query, setQuery] = useState('')
   useEffect(() => setQuery(''), [project])
 
+  /*
+   * Which ids the query matched. (M68)
+   *
+   * The narrowing is `task_search`'s answer, not a local filter, because the rule runs over the
+   * **body** and the board stopped carrying bodies — `matchesQuery`'s doc in `model.ts` has the
+   * whole argument, including why a local id-and-title filter is the one option not open to us: it
+   * would draw *No tasks match "…"* over a task whose description contains exactly what was typed.
+   *
+   * `null` means *no query*, and it is also the state while an answer is outstanding. That is
+   * deliberate — narrowing to nothing for the frame between a keystroke and its answer would flash
+   * an empty board — and it is what makes `listEmpty` honest: with `matched` null the "nothing
+   * survived" branch cannot be reached, so no sentence is drawn about a search that has not run.
+   *
+   * Re-run on `rev` as well as on the query: a comment or a new task changes what the same query
+   * matches, and a stale id set would go on hiding a row the tracker now has. No debounce — the
+   * whole call is one `spawn_blocking` over an in-memory `Vec` and a keystroke costs less than the
+   * render it is already causing; a debounce here would buy nothing and make the box feel late.
+   */
+  const rev = board.kind === 'ready' ? board.rev : null
+  const [matched, setMatched] = useState<ReadonlySet<string> | null>(null)
+  useEffect(() => {
+    if (project === null || query.trim() === '') {
+      setMatched(null)
+      return
+    }
+    let live = true
+    /*
+     * `.catch(notifyFailure)`, never a bare `void`: this is an effect, and an unhandled rejection
+     * out of one unmounts the tree under React 19. A refusal leaves `matched` null, which shows
+     * everything — the honest failure mode for a narrowing control.
+     */
+    void tasksApi
+      .search(project, query)
+      .then((ids) => {
+        if (live) setMatched(ids === null ? null : new Set(ids))
+      })
+      .catch(notifyFailure)
+    return () => {
+      live = false
+    }
+  }, [project, query, rev])
+
   /**
    * The delete the user has armed, and the board they armed it against.
    *
@@ -291,6 +338,7 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
         filter={filter}
         onFilter={setFilter}
         query={query}
+        matched={matched}
         onQuery={setQuery}
         deleteArmed={deleteArmed}
         /*

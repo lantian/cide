@@ -49,11 +49,12 @@
  * rename fails *here*, in the seam that is supposed to know about it.
  */
 import type {
-  Task as WireTask,
   TaskAttachment as WireAttachment,
   TaskAuthor as WireAuthor,
   TaskBoard as WireBoard,
   TaskComment as WireComment,
+  TaskDetail as WireDetail,
+  TaskRow as WireRow,
   TaskStatusChange as WireStatusChange,
 } from '@/ipc/client'
 import type {
@@ -62,6 +63,7 @@ import type {
   CommentAuthor,
   CommentView,
   StatusChangeView,
+  TaskDetailView,
   TaskView,
 } from './model'
 
@@ -134,11 +136,10 @@ function statusChange(from: WireStatusChange): StatusChangeView {
   }
 }
 
-function task(from: WireTask): TaskView {
+function row(from: WireRow): TaskView {
   return {
     id: from.id,
     title: from.title,
-    body: from.body,
     status: from.status,
     // The role this task is **for**. `AgentId | null` on the wire and `string | null` here:
     // `model.ts` cannot name `AgentId`, and the distinction it would draw is not one the panel
@@ -149,17 +150,18 @@ function task(from: WireTask): TaskView {
      * `== null`, which catches **both** `null` and `undefined`, and the distinction cost a bug
      * that broke every task on the board.
      *
-     * `Task::session` is `Option<SessionId>` with `#[serde(default)]` and **no
-     * `skip_serializing_if`** — so a task with no session does not omit the key, it sends
-     * `"session": null`. A check for `undefined` alone therefore fell through to
-     * `String(null)`, which is the seven-character string `"null"`: a truthy session id on
-     * every task in the project. The card drew a session row reading *Conversation null*, and
-     * `primaryAction` — which now refuses the approve road once a session is set — took
-     * **Approve & dispatch off every OpenSpec task there was**.
+     * `TaskRow::session` pairs `#[ts(optional)]` with `skip_serializing_if`, so *this* type does
+     * omit the key — but `Task::session` never did, and for a release it sent `"session": null`
+     * instead. A check for `undefined` alone therefore fell through to `String(null)`, which is
+     * the seven-character string `"null"`: a truthy session id on every task in the project. The
+     * card drew a session row reading *Conversation null*, and `primaryAction` — which refuses
+     * the approve road once a session is set — took **Approve & dispatch off every OpenSpec task
+     * there was**.
      *
-     * `undefined` is still possible and still has to be caught: ts-rs renders the field
-     * optional, and the model is compiled under `exactOptionalPropertyTypes` where the two are
-     * not the same value.
+     * So this stays `== null` even though the row's own encoding no longer needs it. The wire is
+     * two producers wide now (a row and a `TaskDetail`'s row), the file under it is hand-editable
+     * JSON, and a guard that covers both spellings cannot be wrong about either; one that covers
+     * the current spelling only is one `skip_serializing_if` away from that bug again.
      */
     session: from.session == null ? null : String(from.session),
     /*
@@ -172,28 +174,56 @@ function task(from: WireTask): TaskView {
     links: from.links
       .filter((l) => !l.deleted)
       .map((l) => ({ kind: l.link, target: l.target })),
-    /*
-     * Tombstones are dropped here, so nothing above this line knows they exist. (M21)
-     *
-     * A deleted comment stays *in the file* — one merely removed comes back on the next merge
-     * with a stale copy, which is a delete that does not delete, and `TaskComment::deleted` has
-     * the argument. That is a storage concern and the panel has no use for it, so the boundary
-     * is this function. Filtering in the view instead would leave `CommentView` carrying a flag
-     * every consumer had to remember, and the first one to forget would draw an empty log entry
-     * where a comment used to be.
-     */
-    comments: from.comments.filter((c) => !c.deleted).map(comment),
-    attachments: attachments(from.attachments),
     // Who asked for it. Through the same `author` switch as a comment's, because it is the same
     // union — and a `createdBy` passed through raw would go on compiling after a variant was
     // added in Rust that this panel has never heard of.
-    // The status log, unfiltered: a history row has no tombstone to drop — no `TaskEdit`
-    // variant deletes one, which is the property that makes it an audit trail.
-    history: from.history.map(statusChange),
     createdBy: author(from.createdBy),
     createdMs: ms(from.createdUnixMs),
     updatedMs: ms(from.updatedUnixMs),
+    /*
+     * Counts, not lists. (M68)
+     *
+     * Straight through from `cide_tasks::row_of`, which is the **only** place either number is
+     * derived — and that is the whole reason `TaskDetail` nests its row instead of inlining it.
+     * Recomputing them here from a detail's own comments would be a second answer to "how many
+     * comments does this task have", and the two would differ exactly when a tombstone was
+     * involved: a number nobody can see is wrong until it is next to the list it counts.
+     */
+    commentCount: Number(from.commentCount),
+    attachmentCount: Number(from.attachmentCount),
   }
+}
+
+/**
+ * One whole task, for the card: the row joined to the content `task_get` fetched. (M68)
+ *
+ * The tombstone filters live here and in `comment()` rather than in Rust, which is deliberate and
+ * is the seam's oldest rule: `cide_tasks` keeps a deleted comment *in the file* so a merge with a
+ * stale copy cannot resurrect it, and the panel has no use for one. Filtering in the view instead
+ * would leave `CommentView` carrying a flag every consumer had to remember, and the first one to
+ * forget would draw an empty log entry where a comment used to be.
+ */
+function detail(from: WireDetail): TaskDetailView {
+  return {
+    ...row(from.row),
+    body: from.body,
+    comments: from.comments.filter((c) => !c.deleted).map(comment),
+    attachments: attachments(from.attachments),
+    // The status log, unfiltered: a history row has no tombstone to drop — no `TaskEdit`
+    // variant deletes one, which is the property that makes it an audit trail.
+    history: from.history.map(statusChange),
+  }
+}
+
+/**
+ * One task's content as the card reads it, or `null` for a task that is no longer there. (M68)
+ *
+ * `null` in and `null` out: `task_get` answers `None` for an id that has gone, which happens for
+ * real — a card can be open on a task another window has just deleted. The host closes itself on
+ * it rather than drawing an error about an id the user never typed.
+ */
+export function adaptDetail(from: WireDetail | null): TaskDetailView | null {
+  return from === null ? null : detail(from)
 }
 
 /**
@@ -213,6 +243,6 @@ export function adaptBoard(from: WireBoard): Board {
     case 'unreadable':
       return { kind: 'unreadable', path: from.path, error: from.error }
     case 'ready':
-      return { kind: 'ready', tasks: from.tasks.map(task), rev: ms(from.rev) }
+      return { kind: 'ready', tasks: from.tasks.map(row), rev: ms(from.rev) }
   }
 }

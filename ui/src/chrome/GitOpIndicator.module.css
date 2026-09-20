@@ -1,0 +1,62 @@
+/*
+ * `◜ Pushing…` — shaped exactly like `StatusBar.module.css`'s `.stat`, which is the bar's
+ * existing "a mark with a figure after it" rule. Not `composes`d from it: that would reach
+ * across CSS modules for four declarations and couple this file's existence to the bar's
+ * stylesheet, which is the thing this component was split out of.
+ *
+ * No `font-size`. The bar declares `var(--fs-ui-12)` on `.bar` and this inherits it — a bare
+ * `font-size: 12px` here is a label that silently stops following the UI font size, which is
+ * what `check:ui-scale` refuses.
+ */
+.indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--dim);
+  /* The bar is `white-space: nowrap` already; this says so locally because the element is
+     rendered and removed while the row is laid out, and a wrap here would take a second 26px
+     row from under the pane grid. */
+  white-space: nowrap;
+}
+
+/*
+ * The mark, turning.
+ *
+ * `loader-circle` and not `arrow-up`, on `sidebar/AgentsPanel/model.ts`'s rule: what is being
+ * animated is the *mark's* claim, and that glyph is a three-quarter arc that means "turning".
+ * Spinning a direction arrow would be spinning something that is not a spinner.
+ *
+ * # Reduced motion goes through `--motion-loop`, and a media query here would fail the gate
+ *
+ * `check:motion` asserts that exactly **one** `@media (prefers-reduced-motion)` block exists in
+ * the whole of `ui/src`, and that it is in `styles/tokens.css`. That is not a style preference:
+ * `--dur-1`/`--dur-2` are zeroed to 0.01ms there, and an *infinite* animation at 0.01ms strobes,
+ * which is the opposite of what the setting asks for. So loops keep `--dur-sweep` — deliberately
+ * not zeroed — and answer the setting by being **paused**, which renders the 0% frame for ever.
+ *
+ * Which is why `from` is the arc at rest rather than some mid-rotation: paused, this has to be a
+ * legible static "working" mark on its own.
+ *
+ * A fourth copy of these keyframes, after `tasks-spin`, `agents-spin` and `openspec-spin`. A CSS
+ * module cannot share a `@keyframes`; `TasksPanel.module.css` documents the same duplication for
+ * the same reason.
+ */
+.spin {
+  flex: none;
+  /* A wrapper, so it must lay itself out around the mark: `inline-flex` keeps the box exactly
+     the mark's size, which is what makes the rotation look centred without a `place-items` rule
+     — and `check:ui-icons` refuses `place-items: center` beside a `width` that states no
+     padding, so avoiding it here is not only tidier. */
+  display: inline-flex;
+  animation: statusbar-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes statusbar-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}

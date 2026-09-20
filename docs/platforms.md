@@ -224,6 +224,7 @@ new code shipping untested exactly where it is new.
 | **the graphics ladder** (ADR 0006) | **Applies nothing**, correctly — every rung is a WebKitGTK variable and macOS runs WKWebView | `cide_app::graphics::LADDER_APPLIES` |
 | **⌘Q** | Reaches `lifecycle::shutdown` through `RunEvent::Exit`, which is now handled | `cide_app::run`, and `both_ways_out_of_the_run_loop_reach_shutdown` |
 | **⌘W, ⌥⌘H** | **Dead.** macOS's default menu bar answers the accelerator before WKWebView is asked | `cide_core::keymap::MACOS_MENU_CHORDS` |
+| **the properties card's `Permissions`, `Owner` and `Changed` rows** (M70) | **Present on macOS**, absent on Windows: all three come from `MetadataExt`, which is `#[cfg(unix)]` and carries `mode`/`uid`/`gid`/`ctime` on both unix platforms alike. Owner *names* go through `getpwuid_r`/`getgrgid_r`, also POSIX. A `None` renders as no row rather than a blank one, so the Windows outcome is a shorter card and not a broken one | `cide_core::properties`, the `#[cfg(unix)]`/`#[cfg(not(unix))]` pairs |
 | the freedesktop trash spec | Writes to `~/.local/share/Trash`, which Finder cannot see or restore from | `cide_fs::trash` — **unchanged, and wrong there** |
 | XDG state and config paths | Work, but are not the platform convention | `cide_core::persist` — a deliberate choice, see below |
 

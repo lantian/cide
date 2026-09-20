@@ -209,6 +209,18 @@ export interface TabActions {
    * Absent in a window with no tool window, which is every detached-pane window.
    */
   history?: ((path: string) => void) | undefined
+  /**
+   * *Properties* — raises the file properties card. (M70)
+   *
+   * Takes an **absolute** path, for [`history`]'s reason exactly: the card stats it and asks
+   * `git_locate` about it, and a repo-relative string is not a path to either.
+   *
+   * Unlike [`history`] this is present in **every** window, because the card is an overlay and
+   * `file.properties` carries no `shellWindow` clause — `git.blame`'s precedent, argued at the
+   * command's own definition. The one control on the card that needs a tool window is the one
+   * that is conditionally drawn, not the whole gesture.
+   */
+  properties?: ((path: string) => void) | undefined
 }
 
 /**
@@ -274,7 +286,7 @@ export function tabMenuEntries(
   activeTab: TabId,
   actions: TabActions,
 ): MenuEntry[] {
-  const { close, closeMany, split, detach, copy, history } = actions
+  const { close, closeMany, split, detach, copy, history, properties } = actions
   const index = tabs.indexOf(tab)
   const others = tabs.filter((t) => t !== tab && closable(t))
   /*
@@ -371,6 +383,24 @@ export function tabMenuEntries(
               // interesting case: a git diff tab *is* about a file, but its path is
               // repo-relative and naming it to a command that wants a file on disk would be
               // naming a path that is not a path. See `absolutePathOf`.
+              path === null ? NOT_A_FILE : absolute === null ? RELATIVE_DIFF_PATH : NO_HOST,
+          }),
+    },
+    {
+      // Carries the command id for the chord chip, like `history` above — nothing today, and
+      // correct: this is the same act as the palette row.
+      //
+      // Two refusal sentences and not three. `NO_HOST` cannot arise here the way it does for
+      // `history`: the card is an overlay, so every window that draws this menu can raise one,
+      // and a caller that omitted the dep would be a wiring bug rather than a window without a
+      // tool window. It still reads as a sentence if it ever happens.
+      id: 'properties',
+      label: 'Properties',
+      command: 'file.properties',
+      ...(absolute !== null && properties
+        ? { run: () => properties(absolute) }
+        : {
+            disabledReason:
               path === null ? NOT_A_FILE : absolute === null ? RELATIVE_DIFF_PATH : NO_HOST,
           }),
     },

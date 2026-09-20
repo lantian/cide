@@ -345,6 +345,53 @@ try {
     'as is neither, which is what "the user gave no number" looks like',
   )
 
+  // ------------------------------------------- the same four rules, twice, on purpose (M71)
+  //
+  // `LlmProvider::problems` in `cide-ipc` states these rules a second time, and the duplication is
+  // deliberate rather than an oversight: the two answer for callers that cannot be treated alike.
+  // `localProblems` is a **hint beside a form somebody is still typing into** and must not block
+  // the save, because `LlmSettings::cleaned`'s whole argument is that a half-filled row has to
+  // survive storage or the Add button is inert. The Rust one answers `cide_llm_provider`, whose
+  // caller is a model handing over a whole row at once with no next keystroke — so there an
+  // incomplete row is a refusal, made before anything is written.
+  //
+  // What must not happen is one of them losing a rule. Neither side fails to compile for it: the
+  // screen would simply stop warning, or the tool would store a provider that resolves
+  // `--model <id>/<model>` to nothing and leave the run silently opencode's default agent. So the
+  // four are named here and asserted on both sides.
+  const RULES = [
+    { what: 'a provider with no id', rust: 'needs an id', ts: 'needs an id' },
+    { what: 'a custom endpoint with no base URL', rust: 'base URL', ts: 'base URL' },
+    { what: 'half a limit pair', rust: 'only one of its two limits', ts: 'only one of its two limits' },
+    { what: 'a custom endpoint declaring no models', rust: 'must declare its models', ts: 'must declare its models' },
+  ]
+  const rustProblems =
+    /pub fn problems\(&self\) -> Vec<String> \{([\s\S]*?)\n    \}/.exec(
+      shipping(repoFile('crates/cide-ipc/src/llm.rs')),
+    )?.[1] ?? ''
+  ok(rustProblems.length > 0, 'found `LlmProvider::problems` in cide-ipc')
+  const tsProblems =
+    /export function localProblems\(provider: Provider\): string\[\] \{([\s\S]*?)\n\}/.exec(
+      shipping(uiFile('src/settings/llmPools.ts')),
+    )?.[1] ?? ''
+  ok(tsProblems.length > 0, 'found `localProblems` in llmPools.ts')
+  for (const rule of RULES) {
+    ok(rustProblems.includes(rule.rust), `Rust refuses ${rule.what}`)
+    ok(tsProblems.includes(rule.ts), `the screen warns about ${rule.what}`)
+  }
+  // And neither has grown a rule the other has never heard of, which is the drift in the
+  // direction a phrase list cannot see.
+  eq(
+    (rustProblems.match(/problems\.push/g) ?? []).length,
+    RULES.length,
+    'Rust states exactly the rules named above — a new one belongs in RULES and on both sides',
+  )
+  eq(
+    (tsProblems.match(/problems\.push/g) ?? []).length,
+    RULES.length,
+    'and so does the screen',
+  )
+
   // ---------------------------------------------------------------- blanks, defaults, helpers
   eq(blankProvider('catalog').enabled, true, 'a new provider is enabled — the `LlmProvider::default` rule')
   eq(blankProvider('custom').npm, DEFAULT_CUSTOM_NPM, 'a custom endpoint is prefilled with the OpenAI-compatible SDK')

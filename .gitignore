@@ -32,8 +32,12 @@
 # The rest of `.cide/` is committed on purpose. This line used to read `/.cide/`, on the
 # premise that the directory held "runtime state cide itself writes" — it never did:
 # workspace.json and everything like it live in $XDG_STATE_HOME/cide. `.cide/config.json`,
-# `.cide/agents/*.md` and `.cide/tasks.json` are shared project configuration, hand-edited
-# and reviewed in diffs, so this repository has to be able to commit its own.
+# `.cide/agents/*.md`, `.cide/tasks.json` and — since M68 — `.cide/tasks/` are shared project
+# configuration, hand-edited and reviewed in diffs, so this repository has to be able to commit
+# its own. `.cide/tasks/` is named here because it is new and because it is a *directory* full of
+# small files, which is the shape somebody reaches for an ignore rule about: it holds one
+# `task.json` per task plus that task's attachment bytes, and every one of them is the team's
+# record of the work, not a cache.
 
 # Run logs, wherever they land. (This line kept the heading it used to share.)
 *.log

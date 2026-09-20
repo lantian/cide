@@ -1654,6 +1654,51 @@ pub fn file_position(
     positions.get(Path::new(&path))
 }
 
+/// Everything the properties card's first block shows about a path. (M70)
+///
+/// One `symlink_metadata` and, for a plausible text file, one bounded read. Fast enough that the
+/// card opens on it, which is the whole reason the directory walk and the git walk are separate
+/// commands rather than fields of this answer: a card that waited for a recursive walk of
+/// `target/` before drawing the name of the file would be a card nobody opens twice.
+///
+/// **No root containment check**, unlike [`read_document`] and deliberately: this answers only
+/// *about* a path and never returns its contents, so there is nothing to leak, and the file
+/// picker can open something outside every project. What it does refuse is an empty path, which
+/// `symlink_metadata` would otherwise report as a puzzling "No such file or directory" about
+/// nothing at all.
+///
+/// `blocking` for [`file_read`]'s reason — a stalled mount must not take the event loop.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_properties(path: String) -> Result<cide_ipc::FileProperties> {
+    let path = PathBuf::from(path);
+    blocking(move || {
+        cide_core::properties::check_path(&path)?;
+        cide_core::properties::read(&path)
+    })
+    .await
+}
+
+/// What a directory contains: entry counts and the bytes they add up to. (M70)
+///
+/// Its own command because it is the slow half. A properties card draws the name, the mode and
+/// the mtime from [`file_properties`] immediately and fills this row in when it lands, so a
+/// right-click on `node_modules/` costs a spinner in one row rather than a card that does not
+/// appear.
+///
+/// The walk is bounded and says so — `cide_core::properties::dir_summary`, and
+/// [`cide_ipc::DirSummary`] argues why `truncated` is not optional. The short version is
+/// `cide_fs::copy::preview_merge`'s: a count that stops early is honest when it says so and
+/// simply wrong when it does not.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_properties_dir(path: String) -> Result<cide_ipc::DirSummary> {
+    let path = PathBuf::from(path);
+    blocking(move || {
+        cide_core::properties::check_path(&path)?;
+        cide_core::properties::dir_summary(&path)
+    })
+    .await
+}
+
 /// Run a fallible blocking job on the pool, reporting a lost worker as an IO error.
 ///
 /// The join can only fail if the task panicked or the runtime is shutting down. Neither is

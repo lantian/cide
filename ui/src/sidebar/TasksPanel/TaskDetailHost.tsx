@@ -65,11 +65,12 @@ import { useTasks } from '@/sidebar/tasksStore'
 import { useWorkspace } from '@/store/workspace'
 import { useAgents } from '@/sidebar/agentsStore'
 import { rosterRoles } from '@/sidebar/AgentsPanel/model'
-import { TaskDetailModal } from './TaskDetail'
+import { TaskDetailModal, TaskDetailPendingModal } from './TaskDetail'
 import { useSpec } from '../specStore'
 import {
   attachments as attachmentsApi,
   spec as specApi,
+  tasks as tasksApi,
   claudeSend,
   file,
   type ChangeName,
@@ -77,10 +78,16 @@ import {
 import { AttachmentLightbox } from './AttachmentLightbox'
 import { forgetPreview, previewsSnapshot, requestPreview, subscribePreviews } from './attachmentPreviews'
 import { onFileDrop, useDropHot } from './fileDrop'
-import { basename, imageAttachmentsOf, type StagedAttachment } from './model'
+import {
+  basename,
+  imageAttachmentsOf,
+  type StagedAttachment,
+  type TaskDetailView,
+} from './model'
 import { useAwaiting } from '@/panes/awaiting'
 import { openTaskSession } from './openSession'
 import { errorText } from '@/ipc/errorText'
+import { adaptDetail } from './adapt'
 import { adaptChange } from '../OpenSpecPanel/adapt'
 import { issuesFor, primaryAction } from '../OpenSpecPanel/model'
 import {
@@ -250,12 +257,58 @@ function TaskDetailHostImpl() {
   const open = openTask(board, selected)
   const edit = activeEdit(board, open, editing)
 
+  /*
+   * The open task's **content**, fetched by id. (M68)
+   *
+   * The board carries rows now, so a body, a log, a history and a file list are no longer sitting
+   * in `open` — `task_get` answers them and this holds the answer. Three things about it are
+   * load-bearing.
+   *
+   * **It is cleared on `selected`, synchronously with the id changing.** A `detail` left standing
+   * from the previous task would be drawn under the new task's heading for a frame: `t-15`'s title
+   * over `t-14`'s conversation, which is a *wrong* answer that reads as real. The pending card is
+   * a true one that lasts one round trip.
+   *
+   * **It refetches when `rev` moves**, which is how the card sees its own comment appear: every
+   * mutation answers with a board whose `rev` is higher, the effect re-runs, and the log comes back
+   * with the new line in it. Watching `board` itself would do the same, but `rev` is a number and
+   * `newerBoard` already guarantees a dropped snapshot keeps the identity — so this re-runs exactly
+   * when the tracker actually moved.
+   *
+   * **`live` guards the write, not the request.** Two selections in flight can land out of order,
+   * and the loser must not overwrite the winner; the flag is cheaper and more certain than
+   * comparing ids on the way back, because the id is not the only thing that can have moved.
+   */
+  const rev = board.kind === 'ready' ? board.rev : null
+  const [detail, setDetail] = useState<TaskDetailView | null>(null)
+  useEffect(() => setDetail(null), [selected])
+  useEffect(() => {
+    if (project === null || selected === null) return
+    let live = true
+    /*
+     * `.catch(notifyFailure)` rather than a bare `void`: this runs in an effect, and an unhandled
+     * rejection out of one unmounts the tree under React 19 — `TasksPanelHost`'s `guarded` carries
+     * the same reason. A refusal leaves `detail` null, so the card stays pending rather than
+     * claiming the task is empty.
+     */
+    void tasksApi
+      .get(project, selected)
+      .then((wire) => {
+        if (live) setDetail(adaptDetail(wire))
+      })
+      .catch(notifyFailure)
+    return () => {
+      live = false
+    }
+  }, [project, selected, rev])
+
   // Every image on the open card is vouched for once. The cache dedupes, so re-running on each
   // board snapshot costs a loop over the ids and nothing over the IPC.
   useEffect(() => {
-    if (open === null || project === null) return
-    for (const image of imageAttachmentsOf(open)) requestPreview(String(project), open.id, image.id)
-  }, [open, project])
+    if (detail === null || project === null) return
+    for (const image of imageAttachmentsOf(detail))
+      requestPreview(String(project), detail.id, image.id)
+  }, [detail, project])
 
   const attachTask = useTasks((s) => s.attachFiles)
   const attachClipboard = useTasks((s) => s.attachClipboard)
@@ -581,6 +634,14 @@ function TaskDetailHostImpl() {
   )
 
   if (open === null) return null
+  /*
+   * The row is in hand and the content is not. Draw the row's own facts and say so — see
+   * `TaskDetailPendingModal`, and `TaskDetailView`'s doc for why the alternative (build the card
+   * from a row and let the empty values speak) is four separate false claims about the task.
+   */
+  if (detail === null) {
+    return <TaskDetailPendingModal task={open} onClose={() => select(null)} />
+  }
   return (
     <>
     <TaskDetailModal
@@ -590,7 +651,7 @@ function TaskDetailHostImpl() {
        * must not still be in the box when `t-15` opens.
        */
       key={open.id}
-      task={open}
+      task={detail}
       runs={runs}
       roles={roles}
       assigneeHint={hint}
@@ -899,7 +960,7 @@ function TaskDetailHostImpl() {
     />
     {lightbox !== null && (
       <AttachmentLightbox
-        images={imageAttachmentsOf(open)}
+        images={imageAttachmentsOf(detail)}
         current={lightbox}
         previews={previews}
         onClose={() => setLightbox(null)}

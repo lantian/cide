@@ -270,20 +270,34 @@ mod guard {
     const TRACKER_DIR: &str = ".cide";
     const TRACKER_FILE: &str = "tasks.json";
 
+    /// The directory holding one file per task: `.cide/tasks/<id>/task.json`. (M68)
+    ///
+    /// A second thing to match, and it is not optional. The tracker used to be one file, so denying
+    /// writes to `.cide/tasks.json` denied writes to the tracker. Since M68 a task's body, log and
+    /// history are in **its own file**, and an agent with `Write` could edit
+    /// `.cide/tasks/t-5/task.json` directly — behind the single process that holds the only writer,
+    /// whose next flush overwrites it or merges it unpredictably. That is exactly the loss
+    /// [`DENY_REASON`] describes, arriving through a path this matcher had never heard of.
+    ///
+    /// Spelled here rather than imported from `cide_tasks::TASKS_DIR`, on `TRACKER_FILE`'s stated
+    /// reason: this binary has one dependency and is ~1 MB *because* of that.
+    const TRACKER_SUBDIR: &str = "tasks";
+
     /// What the agent is told, and why it names the tools.
     ///
     /// A refusal that does not say what to do instead is a refusal the model retries, or works
     /// around with `Bash`, having learned nothing. So this names the three tools that do the job
     /// the edit was reaching for, and says the thing that makes obeying rational: the tools write
     /// the same file, and the panel updates as they do.
-    const DENY_REASON: &str = "cide owns .cide/tasks.json: a single process holds the only writer \
-         for it, so an edit made behind that process's back is either overwritten by its next \
-         write or merged unpredictably with it, and the work in the edit is lost. Use the \
-         tracker's own tools, which write that same file safely and update the Tasks panel as \
-         they do: mcp__cide__cide_task_update to change a task's title, body or status, \
-         mcp__cide__cide_task_comment to append a comment, mcp__cide__cide_task_assign to set the \
-         agent a task is for. mcp__cide__cide_task_create, mcp__cide__cide_task_list and \
-         mcp__cide__cide_task_get are there as well. Nothing else under .cide/ is restricted.";
+    const DENY_REASON: &str = "cide owns the task tracker — .cide/tasks.json and everything under \
+         .cide/tasks/: a single process holds the only writer for them, so an edit made behind that \
+         process's back is either overwritten by its next write or merged unpredictably with it, \
+         and the work in the edit is lost. Use the tracker's own tools, which write those same \
+         files safely and update the Tasks panel as they do: mcp__cide__cide_task_update to change \
+         a task's title, body or status, mcp__cide__cide_task_comment to append a comment, \
+         mcp__cide__cide_task_assign to set the agent a task is for. mcp__cide__cide_task_create, \
+         mcp__cide__cide_task_list and mcp__cide__cide_task_get are there as well. Nothing else \
+         under .cide/ is restricted.";
 
     /// The decision line to print, or `None` for every other tool call in the world.
     ///
@@ -402,12 +416,18 @@ mod guard {
         false
     }
 
-    /// Does this path end in `.cide/tasks.json` once `.` and `..` are resolved on paper?
+    /// Does this path name the tracker — either half of it — once `.` and `..` are resolved on paper?
+    ///
+    /// Two shapes since M68: `.cide/tasks.json`, the index, and **anything at all** under
+    /// `.cide/tasks/`. The second is deliberately a prefix rather than a match on
+    /// `<id>/task.json`, because everything under a task's directory belongs to the tracker: the
+    /// content file, and the attachment bytes beside it. An agent that may not rewrite a comment
+    /// may not rewrite the screenshot attached to it either.
     ///
     /// `Path::components` already drops `.` and duplicate separators but keeps `..`, which is the
     /// component that matters here, so the popping is done by hand. A `..` with nothing to pop is
-    /// dropped rather than kept: only the last two components are ever inspected, so how far above
-    /// the base the path starts cannot change the answer.
+    /// dropped rather than kept: only the tail is ever inspected, so how far above the base the
+    /// path starts cannot change the answer.
     fn tracker_tail(path: &Path) -> bool {
         let mut stack: Vec<&OsStr> = Vec::new();
         for part in path.components() {
@@ -422,10 +442,20 @@ mod guard {
                 Component::RootDir | Component::Prefix(_) => stack.clear(),
             }
         }
-        matches!(
+        if matches!(
             stack.as_slice(),
             [.., dir, file] if *dir == OsStr::new(TRACKER_DIR) && *file == OsStr::new(TRACKER_FILE)
-        )
+        ) {
+            return true;
+        }
+        // `<anything>/.cide/tasks/…` — the content files and the attachment bytes under them. The
+        // window is scanned rather than only the tail, because the interesting pair can be at any
+        // depth: `.cide/tasks/t-5/task.json` has two components after it and
+        // `.cide/tasks/t-5/attachments/a-1/shot.png` has four.
+        stack
+            .windows(2)
+            .any(|pair| pair[0] == OsStr::new(TRACKER_DIR) && pair[1] == OsStr::new(TRACKER_SUBDIR))
+            && stack.len() > 2
     }
 
     #[cfg(test)]

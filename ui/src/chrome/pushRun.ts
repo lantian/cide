@@ -16,6 +16,7 @@
 import { git as gitApi, type ProjectId, type PushPreview } from '@/ipc/client'
 import { explain, pushReport, type RepoPush } from './branchModel'
 import { notify } from './notices'
+import { beginGitOp } from './gitOpStore'
 import { requestPush } from './pushStore'
 
 /**
@@ -46,8 +47,18 @@ function pushPass(
   force: boolean,
 ): void {
   if (previews.length === 0) return
-  const attempts = previews.map((preview) =>
-    gitApi.push(project, preview.repo.id, {
+  /*
+   * The status bar's indicator, for the minutes this can take. (M65)
+   *
+   * `previews.length`, so a fan-out over four repositories draws `Pushing 0/4…` and counts up as
+   * the answers land, rather than one undifferentiated spinner for the lot. It is begun here and
+   * not in `openPushDialog`, because the gesture starts when the user presses Push — reading the
+   * plan is not pushing, and an indicator that turned while somebody read the dialog would be
+   * claiming commits were leaving the machine before anyone had agreed to it.
+   */
+  const settle = beginGitOp(project, 'push', previews.length)
+  const attempts = previews.map((preview) => {
+    const sent = gitApi.push(project, preview.repo.id, {
       remote: preview.remote,
       refspec: preview.refspec,
       // The publish case, and the only caller that has ever known it up front: the preview read
@@ -57,8 +68,25 @@ function pushPass(
       // it could apply to. A `--force-with-lease` on a fast-forward is a no-op, and sending one
       // anyway would put the flag in the reflog of pushes that never needed it.
       force: force && preview.diverged,
-    }),
-  )
+    })
+    /*
+     * `then(settle, settle)`, and **never** `.finally(settle)`.
+     *
+     * This is the third defect of the same family in this function, and it is the quietest.
+     * `.finally` returns a *new* promise that rejects whenever `sent` does; nothing is attached
+     * to it, so it fires `unhandledrejection`, which `chrome/Failures.tsx` turns into a toast —
+     * on top of the one the `.catch` below already raises. The two do not collapse in
+     * `notices.admit`, which keys on the text: this one's says a sentence from `explain`, and the
+     * stray one's says the bare word `push`, because `describe` falls through a `GitError` with
+     * no `message` to its `kind`. One failed push, two toasts, one of them a single word.
+     *
+     * `then(settle, settle)` fulfils on both outcomes and so can never reject. It also marks
+     * `sent` handled — which changes nothing, because the rethrowing `.catch` below is a
+     * different derived promise and is still the thing that reports the failure.
+     */
+    void sent.then(settle, settle)
+    return sent
+  })
   for (const attempt of attempts) {
     void attempt.catch((error: unknown) => {
       throw new Error(explain(error, 'push'))

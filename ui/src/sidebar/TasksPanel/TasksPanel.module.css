@@ -670,6 +670,47 @@
 }
 
 /*
+ * The card before its content has arrived. (M68)
+ *
+ * One block where the loaded card has eight, and the head above it is the loaded card's own — the
+ * head is entirely a function of the board's row, so it is drawn rather than approximated and this
+ * is only the space below it.
+ *
+ * `min-height` and not a height: the card is a modal at a fixed 620px wide, and a pending state
+ * that was 40px tall would make the dialog jump to full height the moment the answer landed. This
+ * reserves roughly the head-plus-two-fields the loaded card opens at, so the frame the answer
+ * arrives in changes the contents and not the geometry.
+ */
+.pendingBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 180px;
+  margin: 0;
+  padding: var(--sp-4) 14px 14px;
+}
+
+.pendingTitle {
+  font-size: var(--fs-ui-13);
+  line-height: 1.4;
+  color: var(--text);
+}
+
+/*
+ * A statement about the fetch, drawn quiet.
+ *
+ * `--faint` rather than `--fg-dim`-ish emphasis on purpose: it is the least important line on the
+ * card and it is about to be replaced. What it must not be is *absent* — a card showing a title
+ * over empty space is indistinguishable from a task with no description, which is the whole class
+ * of claim `TaskDetailPendingModal` exists to avoid making.
+ */
+.pendingNote {
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--faint);
+}
+
+/*
  * A column of blocks. (M31)
  *
  * The OpenSpec config dialog's arrangement (`ConfigForm.module.css`'s `.form`/`.group`),

@@ -11,8 +11,22 @@
  * *not* lost is the snapshot behind them: `App.tsx` still derives `diagCounts` and still feeds
  * the rail's badge, so the count has one renderer instead of two.
  *
- * Every field is a prop with a placeholder default. The bar reads nothing from the store,
- * so it stays a pure render target that a screenshot test can drive directly.
+ * Every field is a prop with a placeholder default, and *this component* reads nothing from the
+ * store — so it stays a pure render target that a screenshot test can drive directly.
+ *
+ * # Two children are the documented exception, and the rule is about this file
+ *
+ * `<BranchSelector />` and, since M65, `<GitOpIndicator />` each own a module store and subscribe
+ * to it themselves. That is not a hole in the rule above, it is the shape the rule takes for
+ * state `App.tsx` does not hold: the branch is data the selector must already have to draw its
+ * popup, and a running push is started from `keys/dispatch.ts`, the branch popup and the Git
+ * panel, none of which `App.tsx` sits on the path of. Threading either through as a prop would
+ * put a producer's plumbing in a component with no other use for it — and the property that
+ * actually catches bugs, rules living in a module a check script can compile, is kept by both
+ * (`chrome/branchModel.ts`, `chrome/gitOpModel.ts`).
+ *
+ * What the rule still forbids is *this file* growing a subscription. Each such child is one line
+ * here and is separately renderable, so `chrome/auditFixture.ts` keeps its handle on the bar.
  *
  * The open file is the one thing that does not arrive as a prop. It comes from
  * `editor/statusReadout.ts`, which the editor pane feeds, and it arrives in two pieces
@@ -51,6 +65,7 @@ import {
 } from '@/editor/statusReadout'
 import { crumbTargets } from '@/sidebar/rowPaths'
 import { BranchSelector } from './BranchSelector'
+import { GitOpIndicator } from './GitOpIndicator'
 import { Icon } from '@/icons/Icon'
 
 import styles from './StatusBar.module.css'
@@ -259,6 +274,21 @@ export function StatusBar({
           * has to hold to render the list.
           */}
         <BranchSelector />
+
+        {/*
+          * `◜ Pushing…` while a push, pull, fetch or merge is in flight, and nothing at all
+          * otherwise. (M65)
+          *
+          * Here, between the branch and the trail, because it is the branch's news: a push is
+          * the thing `⑂ master` is about to stop being true of. It is also the only slot on the
+          * bar that appears and disappears, so it goes next to the one item that is `flex: none`
+          * and ahead of the one that gives way — the trail shrinks to make room for it, which is
+          * what `.left > .path` re-grants the shrink for.
+          *
+          * It owns its own store, like `<BranchSelector />` above and unlike everything else
+          * here. Its header says why, and `chrome/gitOpModel.ts` holds the rules a check drives.
+          */}
+        <GitOpIndicator />
 
         {/*
          * `crates › cide-core › src › lib.rs › Workspace › open_project`. Empty — and gone, along

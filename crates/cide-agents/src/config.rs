@@ -82,6 +82,16 @@ pub enum Isolation {
     Shared,
 }
 
+/// The default for [`AgentsConfig::stop_grace_secs`]. See that field for the argument.
+pub const DEFAULT_STOP_GRACE_SECS: u16 = 60;
+
+/// The most a project may ask for. Past a few minutes a stop has stopped being a stop, and a
+/// typo'd `6000` would pin a role's worktree for most of a day while the row said "winding
+/// down". Clamped on read rather than refused: a config that will not load is a checkout that
+/// will not open, and [`AgentsConfig`]'s whole loading discipline is that a file from a future
+/// or careless version still works.
+pub const MAX_STOP_GRACE_SECS: u16 = 600;
+
 /// The `agents` block of `.cide/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -190,6 +200,35 @@ pub struct AgentsConfig {
     /// checkout` flipping it is honoured from the next dispatch), and the way back to prompts is
     /// `"skipPermissions": false` in this file.
     pub skip_permissions: bool,
+    /// How long a stopped run is given to wind itself down before cide ends it. Seconds.
+    ///
+    /// # Why a stop waits at all, and why the number lives here
+    ///
+    /// `cide_agent_stop` used to kill outright, and an agent forty minutes into a task usually
+    /// knows things it has not committed or commented — a measurement just taken, a dead end
+    /// ruled out, a defect noticed in passing. All of it died with the child, and the board was
+    /// left with `exit 129`, which a crash produces too. So a stop now *asks* first: the run is
+    /// told to stop, given the caller's reason in their own words, and asked to write what it
+    /// finished and what it was part-way through into its task before exiting. This is how long
+    /// it has.
+    ///
+    /// Sixty, because the wind-down is one more **turn** and not one more line: a model round
+    /// trip plus a tracker call, on a child that may be mid-tool-call when it is asked. Ten
+    /// seconds is a deadline nothing meets, and would make every stop a force with extra steps.
+    ///
+    /// **`0` is allowed and means this project forces every stop** — the pre-M67 behaviour, and
+    /// a coherent policy for a team whose agents have nothing to hand over. It is deliberately
+    /// *not* clamped up to 1 the way [`Self::max_concurrent`] is: a zero concurrency defines a
+    /// project that can never dispatch, which is nonsense rather than policy, while a zero grace
+    /// says something a person could mean. The **ceiling** is clamped on read instead, because
+    /// past a few minutes a stop has stopped being a stop.
+    ///
+    /// Disk-only beside its three neighbours and for their reason — no webview gesture can set
+    /// it, so a round trip through the panel cannot silently reset a number somebody hand-edited
+    /// — and **read fresh at the moment of each stop**, never cached at dispatch: this file is
+    /// committed, so a teammate's commit or a `git checkout` can change it under a running app,
+    /// and a deadline computed at dispatch would honour a number nobody now has.
+    pub stop_grace_secs: u16,
 }
 
 impl Default for AgentsConfig {
@@ -208,11 +247,23 @@ impl Default for AgentsConfig {
             // On, and the field's own doc carries the measurement that decided it: an
             // unattended child cannot answer a prompt, and both harnesses fail silently on one.
             skip_permissions: true,
+            // A minute: one more turn, including a tool call. The field's doc argues it.
+            stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
         }
     }
 }
 
 impl AgentsConfig {
+    /// How long a stop waits, as a duration, with the ceiling applied. (M67)
+    ///
+    /// The one reader of [`Self::stop_grace_secs`], so the clamp cannot be forgotten at a second
+    /// call site and the two answers cannot disagree. `Duration::ZERO` is a real answer and
+    /// means *force every stop* — the caller branches on it rather than treating it as absent.
+    #[must_use]
+    pub fn stop_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.stop_grace_secs.min(MAX_STOP_GRACE_SECS)))
+    }
+
     /// The three fields the panel draws.
     pub fn to_wire(&self) -> OrchestrationConfig {
         OrchestrationConfig {
@@ -659,6 +710,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The grace has a ceiling and no floor, and both halves are deliberate. (M67)
+    #[test]
+    fn a_stop_grace_is_capped_but_zero_is_a_real_answer() {
+        let mut config = AgentsConfig::default();
+        assert_eq!(config.stop_grace(), std::time::Duration::from_secs(60));
+
+        // Zero is policy, not nonsense: "this project forces every stop". Clamping it up to one
+        // would be cide rewriting a number somebody typed on purpose — which is exactly what
+        // `max_concurrent`'s `max(1)` *does* do, because a project that can never dispatch is
+        // not a policy anybody holds. The asymmetry is the point; do not "fix" it.
+        config.stop_grace_secs = 0;
+        assert_eq!(config.stop_grace(), std::time::Duration::ZERO);
+
+        // The ceiling is clamped rather than refused, because a config that will not load is a
+        // checkout that will not open.
+        config.stop_grace_secs = 6_000;
+        assert_eq!(
+            config.stop_grace(),
+            std::time::Duration::from_secs(u64::from(MAX_STOP_GRACE_SECS))
+        );
+    }
+
     /// `None` means "leave this alone", and a nonsense number lands as a sane one rather than as
     /// an error the frontend discards.
     #[test]
@@ -672,6 +745,7 @@ mod tests {
             nudge_orchestrator: false,
             auto_dispatch: false,
             skip_permissions: false,
+            stop_grace_secs: 5,
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
         assert_eq!(config.max_concurrent, 5);

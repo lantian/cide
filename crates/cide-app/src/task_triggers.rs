@@ -5,11 +5,10 @@
 //! it collects [`TaskMutation`]s from the two places tasks are mutated (the panel's commands in
 //! `cmd::tasks`, and the agent-RPC socket's `StoreSink`), reads `.cide/config.json` fresh at the
 //! moment of each burst (the `nudge_orchestrator` discipline: a committed file can be switched
-//! off under a running app, and a cached copy would keep spawning), asks the registry which
-//! dispatches would duplicate a live run, and hands the survivors to
-//! [`crate::cmd::agents::agents_dispatch`] — the same function the panel's button and the
-//! orchestrator's MCP tool call, because that is where the refusal table, the task lookup and
-//! the one-line opening prompt live, and a second path would eventually get the
+//! off under a running app, and a cached copy would keep spawning), and hands each survivor to
+//! [`crate::cmd::agents::dispatch_or_duplicate`] — the function behind the command the panel's
+//! button and the orchestrator's MCP tool call, because that is where the refusal table, the
+//! task lookup and the one-line opening prompt live, and a second path would eventually get the
 //! `bypassPermissions` arm wrong.
 //!
 //! # Both mutation roads end here, and the author gate is applied *after* the funnel
@@ -28,6 +27,30 @@
 //! author `TaskAuthor` has no variant for, and is a named possible follow-up rather than a thing
 //! this module fakes with the user's own identity.
 //!
+//! # The duplicate guard is the funnel's; the check here is only a shortcut (M66)
+//!
+//! Until M66 the `run_holding` call below — then spelled `has_open_run` — was the *only* thing in
+//! cide stopping a role from getting two runs on one task, and it never could have been, for two
+//! reasons. It was on one of the **three** dispatch roads: the Agents panel's button and
+//! `cide_agent_dispatch` asked nothing at all, so an orchestrating session that assigned a task
+//! and then dispatched the same role onto it got exactly what it asked for, twice. And it is not
+//! atomic: [`dispatch`] below spawns, so two mutations in one burst — a `cide_task_create` naming
+//! an assignee and a `cide_task_comment` saying `@role`, which is the pair that produced the
+//! report — both read *no open run* before either reached the queue.
+//!
+//! The rule now lives where every other named dispatch refusal lives.
+//! [`crate::cmd::agents::plan_dispatch`] refuses it with a sentence naming the live run, and
+//! `AgentRegistry::enqueue_unique` refuses it again under the lock that mints the id, which is
+//! the only place the race can actually be lost.
+//!
+//! The check below stays, and is now what it should always have been called: a shortcut. It
+//! spares a spawn, a `.cide/` read and a board list on the ordinary repeated gesture, and it is
+//! where that case is logged with the burst still in hand. When it is beaten,
+//! `dispatch_or_duplicate` answers [`crate::cmd::agents::DispatchOutcome::Duplicate`] rather than
+//! an error, and that arm logs `debug!` — this module's "everything declines by doing nothing"
+//! policy meeting a guard that finally exists is not a warning, and a re-picked assignee has no
+//! business putting a frightening line in anybody's log.
+//!
 //! # `spawn`, never `block_on`
 //!
 //! `consider` is reachable from async command handlers, and
@@ -40,11 +63,13 @@ use std::sync::Arc;
 
 use cide_agents::autodispatch;
 use cide_ipc::{
-    AgentId, DispatchRequest, ProjectId, RunNotify, Task, TaskAuthor, TaskEdit, TaskId, TaskStatus,
+    AgentId, DispatchRequest, ProjectId, RunNotify, Task, TaskAuthor, TaskEdit, TaskId, TaskRow,
+    TaskStatus,
 };
 use tauri::{AppHandle, Manager as _};
 
 use crate::agents::AgentRegistry;
+use crate::cmd::agents::DispatchOutcome;
 use crate::tasks_state::TasksStores;
 use crate::workspace_state::WorkspaceState;
 
@@ -146,7 +171,7 @@ fn consider_blocking(
     // handed `blocker_statuses` over the whole board. The read races later mutations only in
     // the direction that is safe — a blocker finished after this snapshot delays a dispatch
     // until the next gesture, it never starts one early. (M30)
-    let board: Vec<Task> = app
+    let board: Vec<TaskRow> = app
         .try_state::<Arc<TasksStores>>()
         .and_then(|stores| stores.get(project))
         .map(|store| store.list())
@@ -176,10 +201,13 @@ fn consider_blocking(
         }
 
         for agent in trigger.dispatch {
-            if registry.has_open_run(project, &agent, &task) {
+            // The shortcut, not the guard — see the module header. It spares a spawn, a
+            // `load_project` and a board read on the ordinary repeated gesture, and it is where
+            // that case is logged with the burst still in hand. The funnel refuses what beats it.
+            if registry.run_holding(project, &agent, &task).is_some() {
                 tracing::debug!(
                     %project, agent = %agent, task = %task,
-                    "assignment/mention repeated while a run is open; not stacking a second"
+                    "assignment/mention repeated while a run holds the task; not stacking a second"
                 );
                 continue;
             }
@@ -229,11 +257,26 @@ fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId, n
             prompt: None,
             notify: Some(notify),
         };
-        match crate::cmd::agents::agents_dispatch(app.clone(), workspace, agents, tasks, request)
-            .await
+        match crate::cmd::agents::dispatch_or_duplicate(
+            app.clone(),
+            workspace,
+            agents,
+            tasks,
+            request,
+        )
+        .await
         {
-            Ok(run) => {
+            Ok(DispatchOutcome::Started(run)) => {
                 tracing::info!(%run, agent = %agent, %task, "an assignment started a subagent run");
+            }
+            // The race the shortcut above cannot win, landing where it is harmless. `debug!` and
+            // not `warn!`: nothing went wrong — the guard did its job, and the gesture that got
+            // us here already succeeded and already answered. (M66)
+            Ok(DispatchOutcome::Duplicate { held, .. }) => {
+                tracing::debug!(
+                    run = %held.run, agent = %agent, %task,
+                    "the funnel refused a second run beside the one already holding the task"
+                );
             }
             // `plan_dispatch` owns every refusal (role gone, project disabled mid-flight,
             // `bypassPermissions` never authorised); here each one declines by doing nothing

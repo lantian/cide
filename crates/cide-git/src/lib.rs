@@ -63,6 +63,8 @@ pub mod lanes;
 pub mod log;
 pub mod merge;
 pub mod patch;
+/// The git half of the properties card: what this repository remembers about one path. (M70)
+pub mod properties;
 pub mod pull;
 pub mod push;
 pub mod replay;

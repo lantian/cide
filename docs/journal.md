@@ -10574,8 +10574,689 @@ is not surprising in the list, and that a freshly named `sketch.excalidraw` open
 canvas rather than an empty buffer. The placement arithmetic is `check:menus`'s, driven
 without a DOM; the rest is source assertions.
 
-## The chrome audit
+## A running git operation says so (M65)
 
+The report was *"Need a push animation progress in bottom bar near branch to be able to see that
+push currently in progress."*
+
+There was nothing between pressing Push and the toast. `pushStore`'s `confirm` nulls `pending` —
+so the dialog unmounts — and hands off to `pushRun.pushPass`, which fires one `invoke` per
+repository and returns `void` immediately. `git_push` is a single `spawn_blocking` round trip, and
+its own doc says it "can sit on a network round trip for minutes". So a slow push read as: the
+dialog vanished, nothing happened, and some minutes later a toast appeared. The report calls it a
+missing animation; what was missing was any claim at all.
+
+Fetch, Pull and Merge in the branch popup were the same silence. They already moved
+`useBranches.busy`, but the only thing that has ever done is set `disabled` on buttons — in a
+popup that is shut by then. `BranchSelector.module.css` had no busy rule in it at all. So the
+indicator covers all four, and `◜ Pushing…` sits between `⑂ master` and the file trail: it is the
+branch's news, it is the one slot on the bar that appears and disappears, and the trail is the
+item beside it that was already the one designed to give way.
+
+### The number is a count of answers, never a percentage
+
+There is no percentage to show, and reaching for one is a larger change than it looks.
+`cide_git::push`'s only `RemoteCallbacks` registers `sideband_progress` and
+`push_update_reference` and no `push_transfer_progress` — and that route is taken only for local
+remotes anyway, since `route()` hands a real remote to the `git` binary through `.output()`, which
+returns when the whole push is over. Sideband was also tried as a UI source once already and
+rejected, with a test still pinning the decision by name
+(`a_fetch_reports_a_sentence_and_not_a_progress_meter`). A determinate bar would therefore mean a
+new `cide://` event, a contract change, `--progress` stderr parsing for the binary route, and two
+routes reporting differently.
+
+So the honest claim is *this is running*, plus a real `done/total` when one gesture covers several
+repositories — which counts answers received, not bytes. A three-repository push opens at
+`Pushing 0/3…`, which reads oddly for a second and is true. **No Rust changed.**
+
+### Four things that are silent if they are got wrong
+
+**`then(settle, settle)`, never `.finally(settle)`.** `.finally` returns a *new* promise that
+rejects whenever the original does; with nothing attached to it that is an `unhandledrejection`,
+which `Failures.tsx` turns into a toast — on top of the one the caller's own error path already
+raises. The two do not collapse in `notices.admit`, which keys on the text: the real one says a
+sentence from `explain`, and the stray one says the bare word `push`, because `describe` falls
+through a `GitError` with no `message` to its `kind`. One failed push, two toasts, one of them a
+single word. `trackGitOp` therefore attaches a side branch that fulfils on both outcomes and hands
+back **the original promise**, so nothing about the caller's failure path moves.
+
+**The second pull road.** `tryPull`'s opening fetch-and-fast-forward is inside a `try/finally`,
+but `one()` is re-issued from the divergence dialog's `proceed` long after that `finally` has run —
+and it is the *slower* road, because it is the one that actually merges or rebases. Tracking only
+the first would have left the bar silent for exactly the pull worth watching. Both are wrapped,
+and `check:branches` pins each to the call it wraps.
+
+**`branchModel`'s `GitOp` gained no `fetch` arm**, though Fetch reaches `store.run` as a
+`'checkout'` and so would have been mislabelled by anything reading that type. `GitOp` exists for
+a refusal shared by the operations that move the working tree onto another commit; widening it to
+label a spinner would put which-button-was-pressed into a type that exists for a sentence. Which
+verb the indicator says is asked separately, at the four call sites, and the wrap goes round
+`branchApi.*` rather than round `store.run` — whose promise resolves only after its `finally`
+re-runs `load()`, so wrapping it would have said *Pulling* through a status walk of every
+repository in the project.
+
+**Reduced motion is answered by pausing, not by shortening.** `check:motion` fences `transition`
+and is completely blind to `animation`, so nothing in the suite would have caught a spinner that
+strobed. `--dur-sweep` is deliberately *not* zeroed by the reduced-motion block — an infinite
+animation at 0.01ms strobes, which is the opposite of the request — so the loop sets
+`animation-play-state: var(--motion-loop)` and its 0% frame is the arc at rest, because paused
+renders that frame for ever. `check:push` is what asserts it, along with the absence of a second
+`@media (prefers-reduced-motion)` block, which `check:motion` would fail on sight.
+
+### Where the state lives
+
+A module store, not `store/workspace.ts`: nothing here is durable. It is scoped to a **project**,
+which is `notices.ts`'s scope and for `notices.ts`'s reason — in `Stacked` window mode one window
+holds every open project, so an indicator that ignored the project would report one project's push
+over another's bar. `gitOpModel.ts` is import-free so `check:push` can compile and drive it, and
+`check:push` now also compiles `gitOpStore.ts` — into `node_modules/.cache` rather than `tmpdir`,
+because it imports zustand and a bare specifier resolves relative to the emitted file — and drives
+the settle arithmetic: the idempotent double-settle, the 0/3 climb, the zero-total guard, the
+project scope, and that a **rejected** promise clears the indicator, which is the case a naive
+`await work; settle()` leaves turning for ever.
+
+`<GitOpIndicator />` owns that store and subscribes to it, which makes it the bar's second such
+child after `<BranchSelector />`. `StatusBar.tsx`'s header claimed the bar "reads nothing from the
+store"; it now says what is actually true and why — the rule is about *that file* growing a
+subscription, each such child is one line there and separately renderable, and the property that
+catches bugs (rules in a module a check compiles) is kept by both.
+
+**Nothing on a display.** That the mark turns at all, that it is vertically centred on a 26px bar,
+that the trail shrinks rather than the branch being pushed out when the indicator appears in a
+narrow window, that the paused frame under `prefers-reduced-motion: reduce` is legible rather than
+an arc at a meaningless angle, and that the indicator clears at the same moment the toast lands on
+a genuinely slow push. The arithmetic behind it is driven by `check:push` without a DOM; the rest
+is source assertions.
+
+## A role gets one run per task (M66)
+
+The report was a screenshot: role `game-designer`, task t-904, `1/8 +1` — one live run and one
+queued run, on the same task, for the same role, with the note *"It seems, it tags it and assigns
+it. Need protection against this, to avoid double work on same agent."* The orchestrating session
+had created the task with an assignee **and** dispatched the same role onto it, and cide had
+obliged twice.
+
+`autodispatch::trigger` de-duplicates within one mutation and has a table row saying so. Across
+two mutations it has no memory at all, by design — it is pure over one task, and the new
+`nothing_here_remembers_a_previous_mutation_so_the_dedupe_must_live_downstream` is the row that
+says that out loud, because the existing one reads to a hurried eye like the whole story.
+
+The guard was meant to be `AgentRegistry::has_open_run`, and it had two holes, both there since
+M18. It was called from exactly **one of the three** dispatch roads: `task_triggers` asked, and
+the Agents panel's Dispatch button and `cide_agent_dispatch` asked nothing whatsoever. And where
+it *was* called it was not atomic — `task_triggers::dispatch` spawns, so one burst of two
+mutations passed the check twice before either run reached the queue.
+
+What a duplicate cost is worse than a wasted turn. `checkout_name` is a deterministic
+`<role>-<task-slug>` with no uniquifying suffix, so both runs want one worktree; the admission
+gate only serialises them, so the second waits and then replays the same prompt. And `Idle`
+deliberately does not hold that gate — so a duplicate is admitted *beside* an idle first run, and
+`start_child` then kills that idle child to reclaim the directory. The second run does not queue
+behind the first; it ends it. `an_idle_first_run_is_not_displaced_by_a_second_dispatch_of_its_pair`
+is that regression.
+
+The frontend had known about this failure for two milestones. `TaskDetailHost`'s dispatch-to-role
+branch carries the comment *"One road each, and that is what stops a double start… Doing anything
+more on this branch — dispatching as well as assigning — is exactly how a task ends up with two
+runs on it."* A convention holds a component. It does not hold a language model.
+
+### One rule, at the funnel, said out loud
+
+`plan_dispatch` already described itself as "the single funnel all three pass through" so "neither
+path can be forgotten alone" — it simply had no idea a run existed. It now takes the held run as a
+parameter, the way it takes the blocking rule's statuses and for the same reason: the policy stays
+disk-and-decision and the live fact stays the caller's, so a test can put any state in it. A
+dispatch onto a task the role is already on is refused with a sentence naming the run id, the state
+word `cide_agent_runs` prints on that row, and what to do instead — stop it, or wait and read the
+task's comments. Refused rather than coalesced: the caller who most needs to hear this is a model
+that forgot it had already started the role, and a silent no-op teaches it nothing.
+
+The gate sits **above the refusal table**, which is the one ordering decision worth arguing. A run
+holding the pair is proof that subagents were on and the bridge was there when it started, so
+answering *"subagents are off for this project"* while a subagent of that role is live on that very
+task is the less true of the two things cide could say — and the table's answers all invite the
+caller to fix something and dispatch again, which would then be refused here on the second attempt.
+A two-step refusal for one gesture is how a model ends up starting the run it was being told it
+already had. The role lookup stays above the gate, because a name cide cannot resolve is not a pair
+anything can be holding. It also means the gate's tests lean on nothing about the machine, which
+for a guard is worth having.
+
+`AgentRegistry::enqueue` is now `#[cfg(test)]` and `enqueue_unique` is the only door the shipped
+binary has. That is the half that actually closes the race — it decides and inserts under the one
+lock, the same argument `admit_a_pass` makes for taking a slot — while the `plan_dispatch` refusal
+is the half that makes the answer legible. Both compose the sentence through one function, so a
+user cannot tell which fired.
+
+### `Interrupted` stopped counting, and Resume had to be told
+
+The predicate narrowed at the same time. `has_open_run` meant "anything but `Finished`/`Failed`",
+which swept in `Interrupted` — a run whose child died with a previous cide. Nothing is running, so
+nothing would be doubled, and while it counted, a row left behind by a restart silently swallowed
+every re-assignment of that role to that task with a debug line and no way to see why. So
+`run_holding` answers over six states and not eight, `holds_a_pair` is an exhaustive match so a
+state added later is classified by whoever adds it, and the truth table walks all nine.
+
+The cost of that is one new interaction, and it is the kind that would have been found in the wild:
+Resume requeues interrupted rows, so a run dispatched onto a pair whose interrupted row was still
+sitting there would become the second run the moment somebody pressed Resume.
+`requeue_interrupted` now asks the same question, skips with a note naming the run that is actually
+going, and refuses the single-run press with the same fact — the road its viewed-in-a-pane arm
+already had.
+
+### The quiet road stayed quiet, and no wire type moved
+
+Auto-dispatch must not surface any of this: "everything declines by doing nothing" is that module's
+whole policy, and a user re-picking the assignee already on a task is not a failure. The obvious
+shape — a new `CoreError` variant — was the wrong one twice. `CoreError` is a `ts-rs` type whose
+struct variants reach the webview as `{ kind, detail: { … } }`, and `errorText.ts` prints `detail`
+only when it is a **string**, so `DuplicateRun { run, state }` would have shown the panel the
+literal word `duplicateRun`: the `[object Object]` failure that file's header was written about,
+reintroduced by the file that cites it. So the funnel grew a non-command sibling,
+`dispatch_or_duplicate`, answering `Started` or `Duplicate`. The command flattens it to the
+sentence for the panel and the tool; `task_triggers` reads the tag and logs `debug!`. The wire
+stays `CoreError::Io`, no binding regenerated, no TypeScript changed, and `contract-check` and
+`codegen --check` both report no drift.
+
+`task_triggers` keeps its own check, re-described as what it always should have been called: a
+shortcut. It spares a spawn, a `.cide/` read and a board list on the ordinary repeated gesture, and
+it is where that case is logged with the burst still in hand.
+
+Two sentences were added to prose, and they are arguably the actual cure. The orchestrator's system
+prompt now says that a role gets one run per task and that dispatching onto a task it is already on
+is refused; `cide_agent_dispatch`'s own description says the same, because that is the only place a
+model reads a rule before acting. Nothing had ever told it that assigning and dispatching were one
+act.
+
+### What is not verified
+
+**Nothing on a display.** That the panel's notice renders the sentence legibly at the Agents
+panel's width, and that the `+1` badge stays at zero through a double-press of Dispatch, were not
+seen. The Dispatch button is deliberately *not* greyed for this: whether a duplicate would result
+depends on the Tasks panel's selection, and `AgentsPanelHost`'s standing argument about controls
+greyed for reasons that live in another panel applies unchanged — the refusal arrives as a notice
+through the `guarded(...)` path that was already wired.
+
+**The full `plan_dispatch` road is still untested end to end**, and cannot be here: it consults
+`cide-hook` beside the running executable and the role's harness on `PATH`, neither of which a CI
+machine has. The gate's tests reach it only because it sits above that table. The sentence, the
+state words and the ordering are pinned; that a real dispatch on a real project takes this path is
+not, and item 1 of the manual pass is what would see it.
+
+**The other duplication road is untouched.** Two *different* roles on one task still collide on
+nothing, which is right — a mention starting `qa` beside `developer` is the documented semantics.
+But two runs of one `worktree: false` role still share the project root, which is shared isolation
+saying what it says, and M66 did not revisit it.
+
+## A stop is a request before it is a kill (M67)
+
+The report came from an orchestrator running agents in another project, and it named three
+things at once:
+
+> A deliberate stop and a crash are indistinguishable in the record. Exit 129 and 143 appear
+> for both. Six months later nobody can tell whether a run was killed on purpose, hit a bug, or
+> ran out of resources. … An agent 40 minutes into a task usually knows things it has not yet
+> committed or commented: a measurement it just took, a dead end it ruled out, a defect it
+> noticed in passing. A hard kill throws all of it away.
+
+With an incident behind it, which is the part that made this worth a milestone:
+
+> A sound-designer run was stopped seconds after it had posted a plan comment containing a
+> measurement that **contradicted the orchestrator's stated assumption** (the orchestrator
+> believed most audio clips were silent; the agent had measured all 61 files and found real
+> signal in every one). That finding survived only because the agent happened to write it down
+> before being killed. Stopped a minute earlier, it would have been lost.
+
+`cide_agent_stop` latched `stopping`, resolved the session and called `PtySession::kill()` —
+one SIGHUP to the leader, no ladder — so the child died at exit 129 wherever it happened to be.
+The `reason` argument went into `tracing::info!` and nowhere else, and the tool's own
+description said so out loud, telling the caller to re-type it into `cide_task_comment`.
+
+### The whole mechanism already existed
+
+`send_prompt` has forked on `Harness::deliver` since the queue learned to send follow-ups:
+`Delivery::Stdin` for claude and qwen, which host a live TUI and are typed into; and
+`Delivery::Respawn` for opencode and codex, which are one process per turn, so a follow-up is a
+*new child* carrying `--session` into the same conversation. `respawn` already rebinds the run
+to a fresh `SessionId` before killing the old child, so the old exit belongs to nobody.
+
+So a graceful stop is **one more turn, whose prompt is the wind-down instruction** — and it
+needed no new delivery road at all. What it needed was a rung in front of the kill.
+
+The line is composed by `wind_down_prompt`, beside `continuation_prompt` and inheriting both of
+its scars: it is **one line**, because this is typed into a TUI and the harness ends it with
+`\r`, so an embedded newline is another Enter that submits a partial turn; and it names the
+comment tool through `Harness::tool_name`, because `continuation_prompt` hard-coded Claude's
+`mcp__cide__cide_task_get` and every opencode run was told to call a tool it did not have. A
+run with no bridge loses the clause rather than being sent after a tool nobody attached, and a
+run with no task (M40) is asked for no comment at all — it works in the project root and has
+nowhere to report.
+
+The caller's `reason` goes **into the line**, quoted as the stopper's words. That is the most
+valuable of its three destinations and the one the report did not ask for: an agent told *why*
+it is being stopped writes a handover that answers the objection, rather than one that merely
+describes where it got to.
+
+### Esc first, because "stop work now" should mean now
+
+`Harness::interrupt` is new and defaulted to `None`. claude and qwen answer `Some(vec![ESC])`;
+opencode and codex keep the default, because there is nothing to interrupt — their wind-down
+*is* a new child and the old one is killed on the way. A test asserts the two answers can never
+disagree: a harness that can be typed into can be interrupted, and one that cannot, cannot.
+
+Without it the line would sit in the composer until the turn being stopped had finished, which
+on any real piece of work spends most of the grace and then gets force-killed anyway.
+
+### `AwaitingPermission` would have approved the tool call
+
+The worst thing in this milestone's blast radius, found in design rather than in production.
+A wind-down is delivered as text followed by a lone `\r` (`type_submitted_line`'s split-Enter).
+The permission prompt is a **selection list**, and the `\r` is what it reads. A graceful stop on
+an `AwaitingPermission` run would have approved the very tool call the stop was meant to
+prevent.
+
+`stop_route` refuses it by name, beside `Paused` (a `SIGSTOP`ped process neither answers a
+signal nor reads its input; the line would be read on resume, out of order with whatever it was
+doing) and `snapshot_sealed` (a grace per run would turn quitting cide into a minutes-long
+wait, for a comment nobody would be left to read). Every one of those arms **carries why it
+could not be asked**, into the tool's answer and into the epitaph: a stop that silently declined
+to ask first is a feature that appears not to work.
+
+### Two edges, never one
+
+The obvious rule — kill on the next hand-back — is wrong in the direction that destroys the
+thing the feature exists to save. A stop pressed mid-turn types into a composer whose CLI
+queues the line and submits it when the *current* turn ends, so the first `→ Idle` after the ask
+usually belongs to the turn being stopped. `wind_down_step` therefore arms on the wind-down
+turn **starting** and only then treats a hand-back as its end. `AwaitingPermission` counts as a
+start, or a wind-down turn that stops to ask permission is never recognised and only the grace
+ever ends the run.
+
+And the two harness shapes end differently, which was nearly a silent lie about the best case.
+claude and qwen hand the turn back and stay alive, so cide kills them. opencode and codex *are*
+a new child — it answers, writes its comment and exits — so there is no hand-back at all. The
+first draft had no arm for that, which meant every successful wind-down on those two harnesses
+died still flagged as winding down, and its epitaph read **"died before it could wind down"**
+about the one case where everything had worked. A clean exit under an outstanding wind-down is
+now the third answer; a nonzero one still is not, because a child that crashed mid-wind-down
+really did die before it finished.
+
+### The checkout race
+
+`admit_a_pass` excludes `Idle` from checkout occupancy on purpose — a parked child is
+`bring_up`'s to wind down when the directory is actually claimed. But a claude run stopped
+mid-turn hands back `Running → Idle` *before* its wind-down turn starts, and in that window a
+queued sibling is admitted and `idle_children_in` kills our child. The graceful stop silently
+becomes a hard kill, the final comment is never written, and nothing anywhere says why.
+
+`holds_its_checkout` is now one predicate used by the gate *and* the reclaim, because they are
+two spellings of one question and a run that one of them thinks has left the directory while
+the other thinks is still in it is two processes in one worktree. They were separate before
+this and agreed by coincidence. The concurrency **slot** is still released on the hand-back
+edge: holding a checkout and holding a slot are two decisions.
+
+### The record: what did not change is the point
+
+`ended with exit N before finishing this task` and `failed before finishing this task` are
+**byte-identical** to what they were, and they are what the *unstopped* arms still produce. The
+disambiguation is not that they changed — it is that they now only fire when **nobody asked**.
+Editing them to mention a stop would have re-merged the crash and the stop from the other
+direction, which is the bug being fixed.
+
+Every deliberate ending gets its own sentence instead: wound down as asked, asked and would not
+go, killed outright without being asked, killed outright *because* it could not be asked (and
+which obstacle), cancelled before it started, discarded without being resumed. The pair that
+must never collapse is *we asked and it would not go* against *we never asked* — this
+milestone's own bug, one level down.
+
+`death_facts` grew exactly one arm, and the feature does not work without it: **a stopped run
+that exits 0 speaks.** A wound-down opencode or codex child is a whole process that finishes and
+leaves, so the old `code != 0` rule meant the best outcome of the entire feature left no trace
+on the board at all. It is widened for a stopped run only — the exit-0 refusal is about a run
+that decided for itself that it was done, and a board where every clean run carries an automatic
+line is a board where the lines that matter are buried.
+
+### The reclaim was already lying, and this made it worse
+
+`bring_up` kills an idle child to reclaim its worktree, and that produced `ended with exit 129
+before finishing this task` — a crash report about a run whose turn had *already ended*. Odd
+while the sentence meant nothing in particular; a lie the moment it came to mean "nobody
+asked". `StopHow::Reclaimed` now says what it was.
+
+### Two comments, and only on the road that has a window
+
+Every other stop is over by the time the call returns and says everything it has to say in one
+epitaph. A wind-down takes up to the whole grace, so it gets a stop-time comment as well — which
+is also what keeps the reason if cide quits inside that window. The cost is real (every comment
+is tokens in `cide_task_get`) and it is paid only where the run is about to write its *own*
+comment between the two, so the three read as a conversation: you were asked, here is what I
+did, here is how it ended. Both are signed `TaskAuthor::Orchestrator`, cide's one voice; the
+hand is named inside the sentence rather than by minting an author variant for it.
+
+### It returns at once
+
+`AgentSink::stop` keeps its `block_on`, and that is not a wait: the command returns as soon as
+the request is accepted. A stop that blocked for the grace would be the `openDiff` hazard with
+a timer on it — a tool call that lets one wedged subagent freeze the product owner mid-turn,
+when the frozen session is the only thing that could have stopped the others. It would also
+routinely exceed an MCP client's timeout, and a model's move after a failed stop is to stop
+again — which *is* the escalation to a kill. The blocking design would have quietly converted
+graceful stops into forced ones.
+
+So `Sink::stop` answers a `Stopped` rather than `()`, and every arm says whether the role is
+free. The old sentence promised it unconditionally, and on the wind-down road that is false for
+up to a minute — the window in which an orchestrator reading it dispatches the next task and is
+refused for a run it believes it ended.
+
+### Sixty seconds, in a committed file
+
+`AgentsConfig::stop_grace_secs`, disk-only beside `nudgeOrchestrator`, `autoDispatch` and
+`skipPermissions` and for their reason: no webview gesture can set it, so a round trip through
+the panel cannot reset a number somebody hand-edited. Read **fresh at each stop**, never cached
+at dispatch, because the file is committed and a teammate's commit can change it under a running
+app.
+
+Sixty because the wind-down is one more *turn* and not one more line: a model round trip plus a
+tracker call, on a child that may be mid-tool-call when asked. `0` is allowed and means this
+project forces every stop — deliberately *not* clamped up to 1 the way `max_concurrent` is,
+because a zero concurrency defines a project that can never dispatch (nonsense, not policy)
+while a zero grace says something a person could mean. The ceiling is clamped at 600 instead.
+
+### The panel's Stop did not change
+
+It stays the outright kill. Two routes to one word meaning two things is normally the split
+`openPushDialog` exists to prevent, and it is a deliberate call here rather than an oversight: a
+person pressing Stop on a run they are watching wants it stopped and has the row in front of
+them. `client.ts`'s `stop` doc carries the argument, and names the affordance a wind-down there
+would need — a **second press** on an already-stopping row, which `stop_route` already answers
+`Kill` for, and not a modifier, which would be an undiscoverable gesture for a destructive act.
+
+The row does say when a run is winding down, composed in `LiveRun::wire` from the stop record
+rather than written into `note` — `note_cwd` rewrites that field whenever a child comes up, and
+a `Delivery::Respawn` wind-down brings one up, so a sentence written there would be clobbered by
+its own successor.
+
+### What is not verified
+
+**The whole feature rests on a model choosing to obey one more prompt.** Whether a real
+`claude`, `opencode`, `codex` or `qwen` actually answers the wind-down instruction and calls
+`cide_task_comment` before exiting was not measured on any harness. Every rule above is a pure
+table with a test; that one fact is not, and it is the one the feature is for.
+
+**The Esc interrupt is unmeasured.** That a single Esc ends a turn in flight in the current
+`claude` and `qwen` TUIs, and that a line typed after it submits as the next turn rather than
+being eaten, is asserted nowhere. It needs an `#[ignore]`d real-CLI test on `real_qwen.rs`'s
+model, and it is the second thing to write here.
+
+**Nothing on a display.** That the row reads correctly mid-wind-down, that it does not jump
+between the panel's sections while it waits, and what a wound-down child of each harness
+actually exits with — all unobserved.
+
+**A cide that quits mid-wind-down loses the epitaph.** `StopRecord` is not persisted: a restored
+row is `Interrupted` with no child, and a latch about a dead process's pending politeness is a
+claim about nothing. The stop-time comment survives, which is the half that matters.
+
+## The board stops carrying the conversation (M68)
+
+The question was whether one `tasks.json` scales, asked of a real board rather than in the
+abstract — `/home/lantian/work/terrastrike`, four months old. What the measurement found was
+that the file was the wrong thing to worry about:
+
+| | |
+|---|---|
+| `.cide/tasks.json` | **2.19 MB**, 126 tasks (104 done), 551 comments |
+| comments | 1.61 MB — **77.5%** |
+| bodies | 0.37 MB — 18.0% |
+| index-shaped fields | 0.09 MB — 4.5% |
+| git: 121 revisions | 106 MB logical, **1.46 MB packed** |
+
+Git is a non-issue and the single-file diff is load-bearing — it is what makes `cide_tasks::merge`
+reviewable and a `git pull` safe on a shared tracker. Delta compression turns 106 MB of history
+into 1.46 MB without being asked.
+
+The cost was the **broadcast**. `emit::tasks_changed` cloned and serialised the whole board on
+every mutation, and Tauri delivers an event by inlining the payload into a JavaScript *source
+string* and `eval`ing it in each webview on the GTK main loop (`tauri`'s
+`event::emit_js_script` → `webview.eval`). So every comment an agent wrote cost each window a
+2.2 MB JavaScript literal — parsed as **source**, not as JSON. Measured in V8: 10.2 ms as source
+against 2.9 ms via `JSON.parse`, and WebKitGTK is slower and was blocking paint while it did it.
+This is the failure class `cide-pty`'s coalescer exists for, where a `Channel` payload under
+1024 bytes goes through `webview.eval` — arriving by a different door, in a payload three orders
+of magnitude larger. `TASKS_CHANGED`'s own doc had finished its argument with *"it is a few
+kilobytes, the emitter has it in hand"*, and that sentence had been true when it was written.
+
+Six of the eleven task commands also *returned* the whole board, so a mutation shipped
+`Vec<Task>` twice.
+
+**The board now carries `TaskRow`**: the fields a list draws, plus a count of comments and of
+attachments. On that same board, since grown to 135 tasks: **2.25 MB → 50.0 KiB, 46× smaller.**
+A body, a log, a history and a task's file records are fetched by id through `task_get`, and
+searched through `task_search`.
+
+### Search had to move, and that was the interesting part
+
+`matchesQuery` searched the id, the title **and the body** — documented as *"what a user
+half-remembering a task actually recalls"*. A board without bodies cannot filter on them, and the
+option that looked cheapest was the one that had to be refused: narrowing on id and title alone
+would accept a word out of a task's description, find nothing, and draw *No tasks match "…"* over
+a task that contains it. A confident false negative about the user's own data, which is what the
+panel's three separate empty screens exist to prevent.
+
+So the rule moved to `cide_tasks::search`, where the text is, and the panel filters by the id set
+it answers with. One definition of a hit, in Rust, testable without a disk. A local pre-filter
+unioned with Rust's answer was considered and dropped: a second spelling of the same comparison,
+bought with nothing — the call is one `spawn_blocking` over an in-memory `Vec`.
+
+That left a state the panel had never had: a query typed whose answer has not landed. `matched` is
+therefore nullable, `null` means *no query*, and `listEmpty` cannot reach its "nothing survived"
+branch while it holds — so no sentence is drawn about a search that has not run. `list-search-pending`
+is the story, and it asserts the row list is byte-identical to the unnarrowed one.
+
+### Four false claims the type system now prevents
+
+Every content field the card reads renders a **sentence** when it is empty: `No description.`,
+`No comments yet.`, a status-history disclosure that is simply not drawn, an Attachments section
+that vanishes label and all. Drawn from content nobody has fetched, each is a positive claim that
+the task has none.
+
+The worst is not a sentence. `startEdit`/`fieldValue` seed the body editor from `body`; with an
+unfetched body reading `''`, the editor opens empty, `isDirty` reports dirty on the first
+keystroke, and `commitEdit` writes that emptiness over the real body. Silent data loss on a
+gesture that looks like an ordinary edit.
+
+The fix is a type rather than four guards. `TaskDetailView extends TaskView` with the four content
+fields, `TaskDetailProps.task` takes it, and nothing that reads content can be handed a row — so
+the card is unrepresentable without content and `TaskDetailHost` draws its own pending state until
+`task_get` answers. `TaskDetailPending` is the one component in that file allowed a row, and only
+because it draws no content field at all: the id, the status glyph, the title, and a sentence about
+the **fetch**. `check:agents-render` asserts the absences *beside* that sentence, because absence
+alone would pass over a card that had started claiming the task was empty — and over one that
+rendered nothing.
+
+### Two things worth knowing about the shapes
+
+`TaskRow` is a new type rather than `Task` with three keys omitted, because `Task::body` and
+`Task::comments` carry no `#[serde(default)]` — omitting them is a hard deserialize failure, and
+giving them defaults would re-open `TaskAuthor::user`'s argument about what an absent field means.
+
+`TaskDetail` **nests** its row instead of inlining it, so the two counts keep exactly one producer
+(`cide_tasks::row_of`). A flattened shape would have to carry them again — a second place deriving
+a number, where both copies are plausible and a wrong one looks exactly like a right one — or omit
+them and push the derivation into the frontend adapter. The fixture derives them too, and that is
+the point: a story cannot claim three comments over a log of two.
+
+`TaskRow::session` and `::change` pair `#[ts(optional)]` with `skip_serializing_if`, which
+`cide-ipc/src/tasks.rs` contained **none** of. `Task::session` still declares `session?: SessionId`
+in TypeScript while serde writes `null`; `adapt.ts` absorbs it with `== null`, and that guard stays
+even though the row's own encoding no longer needs it — the wire is two producers wide now, the file
+under it is hand-editable, and a guard covering both spellings cannot be wrong about either.
+
+### What is not done
+
+This is the **first half**. The file is still one file: `schemaVersion` is still 1, every mutation
+still rewrites the whole tracker, and growth is still monotonic in words ever written. The storage
+split — `.cide/tasks/<id>/task.json`, attachments moving under the task that owns them, lazy
+content, a v1→v2 migration on first write — is planned and not begun. The measured pressure that
+justified it is gone from the hot path, which is exactly why the split can now be done carefully
+instead of under duress.
+
+**Nothing on a display.** That the main-loop stall is actually gone, that the pending card reads as
+a card still loading rather than as a bug, and that the body editor refuses to open before content
+arrives — all three are arguments from the code and from the numbers, not observations. The
+measurements above are real; the absence of the stall on a KDE Wayland session is not yet.
+
+## A task is a file (M68)
+
+The second half. The first shrank the *broadcast*; this shrinks the *file*, which is the half that
+grows for ever. Schema 2:
+
+```
+.cide/tasks.json                                     the index: rev, nextId, one TaskRow per task
+.cide/tasks/<task-id>/task.json                      body, comments, history, attachment records
+.cide/tasks/<task-id>/attachments/<att-id>/<name>    the bytes, moved from .cide/attachments/
+```
+
+Measured on the same board, since grown to 161 tasks:
+
+| | |
+|---|---|
+| v1, one file | 2,804,134 bytes (**2.67 MB**) — rewritten on every mutation |
+| v2 index | 61,599 bytes (**60.2 KiB**) — rewritten on every mutation |
+| v2 content | 161 files, 2.74 MB total; median 16 KB, largest 75 KB |
+| a mutation's write | 2.67 MB → **77 KB** (index + one median content file), **36× less** |
+
+The index is now bounded by task *count*, not by every word ever written into the project. No policy
+decides what is cold; a done task's thread is one `task_get` away for ever.
+
+### The three rules that make lazy loading safe
+
+**A content file this process has not loaded is never written.** That one sentence is why nothing
+else in `cide-tasks` has to reason about a partially-known board: an absent cache entry is not
+"empty", it is "not ours to touch". A `git pull` bringing comments for a task nobody opened needs no
+merge at all — theirs is still on disk, and the next reader loads it. It also bounds the merge: before
+M68 every write re-read and merged the whole tracker, and `reconcile` now walks the index plus exactly
+the tasks in `dirty`, which on an ordinary afternoon is one.
+
+**Content first, then the index.** Two files is two publishes with no transaction, so the pair has to
+be readable either way round. Content-then-index leaves, at worst, a content file no row names — an
+orphan the reader ignores and the next flush overwrites. Index-first would leave a row pointing at
+content that was never written: a task whose body and whole conversation read as empty, which is the
+one interrupted state that looks like data loss to the person reading it. A content write that
+*fails* deliberately does not abort the index write either — the row is still the truth about the
+task's existence and its status, and refusing to record that because one comment file could not be
+written would turn a disk hiccup into a lost status change.
+
+**An index row with no content file renders; a content directory with no row is ignored.** The
+tempting symmetry is a bug. `TaskStore::delete` writes no tombstone — a task is retained out of the
+vector — so a directory no row names is overwhelmingly a deleted task's leftovers, and adopting one
+would resurrect every task anybody had ever deleted, at the next open.
+
+### Every `TaskEdit` arm was left alone, on purpose
+
+Each of the twelve arms carries a comment recording a decision that was paid for: the
+assignee/session exclusion, the no-op `SetStatus`, the author gates on the comment arms. Rewriting
+them to reach into a row and a content struct separately would have moved all of that prose and
+risked all of those decisions.
+
+So the split lives in two functions. `compose` joins a row to its content — loading the content if
+this process has not seen it — and hands the closure the `&mut Task` every arm was written against;
+`put` splits the result back, and marks the content dirty **only if it actually changed**, which is
+what keeps a title edit from rewriting a task's whole conversation. The cost is paid honestly: a
+`SetTitle` loads content, finds it unchanged, and writes one file.
+
+The rollback needed more care than expected. `update` restores the index by cloning it — ~60 KiB, the
+right trade — but the same move for content would copy every body and comment this process has
+loaded, per mutation: exactly the cost the split removed, arriving back through the path where
+nothing would have measured it. So `ContentCache` has an undo log instead: one entry per `put`,
+holding the previous content and whether the id was already dirty. And whether it was already marked
+for **removal** — without that field a `delete` whose `validate` then failed would leave its id in
+`removed`, and the next flush would take the content of a task that is still in the index. The
+narrowest window and the widest consequence.
+
+### `TaskRow::of` moved to `cide-ipc`, and that is not a layering slip
+
+`cide-agents` renders `cide_task_get`'s header from a whole `Task` it was handed, and needs a row to
+do it — but `cide-agents` may not depend on `cide-tasks`. `TaskAttachment::relative_path` already
+solved this exact problem, with its own doc saying why: *two crates need the formula and only one of
+them may depend on `cide-tasks`, so the formula lives on the record itself.* The projection follows
+it, and the single-producer property is the whole point — the two counts are the only part of a row
+that is not a field copy, and a second place deriving them would be a second answer to *how many
+comments does this task have*, where both copies are plausible.
+
+`TaskDetail` nests its row rather than inlining it for the same reason. The fixture derives the
+counts too, so a story cannot claim three comments over a log of two.
+
+### Converted on start, outright
+
+The user asked for this, and it is better than what was planned. The plan had the conversion riding
+the first *write* — where a lazy design naturally puts it, and which preserved cide's *opening a
+project rewrites nothing* promise. That bought an unpredictable moment: the conversion would fire on
+some later edit, possibly while several agents were writing, and `git status` would stay clean until
+it suddenly was not.
+
+On start it is one observable event at a known time, before anything else touches the tracker, and
+one `git checkout .cide` undoes it. What it costs, accepted knowingly: merely *opening* a schema 1
+project rewrites its committed files, which is the surprise commit `TaskBoard::Absent`'s own hint text
+argues against. The alternatives were worse — asking first leaves the tracker read-only, which refuses
+a dispatched agent's `cide_task_update` until somebody notices a banner, and converting silently only
+for "projects of mine" invents a distinction nothing else in cide draws.
+
+The ladder is `cide_core::persist::migrate`'s, arm per step, over a `Value` so the version is read
+before anything commits to a shape. Two things ride along. The **creator recovery** (M21 — reading a
+pre-`created_by` task's author back out of its seeded first comment) moved *into* the migration: it is
+the one read that is also a rewrite, and the only one with both halves of a legacy task in hand, so
+the answer is now written down once instead of being re-derived by every content load for ever. And
+the **attachment relocation**, which is the only part that touches bytes rather than JSON.
+
+`reconcile` migrates too, and that arm is not theoretical: a `git checkout` of a pre-M68 branch puts a
+schema 1 file back under a running cide, and an arm that dropped the lifted content would have merged
+the index fine and left every one of those tasks reading as having no body and no conversation.
+
+### Verified against the real thing
+
+`a_real_tracker_converts` is `#[ignore]`d and takes `CIDE_TRACKER`, on `cide-core`'s `a_real_package`
+model and for its reason: every fixture in the file was written by somebody who already knew the
+format, and a four-month-old board has tasks from four different builds of cide in it — comments with
+no ids, tasks with no `createdBy`, a `nextId` that predates the field. It **copies** the project's
+`.cide/` and converts the copy; pointing a migration at a live tracker to find out whether it works is
+the one way the test could cost more than it proves.
+
+Against terrastrike: **161 tasks converted, 337 attachments resolve**, every index count agrees with
+the content file beside it, `rev` unmoved (a conversion is not a mutation), and a second open rewrites
+nothing. Git sees the relocation as **337 renames at 100% similarity, zero lines added or deleted** —
+59 MB of bytes move without a single new blob.
+
+### Two places outside `cide-tasks` that knew the path
+
+**`cide-hook`** denies an agent's `Edit`/`Write` to the tracker by matching path components — it links
+no domain crate, deliberately, so it spells them itself. It matched `.cide/tasks.json`, which *was* the
+tracker; after the split an agent could have written `.cide/tasks/t-5/task.json` directly, behind the
+single process that holds the only writer. It now matches anything under `.cide/tasks/` too — a prefix
+and not `<id>/task.json`, because the attachment bytes are under there as well and an agent that may
+not rewrite a comment may not rewrite the screenshot attached to it.
+
+**`dotcide::classify`** matched exactly `tasks.json`. A `git pull` can move a task's comments without
+touching the index at all, and that landed as `Route::Nothing`: no refresh, no broadcast, and a card
+showing yesterday's conversation until something unrelated moved the index.
+
+### What is not done
+
+**Nothing on a display.** The conversion, the pending card, the search box and the absence of the
+main-loop stall are all arguments from code and from numbers. 78 Rust test binaries, 64 of them in
+`cide-tasks`, and all 93 frontend checks pass; none of them can see a window.
+
+**A teammate on an older cide build is locked out** of a converted tracker until they update — it
+reads as *unreadable*, with Reveal and Retry and nothing that writes. That is the correct failure and
+it is what stops a downgrade eating the file, but it is a real consequence of upgrading.
+
+**A deleted task whose row is re-adopted from a stale concurrent writer comes back with its content
+missing**, where before the split it came back whole. Rarer and less harmful than every deleted task
+returning at open, but a real difference.
+
+**Nothing archives yet, and nothing needs to.** The index is bounded by task count and a content file
+is only read when something opens it, so the growth that prompted all of this is no longer in any hot
+path. It is still growth: a ten-year board is still ten years of comments on disk.
+
+## The chrome audit
 M3's stated acceptance criterion was a screenshot diff against the design mock at 1440x900 in
 both themes. Neither side of that diff was ever obtainable here — the mock is a template needing
 a runtime this repo does not have, and KDE Wayland will not raise a shell-launched window for a
@@ -10660,3 +11341,437 @@ with a pinned known-good CLI range and degrades to plain-PTY-only if the handsha
 cide never reads `~/.claude/.credentials.json` and never injects `ANTHROPIC_API_KEY` — that
 variable outranks subscription OAuth and would silently bill a Console org. Children inherit
 their auth by inheriting the environment.
+
+## A resumed run opens onto its own history (M69)
+
+The report was that agent runs come back from a cide restart "paused", and that resuming one
+starts it "from zero prompt". The first half is a vocabulary accident — `RunState::Interrupted`
+draws with the paused tone (`model.ts`'s `interrupted: 'paused'`), and the row's note already
+says what it is. The second half was wrong about the cause and right about the experience, and
+the difference took an evening to establish because the evidence for it was not in cide at all.
+
+**The conversation was never lost.** opencode keeps its sessions in a sqlite store
+(`~/.local/share/opencode/opencode.db`), and it has the whole record: **51** cide continuation
+prompts — *"cide restarted while you were working…"* — and **not one of them opens a session**.
+Every one landed in a conversation that already had 35 to 1,100 parts, and the `step-finish`
+immediately after each reports 36k–295k tokens with the history read from cache. Run
+`e43e6c3b`'s model picked up mid-thought: *"Good, the scenario file exists (uncommitted)…
+commit the scenario draft first, then continue debugging."* The snapshot, the `harnessSession`
+id, `resume_point`, `respawn_spec`'s `--session` — the whole road works, exactly as M42 built
+it.
+
+What was lost was **the panel's view of the run**, which is the only evidence a person has.
+
+Two things cause it, and they compound. A resumed opencode or codex run is a **new cide
+session** — `resume_point` answers `rebind: None` for those two, because their conversation id
+belongs to the CLI and cide's is free to move — so the mirror, the sinks and the
+`logring` ring the previous child filled are all unreachable from the new one. The only bridge
+was `run-screens/<run>.screen`, seeded into the fresh mirror by `SpawnSpec::preload`. And every
+one of those files the last teardown on the reporting machine wrote was **ten bytes**:
+
+```
+00000000: 1b5c 1b5b 3f31 3034 396c                 .\.[?1049l
+```
+
+which is `full_state`'s lead-in — abort any string sequence, leave the alternate screen — over
+a mirror with no scrollback and no non-blank row. Three live runs, three empty pictures. So the
+pane came back holding one separator and the next turn, under a model that had its entire
+context. That is what "it started from zero" looks like from outside.
+
+### The log was there the whole time
+
+`run-logs/<run>.log` is the raw harness stream, teed line by line in `stream_hook` since the
+debug report that asked for it (*"e83a75fe ran 9 minutes and left literally zero evidence of
+what it was doing"*). It is keyed by **run**, not by session, and appended — so it already
+spans every child a run has had *and* every restart between them. `e43e6c3b.log`: 431 events,
+13:13 to 13:34, straight through the 13:25 restart that ended the process which wrote the first
+half. Nothing read it. `grep` for `run_logs_dir` found `agents.rs` and `event_tap.rs` and no
+command, no event, no line of TypeScript.
+
+So a resumed run's mirror is now seeded by replaying that log — through the *same* two function
+pointers the live hook installs. `SessionBinding::Harness` carries `keep` and `render`, and
+`start_child` captures them from the very binding it is about to hand the session, so the rows
+the pane opens onto are the rows the live stream would have drawn for the same lines. There is
+no second rendering written anywhere: `check:json-log` pins that format in one place and it
+stays one place. Replayed over the real log, the run comes back whole — 644 rows, 34 KB:
+
+```
+● cide_task_get  t-912  13ms #7
+I'll start by reading the task and understanding what's being asked.
+● bash  git log --oneline -5 && git status --short && git branch --show-current  172ms #8
+∴ thought  351ms #9
+```
+
+Four things about it are not obvious.
+
+**The handles have to be minted in the same pass.** A `#7` is an index into the session's ring,
+and the ring is new. So each replayed line `keep` accepts is recorded into it as the row is
+drawn, which is what makes a click on a replayed row resolve through `session_log_detail` like
+a live one's. That is also where the budget comes from: `REPLAY_LINES` is the ring's own `CAP`,
+because a larger replay would draw handles the ring had already evicted before it finished —
+a number on screen whose click answers *gone*, which is the one thing the handle exists not to
+do. A log longer than that is replayed from its tail under a dim line saying how much it left
+behind and where the file is.
+
+**A log that stops mid-step leaves the marker up.** The `▸ working…` row is erased by the
+*next* line's rendering, and after a replay the next thing written is cide's own `— resumed
+after a cide restart —`. Without an erase that separator lands under a row claiming a run that
+died twenty minutes ago is working. `cide_agents::ERASE_MARKER` is that erase, made public for
+one caller and for one reason: it goes up exactly one row and is only correct while the marker
+it erases is the one row `render` draws.
+
+**A replayed line is stamped with its own clock.** opencode stamps every event; codex records
+none on any item, which is what `RenderState::now_unix_ms` has been an `Option` for since M62.
+Where there is no clock the log's last-write time stands in — a bound rather than a
+measurement, and the honest half of a bad pair: stamping `now` would make every replayed card
+claim its command ran at the instant somebody pressed Resume.
+
+**The saved screen is still the fallback**, for `SessionBinding::Caller` — a claude or qwen run
+is not teed at all, because its durable transcript already exists under `~/.claude/projects` —
+and for a harness-bound run with no log. It also has a test now. It never had one: the write
+had no path seam, so nothing in the suite could have noticed it producing ten bytes.
+`save_screens_to` takes a directory for `write_snapshot_to`'s reason, and
+`a_live_runs_saved_screen_holds_what_its_mirror_held` drives a real rendered session through
+it. The mechanism is sound, which is the useful half of the answer: a ten-byte file in the wild
+is a statement about the mirror at that moment, not about this code — and the log, written as
+the run goes, cannot be empty for a run that spoke.
+
+### Still open: one resume, two children
+
+The same opencode store shows the continuation line arriving **twice** for three runs at one
+restart, 17.6 seconds apart, with nothing between the two in any of them (parts 271 → 272) and
+only one turn following both — and the same doubling at two and three seconds for two other
+sessions. Two children were forked for one run.
+
+It cannot come from a double press through `requeue_interrupted`: that arm matches
+`RunState::Interrupted` only and leaves the run `Queued` under the same lock, and
+`restore_snapshot_from` is the only other writer of `Interrupted` in the crate. So the second
+one arrived by a road nobody has named. There are now two `info` lines — one where a run is
+requeued, one where a continuing child is admitted, naming the conversation — and the guard
+waits on what they say. Guessing a fix for a duplicate whose source is unknown is how a second
+one gets added.
+
+## What a file *is* (M70), and what is not verified
+
+> *"Need a file properties modal window that will show OS stats and git history if applicable
+> and other usefull stuff that you can advice"*
+
+cide could already show a file's **contents** five ways — editor, image pane, drawing pane, diff,
+blame — and almost nothing **about** the file. The facts were not missing so much as scattered
+and then thrown away: the status bar knows the language and the line ending, `ImagePane` knows
+the pixel dimensions, the file tree knows a status letter, the Log tab knows the history, and
+`document::read` reads the size and the mtime on *every* open and keeps neither. Three more — the
+mode bits, the owner, and the difference between a symlink and the thing it points at — were read
+nowhere in the workspace at all.
+
+This is one card that answers the question, reachable from the file tree's context menu, the tab
+strip's, and the palette, for files **and** directories.
+
+### Three commands, because one would make every card wait on its slowest row
+
+`file_properties` is one `symlink_metadata` and at most one bounded byte scan. `file_properties_dir`
+is a recursive walk with a budget. `file_properties_git` is two bounded revision walks. The card
+opens on the first and fills the other two in, each behind a sentence rather than a blank.
+
+A single command returning all three reads better and is wrong: a right-click on `target/` would
+produce a card that appears seconds later or not at all, for a size nobody asked for. The split is
+the same reasoning `TaskDetailPending` follows — a row that is *not yet known* must not render as
+a row that is *known to be empty*.
+
+### The mistake this was built around: `stamp_at` follows the link
+
+There is already a stat on the wire — `FileStamp`, from `cide_core::document::stamp_at` — and
+reusing it was the obvious first move. It calls `fs::canonicalize` before it stats, which is
+correct there, because a buffer's identity is the file it really edits. Here it would put the
+**target's** size, mode, owner and mtime under the *link's* own name and path, with no error, no
+gap and nothing logged. The card would simply be confidently about a different file.
+
+So `cide_core::properties::read` stats the link and resolves the destination only into a `Target`
+row the reader can see, plus a `symlink_broken` flag — because a dangling link is the state that
+makes every other row about it confusing, and it is the one case `canonicalize` cannot report at
+all. `a_symlink_reports_itself_and_not_its_target` is the guard, and it asserts on the *length*
+rather than on the kind: the kind was never going to be wrong.
+
+### The other one: nanoseconds do not fit in a JavaScript number
+
+`FileStamp::mtime_nanos` is carried as a decimal **string**, and its doc comment records why —
+~1.79e18 is about two hundred times `Number.MAX_SAFE_INTEGER`, the stamp was silently rounded to
+a multiple of 256 ns in the webview, and every autosave on ext4, btrfs and xfs was refused as a
+conflict about a file nothing had touched.
+
+A stamp is a token the frontend hands back untouched. A properties card does the one thing that
+token must never be used for: it **formats** the value. So these times are milliseconds, and they
+are `#[ts(type = "number")]` rather than the `bigint` ts-rs renders an `i64` as — an annotation
+that is honest here precisely because the range is pinned by a test, and that spares every reader
+a narrowing cast which can only ever succeed. The first reader to forget one gets `NaN` in a date
+field with nothing logged anywhere; `gitlog/logModel.ts` already carries that hazard for
+`CommitRow::authored`, where the range is genuinely open and the cast is the right answer.
+
+### Not `git_log`, and this one is about somebody else's feature breaking
+
+The card needs ten commits for a path, which is exactly what `git_log` answers. It keys its
+cancellation flag by `(project, tab: ToolTabId)` so a superseded walk stops within one commit
+instead of scanning to its budget for a page nobody will draw — and a modal has no tool tab.
+Borrowing the Log tab's id would cancel *that tab's* in-flight page every time somebody opened a
+properties card, and a cancelled page is explicitly **not** an error, so the Log tab would go
+quiet with nothing reported anywhere. Minting a sentinel is the `DOCKER_TAB` hazard, already
+written up here as a thing that must never reach a command taking a uuid.
+
+So `cide_git::properties` walks `cide_git::log` directly, bounded small enough that there is
+nothing worth cancelling. It is still the same walk function the Log tab uses — one producer,
+`push::preview`'s rule — so a change to how cide follows a rename reaches this card without
+anybody remembering it exists. `tracked_since_follows_a_rename` is what makes that concrete: a
+file moved last week was not created last week, and the row exists to say so.
+
+### Four answers that are indistinguishable from the right one on screen
+
+Everything on this card is a *claim about a file*, which is the shape where being wrong looks
+exactly like being right. Four of them are pinned by name.
+
+**`more` is the extra row, never `length >= limit`.** The walk asks for one commit more than the
+card shows. Reading `recent.length === RECENT_LIMIT` instead draws *Open full history* onto a file
+whose entire history is already on screen — and is right often enough that nobody would notice.
+
+**Never committed and too-much-history are different answers.** `first_truncated` separates them.
+Collapsed, the card tells somebody their file is untracked because their repository is large.
+
+**An unknown git status is not a clean one.** `TreeStatusMap` is capped at 20,000 entries, and
+below the cap absence genuinely means clean — that is the map's documented encoding. Above it,
+absence means the walk never reached this path, and a green *Clean* there is a tick on a file with
+uncommitted work in it. A truncated map answers *Not reported*.
+
+**A bounded count never looks exact.** The directory walk stops at its budget and says so, and the
+card renders *at least 3.4 MiB*. `cide_fs::copy::preview_merge` settled this for the paste dialog
+and the sentence transfers unchanged: a count that stops early is honest when it says so and
+simply wrong when it does not.
+
+### Small things decided along the way
+
+**No default keybinding.** `alt+enter` is the IDE convention and is already `pane.maximize`.
+Displacing it to save a right-click on a command nobody runs hourly is the wrong trade, and
+`git.history.file` — the row this one sits beside in every menu — ships with no chord for the same
+reason.
+
+**No `shellWindow` clause**, unlike `file.reveal` directly above it in the table. The card is an
+overlay and any window can raise one, which is `git.blame`'s stated precedent. The single control
+that needs a tool window, *Open full history*, is simply not drawn where there is not one, rather
+than the whole command vanishing from the palette of a window it works in.
+
+**Offered on directories**, unlike *Show File History* twenty lines away in the same menu. That
+row is disabled on a folder because the tool window's history *tabs* are per file — a limitation
+of the tab, not of git, which is happy with a directory prefix.
+`a_directory_path_has_a_history_too` pins it.
+
+**No Blame button**, which the plan had. `git.blame` toggles a gutter in an open editor, so from a
+card about a file that is not open it would have to open the file first — a surprising side effect
+from a dialog whose whole job is to describe rather than to do.
+
+**`formatBytes` was already written three times** in `ui/src`, and two of the copies had drifted:
+one rounds a KiB and the other floors it. A fourth was not on the table, so the model imports
+`panes/imageKinds`, which is import-free and therefore compiles standalone beside it under
+`check:properties`. The three existing copies are left alone — consolidating them is a change to
+three check-gated modules and the Tasks panel, and it is not this milestone's.
+
+### What is not verified
+
+**No part of the card has been drawn on a display.** The Rust half *is* now confirmed against
+the tools that own the facts, through a new headless probe — see below — but nothing has painted
+a pixel. The Rust is covered — 17 unit tests in
+`cide_core::properties` (the line counter over five break shapes, the mode-string renderer against
+`ls`'s setuid/sticky spelling, the symlink and walk-loop cases), 8 in `cide-git` against real
+repositories, 4 in `cide-ipc` for the null-key and safe-integer rules — and `check:properties`
+drives every sentence the card prints. None of that can see a card that paints.
+
+`cide-headless properties <path>` is the probe, added for the reason `cide-headless docker` and
+`cide-headless spec <root>` exist: a feature whose failure mode is a plausible sentence needs a
+way to print that sentence beside the truth. Against a real file it matches `stat` field for
+field — size, mode string, uid/gid *and the resolved names*, mtime and ctime to the second — and
+the line count is `wc -l` plus one, which is the editor's convention and the documented
+difference rather than an off-by-one. A real symlink reports its own 52 bytes and `lrwxrwxrwx`
+rather than the target's 16,628, which is the whole design in one line; a dangling one is named
+as broken, which `canonicalize` could not have reported at all. A directory matches `find` and
+`du` exactly, and `target/` — 38 GB of build output — hit the 50,000-entry budget in 73 ms and
+said *at least*, which is both halves of that argument at once.
+
+It deliberately has **no git half**. That would need `cide-git`, which is `git2` with
+`vendored-openssl` and is one of the three crates `docs/platforms.md`'s Darwin type-check
+excludes; linking it would cost a fourth exclusion and with it `cide-headless`'s own macOS
+coverage, permanently, to save typing `git log` in the next shell over. The halves are not
+equally exposed anyway — `cide_git::properties` has eight tests against real repositories and
+`git log --follow` beside it, while the stat half's hazard has no in-tree oracle at all.
+
+Specifically unconfirmed:
+
+- **The Log tab is not cancelled by opening a properties card.** This is the whole argument for
+  the separate command and nothing automated can observe it: open the Log tab, start a filtered
+  walk, open a card, and the log's page must still arrive.
+- **The card opens in a detached-pane window.** It is mounted in both `App.tsx` branches and the
+  failure mode is total silence, which only a display rules out.
+- **Escape closes the card without also reaching the terminal underneath.**
+- **The owner name resolves.** `getpwuid_r` is behind `#[cfg(unix)]` and is exercised by no test;
+  a failure falls back to the number, so the wrong outcome here is a quietly plainer row.
+- **`created_unix_ms` on a filesystem that records one.** ext4 does; the arm is untested either
+  way and `None` renders as an absent row.
+- **Off unix**, `mode`, `mode_string`, `owner` and `changed_unix_ms` are `None` by construction.
+  `docs/platforms.md` records it; no non-Linux host has run this.
+
+## The product owner can change what its agents run on (M71), and what is not verified
+
+> *"Check if claude can change provider/model/agent overall concurrency/agents global model
+> overrides via mcp"*
+
+It could not, and the shape of the gap was tidy enough to be invisible. cide serves a project's
+primary Claude pane sixteen MCP tools; between them a model can define a role, hand it a task,
+watch it, stop it and merge its work. Every knob that decides **what the work runs on** was a
+`#[tauri::command]` the webview alone could reach: `agents_config_set` for the project's
+concurrency cap and default harness, `agent_overrides_set` for a role's local redirection, and
+`settings_set` for the providers and pools an opencode run draws from. So the loop this whole
+vocabulary exists to close — decompose, dispatch, read what came back, adjust, dispatch again —
+had no *adjust*: an orchestrator that worked out a role was too expensive could only ask the user
+to open Settings.
+
+Four tools now, all in the orchestration family, and one existing tool widened to answer for them.
+
+### Twenty tools, not sixteen, and the four are where they are for a reason
+
+`cide_agents_config` patches `.cide/config.json`. `cide_agent_override` patches one row of this
+project's entry in `agent-overrides.json`. `cide_llm_provider` and `cide_llm_pool` patch one row
+of `Settings.llm`. They sit in `tool::ORCHESTRATION` between the two that author a role and the
+dispatch, because what a role runs on is part of defining it — the turn that decides a role is too
+expensive is the turn before the dispatch, not the one after the merge.
+
+Being in that family rather than `tool::ALL` is the whole safety argument, and it is the one
+`agent_rpc`'s header already makes: a dispatched run's connection is handed `ALL` and nothing
+else, so a subagent that could re-point its siblings' models — or raise the cap it is queued
+behind — is not refused at a policy check, it is never offered the name.
+`a_run_gets_the_task_tools_and_can_never_reach_a_dispatch` now guesses all four by name over a
+real socket and asserts `METHOD_NOT_FOUND`.
+
+### The mistake this was built around: a tool shaped like the command underneath it
+
+`agent_overrides_set` takes a whole `ProjectOverrides`. `SettingsPatch::llm` takes a whole
+`LlmSettings`. Both are right for the screen that calls them — it is writing back what it is
+already drawing — and both are catastrophic as a tool signature, because a model that did not read
+first would **erase every provider and every API key on the machine** in one call, and the answer
+would say *saved*.
+
+So each tool names one row, the read-modify-write happens on the far side of the sink, and the
+setters on `AgentSink` take the whole value while the handlers above them do the folding. It is
+`cide_task_link`'s argument — an array field can say what the set *is* and never what the caller
+*did* — arriving at three more tables at once.
+`patching_one_provider_leaves_every_other_one_and_its_key_alone` is the guard, and it asserts on
+the *untouched* provider's credential rather than on a count, because a count survives the bug
+that matters.
+
+### `enabled` is reported and refused, by name
+
+`cide_agents_config` patches `maxConcurrent` and `harness` and will not touch the switch.
+`cide_agents::config`'s header is the argument and it is not restated: a project that has never
+heard of subagents can never spawn one, every unreadable or half-written file funnels to
+`enabled: false`, and guessing `true` means unattended processes in somebody's repository,
+editing files and spending their quota, with the user having done nothing to ask for it. A model
+that could flip it would be making exactly that guess on the user's behalf, from inside the
+project it is already running in.
+
+It is refused **by name** rather than by leaving the property out of the schema, because a
+property a schema does not declare is still a property most clients will send: a model that asked
+to enable subagents and got a cheerful answer about `maxConcurrent` would believe it had. The
+other six keys need no such argument — `isolation`, `allowDangerousPermissions`,
+`nudgeOrchestrator`, `autoDispatch`, `skipPermissions` and `stopGraceSecs` are not on
+`OrchestrationPatch` at all, which is a line `config.rs` drew long before this vocabulary existed.
+`cide_llm_test_model` is absent for a neighbouring reason: the probe spends a real turn of the
+user's quota, which is why it is a button a person presses rather than something a model does in a
+loop over candidates.
+
+### Four more that are indistinguishable from the right answer on screen
+
+**A credential is written and never rendered.** `LlmProvider`'s `Debug` is hand-written so no
+`tracing::debug!(?settings)` can print a key; a tool result is a transcript, a `run-logs/<run>.log`
+and a scrollback, which is the same exposure by another road. The roster says `key set` and the
+provider tool's own answer says `key set`, and `no_answer_anywhere_prints_a_credential` writes one
+and then greps both answers for it.
+
+**A pool entry is `{provider, model}`, never one `provider/model` string.** The first-slash-wins
+splitter has exactly one home, in `ui/src/settings/llmPools.ts`, whose header records that two
+splitters would eventually disagree about what a provider is — and a model id may itself contain
+slashes (`lmstudio/openai/gpt-oss-20b`). Taking the two halves means no second splitter exists to
+disagree.
+
+**The roster prints the resolution, not the definition.** `cide_agents_list`'s harness column was
+`def.harness`, which was correct until a role could be redirected: from here it would have named
+the CLI in the committed file while every dispatch forked another one. It now comes from
+`overrides::resolve` — the function a dispatch resolves with — through `agents::resolutions_for`,
+and so do the model, the pool and the concurrency. `Resolved::refusal` comes with it, so a pool
+an override names and the machine does not have is visible in the roster instead of being
+discovered by a dispatch that will not start.
+
+That helper calls `overrides::resolve` directly rather than `Facts::resolve`, and the difference
+is one subprocess: `Facts::resolve` folds opencode's own default model in by running
+`opencode debug config`, which is right at a fork and wrong on a read taken on most orchestration
+turns. The two differ only where nothing in cide names a model at all, and the row says *its
+default model* rather than an id that might be a different one.
+
+**An override write emits, although the command it calls does not.** `agent_overrides_set` emits
+nothing, which is correct for the panel — the screen is writing what it is already drawing — and
+wrong for a write nothing on screen made. `agent-overrides.json` lives in the profile's config
+directory, which `dotcide` does not watch and nothing else does either, so an override a model
+wrote would have been invisible in every open window until somebody reopened the panel. The sink
+rebuilds the roster and emits `cide://agents-changed` itself, and the comment there says why that
+one line is not in the command.
+
+### The rules are stated twice, on purpose, and gated for it
+
+`LlmProvider::problems` in `cide-ipc` states the same four local rules `llmPools.ts`'
+`localProblems` states — an id, a base URL, an all-or-nothing `limit` pair, a declared model list
+— and the duplication is the interesting part. They answer for callers that cannot be treated
+alike: the screen's is a hint beside a form somebody is still typing into and must not block the
+save, because `LlmSettings::cleaned`'s whole argument is that a half-filled row has to survive
+storage or the Add button is inert. The tool's caller hands over a whole row at once and has no
+next keystroke, so there an incomplete row is a refusal made before anything is written.
+
+Neither side fails to compile for losing a rule — the screen would simply stop warning, and the
+tool would store a provider that resolves `--model <id>/<model>` to nothing and leave the run
+silently opencode's default agent — so `check:pools` now names the four and asserts both sides
+state them, and that neither has grown one the other has never heard of.
+
+### What is not verified
+
+**No part of this has been exercised against a running cide.** Every claim above is a unit test:
+20 new ones in `cide_agents::tools` (285 in that crate now), 2 in `cide-ipc`'s `llm`, and the
+scoping half in `cide-app`'s `agent_rpc` — 579 there, including the four names a run now guesses
+and is refused. `cargo test --locked --workspace` is green, as are clippy, `contract-check`,
+`codegen --check`, `tsc` and every `check:*`.
+
+The twentieth is the one that is not a fake: `what_the_settings_tools_write_is_what_the_loader
+_reads_back` drives the two project-scoped tools against real files in a temp directory and then
+reads them back with `config::load` and `overrides::resolve` — which is the only thing here that
+could see a row landing under a key the resolver does not look up, or a config write losing a
+disk-only key somebody hand-edited. It is `a_role_written_by_a_tool_is_a_role_the_loader_runs`'
+arrangement, one tool over.
+
+Specifically unconfirmed:
+
+- **That a real `claude` is served twenty tools and calls one.** The `tools/list` half is
+  asserted over a real unix socket with a fake `ToolAccess`; nothing here has run a CLI. The
+  descriptions in particular are a prose contract with a language model, and the only test of one
+  is a model reading it.
+- **That `RegistrySink`'s half of the writes lands.** The handlers are asserted against real
+  files, but the sink that a real call goes through is not: its seven methods call
+  `agents_config_get`/`_set`, `agent_overrides_get`/`_set` and `settings_set`, and no test in
+  this milestone calls any of them. The commands are unchanged and were already unverified from
+  this direction — there is still no test anywhere that calls `agents_config_set` or
+  `agent_overrides_set`. The `block_on`-a-command shape is `write_definition`'s, which has run in
+  anger; nothing else about these six has.
+- **That `Settings.llm` survives the round trip through `settings_set`.** The provider and pool
+  folds are asserted over a `FakeAgents` that stores an `LlmSettings`; what `apply_patch` and
+  `LlmSettings::cleaned` then do to it is covered by their own tests and by nothing that joins
+  the two.
+- **That the panel and the Models screen redraw without being reopened.** The override emission
+  is the one line written specifically for it and a display is the only thing that can see it.
+- **The `SettingsPatch` road under a second writer.** A model's `cide_llm_provider` and a user
+  editing the Models screen at the same moment both send a whole `LlmSettings`; the later write
+  wins entire. That is what the screen already does to itself, and nothing here makes it worse or
+  better.
+- **Whether a model uses the tools well.** A roster that now carries a config line, a resolution
+  per role and an LLM footer costs tokens in most orchestration turns; whether that pays for
+  itself is not something a test can answer.

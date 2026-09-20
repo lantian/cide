@@ -543,9 +543,34 @@ pub fn ipc_degraded(app: &AppHandle, health: &cide_ipc::IpcHealth) {
 /// workspace mirror shut or make it accept a stale tree, depending only on which file had seen
 /// more edits. The Tasks panel keeps its own high-water mark.
 ///
-/// The whole board rather than a signal to re-ask, on `workspace_changed`'s own argument: it is
-/// a few kilobytes, the emitter has it in hand, and a window that answered by re-fetching would
-/// be reading a file that may have changed again in between.
+/// The whole board rather than a signal to re-ask, on `workspace_changed`'s own argument: the
+/// emitter has it in hand, and a window that answered by re-fetching would be reading a file that
+/// may have changed again in between.
+///
+/// # What the board may carry, and the measurement that decided it (M68)
+///
+/// This doc used to finish that argument with *"it is a few kilobytes"*, and for two years it was
+/// true. It stopped being true without anything failing: `.cide/tasks.json` on a four-month-old
+/// project reached **2.19 MB** across 126 tasks, of which the comment text alone was 77.5%, and
+/// the board carried every word of it.
+///
+/// That matters here rather than anywhere else because of how an event is delivered. `app.emit`
+/// serialises the payload and hands it to `tauri`'s `event::emit_js_script`, which **inlines it
+/// into a JavaScript source string** and `eval`s that string in every webview, on the GTK main
+/// loop. So the cost is not a JSON parse, it is parsing two megabytes as *source code*, per
+/// window, on every mutation — and a dispatched run writes a comment per tool call. Measured on
+/// that board: 10.2 ms as JS source against 2.9 ms via `JSON.parse`, in V8; WebKitGTK is slower and
+/// it is blocking paint while it does it. This is the same failure class `cide-pty`'s coalescer
+/// exists for, where a `Channel` payload under 1024 bytes goes through `webview.eval` — and it is
+/// why the ceiling on that coalescer is a correctness requirement rather than tuning.
+///
+/// So the board carries [`cide_ipc::TaskRow`]: the fields a *list* draws, plus a count of comments
+/// and of attachments. A body, a log, a history and a task's file records are fetched by id through
+/// `task_get` when something opens one, and searched through `task_search` where they live.
+///
+/// **Nothing may put content back in here.** The pressure to will come from a panel that wants one
+/// more field, and the honest answer is a second command rather than a wider broadcast: this
+/// payload is multiplied by every open window and by every comment every agent writes.
 pub const TASKS_CHANGED: &str = "cide://tasks-changed";
 
 #[derive(Clone, Serialize)]

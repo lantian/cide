@@ -488,7 +488,10 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], primary: bool) -> String {
          with an assignee, or by @mentioning a role in a task's body or a comment — starts that \
          role on it automatically; `mcp__cide__cide_agent_dispatch` (a role and a task id, \
          returns a run id immediately without waiting) is only needed to re-run a role or to add \
-         a one-line extra instruction. Work goes through tasks; the one exception is \
+         a one-line extra instruction. **A role gets one run per task at a time**, so assigning \
+         and then dispatching the same role onto the same task is one act asked for twice: the \
+         second is refused, naming the run you already started. Stop that run or wait for it \
+         rather than starting a second. Work goes through tasks; the one exception is \
          `mcp__cide__cide_agent_dispatch` with `instructions` and **no task**, which starts a \
          quick run in the project root — no worktree, no branch, nothing on the board, so \
          nothing reports back but the tree itself and the run's pane: use it to check or test \
@@ -1790,6 +1793,10 @@ mod tests {
             "{paragraph}"
         );
         assert!(paragraph.contains("@mentioning a role"), "{paragraph}");
+        // ...and that assigning and then dispatching is one act asked for twice, which is the
+        // sentence M66 exists to make true (`cmd::agents::duplicate_refusal`). Nothing had ever
+        // told the orchestrator that, and it assigned and dispatched in the same breath.
+        assert!(paragraph.contains("one run per task"), "{paragraph}");
         // ...limits queue rather than refuse (`AgentRegistry::admit_a_pass`), and a role's
         // tasks genuinely parallelise, each in a per-task worktree (`checkout_name`)...
         assert!(paragraph.contains("queues in order"), "{paragraph}");

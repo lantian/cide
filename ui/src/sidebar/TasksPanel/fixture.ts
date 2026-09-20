@@ -52,6 +52,7 @@ import {
   type RunRef,
   type TaskDraft,
   type TaskStatus,
+  type TaskDetailView,
   type TaskView,
   type AttachmentPreview,
   type AttachmentView,
@@ -59,7 +60,7 @@ import {
 } from './model'
 import { mentionOptions, type MentionOption } from './mentionModel'
 import type { TasksPanelViewProps } from './TasksPanel'
-import type { TaskDetailProps } from './TaskDetail'
+import type { TaskDetailPendingProps, TaskDetailProps } from './TaskDetail'
 import type { TaskComposeProps } from './TaskCompose'
 
 /** A fixed instant, so a digest of a story is the same on two runs. */
@@ -115,9 +116,16 @@ const COMMENTS: readonly CommentView[] = [
   }),
 ]
 
+/**
+ * A board **row**: what `cide://tasks-changed` carries since M68.
+ *
+ * The content fields moved to [`detail`], and the split is the fixture's half of what makes the
+ * card unrepresentable without content — a story that wants a body or a log has to ask for one, so
+ * there is no way to write a card story that silently renders `No comments yet.` over a task the
+ * fixture meant to give a conversation.
+ */
 function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskView {
   return {
-    body: '',
     status: 'todo',
     // No change, which is most tasks — and the value that keeps every existing story's digest
     // byte-identical to what it was before M28. `check:agents-render` compares them.
@@ -129,10 +137,11 @@ function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskVie
     // section at all, so every pre-M30 story's digest stands.
     links: [],
     agent: null,
-    comments: [],
-    // No files either, the same claim for M39: a task with no attachments draws no strip.
-    attachments: [],
-    history: [],
+    // Zero of each, the same claim for M68: a row with no conversation and no files. `detail`
+    // recomputes both from the content it is given, so a card story cannot end up claiming three
+    // comments over a log of two.
+    commentCount: 0,
+    attachmentCount: 0,
     // The user, by default, because that is what the panel's own New task button produces. The
     // stories that need the other answer say so; see `BARE`, which is the card's half of the pair
     // that pins the creator to the author enum rather than to a name.
@@ -143,7 +152,36 @@ function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskVie
   }
 }
 
-const T14 = task({
+/**
+ * A row **with its content**: what `task_get` answers and what the card takes. (M68)
+ *
+ * The counts are **derived here** rather than defaulted, and that is what keeps the fixture honest.
+ * `cide_tasks::row_of` derives them in the app; a story that set them by hand would be free to
+ * claim three comments over a log of two, and since no surface draws the number yet, nothing in
+ * either check would notice. Deriving them means the fixture cannot say something the app never
+ * would.
+ */
+function detail(
+  over: Partial<TaskDetailView> & Pick<TaskDetailView, 'id' | 'title'>,
+): TaskDetailView {
+  const body = over.body ?? ''
+  const comments = over.comments ?? []
+  const attachments = over.attachments ?? []
+  const history = over.history ?? []
+  const files =
+    attachments.length + comments.reduce((n, c) => n + c.attachments.length, 0)
+  return {
+    ...task(over),
+    commentCount: comments.length,
+    attachmentCount: files,
+    body,
+    comments,
+    attachments,
+    history,
+  }
+}
+
+const T14 = detail({
   id: 't-14',
   title: 'Add the retry bar',
   body: 'A frozen run may have lost its turn. Offer a retry rather than re-dispatching.',
@@ -163,7 +201,7 @@ const T14 = task({
   ],
 })
 
-const T15 = task({
+const T15 = detail({
   id: 't-15',
   title: 'Sweep the phase table',
   status: 'review',
@@ -173,9 +211,9 @@ const T15 = task({
   createdBy: { kind: 'agent', agent: 'developer', label: 'Developer' },
 })
 
-const T16 = task({ id: 't-16', title: 'Write check-agents' })
+const T16 = detail({ id: 't-16', title: 'Write check-agents' })
 
-const T17 = task({
+const T17 = detail({
   id: 't-17',
   title: 'Teach the watcher about .cide/',
   status: 'done',
@@ -191,7 +229,7 @@ const T17 = task({
  * function, which React refuses as a child and which `className` stringifies into the whole
  * source text of `Object`.
  */
-const ROGUE = task({
+const ROGUE = detail({
   id: 't-18',
   title: 'A task from the future',
   status: 'constructor' as unknown as TaskStatus,
@@ -205,7 +243,7 @@ const ROGUE = task({
  * so the render check can say "the fixture wrote `**strong**` and the markup contains
  * `<strong>`" about a card whose other properties nothing else asserts on.
  */
-const RICH = task({
+const RICH = detail({
   id: 't-21',
   title: 'Render tracker text as markdown',
   status: 'doing',
@@ -242,9 +280,9 @@ const RICH = task({
  * the sort rather than about the fixture. All three in one group, so the assertion cannot be
  * satisfied by `GROUP_ORDER` doing the work.
  */
-const T31 = task({ id: 't-31', title: 'Quiet since this morning', updatedMs: NOW_MS - 7_200_000 })
-const T32 = task({ id: 't-32', title: 'Stirred an hour ago', updatedMs: NOW_MS - 3_600_000 })
-const T33 = task({ id: 't-33', title: 'Touched a minute ago', updatedMs: NOW_MS - 60_000 })
+const T31 = detail({ id: 't-31', title: 'Quiet since this morning', updatedMs: NOW_MS - 7_200_000 })
+const T32 = detail({ id: 't-32', title: 'Stirred an hour ago', updatedMs: NOW_MS - 3_600_000 })
+const T33 = detail({ id: 't-33', title: 'Touched a minute ago', updatedMs: NOW_MS - 60_000 })
 
 const REV = 42
 
@@ -355,7 +393,7 @@ const CARD_HANDLERS = {
  * must draw *marked* rather than vanish: a reference that silently disappeared is the
  * task-leaves-the-tracker failure, one edge over.
  */
-const LINKED = task({
+const LINKED = detail({
   id: 't-40',
   title: 'Ship the panel',
   links: [
@@ -371,7 +409,7 @@ const LINKED = task({
  * "Blocks t-41" — is **derived**, which is the claim the story exists for: each edge is stored
  * once, on its canonical side, and the other reading is computed from the board.
  */
-const BLOCKED_BY_LINKED = task({
+const BLOCKED_BY_LINKED = detail({
   id: 't-41',
   title: 'Write the release note',
   links: [{ kind: 'blockedBy', target: 't-40' }],
@@ -511,7 +549,7 @@ const TARGETS = [
   { kind: 'fresh' as const, id: '', label: 'New Claude session', detail: 'Adds a pane.' },
 ]
 
-const SPEC_TASK = task({
+const SPEC_TASK = detail({
   id: 't-21',
   title: 'Add the dark theme',
   status: 'doing',
@@ -527,7 +565,7 @@ const SPEC_TASK = task({
  * card that collapsed those rows would be indistinguishable on screen from one that failed to
  * render them.
  */
-const BARE = task({
+const BARE = detail({
   id: 't-19',
   title: '',
   body: '',
@@ -571,6 +609,38 @@ export type TasksStoryName =
   | 'list-filter-no-match'
   | 'list-searched'
   | 'list-search-no-match'
+  | 'list-search-pending'
+
+/**
+ * The card before `task_get` has answered. (M68)
+ *
+ * Its own tiny table because the pending card takes a **row**, not a `TaskDetailProps` — which is
+ * the point of it: the one component in the card's file that may be handed a row, precisely because
+ * it draws no content field at all.
+ *
+ * `task()` and not `detail()`, deliberately. A `detail()` here would hand the story a body and a
+ * log it is forbidden to draw, and the check could then pass while the component quietly started
+ * drawing them.
+ */
+export type PendingStoryName = 'card-pending' | 'card-pending-long-title'
+
+export const PENDING_STORIES: Record<PendingStoryName, TaskDetailPendingProps> = {
+  'card-pending': {
+    task: task({ id: 't-14', title: 'Add the retry bar', status: 'doing' }),
+    onClose: () => {},
+  },
+  /* A title long enough to wrap, because the pending card reserves a minimum height and a wrapped
+     title must eat into it rather than push the note out of the box. */
+  'card-pending-long-title': {
+    task: task({
+      id: 't-704',
+      title:
+        'Nomad infantry: Scavenger and Raider models — establish the silhouette, then the walk cycle',
+      status: 'todo',
+    }),
+    onClose: () => {},
+  },
+}
 
 export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
   'no-project': story({ project: null, board: ready([T14]) }),
@@ -679,13 +749,21 @@ export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
   /* ------------------------------------------------------------------------- the search */
 
   /*
-   * The board of `list`, narrowed by text. `Retry` — capitalised, over a title that says
-   * `retry` — so the story pins case-insensitivity in the markup, not only in the model. One
-   * task survives (t-14, whose title and body both say it); the other three must be absent
-   * from the markup entirely, and the header figure must still count all four, for the
-   * filter's reason.
+   * The board of `list`, narrowed by text. One task survives (t-14, whose title and body both say
+   * `retry`); the other three must be absent from the markup entirely, and the header figure must
+   * still count all four, for the filter's reason.
+   *
+   * **`matched` beside `query`, since M68.** The narrowing is `task_search`'s answer now — the
+   * board carries no bodies, so the rule runs in Rust and `cide-tasks` pins the rule itself
+   * (case-insensitivity included; it used to be pinned here by the capital `Retry`). What this
+   * story pins is the *markup* consequence, which is the half Rust cannot see: a narrowed list
+   * draws fewer rows and an undiminished count.
    */
-  'list-searched': story({ board: ready([T14, T15, T16, T17]), query: 'Retry' }),
+  'list-searched': story({
+    board: ready([T14, T15, T16, T17]),
+    query: 'Retry',
+    matched: new Set(['t-14']),
+  }),
 
   /*
    * A tracker with tasks in it and a query none of them contain.
@@ -695,7 +773,31 @@ export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
    * actions offer Clear search. The box itself stays drawn — a search that hid its own control
    * on a miss would leave no way to clear it.
    */
-  'list-search-no-match': story({ board: ready([T14, T15, T16]), query: 'quaternion' }),
+  'list-search-no-match': story({
+    board: ready([T14, T15, T16]),
+    query: 'quaternion',
+    // An **empty set**, not `null`: the search ran and matched nothing. `null` would be "the
+    // answer is not in yet", which draws no sentence at all — see `list-search-pending`.
+    matched: new Set<string>(),
+  }),
+
+  /*
+   * A query typed whose answer has not landed. (M68)
+   *
+   * The state between a keystroke and `task_search` returning, and it has to be its own story
+   * because the tempting collapse — read "no answer yet" as "nothing matched" — prints
+   * *No tasks match "quaternion"* about a search that has not run, over a board that may well
+   * contain it. One frame is plenty: it is the frame the user is looking at while they type.
+   *
+   * So the whole board is drawn, unnarrowed, and no empty screen appears. The box keeps the text.
+   */
+  'list-search-pending': story({
+    // `list`'s own board, so the render check can assert the row list is *byte-identical* to the
+    // unnarrowed one — a stronger statement of "narrows nothing" than any count.
+    board: ready([T14, T15, T16, T17]),
+    query: 'quaternion',
+    matched: null,
+  }),
 }
 
 /* ============================================================================== the card */
@@ -759,7 +861,7 @@ function attachment(
   }
 }
 
-const ATTACHED = task({
+const ATTACHED = detail({
   id: 't-23',
   title: 'Match the mock',
   body: 'The header is 2px too tall against the design. Screenshots attached.',

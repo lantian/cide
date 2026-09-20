@@ -40,6 +40,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useShallow } from 'zustand/react/shallow'
 import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
+import { openFileProperties } from '@/chrome/filePropertiesOpen'
 import { letterFor, statusAt } from './treeStatus'
 import {
   enterOn,
@@ -2225,6 +2226,36 @@ export function FileTree({
             : (mutationRefusal(scope, writable) ?? null) !== null
               ? { disabledReason: mutationRefusal(scope, writable) ?? '' }
               : { run: () => askDelete(scope) }),
+        },
+        { kind: 'separator' },
+        /*
+         * Properties. Last, under its own rule, which is where every file manager puts it.
+         *
+         * **The row that was clicked, never the selection** — *Reveal in File Manager* and
+         * *Show File History* above take it for the same stated reason, and it is stronger here:
+         * a card is about one path, and there is no such thing as the properties of four files.
+         *
+         * **Offered on directories too**, unlike *Show File History* twenty lines up, and the
+         * difference is not an inconsistency. That row is disabled on a folder because the tool
+         * window's history *tabs* are per file — a limitation of the tab, not of git. This card
+         * has no such constraint: it walks the same path filter git does, which is happy with a
+         * directory prefix, and it adds the two rows a folder is usually right-clicked for
+         * (how many entries, and how large). `cide_git`'s own
+         * `a_directory_path_has_a_history_too` is what pins that.
+         *
+         * Nothing is guessed about whether there is anything to show. An untracked file, a file
+         * in no repository and a folder full of nothing all open the card, which then says which
+         * of those it is — `git.history.file`'s argument immediately above, and the `repoOpen`
+         * mistake it names: a control disabled by a flag nobody maintains, telling the user
+         * something the app does not actually know.
+         */
+        {
+          id: 'properties',
+          label: 'Properties',
+          command: 'file.properties',
+          ...(project !== null
+            ? { run: () => openFileProperties(project, row.path) }
+            : { disabledReason: 'No project is open' }),
         },
       ]
       return entries

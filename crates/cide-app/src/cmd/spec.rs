@@ -1197,7 +1197,7 @@ pub async fn spec_change_archive(
         // A task on this change whose role has a live worktree means there is code to merge, and
         // this path cannot merge it. Refuse and name where the gesture that can lives, rather
         // than writing requirements into `specs/` that the checked-out tree does not implement.
-        let linked: Vec<cide_ipc::Task> = store_for_work
+        let linked: Vec<cide_ipc::TaskRow> = store_for_work
             .list()
             .into_iter()
             .filter(|task| task.change.as_ref() == Some(&change_for_work))

@@ -82,6 +82,25 @@ export function registerDirtyBuffer(path: string, read: (() => string) | null): 
   else dirtyText.set(path, read)
 }
 
+/**
+ * Whether `path` has an open buffer with unsaved edits. (M70)
+ *
+ * Reads the same registry, for the fact it already holds: a provider is registered **only while
+ * a tab is dirty** and removed when it goes clean, so membership is the answer with nothing else
+ * to keep in sync.
+ *
+ * The properties card asks. Its Size and Lines rows are read from the disk — every other row on
+ * it unambiguously is — and while a buffer is dirty the disk and the editor legitimately differ.
+ * One word (`on disk`) fixes that, and this is how the card knows to say it; without it the card
+ * silently contradicts the status bar six inches away and neither says which is stale.
+ *
+ * Deliberately not reactive: the card is a snapshot taken when it opens, and a size that changed
+ * under the reader between one glance and the next would be a worse answer than a labelled one.
+ */
+export function hasDirtyBuffer(path: string): boolean {
+  return dirtyText.has(path)
+}
+
 const states = new Map<string, BlameState>()
 const listeners = new Set<() => void>()
 

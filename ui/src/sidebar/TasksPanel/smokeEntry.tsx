@@ -43,17 +43,19 @@
  */
 import { renderToStaticMarkup } from 'react-dom/server'
 import { TasksPanelView } from './TasksPanel'
-import { TaskDetail } from './TaskDetail'
+import { TaskDetail, TaskDetailPending } from './TaskDetail'
 import { TaskCompose } from './TaskCompose'
 import { MentionList } from './MentionTextarea'
 import { LinkTargetList } from './LinkTargetInput'
 import {
   CARD_STORIES,
+  PENDING_STORIES,
   COMPOSE_STORIES,
   LINK_TARGET_STORIES,
   MENTION_STORIES,
   TASKS_STORIES,
   type CardStoryName,
+  type PendingStoryName,
   type ComposeStoryName,
   type LinkTargetStoryName,
   type MentionStoryName,
@@ -62,7 +64,7 @@ import {
 
 /** What the check script asserts on. */
 export interface TasksDigest {
-  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName | LinkTargetStoryName
+  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName | LinkTargetStoryName | PendingStoryName
   /** The header's right-hand figure. Empty when `metaFigure` withheld it. */
   meta: string
   claim: string | null
@@ -330,6 +332,14 @@ const digests: TasksDigest[] = [
   ...(Object.keys(CARD_STORIES) as CardStoryName[]).map((story) =>
     digest(story, renderToStaticMarkup(<TaskDetail {...CARD_STORIES[story]} />)),
   ),
+  /*
+   * The pending card. (M68) Through the same `digest` as every other story, deliberately: what the
+   * check needs to assert about it is mostly *absence* — no log, no body, no attachment strip, no
+   * write control — and those are the fields `digest` already counts for everything else.
+   */
+  ...(Object.keys(PENDING_STORIES) as PendingStoryName[]).map((story) =>
+    digest(story, renderToStaticMarkup(<TaskDetailPending {...PENDING_STORIES[story]} />)),
+  ),
   ...(Object.keys(COMPOSE_STORIES) as ComposeStoryName[]).map((story) =>
     digest(story, renderToStaticMarkup(<TaskCompose {...COMPOSE_STORIES[story]} />)),
   ),
@@ -343,7 +353,7 @@ const digests: TasksDigest[] = [
 console.log(JSON.stringify(digests))
 
 function digest(
-  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName | LinkTargetStoryName,
+  story: TasksStoryName | CardStoryName | ComposeStoryName | MentionStoryName | LinkTargetStoryName | PendingStoryName,
   html: string,
 ): TasksDigest {
   /*

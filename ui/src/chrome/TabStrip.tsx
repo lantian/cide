@@ -85,6 +85,14 @@ export interface TabStripProps {
    */
   onShowHistory?: ((path: string) => void) | undefined
   /**
+   * *Properties* — raises the file properties card. (M70)
+   *
+   * Takes an **absolute** path, on [`onShowHistory`]'s rule exactly. Unlike that one it is
+   * supplied in *every* window: the card is an overlay, and `file.properties` carries no
+   * `shellWindow` clause.
+   */
+  onProperties?: ((path: string) => void) | undefined
+  /**
    * Close several tabs as one gesture — the menu's *Close others* / *to the left* / *to the
    * right*.
    *
@@ -148,6 +156,7 @@ export function TabStrip({
   onDetach,
   onReorder,
   onShowHistory,
+  onProperties,
 }: TabStripProps) {
   const tablist = useRef<HTMLDivElement | null>(null)
   const drag = useTabDrag({
@@ -310,6 +319,7 @@ export function TabStrip({
         detach: onDetach,
         ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
         ...(onShowHistory ? { history: onShowHistory } : {}),
+        ...(onProperties ? { properties: onProperties } : {}),
       })
     },
   })

@@ -287,6 +287,14 @@ pub enum LlmProvider {
     },
 }
 
+/// Every provider kind, in the order the Settings screen's Add menu offers them.
+///
+/// A slice so a schema's `enum` and a menu cannot disagree with the type — `crate::tasks`'
+/// status vocabulary's arrangement, and the reason `cide_agents::tools` never writes a closed set
+/// out as a literal. `ui/src/settings/llmPools.ts`' `PROVIDER_KINDS` is the same three words on the
+/// other side of the wire, and `check:pools` compares them.
+pub const PROVIDER_KINDS: &[&str] = &["catalog", "custom", "external"];
+
 /// `true`, for the `enabled` fields' `#[serde(default)]`.
 ///
 /// Serde's own default for a `bool` is `false`, and a provider that deserialised disabled is the
@@ -360,6 +368,96 @@ impl LlmProvider {
             Self::Catalog { api_key, .. } | Self::Custom { api_key, .. } => api_key,
             Self::External { .. } => "",
         }
+    }
+
+    /// Which kind this is, spelled exactly as the `kind` tag serialises it.
+    ///
+    /// The tag is already the wire's word for this — `llmPools.ts`' `ProviderKind` is that same
+    /// set — so an accessor that spelled it a fourth time would be a fourth place to get it
+    /// wrong. `every_kind_answers_its_own_tag` reads the tag back out of the serialised value and
+    /// compares, which is what makes this a view of serde's answer rather than a copy of it.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Catalog { .. } => "catalog",
+            Self::Custom { .. } => "custom",
+            Self::External { .. } => "external",
+        }
+    }
+
+    /// What is wrong with this row *before* anything tries to use it, as sentences.
+    ///
+    /// # Why this exists in Rust when `ui/src/settings/llmPools.ts` already has it
+    ///
+    /// They answer for two different callers, and only one of them can be refused. The screen's
+    /// `localProblems` is a **hint beside a form somebody is still typing into**: it must not
+    /// block the save, because [`LlmSettings::cleaned`]'s whole argument is that a half-filled row
+    /// has to survive storage or the Add button is inert. `cide_agents::tools`' provider tool has
+    /// no form and no next keystroke — a model hands over a whole row at once — so for that caller
+    /// an incomplete row is a **refusal**, made here, before the settings are written.
+    ///
+    /// The two therefore state the same rules for opposite purposes, which is a drift risk and is
+    /// gated: `ui/scripts/check-pools.mjs` asserts both cover the same four, because a rule that
+    /// fell out of this list would not fail to compile — it would let a model store a provider
+    /// that resolves `--model <id>/<model>` to nothing, and the run would silently be opencode's
+    /// default agent.
+    ///
+    /// Empty means nothing is *locally* wrong. Whether the endpoint answers is a question only
+    /// `harness::opencode::test_model` can put, and it is deliberately not asked here.
+    #[must_use]
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.id().is_empty() {
+            problems.push(
+                "A provider needs an id \u{2014} it is the left half of every provider/model."
+                    .to_string(),
+            );
+        }
+        if let Self::Custom {
+            id,
+            base_url,
+            models,
+            ..
+        } = self
+        {
+            if base_url.is_empty() {
+                problems.push(
+                    "A custom endpoint needs a base URL, or opencode has nowhere to send a \
+                     request."
+                        .to_string(),
+                );
+            }
+            for model in models {
+                // Measured against opencode 1.18.29: a `limit` carrying one key and not the other
+                // is refused outright — "Missing key provider.<id>.models.<model>.limit.output"
+                // — and a refused document makes the run silently opencode's *default agent*.
+                // `provider_members` writes neither half of an incomplete pair rather than an
+                // invalid object; this says so to a caller that meant the number to have an effect.
+                if (model.context > 0) != (model.output > 0) {
+                    let named = match model.id.is_empty() {
+                        true => "a model".to_string(),
+                        false => format!("\"{}\"", model.id),
+                    };
+                    problems.push(format!(
+                        "{named} gives only one of its two limits. opencode needs both a context \
+                         and an output limit or neither, so cide will write neither until the \
+                         pair is complete."
+                    ));
+                }
+            }
+            if models.iter().all(|model| model.id.is_empty()) {
+                let named = match id.is_empty() {
+                    true => "<id>",
+                    false => id.as_str(),
+                };
+                problems.push(format!(
+                    "A custom endpoint must declare its models. opencode has no catalog for an \
+                     endpoint it has never heard of, so without a model list `--model \
+                     {named}/\u{2026}` resolves to nothing."
+                ));
+            }
+        }
+        problems
     }
 
     /// Trim every field a form cannot, and drop model rows that name nothing.
@@ -843,5 +941,113 @@ mod tests {
             "a freshly added provider must survive the save"
         );
         assert_eq!(after.pools.len(), 1, "and so must a freshly added pool");
+    }
+
+    /// [`LlmProvider::kind`] is a view of serde's tag, not a second spelling of it.
+    ///
+    /// Read back out of the serialised value, so a variant renamed on the wire and not here is a
+    /// failure rather than a schema offering a word no deserialiser accepts.
+    #[test]
+    fn every_kind_answers_its_own_tag() {
+        let one_of_each = [
+            LlmProvider::default(),
+            LlmProvider::Custom {
+                id: "ollama".into(),
+                label: String::new(),
+                enabled: true,
+                npm: String::new(),
+                base_url: "http://127.0.0.1:11434/v1".into(),
+                api_key: String::new(),
+                models: Vec::new(),
+            },
+            LlmProvider::External {
+                id: "openai".into(),
+                label: String::new(),
+                setup: String::new(),
+                expect: Vec::new(),
+            },
+        ];
+        let tags: Vec<String> = one_of_each
+            .iter()
+            .map(|provider| {
+                let value = serde_json::to_value(provider).expect("serializes");
+                let tag = value["kind"].as_str().expect("a tag").to_string();
+                assert_eq!(tag, provider.kind());
+                tag
+            })
+            .collect();
+        assert_eq!(tags, PROVIDER_KINDS);
+    }
+
+    /// The four local rules, each reachable on its own.
+    ///
+    /// They are what `cide_agents::tools`' provider tool refuses on, and the reason the list is
+    /// asserted rule by rule rather than by count is that a caller acts on the *sentence*.
+    #[test]
+    fn an_incomplete_provider_names_what_is_missing() {
+        assert!(
+            keyed().providers[0].problems().is_empty(),
+            "a catalogued provider with an id is complete"
+        );
+        assert!(keyed().providers[1].problems().is_empty());
+
+        let nameless = LlmProvider::default();
+        let said = nameless.problems();
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("needs an id"), "{said:?}");
+
+        // Every custom rule at once, on a row that names itself, so each sentence is identifiable.
+        let empty_endpoint = LlmProvider::Custom {
+            id: "lmstudio".into(),
+            label: String::new(),
+            enabled: true,
+            npm: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            models: vec![LlmModel {
+                id: "openai/gpt-oss-20b".into(),
+                label: String::new(),
+                context: 32768,
+                output: 0,
+            }],
+        };
+        let said = empty_endpoint.problems();
+        assert!(said.iter().any(|why| why.contains("base URL")), "{said:?}");
+        assert!(
+            said.iter()
+                .any(|why| why.contains("only one of its two limits")),
+            "{said:?}"
+        );
+        // A model list of one *named* model is a model list, so that rule must not fire here.
+        assert!(
+            !said
+                .iter()
+                .any(|why| why.contains("must declare its models")),
+            "{said:?}"
+        );
+
+        // The blank row "Add model" appends: kept by `cleaned`, refused here.
+        let no_models = LlmProvider::Custom {
+            id: "lmstudio".into(),
+            label: String::new(),
+            enabled: true,
+            npm: String::new(),
+            base_url: "http://127.0.0.1:1234/v1".into(),
+            api_key: String::new(),
+            models: vec![LlmModel::default()],
+        };
+        let said = no_models.problems();
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("must declare its models"), "{said:?}");
+        assert!(said[0].contains("lmstudio"), "{said:?}");
+
+        // An external provider declares no endpoint and no models, so only the id rule applies.
+        let external = LlmProvider::External {
+            id: "openai".into(),
+            label: String::new(),
+            setup: String::new(),
+            expect: Vec::new(),
+        };
+        assert!(external.problems().is_empty());
     }
 }

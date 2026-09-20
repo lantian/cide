@@ -265,7 +265,18 @@ impl TaskComment {
 ///
 /// Committed, like the rest of `.cide/` — a screenshot a teammate attached to a task should be
 /// there when the task is. cide writes nothing to any `.gitignore` about it.
+/// **The pre-M68 layout.** Read, never written — see [`TaskAttachment::legacy_relative_path`].
 pub const ATTACHMENTS_DIR: &str = ".cide/attachments";
+
+/// The directory holding one subdirectory per task, relative to a project root: `.cide/tasks`.
+///
+/// Spelled here as well as in `cide_tasks::TASKS_DIR` for [`ATTACHMENTS_DIR`]'s stated reason: two
+/// crates need the attachment layout and only one of them may depend on `cide-tasks`, so the formula
+/// lives on the record itself. The two constants are asserted equal by `cide_tasks`' own test.
+pub const TASKS_DIR_RELATIVE: &str = ".cide/tasks";
+
+/// What a task's attachment directory is called inside its own directory.
+pub const ATTACHMENTS_LEAF: &str = "attachments";
 
 /// What an attachment's bytes are, coarsely: a picture the card can draw, or a file it names.
 ///
@@ -319,14 +330,45 @@ pub struct TaskAttachment {
 
 impl TaskAttachment {
     /// Where the bytes live, relative to the project root:
-    /// `.cide/attachments/<task>/<attachment>/<name>`.
+    /// `.cide/tasks/<task>/attachments/<attachment>/<name>`.
     ///
     /// A directory per attachment rather than a uuid-prefixed file name, so [`Self::name`] is the
-    /// real file name on disk and nothing has to be decoded to open it. The task id is a
-    /// component so `git rm -r .cide/attachments/t-17` is one gesture, and so a task's files are
-    /// listable without reading the tracker.
+    /// real file name on disk and nothing has to be decoded to open it.
+    ///
+    /// # Under the task's own directory since M68
+    ///
+    /// It used to be `.cide/attachments/<task>/…`, and the reason given for putting the task id in
+    /// the path was that `git rm -r .cide/attachments/t-17` should be one gesture. That reason is
+    /// better served here: `git rm -r .cide/tasks/t-17` takes the task's description, its whole
+    /// conversation **and** every file anybody attached to it, in one gesture — where the old layout
+    /// left `.cide/attachments/t-17/` behind, because deleting a task cleaned up one tree and not the
+    /// other.
+    ///
+    /// [`Self::legacy_relative_path`] is the old spelling, still read.
     #[must_use]
     pub fn relative_path(&self, task: &TaskId) -> PathBuf {
+        PathBuf::from(TASKS_DIR_RELATIVE)
+            .join(task.as_str())
+            .join(ATTACHMENTS_LEAF)
+            .join(self.id.as_str())
+            .join(&self.name)
+    }
+
+    /// Where the bytes lived before M68: `.cide/attachments/<task>/<attachment>/<name>`.
+    ///
+    /// # Why this is still here
+    ///
+    /// Because a relocation can be interrupted. The schema 1 → 2 conversion moves every attachment
+    /// directory, and a crash, a full disk or a `Ctrl-C` in the middle leaves some files moved and
+    /// some not. A reader that knew only the new path would answer *no such attachment* for the rest
+    /// — a thumbnail that never loads and an Open button that does nothing, with the bytes sitting
+    /// safely on disk the whole time.
+    ///
+    /// So every read tries [`Self::relative_path`] first and falls back to this. That makes a partial
+    /// move harmless rather than a bug report, and it costs one `stat` on a path that is usually
+    /// absent. It is **not** a write path: nothing new is ever written here.
+    #[must_use]
+    pub fn legacy_relative_path(&self, task: &TaskId) -> PathBuf {
         PathBuf::from(ATTACHMENTS_DIR)
             .join(task.as_str())
             .join(self.id.as_str())
@@ -621,11 +663,233 @@ pub struct Task {
     pub updated_unix_ms: u64,
 }
 
-/// The whole of `.cide/tasks.json`.
+/// One task as the *board* carries it: everything except its body, its log and its files. (M68)
 ///
-/// `{ "schemaVersion": 1, "rev": 42, "nextId": 18, "tasks": [ … ] }`, written with
+/// # Why this is a separate type and not `Task` with three keys left out
+///
+/// Two reasons, and the second is the one that decides it.
+///
+/// `Task::body` and `Task::comments` carry no `#[serde(default)]` — deliberately, because for
+/// those two an absent key is not a fact about the task but a truncated document. A `Task` with
+/// them omitted is therefore a *hard* deserialize failure, and giving them defaults to make the
+/// omission legal would re-open the argument [`TaskAuthor::user`] makes: once absent means
+/// `User`, or means "no comments", nothing downstream can tell a task that has none from a
+/// payload that did not carry any.
+///
+/// And that distinction is exactly what this type exists to keep. The board is index-shaped
+/// because `cide://tasks-changed` used to carry every word ever written into a project's tracker
+/// — 2.19 MB on a four-month-old board, of which the comments alone were 77.5% — and Tauri
+/// delivers an event by inlining the payload into a JavaScript **source string** and `eval`ing it
+/// on the GTK main loop (`tauri`'s `event::emit_js_script`). Measured: 10.2 ms to parse that board
+/// as JS source against 2.9 ms as JSON, per window, per comment an agent wrote. `TASKS_CHANGED`'s
+/// own doc has the rest.
+///
+/// So a row is what every consumer of the *list* already needed and nothing more: the panel's row
+/// draws a glyph, an id, a title and an agent chip, and every off-panel reader
+/// (`openCount`, the link pickers, `taskReveal`, the OpenSpec tab) reads status, id, title or
+/// `change`. A whole task is fetched by id when something opens one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskRow {
+    pub id: TaskId,
+    pub title: String,
+    pub status: TaskStatus,
+    /// The role this task is **for** — see [`Task::agent`], which this mirrors exactly.
+    pub agent: Option<AgentId>,
+    /// `#[ts(optional)]` **paired with `skip_serializing_if`**, unlike [`Task::session`].
+    ///
+    /// That pairing is not tidiness. `crate::docker`'s own header spells the failure out: on its
+    /// own, `#[ts(optional)]` changes the emitted *type* and not what serde writes, so the field
+    /// the TypeScript calls `undefined` arrives as `null`, `=== undefined` is false, and the next
+    /// property access throws. `Task` has carried that mismatch since M28 and `adapt.ts` absorbs
+    /// it with `== null`; a new type is a chance not to add a third instance of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub session: Option<SessionId>,
+    /// `#[ts(optional)]` + `skip_serializing_if`, on [`Self::session`]'s argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub change: Option<ChangeName>,
+    /// This task's own edges, tombstones included — [`Task::links`]' posture verbatim.
+    ///
+    /// Links stay on the row rather than moving to the content file with the log, because they
+    /// are read *across* tasks: `blocks` is derived by scanning every other task's list, and
+    /// auto-dispatch refuses a blocked task by reading its blockers' statuses. A reader that had
+    /// to open one file per task to answer "is this one blocked" would be loading the whole board
+    /// to render a list, which is the cost this type exists to avoid.
+    #[serde(default)]
+    pub links: Vec<TaskLink>,
+    #[serde(default = "TaskAuthor::user")]
+    pub created_by: TaskAuthor,
+    pub created_unix_ms: u64,
+    /// See [`Task::updated_unix_ms`] — the merge tiebreak and the panel's in-group sort key.
+    ///
+    /// **A write to a task's content must bump this**, or a comment stops moving its task's merge
+    /// rank and its position in the panel. Nothing throws; the board just quietly stops reordering.
+    pub updated_unix_ms: u64,
+    /// How many live comments the task has. A **cache**; the content file is the truth.
+    ///
+    /// Named `…Count` rather than `comments`, and it is worth the extra word: a field called
+    /// `comments` that is a number where every other reader expects a vector turns `.length` into
+    /// `undefined` instead of a type error, and `undefined > 0` is false — so a task with forty
+    /// comments would render as one with none, in silence. The name makes that a compile error.
+    ///
+    /// It is a cache because the count lives in a committed, hand-editable file separate from the
+    /// comments it counts, so the two can disagree — after a hand edit, a partial merge, or a
+    /// crash between two writes. `cide_tasks` recomputes it whenever it loads content and takes
+    /// content's answer, on `repair`'s rule for an attachment record: the file on disk wins over
+    /// the record that describes it.
+    pub comment_count: u32,
+    /// Live attachments across the body and every live comment, as one number. (M39's count.)
+    ///
+    /// A cache, on [`Self::comment_count`]'s terms. `cide_task_list` prints it because "there is a
+    /// file on this one" changes whether an agent spends a `cide_task_get`.
+    pub attachment_count: u32,
+}
+
+impl TaskRow {
+    /// Project one task down to the row the board carries. (M68)
+    ///
+    /// # Why this is on the DTO rather than in `cide-tasks`
+    ///
+    /// [`TaskAttachment::relative_path`]'s reason, verbatim: two crates need the formula and only one
+    /// of them may depend on `cide-tasks`. The store builds rows, and `cide_agents::tools` needs one
+    /// to render `cide_task_get`'s header from a whole task it was handed — so the formula lives on
+    /// the record, where there is exactly one of it.
+    ///
+    /// That single-producer property is the whole point. The two counts are the one part of a row that
+    /// is not a field copy, and a second place computing them would be a second answer to *how many
+    /// comments does this task have* — where both copies are plausible, and a wrong count looks exactly
+    /// like a right one until somebody opens the card it describes.
+    ///
+    /// `deleted` is filtered on both, matching what the panel and `cide_task_list` draw: a tombstoned
+    /// comment is one the user removed and `adapt.ts` drops it at the seam, so counting it would put a
+    /// `3 comment(s)` on a card showing two. Attachments are counted across the body **and** every
+    /// live comment, which is [`TaskAttachment`]'s own reading of where a task's files live — and a
+    /// comment's attachments are skipped wholesale when the comment itself is a tombstone, because
+    /// `TaskEdit::DeleteComment` tombstones them with it.
+    #[must_use]
+    pub fn of(task: &Task) -> Self {
+        let live_comments = || task.comments.iter().filter(|comment| !comment.deleted);
+        let live = |attachments: &[TaskAttachment]| {
+            attachments
+                .iter()
+                .filter(|attachment| !attachment.deleted)
+                .count()
+        };
+        let attachments = live(&task.attachments)
+            + live_comments()
+                .map(|comment| live(&comment.attachments))
+                .sum::<usize>();
+        Self {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            status: task.status,
+            agent: task.agent.clone(),
+            session: task.session,
+            change: task.change.clone(),
+            links: task.links.clone(),
+            created_by: task.created_by.clone(),
+            created_unix_ms: task.created_unix_ms,
+            updated_unix_ms: task.updated_unix_ms,
+            // Saturating rather than `as`: a `usize` that does not fit a `u32` is four billion comments
+            // on one task, and a wrapping cast would report a small number for an enormous one — the
+            // one way a count can be wrong that reads as ordinary.
+            comment_count: u32::try_from(live_comments().count()).unwrap_or(u32::MAX),
+            attachment_count: u32::try_from(attachments).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// One whole task, as `task_get` answers it: its [`TaskRow`] and everything the row leaves out.
+/// (M68)
+///
+/// # Why the row is nested rather than flattened in
+///
+/// Because the two counts have exactly one producer, `cide_tasks::row_of`, and they must keep it.
+/// A shape that inlined the row's fields beside the content ones would have to either carry the
+/// counts again — a second place deriving a number, where both copies are plausible and a wrong one
+/// looks exactly like a right one — or omit them, which pushes the derivation into the *frontend*
+/// adapter and puts the same second copy one layer further away.
+///
+/// Nesting keeps it to one: whoever builds this asks `row_of` for the row, and every consumer,
+/// wire or webview, spreads that answer.
+///
+/// It also happens to be the shape the storage split is heading for — a row from the index joined
+/// to a content file — so this is the join, written down once while both halves still live in one
+/// file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskDetail {
+    pub row: TaskRow,
+    /// The whole statement of the work, possibly empty — [`Task::body`]'s posture verbatim.
+    pub body: String,
+    pub comments: Vec<TaskComment>,
+    /// The body's files. A comment's ride in its own [`TaskComment::attachments`].
+    pub attachments: Vec<TaskAttachment>,
+    pub history: Vec<TaskStatusChange>,
+}
+
+/// One task's content: everything about it that is not in the index. (M68)
+///
+/// The whole of `.cide/tasks/<task-id>/task.json`:
+/// `{ "body": "…", "comments": [ … ], "history": [ … ], "attachments": [ … ] }`.
+///
+/// # Why a task's own file, and why these four fields
+///
+/// Because this is where a tracker's bytes actually are. Measured on a four-month-old board: 2.19 MB
+/// across 126 tasks, of which the comment text alone was 77.5% and the bodies another 18%. The index
+/// beside it is 4.5% — and the index is what every *list* reads, what the board broadcasts, and what
+/// a mutation has to rewrite. Splitting along that line makes the hot file bounded by task **count**
+/// rather than by every word ever written into the project, with no policy deciding what is "cold".
+///
+/// The four fields are the ones no reader of a list needs and no reader of a card can do without.
+/// `attachments` here is the **body's**; a comment's ride in its own [`TaskComment::attachments`],
+/// which is why `cide_tasks::attachment_record` searches the two chained together and why splitting
+/// them across two files would put one lookup on both sides of a lazy load.
+///
+/// Tombstones live here, as they do everywhere in this file's vocabulary: a deleted comment stays so
+/// that a merge against a stale copy cannot resurrect it. `adapt.ts` is the single seam that drops
+/// them, and it is deliberately in the webview — see `cide_tasks::detail_of`.
+///
+/// **No `rev` and no schema of its own.** Both would be a second ordering counter over one logical
+/// document, and `emit::tasks_changed`'s doc spends a paragraph on why that is a trap. The index
+/// carries the version for the whole tracker; a content file is dated by its own mtime, which is
+/// what `cide_tasks` compares before it writes one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskContent {
+    /// The whole statement of the work, possibly empty — [`Task::body`]'s posture verbatim.
+    ///
+    /// `#[serde(default)]`, unlike `Task::body`, and the difference is the point: a `Task` with no
+    /// `body` key is a truncated document, while a content file with none is a task nobody has
+    /// written a description for. Here the absence is a fact about the task, which is exactly the
+    /// test [`TaskAuthor::user`]'s doc sets for when a default is honest.
+    #[serde(default)]
+    pub body: String,
+    /// Oldest first, which is the order the panel renders and an agent reads.
+    #[serde(default)]
+    pub comments: Vec<TaskComment>,
+    /// Every status transition, oldest first. (M27)
+    #[serde(default)]
+    pub history: Vec<TaskStatusChange>,
+    /// The body's files. Records only; the bytes are at [`TaskAttachment::relative_path`]. (M39)
+    #[serde(default)]
+    pub attachments: Vec<TaskAttachment>,
+}
+
+/// The index: the whole of `.cide/tasks.json`.
+///
+/// `{ "schemaVersion": 2, "rev": 42, "nextId": 18, "tasks": [ … ] }`, written with
 /// `to_vec_pretty`, because a one-line JSON file makes every change a whole-file diff and this
 /// file's diffs are read by people.
+///
+/// **Rows since M68**, not whole tasks — [`TaskContent`] has the argument, and `schemaVersion` went
+/// to 2 with it. Schema 1 was every task inline here; `cide_tasks::read` migrates such a file and
+/// nothing writes one again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -677,12 +941,23 @@ pub struct TaskFile {
     /// tie-break (`groups` in `ui/src/sidebar/TasksPanel/model.ts` carries the argument). That
     /// is a reading order derived from stamps this struct already carries, not a second stored
     /// one, which is why it does not reopen the argument above.
-    pub tasks: Vec<Task>,
+    pub tasks: Vec<TaskRow>,
 }
 
 impl TaskFile {
     /// The shape this build writes.
-    pub const CURRENT_SCHEMA: u32 = 1;
+    ///
+    /// **2 since M68**: the index plus one `.cide/tasks/<id>/task.json` per task. 1 was the whole
+    /// tracker in this one file; `cide_tasks::read` migrates it, and nothing writes a 1 again.
+    pub const CURRENT_SCHEMA: u32 = 2;
+
+    /// The first schema this build can still *read*.
+    ///
+    /// Named rather than spelled inside the ladder so that dropping support for a version is a
+    /// visible edit to a constant with a doc comment, instead of the quiet deletion of a match arm.
+    /// A tracker is a file in somebody's repository and a build that refused last year's is the
+    /// tracker locking a team out of its own history.
+    pub const OLDEST_READABLE_SCHEMA: u32 = 1;
 }
 
 impl Default for TaskFile {
@@ -739,7 +1014,17 @@ pub enum TaskBoard {
         error: String,
     },
     /// Read. `tasks: []` is a real, reportable zero — a tracker that exists and is empty.
-    Ready { tasks: Vec<Task>, rev: u64 },
+    ///
+    /// **Rows, not whole tasks** (M68) — see [`TaskRow`] for the measured reason. A body, a log
+    /// and a task's files are fetched by id, once something opens one.
+    ///
+    /// `rev` must stay on this arm. The receiving store's drop rule is
+    /// `Number.isFinite(next.rev) && next.rev > current.rev` (`newerBoard`, in
+    /// `ui/src/sidebar/TasksPanel/model.ts`), so a `rev` that went missing would make
+    /// `Number.isFinite(undefined)` false, every snapshot would be judged not-newer, and the panel
+    /// would freeze on whatever board it happened to hold — for the rest of the session, with no
+    /// type error anywhere and nothing logged.
+    Ready { tasks: Vec<TaskRow>, rev: u64 },
 }
 
 /// A new task. Inbound.
@@ -1168,7 +1453,16 @@ mod tests {
         let path = task.attachments[0].relative_path(&task.id);
         assert_eq!(
             path,
-            PathBuf::from(".cide/attachments/t-17/a-1/design-v3.png")
+            PathBuf::from(".cide/tasks/t-17/attachments/a-1/design-v3.png"),
+            "under the task's own directory since M68, so `git rm -r .cide/tasks/t-17` takes a \
+             task's description, its conversation and its files in one gesture"
+        );
+        assert_eq!(
+            task.attachments[0].legacy_relative_path(&task.id),
+            PathBuf::from(".cide/attachments/t-17/a-1/design-v3.png"),
+            "and the pre-M68 spelling is still computable, because a relocation that was \
+             interrupted leaves files there and a reader that could not name them would report \
+             every one of them as missing"
         );
         assert!(
             path.is_relative(),

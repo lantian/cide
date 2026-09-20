@@ -63,9 +63,9 @@ pub mod tools;
 pub use config::{AgentsConfig, CideConfig, Isolation};
 pub use defs::{AgentProblem, Catalog, LoadedAgent, Severity};
 pub use harness::{
-    ClaudeHarness, CodexHarness, ContinueSpec, Delivery, FailoverReason, Harness, HarnessError,
-    HarnessSpawn, Observation, OpencodeHarness, QwenHarness, RenderState, RunPlan, SessionBinding,
-    for_kind, registry,
+    ClaudeHarness, CodexHarness, ContinueSpec, Delivery, ERASE_MARKER, FailoverReason, Harness,
+    HarnessError, HarnessSpawn, Observation, OpencodeHarness, QwenHarness, RenderState, RunPlan,
+    SessionBinding, for_kind, registry,
 };
 pub use tools::{Content, TaskSink, ToolResult, descriptors, dispatch};
 

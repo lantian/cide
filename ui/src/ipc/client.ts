@@ -41,9 +41,12 @@ import type {
   KeymapReport,
   LogLineDetail,
   ResolvedBinding,
+  DirSummary,
   FileBytesHead,
   FileBytesWrite,
   FileDoc,
+  FileProperties,
+  FilePropertiesGit,
   ImageDoc,
   FileStamp,
   PaneId,
@@ -1832,6 +1835,29 @@ export const file = {
   stat: (path: string) => invoke<FileStamp | null>('file_stat', { path }),
 
   /**
+   * Everything the properties card's first block shows about a path. (M70)
+   *
+   * One `symlink_metadata` and, for a plausible text file, one bounded read — fast enough that
+   * the card opens on it. The directory walk (`propertiesDir`) and the git walk
+   * (`history.pathProperties`) are separate calls that fill their rows in afterwards, so a
+   * right-click on `node_modules/` costs a pending row rather than a card that does not appear.
+   *
+   * Every stat here is the **link's own** for a symlink, never its target's — `files.stat`
+   * above cannot be reused for this because `document::stamp_at` canonicalises first, which
+   * would put another file's size, mode and mtime under this one's name with no symptom at all.
+   */
+  properties: (path: string) => invoke<FileProperties>('file_properties', { path }),
+
+  /**
+   * What a directory contains: entry counts and the bytes they add up to. (M70)
+   *
+   * The slow half, and its own call for that reason. The walk is bounded and says so —
+   * `DirSummary.truncated` means every count in the answer is a lower bound, and the card is
+   * obliged to render *at least …* rather than a number that looks exact.
+   */
+  propertiesDir: (path: string) => invoke<DirSummary>('file_properties_dir', { path }),
+
+  /**
    * A file's bytes, with the stamp they were read under. (M63)
    *
    * The one `invoke` in this file whose answer is not JSON. `file_read_bytes` answers a raw
@@ -3154,6 +3180,22 @@ export const history = {
     invoke<RepoPath | null>('git_locate', { project, path }),
 
   /**
+   * The properties card's Git block for one path. (M70)
+   *
+   * `null` means the path is in no repository this project holds — a file under `/tmp`, or a
+   * project that was never `git init`ed. The card then draws **no Git block at all**, rather
+   * than an empty one making claims about a file git has never heard of.
+   *
+   * Deliberately not `logWalk.page`. That command keys its cancellation by `(project, tab)` and
+   * a modal has no tool tab; borrowing the Log tab's id would cancel that tab's in-flight page
+   * every time somebody opened a properties card — and a cancelled page is explicitly *not* an
+   * error, so the Log tab would just go quiet with nothing reported anywhere. Rust walks
+   * `cide_git::log` directly instead, bounded small enough that there is nothing to cancel.
+   */
+  pathProperties: (project: ProjectId, path: string) =>
+    invoke<FilePropertiesGit | null>('file_properties_git', { project, path }),
+
+  /**
    * Annotate one file.
    *
    * `contents` is the editor's buffer and is sent **only when the tab is dirty** — passing it
@@ -3193,7 +3235,7 @@ export const history = {
  * happened, and the frame in between shows a list that is visibly wrong. It also means a
  * mutation needs no `hydrate()` follow-up and no wait for the broadcast to come back round.
  * --------------------------------------------------------------------------------------- */
-import type { TaskBoard, TaskEdit, TaskId, TaskNew } from './generated'
+import type { TaskBoard, TaskDetail, TaskEdit, TaskId, TaskNew } from './generated'
 
 export const tasks = {
   /**
@@ -3211,6 +3253,42 @@ export const tasks = {
    */
   board: (project: ProjectId) =>
     pendingCommand('tasks_board', () => invoke<TaskBoard>('tasks_board', { project }), null),
+
+  /**
+   * One whole task: the row joined to its body, log, history and files. (M68)
+   *
+   * The board carries rows, so this is how the card gets the rest. `null` is an **ordinary**
+   * answer — the task has gone, which happens when another window deletes the one you have open —
+   * and it is also what a build with no such handler answers, for `board`'s reason: this is called
+   * from a render effect and a rejection out of one blanks the window under React 19. Both mean
+   * *nothing to draw content from*, and `TaskDetailHost` keeps the pending card up rather than
+   * claiming the task is empty.
+   */
+  get: (project: ProjectId, task: TaskId) =>
+    pendingCommand(
+      'task_get',
+      () => invoke<TaskDetail | null>('task_get', { project, task }),
+      null,
+    ),
+
+  /**
+   * Which task ids match the search box. (M68)
+   *
+   * In Rust because the text is: a query runs over the id, the title **and the body**, and the
+   * body left the board when the board stopped being two megabytes of JavaScript source per
+   * window per mutation. `cide_tasks::search` is the one definition of a hit.
+   *
+   * `null` in a build that cannot answer, which the panel reads as *no query* — showing everything
+   * rather than narrowing to nothing. A search box that silently matched no task would draw
+   * `No tasks match "…"` over a board that contains it, which is the confident false negative the
+   * panel's three separate empty screens exist to prevent.
+   */
+  search: (project: ProjectId, query: string) =>
+    pendingCommand(
+      'task_search',
+      () => invoke<readonly TaskId[]>('task_search', { project, query }),
+      null,
+    ),
 
   /*
    * The three mutations are **not** wrapped, and the asymmetry is the design.
@@ -3682,7 +3760,21 @@ export const agentRuns = {
   dispatch: (request: DispatchRequest) => invoke<RunId>('agents_dispatch', { request }),
 
   /**
-   * End a run: cancel it if it is still queued, kill its child if it has one.
+   * End a run **now**: cancel it if it is still queued, kill its child if it has one.
+   *
+   * # This is the outright kill, and `cide_agent_stop` is not — on purpose
+   *
+   * Since M67 the MCP tool an orchestrator calls *asks* a run to wind down first: it interrupts
+   * the turn, tells the run why it is being stopped, and gives it the project's
+   * `agents.stopGraceSecs` to write what it finished and what it was part-way through onto its
+   * task before killing it. This button does none of that. Two routes to one word meaning two
+   * things is normally the split `openPushDialog` exists to prevent, and it is deliberate here:
+   * a person pressing Stop on a run they are watching wants it stopped, and has the row in
+   * front of them to see that it was.
+   *
+   * If this ever grows a wind-down, the way to force is a **second press** on an
+   * already-stopping row — `stop_route` in `cide_app::agents` already answers `Kill` for that —
+   * and not a modifier, which would be an undiscoverable gesture for a destructive act.
    *
    * Answers nothing, unlike every mutation in `tasks` — there is no roster to hand back,
    * because a stop is not the only writer of one: the registry broadcasts

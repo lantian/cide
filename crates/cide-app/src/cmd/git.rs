@@ -182,6 +182,46 @@ pub async fn git_locate(
     blocking(move || Ok(cide_git::repo::locate(&roots, &path))).await
 }
 
+/// The properties card's Git block for one path. (M70)
+///
+/// `Ok(None)` means *this path is in no repository this project holds* — a file under `/tmp`, or
+/// a project that was never `git init`ed. The card then draws no Git block at all, rather than an
+/// empty one making claims about a file git has never heard of.
+///
+/// # Why this is not [`git_log`]
+///
+/// [`git_log`] keys its cancellation flag by `(project, tab)` so a superseded walk stops within
+/// one commit. A modal has no tool tab. Handing this one the Log tab's id would cancel that tab's
+/// in-flight page every time somebody opened a properties card — and a cancelled page is
+/// explicitly *not* an error, so the Log tab would go quiet with nothing reported anywhere.
+/// Minting a sentinel is the `DOCKER_TAB` hazard, already written up as a thing that must never
+/// reach a command taking a uuid.
+///
+/// So `cide_git::properties` walks `cide_git::log` directly, bounded small enough that there is
+/// nothing worth cancelling. It is still the same walk function the Log tab uses — one producer,
+/// `cide_git::push::preview`'s rule — so a change to how cide follows a rename reaches this card
+/// without anybody remembering it exists.
+///
+/// Does not broadcast: a log is a read, exactly as [`git_log`] says.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_properties_git(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    path: PathBuf,
+) -> Result<Option<cide_ipc::FilePropertiesGit>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        // `locate` and `discover` rather than prefix arithmetic: the innermost repository wins,
+        // a project root is not always a repository root, and a submodule has its own history.
+        let Some(located) = cide_git::repo::locate(&roots, &path) else {
+            return Ok(None);
+        };
+        let repos = cide_git::repo::discover(&roots);
+        cide_git::properties::path_summary(&repos, &located).map(Some)
+    })
+    .await
+}
+
 /// One page of one repository's log — and, with `query.path` set, one file's history. (M18)
 ///
 /// One command rather than two, because the Log tab and a History tab differ by exactly one

@@ -2003,6 +2003,36 @@ try {
         'nothing would leave the user no way to clear what they typed',
     )
 
+    /*
+     * The frame between a keystroke and `task_search`'s answer. (M68)
+     *
+     * The rule this pins is a *refusal to claim*: with no id set in hand the panel narrows
+     * nothing and says nothing. The tempting collapse — treat "no answer yet" as "nothing
+     * matched" — would print `No tasks match "quaternion"` about a search that had not run, over
+     * a board that may well contain it, and it would do so on exactly the frame the user is
+     * looking at while they type. Only the markup can see this: in the model it is one nullable
+     * argument.
+     */
+    const pending = t('list-search-pending')
+    eq(
+      pending.rows?.length,
+      4,
+      'a typed query whose answer has not landed narrows NOTHING — a stale-but-whole list is a ' +
+        'worse filter and a far better claim than an empty one',
+    )
+    eq(
+      pending.noMatch,
+      false,
+      'and draws no empty screen: nothing is asserted about a search that has not run',
+    )
+    eq(pending.searchValue, 'quaternion', 'while the box still holds what was typed')
+    eq(
+      pending.rows,
+      t('list').rows,
+      'in fact it is byte-identical to the unnarrowed list — which is the whole claim, and a ' +
+        'stronger statement of it than any count',
+    )
+
     eq(t('empty').search, false, 'an empty tracker draws no search box: there is nothing to find')
     eq(t('absent').search, false, 'nor does a project with no tracker file')
     eq(t('unreadable').search, false, 'nor an unreadable one, which offers only Reveal and Retry')
@@ -2384,6 +2414,70 @@ try {
     for (const name of ['card', 'card-spec-ready']) {
       eq(tasks[name].deleteDanger, true, `${name}: Delete carries the danger colour unarmed`)
     }
+  }
+
+  /* == the pending card (M68) =============================================================== */
+
+  {
+    /*
+     * The card before `task_get` has answered.
+     *
+     * Everything this component must *not* draw is also what a card with genuinely empty content
+     * does not draw, so absence alone proves nothing here — the exemption loop below would pass
+     * over a pending card that had quietly started claiming the task was empty, and pass over one
+     * that rendered nothing at all. What makes the absences mean something is the **note**: the
+     * card says which content is on its way, and that sentence is the only thing that separates
+     * "not fetched" from "there is none".
+     *
+     * So each absence below is asserted *beside* the note, and the two forbidden sentences are
+     * named outright. They are the ones the loaded card draws for real content, and either of them
+     * over an unfetched task is a confident false claim about the user's own data — the failure
+     * `BOARD_UNKNOWN` prevents one level up and `TaskDetailView` makes unrepresentable one type
+     * over.
+     */
+    for (const name of ['card-pending', 'card-pending-long-title']) {
+      const d = t(name)
+      ok(
+        d.text?.includes('Loading the description and log'),
+        `${name}: the card names what is on its way — the sentence that makes every absence ` +
+          'below a statement about the FETCH rather than about the task',
+      )
+      ok(
+        !d.text?.includes('No comments yet'),
+        `${name}: and never the loaded card's empty-log sentence, which over an unfetched task ` +
+          'is a confident claim that a conversation does not exist',
+      )
+      ok(
+        !d.text?.includes('No description'),
+        `${name}: nor its empty-body one, for the same reason`,
+      )
+      eq(d.comments ?? [], [], `${name}: no log is drawn`)
+      eq(d.historyDrawn ?? false, false, `${name}: no status history`)
+      eq(
+        d.writeControls ?? 0,
+        0,
+        `${name}: and NOTHING that writes — a field editor seeded from a body nobody fetched ` +
+          'opens empty, reports dirty on the first keystroke, and commits that emptiness over ' +
+          'the real text. That is the one failure here that destroys the user\'s work rather ' +
+          'than misreporting it, and the type makes it unrepresentable; this is the belt.',
+      )
+    }
+
+    /*
+     * The head is a function of the row, and the row is already in hand — so it is drawn in full
+     * rather than approximated. A pending card that showed a spinner over nothing would read as a
+     * bug; one that shows the id, the status glyph and the title reads as a card still loading.
+     */
+    const d = t('card-pending')
+    ok(d.text?.includes('t-14'), 'the id is drawn: the row already knows it')
+    ok(d.text?.includes('Add the retry bar'), 'and the title, for the same reason')
+    eq(
+      d.buttons?.length,
+      1,
+      'with exactly one control — the way out, always available. Icon-only, so the digest reads ' +
+        'its text as empty; that it is the CLOSE is what `aria-label` carries, and the count is ' +
+        'what matters here: one control, and nothing that writes.',
+    )
   }
 
   /* == attachments (M39) ==================================================================== */

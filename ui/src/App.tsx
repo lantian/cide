@@ -103,6 +103,7 @@ import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore
 import { OutsideOpenGate } from '@/chrome/OutsideOpenGate'
 import { LogDetailCard } from '@/chrome/LogDetailCard'
 import { PullStrategyGate } from '@/chrome/PullStrategyGate'
+import { FileProperties } from '@/chrome/FileProperties'
 import { PushDialog } from '@/chrome/PushDialog'
 import { ConflictsDialog } from '@/chrome/ConflictsDialog'
 import { requestOutsideOpen } from '@/chrome/outsideOpenStore'
@@ -1451,6 +1452,17 @@ export function App() {
         <PullStrategyGate />
         <PushDialog />
         <ConflictsDialog />
+        {/*
+          * The properties card, and `onOpenHistory` is deliberately **not** passed here.
+          *
+          * `file.properties` carries no `shellWindow` clause — an overlay is raisable from any
+          * window, which is `git.blame`'s stated precedent — so the command is live in this
+          * window and the card has to be mounted in this branch or the keystroke asks nobody at
+          * all, with nothing on screen and nothing logged. But a detached-pane window has no
+          * tool window, so the one control that would open one is simply not drawn, rather than
+          * being offered and then reporting that this window cannot do it.
+          */}
+        <FileProperties />
       </>
     )
   }
@@ -2054,6 +2066,16 @@ export function App() {
         <PullStrategyGate />
         <PushDialog />
         <ConflictsDialog />
+        {/* The shell has a tool window, so here the card may offer the way into it. The repo and
+            the repo-relative path come off the answer the card already holds, so this route does
+            not re-run `git_locate` the way `git.history.file` has to. */}
+        <FileProperties
+          onOpenHistory={(repo, relPath) => {
+            const project = activeProjectId
+            if (project === null) return
+            void toolWindowApi.openHistory(project, repo, relPath).catch(() => {})
+          }}
+        />
 
         {/*
           * The open task's card, over whichever panel selected it. Outside every `sidebar.view`
@@ -2291,6 +2313,14 @@ const WorkspaceContent = memo(function WorkspaceContent({
                     // — live in one dispatch case, and a second copy in a menu handler is a second
                     // copy that stops matching.
                     onShowHistory={(path) => runCommand('git.history.file', { path })}
+                    /*
+                     * *Properties*, through `runCommand` for the reason `onShowHistory` beside
+                     * it routes that way: the path resolution and every refusal sentence live in
+                     * one dispatch case. The file tree's copy of this row calls the opener
+                     * directly instead, because it already holds a path the tree resolved — both
+                     * ends land on `openFileProperties`.
+                     */
+                    onProperties={(path) => runCommand('file.properties', { path })}
                     onSplit={() => {
                       // Splits the focused pane sideways with the tab's default intent —
                       // a shell in the pinned console, a new session in a ClaudeFull tab.

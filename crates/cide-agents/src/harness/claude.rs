@@ -99,7 +99,7 @@ use cide_pty::{Geometry as PtyGeometry, SpawnSpec};
 use cide_ipc::HarnessSession;
 
 use super::{
-    ADHOC_PREAMBLE, ContinueSpec, Delivery, Harness, HarnessError, HarnessSpawn, Observation,
+    ADHOC_PREAMBLE, ContinueSpec, Delivery, ESC, Harness, HarnessError, HarnessSpawn, Observation,
     RunPlan, SERVER, SessionBinding, tracker_preamble,
 };
 
@@ -155,6 +155,17 @@ impl Harness for ClaudeHarness {
     }
     fn deliver(&self, text: &str) -> Delivery {
         Delivery::Stdin(submit(text))
+    }
+
+    /// Esc, which is how a person at this TUI ends a turn in flight.
+    ///
+    /// One byte and not two: a second Esc is the history gesture, not a harder interrupt, and a
+    /// pair sent together would open the composer's history over the wind-down line about to be
+    /// typed. See `cide_app::agents`' stop road for the beat that has to follow it — bytes
+    /// arriving in the same `read` as the Esc are read by a TUI that is still tearing its turn
+    /// down, which is `type_submitted_line`'s measured failure in a new place.
+    fn interrupt(&self) -> Option<Vec<u8>> {
+        Some(vec![ESC])
     }
 
     /// `claude`, and the conversation as the [`cide_ipc::SessionId`] it already is.

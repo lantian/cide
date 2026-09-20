@@ -35,7 +35,7 @@ use std::sync::Arc;
 use cide_core::CoreError;
 use cide_ipc::{
     AttachTarget, ImageDoc, ProjectId, StagedFile, TaskAttachmentId, TaskAuthor, TaskBoard,
-    TaskEdit, TaskId, TaskNew,
+    TaskDetail, TaskEdit, TaskId, TaskNew,
 };
 use cide_tasks::{TaskStore, attachments};
 use tauri::{Manager, State};
@@ -93,6 +93,64 @@ pub async fn tasks_board(
     let root = tasks_state::project_root(&state, project)?;
     let stores = Arc::clone(&stores);
     blocking(move || Ok(tracker(&stores, project, root).board())).await
+}
+
+/// One whole task — body, log, history, files — by id. (M68)
+///
+/// The other half of the board going index-shaped: [`cide_ipc::TaskRow`] carries what a *list*
+/// needs, and this carries what opening one needs. `None` is an ordinary answer, not a refusal: a
+/// card can be open on a task another window has just deleted, and the panel's job then is to
+/// close itself rather than to show an error about an id the user never typed.
+///
+/// **An answer here is a snapshot, not a subscription.** The reply carries no `rev` because the
+/// board's does: the caller already holds a board, learns from `cide://tasks-changed` that the
+/// tracker moved, and asks again. A `rev` on this reply would be a second ordering counter over
+/// the same file, which is the trap `emit::tasks_changed`'s doc spends a paragraph on — one
+/// counter, one high-water mark.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_get(
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    task: TaskId,
+) -> Result<Option<TaskDetail>> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    blocking(move || {
+        Ok(tracker(&stores, project, root)
+            .get(&task)
+            .as_ref()
+            .map(cide_tasks::detail_of))
+    })
+    .await
+}
+
+/// Which tasks match the search box: ids, in the file's own order. (M68)
+///
+/// Searching moved out of the webview because the text moved out of the board — `cide_tasks::search`
+/// carries the whole argument, including why the rule is *id, title and body* and not the comments.
+///
+/// **Ids rather than rows**, deliberately. The panel already holds a row for every task, so
+/// answering with rows would send a second copy of the board over the wire on every keystroke and
+/// leave the panel deciding which of two copies of one task to draw. An id set is the smallest
+/// thing that answers the question, and it composes with the status filter the panel applies
+/// anyway.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_search(
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    query: String,
+) -> Result<Vec<TaskId>> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    blocking(move || {
+        // `TaskStore::search`, not the free function: the store owns the policy about how many content
+        // files to open, and a search is the one operation that wants all of them. The rule itself is
+        // `cide_tasks::search`'s, which the store calls with its own bodies.
+        Ok(tracker(&stores, project, root).search(&query))
+    })
+    .await
 }
 
 /// Create a task, and answer with the board it landed in.

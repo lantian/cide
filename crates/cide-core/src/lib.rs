@@ -40,6 +40,8 @@ pub mod persist;
 /// cide forked — a wrapper, a shell, a re-exec through a proxy.
 pub mod proc;
 pub mod profile;
+/// What a path *is* — OS stat, and what one pass over a text file's bytes says. (M70)
+pub mod properties;
 pub mod proxy;
 /// Editor colour schemes: importing a VS Code theme, and the imported ones on disk.
 pub mod scheme;
