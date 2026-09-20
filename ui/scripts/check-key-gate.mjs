@@ -293,6 +293,7 @@ try {
     // It was missing from this fixture for a whole milestone because `rustDefaults()` above
     // could not see a 3-tuple — see the note there.
     { key: 'ctrl+b', command: 'navigate.definition', when: 'editorFocused' },
+    { key: 'f1', command: 'navigate.documentation', when: 'editorFocused' },
     // M14. Find usages, on IDEA's chord. Scoped for the same reason ⌃B is, and it is not
     // theoretical here: F7 encodes as `ESC [ 18 ~` and Alt+F7 as `ESC ESC [ 18 ~`, so an
     // unconditional binding would take a key `mc` puts a menu on, in every terminal pane in every

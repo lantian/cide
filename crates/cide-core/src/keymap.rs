@@ -463,6 +463,14 @@ pub fn defaults() -> Vec<Binding> {
             // On macOS `platform_layer` rewrites this to ⌘B, which is IDEA's mac binding for the
             // same action — correct by luck rather than by exception, but correct.
             ("ctrl+b", "navigate.definition", "editorFocused"),
+            // Quick documentation. (M60) `f1`, which is IDEA's *macOS* chord for it and free in
+            // every layer here: nothing in `defaults()` binds an f-key below `f3`, CodeMirror
+            // binds no F1, and xterm sends it as `ESC O P` — which `mc`-style TUIs do read, so
+            // the `editorFocused` scope is doing the same work it does for `ctrl+b`. Not IDEA's
+            // Linux `ctrl+q`: that is XON in every terminal pane, the partner of the `ctrl+s`
+            // this table already argues about, and `platform_layer` would rewrite it to ⌘Q on a
+            // Mac, which quits the application.
+            ("f1", "navigate.documentation", "editorFocused"),
             /*
              * Find usages — IDEA's own chord, unchanged. (M14)
              *

@@ -30,4 +30,4 @@
  * So `as_str` is now the *only* spelling, serde is told to use it, and `check-ext.mjs` compares
  * against `generated.ts` — the artefact that actually crosses the boundary.
  */
-export type Capability = "editor:read" | "editor:write" | "fs:read" | "git:read" | "process:spawn";
+export type Capability = "editor:read" | "editor:write" | "fs:read" | "git:read" | "lsp:connect" | "process:spawn";

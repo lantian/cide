@@ -42,6 +42,15 @@ pub enum Effect {
     },
     /// The source's status changed.
     Status(SourceStatus),
+    /// A notification the session has no arm for, handed up whole. (M60)
+    ///
+    /// Not every notification is the protocol's: Godot answers `textDocument/declaration` on a
+    /// built-in with a `gdscript/show_native_symbol` notification carrying the class's
+    /// documentation, and a caller that sent the request is waiting for exactly that. The
+    /// supervisor delivers it to a waiter registered for the method
+    /// (`Requester::expect_notification`) and drops it otherwise — so a notification nobody
+    /// asked for costs one map lookup, which is what dropping it cost before.
+    Notification { method: String, params: Value },
 }
 
 /// Where the handshake has got to.
@@ -159,6 +168,22 @@ impl Session {
         server: Server,
         init_options: Option<Value>,
     ) -> (Self, Vec<Effect>) {
+        Self::with_transport(roots, server, init_options, Transport::Stdio)
+    }
+
+    /// [`Session::with_init_options`], saying how the server is reached. (M59)
+    ///
+    /// A parameter and not a registry lookup (`server.def().connect`), for the tests' sake: the
+    /// registry is process-global and nothing under `#[cfg(test)]` may `install` into it
+    /// (`tests/registry.rs` says why), so a handshake that read the transport off the registry
+    /// could never be driven with a socket in-crate. `server.rs` is the one caller and already
+    /// holds the candidate.
+    pub fn with_transport(
+        roots: &[std::path::PathBuf],
+        server: Server,
+        init_options: Option<Value>,
+        transport: Transport,
+    ) -> (Self, Vec<Effect>) {
         let mut session = Self {
             phase: Phase::Initializing,
             progress: std::collections::BTreeMap::new(),
@@ -175,7 +200,7 @@ impl Session {
             "jsonrpc": "2.0",
             "id": session.initialize_id,
             "method": "initialize",
-            "params": initialize_params(roots, server, session.init_options.as_ref()),
+            "params": initialize_params(roots, server, session.init_options.as_ref(), transport),
         });
         let effects = vec![
             Effect::Send(request),
@@ -329,7 +354,14 @@ impl Session {
                     self.push_status(&mut effects);
                 }
             }
-            _ => {}
+            // Every other notification is handed up: nobody here knows what it means, but a
+            // caller may be waiting for it by name. See [`Effect::Notification`].
+            (method, None) => {
+                effects.push(Effect::Notification {
+                    method: method.to_string(),
+                    params,
+                });
+            }
         }
 
         effects
@@ -696,6 +728,35 @@ impl Session {
             Effect::Send(json!({ "jsonrpc": "2.0", "method": "exit" })),
         ]
     }
+
+    /// The orderly half for a server cide did not start: `shutdown`, and **never `exit`**. (M59)
+    ///
+    /// `exit` asks a server *process* to end. An attached server is somebody else's process — the
+    /// running Godot editor, serving up to eight clients at once — and asking it to exit would be
+    /// asking the user's editor to close on cide's account. Godot binds no handler for either (a
+    /// `shutdown` request is answered `-32601`, an `exit` notification is dropped), so against it
+    /// the difference is invisible today; the rule exists for the server that does implement
+    /// them, and `server.rs`'s socket ladder accepts *any* reply to this id, error included.
+    pub fn detach(&mut self) -> Vec<Effect> {
+        self.phase = Phase::Stopping;
+        let id = self.next_id;
+        self.next_id += 1;
+        vec![Effect::Send(
+            json!({ "jsonrpc": "2.0", "id": id, "method": "shutdown" }),
+        )]
+    }
+}
+
+/// How the server is reached, for the one thing the handshake says differently. (M59)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// A child cide spawned. `processId` is cide's own pid, so a server that watches its parent
+    /// dies with it — the contract `child_env::arm` makes from the other side.
+    Stdio,
+    /// A socket to a server cide did not start. `processId` is `null`, which the protocol
+    /// allows: cide is not its parent, and a server that watched cide's pid — a number in
+    /// another process tree, reused by the kernel at will — would exit for the wrong process.
+    Socket,
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -743,6 +804,7 @@ fn initialize_params(
     roots: &[std::path::PathBuf],
     server: Server,
     init_options: Option<&Value>,
+    transport: Transport,
 ) -> Value {
     let folders: Vec<Value> = roots
         .iter()
@@ -753,8 +815,15 @@ fn initialize_params(
             })
         })
         .collect();
+    // `null` and not absent for a socket: the field is required by the protocol, and "no parent"
+    // is a statement the server may act on (nothing to watch), where a missing key is a client
+    // that forgot. See [`Transport`].
+    let process_id = match transport {
+        Transport::Stdio => json!(std::process::id()),
+        Transport::Socket => Value::Null,
+    };
     let mut params = json!({
-        "processId": std::process::id(),
+        "processId": process_id,
         "clientInfo": { "name": "cide", "version": env!("CARGO_PKG_VERSION") },
         "rootUri": roots.first().map(|r| crate::convert::path_to_uri(r)),
         "workspaceFolders": folders,
@@ -1677,6 +1746,52 @@ mod tests {
         assert!(sent[0].get("id").is_some(), "shutdown is a request");
         assert_eq!(sent[1]["method"], "exit");
         assert!(sent[1].get("id").is_none(), "exit is a notification");
+    }
+
+    /// The socket half of the ladder (M59): `shutdown`, and never `exit`. An attached server is
+    /// somebody else's process, and `exit` would be asking the user's editor to close.
+    #[test]
+    fn detaching_sends_shutdown_and_never_exit() {
+        let mut session = running();
+        let effects = session.detach();
+        let sent = sent(&effects);
+        assert_eq!(sent.len(), 1, "one message, and it is not `exit`: {sent:?}");
+        assert_eq!(sent[0]["method"], "shutdown");
+        assert!(
+            sent[0].get("id").is_some(),
+            "shutdown is a request, so a reply can be waited on"
+        );
+        assert!(
+            !sent.iter().any(|m| m["method"] == "exit"),
+            "`exit` is for a process cide owns"
+        );
+    }
+
+    /// `processId` is the one thing the handshake says differently per transport (M59): cide's
+    /// pid for a child that may watch its parent, `null` for a server in another process tree.
+    #[test]
+    fn an_attached_handshake_declares_no_parent_pid() {
+        let roots = [std::path::PathBuf::from("/repo")];
+        let (_, effects) =
+            Session::with_transport(&roots, Server::RUST_ANALYZER, None, Transport::Socket);
+        let request = &sent(&effects)[0];
+        assert_eq!(request["method"], "initialize");
+        assert!(
+            request["params"].get("processId").is_some(),
+            "the key is present — the protocol requires it"
+        );
+        assert_eq!(
+            request["params"]["processId"],
+            Value::Null,
+            "and null: cide is not this server's parent"
+        );
+        let (_, effects) =
+            Session::with_transport(&roots, Server::RUST_ANALYZER, None, Transport::Stdio);
+        assert_eq!(
+            sent(&effects)[0]["params"]["processId"],
+            json!(std::process::id()),
+            "a spawned child is told its parent"
+        );
     }
 
     #[test]

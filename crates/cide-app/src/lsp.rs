@@ -328,6 +328,48 @@ pub struct ProjectDiagnostics {
     completion_token: std::sync::atomic::AtomicU32,
     /// What the pump owes after a disk change. See [`Kick`].
     kick: Arc<Kick>,
+    /// The buffers the editor has told this project's servers about. See [`OpenDocuments`].
+    open_docs: OpenDocuments,
+    /// Documentation pages by the subject that names them, newest last. See
+    /// [`Self::documentation`] for what is remembered and why.
+    docs_cache: Mutex<Vec<(cide_ipc::DocsSubject, cide_ipc::SymbolDocs)>>,
+}
+
+/// How many documentation pages a project remembers. A page is a screenful; this is a few
+/// hundred kilobytes at most, and the reason for remembering any is one round trip saved on the
+/// tab that opens on an answer — see [`ProjectDiagnostics::documentation`].
+const DOCS_CACHE_DEPTH: usize = 32;
+
+/// One open buffer, as the last `didOpen` or `didChange` described it. (M59)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDocument {
+    pub version: i32,
+    pub text: String,
+}
+
+/// The buffers the editor has told this project's servers about, by path. (M59)
+///
+/// A server's life ends — a crash-restart, the memory watchdog, the Restart button, or the Godot
+/// editor closing under an attached session — and its successor knows nothing of the documents
+/// the previous life was told about. `ui/src/editor/docSync.ts` refcounts opens per path and
+/// sends each `didOpen` exactly once; it listens to no status and cannot know a life ended. So
+/// the app keeps the last full text (sync is full-text, so the copy is exact) and replays a
+/// `didOpen` per document on [`LspEvent::Handshook`]. rust-analyzer and gopls read the disk and
+/// hid the gap from M3 to M59; Godot publishes only on open, change and save, and a reconnect
+/// without this sat silent until the user typed.
+///
+/// A `didChange` the frontend skipped as too large keeps the `didOpen` text here, which is what
+/// the server has anyway.
+type OpenDocuments = Arc<Mutex<BTreeMap<PathBuf, OpenDocument>>>;
+
+/// The open documents a freshly handshaken server should be told about: the ones it owns.
+///
+/// Pure over the ownership question so it can be tested without the process-global registry.
+fn owned_documents(
+    docs: &BTreeMap<PathBuf, OpenDocument>,
+    owns: impl Fn(&std::path::Path) -> bool,
+) -> Vec<(&PathBuf, &OpenDocument)> {
+    docs.iter().filter(|(path, _)| owns(path)).collect()
 }
 
 impl ProjectDiagnostics {
@@ -351,6 +393,7 @@ impl ProjectDiagnostics {
         );
 
         let kick = Arc::new(Kick::default());
+        let open_docs: OpenDocuments = Arc::new(Mutex::new(BTreeMap::new()));
         let pump = std::thread::Builder::new()
             .name(format!("cide-diag-{project}"))
             .spawn({
@@ -358,8 +401,9 @@ impl ProjectDiagnostics {
                 let handles = Arc::clone(&handles);
                 let stop = Arc::clone(&stop);
                 let kick = Arc::clone(&kick);
+                let open_docs = Arc::clone(&open_docs);
                 let roots = roots.clone();
-                move || pump(app, project, roots, store, handles, stop, kick)
+                move || pump(app, project, roots, store, handles, stop, kick, open_docs)
             })
             .ok();
 
@@ -375,6 +419,8 @@ impl ProjectDiagnostics {
             completion_cache: Mutex::new(Vec::new()),
             completion_token: std::sync::atomic::AtomicU32::new(0),
             kick,
+            open_docs,
+            docs_cache: Mutex::new(Vec::new()),
         }
     }
 
@@ -390,6 +436,42 @@ impl ProjectDiagnostics {
     /// The store itself, for the MCP tool — which reads it **unfiltered**.
     pub fn store(&self) -> Arc<Mutex<DiagnosticStore>> {
         Arc::clone(&self.store)
+    }
+
+    /// The editor opened a file: remember it, and tell whichever server owns it. (M59)
+    ///
+    /// The three `document_*` methods are the only writers of [`OpenDocuments`], and every path
+    /// that tells a server about a buffer goes through one of them — a `didOpen` sent around
+    /// them would be a document the next life of that server is never told about.
+    pub fn document_opened(&self, path: &std::path::Path, version: i32, text: String) {
+        self.open_docs.lock().insert(
+            path.to_path_buf(),
+            OpenDocument {
+                version,
+                text: text.clone(),
+            },
+        );
+        self.notify_document(path, |session, uri, language_id| {
+            session.did_open(uri, language_id, version, text.clone())
+        });
+    }
+
+    /// The buffer changed. A change for a path never opened updates nothing here and is still
+    /// sent, which is the pre-M59 behaviour exactly.
+    pub fn document_changed(&self, path: &std::path::Path, version: i32, text: String) {
+        if let Some(doc) = self.open_docs.lock().get_mut(path) {
+            doc.version = version;
+            doc.text = text.clone();
+        }
+        self.notify_document(path, |session, uri, _| {
+            session.did_change(uri, version, text.clone())
+        });
+    }
+
+    /// The editor closed the file: forget it, and tell the server.
+    pub fn document_closed(&self, path: &std::path::Path) {
+        self.open_docs.lock().remove(path);
+        self.notify_document(path, |session, uri, _| session.did_close(uri));
     }
 
     /// Send a document notification to whichever server owns that language.
@@ -1064,6 +1146,126 @@ impl ProjectDiagnostics {
     /// Extracted so the three request paths cannot drift on *which* server owns a file or on the
     /// take-the-lock-then-drop-it rule. The sentence is the caller's, because "Go to definition
     /// needs it" and "Find usages needs it" name different gestures.
+    /// Documentation for a subject, by whichever road the owning server has. (M60)
+    ///
+    /// **Blocks for up to `timeout`.** Call it from the blocking pool, never from a Tauri command
+    /// worker — see `cmd::diagnostics::docs_lookup`.
+    ///
+    /// # What is remembered, and what is asked again
+    ///
+    /// A page whose provider can name it — a Godot native symbol, `#ref/class/Node` — is kept by
+    /// that name, so the tab that opens on the answer draws without a second round trip and a
+    /// reference followed twice is fetched once. A page asked for *by position* is never kept:
+    /// the buffer under that position moves, and a remembered page would describe the symbol
+    /// that used to be there. The answer's subject is the remembered one, which is how a
+    /// position lookup that landed on a native symbol comes back with a name the tab can carry.
+    ///
+    /// Never returns an error type: every failure is a sentence, `definition`'s rule.
+    pub fn documentation(
+        &self,
+        subject: &cide_ipc::DocsSubject,
+        timeout: std::time::Duration,
+    ) -> cide_ipc::DocsAnswer {
+        use cide_ipc::{DocsAnswer, DocsSubject};
+        use cide_lsp::docs::{self, Outcome};
+
+        if let DocsSubject::Reference { .. } = subject {
+            let cached = self
+                .docs_cache
+                .lock()
+                .iter()
+                .find(|(known, _)| known == subject)
+                .map(|(_, page)| page.clone());
+            if let Some(page) = cached {
+                return DocsAnswer::Found {
+                    page: Box::new(page),
+                    subject: subject.clone(),
+                };
+            }
+        }
+        let (server, requester) = match subject {
+            DocsSubject::Position { path, .. } => match self.requester_for(path) {
+                Ok(pair) => pair,
+                Err(missing) => {
+                    return DocsAnswer::Unavailable {
+                        reason: missing.sentence("Quick documentation"),
+                    };
+                }
+            },
+            DocsSubject::Reference { source, .. } => match self.requester_by_source(source) {
+                Some(pair) => pair,
+                None => {
+                    return DocsAnswer::Unavailable {
+                        reason: format!(
+                            "{source} is not running for this project. Following a reference \
+                             needs it."
+                        ),
+                    };
+                }
+            },
+        };
+        let outcome = match subject {
+            DocsSubject::Position {
+                path,
+                line,
+                column,
+                word,
+            } => docs::lookup(&requester, path, *line, *column, word, timeout),
+            DocsSubject::Reference {
+                ref_kind, target, ..
+            } => docs::follow(&requester, ref_kind, target, timeout),
+        };
+        match outcome {
+            Outcome::Page(page) => {
+                let subject = page
+                    .reference
+                    .as_deref()
+                    .and_then(docs::parse_reference)
+                    .map(|(kind, target)| DocsSubject::Reference {
+                        source: page.source.clone(),
+                        ref_kind: kind.to_string(),
+                        target: target.to_string(),
+                    })
+                    .unwrap_or_else(|| subject.clone());
+                if let DocsSubject::Reference { .. } = subject {
+                    let mut cache = self.docs_cache.lock();
+                    cache.retain(|(known, _)| *known != subject);
+                    if cache.len() >= DOCS_CACHE_DEPTH {
+                        cache.remove(0);
+                    }
+                    cache.push((subject.clone(), page.clone()));
+                }
+                DocsAnswer::Found {
+                    page: Box::new(page),
+                    subject,
+                }
+            }
+            Outcome::Nothing => DocsAnswer::NotFound,
+            // `definition`'s sentence: while a server indexes, this is the expected answer for
+            // the first minute of a session, and "nothing here" would be a lie.
+            Outcome::Failed(cide_lsp::RequestError::Timeout) => DocsAnswer::Unavailable {
+                reason: format!(
+                    "{} did not answer in time — it is probably still indexing. Try again in a \
+                     moment.",
+                    server.binary()
+                ),
+            },
+            Outcome::Failed(error) => DocsAnswer::Unavailable {
+                reason: format!("{}: {error}", server.binary()),
+            },
+        }
+    }
+
+    /// The running server registered under `source` — a page's own `source`, for following a
+    /// reference back to the server that wrote it.
+    fn requester_by_source(&self, source: &str) -> Option<(Server, cide_lsp::Requester)> {
+        let handles = self.handles.lock();
+        handles
+            .iter()
+            .find(|handle| handle.server().binary() == source)
+            .map(|handle| (handle.server(), handle.requester()))
+    }
+
     fn requester_for(
         &self,
         path: &std::path::Path,
@@ -2065,6 +2267,7 @@ fn owner_of(path: &std::path::Path) -> Option<Server> {
 }
 
 /// Drain the handles, fold into the store, emit — coalesced. Pay what a disk change owes.
+#[allow(clippy::too_many_arguments)]
 fn pump(
     app: tauri::AppHandle,
     project: ProjectId,
@@ -2073,6 +2276,7 @@ fn pump(
     handles: Arc<Mutex<Vec<LspHandle>>>,
     stop: Arc<AtomicBool>,
     kick: Arc<Kick>,
+    open_docs: OpenDocuments,
 ) {
     // The two halves of the debounce: when the first un-emitted change arrived, and when the last
     // one did. See the module docs for why both are needed.
@@ -2091,9 +2295,39 @@ fn pump(
             for handle in handles.iter() {
                 let source = handle.server().source();
                 for event in handle.drain() {
-                    changed = true;
                     match event {
+                        // A new life shook hands: tell it about every open document it owns.
+                        // (M59) See [`OpenDocuments`] for why this is the app's job. `send` is a
+                        // `try_send`, so holding both locks across the loop blocks nothing;
+                        // nothing in the store moved, so this is not a `changed`.
+                        LspEvent::Handshook => {
+                            let server = handle.server();
+                            let (session, _) = cide_lsp::Session::new(&roots, server);
+                            let docs = open_docs.lock();
+                            for (path, doc) in
+                                owned_documents(&docs, |path| server_for(path) == Some(server))
+                            {
+                                let Some(language) = language_of(path) else {
+                                    continue;
+                                };
+                                let uri = cide_lsp::convert::path_to_uri(path);
+                                if let cide_lsp::Effect::Send(value) = session.did_open(
+                                    uri,
+                                    &server.language_id_for(Some(&language)),
+                                    doc.version,
+                                    doc.text.clone(),
+                                ) {
+                                    handle.send(value);
+                                }
+                            }
+                            tracing::debug!(
+                                project = ?project,
+                                source = %source,
+                                "replayed the open documents to a new life"
+                            );
+                        }
                         LspEvent::Status(status) => {
+                            changed = true;
                             // The one line that says what the panel was told, because the
                             // panel is the end of a four-hop pipe (server → session → store
                             // → webview) and "the bar shows X but the label says Y" has
@@ -2107,6 +2341,7 @@ fn pump(
                             store.lock().set_status(source.clone(), status)
                         }
                         LspEvent::Published { abs_path, items } => {
+                            changed = true;
                             let rel = relative(&roots, &abs_path);
                             let converted = items
                                 .iter()
@@ -2756,5 +2991,44 @@ mod tests {
         // loop — the pressure ADR 0003 forced `cide-pty` to coalesce for.
         assert!(COALESCE < COALESCE_CEILING);
         assert!(TICK < COALESCE, "the pump cannot notice its own debounce");
+    }
+
+    /// The replay after a new life tells a server about the documents *it* owns and no others —
+    /// a Go file replayed to rust-analyzer is a `didOpen` for a language it never declared. The
+    /// ownership question is passed in because the registry is process-global. (M59)
+    #[test]
+    fn a_new_life_is_told_about_the_documents_it_owns_and_no_others() {
+        let mut docs: BTreeMap<PathBuf, OpenDocument> = BTreeMap::new();
+        for (path, text) in [
+            ("/p/a.gd", "extends Node"),
+            ("/p/b.rs", "fn a() {}"),
+            ("/p/c.gd", ""),
+        ] {
+            docs.insert(
+                PathBuf::from(path),
+                OpenDocument {
+                    version: 3,
+                    text: text.into(),
+                },
+            );
+        }
+        let owned = owned_documents(&docs, |path| {
+            path.extension().is_some_and(|ext| ext == "gd")
+        });
+        let paths: Vec<&str> = owned
+            .iter()
+            .map(|(path, _)| path.to_str().unwrap_or_default())
+            .collect();
+        assert_eq!(paths, vec!["/p/a.gd", "/p/c.gd"]);
+        assert_eq!(
+            owned[0].1,
+            &OpenDocument {
+                version: 3,
+                text: "extends Node".into()
+            },
+            "with the last text and version the editor sent, so the server sees the buffer as \
+             it is and not as the disk has it"
+        );
+        assert!(owned_documents(&docs, |_| false).is_empty());
     }
 }

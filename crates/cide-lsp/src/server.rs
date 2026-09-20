@@ -1,6 +1,7 @@
-//! Spawning a language server and keeping it alive, or deciding not to.
+//! Spawning a language server and keeping it alive, or deciding not to — or, since M59,
+//! attaching to one somebody else runs.
 //!
-//! Three threads per server, and the division is the same one `cide-pty` makes:
+//! Three threads per spawned server, and the division is the same one `cide-pty` makes:
 //!
 //! ```text
 //! supervisor ── spawn ─┬─ reader thread  → codec::read_message → Session → events out
@@ -10,9 +11,20 @@
 //!
 //! The supervisor thread is the one that forks, and it blocks until the child is gone — which is
 //! what makes [`cide_core::child_env::arm`] safe here. See the crate docs.
+//!
+//! An **attached** server (`discover::Target::Tcp` — the Godot editor's language server, on a
+//! loopback port) has two threads and no stderr: the same supervisor and reader over a socket,
+//! the writer being the socket's other half. Everything else about it is a *negative* of the
+//! spawned shape, and each negative is a rule: nothing is signalled, nothing is reaped, `exit` is
+//! never sent, a refused connect is *not running* rather than *could not start*, and a socket
+//! that closed after the handshake is the user restarting their editor rather than a crash. The
+//! guarded arm in [`supervise_lives`] and the socket half of [`open`]/[`run_once`] are where
+//! those rules live, and the fake-server tests at the bottom are the first non-ignored
+//! end-to-end tests this crate has had.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -24,11 +36,26 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde_json::Value;
 
 use crate::codec;
-use crate::discover::{Candidate, Server};
-use crate::session::{Effect, Session};
+use crate::discover::{Candidate, Server, Target};
+use crate::session::{Effect, Session, Transport};
 
 /// How long to wait for `shutdown`'s reply, then for the process to exit on its own.
 const GRACE: Duration = Duration::from_secs(2);
+/// How long a socket connect may take before it reads as "nothing is listening". (M59)
+///
+/// Loopback refuses at once, so this bounds only a port that accepts and never completes.
+/// Short because `Drop for LspHandle` joins the supervisor *through* this call: a long timeout
+/// here is a project that takes that long to close.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often an attached server is tried again while nothing is listening, or after its socket
+/// closed. (M59)
+///
+/// Not the crash backoff and not on its budget: a server cide did not start is not one it can
+/// give up on, so this is a cadence, not a ladder. One loopback `connect()` per three seconds
+/// per project is invisible; three seconds is also short enough that opening the project in
+/// Godot is answered within a breath, and long enough that the in-crate tests, which wait
+/// through one of these, keep the whole suite under ten seconds.
+const ATTACH_RETRY: Duration = Duration::from_secs(3);
 /// And after `SIGTERM`, before `SIGKILL`.
 const KILL_AFTER: Duration = Duration::from_secs(1);
 
@@ -118,6 +145,15 @@ pub enum LspError {
 pub enum LspEvent {
     /// This source's status changed.
     Status(SourceStatus),
+    /// The handshake completed for a new life. (M59)
+    ///
+    /// Once per life, on the `initialize` reply — before any `Ready`, which `READY_SETTLE`
+    /// holds back. The app replays every open document to the server on it: the documents the
+    /// previous life was told about died with it, and a server that publishes only on
+    /// open/change/save (Godot) would otherwise sit silent until the user types. rust-analyzer
+    /// and gopls read the disk and hid that gap from M3 to M59; a crash-restart, a watchdog
+    /// respawn and the Restart button all had it.
+    Handshook,
     /// Replace one file's diagnostics for this source. Already converted; `rel` still has to be
     /// filled in by the app, which is the only layer that knows the project's roots.
     Published {
@@ -165,7 +201,21 @@ impl std::fmt::Display for RequestError {
 }
 
 /// Waiters, by request id.
-type Pending = Arc<parking_lot::Mutex<HashMap<i64, Sender<Result<Value, RequestError>>>>>;
+type Pending = Arc<parking_lot::Mutex<HashMap<PendingKey, Sender<Result<Value, RequestError>>>>>;
+
+/// What a waiter in the pending map is waiting for. (M60)
+///
+/// A reply, by request id — every request since M12 — or the next notification of a named
+/// method, which is how a caller correlates a server's *custom* answer to something it asked:
+/// Godot answers `textDocument/declaration` on a built-in with an empty reply and a
+/// `gdscript/show_native_symbol` notification carrying the documentation. One map rather than
+/// two, so a life ending releases both kinds of waiter through the one `cancel_pending`, and
+/// nothing has to grow a second drain.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PendingKey {
+    Reply(i64),
+    Notification(String),
+}
 
 /// The first id this crate allocates for a caller's request.
 ///
@@ -237,7 +287,7 @@ impl Requester {
             .fetch_add(1, Ordering::Relaxed)
             .max(REQUEST_ID_BASE);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        self.pending.lock().insert(id, tx);
+        self.pending.lock().insert(PendingKey::Reply(id), tx);
         announce(id);
 
         let message = serde_json::json!({
@@ -251,7 +301,7 @@ impl Requester {
         // block. `LspHandle::send` drops in this situation with a `warn!`, which is right for a
         // notification nobody is waiting on and wrong for a request somebody is.
         if let Err(error) = self.outbox.try_send(message) {
-            self.pending.lock().remove(&id);
+            self.pending.lock().remove(&PendingKey::Reply(id));
             return Err(match error {
                 TrySendError::Full(_) => RequestError::Queue,
                 TrySendError::Disconnected(_) => RequestError::ServerGone,
@@ -279,8 +329,39 @@ impl Requester {
                 Err(RequestError::Timeout)
             }
         };
-        self.pending.lock().remove(&id);
+        self.pending.lock().remove(&PendingKey::Reply(id));
         answer
+    }
+
+    /// Wait for the next notification of `method`, as a receiver to block on. (M60)
+    ///
+    /// Registered **before** the request that provokes it is sent, for the reason
+    /// [`Self::request`] registers its waiter before writing: Godot sends the notification
+    /// *while* handling `textDocument/declaration`, so it can arrive before the reply does, and
+    /// only the map — never the order of calls — makes that safe. One waiter per method; a
+    /// second registration supersedes the first, which is then told `Cancelled`. The receiver
+    /// answers `Ok(params)` once, `Err(ServerGone)` if the life ends first, and nothing at all
+    /// if the server never sends it — so the caller's `recv_timeout` is the deadline, and
+    /// [`Self::forget_notification`] afterwards is what keeps a stale waiter from swallowing a
+    /// later notification meant for somebody else.
+    pub fn expect_notification(&self, method: &str) -> Receiver<Result<Value, RequestError>> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if let Some(previous) = self
+            .pending
+            .lock()
+            .insert(PendingKey::Notification(method.to_string()), tx)
+        {
+            let _ = previous.try_send(Err(RequestError::Cancelled));
+        }
+        rx
+    }
+
+    /// Withdraw a waiter [`Self::expect_notification`] registered, when the notification did not
+    /// come. Safe when it already did — the delivery removed the entry.
+    pub fn forget_notification(&self, method: &str) {
+        self.pending
+            .lock()
+            .remove(&PendingKey::Notification(method.to_string()));
     }
 
     /// Withdraw an outstanding request: release its waiter *and* tell the server to stop.
@@ -298,7 +379,7 @@ impl Requester {
     /// simply not there, and `$/cancelRequest` for an unknown id is explicitly a no-op in the
     /// protocol.
     pub fn cancel(&self, id: i64) {
-        if let Some(waiter) = self.pending.lock().remove(&id) {
+        if let Some(waiter) = self.pending.lock().remove(&PendingKey::Reply(id)) {
             let _ = waiter.try_send(Err(RequestError::Cancelled));
         }
         self.notify_cancel(id);
@@ -333,7 +414,7 @@ fn take_reply(pending: &Pending, message: &Value) -> bool {
     };
     // Taken out of the map here rather than by the waiter, so that a reply arriving twice — which
     // a misbehaving server may do — cannot resolve a *later* request that reused the id.
-    let Some(waiter) = pending.lock().remove(&id) else {
+    let Some(waiter) = pending.lock().remove(&PendingKey::Reply(id)) else {
         return false;
     };
     let answer = match message.get("error") {
@@ -530,11 +611,12 @@ pub struct LspHandle {
 }
 
 impl LspHandle {
-    /// Discover, spawn and hand back a handle — or say why not, in a sentence.
+    /// Discover, spawn (or connect) and hand back a handle — or say why not, in a sentence.
     ///
     /// **Must be called from a thread that outlives the server.** `cide-app` calls it on the
     /// long-lived `cide-spawn` thread via `child_env::on_spawn_thread`, which is the whole reason
-    /// that function exists. See the crate docs.
+    /// that function exists. See the crate docs. An attached server needs none of that — nothing
+    /// is forked — and takes the same road anyway, so there is one spawn discipline and not two.
     pub fn start(server: Server, roots: Vec<PathBuf>) -> Result<Self, LspError> {
         Self::start_with(
             server,
@@ -564,7 +646,7 @@ impl LspHandle {
             // fork need answered.
             tracing::info!(
                 server = server.binary(),
-                path = %first.path.display(),
+                target = %first.target,
                 provenance = ?first.provenance,
                 fallbacks = candidates.len() - 1,
                 "resolved"
@@ -618,6 +700,9 @@ impl LspHandle {
     /// ends — so a reader may still race a just-died process, and must treat "no such
     /// process" as an ordinary answer, never an error. Signalling through this pid would be
     /// a bug (the shutdown ladder owns the process); reading is all it is for.
+    ///
+    /// Always `None` for an attached server (M59): there is no child, and the watchdog has
+    /// nothing to measure or restart — the process is the user's editor.
     pub fn pid(&self) -> Option<u32> {
         match self.pid.load(Ordering::Acquire) {
             0 => None,
@@ -786,6 +871,68 @@ fn start_failure_reason(server: Server, stderr: &str) -> String {
     reason
 }
 
+/// The sentence for an attached server that cannot be reached, or stopped being. (M59)
+///
+/// Two sentences, because `check:problems` pins that the reason is shown whole: what is not
+/// listening where, then the definition's own `installHint` — which for a connect server is how
+/// the user makes it reachable ("open this project in the Godot editor"), the same job the field
+/// does for a spawned one. No stderr and no rustup diagnosis: there is no process here.
+///
+/// One sentence for both the refused connect and the closed socket, on purpose: a socket that
+/// closed is a server that is no longer listening, and the panel should say the same thing on
+/// both roads rather than teach the user two.
+fn attach_failure_reason(server: Server, addr: &std::net::SocketAddr) -> String {
+    let mut reason = format!("{} is not listening on {addr}.", server.binary());
+    let hint = server.install_hint();
+    if !hint.is_empty() {
+        reason.push(' ');
+        reason.push_str(&hint);
+    }
+    reason
+}
+
+/// Wait out a pause between lives, discarding anything queued for the session that just died —
+/// and releasing anyone waiting on it. `false` means stop: the flag went up, or the handle was
+/// dropped and nothing more is coming.
+///
+/// Two bugs lived in the three lines this replaces, and both were invisible:
+///
+/// * **A discarded message could be a request.** The waiter had been registered before the
+///   send, the cancellation for this life had already run, and the next life is a fresh child
+///   that was never told to answer. The caller sat out its own deadline and was told "still
+///   indexing" about a server that had crashed — the exact `Timeout`-versus-`ServerGone`
+///   confusion `RequestError` exists to keep apart. So every discard is followed by a
+///   cancellation.
+/// * **One queued message skipped the rest of the backoff.** The old form was
+///   `if recv_timeout(wait).is_ok() || stop { }` with an empty body, which fell straight back
+///   into the loop and respawned. An editor sending `didChange` every 300 ms therefore defeated
+///   the backoff entirely and turned a crash loop into a respawn storm — which is what the
+///   backoff is for.
+///
+/// Polled in short slices rather than one long `recv_timeout` so a shutdown is still noticed at
+/// once instead of after four seconds. A helper since M59 because the attach cadence is a
+/// second caller, and a second copy of a rule with two known bugs in its history is one too many.
+fn wait_out(
+    wait: Duration,
+    outbox: &Receiver<Value>,
+    stop: &AtomicBool,
+    pending: &Pending,
+) -> bool {
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        match outbox.recv_timeout(BACKOFF_TICK) {
+            Ok(_) => cancel_pending(pending, RequestError::ServerGone),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            // The handle was dropped: nothing more is coming and nothing is waiting.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    true
+}
+
 /// After a life ends in failure: the rung to try next, if advancing is right at all.
 ///
 /// Pure, and separate from the supervisor's match, because the rule packs two decisions that
@@ -855,6 +1002,10 @@ fn supervise_lives(
     // Which rung of the ladder this and every following life runs. Only ever advanced by
     // `next_candidate`, i.e. only on a failure to *start* — see the match below.
     let mut at = 0usize;
+    // The last "not listening" sentence an attached server was given, so it is said once per
+    // outage rather than once per retry tick. Cleared by a life that handshook, because after
+    // one the same sentence is news again.
+    let mut last_sentence: Option<String> = None;
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -890,6 +1041,39 @@ fn supervise_lives(
         cancel_pending(pending, RequestError::ServerGone);
         match outcome {
             Ok(()) => return,
+            // An attached server (M59): one rung and no budget. Nothing is listening — the user
+            // has not opened the project in Godot yet, or just closed it — or the socket closed
+            // after the handshake, which is the same fact a moment later. Neither is cide's to
+            // give up on: a server cide did not start is not one it can fail to start, and
+            // `next_candidate`'s ladder and the crash window below are both statements about
+            // processes cide owns. So the status is *not running*, which the panel dims, and
+            // the answer is to try again on `ATTACH_RETRY`. Said once per outage, because the
+            // app pump re-emits to every window for each drained event.
+            Err(Failure {
+                reason,
+                ever_handshook,
+            }) if candidate.target.is_socket() => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if ever_handshook {
+                    last_sentence = None;
+                }
+                if last_sentence.as_deref() != Some(reason.as_str()) {
+                    tracing::info!(
+                        server = server.binary(),
+                        %reason,
+                        "not reachable; trying again every {ATTACH_RETRY:?}",
+                    );
+                    let _ = events.send(LspEvent::Status(SourceStatus::Unavailable {
+                        reason: reason.clone(),
+                    }));
+                    last_sentence = Some(reason);
+                }
+                if !wait_out(ATTACH_RETRY, outbox, stop, pending) {
+                    return;
+                }
+            }
             // Died before answering `initialize`. Not a crash — a **failure to start**, and no
             // amount of retrying fixes one: the binary is missing a component, was built for
             // another libc, or is a shim that cannot dispatch. Retrying costs seven seconds and
@@ -914,8 +1098,8 @@ fn supervise_lives(
                 if let Some(next) = next_candidate(at, candidates.len(), false) {
                     tracing::warn!(
                         server = server.binary(),
-                        failed = %candidate.path.display(),
-                        next = %candidates[next].path.display(),
+                        failed = %candidate.target,
+                        next = %candidates[next].target,
                         %reason,
                         "start failure; trying the next rung of the ladder",
                     );
@@ -923,8 +1107,7 @@ fn supervise_lives(
                         percentage: None,
                         detail: format!(
                             "{} could not start; falling back to {}",
-                            candidate.path.display(),
-                            candidates[next].path.display(),
+                            candidate.target, candidates[next].target,
                         ),
                     }));
                     at = next;
@@ -939,7 +1122,7 @@ fn supervise_lives(
                         " (every build was tried: {})",
                         candidates
                             .iter()
-                            .map(|c| c.path.display().to_string())
+                            .map(|c| c.target.to_string())
                             .collect::<Vec<_>>()
                             .join(", "),
                     ));
@@ -976,38 +1159,11 @@ fn supervise_lives(
                     detail: format!("restarting {}", server.binary()),
                     percentage: None,
                 }));
-                /*
-                 * Wait out the backoff, discarding anything queued for the session that just
-                 * died — and releasing anyone waiting on it.
-                 *
-                 * Two bugs lived in the three lines this replaces, and both were invisible:
-                 *
-                 * * **A discarded message could be a request.** The waiter had been registered
-                 *   before the send, the cancellation for this life had already run above, and
-                 *   the next life is a fresh child that was never told to answer. The caller sat
-                 *   out its own deadline and was told "still indexing" about a server that had
-                 *   crashed — the exact `Timeout`-versus-`ServerGone` confusion `RequestError`
-                 *   exists to keep apart. So every discard is followed by a cancellation.
-                 * * **One queued message skipped the rest of the backoff.** The old form was
-                 *   `if recv_timeout(wait).is_ok() || stop { }` with an empty body, which fell
-                 *   straight back into the loop and respawned. An editor sending `didChange`
-                 *   every 300 ms therefore defeated the backoff entirely and turned a crash loop
-                 *   into a respawn storm — which is what the backoff is for.
-                 *
-                 * Polled in short slices rather than one long `recv_timeout` so a shutdown is
-                 * still noticed at once instead of after four seconds.
-                 */
-                let deadline = Instant::now() + wait;
-                while Instant::now() < deadline {
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                    match outbox.recv_timeout(BACKOFF_TICK) {
-                        Ok(_) => cancel_pending(pending, RequestError::ServerGone),
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        // The handle was dropped: nothing more is coming and nothing is waiting.
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-                    }
+                // Wait out the backoff, discarding anything queued for the session that just
+                // died — and releasing anyone waiting on it. `wait_out` carries the two bugs
+                // that history taught this line.
+                if !wait_out(wait, outbox, stop, pending) {
+                    return;
                 }
             }
         }
@@ -1064,6 +1220,206 @@ fn build_command(
     command
 }
 
+/// What one life holds beside the pump, per transport — and what its ladder has to work with
+/// afterwards. (M59)
+///
+/// The pump itself is transport-blind: it reads frames off a channel the reader thread fills and
+/// writes frames into a `Box<dyn Write>`. Everything that is *not* blind is on this enum, so a
+/// rule that differs between the two shapes has exactly one place to be wrong.
+enum Link {
+    /// A child cide spawned and owns: the process, its stderr drain, the tail that drain keeps
+    /// for the crash report, and the flag that moves a dying server's stderr onto
+    /// [`EXIT_LOG_TARGET`].
+    Child {
+        child: Child,
+        stderr_thread: std::thread::JoinHandle<()>,
+        tail: Arc<parking_lot::Mutex<String>>,
+        stopping: Arc<AtomicBool>,
+    },
+    /// A socket to a server somebody else runs. Nothing to signal, nothing to reap; `stream` is
+    /// the handle the ladder shuts, which is what unblocks the reader's clone.
+    Socket {
+        stream: TcpStream,
+        addr: std::net::SocketAddr,
+    },
+}
+
+/// The reader thread: frames off `source` into `inbound` until EOF — which is what a server
+/// exiting, or a socket closing, looks like.
+fn spawn_reader<R: Read + Send + 'static>(
+    server: Server,
+    source: R,
+    inbound: Sender<Value>,
+) -> Result<std::thread::JoinHandle<()>, Failure> {
+    std::thread::Builder::new()
+        .name(format!("cide-lsp-{}-rx", server.binary()))
+        .spawn(move || {
+            let mut input = BufReader::new(source);
+            while let Ok(message) = codec::read_message(&mut input) {
+                if inbound.send(message).is_err() {
+                    return;
+                }
+            }
+        })
+        .map_err(|e| Failure {
+            reason: e.to_string(),
+            ever_handshook: false,
+        })
+}
+
+/// What [`open`] hands the pump: the link the ladder will need, the writer, and the reader
+/// thread to join. The writer is boxed because `codec::write_message` is generic over a sized
+/// `Write` and a `Box<dyn Write>` is one; the pump never learns which half of a pipe or a
+/// socket it holds.
+type Opened = (Link, Box<dyn Write + Send>, std::thread::JoinHandle<()>);
+
+/// Open one life's transport: spawn the child, or connect the socket.
+fn open(
+    server: Server,
+    candidate: &Candidate,
+    roots: &[PathBuf],
+    tuning: crate::config::Tuning,
+    pid: &std::sync::atomic::AtomicU32,
+    inbound: Sender<Value>,
+) -> Result<Opened, Failure> {
+    match &candidate.target {
+        Target::Process {
+            path,
+            child_path_dirs,
+        } => {
+            let cwd = roots.first().cloned().unwrap_or_else(std::env::temp_dir);
+            let mut command = build_command(
+                path,
+                &server.args(),
+                &cwd,
+                &crate::config::extra_env(server, candidate.provenance, tuning),
+                child_path_dirs,
+            );
+
+            let mut child: Child = command.spawn().map_err(|e| Failure {
+                reason: e.to_string(),
+                ever_handshook: false,
+            })?;
+            pid.store(child.id(), Ordering::Release);
+            let stdin = child.stdin.take().ok_or_else(|| Failure {
+                reason: "no stdin".into(),
+                ever_handshook: false,
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| Failure {
+                reason: "no stdout".into(),
+                ever_handshook: false,
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| Failure {
+                reason: "no stderr".into(),
+                ever_handshook: false,
+            })?;
+
+            let tail = Arc::new(parking_lot::Mutex::new(String::new()));
+            // Set the moment the shutdown ladder starts, and read by the stderr drain alone: it
+            // is what moves a dying server's stderr onto [`EXIT_LOG_TARGET`].
+            let stopping = Arc::new(AtomicBool::new(false));
+
+            // Reader. Ends on EOF, which is what a server exiting looks like.
+            let reader = spawn_reader(server, stdout, inbound)?;
+
+            // stderr drain. Never parsed — a server's stderr is human prose — but the tail of it
+            // is the only evidence a crash report can carry.
+            let stderr_thread = {
+                let tail = Arc::clone(&tail);
+                let stopping = Arc::clone(&stopping);
+                std::thread::Builder::new()
+                    .name(format!("cide-lsp-{}-err", server.binary()))
+                    .spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        let mut stderr = stderr;
+                        while let Ok(read) = stderr.read(&mut buf) {
+                            if read == 0 {
+                                return;
+                            }
+                            let text = String::from_utf8_lossy(&buf[..read]);
+                            // Same level, different target, once the ladder has begun — see
+                            // [`EXIT_LOG_TARGET`] for what that buys and what it costs.
+                            if stopping.load(Ordering::Acquire) {
+                                tracing::debug!(target: EXIT_LOG_TARGET, "{}", text.trim_end());
+                            } else {
+                                tracing::debug!(target: "cide::lsp", "{}", text.trim_end());
+                            }
+                            let mut tail = tail.lock();
+                            tail.push_str(&text);
+                            if tail.len() > KEEP_STDERR {
+                                let cut = tail.len() - KEEP_STDERR;
+                                // On a char boundary, or `String::drain` panics on a multi-byte
+                                // tail.
+                                let cut = (0..=cut)
+                                    .rev()
+                                    .find(|i| tail.is_char_boundary(*i))
+                                    .unwrap_or(0);
+                                tail.drain(..cut);
+                            }
+                        }
+                    })
+                    .map_err(|e| Failure {
+                        reason: e.to_string(),
+                        ever_handshook: false,
+                    })?
+            };
+            Ok((
+                Link::Child {
+                    child,
+                    stderr_thread,
+                    tail,
+                    stopping,
+                },
+                Box::new(stdin),
+                reader,
+            ))
+        }
+        Target::Tcp { addr } => {
+            // Defence in depth: `locate` refused a non-loopback address already and nothing else
+            // builds a `Candidate` — but this is the last line before the user's documents leave
+            // the process, so it asks once more, in the words the manifest rule uses.
+            if !addr.ip().is_loopback() {
+                return Err(Failure {
+                    reason: format!(
+                        "{addr} is not a loopback address, and cide attaches to a language \
+                         server only on this machine."
+                    ),
+                    ever_handshook: false,
+                });
+            }
+            // A refusal is the ordinary answer here — Godot is not open yet — so its OS error
+            // goes to the log and the user gets the sentence about what to open.
+            let stream = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT).map_err(|e| {
+                tracing::debug!(server = server.binary(), %addr, error = %e, "connect refused");
+                Failure {
+                    reason: attach_failure_reason(server, addr),
+                    ever_handshook: false,
+                }
+            })?;
+            // Every frame is a whole message and the next one waits on the reply; Nagle would
+            // hold the tail of each behind the previous ACK for nothing.
+            let _ = stream.set_nodelay(true);
+            let clone = |what: &str| {
+                stream.try_clone().map_err(|e| Failure {
+                    reason: format!("could not clone the socket for its {what}: {e}"),
+                    ever_handshook: false,
+                })
+            };
+            let reader_half = clone("reader")?;
+            let control = clone("shutdown")?;
+            let reader = spawn_reader(server, reader_half, inbound)?;
+            Ok((
+                Link::Socket {
+                    stream: control,
+                    addr: *addr,
+                },
+                Box::new(stream),
+                reader,
+            ))
+        }
+    }
+}
+
 /// One life of one server. `Ok(())` means an orderly stop; `Err` means it died.
 #[allow(clippy::too_many_arguments)]
 fn run_once(
@@ -1078,114 +1434,32 @@ fn run_once(
     caps: &Arc<Caps>,
     pid: &std::sync::atomic::AtomicU32,
 ) -> Result<(), Failure> {
-    let cwd = roots.first().cloned().unwrap_or_else(std::env::temp_dir);
-    let mut command = build_command(
-        &candidate.path,
-        &server.args(),
-        &cwd,
-        &crate::config::extra_env(server, candidate.provenance, tuning),
-        &candidate.child_path_dirs,
-    );
-
-    let mut child: Child = command.spawn().map_err(|e| Failure {
-        reason: e.to_string(),
-        ever_handshook: false,
-    })?;
-    pid.store(child.id(), Ordering::Release);
-    let mut stdin = child.stdin.take().ok_or_else(|| Failure {
-        reason: "no stdin".into(),
-        ever_handshook: false,
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| Failure {
-        reason: "no stdout".into(),
-        ever_handshook: false,
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| Failure {
-        reason: "no stderr".into(),
-        ever_handshook: false,
-    })?;
-
     let (inbound_tx, inbound_rx) = crossbeam_channel::unbounded::<Value>();
-    let tail = Arc::new(parking_lot::Mutex::new(String::new()));
-    // Set the moment the shutdown ladder starts, and read by the stderr drain alone: it is what
-    // moves a dying server's stderr onto [`EXIT_LOG_TARGET`].
-    let stopping = Arc::new(AtomicBool::new(false));
-
-    // Reader. Ends on EOF, which is what a server exiting looks like.
-    let reader = std::thread::Builder::new()
-        .name(format!("cide-lsp-{}-rx", server.binary()))
-        .spawn(move || {
-            let mut input = BufReader::new(stdout);
-            while let Ok(message) = codec::read_message(&mut input) {
-                if inbound_tx.send(message).is_err() {
-                    return;
-                }
-            }
-        })
-        .map_err(|e| Failure {
-            reason: e.to_string(),
-            ever_handshook: false,
-        })?;
-
-    // stderr drain. Never parsed — a server's stderr is human prose — but the tail of it is the
-    // only evidence a crash report can carry.
-    let stderr_thread = {
-        let tail = Arc::clone(&tail);
-        let stopping = Arc::clone(&stopping);
-        std::thread::Builder::new()
-            .name(format!("cide-lsp-{}-err", server.binary()))
-            .spawn(move || {
-                let mut buf = [0u8; 4096];
-                let mut stderr = stderr;
-                while let Ok(read) = stderr.read(&mut buf) {
-                    if read == 0 {
-                        return;
-                    }
-                    let text = String::from_utf8_lossy(&buf[..read]);
-                    // Same level, different target, once the ladder has begun — see
-                    // [`EXIT_LOG_TARGET`] for what that buys and what it costs.
-                    if stopping.load(Ordering::Acquire) {
-                        tracing::debug!(target: EXIT_LOG_TARGET, "{}", text.trim_end());
-                    } else {
-                        tracing::debug!(target: "cide::lsp", "{}", text.trim_end());
-                    }
-                    let mut tail = tail.lock();
-                    tail.push_str(&text);
-                    if tail.len() > KEEP_STDERR {
-                        let cut = tail.len() - KEEP_STDERR;
-                        // On a char boundary, or `String::drain` panics on a multi-byte tail.
-                        let cut = (0..=cut)
-                            .rev()
-                            .find(|i| tail.is_char_boundary(*i))
-                            .unwrap_or(0);
-                        tail.drain(..cut);
-                    }
-                }
-            })
-            .map_err(|e| Failure {
-                reason: e.to_string(),
-                ever_handshook: false,
-            })?
+    let (link, mut writer, reader) = open(server, candidate, roots, tuning, pid, inbound_tx)?;
+    let transport = match link {
+        Link::Child { .. } => Transport::Stdio,
+        Link::Socket { .. } => Transport::Socket,
     };
 
     // The one call site where provenance exists and a `Session` is born, which is what makes
     // the gate in `config::init_options` airtight: a stock PATH server cannot receive cide's
     // configuration because nothing else ever constructs the live session.
-    let (mut session, initial) = Session::with_init_options(
+    let (mut session, initial) = Session::with_transport(
         roots,
         server,
         crate::config::init_options(server, candidate.provenance, tuning),
+        transport,
     );
     // When a held-back `Ready` becomes believable. See `READY_SETTLE`.
     let mut ready_at: Option<Instant> = None;
-    let write = |stdin: &mut std::process::ChildStdin,
+    let write = |writer: &mut Box<dyn Write + Send>,
                  effects: Vec<Effect>,
                  ready_at: &mut Option<Instant>|
      -> Result<(), String> {
         for effect in effects {
             match effect {
                 Effect::Send(value) => {
-                    codec::write_message(stdin, &value).map_err(|e| e.to_string())?;
+                    codec::write_message(writer, &value).map_err(|e| e.to_string())?;
                 }
                 Effect::Status(status) => {
                     if matches!(status, SourceStatus::Ready) {
@@ -1202,16 +1476,33 @@ fn run_once(
                 Effect::Publish { abs_path, items } => {
                     let _ = events.send(LspEvent::Published { abs_path, items });
                 }
+                // Delivered to whoever asked for it by name, and dropped otherwise — see
+                // `Requester::expect_notification`. Never an `LspEvent`: the pump has one
+                // consumer and no way to hand a payload back to the command thread waiting on it.
+                Effect::Notification { method, params } => {
+                    let waiter = pending.lock().remove(&PendingKey::Notification(method));
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.try_send(Ok(params));
+                    }
+                }
             }
         }
         Ok(())
     };
     // The `initialize` write, and the first place a shim that cannot dispatch shows itself: the
     // child is already gone, so this is a broken pipe rather than anything about the protocol.
-    write(&mut stdin, initial, &mut ready_at).map_err(|reason| Failure {
+    write(&mut writer, initial, &mut ready_at).map_err(|reason| Failure {
         reason,
         ever_handshook: false,
     })?;
+
+    // What the reader ending means, per transport: a child closed its stdout, i.e. exited, and
+    // its stderr tail is the evidence; a socket closed, and the only thing to say is that
+    // nothing is listening there now.
+    let eof_reason = || match &link {
+        Link::Child { tail, .. } => tail.lock().trim().to_string(),
+        Link::Socket { addr, .. } => attach_failure_reason(server, addr),
+    };
 
     // The pump. Two channels and a timeout, so neither side can starve the other and a stop is
     // noticed within the tick even when the server has gone silent.
@@ -1241,23 +1532,25 @@ fn run_once(
                     // Published on the one transition, rather than on every message: the answer
                     // cannot change within a life, and re-reading a JSON object per
                     // `publishDiagnostics` during a burst of hundreds is work for an answer
-                    // nobody asked a second time.
+                    // nobody asked a second time. `Handshook` rides the same transition, so the
+                    // app's replay of open documents lands on a server that can take them.
                     if !handshook_before && session.ever_handshook() {
                         caps.store_from(&session);
+                        let _ = events.send(LspEvent::Handshook);
                     }
-                    if let Err(reason) = write(&mut stdin, effects, &mut ready_at) {
+                    if let Err(reason) = write(&mut writer, effects, &mut ready_at) {
                         break Err(Failure { reason, ever_handshook: session.ever_handshook() });
                     }
                 }
-                // The reader ended: the server closed stdout, i.e. it exited.
+                // The reader ended: the server closed its side.
                 Err(_) => break Err(Failure {
-                    reason: tail.lock().trim().to_string(),
+                    reason: eof_reason(),
                     ever_handshook: session.ever_handshook(),
                 }),
             },
             recv(outbox) -> message => match message {
                 Ok(message) => {
-                    if let Err(error) = codec::write_message(&mut stdin, &message) {
+                    if let Err(error) = codec::write_message(&mut writer, &message) {
                         break Err(Failure {
                             reason: error.to_string(),
                             ever_handshook: session.ever_handshook(),
@@ -1281,44 +1574,79 @@ fn run_once(
         }
     };
 
-    // The ladder. `shutdown` then `exit` first, always: gopls writes its cache on `exit`, and a
-    // signal first costs the user that cache and makes the next start re-index from nothing.
-    //
-    // The flag goes up before the write, not after: `sqls` panics *inside* its handling of
-    // `exit`, so a flag raised afterwards would be raised after the traceback had been logged.
-    stopping.store(true, Ordering::Release);
-    let _ = write(&mut stdin, session.shutdown(), &mut ready_at);
-    drop(stdin);
+    match link {
+        Link::Child {
+            mut child,
+            stderr_thread,
+            tail: _,
+            stopping,
+        } => {
+            // The ladder. `shutdown` then `exit` first, always: gopls writes its cache on `exit`,
+            // and a signal first costs the user that cache and makes the next start re-index
+            // from nothing.
+            //
+            // The flag goes up before the write, not after: `sqls` panics *inside* its handling
+            // of `exit`, so a flag raised afterwards would be raised after the traceback had
+            // been logged.
+            stopping.store(true, Ordering::Release);
+            let _ = write(&mut writer, session.shutdown(), &mut ready_at);
+            drop(writer);
 
-    let deadline = Instant::now() + GRACE;
-    let mut exited = false;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                exited = true;
-                break;
+            let deadline = Instant::now() + GRACE;
+            let mut exited = false;
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        exited = true;
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                    Err(_) => break,
+                }
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => break,
+            if !exited {
+                terminate(&child);
+                let deadline = Instant::now() + KILL_AFTER;
+                while Instant::now() < deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        exited = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                if !exited {
+                    let _ = child.kill();
+                }
+            }
+            let _ = child.wait();
+            let _ = reader.join();
+            let _ = stderr_thread.join();
+        }
+        Link::Socket { stream, addr: _ } => {
+            // The socket ladder, and every rung the child's has is deliberately missing from it:
+            // no `exit` (`Session::detach` says why), no `try_wait`, no signal, no `kill`. The
+            // process is the user's editor. `shutdown` is sent as a courtesy and *any* reply to
+            // it — Godot's is `-32601`, method not found — or the reader ending is taken as the
+            // answer; then the socket is shut on both halves, which is what makes the reader's
+            // clone see EOF and lets the join below return.
+            let _ = write(&mut writer, session.detach(), &mut ready_at);
+            let deadline = Instant::now() + GRACE;
+            while Instant::now() < deadline {
+                match inbound_rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(message) => {
+                        if message.get("method").is_none() && message.get("id").is_some() {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            drop(writer);
+            let _ = reader.join();
         }
     }
-    if !exited {
-        terminate(&child);
-        let deadline = Instant::now() + KILL_AFTER;
-        while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                exited = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        if !exited {
-            let _ = child.kill();
-        }
-    }
-    let _ = child.wait();
-    let _ = reader.join();
-    let _ = stderr_thread.join();
 
     outcome
 }
@@ -1543,16 +1871,20 @@ mod tests {
             let (events, _events_rx) = crossbeam_channel::unbounded::<LspEvent>();
             let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             let (waiter_tx, waiter_rx) = crossbeam_channel::bounded(1);
-            pending.lock().insert(REQUEST_ID_BASE, waiter_tx);
+            pending
+                .lock()
+                .insert(PendingKey::Reply(REQUEST_ID_BASE), waiter_tx);
 
             // Stop already set: `supervise` must return through the top-of-loop check.
             let stop = Arc::new(AtomicBool::new(true));
             supervise(
                 Server::RUST_ANALYZER,
                 vec![Candidate {
-                    path: PathBuf::from("/nonexistent/never-spawned"),
+                    target: Target::Process {
+                        path: PathBuf::from("/nonexistent/never-spawned"),
+                        child_path_dirs: Vec::new(),
+                    },
                     provenance: crate::discover::Provenance::SystemPath,
-                    child_path_dirs: Vec::new(),
                 }],
                 Vec::new(),
                 crate::config::Tuning::default(),
@@ -1931,14 +2263,18 @@ mod tests {
         let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let candidates = vec![
             Candidate {
-                path: broken,
+                target: Target::Process {
+                    path: broken,
+                    child_path_dirs: Vec::new(),
+                },
                 provenance: crate::discover::Provenance::Bundled,
-                child_path_dirs: Vec::new(),
             },
             Candidate {
-                path: real,
+                target: Target::Process {
+                    path: real,
+                    child_path_dirs: Vec::new(),
+                },
                 provenance: crate::discover::Provenance::SystemPath,
-                child_path_dirs: Vec::new(),
             },
         ];
 
@@ -1991,5 +2327,360 @@ mod tests {
             ready,
             "the session never reached Ready through the fallback"
         );
+    }
+
+    // --- an attached server, against a fake one on a loopback port (M59) --------------------
+    //
+    // The first end-to-end tests in this crate that are not `#[ignore]`d: a socket needs no
+    // binary on PATH, no toolchain and no index. The fake answers `initialize` the way Godot
+    // does — a capabilities object, full-text sync — then records every method it is sent until
+    // the socket closes, and answers `shutdown` with `-32601` because that is what Godot answers.
+
+    use std::net::TcpListener;
+
+    /// What the fake saw, for the assertions.
+    #[derive(Default)]
+    struct Seen {
+        /// `params.processId` of the first `initialize`.
+        process_id: Option<Value>,
+        /// Every method after `initialize`, across every connection.
+        methods: Vec<String>,
+        accepted: usize,
+    }
+
+    /// A fake server: accepts `accepts` connections in turn, handshakes each, then records
+    /// methods until EOF — or, with `close_after`, drops the socket that long after the client's
+    /// `initialized` (the user restarting Godot), and goes back to accepting.
+    fn fake_server(
+        listener: TcpListener,
+        accepts: usize,
+        close_after: Option<Duration>,
+        seen: Arc<parking_lot::Mutex<Seen>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            for _ in 0..accepts {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                seen.lock().accepted += 1;
+                let mut input = BufReader::new(stream.try_clone().expect("clone"));
+                let mut output = stream;
+                let Ok(init) = codec::read_message(&mut input) else {
+                    continue;
+                };
+                assert_eq!(init["method"], "initialize");
+                seen.lock().process_id = Some(init["params"]["processId"].clone());
+                codec::write_message(
+                    &mut output,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": init["id"],
+                        "result": { "capabilities": { "textDocumentSync": 1 } },
+                    }),
+                )
+                .expect("reply");
+                while let Ok(message) = codec::read_message(&mut input) {
+                    let Some(method) = message.get("method").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    seen.lock().methods.push(method.to_string());
+                    if method == "initialized"
+                        && let Some(wait) = close_after
+                    {
+                        std::thread::sleep(wait);
+                        break;
+                    }
+                    if method == "shutdown" {
+                        let _ = codec::write_message(
+                            &mut output,
+                            &serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": message["id"],
+                                "error": { "code": -32601, "message": "Method not found" },
+                            }),
+                        );
+                    }
+                }
+                // `output` drops here: the client sees EOF.
+            }
+        })
+    }
+
+    /// A supervisor over one socket candidate, on a test thread.
+    struct Attached {
+        events: Receiver<LspEvent>,
+        outbox: Option<Sender<Value>>,
+        stop: Arc<AtomicBool>,
+        pending: Pending,
+        supervisor: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Attached {
+        fn start(addr: std::net::SocketAddr) -> Self {
+            let (outbox_tx, outbox_rx) = crossbeam_channel::bounded::<Value>(OUTBOX);
+            let (events_tx, events_rx) = crossbeam_channel::unbounded::<LspEvent>();
+            let stop = Arc::new(AtomicBool::new(false));
+            let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let supervisor = {
+                let stop = Arc::clone(&stop);
+                let pending = Arc::clone(&pending);
+                std::thread::spawn(move || {
+                    supervise(
+                        Server::RUST_ANALYZER,
+                        vec![Candidate {
+                            target: Target::Tcp { addr },
+                            provenance: crate::discover::Provenance::Attached,
+                        }],
+                        Vec::new(),
+                        crate::config::Tuning::default(),
+                        outbox_rx,
+                        events_tx,
+                        stop,
+                        pending,
+                        Arc::new(Caps::default()),
+                        Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    )
+                })
+            };
+            Self {
+                events: events_rx,
+                outbox: Some(outbox_tx),
+                stop,
+                pending,
+                supervisor: Some(supervisor),
+            }
+        }
+
+        /// Wait for the next status event, up to `within`.
+        fn next_status(&self, within: Duration) -> Option<SourceStatus> {
+            let deadline = Instant::now() + within;
+            while Instant::now() < deadline {
+                match self.events.recv_timeout(Duration::from_millis(50)) {
+                    Ok(LspEvent::Status(status)) => return Some(status),
+                    Ok(_) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return None,
+                }
+            }
+            None
+        }
+
+        /// Wait for `Ready`, failing on a permanent `Unavailable` — the crash budget's sentence —
+        /// and returning every transient `Unavailable` seen on the way.
+        fn ready(&self, within: Duration) -> Vec<String> {
+            let deadline = Instant::now() + within;
+            let mut unavailable = Vec::new();
+            while let Some(status) =
+                self.next_status(deadline.saturating_duration_since(Instant::now()))
+            {
+                match status {
+                    SourceStatus::Ready => return unavailable,
+                    SourceStatus::Unavailable { reason } => {
+                        assert!(
+                            !reason.contains("times in five minutes"),
+                            "the crash budget was spent on a socket: {reason}"
+                        );
+                        unavailable.push(reason);
+                    }
+                    SourceStatus::Scanning { .. } => {}
+                }
+            }
+            panic!("no Ready within {within:?}; transient: {unavailable:?}");
+        }
+
+        /// The drop path: stop, drop the outbox, join.
+        fn stop(mut self) -> Duration {
+            let started = Instant::now();
+            self.stop.store(true, Ordering::Release);
+            drop(self.outbox.take());
+            if let Some(handle) = self.supervisor.take() {
+                let _ = handle.join();
+            }
+            started.elapsed()
+        }
+    }
+
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            drop(self.outbox.take());
+            if let Some(handle) = self.supervisor.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn loopback() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("bind")
+    }
+
+    #[test]
+    fn an_attached_server_reaches_ready_and_is_told_no_parent_pid() {
+        let listener = loopback();
+        let addr = listener.local_addr().expect("addr");
+        let seen = Arc::new(parking_lot::Mutex::new(Seen::default()));
+        let fake = fake_server(listener, 1, None, Arc::clone(&seen));
+
+        let attached = Attached::start(addr);
+        let transient = attached.ready(Duration::from_secs(10));
+        assert!(
+            transient.is_empty(),
+            "a listening server is never 'not listening': {transient:?}"
+        );
+        assert_eq!(
+            seen.lock().process_id,
+            Some(Value::Null),
+            "cide is not this server's parent, and must not claim to be"
+        );
+        attached.stop();
+        let _ = fake.join();
+    }
+
+    #[test]
+    fn stopping_an_attached_server_sends_shutdown_and_never_exit() {
+        let listener = loopback();
+        let addr = listener.local_addr().expect("addr");
+        let seen = Arc::new(parking_lot::Mutex::new(Seen::default()));
+        let fake = fake_server(listener, 1, None, Arc::clone(&seen));
+
+        let attached = Attached::start(addr);
+        attached.ready(Duration::from_secs(10));
+        let took = attached.stop();
+        let _ = fake.join();
+        let methods = seen.lock().methods.clone();
+        assert!(
+            methods.contains(&"initialized".to_string()),
+            "the handshake completed: {methods:?}"
+        );
+        assert_eq!(
+            methods.last().map(String::as_str),
+            Some("shutdown"),
+            "the last word is `shutdown`, a courtesy the server may refuse: {methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "exit"),
+            "`exit` is never sent to a process cide did not start: {methods:?}"
+        );
+        assert!(
+            took < GRACE + Duration::from_secs(1),
+            "the fake answered `shutdown` with an error and that counted as the reply — the \
+             ladder did not sit out the whole grace period: {took:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_listening_keeps_trying_and_says_so() {
+        // Take a port, then give it back: the address is real and nothing is on it.
+        let addr = loopback().local_addr().expect("addr");
+        let attached = Attached::start(addr);
+        let first = attached
+            .next_status(Duration::from_secs(5))
+            .expect("a status");
+        let SourceStatus::Unavailable { reason } = first else {
+            panic!("the first word about an unreachable server is Unavailable, got {first:?}");
+        };
+        assert!(
+            reason.contains("is not listening on") && reason.contains(&addr.port().to_string()),
+            "the sentence names the address: {reason}"
+        );
+        assert!(
+            reason.contains("rustup component add rust-analyzer"),
+            "and carries the definition's own hint — how the user makes it reachable: {reason}"
+        );
+
+        // Now something listens. The retry finds it with no restart asked for.
+        let listener = TcpListener::bind(addr).expect("rebind");
+        let seen = Arc::new(parking_lot::Mutex::new(Seen::default()));
+        let fake = fake_server(listener, 1, None, Arc::clone(&seen));
+        let transient = attached.ready(ATTACH_RETRY + Duration::from_secs(5));
+        assert!(
+            transient.is_empty(),
+            "the outage sentence is said once, not once per retry tick: {transient:?}"
+        );
+        attached.stop();
+        let _ = fake.join();
+    }
+
+    #[test]
+    fn a_closed_socket_after_handshake_reconnects_rather_than_counting_a_crash() {
+        let listener = loopback();
+        let addr = listener.local_addr().expect("addr");
+        let seen = Arc::new(parking_lot::Mutex::new(Seen::default()));
+        // Drops the first connection a moment after the handshake — long enough for Ready to
+        // have settled — then accepts a second.
+        let fake = fake_server(
+            listener,
+            2,
+            Some(READY_SETTLE + Duration::from_millis(500)),
+            Arc::clone(&seen),
+        );
+
+        let attached = Attached::start(addr);
+        attached.ready(Duration::from_secs(10));
+        // The socket closes; the next word is the outage sentence, not a crash count, and the
+        // one after that is Ready again — through the retry, with nothing pressed.
+        let transient = attached.ready(ATTACH_RETRY + Duration::from_secs(8));
+        assert_eq!(
+            transient.len(),
+            1,
+            "one outage, one sentence, then Ready again: {transient:?}"
+        );
+        assert!(
+            transient[0].contains("is not listening on"),
+            "{transient:?}"
+        );
+        assert_eq!(
+            seen.lock().accepted,
+            2,
+            "the second life is a second connection"
+        );
+        attached.stop();
+        let _ = fake.join();
+    }
+
+    #[test]
+    fn a_stop_during_the_attach_wait_returns_promptly() {
+        let addr = loopback().local_addr().expect("addr");
+        let attached = Attached::start(addr);
+        assert!(matches!(
+            attached.next_status(Duration::from_secs(5)),
+            Some(SourceStatus::Unavailable { .. })
+        ));
+        // Mid-wait. The retry cadence is three seconds; a stop must not sit it out.
+        let took = attached.stop();
+        assert!(
+            took < Duration::from_secs(1),
+            "closing a project waited out the attach cadence: {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_queued_request_during_the_attach_wait_is_cancelled_not_timed_out() {
+        let addr = loopback().local_addr().expect("addr");
+        let attached = Attached::start(addr);
+        assert!(matches!(
+            attached.next_status(Duration::from_secs(5)),
+            Some(SourceStatus::Unavailable { .. })
+        ));
+        // A request registered while the supervisor waits between attempts: the wait discards
+        // the message and must release its waiter with `ServerGone`, or the caller sits out its
+        // own deadline and is told "still indexing" about a server that is not there.
+        let (waiter_tx, waiter_rx) = crossbeam_channel::bounded(1);
+        attached
+            .pending
+            .lock()
+            .insert(PendingKey::Reply(REQUEST_ID_BASE), waiter_tx);
+        attached
+            .outbox
+            .as_ref()
+            .expect("outbox")
+            .send(serde_json::json!({ "jsonrpc": "2.0", "id": REQUEST_ID_BASE, "method": "x" }))
+            .expect("queued");
+        assert_eq!(
+            waiter_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(RequestError::ServerGone)),
+            "the waiter was left to time out during the attach wait"
+        );
+        attached.stop();
     }
 }

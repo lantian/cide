@@ -245,6 +245,24 @@ mod tests {
             extra_env(Server::GOPLS, Provenance::HintDir, Tuning::default()).is_empty(),
             "an npm-dir binary must get byte-for-byte the environment a PATH one gets"
         );
+        // An attached server (M59) is somebody else's process: no fork options through either
+        // lane and no environment, because there is no spawn to carry one. Pinned for both
+        // servers so the `matches!` gates cannot quietly widen to it.
+        assert!(!wants_options(Server::RUST_ANALYZER, Provenance::Attached));
+        assert!(!wants_options(Server::GOPLS, Provenance::Attached));
+        assert!(
+            extra_env(Server::GOPLS, Provenance::Attached, Tuning::default()).is_empty(),
+            "a server cide did not start has no environment to be given"
+        );
+        assert_eq!(
+            init_options(
+                Server::RUST_ANALYZER,
+                Provenance::Attached,
+                Tuning::default()
+            ),
+            None,
+            "and lane two stays shut for it"
+        );
     }
 
     #[test]

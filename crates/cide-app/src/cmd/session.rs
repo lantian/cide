@@ -1697,7 +1697,10 @@ pub fn session_log_detail(
     session: SessionId,
     handle: u64,
 ) -> Option<cide_ipc::LogLineDetail> {
-    let raw = logs.get(session, handle)?;
+    let crate::logring::Kept {
+        raw,
+        recorded_unix_ms,
+    } = logs.get(session, handle)?;
     // Pretty-printed here rather than in the webview, so the one place that knows the bytes
     // is the one place that formats them — and so a pane in a detached window, which has its
     // own JavaScript realm, cannot render it differently from a docked one.
@@ -1705,7 +1708,11 @@ pub fn session_log_detail(
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| raw.clone());
-    Some(cide_ipc::LogLineDetail { raw, pretty })
+    Some(cide_ipc::LogLineDetail {
+        raw,
+        pretty,
+        recorded_unix_ms,
+    })
 }
 
 #[cfg(test)]

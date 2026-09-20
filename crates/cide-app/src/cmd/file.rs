@@ -381,7 +381,7 @@ struct Openable {
 /// | guard | concern | what removing it costs |
 /// | --- | --- | --- |
 /// | shape: absolute, no `..` | **integrity** — a path that means something different depending on who resolves it | a relative path canonicalised against cide's *own* cwd, which is not the project |
-/// | containment (textual, then canonical) | **confidentiality** — any readable text file on the machine | `~/.claude/.credentials.json` in a buffer, and from there in `claude_selection_changed` |
+/// | containment (textual, then canonical) | **confidentiality** — any readable text file on the machine | `~/.claude/.credentials.json` in a buffer, and from there in `claude_send_lines` |
 /// | `is_file` | **liveness** — FIFOs, device nodes, sockets, directories | a blocking-pool worker parked in `read_to_end` for ever, or `/dev/zero` read until the process is OOM-killed |
 /// | size limit | **junk** — a 2 GB log becomes a tab and then an error | annoying, not dangerous |
 ///
@@ -1468,13 +1468,155 @@ pub(crate) fn write_document(
     caches: &[PathBuf],
     if_unchanged: Option<cide_ipc::FileStamp>,
 ) -> Result<Option<cide_ipc::FileStamp>> {
+    write_document_bytes(path, text.as_bytes(), roots, caches, if_unchanged)
+}
+
+/// [`write_document`] over bytes: the rule, then the precondition, then the write. (M63)
+///
+/// One body for both roads, so a drawing saved as a PNG under a dependency cache is refused by
+/// the same sentence a buffer is.
+pub(crate) fn write_document_bytes(
+    path: &Path,
+    bytes: &[u8],
+    roots: &[PathBuf],
+    caches: &[PathBuf],
+    if_unchanged: Option<cide_ipc::FileStamp>,
+) -> Result<Option<cide_ipc::FileStamp>> {
     if let Some(reason) = cide_core::toolchain::read_only_reason_in(path, roots, caches) {
         return Err(CoreError::Io(reason));
     }
     // Checked **after** the read-only rule and before anything is written. Order matters only
     // for the message: a buffer over a registry source that also happens to have moved should
     // report the rule the user can act on.
-    document::write_if_unchanged(path, text, if_unchanged)
+    document::write_bytes_if_unchanged(path, bytes, if_unchanged)
+}
+
+/// The file's stamp right now, for a pane that follows the disk without re-reading it. (M63)
+///
+/// The drawing pane compares this against the stamp it read with, on every `cide://git-status`,
+/// exactly as `EditorPane::recheckOnDisk` does — except that the editor answers the question by
+/// re-reading the whole text through `file_read`, which for a two-megabyte `.excalidraw.png` on
+/// every status event would be a needless read the user can feel. `None` is a filesystem that
+/// would not answer, and the pane treats it as `FileStamp` documents: no precondition.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_stat(path: String) -> Result<Option<cide_ipc::FileStamp>> {
+    blocking(move || Ok(document::stamp_at(&PathBuf::from(path)))).await
+}
+
+/// Read a file's bytes for the drawing pane — the one command that answers bytes. (M63)
+///
+/// # The rule this is the exception to, and why it holds anyway
+///
+/// [`image_read`] above refuses to send pixels over the IPC, and `cide_ipc::image` states the
+/// argument: Tauri's IPC is JSON, and a `Vec<u8>` through it is a decimal array or a base64
+/// string, either of which parks a 40 MB PNG in three heaps on the thread that draws every
+/// terminal. The asset protocol was the answer for an `<img>`, and it is **not** available
+/// here: the pane needs the bytes as a `Blob` it can hand to Excalidraw's `loadFromBlob`, and
+/// `fetch()` on `asset://` fails on Linux — wry registers the scheme as secure and not as
+/// CORS-enabled, and the CSP's `connect-src` does not name it either.
+///
+/// What holds is the *reason* for the rule rather than its letter. `tauri::ipc::Response::new`
+/// is neither JSON nor base64: it travels as `application/octet-stream` over the same custom
+/// protocol the terminal's scrollback takes (`cmd::diag::diag_echo_bytes`, `session_attach`),
+/// one round trip, no `eval`, and the webview receives an `ArrayBuffer`. The bytes are copied
+/// once, into the frame.
+///
+/// # Why a frame and not a `Response` alone
+///
+/// A `Response` is a body and nothing else, and the pane needs the stamp the bytes were read
+/// with — from the **same** `stat`, or a rewrite landing between two calls is a spurious
+/// conflict bar on the next autosave. So the answer is `cide_ipc::frame`: a JSON
+/// [`cide_ipc::FileBytesHead`] and the payload, in one buffer, split by four bytes of length.
+///
+/// The read-only rule is applied exactly as [`read_document`] applies it, for the same
+/// registry-source reason; a drawing under `~/.cargo/registry` opens in view mode.
+///
+/// `blocking` for [`file_read`]'s reason — a stalled mount must not take the event loop.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_read_bytes(
+    state: State<'_, WorkspaceState>,
+    path: String,
+) -> Result<tauri::ipc::Response> {
+    let roots = open_roots(&state);
+    let caches = cide_core::toolchain::dependency_roots();
+    blocking(move || {
+        let path = PathBuf::from(path);
+        let mut raw = document::read_bytes(&path)?;
+        if let Some(reason) = cide_core::toolchain::read_only_reason_in(&path, &roots, &caches) {
+            tracing::debug!(%reason, "opening a dependency source read-only");
+            raw.writable = false;
+        }
+        let head = cide_ipc::FileBytesHead {
+            writable: raw.writable,
+            stamp: raw.stamp,
+        };
+        let head = serde_json::to_string(&head)
+            .map_err(|e| CoreError::Io(format!("{} could not be framed: {e}", path.display())))?;
+        let frame = cide_ipc::frame::pack(&head, &raw.bytes)
+            .map_err(|e| CoreError::Io(format!("{}: {e}", path.display())))?;
+        Ok(tauri::ipc::Response::new(frame))
+    })
+    .await
+}
+
+/// Write a file's bytes back — [`file_write`] for a drawing saved as PNG. (M63)
+///
+/// The request is a **raw body**, not JSON arguments: `invoke('file_write_bytes', bytes)` with a
+/// `Uint8Array` arrives as `tauri::ipc::InvokeBody::Raw`, which is the request-side twin of the
+/// `Response` [`file_read_bytes`] answers with, and the same argument applies. The path and the
+/// precondition ride in the frame's head ([`cide_ipc::FileBytesWrite`]) rather than in request
+/// headers, because a header value is visible ASCII and a path is not.
+///
+/// `async` with a borrowed `Request` is allowed by Tauri's macro only for a command returning a
+/// `Result`, which this does; the body is copied into an owned frame before the blocking pool
+/// takes it. Every rule [`write_document`] applies — the dependency-cache refusal, then the
+/// stamp — is applied here through the same function.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_write_bytes(
+    state: State<'_, WorkspaceState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<Option<cide_ipc::FileStamp>> {
+    let (write, bytes) = bytes_request(request.body())?;
+    let roots = open_roots(&state);
+    let caches = cide_core::toolchain::dependency_roots();
+    blocking(move || {
+        write_document_bytes(
+            &PathBuf::from(write.path),
+            &bytes,
+            &roots,
+            &caches,
+            write.if_unchanged,
+        )
+    })
+    .await
+}
+
+/// [`file_write_bytes`]'s parse, over the body alone, so it can be driven without a webview.
+///
+/// A JSON body is refused by name rather than deserialised into something: a caller that reached
+/// this command through `invoke(cmd, { path, bytes })` has put the bytes through exactly the road
+/// this command exists to avoid, and the sentence should say so.
+pub(crate) fn bytes_request(
+    body: &tauri::ipc::InvokeBody,
+) -> Result<(cide_ipc::FileBytesWrite, Vec<u8>)> {
+    let raw = match body {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes,
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err(CoreError::Io(
+                "file_write_bytes takes a raw body — a framed Uint8Array, never JSON arguments; \
+                 see cide_ipc::frame"
+                    .into(),
+            ));
+        }
+    };
+    let (head, payload) = cide_ipc::frame::unpack(raw)
+        .map_err(|e| CoreError::Io(format!("file_write_bytes: {e}")))?;
+    let write: cide_ipc::FileBytesWrite = serde_json::from_str(head).map_err(|e| {
+        CoreError::Io(format!(
+            "file_write_bytes: the frame head is not a write request: {e}"
+        ))
+    })?;
+    Ok((write, payload.to_vec()))
 }
 
 /// Remember where the user is in a file. (M12)
@@ -1526,39 +1668,20 @@ async fn blocking<T: Send + 'static>(
     }
 }
 
-/// Report the editor's selection to the project's Claude sessions.
-///
-/// The gap this closes: `IdeServer::selection_changed` existed, was unit-tested, and had no
-/// producer — nothing in `cide-app` called it and there was no command to reach it from.
-/// A handler with no caller is a feature that passes its tests and has never run.
-///
-/// **Line numbers are 0-based on the wire** and 1-based everywhere a human sees them, so the
-/// conversion happens here, at the boundary, exactly once. CodeMirror counts lines from 1.
-///
-/// Debounced on the frontend, not here: a selection drag fires per animation frame, and a
-/// command per frame would be an IPC round trip per frame.
-#[tauri::command(rename_all = "camelCase")]
-pub fn claude_selection_changed(
-    app: tauri::AppHandle,
-    project: cide_ipc::ProjectId,
-    path: String,
-    text: String,
-    start_line: u32,
-    end_line: u32,
-) {
-    let Some(servers) = app.try_state::<crate::ide::IdeServers>() else {
-        return;
-    };
-    servers.selection_changed(
-        project,
-        cide_ide_mcp::SelectionChanged {
-            file_path: path,
-            text,
-            start_line: start_line.saturating_sub(1),
-            end_line: end_line.saturating_sub(1),
-        },
-    );
-}
+// There used to be a `claude_selection_changed` command here, registered in `lib.rs` and named
+// in `contract/commands.json`, that `EditorPane` called on an 80 ms debounce from the editor's
+// selection listener — every caret move, in every open file — and that **broadcast** the
+// selection to every `claude` connected to the project. It was added because the addressed
+// `IdeServer::selection_changed` had no producer, and the argument was that a selection is a
+// fact about the editor rather than a message to one conversation. The chair disagreed: the
+// CLI shows a received selection as `⧉ Selected N lines from <file>` in its prompt and sends
+// the text as context with the next message, so reading a file while four agents worked put
+// that file into all four conversations, and there was nothing on screen in the editor to say
+// so. The command is gone rather than gated, because there is no reading of "the user looked
+// at a file" that makes it a message to anybody. `claude_send_lines` below is the deliberate
+// gesture — a context-menu row naming one session — and it now carries the selection as well as
+// the mention, to that pane only. Deleting it is the same three-file change as the note below
+// describes, so a reviewer sees the surface shrink.
 
 // There used to be a `claude_mention_file` command here, registered in `lib.rs` and named in
 // `contract/commands.json`, whose body was `claude_send_lines`'s second half with the result
@@ -1813,13 +1936,18 @@ impl serde::Serialize for ClaudeSendError {
 ///
 /// # What the gesture does, and why this shape
 ///
-/// Two notifications, in this order:
+/// Two notifications, in this order, **both addressed to the same pane**:
 ///
-/// 1. `selection_changed`, broadcast, so every connected `claude` in the project has the range
-///    in its status line and agrees with what is about to be mentioned. Un-debounced, unlike
-///    [`claude_selection_changed`] — this one is a deliberate act, not a drag.
-/// 2. `at_mentioned`, addressed to one pane, which is what actually puts `@path#L10-20` into
-///    that conversation's prompt.
+/// 1. `selection_changed`, which gives that `claude` the selected text — the CLI shows it as
+///    `⧉ Selected N lines` and sends it as context with the next message.
+/// 2. `at_mentioned`, which puts `@path#L10-20` into that conversation's prompt.
+///
+/// The first used to be a broadcast, sent before the pane was even resolved, on the theory
+/// that a status line in every other conversation should agree with the one being mentioned.
+/// That made the one deliberate gesture in this file type into every conversation in the
+/// project, which is the failure `cide_ide_mcp::server`'s module doc names. Both go to the
+/// resolved target now, after resolution, so the pane that gets the mention is the pane that
+/// gets the text and nobody else gets either.
 ///
 /// The alternative that lost was pasting the selected *text* into the prompt. It sounds more
 /// direct and is worse: a mention is what the protocol offers, it costs the agent one read of
@@ -1860,8 +1988,8 @@ impl serde::Serialize for ClaudeSendError {
 ///
 /// # Line numbers
 ///
-/// 1-based in, 0-based on the wire, converted here exactly once — the same boundary
-/// [`claude_selection_changed`] uses. `None` for both means the whole file, so the caret
+/// 1-based in, 0-based on the wire, converted here exactly once, at the boundary. `None` for
+/// both means the whole file, so the caret
 /// sitting in a buffer mentions the file rather than one arbitrary line. Verified against
 /// `cide_ide_mcp::protocol::AtMentioned`, which documents the wire as 0-based inclusive and
 /// omits an absent bound rather than sending `null` (the CLI validates against a schema where
@@ -1901,21 +2029,6 @@ pub fn claude_send_lines(
     // values — so the range Claude highlights and the range it is told about cannot disagree.
     let start = line_start.map(|l| l.saturating_sub(1));
     let end = line_end.map(|l| l.saturating_sub(1));
-
-    if let (Some(start), Some(end)) = (start, end) {
-        // Best-effort and deliberately unchecked: reaching nobody here is reported by the
-        // mention below, and failing the whole gesture because a *status line* did not update
-        // would refuse a mention that was about to work.
-        servers.selection_changed(
-            project,
-            cide_ide_mcp::SelectionChanged {
-                file_path: path.clone(),
-                text,
-                start_line: start,
-                end_line: end,
-            },
-        );
-    }
 
     // Before asking who can receive, work out who the connected CLIs *are*. A `claude` behind
     // a launcher announces its own pid rather than the wrapper's, which is the pid this pane
@@ -1959,6 +2072,25 @@ pub fn claude_send_lines(
             .find(|candidate| reachable.contains(&candidate.to_string()))
             .unwrap_or(pane)
     };
+
+    if let (Some(start), Some(end)) = (start, end) {
+        // To `target`, never to anyone else, and only once the target is known — a
+        // selection sent before resolution went to a pane the mention then did not. Its
+        // delivery is deliberately not checked: it reaches exactly the socket the mention
+        // below reaches, and the mention is the half that reports. Failing the gesture
+        // because the *text* did not land would refuse a mention that was about to work,
+        // and reporting it separately would be two sentences about one socket.
+        servers.selection_changed(
+            project,
+            target,
+            cide_ide_mcp::SelectionChanged {
+                file_path: path.clone(),
+                text,
+                start_line: start,
+                end_line: end,
+            },
+        );
+    }
 
     match servers.at_mentioned(
         project,
@@ -3635,6 +3767,61 @@ mod tests {
                 "a refusal the user cannot read is a link wired to nothing: {json}"
             );
         }
+    }
+    /*
+     * The bytes road's parse. (M63)
+     *
+     * Everything about `file_write_bytes` that is not Tauri is here: the frame is split, the head
+     * is a `FileBytesWrite`, the payload is the file. The refusals carry sentences that name the
+     * road the caller should have taken, because the failure a user sees is "my drawing did not
+     * save" and the log line is the only clue.
+     */
+
+    #[test]
+    fn a_framed_write_is_split_into_its_request_and_its_bytes() {
+        let head = serde_json::to_string(&cide_ipc::FileBytesWrite {
+            path: "/home/иван/схема.excalidraw.png".into(),
+            if_unchanged: Some(cide_ipc::FileStamp {
+                mtime_nanos: 1_700_000_000_000_000_001,
+                len: 42,
+            }),
+        })
+        .expect("serialises");
+        let payload = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let frame = cide_ipc::frame::pack(&head, payload).expect("packs");
+
+        let (write, bytes) =
+            bytes_request(&tauri::ipc::InvokeBody::Raw(frame)).expect("a well-formed frame");
+        assert_eq!(write.path, "/home/иван/схема.excalidraw.png");
+        assert_eq!(write.if_unchanged.map(|s| s.len), Some(42));
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn a_json_body_is_refused_by_name() {
+        let error = bytes_request(&tauri::ipc::InvokeBody::Json(serde_json::json!({
+            "path": "/tmp/x.excalidraw",
+            "bytes": [1, 2, 3]
+        })))
+        .expect_err("JSON is the road this command exists to avoid");
+        let text = format!("{error}");
+        assert!(text.contains("raw body"), "{text}");
+        assert!(text.contains("never JSON"), "{text}");
+    }
+
+    #[test]
+    fn a_truncated_frame_and_a_head_that_is_not_a_write_are_refused_with_the_reason() {
+        let error = bytes_request(&tauri::ipc::InvokeBody::Raw(vec![9, 0, 0, 0, b'{']))
+            .expect_err("the prefix promises nine bytes of head");
+        assert!(format!("{error}").contains("truncated"), "{error}");
+
+        let frame = cide_ipc::frame::pack(r#"{"writable":true}"#, b"").expect("packs");
+        let error = bytes_request(&tauri::ipc::InvokeBody::Raw(frame))
+            .expect_err("a read head is not a write head");
+        assert!(
+            format!("{error}").contains("not a write request"),
+            "{error}"
+        );
     }
 }
 

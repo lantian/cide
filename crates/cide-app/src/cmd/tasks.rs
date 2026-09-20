@@ -124,7 +124,7 @@ pub async fn task_new(
         // broadcast below — see `TaskNew::attachments`. A refusal here (a file that went away
         // between the pick and the click) takes the task with it: the dialog stays open with
         // the sentence, and a retry must not mint a second `t-<n>` beside a first that has no
-        // files. The id is spent either way, which `high_water_mark` says is by design. (M39)
+        // files. The id is spent either way, which `TaskFile::next_id` says is by design. (M39)
         let task = match req.attachments.as_deref() {
             Some(sources) if !sources.is_empty() => {
                 match store.attach(&task.id, AttachTarget::Task, sources, TaskAuthor::User) {

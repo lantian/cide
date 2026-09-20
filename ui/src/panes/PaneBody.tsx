@@ -20,6 +20,8 @@ import { TerminalPane } from './TerminalPane'
 import { EditorPane } from './EditorPane'
 import { ImagePane } from './ImagePane'
 import { imageKindFor } from './imageKinds'
+import { ExcalidrawPane } from './ExcalidrawPane'
+import { drawingKindFor } from './excalidrawKinds'
 import { ClaudeDiffPane } from './ClaudeDiffPane'
 // Not lazy-loaded, for the reason `ImagePane` below is not: a pane that renders nothing for a
 // frame while a chunk arrives is a pane the layout measures at zero.
@@ -254,7 +256,30 @@ export function PaneBody({
      * `ImagePane` is not lazy-loaded and must not become so. A pane that renders nothing for a
      * frame while a chunk arrives is a pane the layout measures at zero, which is the failure
      * `layout/paneHosts.ts` spends thirty lines preventing for terminals.
+     *
+     * A drawing is a file tab too, and its fork comes **first**. (M63)
+     *
+     * `x.excalidraw.png` ends in `.png`, so the image test below would take it and show the
+     * picture — the very file the drawing pane exists to edit. `drawingKindFor` is asked before
+     * `imageKindFor` for that reason alone, and `check:excalidraw` pins the order. Same rule
+     * as the image fork in every other respect: by name, on the pane kind, nothing in Rust.
+     *
+     * `ExcalidrawPane` is a static import, honouring the rule above — it paints its full-size
+     * root on the first frame. What *is* lazy is the drawing engine behind it: 2.7 MB of
+     * JavaScript that the pane `import()`s after mounting, in parallel with the file read, and
+     * that no window pays for until somebody opens a drawing.
      */
+    if (drawingKindFor(editor.path) !== null) {
+      return (
+        <ExcalidrawPane
+          path={editor.path}
+          root={cwd}
+          project={project}
+          tab={editor.tab}
+          onScreen={onScreen}
+        />
+      )
+    }
     if (imageKindFor(editor.path) !== null) {
       return <ImagePane path={editor.path} root={cwd} onScreen={onScreen} />
     }

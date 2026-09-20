@@ -448,6 +448,12 @@ pub fn tab_outlives_close(kind: &TabKind) -> bool {
         // `Ctrl+Shift+T` a day later would be a permanent apology tab about an id that no
         // longer resolves — and, worse, `reopen_project` would restore it on every launch.
         TabKind::Docker { .. } | TabKind::DockerFiles { .. } => false,
+        // **True**, unlike the Docker tabs beside it, because the tab carries a *question* the
+        // server answers afresh on every mount: a Godot native symbol is addressable by name for
+        // as long as the engine has the class, and a hover subject is a position in a file that
+        // survives a restart as well as the file does. A page the server can no longer answer
+        // draws its sentence and nothing worse — there is no id here that stops resolving.
+        TabKind::Docs { .. } => true,
         TabKind::ClaudeHome
         | TabKind::ClaudeFull { .. }
         | TabKind::File { .. }

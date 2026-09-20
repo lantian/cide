@@ -44,7 +44,6 @@ import { EditorSurface, type SaveCause } from '@/editor/EditorSurface'
  */
 const GIT_RECHECK_MS = 120
 import {
-  claude as claudeApi,
   diag,
   events,
   fileChanged,
@@ -156,11 +155,11 @@ type Load =
 /**
  * How long a burst of scrolling accumulates before one IPC call.
  *
- * The second rung of the ladder in `crates/cide-app/src/positions_state.rs`. Longer than the
- * 80 ms `reportSelection` uses below, and the difference is what each notification is *for*:
- * that one drives a status line a human is watching in another process, so staleness is
- * visible; this one is a durable record nobody reads until the file is reopened, so the only
- * thing that matters is that the last gesture of a burst lands.
+ * The second rung of the ladder in `crates/cide-app/src/positions_state.rs`. Generous, because
+ * this is a durable record nobody reads until the file is reopened, so the only thing that
+ * matters is that the last gesture of a burst lands. (An 80 ms sibling used to sit beside it,
+ * reporting the selection to every `claude` in the project on each caret move; see the note
+ * above `reportPosition` for why there is no such thing any more.)
  */
 const POSITION_DEBOUNCE_MS = 500
 
@@ -264,6 +263,23 @@ export function EditorPane({
   const completion = useMemo(
     () => ({ enabled: completionOn, onTyping: completionOnTyping }),
     [completionOn, completionOnTyping],
+  )
+  /**
+   * `settings.editor.tabSize`, `.insertSpaces` and `.detectIndentation`, from the mirror. (M59)
+   *
+   * The first two were offered in Settings ▸ Editor from M15 and read by nothing until here —
+   * `docs/journal.md`'s M15 finding, and the reason `check:editor` asserts a setting is *read*
+   * rather than merely offered. Defaults match `EditorSettings::default()` before bootstrap.
+   * Three scalar reads and a memo, for `completion`'s reason above.
+   */
+  const tabSize = useWorkspace((s) => s.boot?.workspace.settings.editor.tabSize ?? 4)
+  const insertSpaces = useWorkspace((s) => s.boot?.workspace.settings.editor.insertSpaces ?? true)
+  const detectIndentation = useWorkspace(
+    (s) => s.boot?.workspace.settings.editor.detectIndentation ?? true,
+  )
+  const indent = useMemo(
+    () => ({ tabSize, insertSpaces, detect: detectIndentation }),
+    [tabSize, insertSpaces, detectIndentation],
   )
   /**
    * Is a Claude Code diff of **this file** on screen, with the agent blocked on it?
@@ -758,44 +774,27 @@ export function EditorPane({
     [path, project, tab],
   )
 
-  /**
-   * Tell the project's Claude sessions where the caret is.
+  /*
+   * Nothing here reports the selection to Claude, and that is a decision rather than a gap.
    *
-   * Debounced, and that is the whole reason this is not a straight call: a selection drag
-   * fires the editor's update listener once per animation frame, and one IPC round trip per
-   * frame during a drag is the kind of cost that only shows up on someone else's machine.
-   * 80 ms is below the threshold where a status readout feels stale and well above a frame.
-   *
-   * Fire-and-forget: the notification is advisory — Claude Code shows it in its status line
-   * — and a failed send must never interrupt typing. A project with no IDE server, or no
-   * connected `claude`, drops it on the Rust side with a debug log.
+   * There used to be a `reportSelection` beside `reportPosition`: an 80 ms debounce over the
+   * surface's selection listener that called `claude_selection_changed`, which Rust broadcast
+   * to every `claude` connected to the project. The argument was that a selection is a fact
+   * about the editor, not a message to one conversation. What the CLI does with it says
+   * otherwise — it draws `⧉ Selected N lines from <file>` in its prompt and sends the text as
+   * context with the next message — so reading a file while four agents worked put that file
+   * into all four conversations, silently, and moving the caret changed what each of them was
+   * about to be told. The deliberate gesture is the editor menu's *Send … to Claude ▸*, which
+   * names one session and goes through `claude_send_lines` to that pane only; it now carries
+   * the selection as well as the mention. A selection that nobody asked to send is not sent.
    */
-  const selectionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
-  const reportSelection = useCallback(
-    (sel: { text: string; startLine: number; endLine: number }) => {
-      if (project === undefined) return
-      if (selectionTimer.current !== undefined) clearTimeout(selectionTimer.current)
-      selectionTimer.current = setTimeout(() => {
-        void claudeApi.selectionChanged(project, path, sel.text, sel.startLine, sel.endLine)
-      }, 80)
-    },
-    [project, path],
-  )
-
-  // A pending report for a pane that has gone would fire against an unmounted editor.
-  useEffect(
-    () => () => {
-      if (selectionTimer.current !== undefined) clearTimeout(selectionTimer.current)
-    },
-    [],
-  )
 
   /**
    * Remember where the user is in this file.
    *
-   * Debounced here rather than in the surface, for the reason `reportSelection` above is: the
-   * surface is documented as pure — "no IPC, no store, no knowledge of tabs" — and the moment it
-   * knows what a debounce is for, it knows about the wire.
+   * Debounced here rather than in the surface: the surface is documented as pure — "no IPC,
+   * no store, no knowledge of tabs" — and the moment it knows what a debounce is for, it knows
+   * about the wire.
    *
    * The trailing edge matters and the leading edge does not. Nobody needs the *first* frame of a
    * scroll recorded; what has to survive is where the gesture ended, which is why this resets
@@ -861,15 +860,14 @@ export function EditorPane({
   )
 
   /*
-   * On the way out this **flushes**, where the selection cleanup above **cancels** — and the
-   * asymmetry is the whole point rather than an oversight.
+   * On the way out this **flushes** rather than cancels, and the choice is the point.
    *
-   * A pending `selection_changed` for a pane that has gone is noise: it describes a caret that
-   * is no longer on screen, in a notification whose only consumer is a status line. A pending
-   * *position* for a pane that has gone is the single most valuable one there is — closing the
-   * tab, switching project and detaching a pane all arrive here as an unmount, and every one of
-   * them is a moment the user expects to come back to. Cancelling would mean the last half
-   * second of every reading session was the half that got lost.
+   * A pending *position* for a pane that has gone is the single most valuable one there is —
+   * closing the tab, switching project and detaching a pane all arrive here as an unmount, and
+   * every one of them is a moment the user expects to come back to. Cancelling would mean the
+   * last half second of every reading session was the half that got lost. (The selection
+   * report that used to sit beside this one cancelled on unmount, for the opposite reason: a
+   * caret that is no longer on screen is noise. It is gone entirely now; see above.)
    *
    * A window closed by the compositor does not run React cleanup at all. The 500 ms debounce
    * will normally have fired long before; what covers the rest is the store's own flush in
@@ -1375,6 +1373,7 @@ export function EditorPane({
           doc={load.text}
           reloadKey={reloadKey}
           readOnly={!load.writable}
+          indent={indent}
           onDirtyChange={reportDirty}
           onSave={onSave}
           /*
@@ -1389,7 +1388,6 @@ export function EditorPane({
             ceilingMs: AUTOSAVE_CEILING_MS,
             allow: allowAutosave,
           }}
-          onSelection={reportSelection}
           at={load.at}
           onView={reportPosition}
           onSaveHandle={registerSaveHandle}

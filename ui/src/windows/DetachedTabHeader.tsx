@@ -55,6 +55,8 @@ function tabTitle(kind: TabKind): string {
       return kind.name
     case 'docker':
       return kind.title
+    case 'docs':
+      return kind.title
     case 'dockerFiles':
       return `${kind.name} : files`
     case 'openSpec':

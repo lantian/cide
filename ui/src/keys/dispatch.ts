@@ -109,6 +109,7 @@ import { focusedCaret, focusedFolds, focusedFormat, focusedWord } from '@/editor
 import { focusedChangeNav } from '@/panes/changeNav'
 import { formatDocument } from '@/editor/formatDocument'
 import { goToDefinition } from '@/editor/goToDefinition'
+import { showDocumentation } from '@/editor/quickDocumentation'
 import { findUsages, goToImplementation } from '@/editor/codeIntel'
 import { refreshDiagnostics } from '@/sidebar/ProblemsPanel/actions'
 import { navigate } from '@/editor/jump'
@@ -1701,9 +1702,25 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // declaration is not what anyone meant. `goToImplementation` falls back to the plain
         // declaration when nothing implements it, which is both the right answer and what stops
         // the two functions calling each other for ever.
-        goToDefinition(project.id, caret.path, caret.line, caret.column, () =>
-          goToImplementation(project.id, caret.path, caret.line, caret.column, focusedWord()),
+        goToDefinition(
+          project.id,
+          caret.path,
+          caret.line,
+          caret.column,
+          () => goToImplementation(project.id, caret.path, caret.line, caret.column, focusedWord()),
+          focusedWord() ?? '',
         )
+        return
+      }
+
+      case 'navigate.documentation': {
+        // The same four-line preamble as `navigate.definition`, for the same reason: a `when`
+        // gates the palette and never the keyboard, so F1 in a terminal pane arrives here.
+        const caret = focusedCaret()
+        if (caret === null) return unmet(command, 'no editor focused')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        showDocumentation(project.id, caret.path, caret.line, caret.column, focusedWord() ?? '')
         return
       }
 

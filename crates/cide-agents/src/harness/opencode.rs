@@ -184,8 +184,8 @@ use cide_ipc::HarnessSession;
 
 use super::RenderState;
 use super::render::{
-    BOLD, CYAN, DIM, REASONING_BUDGET, RED, RESET, TITLE_BUDGET, absorbs, clip, compact_input,
-    compose, one_line_of, prose, thousands,
+    BOLD, CYAN, DIM, RED, RESET, TITLE_BUDGET, absorbs, clip, compact_input, compose, measured_ms,
+    one_line_of, prose, tail, thought_line, thousands,
 };
 
 // Named from here since M42 — `SpawnSpec::fixed_size`'s reason is in `render.rs` now, and
@@ -1097,11 +1097,24 @@ fn capture(line: &str) -> Option<String> {
 // ==========================================================================================
 
 /// Whether a person may later ask for this line's whole event — [`SessionBinding::Harness`]'s
-/// `keep`. A tool call (its input and its whole output), the model's own words, and an error
-/// are worth a ring slot; a step marker or a reasoning fragment is not.
+/// `keep`. A tool call (its input and its whole output), the model's own words, a block of the
+/// model's thinking, and an error are worth a ring slot; a step marker is not.
+///
+/// Reasoning joined the list in M62 and the reason is the inverse of why it was excluded: the
+/// rendering used to *show* a clipped 240 characters of it, so the ring was a second copy of
+/// something already on screen. Now the row shows a duration and nothing else, which makes this
+/// ring the only place the thinking survives at all — see [`render_event`]'s reasoning arm.
+///
+/// Paired with the handle the row carries: keep a line the row does not name, and the slot is
+/// spent on something no click can reach; name a handle for a line this refuses, and the row
+/// shows a `#7` that resolves to nothing. The test asserts both halves over one fixture.
 pub fn keep_event(line: &str) -> bool {
-    Event::parse(line)
-        .is_some_and(|event| matches!(event.kind.as_str(), "tool_use" | "text" | "error"))
+    Event::parse(line).is_some_and(|event| {
+        matches!(
+            event.kind.as_str(),
+            "tool_use" | "text" | "reasoning" | "error"
+        )
+    })
 }
 
 /// One event line, as a person should read it — [`SessionBinding::Harness`]'s `render`.
@@ -1122,8 +1135,10 @@ pub fn keep_event(line: &str) -> bool {
 ///   `step_finish`, and every line rendered in between erases it and draws it again below
 ///   itself. The last row of the pane therefore answers the question the report asked: a marker
 ///   means the model is thinking or a tool is running, no marker means the turn is over;
-/// * the model's own text passes whole, reasoning passes dimmed and clipped, `step_finish` is one
-///   dim token count;
+/// * the model's own text passes whole; a block of reasoning collapses to one dim row naming how
+///   long it took — `∴ thought  4.1s #8`, the whole of the thinking behind the same kind of
+///   handle a tool call carries (M62, which replaced a clipped 240 characters of it per block);
+///   `step_finish` is one dim token count;
 /// * an event type this build has never heard of becomes a dim one-word marker rather than a
 ///   screenful of JSON, and **a line that is not JSON is kept verbatim** — that is the CLI's own
 ///   prose (a warning, a rejected permission) and hiding it would hide the failure. Under a live
@@ -1163,13 +1178,20 @@ pub fn render_event(state: &mut RenderState, line: &str, handle: Option<u64>) ->
             }
             Some(text.to_string())
         }
+        // One row, no prose: `∴ thought  4.1s #8`. The whole block is behind the handle.
+        //
+        // The duration is the part's own `time` where it has one — opencode stamps a completed
+        // part with `{"start":…,"end":…}`, which is the harness's own measurement and outranks
+        // anything cide could time from outside. `end` is optional on a part, though, so the
+        // fallback is the gap since the last line that drew anything; a row with no duration at
+        // all is what both refusing looks like, and it is a better answer than `0ms`.
         "reasoning" => {
             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
-            let text = one_line_of(text);
-            if text.is_empty() {
+            if one_line_of(text).is_empty() {
                 return Rendered::Drop;
             }
-            Some(format!("{DIM}∴ {}{RESET}", clip(&text, REASONING_BUDGET)))
+            let ms = duration_ms(part).or_else(|| measured_ms(state));
+            Some(thought_line(ms, handle))
         }
         "tool_use" => Some(render_tool(part, handle)),
         // The shape the CLI actually prints for a failure is top-level — `{"type":"error",
@@ -1205,20 +1227,9 @@ fn render_tool(part: &Value, handle: Option<u64>) -> String {
     };
     let title = clip(&one_line_of(&title), TITLE_BUDGET);
 
-    // The dim tail: how long it took, and the handle a click resolves. The handle is last and
-    // spelled `#<n>` because `ui/src/terminal/runLinks.ts` reads it off the end of the line.
-    let mut tail: Vec<String> = Vec::new();
-    if let Some(ms) = duration_ms(state) {
-        tail.push(duration(ms));
-    }
-    if let Some(handle) = handle {
-        tail.push(format!("#{handle}"));
-    }
-    let tail = if tail.is_empty() {
-        String::new()
-    } else {
-        format!("  {DIM}{}{RESET}", tail.join(" "))
-    };
+    // The dim tail: how long it took, and the handle a click resolves. Shared with the thought
+    // row since M62 — see `render::tail`, which is why the handle is last.
+    let tail = tail(duration_ms(state), handle);
 
     if status == "error" {
         let error = state
@@ -1251,23 +1262,15 @@ fn display_tool(tool: &str) -> String {
     }
 }
 
-/// `state.time.end - state.time.start`, in milliseconds, when the CLI recorded both.
-fn duration_ms(state: &Value) -> Option<u64> {
-    let start = state.pointer("/time/start").and_then(Value::as_u64)?;
-    let end = state.pointer("/time/end").and_then(Value::as_u64)?;
+/// `time.end - time.start`, in milliseconds, when the CLI recorded both.
+///
+/// Read from whichever document carries the `time` object: a tool call's `part.state` and, since
+/// M62, a reasoning `part` itself. `None` where either end is missing — `end` is absent on a part
+/// opencode has not finished, and half an interval is not a duration.
+fn duration_ms(value: &Value) -> Option<u64> {
+    let start = value.pointer("/time/start").and_then(Value::as_u64)?;
+    let end = value.pointer("/time/end").and_then(Value::as_u64)?;
     Some(end.saturating_sub(start))
-}
-
-/// `8ms`, `1.2s`, `2m05s` — three shapes, because a build and a `read` are three orders of
-/// magnitude apart and one format reads badly at one end or the other.
-fn duration(ms: u64) -> String {
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1_000)
-    }
 }
 
 /// The child, fresh (`resume: None`) or continuing a conversation the harness already minted.
@@ -1351,6 +1354,15 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
     // Not a display preference. This is the channel — see the module header.
     args.push("--format".into());
     args.push("json".into());
+    // And nor is this, which is why it is not behind a setting. Measured against 1.18.31: the
+    // CLI gates its `reasoning` event on a flag, `m = j.mini ? (j.thinking ?? true) :
+    // (j.thinking ?? false)`, and cide passes neither `--mini` nor this — so a run's stream
+    // carried **no reasoning event at all**, whatever the model did. The collapsed thought row
+    // shipped correct and drew nothing, over a stream of 16 `tool_use` and 2 `text` events with
+    // the model plainly thinking between them (run c913aa51). `--format json` is the whole
+    // reason: without a flag the CLI prints its own `Thinking: …` block only when it is talking
+    // to a person, and cide is not a person.
+    args.push("--thinking".into());
     args.push("--dir".into());
     args.push(plan.cwd.to_string_lossy().to_string());
 
@@ -1792,22 +1804,59 @@ mod tests {
             "{rendered}"
         );
 
-        // The model's words pass whole; reasoning passes dimmed and clipped.
+        // The model's words pass whole.
         let text = r#"{"type":"text","sessionID":"s","part":{"type":"text","text":"The task is already in doing.\n\nChecking the build."}}"#;
         let rendered = render_event(&mut state, text, None)
             .text()
             .expect("rendered")
             .to_string();
         assert!(rendered.contains("Checking the build."), "{rendered}");
+
+        // A block of thinking is one row naming how long it took, and **none** of the thinking.
+        // The whole of it is behind the handle — the collapse is the feature, so a rendering
+        // that put the prose back would still pass every assertion about the duration and the
+        // token below.
+        let thinking = "x".repeat(500);
         let reasoning = format!(
-            r#"{{"type":"reasoning","sessionID":"s","part":{{"type":"reasoning","text":{}}}}}"#,
-            serde_json::to_string(&"x".repeat(500)).unwrap()
+            r#"{{"type":"reasoning","sessionID":"s","part":{{"type":"reasoning","text":{},"time":{{"start":1000,"end":5100}}}}}}"#,
+            serde_json::to_string(&thinking).unwrap()
         );
-        let rendered = render_event(&mut state, &reasoning, None)
+        let rendered_reasoning = render_event(&mut state, &reasoning, Some(8))
             .text()
             .expect("rendered")
             .to_string();
-        assert!(rendered.contains('…') && rendered.len() < 400, "{rendered}");
+        assert!(
+            rendered_reasoning.contains("∴ thought")
+                && rendered_reasoning.contains("4.1s")
+                && rendered_reasoning.contains("#8")
+                && !rendered_reasoning.contains("xxx"),
+            "{rendered_reasoning}"
+        );
+
+        // The part's own `time` outranks the clock, but `end` is optional on a part: without it
+        // the row falls back to the silence it ended. Neither available — an unstamped caller,
+        // a first line — draws no duration at all, and never `0ms`, which is a measurement cide
+        // did not make.
+        let untimed =
+            r#"{"type":"reasoning","sessionID":"s","part":{"type":"reasoning","text":"mm"}}"#;
+        let mut timed = RenderState {
+            now_unix_ms: Some(9_000),
+            last_line_unix_ms: Some(6_500),
+            ..RenderState::default()
+        };
+        let rendered = render_event(&mut timed, untimed, None)
+            .text()
+            .expect("rendered")
+            .to_string();
+        assert!(rendered.contains("2.5s"), "{rendered}");
+        let rendered = render_event(&mut RenderState::default(), untimed, Some(3))
+            .text()
+            .expect("rendered")
+            .to_string();
+        assert!(
+            rendered.contains("∴ thought") && rendered.contains("#3") && !rendered.contains("ms"),
+            "{rendered}"
+        );
 
         // A failure the CLI reports at the top level — no `part` at all — names itself.
         let error = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"ProviderAuthError"}}"#;
@@ -1834,14 +1883,13 @@ mod tests {
             "{unknown}"
         );
 
-        // What a person may ask for whole, and what nobody will.
+        // What a person may ask for whole, and what nobody will. Reasoning is kept **and** the
+        // row names a handle, asserted together over one fixture: keep a line the row does not
+        // name and the slot is spent on something no click reaches; name a handle for a line
+        // this refuses and the row shows a `#7` that resolves to nothing.
         assert!(keep_event(&tool) && keep_event(text) && keep_event(error));
+        assert!(keep_event(&reasoning) && rendered_reasoning.contains("#8"));
         assert!(!keep_event(STEP_START) && !keep_event("! permission requested: bash (*)"));
-
-        // Three orders of magnitude, three shapes.
-        assert_eq!(duration(8), "8ms");
-        assert_eq!(duration(1_234), "1.2s");
-        assert_eq!(duration(125_000), "2m05s");
     }
 
     /// `--auto` rides the project default (`agents.skipPermissions`) — and the message stays the
@@ -1988,6 +2036,10 @@ mod tests {
         assert_eq!(value_of(args, "--model"), "anthropic/claude-sonnet-4-5");
         assert_eq!(value_of(args, "--variant"), "high");
         assert_eq!(value_of(args, "--format"), "json");
+        // Without this the CLI emits no `reasoning` event at all and the thought row draws
+        // nothing — a feature that is correct everywhere and invisible. The flag is the stream's
+        // content, not a display preference, so it is asserted beside `--format`.
+        assert!(args.iter().any(|arg| arg == "--thinking"), "{args:?}");
         assert_eq!(value_of(args, "--dir"), "/repo/.cide/worktrees/developer");
         assert_eq!(
             value_of(args, "--title"),

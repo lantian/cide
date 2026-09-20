@@ -71,6 +71,7 @@ import { copyUnavailable, pasteUnavailable, readClipboard, writeClipboard } from
 import { toggleBlame } from './blameStore'
 import { levelFor, setLevel } from './highlightLevel'
 import { goToDefinition } from './goToDefinition'
+import { showDocumentation } from './quickDocumentation'
 import { focusedFormat } from './caretTrack'
 import { formatDocument } from './formatDocument'
 import { findUsages } from './codeIntel'
@@ -524,7 +525,42 @@ export function useCodeMenu({
                   const line = live.state.doc.lineAt(from)
                   // 1-based line, and a 1-based UTF-16 column — `from - line.from` is already a
                   // UTF-16 offset because that is what a CodeMirror document position is.
-                  goToDefinition(project, path, line.number, from - line.from + 1)
+                  goToDefinition(
+                    project,
+                    path,
+                    line.number,
+                    from - line.from + 1,
+                    undefined,
+                    wordTargetAt(live, from)?.text ?? '',
+                  )
+                },
+        },
+        {
+          id: 'quickDocumentation',
+          label: 'Quick documentation',
+          command: 'navigate.documentation',
+          /*
+           * A page about the symbol under the caret, from whichever server owns the file. (M60)
+           * The same `disabledReason` XOR `run` rule as the item above: an item carrying both
+           * looks wired and is dead.
+           */
+          disabledReason:
+            project === undefined
+              ? 'This editor is not part of a project, so there is nothing to ask'
+              : undefined,
+          run:
+            project === undefined
+              ? undefined
+              : () => {
+                  const { from } = live.state.selection.main
+                  const line = live.state.doc.lineAt(from)
+                  showDocumentation(
+                    project,
+                    path,
+                    line.number,
+                    from - line.from + 1,
+                    wordTargetAt(live, from)?.text ?? '',
+                  )
                 },
         },
         {

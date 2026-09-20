@@ -18,9 +18,10 @@ pub mod headless;
 // `cide_ipc::history::CommitRow` so the wire's two git vocabularies stay greppable apart. A `///`
 // on the `mod` line would resolve this module's own intra-doc links in *this* file's scope, which
 // is how the four `unresolved link to LogQuery::limit` warnings appeared and then went away.
+/// Image documents. Identity only — never the pixels; the module header says why.
+pub mod frame;
 pub mod history;
 pub mod ids;
-/// Image documents. Identity only — never the pixels; the module header says why.
 pub mod image;
 pub mod keymap;
 pub mod llm;
@@ -83,6 +84,7 @@ pub use search::{SearchFrame, SearchHit, SearchMode, SearchProblem, SearchQuery}
 // view over `cide-lsp`, `cide-lang` and a Claude one-shot. The only thing they share is that a
 // file has both, and that is not a reason to put them in one file.
 pub mod diagnostics;
+pub mod docs;
 pub mod symbols;
 
 pub use diagnostics::{
@@ -91,6 +93,7 @@ pub use diagnostics::{
     FormatAnswer, FormatRange, ProbeAnswer, Severity, SourceReport, SourceStatus, Usage,
     UsagesAnswer,
 };
+pub use docs::{DocsAnswer, DocsLink, DocsMember, DocsSubject, SymbolDocs};
 pub use symbols::{
     FileOutline, Symbol, SymbolFrame, SymbolIndexStatus, SymbolKind, SymbolRow, SymbolSpan,
 };
@@ -799,6 +802,35 @@ pub enum ReopenedFile {
     Opened { tab: TabId },
     /// Nothing is at that path any more. No tab was opened and nothing was consumed.
     Gone { path: String },
+}
+
+/// What rides beside a file's bytes on the way **to** the webview. (M63)
+///
+/// The head of the frame `file_read_bytes` answers with (`cide_ipc::frame`): the two facts
+/// [`FileDoc`] carries besides its text, from the same `metadata` call that read the bytes.
+/// The drawing pane's autosave compares against `stamp` exactly as the editor's does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileBytesHead {
+    /// See [`FileDoc::writable`] — the mode bits, and the dependency-cache rule applied.
+    pub writable: bool,
+    /// See [`FileDoc::stamp`].
+    pub stamp: Option<FileStamp>,
+}
+
+/// What rides beside a file's bytes on the way **from** the webview. (M63)
+///
+/// The head of the frame `file_write_bytes` is handed. The path is in the head and not in a
+/// request header because a header value is visible ASCII and a path is not — see
+/// `cide_ipc::frame`'s module comment. `if_unchanged` has `file_write`'s meaning exactly:
+/// `None` writes unconditionally (Ctrl+S), `Some` is the autosave precondition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileBytesWrite {
+    pub path: String,
+    pub if_unchanged: Option<FileStamp>,
 }
 
 /// A text file as the editor loads it. (M9)

@@ -40,12 +40,28 @@ pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// file, and opening it is the honest outcome.
 const SNIFF_BYTES: usize = 8 * 1024;
 
-/// Read a file as a text document.
+/// A file's bytes, with the identity a [`FileDoc`] carries and none of the text rules. (M63)
 ///
-/// Fails rather than guessing for the three cases that are not editable text: too large,
-/// not UTF-8, and binary. `CoreError::Io` carries the sentence in each case, because the
-/// frontend's only reasonable response to all three is to say so.
-pub fn read(path: &Path) -> Result<FileDoc> {
+/// What [`read`] is built on, and what the drawing pane reads through: an Excalidraw file is a
+/// PNG as often as it is JSON, and `looks_binary`'s NUL test — correct for a buffer CodeMirror
+/// is about to edit — would refuse exactly the files that pane exists to open. Not a wire type:
+/// the command layer frames it (`cide_ipc::frame`) and hands the webview a
+/// [`cide_ipc::FileBytesHead`] beside the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDoc {
+    pub bytes: Vec<u8>,
+    /// Exactly [`FileDoc::writable`]'s answer — the mode bits, nothing else.
+    pub writable: bool,
+    /// Exactly [`FileDoc::stamp`]: from the same `metadata` call the size cap read.
+    pub stamp: Option<FileStamp>,
+}
+
+/// Read a file's bytes, under the same two refusals every document read makes.
+///
+/// A directory and a file over [`MAX_FILE_BYTES`] are refused with the sentence [`read`] would
+/// have used, because the cap is about what the webview can hold and not about what the bytes
+/// mean. Nothing is sniffed here — that is [`read`]'s job, and its whole difference from this.
+pub fn read_bytes(path: &Path) -> Result<RawDoc> {
     let meta = fs::metadata(path)?;
     if meta.is_dir() {
         return Err(CoreError::Io(format!(
@@ -68,20 +84,35 @@ pub fn read(path: &Path) -> Result<FileDoc> {
     let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
     File::open(path)?.read_to_end(&mut bytes)?;
 
-    if looks_binary(&bytes) {
+    Ok(RawDoc {
+        bytes,
+        writable: !meta.permissions().readonly(),
+        stamp: stamp_of(&meta),
+    })
+}
+
+/// Read a file as a text document.
+///
+/// Fails rather than guessing for the three cases that are not editable text: too large,
+/// not UTF-8, and binary. `CoreError::Io` carries the sentence in each case, because the
+/// frontend's only reasonable response to all three is to say so.
+pub fn read(path: &Path) -> Result<FileDoc> {
+    let raw = read_bytes(path)?;
+
+    if looks_binary(&raw.bytes) {
         return Err(CoreError::Io(format!(
             "{} looks like a binary file",
             path.display()
         )));
     }
-    let text = String::from_utf8(bytes)
+    let text = String::from_utf8(raw.bytes)
         .map_err(|_| CoreError::Io(format!("{} is not valid UTF-8", path.display())))?;
 
     Ok(FileDoc {
         path: path.to_path_buf(),
         text,
-        writable: !meta.permissions().readonly(),
-        stamp: stamp_of(&meta),
+        writable: raw.writable,
+        stamp: raw.stamp,
     })
 }
 
@@ -128,12 +159,21 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 
 /// Write a document back, atomically, without replacing a symlink with a regular file.
 ///
+/// [`write_bytes`] over the text's bytes — one atomic writer, so a drawing saved as PNG and a
+/// buffer saved as text cannot differ in the parts that matter (the symlink, the mode bits,
+/// the `sync_all` before the rename).
+pub fn write(path: &Path, text: &str) -> Result<()> {
+    write_bytes(path, text.as_bytes())
+}
+
+/// Write bytes back, atomically, without replacing a symlink with a regular file.
+///
 /// The temp-then-rename dance is the same one `persist::save_atomic` does for the workspace
 /// file, and it is repeated rather than shared because the two differ in the parts that
 /// matter here: this one resolves symlinks, and it carries the original file's permission
 /// bits across, which a freshly created temp file would otherwise silently reset to the
 /// process umask. Losing the executable bit on a shell script is a real bug and a quiet one.
-pub fn write(path: &Path, text: &str) -> Result<()> {
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     // `canonicalize` on the *target*, so editing a symlinked file writes through the link
     // rather than replacing it. It also requires the file to exist, which is correct here:
     // this only ever saves a buffer that was read from disk.
@@ -146,7 +186,7 @@ pub fn write(path: &Path, text: &str) -> Result<()> {
         if let Some(perms) = perms.clone() {
             file.set_permissions(perms)?;
         }
-        file.write_all(text.as_bytes())?;
+        file.write_all(bytes)?;
         // Without this the rename can publish a name whose bytes have not reached the disk,
         // and a crash leaves a file that exists and is empty — strictly worse than the
         // half-written one the atomic write was meant to prevent.
@@ -192,6 +232,17 @@ pub fn write_if_unchanged(
     text: &str,
     expect: Option<FileStamp>,
 ) -> Result<Option<FileStamp>> {
+    write_bytes_if_unchanged(path, text.as_bytes(), expect)
+}
+
+/// [`write_if_unchanged`] over bytes — the precondition, the refusal and the returned stamp are
+/// one rule for both roads, which is what lets the drawing pane's autosave make exactly the
+/// claim the editor's does. See [`write_if_unchanged`] for the argument.
+pub fn write_bytes_if_unchanged(
+    path: &Path,
+    bytes: &[u8],
+    expect: Option<FileStamp>,
+) -> Result<Option<FileStamp>> {
     if let Some(expect) = expect {
         // `None` here is a filesystem that will not answer, not a mismatch — see `stamp_of`.
         // Refusing to save because a `stat` was unhelpful would be worse than the race.
@@ -203,7 +254,7 @@ pub fn write_if_unchanged(
             });
         }
     }
-    write(path, text)?;
+    write_bytes(path, bytes)?;
     Ok(stamp_at(path))
 }
 
@@ -405,6 +456,73 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "left temp files behind");
+    }
+
+    /*
+     * The bytes road. (M63)
+     *
+     * A drawing is a PNG as often as it is JSON, and the one reader this module had refuses a NUL
+     * in the first 8 KiB — correctly, for a buffer CodeMirror is about to edit. These pin that
+     * `read_bytes` answers what `read` refuses, that both go through the one atomic writer, and
+     * that the autosave precondition is the same rule on both roads.
+     */
+
+    #[test]
+    fn bytes_round_trip_through_what_the_text_reader_refuses() {
+        let path = tempdir().join("drawing.excalidraw.png");
+        fs::write(&path, b"seed").expect("seed");
+
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0rest of a picture";
+        write_bytes(&path, png).expect("write");
+        let raw = read_bytes(&path).expect("read");
+        assert_eq!(raw.bytes, png, "byte for byte, NULs included");
+        assert!(raw.writable);
+        assert!(
+            raw.stamp.is_some(),
+            "the same stamp the text road hands out"
+        );
+
+        let refusal = read(&path).expect_err("the text reader must go on refusing it");
+        assert!(format!("{refusal}").contains("binary"), "{refusal}");
+
+        let strays: Vec<_> = fs::read_dir(path.parent().expect("parent"))
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files behind");
+    }
+
+    #[test]
+    fn a_stale_precondition_refuses_the_bytes_road_too() {
+        let path = tempdir().join("stale.excalidraw.png");
+        fs::write(&path, b"before").expect("seed");
+        let opened = read_bytes(&path).expect("read").stamp;
+        fs::write(&path, b"rewritten by something else").expect("another process writes it");
+
+        let refusal = write_bytes_if_unchanged(&path, b"\x89PNG", opened).expect_err("refused");
+        assert!(
+            matches!(refusal, CoreError::FileChanged { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read"),
+            b"rewritten by something else"
+        );
+
+        let after = write_bytes_if_unchanged(&path, b"\x89PNG", None).expect("unconditional");
+        assert!(
+            after.is_some(),
+            "and the new stamp comes back, as on the text road"
+        );
+        assert_eq!(fs::read(&path).expect("read"), b"\x89PNG");
+    }
+
+    #[test]
+    fn read_bytes_refuses_a_directory_with_the_text_readers_sentence() {
+        let dir = tempdir();
+        let error = read_bytes(&dir).expect_err("a directory is not a document");
+        assert!(format!("{error}").contains("is a directory"), "{error}");
     }
 
     #[test]

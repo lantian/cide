@@ -357,6 +357,86 @@ pub struct LanguageServerDef {
     #[ts(optional)]
     #[ts(type = "unknown")]
     pub init_options: Option<serde_json::Value>,
+    /// Reach the server over TCP instead of spawning it. (M59)
+    ///
+    /// Godot's language server is the running Godot editor, listening on `127.0.0.1:6005`; there
+    /// is no binary to run on stdio and never will be. With this set, cide *attaches*: it
+    /// connects, handshakes, and treats "nothing is listening" as *not running* rather than as a
+    /// failure — the user opens the project in Godot and the row goes green by itself.
+    ///
+    /// # `binary` is still required, and it is the server's *name*
+    ///
+    /// It keys `cide_lsp::discover::install`'s merge, `by_binary`, the Problems panel's source id,
+    /// the supervisor thread's name and every log line; for a spawned server it is also the
+    /// program. Nothing is looked up for a connect server. `args` with `connect` is refused by the
+    /// manifest: spawn-and-connect (`godot --headless --editor --lsp-port N`) is a later pass, and
+    /// the same definition with `args` added is how it would be spelled.
+    ///
+    /// # Loopback only, as a literal address
+    ///
+    /// `host` must parse as an IP address and answer `is_loopback()`; a name — `localhost`
+    /// included — is refused, because connecting takes a `SocketAddr` and resolving a name is an
+    /// `/etc/hosts` question. This is the analogue of `binary`'s "never an absolute path":
+    /// `didOpen` carries the whole document, so a manifest that could name a host could ship the
+    /// user's files to it. Checked in `cide_ext::manifest` and again in `cide_lsp::discover`,
+    /// because a builtin definition is never validated.
+    ///
+    /// A connect server must also declare `project_markers`: empty means *any root*, and with
+    /// the attach retry that is a connect attempt against the port every few seconds in every
+    /// project the user ever opens.
+    ///
+    /// Paired with `skip_serializing_if`, unlike `init_options` above, whose `unknown` type
+    /// admits a `null`: `connect?: TcpEndpoint` would throw on `.host` if `null` arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub connect: Option<TcpEndpoint>,
+}
+
+/// Where a [`LanguageServerDef::connect`] server listens. See that field for the loopback rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TcpEndpoint {
+    /// A literal loopback IP address, `127.0.0.1` or `::1`. Never a name.
+    pub host: String,
+    /// Godot 4's default is 6005 (`network/language_server/remote_port`); Godot 3 used 6008.
+    pub port: u16,
+}
+
+impl TcpEndpoint {
+    /// The address to connect to, or the sentence for why there is none.
+    ///
+    /// **One producer of the loopback rule.** `cide_ext::manifest` refuses a definition on it
+    /// and `cide_lsp::discover` refuses to connect on it, and the two crates cannot share a
+    /// validator's verdict — so the rule lives beside the type both of them read, and each asks
+    /// it rather than restating it.
+    ///
+    /// A literal IP, never a name: connecting takes a `SocketAddr`, and resolving `localhost` is
+    /// an `/etc/hosts` question a manifest must not get to ask. `is_loopback` covers the whole
+    /// of `127.0.0.0/8` and `::1`. Port 0 is refused because nothing listens on it and a
+    /// connect that always fails would read as "not running" for ever.
+    pub fn loopback_addr(&self) -> Result<std::net::SocketAddr, String> {
+        let Ok(ip) = self.host.trim().parse::<std::net::IpAddr>() else {
+            return Err(format!(
+                "`connect.host` is `{}`, which is not an IP address. cide connects a language \
+                 server only on this machine, by a literal loopback address — `127.0.0.1` or \
+                 `::1` — and never by name, `localhost` included.",
+                self.host
+            ));
+        };
+        if !ip.is_loopback() {
+            return Err(format!(
+                "`connect.host` is `{}`, which is not a loopback address. cide connects a \
+                 language server only on this machine: `didOpen` carries the whole document, so \
+                 a definition that could name a host could send your files to it.",
+                self.host
+            ));
+        }
+        if self.port == 0 {
+            return Err("`connect.port` is 0, which nothing listens on.".to_string());
+        }
+        Ok(std::net::SocketAddr::new(ip, self.port))
+    }
 }
 
 // ==========================================================================================
@@ -705,6 +785,7 @@ pub fn builtin_servers() -> Vec<LanguageServerDef> {
             // gitignore-filtered index, and telling it twice makes it worse rather than better.
             declares_watched_files: false,
             extra_path_hints: words(&["~/.cargo/bin"]),
+            connect: None,
             // The fork's options ride the provenance gate in `cide_lsp::config`, not this
             // field — see its documentation for why the two lanes must not mix.
             init_options: None,
@@ -719,6 +800,7 @@ pub fn builtin_servers() -> Vec<LanguageServerDef> {
             // gopls has no watcher and needs to be told.
             declares_watched_files: true,
             extra_path_hints: words(&["~/go/bin"]),
+            connect: None,
             // gopls is configured through the *env* lane (`GOPLSCACHE`), also provenance-gated.
             init_options: None,
         },
@@ -752,6 +834,7 @@ pub fn builtin_servers() -> Vec<LanguageServerDef> {
             declares_watched_files: true,
             extra_path_hints: vec![],
             init_options: None,
+            connect: None,
         },
         // Compose, which is YAML with a schema.
         //
@@ -805,6 +888,7 @@ pub fn builtin_servers() -> Vec<LanguageServerDef> {
                     }
                 }
             })),
+            connect: None,
         },
     ]
 }
@@ -881,5 +965,70 @@ mod tests {
                 assert!(ids.contains(id), "{} claims unknown `{id}`", server.binary);
             }
         }
+    }
+
+    /// The loopback rule, in both directions: the two literal loopback families connect, and
+    /// every way of naming somewhere else — a name, a LAN address, a dead port — is refused with
+    /// a sentence that says which rule it broke. (M59)
+    #[test]
+    fn a_connect_endpoint_is_a_literal_loopback_address_or_nothing() {
+        let endpoint = |host: &str, port: u16| TcpEndpoint {
+            host: host.into(),
+            port,
+        };
+        assert_eq!(
+            endpoint("127.0.0.1", 6005).loopback_addr().expect("v4"),
+            "127.0.0.1:6005".parse().expect("addr")
+        );
+        assert_eq!(
+            endpoint("::1", 6005).loopback_addr().expect("v6"),
+            "[::1]:6005".parse().expect("addr")
+        );
+        assert!(
+            endpoint("127.0.0.2", 6005).loopback_addr().is_ok(),
+            "the whole of 127/8 is loopback"
+        );
+        let named = endpoint("localhost", 6005)
+            .loopback_addr()
+            .expect_err("a name");
+        assert!(named.contains("not an IP address"), "{named}");
+        assert!(
+            named.contains("localhost"),
+            "the refusal names the value: {named}"
+        );
+        let lan = endpoint("10.0.0.1", 6005)
+            .loopback_addr()
+            .expect_err("a LAN address");
+        assert!(lan.contains("not a loopback address"), "{lan}");
+        assert!(
+            lan.contains("your files"),
+            "and says what is at stake: {lan}"
+        );
+        let dead = endpoint("127.0.0.1", 0)
+            .loopback_addr()
+            .expect_err("port 0");
+        assert!(dead.contains("port"), "{dead}");
+    }
+
+    /// `connect` rides the wire only when set: with `skip_serializing_if` a builtin's row carries
+    /// no `connect` key at all, so the generated TypeScript reads it as `undefined` and never as
+    /// `null` — the pairing rule `CLAUDE.md` states for every `#[ts(optional)]`.
+    #[test]
+    fn connect_is_absent_from_the_wire_unless_set() {
+        for server in builtin_servers() {
+            let value = serde_json::to_value(&server).expect("serialise");
+            assert!(
+                value.get("connect").is_none(),
+                "{} carries a `connect` key it did not set",
+                server.binary
+            );
+        }
+        let mut godot = builtin_servers().remove(0);
+        godot.connect = Some(TcpEndpoint {
+            host: "127.0.0.1".into(),
+            port: 6005,
+        });
+        let value = serde_json::to_value(&godot).expect("serialise");
+        assert_eq!(value["connect"]["port"], 6005);
     }
 }

@@ -409,6 +409,7 @@ mod tests {
             declares_watched_files: false,
             extra_path_hints: vec![],
             init_options: None,
+            connect: None,
         };
         let contributes = Contributions {
             languages: vec![language("yaml", "yaml")],
@@ -463,6 +464,7 @@ mod tests {
             declares_watched_files: false,
             extra_path_hints: vec![],
             init_options: None,
+            connect: None,
         };
         let first = Contributions {
             languages: vec![language("yaml", "yaml")],

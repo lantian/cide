@@ -156,7 +156,13 @@ const SERVER_KEYS: &[&str] = &[
     // server that *needs* configuration (a YAML server with its own schemas, the case cide's own
     // builtin exists for) could never configure it at all.
     "initOptions",
+    // M59. Reach the server over a loopback socket instead of spawning it — Godot's language
+    // server is the running Godot editor. `validate_contributions` refuses everything about it
+    // that could reach further than this machine; see `LanguageServerDef::connect`.
+    "connect",
 ];
+/// The keys of a `connect` endpoint. Pinned to `cide_ipc::lang::TcpEndpoint` like the rest.
+const CONNECT_KEYS: &[&str] = &["host", "port"];
 const PANEL_KEYS: &[&str] = &["id", "label", "icon", "location"];
 const COMMAND_KEYS: &[&str] = &["id", "title", "keywords"];
 const SETTING_KEYS: &[&str] = &["id", "label", "description", "kind"];
@@ -480,6 +486,16 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, ExtProblem> {
                         ));
                     }
                 }
+                if key == "languageServers"
+                    && let Some(connect) = row.get("connect")
+                {
+                    problems.extend(unknown_keys(
+                        &path,
+                        connect,
+                        CONNECT_KEYS,
+                        &format!("contributes.languageServers[{at}].connect."),
+                    ));
+                }
             }
         }
     }
@@ -563,24 +579,40 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, ExtProblem> {
 fn validate_contributions(path: &Path, manifest: &mut Manifest) {
     let declared: BTreeSet<Capability> = manifest.capabilities.iter().copied().collect();
 
-    // A language server is a process, and a process is `process:spawn`. Checked here rather than
-    // at spawn so the sentence names the manifest that asked, and checked *again* at spawn
+    // A language server is a process — `process:spawn` — or, with `connect`, a socket to a
+    // program already running — `lsp:connect` (M59). Each server is held to the capability *its*
+    // transport needs and dropped alone, so an extension that spawns one server and attaches to
+    // another with only one of the two grants keeps the one it asked for. Checked here rather
+    // than at spawn so the sentence names the manifest that asked, and checked *again* at spawn
     // because neither is allowed to be the only one — `cide_agents::valid_name` and
     // `cide_git::worktree::validate_agent` guard one join between them on the same rule.
-    if !manifest.contributes.language_servers.is_empty()
-        && !declared.contains(&Capability::ProcessSpawn)
     {
-        manifest.problems.push(error(
-            path,
-            None,
-            format!(
-                "contributes {} language server(s) but does not ask for `process:spawn`. \
-                 Running a program is a permission the user grants at install, so the servers \
-                 are ignored.",
-                manifest.contributes.language_servers.len()
-            ),
-        ));
-        manifest.contributes.language_servers.clear();
+        let problems = &mut manifest.problems;
+        manifest.contributes.language_servers.retain(|server| {
+            let (needed, what) = if server.connect.is_some() {
+                (
+                    Capability::LspConnect,
+                    "Connecting to a program on your machine",
+                )
+            } else {
+                (Capability::ProcessSpawn, "Running a program")
+            };
+            if declared.contains(&needed) {
+                return true;
+            }
+            problems.push(error(
+                path,
+                None,
+                format!(
+                    "language server `{}` needs `{}`, which this manifest does not ask for. \
+                     {what} is a permission the user grants at install, so the server is \
+                     ignored.",
+                    server.binary,
+                    needed.as_str()
+                ),
+            ));
+            false
+        });
     }
 
     // A panel is drawn from a view model a worker produces. Without a worker there is nothing to
@@ -903,6 +935,59 @@ fn validate_contributions(path: &Path, manifest: &mut Manifest) {
                 ),
             ));
             return false;
+        }
+        // A connect server (M59): everything about it that could reach further than this
+        // machine, or further than this kind of project, is refused by name.
+        if let Some(endpoint) = &server.connect {
+            if !server.args.is_empty() {
+                problems.push(error(
+                    path,
+                    None,
+                    format!(
+                        "language server `{}` declares both `connect` and `args`. A connect \
+                         server is one already running — cide starts nothing for it — and \
+                         spawn-and-connect is not supported. Drop `args`, or drop `connect`.",
+                        server.binary
+                    ),
+                ));
+                return false;
+            }
+            // The rule itself lives beside the type (`TcpEndpoint::loopback_addr`), and
+            // `cide_lsp::discover` asks it again before connecting — a builtin definition never
+            // passes through here.
+            if let Err(reason) = endpoint.loopback_addr() {
+                problems.push(error(
+                    path,
+                    None,
+                    format!("language server `{}`: {reason}", server.binary),
+                ));
+                return false;
+            }
+            if server.project_markers.is_empty() {
+                problems.push(error(
+                    path,
+                    None,
+                    format!(
+                        "language server `{}` has `connect` but no `projectMarkers`. Empty means \
+                         every project, and a connect server is retried every few seconds while \
+                         nothing listens — so it must name the file that makes a directory its \
+                         kind of project.",
+                        server.binary
+                    ),
+                ));
+                return false;
+            }
+            if !server.extra_path_hints.is_empty() {
+                problems.push(warning(
+                    path,
+                    None,
+                    format!(
+                        "language server `{}` has `connect`, so its `extraPathHints` are never \
+                         searched.",
+                        server.binary
+                    ),
+                ));
+            }
         }
         // A warning, not a refusal: an extension may legitimately drive a server for a language
         // some *other* extension contributes, and refusing that would make install order matter.
@@ -1311,6 +1396,132 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- connect servers (M59) --------------------------------------------------------------
+
+    /// One connect server, spelled the way the `godot` extension spells it.
+    fn connect_manifest(capabilities: &str, server_extra: &str) -> String {
+        format!(
+            r#"{{
+              "id": "g", "capabilities": [{capabilities}],
+              "contributes": {{ "languages": [{{ "id": "gdscript", "label": "GDScript",
+                  "extensions": [{{ "ext": "gd" }}], "grammar": {{ "name": "GDScript" }} }}],
+                "languageServers": [
+                {{ "binary": "godot", "connect": {{ "host": "127.0.0.1", "port": 6005 }},
+                  "languageIds": ["gdscript"], "projectMarkers": ["project.godot"],
+                  "projectKind": "Godot project", "installHint": "open it in Godot"{server_extra} }} ] }}
+            }}"#
+        )
+    }
+
+    /// The positive case first, so every refusal below is known to be *the* reason.
+    #[test]
+    fn a_loopback_connect_server_with_a_marker_survives() {
+        let dir = scratch("connect-ok");
+        plant(&dir, &connect_manifest(r#""lsp:connect""#, ""));
+        let manifest = read_manifest(&dir).expect("loads");
+        assert_eq!(manifest.contributes.language_servers.len(), 1);
+        let server = &manifest.contributes.language_servers[0];
+        assert_eq!(server.connect.as_ref().map(|c| c.port), Some(6005));
+        assert!(
+            manifest.problems.is_empty(),
+            "a well-formed connect server earns no problem: {:?}",
+            manifest.problems
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The capability a server needs is the one *its* transport needs — and the words on the
+    /// install sheet are why they are two: an extension that attaches to the user's own Godot
+    /// runs no program, and "run programs on your machine" would be the wrong sentence.
+    #[test]
+    fn a_connect_server_needs_lsp_connect_and_not_process_spawn() {
+        let dir = scratch("connect-cap");
+        plant(&dir, &connect_manifest(r#""process:spawn""#, ""));
+        let manifest = read_manifest(&dir).expect("loads");
+        assert!(manifest.contributes.language_servers.is_empty());
+        assert!(
+            manifest
+                .problems
+                .iter()
+                .any(|p| p.message.contains("`lsp:connect`")),
+            "{:?}",
+            manifest.problems
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_connect_server_with_args_is_refused() {
+        let dir = scratch("connect-args");
+        plant(
+            &dir,
+            &connect_manifest(r#""lsp:connect""#, r#", "args": ["--headless"]"#),
+        );
+        let manifest = read_manifest(&dir).expect("loads");
+        assert!(manifest.contributes.language_servers.is_empty());
+        assert!(
+            manifest
+                .problems
+                .iter()
+                .any(|p| p.message.contains("spawn-and-connect is not supported")),
+            "{:?}",
+            manifest.problems
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The analogue of the absolute-path refusal: a definition that could name a host could send
+    /// the user's files to it, and a name — `localhost` included — is a resolution nobody here
+    /// controls. Each refusal names the value it refused.
+    #[test]
+    fn a_connect_host_off_loopback_is_refused_by_name() {
+        for (host, expect) in [
+            ("10.0.0.1", "not a loopback address"),
+            ("localhost", "not an IP address"),
+            ("example.com", "not an IP address"),
+        ] {
+            let dir = scratch(&format!("connect-host-{}", host.replace('.', "-")));
+            let manifest_text = connect_manifest(r#""lsp:connect""#, "")
+                .replace(r#""host": "127.0.0.1""#, &format!(r#""host": "{host}""#));
+            plant(&dir, &manifest_text);
+            let manifest = read_manifest(&dir).expect("loads");
+            assert!(
+                manifest.contributes.language_servers.is_empty(),
+                "{host} survived"
+            );
+            assert!(
+                manifest
+                    .problems
+                    .iter()
+                    .any(|p| p.message.contains(expect) && p.message.contains(host)),
+                "{host}: {:?}",
+                manifest.problems
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Empty markers mean every project, and a connect server is retried while nothing listens —
+    /// a connect attempt against port 6005 every few seconds in every repository the user opens.
+    #[test]
+    fn a_connect_server_without_a_marker_is_refused() {
+        let dir = scratch("connect-marker");
+        let manifest_text =
+            connect_manifest(r#""lsp:connect""#, "").replace(r#"["project.godot"]"#, "[]");
+        plant(&dir, &manifest_text);
+        let manifest = read_manifest(&dir).expect("loads");
+        assert!(manifest.contributes.language_servers.is_empty());
+        assert!(
+            manifest
+                .problems
+                .iter()
+                .any(|p| p.message.contains("no `projectMarkers`")),
+            "{:?}",
+            manifest.problems
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A path from a manifest never leaves the repository. Checked on the string, before any
     /// filesystem call, because `Path::join` with an absolute right-hand side silently discards
     /// the left one.
@@ -1511,6 +1722,21 @@ mod tests {
                 declares_watched_files: false,
                 extra_path_hints: vec![],
                 init_options: None,
+                // `Some`, or `skip_serializing_if` drops the key and the table is never asked
+                // to name it — the caveat this test's own doc records.
+                connect: Some(cide_ipc::lang::TcpEndpoint {
+                    host: String::new(),
+                    port: 0,
+                }),
+            })
+            .expect("serialise"),
+        );
+        check(
+            "CONNECT_KEYS",
+            CONNECT_KEYS,
+            serde_json::to_value(cide_ipc::lang::TcpEndpoint {
+                host: String::new(),
+                port: 0,
             })
             .expect("serialise"),
         );

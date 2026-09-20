@@ -7,7 +7,13 @@
  * The title between them is deliberately **not** linked: it is routinely a path
  * (`● read  src/main.rs`), and `pathLinks.ts`'s provider must keep it — xterm drops a later
  * provider's link wherever it overlaps an earlier one, and this provider registers after that
- * one.
+ * one. Since M60 it is also what lets a task code in a title be clickable, because the third
+ * provider registers after this one and inherits the same rule.
+ *
+ * That the *prefix* survives the same rule is not luck: `pathMatch.ts`'s `plausible` refuses a
+ * candidate with fewer than two `/`-separated segments unless it is proven, so a bare word —
+ * `bash`, and since M62 `thought` — is never a path candidate and the earlier provider never
+ * claims the range.
  *
  * A **plain** click activates, unlike a path link's ctrl+click. Two reasons. The click gate in
  * `pathLinks.ts` claims every ctrl/meta+left press in a terminal pane in capture and resolves it
@@ -18,53 +24,16 @@
  *
  * `provideLinks` is called only when the pointer crosses into a buffer line it has not asked
  * about (see `pathLinks.ts`), so scanning a line here costs nothing per byte of output.
+ *
+ * The buffer walk and the offset arithmetic live in `bufferSpan.ts`, shared with
+ * `taskLinkProvider.ts` — see its header for why they are not private here any more.
  */
-import type { IBufferLine, IDisposable, ILink } from '@xterm/xterm'
+import type { IDisposable, ILink } from '@xterm/xterm'
 import { paneSession } from '@/ipc/client'
 import { showLogDetail } from '@/chrome/logDetailStore'
+import { logicalLine, spanOf } from './bufferSpan'
 import { parseRunLine } from './runLinks'
 import type { TerminalHandle } from './xterm'
-
-/** How many wrapped rows a logical line may span before the walk gives up. */
-const MAX_ROWS = 64
-
-/** One logical line as the buffer holds it: the top row's index and every row, untrimmed. */
-interface Logical {
-  readonly top: number
-  readonly rows: readonly string[]
-}
-
-/**
- * The logical line the row `index` belongs to, following the terminal's own wrapping.
- *
- * Untrimmed rows (`translateToString(false)`), so a string offset into the joined text maps
- * back to a cell by dividing by the width — `pathLinks.ts` trims and then corrects for it,
- * which a tool line, ASCII but for its glyph, does not need.
- */
-function logicalLine(term: TerminalHandle['term'], index: number): Logical | null {
-  const buf = term.buffer.active
-  if (!buf.getLine(index)) return null
-  let top = index
-  while (top > 0 && index - top < MAX_ROWS && buf.getLine(top)?.isWrapped) top--
-  let bottom = index
-  while (bottom - top < MAX_ROWS && buf.getLine(bottom + 1)?.isWrapped) bottom++
-  const rows: string[] = []
-  for (let y = top; y <= bottom; y++) {
-    const line: IBufferLine | undefined = buf.getLine(y)
-    if (!line) break
-    rows.push(line.translateToString(false))
-  }
-  return { top, rows }
-}
-
-/** Buffer coordinates, 1-based and inclusive as `ILink.range` wants them, for `[start, end)`. */
-function rangeOf(logical: Logical, cols: number, start: number, end: number): ILink['range'] {
-  const at = (offset: number) => ({
-    x: (offset % cols) + 1,
-    y: logical.top + Math.floor(offset / cols) + 1,
-  })
-  return { start: at(start), end: at(end - 1) }
-}
 
 export function attachRunLinks(
   handle: TerminalHandle,
@@ -76,7 +45,7 @@ export function attachRunLinks(
   const term = handle.term
   const provider = {
     provideLinks(y: number, callback: (links: ILink[] | undefined) => void): void {
-      const logical = logicalLine(term, y - 1)
+      const logical = logicalLine(term.buffer.active, y - 1)
       const session = ctx.session()
       if (logical === null || session === null) {
         callback(undefined)
@@ -90,10 +59,25 @@ export function attachRunLinks(
       }
       const cols = Math.max(1, term.cols)
       const { handle: lineHandle } = parsed
-      const activate = () =>
+      const activate = (event: MouseEvent) => {
+        /*
+         * xterm's `Linkifier._handleMouseUp` (`Linkifier.ts:220`) checks neither the button nor
+         * the selection: it activates whenever a mousedown and a mouseup landed on the same
+         * link. So a right-click's mouseup opened this card behind the pane's own context menu,
+         * a middle-click paste opened it instead of pasting, and dragging across the `● bash`
+         * glyph to copy the line opened it too — three gestures nobody aimed here, each of
+         * which reads as the app acting on its own. (M60)
+         *
+         * Ctrl and meta are refused as well, even though `pathLinks.ts` swallows that press in
+         * capture long before xterm sees it. Stating the gesture here is what keeps the two
+         * files from disagreeing if that gate ever changes.
+         */
+        if (event.button !== 0 || event.ctrlKey || event.metaKey) return
+        if (term.getSelection() !== '') return
         showLogDetail(() => paneSession.logDetail(session, lineHandle))
+      }
       const link = (start: number, end: number): ILink => ({
-        range: rangeOf(logical, cols, start, end),
+        range: spanOf(logical, cols, start, end),
         text: text.slice(start, end),
         activate,
       })

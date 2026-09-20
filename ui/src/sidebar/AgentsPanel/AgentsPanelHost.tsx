@@ -113,6 +113,7 @@ import { fsReveal, type ProjectId } from '@/ipc/client'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { useAgents } from '@/sidebar/agentsStore'
 import { useTasks } from '@/sidebar/tasksStore'
+import { revealTask } from '@/chrome/taskReveal'
 import { AgentsPanelView } from './AgentsPanel'
 
 /** How often elapsed times are recomputed. See the header for why it is not 30 s. */
@@ -133,19 +134,6 @@ export interface AgentsPanelProps {
   /** The active project, or `null` — in a detached-pane window, and before one is open. */
   project: ProjectId | null
 }
-
-/**
- * What a task link says when its task cannot be opened. Two sentences, because the two
- * failures are different facts: a board that cannot be read (the Tasks panel's `absent` and
- * `unreadable` screens say why), and a task that was deleted after the run was dispatched —
- * the row keeps drawing the id on purpose, so the click can land on a task that is gone.
- * Either way the refusal goes on screen: a link that silently does nothing is the failure
- * this project has paid for most often.
- */
-const BOARD_NOT_READABLE =
-  'The task board cannot be read, so the task cannot be opened — the Tasks panel says why.'
-const taskGone = (task: string) =>
-  `${task} is not on the board any more — it was deleted after this run was dispatched against it.`
 
 /**
  * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
@@ -418,28 +406,20 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
        * — the sidebar is not switched to Tasks, because a modal that dims the whole window
        * needs no panel under it, and yanking the view out from under the user was ceremony.
        *
-       * `select` is read off the store rather than subscribed to, because this host draws
-       * nothing from it and a subscription would re-render the panel on every selection change
-       * made elsewhere. `TaskId` is a bare `string` in `model.ts` — that file imports nothing —
-       * and the newtype is a `string` on the wire too, so this is the seam where the panel's
-       * plain id becomes the tracker's id again.
+       * `TaskId` is a bare `string` in `model.ts` — that file imports nothing — and the newtype
+       * is a `string` on the wire too, so this is the seam where the panel's plain id becomes
+       * the tracker's id again.
        *
-       * The two refusals are the honest ends of the gesture: `openTask` keeps the card off
+       * The guard and its three refusals live in `chrome/taskReveal.ts` rather than here, and
+       * have since a `t-503` in a terminal pane's output became the second road to this same
+       * gesture (M60). The refusals are the honest ends of it — `openTask` keeps the card off
        * screen when the board is not `ready` or the id is not on it, so a bare `select` in
-       * either state would be a click that visibly does nothing. The guard reads the `board`
-       * this render was drawn from — the same object the chips' titles came from.
+       * either state would be a click that visibly does nothing — and two copies of them would
+       * have drifted on wording long before anybody noticed they disagreed on the guard.
+       * `project` is passed because a task id is unique only within a project; see
+       * `taskReveal.ts`.
        */
-      onRevealTask={(task: string) => {
-        if (board.kind !== 'ready') {
-          notifyFailure(BOARD_NOT_READABLE)
-          return
-        }
-        if (!board.tasks.some((t) => t.id === task)) {
-          notifyFailure(taskGone(task))
-          return
-        }
-        useTasks.getState().select(task)
-      }}
+      onRevealTask={(task: string) => revealTask(task, project)}
       /*
        * Nothing is withheld here any more. Every handler `AgentsPanelViewProps` declares is
        * passed, and each one's control is drawn or not by the view's own gate.

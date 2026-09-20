@@ -469,6 +469,12 @@ function Editor({ settings, patch }: SectionProps) {
           onChange={(v) => set({ insertSpaces: v })}
         />
         <ToggleRow
+          label="Detect indentation from the file"
+          hint="A buffer that already indents with tabs, or with two spaces, keeps doing so. Tab size and Insert spaces decide only a file with no indentation of its own."
+          checked={editor.detectIndentation}
+          onChange={(v) => set({ detectIndentation: v })}
+        />
+        <ToggleRow
           label="Show the minimap"
           hint="The 96px canvas strip down the right edge of a buffer."
           checked={editor.showMinimap}

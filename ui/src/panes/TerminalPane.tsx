@@ -12,6 +12,7 @@ import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
 import { forgetSession, getHost, openTerminal, peekHost } from '@/layout/paneHosts'
 import { setPathLinkEnv } from '@/terminal/pathLinks'
+import { setTaskLinkEnv } from '@/terminal/taskLinkProvider'
 import { copyTerminalSelection, pasteIntoTerminal } from '@/terminal/clipboard'
 import type { TerminalPaneKind } from '@/terminal/keys'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
@@ -639,6 +640,25 @@ export function TerminalPane({
       },
     })
 
+    /*
+     * And what a task code printed in this pane means. (M60)
+     *
+     * A getter for the same reason as its four siblings above: the provider lives on the host
+     * and this effect runs once per pane, so a project switched under a parked pane has to be
+     * visible to the next hover rather than to the next remount. A captured value would freeze
+     * the first mount's project, and the pane would then offer the wrong project's codes with
+     * no symptom until a click opened somebody else's task.
+     *
+     * Before the `spec === null` return below, deliberately: a pane whose `specFor` answers
+     * `null` spawns no process and still holds whatever output it has, so its codes must stay
+     * live. `''` for a pane with no project — `taskLinks.ts` reads that as no link at all.
+     */
+    setTaskLinkEnv(paneId, {
+      get project() {
+        return projectRef.current ?? ''
+      },
+    })
+
     const restoreEntry = restoreRef.current
 
     const spec = specFor(
@@ -1044,6 +1064,10 @@ export function TerminalPane({
       // closing project would keep resolving paths against that project's roots and opening
       // tabs in it.
       setPathLinkEnv(paneId, null)
+      // Same rule and the same reason one line over: without this, a pane unmounted from a
+      // closing project would keep offering that project's task codes, and `revealTask` would
+      // be asked to open a task against a board no longer attached to anything.
+      setTaskLinkEnv(paneId, null)
       // The host outlives this mount, so the listeners have to come off with it — otherwise a
       // pane remounted by a split would accumulate one right-click handler per mount and open
       // as many menus.

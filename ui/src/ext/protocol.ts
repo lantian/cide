@@ -46,6 +46,7 @@ export type CapabilityName =
   | 'editor:write'
   | 'fs:read'
   | 'git:read'
+  | 'lsp:connect'
   | 'process:spawn'
 
 /** Every capability, for the check that pins this against the Rust enum. */
@@ -54,6 +55,7 @@ export const CAPABILITIES: readonly CapabilityName[] = [
   'editor:write',
   'fs:read',
   'git:read',
+  'lsp:connect',
   'process:spawn',
 ]
 

@@ -437,6 +437,16 @@ pub struct EditorSettings {
     pub font_size: f32,
     pub tab_size: u8,
     pub insert_spaces: bool,
+    /// Read a buffer's own indentation before applying the two above. (M59)
+    ///
+    /// On by default, because the two above were read by *nothing* from M3 to M59 and every
+    /// buffer got four spaces: a tab-indented file — GDScript, Go, a Makefile — took a space from
+    /// Tab and a compiler's refusal from the next build (Godot: "Used space character for
+    /// indentation instead of tab as used before in the file"). With this on, `tab_size` and
+    /// `insert_spaces` decide only a buffer with no indentation of its own to copy; a file that
+    /// already indents with tabs, or with two spaces, keeps doing so. The detector is
+    /// `ui/src/editor/indentDetect.ts`, and `check:editor` drives it.
+    pub detect_indentation: bool,
     pub show_minimap: bool,
     pub word_wrap: bool,
     pub trim_trailing_whitespace_on_save: bool,
@@ -538,6 +548,7 @@ impl Default for EditorSettings {
             font_size: DEFAULT_CODE_FONT_SIZE,
             tab_size: 4,
             insert_spaces: true,
+            detect_indentation: true,
             show_minimap: true,
             word_wrap: false,
             trim_trailing_whitespace_on_save: false,

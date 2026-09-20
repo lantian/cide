@@ -1491,6 +1491,9 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
     match (open, wanted) {
         (TabKind::File { path: a, .. }, TabKind::File { path: b, .. }) => a == b,
         (TabKind::Settings { .. }, TabKind::Settings { .. }) => true,
+        // A documentation tab is its subject — the question, never the title, which is a
+        // caption written from one answer. (M60)
+        (TabKind::Docs { subject: a, .. }, TabKind::Docs { subject: b, .. }) => a == b,
         // An extension page is a singleton *per extension*, not per project: two of them are two
         // different READMEs, and a user comparing SQL against YAML wants both open. The `name` is
         // deliberately not part of the identity — it is a caption, and an extension that renamed

@@ -21,6 +21,8 @@ import type {
   CompletionAnswer,
   CompletionResolveAnswer,
   DefinitionAnswer,
+  DocsAnswer,
+  DocsSubject,
   DiagnosticSourceId,
   DiagnosticsSnapshot,
   DiffAnswer,
@@ -39,6 +41,8 @@ import type {
   KeymapReport,
   LogLineDetail,
   ResolvedBinding,
+  FileBytesHead,
+  FileBytesWrite,
   FileDoc,
   ImageDoc,
   FileStamp,
@@ -521,30 +525,16 @@ export const claude = {
       requestId,
     }),
 
-  /**
-   * Tell every connected `claude` in the project where the editor selection is.
-   *
-   * Broadcast rather than addressed, unlike `at_mentioned`: a mention is a message aimed at
-   * one conversation, a selection is a fact about the editor, and when an editor is focused
-   * there is no "current" Claude pane to aim at.
-   *
-   * Lines are 1-based here and converted to the protocol's 0-based in Rust, at the boundary,
-   * exactly once.
+  /*
+   * `selectionChanged` used to live here, wrapping a `claude_selection_changed` command that
+   * `EditorPane` called on an 80 ms debounce from every caret move in every open file. Rust
+   * broadcast it to every `claude` in the project, and the CLI shows a received selection as
+   * `⧉ Selected N lines from <file>` in its prompt and sends the text with the next message —
+   * so glancing at a file typed it into every conversation at once, with nothing in the editor
+   * to say so. Removed with the command. The deliberate gesture is `claudeSend.lines` at the
+   * bottom of this file: a context-menu row naming one session, which now carries the
+   * selection *and* the mention to that pane and to no other.
    */
-  selectionChanged: (
-    projectId: ProjectId,
-    path: string,
-    text: string,
-    startLine: number,
-    endLine: number,
-  ) =>
-    invoke<void>('claude_selection_changed', {
-      project: projectId,
-      path,
-      text,
-      startLine,
-      endLine,
-    }).catch(() => {}),
 
   /*
    * `mentionFile` used to live here, wrapping a `claude_mention_file` command that no longer
@@ -1831,6 +1821,76 @@ export const file = {
 
   /** Where the user last was in `path`, or `null`. */
   position: (path: string) => invoke<ViewPosition | null>('file_position', { path }),
+
+  /**
+   * The file's stamp right now, for a pane that follows the disk without re-reading it. (M63)
+   *
+   * `null` is a filesystem that would not answer, and means what it means to `write`: no
+   * precondition. Compare by **value** — `mtimeNanos` is a string and two answers are two
+   * objects — which is what `panes/excalidrawKinds.ts`'s `sameStamp` is for.
+   */
+  stat: (path: string) => invoke<FileStamp | null>('file_stat', { path }),
+
+  /**
+   * A file's bytes, with the stamp they were read under. (M63)
+   *
+   * The one `invoke` in this file whose answer is not JSON. `file_read_bytes` answers a raw
+   * `tauri::ipc::Response` — `application/octet-stream` over the same custom protocol the
+   * terminal's scrollback takes, one round trip, no `eval` — and Tauri hands it back as an
+   * `ArrayBuffer`. Inside it is `cide_ipc::frame`'s envelope: four bytes of little-endian
+   * length, that many bytes of JSON (`FileBytesHead`), then the file. `image.read` below
+   * explains why bytes never travel as JSON or base64; this is the road for the one pane that
+   * needs the bytes *in JavaScript* rather than in an `<img>`.
+   */
+  readBytes: async (path: string): Promise<{ head: FileBytesHead; bytes: Uint8Array<ArrayBuffer> }> =>
+    unpackFrame<FileBytesHead>(await invoke<ArrayBuffer>('file_read_bytes', { path })),
+
+  /**
+   * Write a file's bytes back, optionally only if the file on disk has not moved. (M63)
+   *
+   * `write`'s twin for bytes: the same `ifUnchanged` precondition, the same `FileChanged`
+   * rejection, the same returned stamp. The arguments are not JSON either — the `Uint8Array`
+   * *is* the request body, framed with `FileBytesWrite` as its head, and `file_write_bytes`
+   * reads it as `InvokeBody::Raw`. The path rides in the head and not in a request header
+   * because a header value is visible ASCII and a path is not.
+   */
+  writeBytes: (path: string, bytes: Uint8Array, ifUnchanged: FileStamp | null = null) => {
+    const head: FileBytesWrite = { path, ifUnchanged }
+    return invoke<FileStamp | null>('file_write_bytes', packFrame(JSON.stringify(head), bytes))
+  },
+}
+
+/**
+ * `cide_ipc::frame`, mirrored: `u32 LE n | n bytes of JSON head | payload`.
+ *
+ * Four lines each way, kept beside the two commands that use them so the wire shape has
+ * exactly two spellings — the Rust module and this — and `check:excalidraw` pins the
+ * little-endian `DataView` calls that make them agree.
+ */
+const FRAME_PREFIX = 4
+
+function packFrame(head: string, payload: Uint8Array): Uint8Array<ArrayBuffer> {
+  const headBytes = new TextEncoder().encode(head)
+  const frame = new Uint8Array(FRAME_PREFIX + headBytes.length + payload.length)
+  new DataView(frame.buffer).setUint32(0, headBytes.length, true)
+  frame.set(headBytes, FRAME_PREFIX)
+  frame.set(payload, FRAME_PREFIX + headBytes.length)
+  return frame
+}
+
+function unpackFrame<Head>(frame: ArrayBuffer): { head: Head; bytes: Uint8Array<ArrayBuffer> } {
+  if (frame.byteLength < FRAME_PREFIX) {
+    throw new Error(`the frame is truncated: ${frame.byteLength} bytes where at least 4 were promised`)
+  }
+  const length = new DataView(frame).getUint32(0, true)
+  const end = FRAME_PREFIX + length
+  if (frame.byteLength < end) {
+    throw new Error(`the frame is truncated: ${frame.byteLength} bytes where at least ${end} were promised`)
+  }
+  const head = JSON.parse(
+    new TextDecoder().decode(new Uint8Array(frame, FRAME_PREFIX, length)),
+  ) as Head
+  return { head, bytes: new Uint8Array(frame, end) }
 }
 
 /**
@@ -4620,6 +4680,24 @@ import type {
   DockerStream,
   InspectTarget,
 } from './generated'
+
+/**
+ * Symbol documentation, as a page any language server can fill. (M60)
+ *
+ * `lookup` is the gesture — F1, the context menu, and Go to definition's fallback when a server
+ * answers "no file" — and it never rejects: "nothing to say", "still indexing" and "no server"
+ * are three `DocsAnswer` variants with three sentences, `diagnostics.definition`'s rule. `page`
+ * is what a docs tab asks on every mount, because the tab carries a *subject* and never the
+ * page (`TabKind::Docs`); `openTab` reuses a tab already about the same subject.
+ */
+export const docs = {
+  lookup: (projectId: ProjectId, path: string, line: number, column: number, word: string) =>
+    invoke<DocsAnswer>('docs_lookup', { project: projectId, path, line, column, word }),
+  page: (projectId: ProjectId, subject: DocsSubject) =>
+    invoke<DocsAnswer>('docs_page', { project: projectId, subject }),
+  openTab: (projectId: ProjectId, subject: DocsSubject, title: string) =>
+    invoke<TabId>('tab_open_docs', { project: projectId, subject, title }),
+}
 
 /**
  * Stamps `docker.watch` calls so Rust can discard one that lost a race. (M54)

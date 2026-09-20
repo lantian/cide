@@ -15,6 +15,18 @@
 //! pane. Broadcasting a `selection_changed` instead would put the text the user highlighted
 //! into the other pane's prompt, silently, with nothing on screen to explain it.
 //!
+//! That paragraph was written first, contradicted for a while, and is true again. A broadcast
+//! `selection_changed_all` was added when the addressed one turned out to have no producer,
+//! on the argument that a selection is "a fact about the editor" rather than a message aimed
+//! at one conversation, so every `claude` in the project should hear it. From a chair it was
+//! exactly the failure the paragraph above predicts: every caret move in any editor put
+//! `⧉ Selected N lines from <file>` into the prompt of every `claude` in the project, and
+//! the CLI sends that selection as context with the next message — so a conversation about
+//! the Docker panel was handed the git panel's code because the user had glanced at it. The
+//! broadcast is gone. The only selection a CLI hears is the one *Send lines to Claude*
+//! addresses to it, in the same breath as the mention, and an editor that is merely being
+//! read tells nobody anything.
+//!
 //! The pid map is filled by [`IdeServer::bind_pane`] rather than discovered here, because
 //! only the application knows which `PtySession` owns a pid. Either order works: the two maps
 //! are independent, and a notification sent before both halves exist is dropped with a log
@@ -322,32 +334,6 @@ impl Inner {
         pids
     }
 
-    /// Every open connection, bound to a pane or not.
-    ///
-    /// This used to require a pane binding, on the theory that including an unbound
-    /// connection "would send a selection to a `claude` that may not be in this project at
-    /// all". That theory was wrong, and it made a documented case silently dead: this server
-    /// is *per project*, it is reachable only with this project's `authToken`, and
-    /// `cmd::session` hands `CLAUDE_CODE_SSE_PORT` to **every** pane — shells included —
-    /// precisely so that "a user who types `claude` into a cide shell should reach this
-    /// project's server too". That `claude` is a grandchild of the shell, so its pid is not
-    /// the pid `pane_bind_session` bound, so it never appears in `pane_of_pid`, so it
-    /// received no selection ever. A connection that got through the handshake is in this
-    /// project by construction.
-    ///
-    /// Addressed notifications still require the binding, and must: `at_mentioned` types into
-    /// one prompt, and picking a pane by guessing is the failure mode the addressing exists
-    /// to avoid. Broadcast is the case where "everyone in this project" is the right answer
-    /// and no attribution is needed to give it.
-    fn all_senders(&self) -> Vec<mpsc::UnboundedSender<Message>> {
-        self.conns
-            .lock()
-            .open
-            .values()
-            .map(|conn| conn.out.clone())
-            .collect()
-    }
-
     /// How many CLIs are attached to this project's server at all.
     ///
     /// The number is what separates "no Claude is connected to cide" from "a Claude is
@@ -534,33 +520,26 @@ impl IdeServer {
         self.inner.unbound_pids()
     }
 
-    /// Tell the `claude` in `pane` where the user is looking.
+    /// Tell the `claude` in `pane` what the user selected — the text, not only the range.
+    ///
+    /// Addressed, exactly as [`Self::at_mentioned`] is, and for the same reason: the CLI puts
+    /// the selection into its prompt as `⧉ Selected N lines` and sends the text as context
+    /// with the next message, so this is *typing into a conversation*, whatever the method's
+    /// name suggests. There is no broadcast form any more — see the module doc — so the one
+    /// caller is *Send lines to Claude*, which sends this and then the mention to the same
+    /// pane it resolved for both.
+    ///
+    /// The binding this needs is the same one the mention needs. A `claude` typed into a
+    /// shell pane, or one behind a launcher, announces a pid cide never forked; that used to
+    /// be the argument for a broadcast that needed no binding, and it is answered instead by
+    /// `cide_app::ide::resolve_unbound_connections`, which walks the pid's ancestry to the
+    /// pane that owns it before either notification is sent.
     pub fn selection_changed(&self, pane: &str, payload: SelectionChanged) -> Delivery {
         self.notify_pane(
             pane,
             protocol::notify::SELECTION_CHANGED,
             selection_params(&payload),
         )
-    }
-
-    /// Tell **every** connected `claude` in this project where the editor selection is.
-    ///
-    /// Broadcast rather than addressed to one pane, which is the opposite of `at_mentioned`
-    /// and deliberate. An `@`-mention is a message the user aimed at one conversation; a
-    /// selection is a fact about the editor, and a project with two Claude panes has two
-    /// conversations that both benefit from knowing it. Addressing one would mean picking a
-    /// "current" Claude, and when an editor is focused there isn't one.
-    /// Returns how many CLIs it reached, so a caller can tell "sent" from "sent to nobody".
-    pub fn selection_changed_all(&self, payload: SelectionChanged) -> usize {
-        let params = selection_params(&payload);
-        let senders = self.inner.all_senders();
-        for out in &senders {
-            send_json(
-                out,
-                &Notification::new(protocol::notify::SELECTION_CHANGED, params.clone()),
-            );
-        }
-        senders.len()
     }
 
     /// Put a file reference into the prompt of the `claude` in `pane`.
@@ -2008,60 +1987,6 @@ mod tests {
         assert_eq!(notification["params"]["filePath"], "/src/main.rs");
         assert_eq!(notification["params"]["lineStart"], 9);
         assert_eq!(notification["params"]["lineEnd"], 19);
-
-        server.shutdown().await;
-    }
-
-    /// The regression that made *Send lines to Claude* a no-op for a whole class of session.
-    ///
-    /// `cmd::session` gives `CLAUDE_CODE_SSE_PORT` to **every** pane, shells included, so that
-    /// "a user who types `claude` into a cide shell should reach this project's server too".
-    /// That `claude` is a grandchild of the shell, so its pid is not the one
-    /// `pane_bind_session` bound, so it never appears in `pane_of_pid` — and the broadcast
-    /// used to filter on exactly that map. The connection was live, authenticated with this
-    /// project's token, and heard nothing, for ever, with no log line at the sending end.
-    #[tokio::test]
-    async fn a_claude_that_no_pane_owns_still_hears_the_broadcast_selection() {
-        let server = server().await;
-        let mut events = server.events();
-
-        let mut ws = connect(server.port(), TOKEN)
-            .await
-            .expect("the CLI connects");
-        handshake(&mut ws).await;
-        // A pid nothing ever bound: the shell's grandchild, or a `claude` that connected
-        // before the frontend got round to calling `pane_bind_session`.
-        send(
-            &mut ws,
-            json!({"jsonrpc":"2.0","method":"ide_connected","params":{"pid":7777}}),
-        )
-        .await;
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), events.recv())
-                .await
-                .expect("a connect event"),
-            Some(ServerEvent::Connected { pid: 7777, .. })
-        ));
-
-        let reached = server.selection_changed_all(SelectionChanged {
-            file_path: "/src/main.rs".into(),
-            text: "let x = 1;".into(),
-            start_line: 3,
-            end_line: 3,
-        });
-        assert_eq!(reached, 1, "an unbound connection is still in this project");
-
-        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("the selection arrives")
-            .expect("the socket is open")
-            .expect("a readable frame");
-        let Message::Text(text) = frame else {
-            panic!("expected a text frame");
-        };
-        let notification: Value = serde_json::from_str(&text).expect("a JSON frame");
-        assert_eq!(notification["method"], "selection_changed");
-        assert_eq!(notification["params"]["filePath"], "/src/main.rs");
 
         server.shutdown().await;
     }

@@ -104,6 +104,7 @@ import {
   type Candidate,
   type Resolution,
 } from './pathMatch'
+import { matchTaskCodes } from './taskLinks'
 import type { TerminalHandle } from './xterm'
 
 /**
@@ -695,6 +696,21 @@ export function attachPathLinks(
     }
     const miss = scan.misses.find((candidate) => linkAtCell(candidate.range, cell))
     if (miss !== undefined) {
+      /*
+       * A task code is a path candidate, because `pathMatch.ts`'s `BODY` includes `-`. (M60)
+       *
+       * It resolves to nothing, so it arrives here as a miss — and "does not name a file or
+       * folder" is true of `t-503` and useless next to an underline that a *plain* click would
+       * have opened. The contradiction is visible to the user, so the sentence names the other
+       * gesture instead of the failed one.
+       */
+      if (matchTaskCodes(miss.text).length === 1) {
+        notify(`${miss.text} is a task code, not a path.`, {
+          kind: 'warn',
+          hint: 'Click a task code without Ctrl to open the task.',
+        })
+        return
+      }
       notify(`${miss.text} does not name a file or folder cide can reach from this pane.`, {
         kind: 'warn',
         hint: 'Paths resolve against the pane’s working directory and the project’s roots.',

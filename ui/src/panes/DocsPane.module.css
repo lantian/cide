@@ -1,0 +1,214 @@
+/*
+ * The documentation pane. (M60)
+ *
+ * Its own stylesheet for `DockerInspectPane.module.css`'s reason: a borrowed module is exactly
+ * the classes it happens to have, `styles.member` type-checks as `undefined`, and React drops the
+ * attribute in silence.
+ *
+ * Chrome type is the `--fs-ui-*` ladder; the prose inside the markdown preview is that
+ * component's own (`--fs-code`, per its header), and the signature line is code too. Every colour
+ * is a token, so the page follows the scheme without a rule of its own.
+ */
+
+.pane {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.header {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 20px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* `appearance: none` keeps WebKit's `1px 6px`, so the padding is stated — the icon note in CLAUDE.md. */
+.back {
+  appearance: none;
+  padding: 0;
+  margin: 0;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.back:hover:enabled {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.back:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.mark {
+  color: var(--dim);
+  display: grid;
+  place-items: center;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--fs-ui-16);
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kind {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  background: var(--chrome);
+  text-transform: lowercase;
+}
+
+.source {
+  flex: none;
+  margin-left: auto;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: var(--fs-ui-12);
+}
+
+.link {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.signature {
+  margin: 4px 0 0;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: var(--chrome);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-code);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 20px 40px;
+}
+
+.prose {
+  max-width: 84ch;
+}
+
+.members {
+  max-width: 84ch;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.membersTitle {
+  margin: 0 0 12px;
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.member {
+  padding: 10px 0 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.memberHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.memberName {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: var(--fs-code);
+  font-weight: 600;
+  color: var(--text);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.memberName:enabled {
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.memberName:enabled:hover {
+  text-decoration: underline;
+}
+
+.memberSignature {
+  margin: 4px 0 6px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-code);
+  color: var(--dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  margin: 0;
+  font-size: var(--fs-ui-12);
+  color: var(--faint);
+}
+
+.notice {
+  margin: 0;
+  padding: 20px;
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--dim);
+}

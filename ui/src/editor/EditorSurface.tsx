@@ -48,6 +48,7 @@ import { lineEditKeymap } from './editorKeys'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
 import { foldSpecFor, languageIdFor, languageName, loadLanguage } from './languages'
+import { indentPolicy, type IndentDefaults } from './indentDetect'
 import {
   foldAllRanges,
   foldEffectsFor,
@@ -205,6 +206,19 @@ export interface EditorSurfaceProps {
    * Absent means off, which is what those surfaces want and what a fixture gets for free.
    */
   completion?: { readonly enabled: boolean; readonly onTyping: boolean } | undefined
+  /**
+   * What Tab inserts, from `settings.editor`: `tabSize`, `insertSpaces`, and whether the buffer's
+   * own text outranks both. (M59)
+   *
+   * A prop for `completion`'s reason above. Absent means what `EditorSettings::default()`
+   * carries — four spaces, detection on — so a surface that passes nothing behaves as every
+   * buffer did before the two settings were read at all, plus the detection. The whole policy is
+   * `indentDetect.ts`; this component only decides *when* it is asked: at build, from the text
+   * the view is built with, and again when any of the three change.
+   */
+  indent?:
+    | { readonly tabSize: number; readonly insertSpaces: boolean; readonly detect: boolean }
+    | undefined
   /** The file exactly as it came off disk, line endings included. */
   doc: string
   /**
@@ -255,19 +269,15 @@ export interface EditorSurfaceProps {
     | undefined
   /** Called on focus, so the pane tree can follow the caret. */
   onFocus?: (() => void) | undefined
-  /**
-   * The selection, for Claude Code's `selection_changed` notification.
-   *
-   * Lines are **1-based here** and converted to the protocol's 0-based at the Rust boundary,
-   * so nothing in between has to remember which convention it is holding. Fires on every
-   * selection change including an empty one — a caret move is a selection of zero
-   * characters, and the CLI's status wants to follow the caret, not only a highlight.
-   *
-   * Debouncing is the caller's: a drag fires this once per animation frame.
+  /*
+   * There is deliberately no `onSelection` here. One existed — the selection's text and line
+   * range, fired on every caret move for Claude Code's `selection_changed` notification — and
+   * its one consumer broadcast it to every `claude` in the project, which typed the file the
+   * user was *reading* into every conversation's prompt. `panes/EditorPane.tsx` has the
+   * account. The gesture that sends a selection is the editor menu, and `useSendToClaude.ts`
+   * reads the selection from the view at the moment of sending; nothing needs a per-keystroke
+   * stream of it.
    */
-  onSelection?:
-    | ((selection: { text: string; startLine: number; endLine: number }) => void)
-    | undefined
   /**
    * Receives an awaitable save for this buffer, and `null` when the editor goes away.
    *
@@ -383,9 +393,8 @@ export interface EditorSurfaceProps {
    * The buffer's view moved: the caret, the first visible line, or both. (M12)
    *
    * Fires at most once an animation frame, and only when the answer actually changed — see
-   * `viewTracker.ts`. **The caller must debounce before it does anything expensive**, the same
-   * contract [`onSelection`] carries and for the same reason; `EditorPane` trailing-debounces
-   * this at 500 ms and flushes it on unmount.
+   * `viewTracker.ts`. **The caller must debounce before it does anything expensive**;
+   * `EditorPane` trailing-debounces this at 500 ms and flushes it on unmount.
    */
   onView?: ((at: FileView) => void) | undefined
   /**
@@ -496,6 +505,25 @@ export function cursorLabel(state: EditorState): string {
   return `Ln ${line.number}, Col ${head - line.from + 1}`
 }
 
+/** What `EditorSettings::default()` carries, for a surface that passes no `indent` at all. */
+const DEFAULT_INDENT: IndentDefaults = { tabSize: 4, insertSpaces: true }
+
+/**
+ * The two facets `indentDetect.ts` decides, as the indent compartment's contents. (M59)
+ *
+ * `indentUnit` is what Tab (`indentWithTab` → `indentMore`) and Enter insert; `tabSize` is how
+ * wide an existing tab draws and — through `indentString` — how many columns one unit is when
+ * the unit is a tab. Both from one answer, so the two cannot disagree about the same buffer.
+ */
+function indentExtensions(source: string, indent: EditorSurfaceProps['indent']): Extension {
+  const defaults: IndentDefaults =
+    indent === undefined
+      ? DEFAULT_INDENT
+      : { tabSize: indent.tabSize, insertSpaces: indent.insertSpaces }
+  const policy = indentPolicy(source, defaults, indent?.detect ?? true)
+  return [indentUnit.of(policy.unit), EditorState.tabSize.of(policy.tabSize)]
+}
+
 export function EditorSurface({
   path,
   // Defaulted from `path` in the pattern itself rather than in a `??` below, so the fallback is
@@ -508,11 +536,11 @@ export function EditorSurface({
   reloadKey = 0,
   readOnly = false,
   completion,
+  indent,
   onDirtyChange,
   onSave,
   autosave,
   onFocus,
-  onSelection,
   onSaveHandle,
   onScrollHandle,
   onFocusHandle,
@@ -545,6 +573,11 @@ export function EditorSurface({
    */
   const completionRef = useRef(completion)
   completionRef.current = completion
+  /** The live view's indent compartment, so a settings change can reconfigure it. (M59) */
+  const indentSlotRef = useRef<Compartment | null>(null)
+  /** The indent settings as they stand, for the build effect to seed from — `completionRef`'s reason. */
+  const indentRef = useRef(indent)
+  indentRef.current = indent
   /*
    * The last diagnostics actually dispatched into this view, as a serialized fingerprint.
    * A ref and not state: it exists to *suppress* renders' side effects, and its doc-position
@@ -566,8 +599,6 @@ export function EditorSurface({
   dirtyCb.current = onDirtyChange
   const focusCb = useRef(onFocus)
   focusCb.current = onFocus
-  const selectionCb = useRef(onSelection)
-  selectionCb.current = onSelection
   const saveHandleCb = useRef(onSaveHandle)
   saveHandleCb.current = onSaveHandle
   const scrollHandleCb = useRef(onScrollHandle)
@@ -837,6 +868,15 @@ export function EditorSurface({
      * two orderings.
      */
     const completionSlot = new Compartment()
+    /*
+     * What Tab inserts, in a compartment for the same reason. (M59)
+     *
+     * Seeded from the buffer's own text as well as from the settings — `indentDetect.ts` — and
+     * that is why the seeding happens *here*: `source` is the one place the whole document is a
+     * string before the view owns it, and the answer has to be in the extension array the view
+     * is built with, because the first Tab can land before any effect has run.
+     */
+    const indentSlot = new Compartment()
     /*
      * Which polarity CodeMirror thinks it is drawing in. (M24)
      *
@@ -1168,8 +1208,7 @@ export function EditorSurface({
        * like a cross-file jump and put an entry on the Back stack that returns to itself.
        */
       navRecorder(project, identity),
-      indentUnit.of('    '),
-      EditorState.tabSize.of(4),
+      indentSlot.of(indentExtensions(source, indentRef.current)),
       languageSlot.of([]),
       lintSlot.of([]),
       completionSlot.of(completionFor(completionRef.current, project, path, readOnly, oversize)),
@@ -1267,14 +1306,6 @@ export function EditorSurface({
              */
             publishTrail(at.number, column)
           }
-          // Read from `update.state`, not from a captured view: this listener outlives
-          // several states and the one that changed is the one to report.
-          const { from, to } = update.state.selection.main
-          selectionCb.current?.({
-            text: update.state.sliceDoc(from, to),
-            startLine: update.state.doc.lineAt(from).number,
-            endLine: update.state.doc.lineAt(to).number,
-          })
         }
         if (update.docChanged) {
           // The read is deferred, not the notification: `viewRef` is what makes "as it is then"
@@ -1486,6 +1517,7 @@ export function EditorSurface({
     const stopPolarity = watchPolarity(view, polarity)
     lintSlotRef.current = lintSlot
     completionSlotRef.current = completionSlot
+    indentSlotRef.current = indentSlot
     blameSlotRef.current = blameSlot
     /*
      * The markers the column was already showing, pushed into the buffer that replaced it.
@@ -1915,6 +1947,7 @@ export function EditorSurface({
     return () => {
       viewRef.current = null
       lintSlotRef.current = null
+      indentSlotRef.current = null
       lintFingerprintRef.current = null
       blameSlotRef.current = null
       saveHandleCb.current?.(null)
@@ -2088,6 +2121,25 @@ export function EditorSurface({
     // the slot to what it was just seeded with. Idempotent, and cheaper than a rule about which
     // of the two owns the seeding.
   }, [completion, project, path, readOnly])
+
+  /*
+   * Re-decide what Tab inserts when the indent settings change. (M59)
+   *
+   * Read off the *live* document rather than the `doc` prop: the user may have re-indented the
+   * buffer since it opened, and a settings change is the one moment they would expect that to be
+   * noticed. Keyed on the three scalars and not the object, for `check:selectors`' reason — the
+   * pane memoises the object, but a fresh one would only cost an idempotent dispatch here, and
+   * three scalars keep that true whether or not it stays memoised. Not keyed on `path`: the
+   * build effect seeds the compartment for a new file, so there is nothing for this to redo.
+   */
+  useEffect(() => {
+    const view = viewRef.current
+    const slot = indentSlotRef.current
+    if (view === null || slot === null) return
+    view.dispatch({
+      effects: slot.reconfigure(indentExtensions(view.state.doc.toString(), indentRef.current)),
+    })
+  }, [indent?.tabSize, indent?.insertSpaces, indent?.detect])
 
   /*
    * Put the blame column up, and keep it filled. (M18)

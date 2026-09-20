@@ -82,6 +82,7 @@ import { useAgents } from '@/sidebar/agentsStore'
 import { TasksPanel, TaskDetailHost } from '@/sidebar/TasksPanel'
 import { DockerFilesPane } from '@/panes/DockerFilesPane'
 import { DockerInspectPane } from '@/panes/DockerInspectPane'
+import { DocsPane } from '@/panes/DocsPane'
 import { useDocker } from '@/sidebar/dockerStore'
 import { OpenSpecPanel } from '@/sidebar/OpenSpecPanel'
 import { ProposeDialog, useProposeDialog } from '@/sidebar/OpenSpecPanel/ProposeDialog'
@@ -2358,6 +2359,17 @@ const WorkspaceContent = memo(function WorkspaceContent({
                         {...(tab.kind.subject.kind === 'change'
                           ? { change: tab.kind.subject.change }
                           : { spec: tab.kind.subject.spec })}
+                      />
+                    ) : tab.kind.kind === 'docs' ? (
+                      /*
+                       * A symbol's documentation, replacing the pane tree for the reasons the
+                       * arms around it give: a page *about* something, nothing for a split to
+                       * split. The tab carries a subject; the pane asks for the page. (M60)
+                       */
+                      <DocsPane
+                        project={activeProject.id}
+                        subject={tab.kind.subject}
+                        title={tab.kind.title}
                       />
                     ) : tab.kind.kind === 'docker' ? (
                       /*

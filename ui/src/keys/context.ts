@@ -54,6 +54,7 @@
 import { useWorkspace } from '@/store/workspace'
 import { registeredBuffers } from '@/editor/openBuffers'
 import { isComposePath } from '@/chrome/composeModel'
+import { drawingKindFor } from '@/panes/excalidrawKinds'
 import {
   activeProjectOf,
   claudeTargetOf,
@@ -89,6 +90,7 @@ export const DERIVED_FLAGS = [
   'claudePaneFocused',
   'terminalFocused',
   'editorFocused',
+  'drawingFocused',
   'projectOpen',
   'multipleProjects',
   'multipleTabs',
@@ -112,6 +114,22 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
   const project = activeProjectOf(boot)
   const focused = focusTarget(boot)
   const kind = focused?.pane.kind
+  /*
+   * The focused pane is a file tab's editor pane and the file is an Excalidraw drawing. (M63)
+   *
+   * A drawing pane *is* a `PaneKind::Editor` pane — `PaneBody` forks on the file's name, and
+   * Rust never hears about it — so without this line it satisfied `editorFocused`, and every
+   * binding carrying that clause swallowed a chord the canvas needed: `ctrl+g` (go to line;
+   * *group* to Excalidraw), `ctrl+equal` / `ctrl+minus` (fold; *zoom*), `alt+up` / `alt+down`
+   * (walk members in a buffer with none). Each reached `dispatch.ts`, found no caret, logged
+   * `did nothing`, and the drawing never saw the key.
+   *
+   * By name off `focusedTabPath`, the way `composeFileActive` is — derivable from the mirror
+   * as Rust fills it, since `TabKind::File` carries the path. Pane-level rather than tab-level,
+   * because its job is to narrow `editorFocused`, which is pane-level.
+   */
+  const focusedPath = focusedTabPath(boot)
+  const drawing = kind === 'editor' && focusedPath !== null && drawingKindFor(focusedPath) !== null
 
   return {
     paneFocused: focused !== null,
@@ -120,7 +138,11 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
     // for a diff pane, which has no terminal at all and which `App.tsx`'s
     // `kind !== 'editor'` spelling counted as one.
     terminalFocused: kind === 'claude' || kind === 'shell',
-    editorFocused: kind === 'editor',
+    // An editor pane that is a **text buffer**: the drawing pane is excluded above, and the
+    // status bar's own `editorFocused` in `App.tsx` deliberately is not — it wants the readout
+    // shown for a drawing, and the gate wants the chords let through. Two flags, two questions.
+    editorFocused: kind === 'editor' && !drawing,
+    drawingFocused: drawing,
 
     projectOpen: project !== null,
     // This window's strip, not the workspace's project map: in `perProject` window mode the

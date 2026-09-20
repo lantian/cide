@@ -26,6 +26,7 @@
  */
 import { diagnostics as diagnosticsApi, file as fileApi, type ProjectId } from '@/ipc/client'
 import { jumpTo } from './jump'
+import { showDocumentation } from './quickDocumentation'
 
 /**
  * Put a sentence on screen.
@@ -51,6 +52,7 @@ export function goToDefinition(
   line: number,
   column: number,
   onInterfaceMethod?: () => void,
+  word = '',
 ): void {
   void diagnosticsApi
     .definition(project, path, line, column)
@@ -119,11 +121,12 @@ export function goToDefinition(
           void fileApi.open(project, answer.path)
           return
         case 'notFound':
-          // Deliberately a report and not a silence. A caret on a keyword or inside a comment
-          // legitimately resolves to nothing, and a gesture that does nothing at all is
-          // indistinguishable from one that is broken — the complaint that produced
-          // `useSendToClaude` in the first place.
-          report('No declaration found for what is under the caret.')
+          // Not a silence, and since M60 not a sentence either — a second question. A caret on
+          // a keyword resolves to nothing, but so does a caret on Godot's `Dictionary` or a JDK
+          // class: no file, and a server full of things to say about it. Quick documentation
+          // asks, opens a page when there is one, and otherwise says that neither was found —
+          // the sentence this arm used to say, with the second miss added.
+          showDocumentation(project, path, line, column, word, true)
           return
         case 'unavailable':
           // Carries the server's own sentence: "rust-analyzer is still indexing", "gopls is not

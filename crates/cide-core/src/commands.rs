@@ -114,6 +114,19 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     // Six Compose rows offered on every `.rs` file, each of them inert, is precisely the
     // listed-but-silently-dead state this module exists to make unrepresentable.
     "composeFileActive",
+    // The focused pane is a file tab's editor pane and the file is an Excalidraw drawing. (M63)
+    //
+    // Pane-level, like `editorFocused`, and not tab-level like `composeFileActive`: it exists to
+    // *narrow* `editorFocused`, which the drawing pane would otherwise satisfy — it is a
+    // `PaneKind::Editor` pane in a `TabKind::File` tab — so that every binding carrying
+    // `editorFocused` stopped swallowing the chord it shares with the canvas. `ctrl+g` is *Go
+    // to line* to the editor and *Group* to Excalidraw; `ctrl+equal`/`ctrl+minus` are fold and
+    // unfold to one and zoom to the other; `alt+up`/`alt+down` walk members in a buffer that
+    // has none. Each of those reached `dispatch.ts`, found no caret, logged a line, and the
+    // canvas never saw the key. `keys/context.ts` derives it by name from the tab's path — the
+    // same rule `composeFileActive` follows, and derivable from the mirror as Rust fills it —
+    // and defines `editorFocused` as "an editor pane that is *not* a drawing".
+    "drawingFocused",
     "claudeTarget",
     // There is deliberately no `repoOpen`. See the note above the Git group in [`build`]: the
     // webview cannot answer "does this project contain a git repository" without asking the
@@ -852,7 +865,10 @@ fn build() -> Vec<Command> {
             .when("terminalFocused")
             .keywords(&["search", "find", "grep", "scrollback", "transcript"]),
         // File.
-        Command::new("file.save", "Save file", FILE).when("editorFocused"),
+        // `editorFocused || drawingFocused`: the drawing pane is not an editor for the purposes
+        // of every other clause here (see `drawingFocused` in `CONTEXT_FLAGS`), and it saves.
+        // The *binding* is unconditional either way — this clause is the palette's filter.
+        Command::new("file.save", "Save file", FILE).when("editorFocused || drawingFocused"),
         Command::new("file.saveAll", "Save all files", FILE).when("editorOpen"),
         /*
          * Reformat code — Shift+Alt+F. (M26)
@@ -1170,6 +1186,15 @@ fn build() -> Vec<Command> {
         Command::new("navigate.definition", "Go to definition", NAVIGATE)
             .when("editorFocused")
             .keywords(&["declaration", "jump", "resolve", "symbol", "source"]),
+        // IDEA's *Quick Documentation*. (M60) A separate id rather than a mode of
+        // `navigate.definition`, for the reason the block below gives about implementation: it
+        // is a different question with a different answer (a page, not a place), and a user
+        // binds and greps for it under its own name. Go to definition falls back to it when
+        // the server answers "no file" — Godot's built-ins, a JDK class — but the command is
+        // how documentation is asked for on purpose.
+        Command::new("navigate.documentation", "Quick documentation", NAVIGATE)
+            .when("editorFocused")
+            .keywords(&["docs", "help", "reference", "hover", "javadoc", "describe"]),
         /*
          * Find usages — IDEA's Alt+F7. (M14)
          *

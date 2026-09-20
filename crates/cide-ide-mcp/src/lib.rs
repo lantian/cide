@@ -43,14 +43,15 @@
 //! let mut rx  = server.events();        // ServerEvent stream
 //!
 //! server.bind_pane(pid, pane_id);       // the app knows which PtySession has that pid
-//! server.selection_changed_all(payload);            // -> how many CLIs it reached
+//! server.selection_changed(pane, payload);          // -> Delivery
 //! server.at_mentioned(pane, payload);               // -> Delivery
 //! server.shutdown().await;
 //! ```
 //!
-//! The two notification calls **report** rather than only logging. Every one of them can be a
-//! no-op — no `claude` has connected, or the one in that pane has not — and a gesture that
-//! silently does nothing is the defect this project keeps shipping. See [`server::Delivery`].
+//! Both notifications are **addressed** to one pane and **report** rather than only logging.
+//! Either can be a no-op — no `claude` has connected, or the one in that pane has not — and a
+//! gesture that silently does nothing is the defect this project keeps shipping. See
+//! [`server::Delivery`]. There is no broadcast: `server.rs`'s module doc says why, twice.
 //!
 //! `ServerEvent` is the whole outbound vocabulary: `Connected { connection, pid }`,
 //! `Disconnected { connection }`, `DiffRequested(DiffRequest)`,

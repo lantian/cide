@@ -3999,13 +3999,25 @@ impl AgentRegistry {
             if let Some(reason) = diagnoser.and_then(|harness| harness.diagnose(line)) {
                 registry.note_provider_failure(run, reason);
             }
+            // The wall clock, read once, on the coalescer thread, at the only moment this line
+            // is in hand — `logring`'s module header makes the whole argument, and M62 gave the
+            // renderer the same need: codex states no clock on any item, so a thinking block's
+            // duration is the silence it ended and cide is the only thing that can time it. One
+            // read for both, because two reads of `SystemTime::now()` for one line are two
+            // different answers to when it arrived.
+            let now = crate::logring::now_unix_ms();
             // Kept before it is rendered and only when the harness says a person may want it
             // whole — `json_log_render`'s rule, one hook over. The raw line is what the card
             // shows; the rendering is what the pane shows.
             let handle = keep(line)
-                .then(|| ring.as_ref().map(|ring| ring.record(session, line.trim())))
+                .then(|| {
+                    ring.as_ref()
+                        .map(|ring| ring.record_at(session, line.trim(), now))
+                })
                 .flatten();
-            render(&mut state.lock(), line, handle)
+            let mut state = state.lock();
+            state.now_unix_ms = Some(now);
+            render(&mut state, line, handle)
         }))
     }
 

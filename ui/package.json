@@ -27,6 +27,7 @@
     "check:diff-render": "node scripts/check-diff-render.mjs",
     "check:editor": "node scripts/check-editor.mjs",
     "check:exit": "node scripts/check-exit-marker.mjs",
+    "check:excalidraw": "node scripts/check-excalidraw.mjs",
     "check:ext": "node scripts/check-ext.mjs",
     "check:ext-render": "node scripts/check-ext-render.mjs",
     "check:fonts": "node scripts/check-fonts.mjs",
@@ -85,6 +86,7 @@
     "check:switcher": "node scripts/check-switcher.mjs",
     "check:tab-drag": "node scripts/check-tab-drag.mjs",
     "check:tab-overflow": "node scripts/check-tab-overflow.mjs",
+    "check:task-links": "node scripts/check-task-links.mjs",
     "check:terminal-find": "node scripts/check-terminal-find.mjs",
     "check:terminal-keys": "node scripts/check-terminal-keys.mjs",
     "check:theme": "node scripts/check-theme.mjs",
@@ -102,7 +104,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
   },
-  "//": "Versions are pinned exactly, with no carets. Vite 8 defaults to the Rolldown/Oxc pipeline, where the known breakage class is plugins reaching into Rollup internals \u2014 a caret range would let that arrive unannounced during a milestone.",
+  "//": "Versions are pinned exactly, with no carets. Vite 8 defaults to the Rolldown/Oxc pipeline, where the known breakage class is plugins reaching into Rollup internals — a caret range would let that arrive unannounced during a milestone.",
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
     "@codemirror/commands": "6.10.4",
@@ -112,6 +114,7 @@
     "@codemirror/search": "6.7.1",
     "@codemirror/state": "6.7.1",
     "@codemirror/view": "6.43.8",
+    "@excalidraw/excalidraw": "0.18.1",
     "@fontsource/inter": "5.3.0",
     "@fontsource/jetbrains-mono": "5.3.0",
     "@lezer/highlight": "1.2.3",

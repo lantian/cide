@@ -2507,12 +2507,18 @@ mod tests {
         // is deliberately not consulted for the link: `vt100` drops OSC 8 from
         // `state_formatted`, which is why a reattached pane's existing lines are inert and why
         // this asserts on the ring rather than on the screen.
-        let raw = ring
+        let kept = ring
             .get(id, 0)
             .expect("the first rendered line is handle 0 of this session's ring");
+        let raw = kept.raw;
         assert!(
             raw.contains(r#""msg":"conn failed""#) && raw.contains(r#""port":5432"#),
             "the ring keeps the bytes the child wrote, not the rendering: {raw:?}"
+        );
+        assert!(
+            kept.recorded_unix_ms > 1_700_000_000_000,
+            "and the moment it arrived, for the card's clock: {}",
+            kept.recorded_unix_ms
         );
         assert_eq!(
             ring.get(id, 99),

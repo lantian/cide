@@ -12,7 +12,19 @@ export type EditorSettings = {
  *
  * Clamped where a patch lands, not here: see [`clamp_font_size`].
  */
-fontSize: number, tabSize: number, insertSpaces: boolean, showMinimap: boolean, wordWrap: boolean, trimTrailingWhitespaceOnSave: boolean, 
+fontSize: number, tabSize: number, insertSpaces: boolean, 
+/**
+ * Read a buffer's own indentation before applying the two above. (M59)
+ *
+ * On by default, because the two above were read by *nothing* from M3 to M59 and every
+ * buffer got four spaces: a tab-indented file — GDScript, Go, a Makefile — took a space from
+ * Tab and a compiler's refusal from the next build (Godot: "Used space character for
+ * indentation instead of tab as used before in the file"). With this on, `tab_size` and
+ * `insert_spaces` decide only a buffer with no indentation of its own to copy; a file that
+ * already indents with tabs, or with two spaces, keeps doing so. The detector is
+ * `ui/src/editor/indentDetect.ts`, and `check:editor` drives it.
+ */
+detectIndentation: boolean, showMinimap: boolean, wordWrap: boolean, trimTrailingWhitespaceOnSave: boolean, 
 /**
  * Write a changed file when it loses focus, and after a minute with no edits. (M15)
  *

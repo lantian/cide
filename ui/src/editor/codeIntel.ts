@@ -49,6 +49,7 @@ import {
 import { noSymbolSentence, noUsagesSentence, type UsagesKind } from '@/overlays/usagesModel'
 import { goToDefinition } from './goToDefinition'
 import { jumpTo } from './jump'
+import { showDocumentation } from './quickDocumentation'
 import {
   CLICK_TIMEOUT_MS,
   HOVER_TIMEOUT_MS,
@@ -304,7 +305,11 @@ export function ctrlActivate(project: ProjectId, path: string, word: WordTarget)
         return
       case 'none':
         if (answer.kind === 'notFound') {
-          report('No declaration found for what is under the caret.')
+          // The second question, the same one `goToDefinition` asks (M60): a Godot built-in or a
+          // JDK class has no file and a server full of things to say. Quick documentation opens
+          // a page when there is one and says "no declaration, and nothing documents it" when
+          // there is not — the sentence this branch used to say, with the second miss added.
+          showDocumentation(project, path, word.line, word.column, word.text, true)
           return
         }
         report(answer.reason ?? 'The language server could not be asked.')

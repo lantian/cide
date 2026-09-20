@@ -154,12 +154,15 @@ const OK: NameVerdict = { error: null, note: null }
  * * `.` and `..` — they already name this directory and its parent, which is also the shape
  *   an escape attempt takes;
  * * a name that exists — refused here so the user sees it before pressing Enter. Rust refuses
- *   it again, because the directory can gain the name between the keystroke and the command.
+ *   it again, because the directory can gain the name between the keystroke and the command;
+ * * a name that is still only `seed` — the extension a *New ▸ Rust* gesture put in the box.
+ *   Its own arm below says why it cannot be left to the dot-file note.
  */
 export function checkName(
   name: string,
   siblings: readonly string[],
   directory: boolean,
+  seed = '',
 ): NameVerdict {
   const trimmed = name.trim()
   const what = directory ? 'folder' : 'file'
@@ -169,6 +172,26 @@ export function checkName(
     // an untouched field reads as a failure before anything was attempted. The caller draws
     // this as a hint; only Enter treats it as a refusal.
     return { error: `Type a ${what} name.`, note: null }
+  }
+  /*
+   * The box holds the seed and nothing else — the same mistake as the empty box, one gesture
+   * later. (M64)
+   *
+   * *New ▸ Rust* opens the box holding `.rs` with the caret in front of it, so the state
+   * this catches is the one every such gesture starts in. Nothing below refuses it: a leading
+   * dot is a **note**, so `.rs` would sail through and create a hidden file called `.rs` —
+   * and the note it would carry on the way (*"a dot-file may be hidden…"*) is a warning about
+   * ignore rules for a file the user has not finished naming, which is worse than silence.
+   *
+   * Compared **trimmed**, because `nameToSend` trims: without that, one space walks straight
+   * past this and creates the file anyway.
+   *
+   * The rule is here rather than in the panel so that `check-new-entry.mjs` can drive it,
+   * which is the whole reason this module is import-free. `seed` defaults to `''` — what a
+   * plain *New File…* passes — and `''` is never a `trimmed`, so the arm cannot fire for it.
+   */
+  if (seed !== '' && trimmed === seed) {
+    return { error: `Type a name in front of “${seed}”.`, note: null }
   }
   if (trimmed.includes('/')) {
     return {
@@ -211,7 +234,12 @@ export function checkName(
  * name with a trailing space passed the sibling check against its trimmed form and was then
  * sent untrimmed.
  */
-export function nameToSend(raw: string, siblings: readonly string[], directory: boolean): string | null {
-  if (checkName(raw, siblings, directory).error !== null) return null
+export function nameToSend(
+  raw: string,
+  siblings: readonly string[],
+  directory: boolean,
+  seed = '',
+): string | null {
+  if (checkName(raw, siblings, directory, seed).error !== null) return null
   return raw.trim()
 }

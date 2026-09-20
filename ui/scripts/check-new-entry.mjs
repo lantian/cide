@@ -184,6 +184,45 @@ try {
       + 'may not appear — which the panel says again afterwards if it really did not')
   eq(note('main.rs', ['other.rs']), null, 'an ordinary name gets neither an error nor a note')
 
+  // ---- a name that is still only the seed --------------------------------------------------
+  //
+  // The file tree's *New ▸ Rust* opens the box holding `.rs` with the caret in front of it, so
+  // this is the state EVERY such gesture starts in — and the one arm above it would otherwise
+  // fall into is the dot-file NOTE, which is not a refusal at all. Enter would then create a
+  // hidden file literally called `.rs`, carrying a warning about ignore rules for a file nobody
+  // had finished naming. The rule lives in `checkName` rather than in the panel exactly so that
+  // it can be driven from here; in a `useCallback` it would be pinned by a source grep and
+  // nothing else.
+
+  const seeded = (name, seed) => m.checkName(name, SIBS, false, seed)
+
+  ok(seeded('.rs', '.rs').error !== null,
+    'a box holding nothing but the seed is refused, like the empty box it stands in for')
+  ok(seeded('.rs', '.rs').error.includes('.rs'),
+    'and the message names the seed, because "type a name" alone does not say where')
+  ok(seeded('  .rs  ', '.rs').error !== null,
+    'compared TRIMMED, because `nameToSend` trims: one trailing space would otherwise walk '
+      + 'straight past this and create the file anyway')
+  eq(m.nameToSend('.rs', SIBS, false, '.rs'), null, 'so nothing is sent for it')
+
+  eq(seeded('parser.rs', '.rs').error, null,
+    'a real name ending in the seed is NOT the seed — which is the whole point of the gesture')
+  eq(seeded('parser.rs', '.rs').note, null, 'and carries no note either')
+  ok(seeded('.gitignore', '.rs').error === null,
+    'nor does a different dot-file, which keeps its own note and its own meaning')
+  ok(seeded('.gitignore', '.rs').note !== null, '…that note')
+
+  ok(m.checkName('.rs', SIBS, false).error === null,
+    'and with NO seed — what a plain *New File…* passes — `.rs` is an ordinary dot-file again, '
+      + 'so the unseeded box behaves exactly as it did before M64')
+  ok(m.checkName('.rs', SIBS, false).note !== null, '…with its dot-file note')
+  eq(m.nameToSend('.rs', SIBS, false), '.rs', 'and is sent')
+
+  ok(seeded('.excalidraw', '.excalidraw').error !== null,
+    'the drawing seed is refused for a sharper reason than the rest: `drawingKindFor` wants a '
+      + 'stem in front of the suffix, so a file called exactly `.excalidraw` would not even '
+      + 'open in the pane the gesture promised')
+
   // ---- what is actually sent -------------------------------------------------------------
 
   eq(m.nameToSend('  main2.rs  ', SIBS, false), 'main2.rs',

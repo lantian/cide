@@ -126,7 +126,12 @@ try {
   const client = read('../src/ipc/client.ts')
   const app = read('../src/App.tsx')
   const store = read('../src/sidebar/treeStore.ts')
-  const tree = read('../src/sidebar/FileTree.tsx')
+  // Stripped, like `picker` below. Every string the assertions in sections 3 and 6c look for
+  // is one this panel's own prose also spells — `creationRefusal`, `SCRATCH_TYPES`,
+  // `setSelectionRange` — because the house style is to name the rule a comment defends.
+  // Three assertions in this repository have already passed by matching their own
+  // explanation; this file is not going to be the fourth.
+  const tree = stripComments(read('../src/sidebar/FileTree.tsx'))
   const host = read('../src/overlays/OverlayHost.tsx')
   const overlayStore = read('../src/overlays/store.ts')
   const picker = stripComments(read('../src/overlays/ScratchType.tsx'))
@@ -415,6 +420,75 @@ try {
     !/onCreate\(query/.test(picker),
     'and Enter on an empty list does NOT create a scratch of the typed extension: that is a ' +
       'free-text path into `cide_core::scratch::check_ext` and a separate decision',
+  )
+
+  // --- 6c. the same list, in the file tree's *New ▸* submenu (M64) -------------------------
+  //
+  // The tree is `SCRATCH_TYPES`'s second reader, and everything section 6 argues about the
+  // picker applies here unchanged: a literal array in `FileTree.tsx` would offer a type the
+  // editor cannot highlight, and nothing would notice. What is new is that this surface also
+  // SEEDS the name box, and three of its rules fail in silence — a seed built from anything
+  // but the row's own extension, a caret left where `focus()` puts it, and an "untouched box"
+  // test that still means "empty".
+
+  ok(
+    /SCRATCH_TYPES\.map\(/.test(tree) && /from '@\/editor\/languages'/.test(tree),
+    "the tree's *New ▸* submenu is built from `SCRATCH_TYPES`, not from an array of its own. " +
+      'The picker made the same promise in section 6 and for the same reason — and a second ' +
+      'copy here would also be the one place an extension\'s languages silently stop appearing',
+  )
+  ok(
+    /submenu: \(\) =>/.test(tree),
+    '…through the `submenu` THUNK, so the rows are built when it opens. An array built with the ' +
+      'parent menu could not list a language installed since the right-click, which for a menu ' +
+      'whose whole subject is "what can this installation make" is the wrong answer',
+  )
+  ok(
+    /startDraft\(target_, false, `\.\$\{type\.ext\}`\)/.test(tree),
+    'and a row seeds the box with its OWN extension. Any other expression here is a menu that ' +
+      'says Rust and writes something else, with the row, the pane and the highlighting all ' +
+      'agreeing with each other and not with the label',
+  )
+  ok(
+    /startDraft\(target_, false, DEFAULT_DRAWING_SUFFIX\)/.test(tree)
+      && /from '@\/panes\/excalidrawKinds'/.test(tree),
+    'the *Drawing* row takes its suffix from `panes/excalidrawKinds`, never a literal here. ' +
+      'That module owns the four suffixes `drawingKindFor` routes on, and a copy that drifted ' +
+      'off them would open an empty text buffer where a canvas was promised',
+  )
+  ok(
+    !/label: 'New ▸'/.test(tree) && !/label: 'New…'/.test(tree),
+    "the parent row is labelled plain `New`: `ContextMenu` draws the chevron itself, and `▸` " +
+      'is not in `check:ui-icons`\'s prose allowlist — which is why *Compose* beside it is ' +
+      'spelled the same way',
+  )
+
+  ok(
+    /const untouched = draftSeed === '' \? draftName\.trim\(\) === '' : draftName\.trim\(\) === draftSeed/
+      .test(tree),
+    '"untouched" is measured against the SEED. Against `\'\'` it would be false the moment a ' +
+      'seeded box opened, and the strip would greet *New ▸ Rust* with the dot-file note — a ' +
+      'warning about ignore rules for a file nobody has named yet. The empty case keeps its own ' +
+      '`.trim()` spelling so a box holding three spaces goes on showing its destination',
+  )
+  ok(
+    /nameToSend\(raw, current\.siblings, current\.directory, draftSeed\)/.test(tree),
+    'and the seed reaches `checkName` through `commitDraft`, so Enter on a box still holding ' +
+      '`.rs` refuses down the SAME road as Enter on an empty one. `check:new-entry` drives that ' +
+      'rule; a branch in the component could only ever have been grepped for',
+  )
+  ok(
+    /\[fail, draftSeed\]/.test(tree),
+    "…and `draftSeed` is in `commitDraft`'s dependency array. Without it the closure keeps the " +
+      'first draft this panel ever opened, and a later *New ▸ Go* compares `.go` against `.rs` ' +
+      'and creates the very file the rule exists to refuse. There is no `exhaustive-deps` lint ' +
+      'in this project to catch it',
+  )
+  ok(
+    /el\.setSelectionRange\(0, 0\)/.test(tree),
+    'the caret is put in FRONT of the seed. Where `focus()` leaves it, typing `parser` into a ' +
+      'box holding `.rs` spells `.rsparser` — a legal filename, so nothing refuses it and the ' +
+      'only symptom is a file with the wrong name',
   )
 
   // --- 7. the Rust side's own promises, in the strings that cross ---------------------------

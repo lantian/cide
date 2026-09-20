@@ -325,26 +325,34 @@ impl IdeServers {
         }
     }
 
-    /// Tell every connected `claude` in a project where the editor selection is.
+    /// Tell one pane's `claude` what the user selected.
     ///
-    /// Returns how many CLIs it reached; `None` when the project has no server at all. The
-    /// two are different sentences — "cide could not start an IDE server" and "no `claude`
-    /// has connected to it" — and only the caller can put either one on screen.
+    /// Addressed to a single pane, like [`Self::at_mentioned`] and never broadcast. It used to
+    /// be: a debounced command reported every caret move in every editor to every `claude` in
+    /// the project, and the CLI shows that as `⧉ Selected N lines` in its prompt and sends the
+    /// text with the next message — typing into conversations the user was not looking at,
+    /// because they were looking at a file. `cide_ide_mcp::server`'s module doc has the whole
+    /// account. The one caller now is *Send lines to Claude*, which sends this and the mention
+    /// to the pane it resolved for both.
+    ///
+    /// `None` when the project has no server; otherwise whether the notification actually
+    /// went onto a socket, as for the mention.
     pub fn selection_changed(
         &self,
         project: ProjectId,
+        pane: PaneId,
         payload: cide_ide_mcp::SelectionChanged,
-    ) -> Option<usize> {
+    ) -> Option<cide_ide_mcp::Delivery> {
         self.servers
             .get(&project)
-            .map(|entry| entry.server.selection_changed_all(payload))
+            .map(|entry| entry.server.selection_changed(&pane.to_string(), payload))
     }
 
     /// Put a file reference into one pane's `claude` prompt.
     ///
-    /// Addressed to a single pane, unlike `selection_changed`. A mention is something the
-    /// user aimed at a conversation — it lands in that prompt as text they are about to send
-    /// — so broadcasting it would type into every Claude in the project at once.
+    /// Addressed to a single pane. A mention is something the user aimed at a conversation —
+    /// it lands in that prompt as text they are about to send — so broadcasting it would type
+    /// into every Claude in the project at once.
     ///
     /// `None` when the project has no server; otherwise whether the notification actually
     /// went onto a socket. See [`cide_ide_mcp::Delivery`] — an `@`-mention that reaches

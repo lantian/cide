@@ -39,6 +39,10 @@ try {
       'node_modules/typescript/bin/tsc',
       'src/terminal/logLink.ts',
       'src/terminal/runLinks.ts',
+      'src/chrome/logDetailModel.ts',
+      // Two source directories: without a stated root, tsc picks their common ancestor and
+      // the emitted paths below move with whichever file is added next.
+      '--rootDir', 'src',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -47,7 +51,7 @@ try {
     ],
     { cwd: UI, stdio: 'inherit' },
   )
-  const link = await import(`file://${join(out, 'logLink.js')}`)
+  const link = await import(`file://${join(out, 'terminal', 'logLink.js')}`)
 
   const session = '4a7c2f10-9b3d-4e6a-8f21-0c5d7e9a1b34'
   const uri = link.formatLogLink(session, 42)
@@ -62,7 +66,7 @@ try {
    * the handle token at the very end — `cide_agents::harness::opencode::render_tool`'s shape,
    * read back off the buffer text so a click can resolve it after a replay dropped every OSC 8.
    */
-  const run = await import(`file://${join(out, 'runLinks.js')}`)
+  const run = await import(`file://${join(out, 'terminal', 'runLinks.js')}`)
   const tool = '● bash  cargo test --workspace  1.2s #7'
   eq(
     run.parseRunLine(tool),
@@ -76,6 +80,21 @@ try {
   eq(run.parseRunLine('#7 ● bash  cargo test'), null, 'the token is read off the end only')
   eq(run.parseRunLine('  The task is already in doing. #7'), null, 'prose ending in a hash is not a tool line')
   eq(run.parseRunLine('● bash  echo #7 #x'), null, 'and the token must be digits')
+
+  /*
+   * The thought row (M62). A block of the model's reasoning is one collapsed row whose whole
+   * text lives behind the handle, so the row *must* parse: a `∴` line that this grammar refuses
+   * shows a `#8` nobody can click, and nothing in Rust or in the pane can see that. Its `tool`
+   * is the word `thought`, which is why no second grammar was needed.
+   */
+  const thought = '∴ thought  4.1s #8'
+  eq(
+    run.parseRunLine(thought),
+    { tool: 'thought', handle: 8, toolEnd: 9, tokenStart: thought.length - 2, end: thought.length },
+    'a thought row parses as a run line, prefix and token alike',
+  )
+  eq(run.parseRunLine('∴ thought  #8').handle, 8, 'and with no duration, which is the unknown case')
+  eq(run.parseRunLine('∴ thought'), null, 'no token, no link — a rendering without a ring')
 
   /*
    * The refusals. Each of these is something a child process can put on the screen by writing
@@ -107,6 +126,107 @@ try {
     eq(link.isLogLink(bad), false, `isLogLink refuses ${JSON.stringify(bad)}`)
   }
 
+  /*
+   * The card's reading of a kept line (`chrome/logDetailModel.ts`), and the clock it prints.
+   *
+   * A tool call opened from a run's pane said what ran and how it ended and not *when* — the
+   * meta row had a status and a duration and no date or time at all. The clock has two sources
+   * and the card must pick the right one per harness: opencode records the call's own start,
+   * codex records nothing, and a codex call therefore falls back to the moment the line reached
+   * cide (`LogLineDetail::recordedUnixMs`, stamped by `logring` on arrival). Driven over each
+   * harness's real event shape, because the fields are two wire formats that change without
+   * telling this file.
+   */
+  const model = await import(`file://${join(out, 'chrome', 'logDetailModel.js')}`)
+  const opencodeTool = JSON.stringify({
+    type: 'tool_use',
+    sessionID: 's',
+    part: {
+      type: 'tool',
+      tool: 'bash',
+      state: {
+        status: 'completed',
+        input: { command: 'cargo test --workspace' },
+        output: 'ok',
+        title: 'cargo test --workspace',
+        time: { start: 1_758_204_207_000, end: 1_758_204_208_200 },
+        metadata: { exit: 0 },
+      },
+    },
+  })
+  const opencodeView = model.viewOf(opencodeTool)
+  eq(opencodeView.kind, 'tool', 'an opencode tool_use is the tool view')
+  eq(opencodeView.startedAt, 1_758_204_207_000,
+    'and its clock is the call’s own start, by the harness’s clock — not the line’s arrival, '
+      + 'which is a duration later')
+  eq(opencodeView.duration, '1.2s', 'the duration beside it is the renderer’s shape')
+  eq(opencodeView.command, 'cargo test --workspace', 'one string input is the command')
+
+  const codexCommand = JSON.stringify({
+    type: 'item.completed',
+    item: {
+      id: 'item_1',
+      type: 'command_execution',
+      command: 'cargo build',
+      aggregated_output: '   Compiling x\n',
+      exit_code: 0,
+      status: 'completed',
+    },
+  })
+  const codexView = model.viewOf(codexCommand)
+  eq(codexView.kind, 'tool', 'a codex command_execution is the tool view')
+  eq(codexView.startedAt, null,
+    'codex records no clock on an item, so the view says so and the card prints the line’s '
+      + 'arrival instead — a fabricated start here would be a wrong time drawn confidently')
+  eq(model.viewOf(JSON.stringify({
+    type: 'item.completed',
+    item: { id: 'i', type: 'mcp_tool_call', server: 'cide', tool: 'cide_task_get',
+      status: 'completed', arguments: { id: 't-14' } },
+  })).startedAt, null, 'an MCP call has no clock either')
+  eq(model.viewOf(JSON.stringify({
+    type: 'item.completed',
+    item: { id: 'i', type: 'file_change', status: 'completed', changes: [] },
+  })).startedAt, null, 'nor a file change')
+  eq(model.viewOf(JSON.stringify({ type: 'text', part: { type: 'text', text: 'hi' } })),
+    { kind: 'text', text: 'hi' }, 'the model’s own words are the text view')
+
+  /*
+   * Thinking is its own view on both roads, and the text arrives whole. Since M62 the run's pane
+   * draws none of the reasoning — only `∴ thought  4.1s #8` — so this card is the only copy, and
+   * a `clip` or a one-line collapse leaking in here would be invisible until somebody opened
+   * one. The newlines are part of the claim.
+   */
+  const thinking = '**Planning**\n\nRead the task first, then the build.'
+  eq(model.viewOf(JSON.stringify({ type: 'reasoning', part: { type: 'reasoning', text: thinking } })),
+    { kind: 'reasoning', text: thinking },
+    'an opencode reasoning part is the reasoning view, unclipped and with its newlines')
+  eq(model.viewOf(JSON.stringify({
+    type: 'item.completed',
+    item: { id: 'item_0', type: 'reasoning', text: thinking },
+  })), { kind: 'reasoning', text: thinking }, 'and so is a codex reasoning item')
+  eq(model.viewOf('{"level":"info","msg":"tick"}'), null,
+    'a structured log line is neither, and stays the JSON view')
+  eq(model.viewOf('not json'), null, 'and so does a line that is not JSON')
+
+  // The stamp: a date and a 24-hour clock, local time, always nineteen characters. The
+  // instant is built from local components so the assertion holds in every time zone the
+  // check runs in; the afternoon hour is what pins the 24-hour form, because `02:03:27` under
+  // a 12-hour clock is a different, wrong, and plausible-looking answer.
+  const afternoon = new Date(2026, 8, 18, 14, 3, 27).getTime()
+  eq(model.stamp(afternoon), '2026-09-18 14:03:27', 'a date and a 24-hour clock, zero-padded')
+  eq(model.stamp(new Date(2026, 0, 5, 0, 0, 0).getTime()), '2026-01-05 00:00:00',
+    'midnight is 00, not 12, and single digits are padded')
+  eq(model.stamp(Number.NaN).length, 19, 'a broken value is a placeholder of the same width')
+  ok(!model.stamp(Number.NaN).includes('NaN'), 'and never spells NaN')
+
+  const card = readFileSync(join(UI, 'src', 'chrome', 'LogDetailCard.tsx'), 'utf8')
+  ok(/at=\{view\.startedAt \?\? recordedAt\}/.test(card),
+    'the tool view draws the harness’s start where there is one and the line’s arrival where '
+      + 'there is not — both, in that order, or a codex call has no clock at all again')
+  ok(/Number\(pending\.detail\.recordedUnixMs\)/.test(card),
+    'and the arrival is converted from the wire’s bigint before any arithmetic can throw '
+      + 'inside the render')
+
   // --- the cross-language and cross-module wiring -------------------------------------------
 
   const rust = readFileSync(resolve(UI, '..', 'crates', 'cide-app', 'src', 'lifecycle.rs'), 'utf8')
@@ -116,6 +236,29 @@ try {
       + 'rename on either side is a link that silently stops opening anything')
   ok(/format!\("\{LOG_LINK_SCHEME\}:\{session\}:\{handle\}"\)/.test(rust),
     'and Rust assembles it in the order the parser reads it')
+
+  /*
+   * The thought row is two literals in two languages with no compiler between them, which is
+   * how a click quietly stops doing anything. So the row Rust builds is read out of its source
+   * and driven through the parser above — `LOG_LINK_SCHEME`'s rule, one row over.
+   */
+  // Comments stripped first, and in this file that is mandatory rather than tidy: the house
+  // style is to name the failure a rule prevents, so `render.rs`'s own prose spells the row, the
+  // tail and the budget that went away — every assertion below would pass by matching the
+  // documentation of the thing it is checking for.
+  const stripRust = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+  const render = stripRust(readFileSync(
+    resolve(UI, '..', 'crates', 'cide-agents', 'src', 'harness', 'render.rs'), 'utf8'))
+  const row = /format!\("\{DIM\}(.+?)\{RESET\}\{\}", tail\(ms, handle\)\)/.exec(render)?.[1] ?? null
+  ok(row !== null, 'render.rs still builds the thought row from one format string')
+  ok(run.parseRunLine(`${row}  4.1s #8`) !== null && run.parseRunLine(`${row}  #8`) !== null,
+    `the row Rust spells (${row}) is a row this parser reads, with and without a duration`)
+  ok(/pub\(super\) fn tail\(ms: Option<u64>, handle: Option<u64>\)/.test(render),
+    'and one function spells the `#handle` tail for both harnesses, so a tool line and a '
+      + 'thought row cannot drift out of that grammar separately')
+  ok(!/REASONING_BUDGET/.test(render),
+    'the clipped reasoning line is gone — the collapse is the feature, and a budget here would '
+      + 'mean the prose came back')
 
   const jsonlog = readFileSync(resolve(UI, '..', 'crates', 'cide-core', 'src', 'jsonlog.rs'), 'utf8')
   ok(/fn osc8\(uri: &str\)/.test(jsonlog) && jsonlog.includes('OSC8_END'),
@@ -145,7 +288,7 @@ try {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)
   }
-  console.log(`json-log: ok (scheme ${link.LOG_LINK_SCHEME}, parser + wiring)`)
+  console.log(`json-log: ok (scheme ${link.LOG_LINK_SCHEME}, parser + card model + wiring)`)
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

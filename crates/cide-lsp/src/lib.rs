@@ -54,6 +54,7 @@ pub mod codec;
 pub mod config;
 pub mod convert;
 pub mod discover;
+pub mod docs;
 pub mod server;
 pub mod session;
 

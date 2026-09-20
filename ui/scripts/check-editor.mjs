@@ -176,6 +176,10 @@ try {
       // needs an `EditorState`, and a fold that starts one line off is invisible in a screenshot
       // and obvious in an assertion.
       'src/editor/foldRanges.ts',
+      // M59, section 22: what Tab inserts, decided from the buffer's own text. Import-free for
+      // the reason above it — a wrong answer here throws nothing, looks right on screen, and is
+      // reported by the user's compiler (Godot refuses a file that mixes tabs and spaces).
+      'src/editor/indentDetect.ts',
       // M17, section 12: the editor's key bindings, as data. Not import-free — it imports the
       // two CodeMirror packages whose commands it names — but deliberately import-*light*, and
       // that is the point: `find.ts` and `EditorSurface.tsx` cannot be required (a CSS module
@@ -268,6 +272,7 @@ try {
   const { claudeSessions } = load('claudeSessions.js')
   const readout = load('statusReadout.js')
   const folds = load('foldRanges.js')
+  const indentDetect = load('indentDetect.js')
   const { foldSpecFor, foldSpecs, DEFAULT_FOLD_SPEC } = load('languages.js')
   const { StringStream } = require('@codemirror/language')
   const { Text } = require('@codemirror/state')
@@ -2399,6 +2404,42 @@ try {
       !/does not (yet )?resolve|Needs a language server|No language server yet/.test(gotoItem),
       'no leftover "there is no language server" excuse on the item: a client that sends ' +
         '`textDocument/definition` makes every wording of that sentence false',
+    )
+    /*
+     * Quick documentation (M60), the same three claims for the same reason: the item was added
+     * beside Go to definition and inherits its whole failure mode — a row that draws, is
+     * enabled, and calls nothing.
+     */
+    const docsItem = itemBlock(menuCode, 'quickDocumentation')
+    ok(docsItem.length > 0, 'the Quick documentation item exists')
+    ok(
+      /run:/.test(docsItem) && /showDocumentation\(/.test(docsItem),
+      'the Quick documentation item carries a `run` that calls the helper',
+    )
+    ok(
+      /command: 'navigate\.documentation'/.test(docsItem),
+      'and names its command, so its key chip comes from the live keymap rather than a literal',
+    )
+    ok(
+      /showDocumentation\(/.test(strip(readFileSync('src/keys/dispatch.ts', 'utf8'))),
+      'F1 reaches the same helper — a command id with no dispatch case is listed in the palette ' +
+        'and inert',
+    )
+    ok(
+      /case 'notFound':[\s\S]{0,900}showDocumentation\(/.test(
+        strip(readFileSync('src/editor/goToDefinition.ts', 'utf8')),
+      ),
+      'and Go to definition falls back to it when the server answers "no file" — the case that ' +
+        'produced the feature: Godot\'s built-ins, a JDK class, anything a server can describe ' +
+        'and nobody can open',
+    )
+    ok(
+      /answer\.kind === 'notFound'[\s\S]{0,600}showDocumentation\(/.test(
+        strip(readFileSync('src/editor/codeIntel.ts', 'utf8')),
+      ),
+      "and so does Ctrl+click, which inlines its own jump and its own not-found branch rather " +
+        'than calling goToDefinition — the first thing tried from the chair was a click on ' +
+        '`Dictionary`, and it said the old sentence',
     )
     ok(
       /goToDefinition\(/.test(strip(readFileSync('src/keys/dispatch.ts', 'utf8'))),
@@ -5301,12 +5342,40 @@ try {
       /useEffect\(\(\) => \(\) => sendPosition\(\), \[sendPosition\]\)/.test(paneSrc),
       'the unmount FLUSHES the pending note rather than cancelling it — tab close, project ' +
         'switch and detach all arrive as an unmount, and every one of them is a moment the user ' +
-        'expects to come back to. The selection cleanup beside it cancels, and that asymmetry ' +
-        'is the whole point',
+        'expects to come back to',
+    )
+    /*
+     * And no sibling reports the selection. One did: an 80 ms debounce over the surface's
+     * selection listener, broadcast by Rust to every claude in the project, and the CLI puts a
+     * received selection into its prompt and sends the text with the next message — so
+     * reading a file typed it into every conversation at once. The deliberate gesture is
+     * useSendToClaude, which reads the selection from the view when a menu row is chosen and
+     * addresses one pane. Sources are comment-stripped first: every file below names the old
+     * command in prose, which is exactly the match this project has shipped three times.
+     */
+    const surfaceCode = stripJs(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    const clientCode = stripJs(readFileSync('src/ipc/client.ts', 'utf8'))
+    const rustFile = stripJs(readFileSync('../crates/cide-app/src/cmd/file.rs', 'utf8'))
+    const rustServer = stripJs(readFileSync('../crates/cide-ide-mcp/src/server.rs', 'utf8'))
+    ok(
+      !/selectionChanged|selectionTimer|onSelection=/.test(paneSrc),
+      'EditorPane reports no selection to Claude: a caret move is not a message to anybody, ' +
+        'and the CLI treats a received selection as one',
     )
     ok(
-      /clearTimeout\(selectionTimer\.current\)/.test(paneSrc),
-      'while the selection report still cancels: it describes a caret that is no longer on screen',
+      !/onSelection|selectionCb/.test(surfaceCode),
+      'and the surface offers no per-keystroke selection stream for a pane to wire back up',
+    )
+    ok(
+      !/claude_selection_changed/.test(clientCode) && !/claude_selection_changed/.test(rustFile),
+      'the command is gone on both sides of the wire, not gated: there is no reading of ' +
+        '"the user looked at a file" that makes it a message',
+    )
+    ok(
+      !/selection_changed_all|all_senders/.test(rustServer) &&
+        /pub fn selection_changed\(&self, pane: &str/.test(rustServer),
+      'and the IDE server has only the ADDRESSED selection — the one Send lines to Claude ' +
+        'sends to the same pane as its mention',
     )
 
     /* Write amplification: the note must not travel the workspace-mutation path. */
@@ -6180,10 +6249,11 @@ try {
 
     // And the setting is read, not merely offered.
     ok(/settings\.editor\.autosave/.test(pane),
-      'THE TOGGLE IS READ. Four toggles and a number in this very settings section persist, '
-      + 'survive a relaunch and change nothing — `tabSize`, `insertSpaces`, `showMinimap`, '
-      + '`wordWrap` and `trimTrailingWhitespaceOnSave` all have no reader, and no gate in this '
-      + 'repository can see that. This one ships with an assertion that it is wired')
+      'THE TOGGLE IS READ. Three toggles in this very settings section persist, survive a '
+      + 'relaunch and change nothing — `showMinimap`, `wordWrap` and '
+      + '`trimTrailingWhitespaceOnSave` have no reader, and no gate in this repository can see '
+      + 'that. `tabSize` and `insertSpaces` were on that list from M15 to M59; section 22 pins '
+      + 'their readers now. This one ships with an assertion that it is wired')
     ok(/checked=\{editor\.autosave\}/.test(sections) && /autosave: v/.test(sections),
       'and it is offered in Settings ▸ Editor, in both directions')
   }
@@ -7343,6 +7413,189 @@ try {
           'with nothing collapsed is the common case rather than the edge one',
       )
     }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 22. What Tab inserts — the buffer's own indentation first, the settings after (M59)
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * `settings.editor.tabSize` and `insertSpaces` were offered from M15 and read by nothing
+   * until M59 — the finding section 14 above pins by exception. They are read now, through
+   * `indentDetect.ts`, and the buffer's own text outranks them: a tab-indented file gets a tab
+   * from Tab whatever the settings say, because the alternative is a file Godot refuses to run
+   * and `gofmt` rewrites. Every answer below is silent when wrong — nothing throws, the buffer
+   * looks right, the compiler complains — which is why the detector is import-free and driven
+   * here rather than trusted.
+   */
+  {
+    const { detectIndent, indentUnitFor, indentPolicy, clampTabSize, DETECT_LINE_LIMIT } =
+      indentDetect
+
+    /* ------------------------------------------------------------------- the detector */
+
+    const gd = [
+      'extends Node2D',
+      '',
+      'func _ready():',
+      '\tvar x = 1',
+      '\tif x:',
+      '\t\tprint(x)',
+      '',
+      '\tpass',
+    ].join('\n')
+    eq(detectIndent(gd), { kind: 'tab' }, 'a tab-indented GDScript file is a tab file')
+    const yaml = ['a:', '  b:', '    c: 1', '  d: 2', 'e: 3'].join('\n')
+    eq(
+      detectIndent(yaml),
+      { kind: 'spaces', width: 2 },
+      'two-space YAML is two spaces — the *step* between lines, never the deepest indent seen',
+    )
+    const py = ['def f():', '    x = (', '        1,', '    )', '', '    return x'].join('\n')
+    eq(
+      detectIndent(py),
+      { kind: 'spaces', width: 4 },
+      'four-space Python is four, and the blank line inside the function does not make ' +
+        '`return` look like a jump from column zero',
+    )
+    eq(detectIndent('a\nb\nc\n'), null, 'a file with nothing indented has nothing to say')
+    eq(detectIndent(''), null, 'nor does an empty one')
+    eq(
+      detectIndent('\t\n   \n\t \r\n'),
+      null,
+      'blank lines never vote, whatever whitespace they are made of',
+    )
+    eq(
+      detectIndent(['x', '\ta', '\tb', '  c'].join('\n')),
+      { kind: 'tab' },
+      'a mixed file goes to the majority',
+    )
+    eq(
+      detectIndent(['x', '\ta', '  c'].join('\n')),
+      null,
+      "and a tie is nobody's — the settings decide",
+    )
+    eq(
+      detectIndent('a:\r\n  b: 1\r\n    c: 2\r\n'),
+      { kind: 'spaces', width: 2 },
+      'CRLF lines measure the same as LF ones',
+    )
+    eq(
+      detectIndent(['f(', '            aligned,', ')'].join('\n')),
+      { kind: 'spaces', width: null },
+      'a single twelve-space alignment is a space-indented file with no readable width — ' +
+        'past the step cap, alignment is not indentation',
+    )
+    eq(
+      detectIndent(['a', '  b', 'a', '    c'].join('\n')),
+      { kind: 'spaces', width: 2 },
+      'steps of 2 and 4 seen once each: the smaller wins, because a file whose steps are as ' +
+        'often 2 as 4 is a two-space file with some double indents in it',
+    )
+    eq(
+      detectIndent(['a', '    b', '        c', '    d', '        e', '    f'].join('\n')),
+      { kind: 'spaces', width: 4 },
+      'and the most frequent step wins over a smaller one seen less often',
+    )
+    const late = 'a\n'.repeat(DETECT_LINE_LIMIT) + '\tb\n'
+    eq(
+      detectIndent(late),
+      null,
+      'past the line limit nothing is read — the walk is bounded for the ten-megabyte log ' +
+        'opened by accident',
+    )
+    eq(detectIndent(late, DETECT_LINE_LIMIT + 1), { kind: 'tab' }, 'and the limit is the only reason')
+
+    /* ------------------------------------------------------------- the unit, resolved */
+
+    eq(
+      indentUnitFor({ kind: 'tab' }, { tabSize: 4, insertSpaces: true }),
+      '\t',
+      'a detected tab outranks Insert spaces',
+    )
+    eq(
+      indentUnitFor({ kind: 'spaces', width: 2 }, { tabSize: 4, insertSpaces: false }),
+      '  ',
+      'a detected width outranks both settings',
+    )
+    eq(
+      indentUnitFor({ kind: 'spaces', width: null }, { tabSize: 3, insertSpaces: false }),
+      '   ',
+      'a space file with no readable width takes the tab size as its width — that it is a ' +
+        'space file is the part that was read',
+    )
+    eq(indentUnitFor(null, { tabSize: 4, insertSpaces: true }), '    ', 'nothing detected: the settings, spaces')
+    eq(indentUnitFor(null, { tabSize: 4, insertSpaces: false }), '\t', 'nothing detected: the settings, a tab')
+    eq(clampTabSize(0), 1, 'a tab width of zero is a division by zero in a layout and is clamped')
+    eq(clampTabSize(99), 16, 'and the top of the band is the Settings control\'s')
+    eq(clampTabSize(Number.NaN), 4, 'a nonsensical width is the default')
+    eq(clampTabSize(2.6), 3, 'a fractional one is rounded')
+    eq(
+      indentPolicy(gd, { tabSize: 4, insertSpaces: true }, false),
+      { unit: '    ', tabSize: 4 },
+      'detection off: the settings alone, even over a tab file',
+    )
+    eq(
+      indentPolicy(gd, { tabSize: 8, insertSpaces: true }, true),
+      { unit: '\t', tabSize: 8 },
+      "detection on: the buffer's unit, the settings' tab width — the width is about the " +
+        "user's eyes, not about the file",
+    )
+
+    /* ---------------------------------------------- Tab, against a real EditorState */
+
+    {
+      const { EditorState } = require('@codemirror/state')
+      const { indentUnit } = require('@codemirror/language')
+      const { indentWithTab } = require('@codemirror/commands')
+      const press = (text, unit) => {
+        const state = EditorState.create({
+          doc: text,
+          extensions: [indentUnit.of(unit), EditorState.tabSize.of(4)],
+          selection: { anchor: 0 },
+        })
+        const v = { state, dispatch: (spec) => { v.state = v.state.update(spec).state } }
+        ok(indentWithTab.run(v), 'indentWithTab acts on the stand-in view')
+        return v.state.doc.toString()
+      }
+      eq(press('x', '\t'), '\tx', 'with a tab unit, Tab puts a tab in front of the line')
+      eq(press('x', '  '), '  x', 'and with a two-space unit, two spaces — the unit is the whole mechanism')
+    }
+
+    /* ---------------------------------------------------------------- wired, both ends */
+
+    const bare = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+    const surface22 = bare(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    const pane22 = bare(readFileSync('src/panes/EditorPane.tsx', 'utf8'))
+    const sections22 = bare(readFileSync('src/settings/sections.tsx', 'utf8'))
+    ok(
+      !/indentUnit\.of\('    '\)/.test(surface22) && !/tabSize\.of\(4\)/.test(surface22),
+      'THE FOUR-SPACE LITERAL IS GONE from EditorSurface — it was what made every buffer a ' +
+        'space-indented one and both settings dead from M3 to M59',
+    )
+    ok(
+      /indentSlot\.of\(indentExtensions\(source, indentRef\.current\)\)/.test(surface22),
+      'the indent compartment is seeded from the buffer text at build time, before any effect ' +
+        'can run — the first Tab can land before one does',
+    )
+    ok(/indentPolicy\(/.test(surface22), 'and the answer comes from the detector, not a second table')
+    ok(
+      /slot\.reconfigure\(indentExtensions\(view\.state\.doc\.toString\(\)/.test(surface22),
+      'a settings change re-decides from the live document rather than the `doc` prop',
+    )
+    for (const key of ['tabSize', 'insertSpaces', 'detectIndentation']) {
+      ok(
+        new RegExp(`settings\\.editor\\.${key}`).test(pane22),
+        `settings.editor.${key} IS READ — by EditorPane, the one surface with a document a ` +
+          'language server has been told about, and handed down as a prop (the rule every ' +
+          'other editor setting follows)',
+      )
+    }
+    ok(/indent=\{indent\}/.test(pane22), 'and reaches the surface')
+    ok(
+      /checked=\{editor\.detectIndentation\}/.test(sections22) && /detectIndentation: v/.test(sections22),
+      'the detection toggle is offered in Settings ▸ Editor, in both directions',
+    )
   }
 
   if (failed > 0) {

@@ -517,8 +517,9 @@ try {
     [...protocol.CAPABILITIES].filter((cap) => model.isStrongCapability(cap)),
     ['process:spawn'],
     'and exactly one is toned apart. Every other capability is a read of something already on '
-      + 'screen or already in the repository; this one means the manifest names a binary and cide '
-      + "runs it against the user's project",
+      + 'screen or already in the repository, or a connection to a loopback port the user\'s own '
+      + 'software opened; this one means the manifest names a binary and cide runs it against '
+      + "the user's project",
   )
   ok(
     model.consentLine(['fs:read', 'process:spawn']).includes(' and '),

@@ -419,6 +419,8 @@ function overflowLabel(tab: Tab): string {
       return tab.kind.spec.title
     case 'settings':
       return 'Settings'
+    case 'docs':
+      return tab.kind.title
     default:
       // A `TabKind` variant added later. A line that says *something* beats a hole in the list;
       // `TabStrip.viewFor` is where the compiler is made to care about the new variant.

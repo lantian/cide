@@ -51,6 +51,7 @@ fn an_npm_installed_server_is_found_and_reaches_ready() {
         declares_watched_files: false,
         extra_path_hints: vec![],
         init_options: None,
+        connect: None,
     });
     let handles = cide_lsp::discover::install(wanted);
     let server = handles[2];
@@ -68,10 +69,10 @@ fn an_npm_installed_server_is_found_and_reaches_ready() {
     // The whole road: `locate`'s ladder (PATH, then the hint rung with the Node directories),
     // the candidate's `child_path_dirs` reaching the spawn, the handshake, Ready.
     let found = cide_lsp::discover::find(server, std::slice::from_ref(&dir));
-    let cide_lsp::discover::Found::Ready(path) = found else {
+    let cide_lsp::discover::Found::Ready(target) = found else {
         panic!("typescript-language-server was not found: {found:?} — is it installed?");
     };
-    eprintln!("resolved to {}", path.display());
+    eprintln!("resolved to {target}");
 
     let handle = LspHandle::start(server, vec![dir.clone()]).expect("start");
     let deadline = Instant::now() + Duration::from_secs(60);

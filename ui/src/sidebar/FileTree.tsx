@@ -65,6 +65,8 @@ import { copyText } from './copyText'
 import { creationRefusal, isRootPath, mutationRefusal, relativeTo, rootOf } from './rowPaths'
 import { groupIcon, groupIdOf, isSyntheticPath, rowVerbs } from './groupRows'
 import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
+import { SCRATCH_TYPES } from '@/editor/languages'
+import { DEFAULT_DRAWING_SUFFIX } from '@/panes/excalidrawKinds'
 import { pasteEntries, planEntries, useFileClipboard } from './fileClipboard'
 import {
   clipboardText,
@@ -395,6 +397,20 @@ export function FileTree({
    * *after* pressing Enter is the thing this whole module is trying not to be.
    */
   const [draftName, setDraftName] = useState('')
+  /**
+   * What [`startDraft`] put in the box, which the user has not typed. (M64)
+   *
+   * `''` for *New File…* and *New Folder…*, and `'.rs'` for *New ▸ Rust* — the extension,
+   * with the caret placed in front of it so the stem is what gets typed.
+   *
+   * It exists because "the user has not named this yet" could be spelled `draftName === ''`
+   * only while the box always opened empty. Two readers need the distinction and neither can
+   * derive it: `draftMessage` shows the *destination* until the name is the user's, and
+   * `checkName` refuses to create a file called `.rs`. Held here rather than in the store
+   * because the store's `draft` is the row's *placement* and this is the box's contents, which
+   * is already this component's (see `draftName` above).
+   */
+  const [draftSeed, setDraftSeed] = useState('')
   /**
    * Whether Enter has already been pressed on this draft and refused.
    *
@@ -1496,8 +1512,13 @@ export function FileTree({
    * itself, no row means the project's first root — and everything about placing the editor
    * (expanding the folder, finding the anchor row, scrolling to it) is `beginDraft`'s.
    */
-  const startDraft = useCallback((target: NewEntryTarget, directory: boolean) => {
-    setDraftName('')
+  const startDraft = useCallback((target: NewEntryTarget, directory: boolean, seed = '') => {
+    // Both, unconditionally, and never `if (seed !== undefined)`: a project switch clears the
+    // store's `draft` without coming through `cancelDraft` (`treeStore.ts`'s `attach`), so the
+    // only thing standing between a seed and the *next* gesture is that opening a draft always
+    // rewrites it. `''` is what *New File…* passes and what the plain case has always meant.
+    setDraftName(seed)
+    setDraftSeed(seed)
     setDraftTried(false)
     // A create still in flight belongs to the draft being replaced, not to this one.
     creating.current = false
@@ -1529,7 +1550,11 @@ export function FileTree({
     (raw: string) => {
       const current = useFileTree.getState().draft
       if (current === null) return
-      const name = nameToSend(raw, current.siblings, current.directory)
+      // `draftSeed` is handed over so that Enter on a box still holding nothing but `.rs`
+      // refuses through the *same* road as Enter on an empty box, rather than through a branch
+      // of its own here. `checkName` owns the rule and `check:new-entry` drives it; without it
+      // a leading dot is only a note, and this would cheerfully create a hidden file `.rs`.
+      const name = nameToSend(raw, current.siblings, current.directory, draftSeed)
       // Refused locally. The note strip is driven by the same `checkName` over the same text,
       // so for every *typed* name it is already showing the reason — but the EMPTY box shows
       // its destination instead, on purpose, and without this flag Enter on an empty box did
@@ -1569,12 +1594,17 @@ export function FileTree({
           fail(what)(error)
         })
     },
-    [fail],
+    // `draftSeed` belongs here: without it the closure keeps the seed of the *first* draft this
+    // panel ever opened, and a second *New ▸ Go* would compare `.go` against `.rs` and create
+    // the very file the seed rule exists to refuse. There is no `react-hooks/exhaustive-deps`
+    // in this project to catch that.
+    [fail, draftSeed],
   )
 
   const cancelDraft = useCallback(() => {
     useFileTree.getState().cancelDraft()
     setDraftName('')
+    setDraftSeed('')
     setDraftTried(false)
   }, [])
 
@@ -1590,6 +1620,13 @@ export function FileTree({
    * silence: `checkName` refuses the empty name, `commitDraft` declines to close the box, and
    * the strip goes on cheerfully naming a destination — a keypress that does nothing and says
    * nothing. `draftTried` is set by that refusal and shows the real verdict from then on.
+   *
+   * And since M64 "untouched" also has to stop meaning "empty". A box opened by *New ▸ Rust*
+   * holds `.rs`, which `checkName` has plenty to say about — *"a dot-file may be hidden by
+   * this project's ignore rules"* — all of it about a name the user has not written. So the
+   * comparison is against `draftSeed`, and the empty case keeps its own `.trim()` spelling
+   * rather than being folded in: `''` is not a trimmed string, and a box holding only whitespace
+   * has been politely showing its destination since the draft row existed.
    */
   const draftMessage: { text: string; bad: boolean } = (() => {
     if (draft === null) return { text: '', bad: false }
@@ -1597,8 +1634,9 @@ export function FileTree({
       ? basenameOf(draft.parent)
       : relativeTo(draft.parent, roots)
     const destination = `New ${draft.directory ? 'folder' : 'file'} in ${where}`
-    if (draftName.trim() === '' && !draftTried) return { text: destination, bad: false }
-    const verdict = checkName(draftName, draft.siblings, draft.directory)
+    const untouched = draftSeed === '' ? draftName.trim() === '' : draftName.trim() === draftSeed
+    if (untouched && !draftTried) return { text: destination, bad: false }
+    const verdict = checkName(draftName, draft.siblings, draft.directory, draftSeed)
     if (verdict.error !== null) return { text: verdict.error, bad: true }
     if (verdict.note !== null) return { text: verdict.note, bad: false }
     return { text: destination, bad: false }
@@ -1725,6 +1763,62 @@ export function FileTree({
         target_ === null
           ? []
           : [
+              /*
+               * *New ▸* — one row per file type this installation supports. (M64)
+               *
+               * First, above *New File…*, because it is the more specific gesture: a person who
+               * knows they want a Rust file never has to spell `.rs`, and the one who does not
+               * still has the plain row directly under it. Picking a type **creates nothing** —
+               * it opens the same draft box with the extension already in it and the caret in
+               * front — so Escape costs exactly what it costs today.
+               *
+               * The rows are `SCRATCH_TYPES`, which is the *New scratch file…* picker's list and
+               * is not a second copy of anything: it is an exported `let` rebuilt by
+               * `registerLanguages` from the bootstrap's merged language table, so an
+               * extension's languages appear here without this panel knowing extensions exist.
+               * A literal array instead is how a type gets offered that the editor cannot
+               * highlight — `check:scratch` forbids exactly that for the picker and now for
+               * this.
+               *
+               * Built when the submenu **opens**, which is what `MenuItem.submenu`'s thunk is
+               * for, and which is what makes an extension installed since the right-click show
+               * up. `target_` is captured instead, exactly as *Compose ▸* below captures
+               * `row.path`: an eviction between the right-click and the click must not redirect
+               * the gesture to another folder.
+               *
+               * The rows carry the **label alone**. The extension is a menu column this widget
+               * does not have, and it is about to be visible in the box anyway — which is the
+               * better place for it, and the opposite of `ScratchType.tsx`'s reasoning only
+               * because that picker has no box to show. The list can never be empty (`languages.ts`
+               * appends `Plain Text` unconditionally, and registers the builtins at module
+               * load), so there is no disabled state to write: an empty thunk would be a parent
+               * row that does nothing on hover and explains nothing, which is the dead control
+               * this panel keeps paying for.
+               *
+               * *Drawing* is last, after a rule, because it is the one row that is not a
+               * language — nothing in `cide_ipc::lang` knows `excalidraw` — and because
+               * `.dockerfile` above it is already a mild oddity worth keeping away from it: that
+               * is a real extension of the Dockerfile language, so it highlights, even though a
+               * Dockerfile is normally matched by *filename*. Both are what the scratch picker
+               * has always produced.
+               */
+              {
+                id: 'newOfType',
+                label: 'New',
+                submenu: () => [
+                  ...SCRATCH_TYPES.map((type) => ({
+                    id: `new-type-${type.ext}`,
+                    label: type.label,
+                    run: () => startDraft(target_, false, `.${type.ext}`),
+                  })),
+                  { kind: 'separator' as const },
+                  {
+                    id: 'new-type-drawing',
+                    label: 'Drawing',
+                    run: () => startDraft(target_, false, DEFAULT_DRAWING_SUFFIX),
+                  },
+                ],
+              },
               {
                 id: 'newFile',
                 label: named ? `New File in ${target_.label}…` : 'New File…',
@@ -2588,6 +2682,18 @@ function DraftRow({
           if (el === null || focused.current) return
           focused.current = true
           el.focus()
+          /*
+           * In front of the seed, never after it. (M64)
+           *
+           * A box opened by *New ▸ Rust* holds `.rs` and the stem is what the user is about to
+           * type; leaving the caret where `focus()` puts it spells `.rsparser`. Stated rather
+           * than left to the engine, which is the same reason the rename input one component
+           * down states its own selection — and that one is the mirror image of this, keeping
+           * the extension *out* of the selection so a rename does not re-type it.
+           *
+           * A no-op for the empty box *New File…* opens, so there is one rule here and not two.
+           */
+          el.setSelectionRange(0, 0)
         }}
         onChange={(e) => onChange(e.target.value)}
         onMouseDown={(e) => e.stopPropagation()}

@@ -129,6 +129,19 @@ pub enum Capability {
     /// there will not be one until something needs it badly enough to argue for it here.
     #[serde(rename = "git:read")]
     GitRead,
+    /// Connect to a language server already running on this machine — a `languageServers`
+    /// contribution with a `connect` endpoint, which starts nothing. (M59)
+    ///
+    /// Not [`Self::ProcessSpawn`], and the words are the reason: the install sheet says *run
+    /// programs on your machine* for that one, and an extension that attaches to the user's own
+    /// Godot editor runs no program. The manifest may name only a loopback address
+    /// (`cide_ipc::lang::LanguageServerDef::connect`), so what is granted is a connection to a
+    /// port the user's own software opened, carrying the documents they have open.
+    ///
+    /// Declared before `ProcessSpawn` on purpose: this enum derives `Ord` in declaration order
+    /// and the manifest sorts by it, so the widest blast radius has to stay last.
+    #[serde(rename = "lsp:connect")]
+    LspConnect,
     /// Run a process. What a `languageServers` contribution needs, and the one capability whose
     /// grant is a real trust decision — the manifest names a binary and cide runs it against the
     /// user's project.
@@ -143,6 +156,7 @@ impl Capability {
         Capability::FsRead,
         Capability::GitRead,
         Capability::EditorWrite,
+        Capability::LspConnect,
         Capability::ProcessSpawn,
     ];
 
@@ -154,6 +168,7 @@ impl Capability {
             Self::EditorWrite => "editor:write",
             Self::FsRead => "fs:read",
             Self::GitRead => "git:read",
+            Self::LspConnect => "lsp:connect",
             Self::ProcessSpawn => "process:spawn",
         }
     }
@@ -166,6 +181,7 @@ impl Capability {
             Self::EditorWrite => "add highlighting, problems and an outline to files you have open",
             Self::FsRead => "read files in your project",
             Self::GitRead => "read your git status and history",
+            Self::LspConnect => "connect to a language server already running on your machine",
             Self::ProcessSpawn => "run programs on your machine",
         }
     }

@@ -31,6 +31,7 @@ import { SerializeAddon } from '@xterm/addon-serialize'
 import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
 import { attachPathLinks } from '@/terminal/pathLinks'
 import { attachRunLinks } from '@/terminal/runLinkProvider'
+import { attachTaskLinks } from '@/terminal/taskLinkProvider'
 import type { TerminalPaneKind } from '@/terminal/keys'
 import {
   STALL_MS,
@@ -452,6 +453,21 @@ export function openTerminal(paneId: string, kind: TerminalPaneKind): TerminalHa
       session: () => getHost(paneId).sessionId ?? null,
     }),
   )
+
+  /*
+   * Task codes, third and last — and the order is the feature, not the tidying. (M60)
+   *
+   * xterm keeps the *earlier* provider's link wherever two overlap, so a project that really
+   * contains a file named `t-503` keeps its path link, and a code inside a tool line's title
+   * survives because the run provider above claims only the glyph and the `#7`. Nothing but
+   * `check:task-links` pins this order, and the symptom of getting it wrong is a link that
+   * works everywhere except the one line somebody complains about.
+   *
+   * What the pane's *project* is arrives separately from React through `setTaskLinkEnv`, for
+   * the reason written above the path links: that is a prop, and props change without the host
+   * changing.
+   */
+  host.cleanup.push(attachTaskLinks(handle, { paneId }))
 
   promoteWebgl(handle)
   return handle

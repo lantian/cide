@@ -194,6 +194,7 @@ impl Server {
             install_hint: "reinstall the extension that provided it".into(),
             declares_watched_files: false,
             extra_path_hints: Vec::new(),
+            connect: None,
         })
     }
 
@@ -256,8 +257,10 @@ impl Server {
         self.def().declares_watched_files
     }
 
-    /// How to install it, in the words the user would type.
-    fn install_hint(self) -> String {
+    /// How to install it, in the words the user would type — or, for a connect server, how to
+    /// make it reachable ("open this project in the Godot editor"): the same job, so the same
+    /// field. `server.rs` reads it for the attach sentence, hence `pub(crate)`.
+    pub(crate) fn install_hint(self) -> String {
         self.def().install_hint
     }
 
@@ -281,7 +284,8 @@ impl Server {
 /// Where a server was found, or why it was not.
 #[derive(Debug, Clone)]
 pub enum Found {
-    Ready(PathBuf),
+    /// The first candidate's target: a binary to spawn, or an address to attach to.
+    Ready(Target),
     /// The binary is not installed, or this project has nothing for it to do. Carries the
     /// sentence the panel prints verbatim.
     Missing(String),
@@ -327,23 +331,65 @@ pub enum Provenance {
     /// still, never cide's build, so `config.rs`'s `Bundled | Override` gate leaves it
     /// unconfigured exactly like [`Self::SystemPath`].
     HintDir,
+    /// A server cide did not start, reached over a loopback socket — the Godot editor's. (M59)
+    ///
+    /// Neither cide's build nor the user's installation of a binary: a process something else
+    /// owns. Both gates in `config.rs` (`Bundled | Override`) exclude it by construction, so an
+    /// attached server gets no fork options and no environment, and the pin test there says so.
+    Attached,
+}
+
+/// How one candidate is reached. (M59)
+///
+/// Two shapes because two things are true of a server: it is either a binary cide spawns and
+/// owns for its whole life, or a socket to a program cide neither started nor may stop. Every
+/// rule in `server.rs` that differs between them — the stderr drain, the signal ladder, the
+/// crash budget, whether `exit` is ever sent — matches on this and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A binary to spawn on stdio.
+    Process {
+        path: PathBuf,
+        /// Directories this binary's process must have on its `PATH` beyond what every child
+        /// already gets: empty for Override/Bundled/SystemPath — byte-identical behaviour to
+        /// before the hint rung existed — and, for a [`Provenance::HintDir`] candidate, the
+        /// directory the binary was found in plus the directory `node` lives in when `PATH`
+        /// reaches none. The latter because an npm server is a `#!/usr/bin/env node` script:
+        /// `execve` succeeds and the shebang dies with `env: node: No such file or directory`
+        /// (`child_env::prepare_command_with`'s documented failure). This field is what makes
+        /// the marketplace README's "appended to the child's PATH" sentence about
+        /// `extraPathHints` true.
+        child_path_dirs: Vec<PathBuf>,
+    },
+    /// A server already running, on a loopback address `cide_ipc::lang::TcpEndpoint::
+    /// loopback_addr` accepted. Never spawned, never signalled, never told to `exit`.
+    Tcp { addr: std::net::SocketAddr },
+}
+
+impl Target {
+    /// Whether this is a socket to somebody else's process — the question every rule in
+    /// `server.rs` that differs between the two shapes asks.
+    #[must_use]
+    pub fn is_socket(&self) -> bool {
+        matches!(self, Self::Tcp { .. })
+    }
+}
+
+impl std::fmt::Display for Target {
+    /// What the log and the Problems panel print for a candidate: the path, or the address.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Process { path, .. } => write!(f, "{}", path.display()),
+            Self::Tcp { addr } => write!(f, "{addr}"),
+        }
+    }
 }
 
 /// One way to run a server. [`locate`] returns them best-first.
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    pub path: PathBuf,
+    pub target: Target,
     pub provenance: Provenance,
-    /// Directories this binary's process must have on its `PATH` beyond what every child
-    /// already gets: empty for Override/Bundled/SystemPath — byte-identical behaviour to
-    /// before the hint rung existed — and, for a [`Provenance::HintDir`] candidate, the
-    /// directory the binary was found in plus the directory `node` lives in when `PATH`
-    /// reaches none. The latter because an npm server is a `#!/usr/bin/env node` script:
-    /// `execve` succeeds and the shebang dies with `env: node: No such file or directory`
-    /// (`child_env::prepare_command_with`'s documented failure). This field is what makes the
-    /// marketplace README's "appended to the child's PATH" sentence about `extraPathHints`
-    /// true.
-    pub child_path_dirs: Vec<PathBuf>,
 }
 
 /// Every way this server's binary can be run, best first — or the sentence for why none can.
@@ -368,6 +414,30 @@ pub fn locate(
     choice: cide_ipc::settings::ServerBinaryChoice,
 ) -> Result<Vec<Candidate>, String> {
     let binary = server.binary();
+    if let Some(endpoint) = server.def().connect {
+        // A connect server: no probes, no ladder, no `choice`. Nothing is looked up because
+        // nothing is run, and there is one rung because there is nothing to fall back to.
+        //
+        // The loopback rule is asked here as well as in `cide_ext::manifest`, because a builtin
+        // definition is never validated and the two crates cannot share a verdict — the same
+        // twice-checked discipline the manifest states for `process:spawn`. The marker probe
+        // still gates everything: it is the only thing that scopes the attach retry to the
+        // projects that have this kind of thing in them, and `LanguageServerDef::connect` says
+        // why a connect server may not leave it empty.
+        let addr = endpoint
+            .loopback_addr()
+            .map_err(|reason| format!("{binary} was not connected: {reason}"))?;
+        if !roots.iter().any(|root| has_marker(server, root)) {
+            return Err(format!(
+                "No {} project under this project's roots, so {binary} was not connected.",
+                server.project_kind(),
+            ));
+        }
+        return Ok(vec![Candidate {
+            target: Target::Tcp { addr },
+            provenance: Provenance::Attached,
+        }]);
+    }
     let bundled_row = BUNDLED.iter().find(|(name, _, _)| *name == binary);
     let dirs = hint_dirs(server);
     let probes = Probes {
@@ -467,9 +537,11 @@ fn ladder(
             // Alone, not first: everything below exists to be fallen back to, and the one
             // thing an override must never do is quietly become something else.
             Ok(path) => Ok(vec![Candidate {
-                path,
+                target: Target::Process {
+                    path,
+                    child_path_dirs: Vec::new(),
+                },
                 provenance: Provenance::Override,
-                child_path_dirs: Vec::new(),
             }]),
             Err(value) => Err(Refusal::BrokenOverride(value)),
         };
@@ -479,16 +551,20 @@ fn ladder(
         && let Some(path) = probes.bundled
     {
         candidates.push(Candidate {
-            path,
+            target: Target::Process {
+                path,
+                child_path_dirs: Vec::new(),
+            },
             provenance: Provenance::Bundled,
-            child_path_dirs: Vec::new(),
         });
     }
     if let Some(path) = probes.system {
         candidates.push(Candidate {
-            path,
+            target: Target::Process {
+                path,
+                child_path_dirs: Vec::new(),
+            },
             provenance: Provenance::SystemPath,
-            child_path_dirs: Vec::new(),
         });
     }
     // The hint rung, after PATH: a user-managed PATH install wins over anything a manifest
@@ -509,9 +585,11 @@ fn ladder(
             child_path_dirs.push(node_dir.clone());
         }
         candidates.push(Candidate {
-            path,
+            target: Target::Process {
+                path,
+                child_path_dirs,
+            },
             provenance: Provenance::HintDir,
-            child_path_dirs,
         });
     }
     if candidates.is_empty() {
@@ -531,13 +609,12 @@ pub fn find(server: Server, roots: &[PathBuf]) -> Found {
         roots,
         cide_ipc::settings::ServerBinaryChoice::default(),
     ) {
-        Ok(candidates) => Found::Ready(
-            candidates
-                .into_iter()
-                .next()
-                .map(|candidate| candidate.path)
-                .unwrap_or_default(),
-        ),
+        Ok(candidates) => match candidates.into_iter().next() {
+            Some(candidate) => Found::Ready(candidate.target),
+            // `locate` never answers an empty `Ok`; said in a sentence rather than a panic
+            // because this is the road a throwaway caller takes.
+            None => Found::Missing(format!("{} resolved to nothing", server.binary())),
+        },
         Err(reason) => Found::Missing(reason),
     }
 }
@@ -742,8 +819,41 @@ mod tests {
     fn shape(candidates: &[Candidate]) -> Vec<(Provenance, &str)> {
         candidates
             .iter()
-            .map(|c| (c.provenance, c.path.to_str().unwrap_or_default()))
+            .map(|c| {
+                let where_ = match &c.target {
+                    Target::Process { path, .. } => path.to_str().unwrap_or_default(),
+                    Target::Tcp { .. } => "<tcp>",
+                };
+                (c.provenance, where_)
+            })
             .collect()
+    }
+
+    /// The `PATH` additions a candidate carries — none, for a socket.
+    fn dirs(candidate: &Candidate) -> Vec<PathBuf> {
+        match &candidate.target {
+            Target::Process {
+                child_path_dirs, ..
+            } => child_path_dirs.clone(),
+            Target::Tcp { .. } => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_target_prints_as_a_path_or_an_address() {
+        // Both reach the log's `resolved` line and the ladder's fallback prose, so a socket
+        // candidate must print as something a reader can act on rather than a Debug dump.
+        let process = Target::Process {
+            path: PathBuf::from("/usr/bin/gopls"),
+            child_path_dirs: Vec::new(),
+        };
+        assert_eq!(process.to_string(), "/usr/bin/gopls");
+        assert!(!process.is_socket());
+        let socket = Target::Tcp {
+            addr: "127.0.0.1:6005".parse().expect("addr"),
+        };
+        assert_eq!(socket.to_string(), "127.0.0.1:6005");
+        assert!(socket.is_socket());
     }
 
     #[test]
@@ -888,7 +998,7 @@ mod tests {
              fallback for a PATH build that dies before its handshake"
         );
         assert!(
-            got[0].child_path_dirs.is_empty(),
+            dirs(&got[0]).is_empty(),
             "a PATH binary gets the PATH every child gets — byte-identical to before the rung"
         );
     }
@@ -903,7 +1013,7 @@ mod tests {
         p.node_dir = Some(PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin"));
         let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::Builtin).expect("resolved");
         assert_eq!(
-            got[0].child_path_dirs,
+            dirs(&got[0]),
             vec![
                 PathBuf::from("/home/u/.npm-global/bin"),
                 PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin"),
@@ -918,7 +1028,7 @@ mod tests {
         p.node_dir = Some(PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin"));
         let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::Builtin).expect("resolved");
         assert_eq!(
-            got[0].child_path_dirs,
+            dirs(&got[0]),
             vec![PathBuf::from("/home/u/.nvm/versions/node/v22.0.0/bin")]
         );
     }
@@ -943,7 +1053,7 @@ mod tests {
         p.hints = vec![PathBuf::from("/home/u/.npm-global/bin/ra")];
         let got = ladder(p, cide_ipc::settings::ServerBinaryChoice::Builtin).expect("resolved");
         assert_eq!(shape(&got), vec![(Provenance::Override, "/fork/ra")]);
-        assert!(got[0].child_path_dirs.is_empty());
+        assert!(dirs(&got[0]).is_empty());
     }
 
     #[test]

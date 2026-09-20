@@ -9758,6 +9758,822 @@ argv this road builds is one the CLI accepts. The quota-free `real_opencode` pai
 at a closed port) was run as well and passes.
 
 
+## Reading a file typed it into every conversation
+
+Reported from a chair, in one sentence: selecting text in an open file put a link into the
+input of every Claude session in the project. The context menu that sends a selection to *one*
+named session is the wanted gesture; the automatic one was not.
+
+**What it was.** `EditorPane` had an 80 ms debounce over the surface's selection listener —
+every caret move, every drag, in every open file — that called `claude_selection_changed`, and
+Rust broadcast that to every `claude` connected to the project's IDE server through
+`IdeServer::selection_changed_all`. It was added deliberately, in the commit that gave the
+addressed `selection_changed` its first producer, on an argument written into three doc
+comments: a mention is a message aimed at one conversation, a selection is *a fact about the
+editor*, and when an editor is focused there is no "current" Claude pane to aim at, so tell
+everyone. The `cide-ide-mcp` module doc, written earlier, said the opposite — *"Broadcasting a
+`selection_changed` instead would put the text the user highlighted into the other pane's
+prompt, silently, with nothing on screen to explain it"* — and kept saying it, one screen above
+the method that did exactly that.
+
+**What the CLI does with it is what decides.** A received `selection_changed` is not a status
+line. Claude Code draws `⧉ Selected N lines from <file>` in its prompt and sends the selected
+text as context with the next message. So the "fact about the editor" was typed into four
+conversations at once whenever the user read a file while four agents worked, and moving the
+caret changed what each of them was about to be told, with nothing in the editor to say so.
+There is no reading of "the user looked at a file" that makes it a message to anybody, which is
+why the command is gone rather than gated behind a setting.
+
+**What went.** The command, its `contract/commands.json` line, `claude.selectionChanged` in
+`ipc/client.ts`, `EditorSurface`'s `onSelection` prop and the listener branch that fed it,
+`EditorPane`'s debounce, `IdeServer::selection_changed_all`, `Inner::all_senders`, and the test
+that pinned the broadcast reaching a `claude` no pane owned. That test's premise — a `claude`
+typed into a shell pane announces a pid cide never forked, so an *addressed* notification could
+not reach it and a broadcast was the only way — is answered since M29 by
+`ide::resolve_unbound_connections`, which walks the pid's ancestry to the owning pane before
+either notification is sent. The module doc's claim that every notification is addressed and
+none are broadcast is true again, and it now records the interval in which it was not.
+
+**What stayed, moved.** `claude_send_lines` — the context menu's *Send … to Claude ▸* and
+Ctrl+P's ⌥⏎ — sent *two* notifications: the selection, broadcast, **before** resolving which
+pane would get the mention, and then the mention, addressed. So the one deliberate gesture in
+the file also typed into every conversation. Both now go to the resolved target, after
+resolution, through the addressed `IdeServer::selection_changed` that had been waiting since
+M2: the pane that gets `@path#L10-20` is the pane that gets the text, and no other pane gets
+either. Its delivery is deliberately not checked separately — it reaches exactly the socket
+the mention reaches, and the mention is the half that reports.
+
+### What is NOT verified
+
+None of this has been seen on a display. What is pinned: `cide-ide-mcp`'s
+`a_connection_names_its_pid_and_gets_its_own_pane` already asserted that the other pane in a
+project hears *nothing* on an addressed selection, and it passes unchanged; the app crate's
+`ide` tests pass; `tsc`, the contract check and every `check:*` script pass. What is not: that
+the CLI's `⧉ Selected` chip no longer appears in the sessions the user did not send to — the
+only way to see that is to open two Claude panes, select in an editor, and look — and that the
+chip *does* appear in the one session a menu row names, in the same message as the mention.
+
+
+## Godot as an extension, a language server cide did not start, and what Tab inserts (M59)
+
+The request was *"add Godot script language support as extension"*, and the shape of the answer
+was fixed by ADR 0010 before a line was written: a language is data in a marketplace manifest.
+What was not fixed was everything a `.gd` file needs that data could not give it. Three things
+came out of the scoping, and two of them are core changes.
+
+### The `godot` extension (`../cide-marketplace/extensions/godot`)
+
+Three languages and one server, no worker. **GDScript** is the reference's keyword table, the
+Variant types, the `@GDScript` and `@GlobalScope` functions as calls, and nine rules in an order
+that is a precedence: `##` doc comments ahead of the `#` path; every annotation by one regex
+rather than the thirty-seven-name list (the list grows per release, and a missing name would
+silently be a variable); `$Player/Sprite` and `%UniqueName` and the quoted `$"…"`/`%"…"`/`^"…"`
+forms as node references, the sigil consumed and the string left to the string path; `&"name"`
+and `r"raw"` as strings; `get:`/`set(value):` anchored to the head of the line so `get_node(`
+never matches; and `MAX_SPEED`/`State.IDLE`/`Vector2.ZERO` as constants with a lookahead that
+keeps `AABB`, `RID`, `OS`, `IP`, `JSON` and `UPNP` on the type path. Folding is by indentation
+plus `#region` and triple quotes. **The shading language** is C-like with three rules
+(preprocessor lines, uniform hints, and the `ALL_CAPS` built-in variables on the variable role —
+the first thing in the marketplace to use it). **The scene/resource family** — `.tscn`, `.tres`,
+`.escn`, `project.godot`, `.import`, `.gdextension` — is one INI-shaped grammar: a section head
+as a keyword with its `[` attached (once the tokenizer has taken the bracket, nothing is at the
+head of the line), `key = value` and section attributes as properties, `ExtResource(` and
+`Vector2(` as types followed by a call. `.cfg` is unclaimed on purpose.
+
+The marketplace's `showcase` asks for the new capability too — it exists to ask for every one —
+and the sibling test in `cide-ext` pins seven extensions, the connect binding's endpoint, and
+that the three Godot languages displace nothing.
+
+### Attaching to a language server (ADR 0014)
+
+Godot's language server is the running Godot editor on `127.0.0.1:6005`. There is no binary,
+and `cide-lsp` had exactly one transport: spawn a `Command`, own its pipes, arm it, walk a
+signal ladder. The socat bridge and the headless spawn were both argued and both lost — the
+ADR has it — and the shape that won treats such a server as somebody else's process in every
+rule that touches it:
+
+* `LanguageServerDef.connect: Option<TcpEndpoint>`, with `binary` staying the server's *name*
+  (it keys the registry merge, the Problems source id, the thread name). `Candidate` is now
+  `{ target: Target, provenance }` with `Target::Process | Target::Tcp`, and `Provenance::Attached`
+  is excluded from both `config.rs` gates by construction.
+* **Loopback only, as a literal IP**, refused by name otherwise (`localhost` included — resolving
+  a name is an `/etc/hosts` question), asked in the manifest and again in `locate`, because a
+  builtin definition never sees the manifest. `didOpen` carries the whole document; a definition
+  that could name a host could send the user's files to it.
+* **A new capability, `lsp:connect`.** The install sheet said *run programs on your machine* for
+  every server, and this one runs none. Declared before `ProcessSpawn` because `Capability`
+  derives `Ord` in declaration order and the manifest sorts by it.
+* **Never `exit`.** `Session::detach` is the `shutdown` request alone; Godot binds neither
+  handler (a `shutdown` gets `-32601`, an `exit` is dropped), and the ladder accepts any reply to
+  the id, error included, or EOF. `processId` is `null`. No `try_wait`, no signal, no `kill`.
+* **Not listening is not broken.** A guarded arm ahead of the two failure arms in
+  `supervise_lives`: `Unavailable` once per outage, `ATTACH_RETRY` (3 s), try again — no ladder
+  to advance, no crash budget to spend. A socket that closes after the handshake takes the same
+  road. The sliced wait became `wait_out`, one helper for both callers, carrying the two bugs its
+  history taught it.
+* **A connect server must declare `projectMarkers`**, or the retry is a `connect()` in every
+  project the user ever opens. `args` with `connect` is refused: spawn-and-connect is a later
+  pass, and this is what keeps a manifest from pre-empting it.
+
+The finding that changed the plan came from asking what a reconnect would show. **No server was
+ever re-sent its open documents after a new life.** `docSync.ts` sends each `didOpen` once and
+listens to no status; a crash-restart, the watchdog and the Restart button all started a life
+that knew no documents. rust-analyzer and gopls read the disk and hid it; Godot publishes only on
+open, change and save, and would have sat silent until the user typed. So `LspEvent::Handshook`
+fires once per life, `ProjectDiagnostics` keeps every open buffer's last full text (sync is
+full-text, so the copy is exact), and the pump replays a `didOpen` for each document the server
+owns. Every `didOpen` now goes through `document_opened`/`document_changed`/`document_closed`,
+and the fix is for every server, not the new one.
+
+### What Tab inserts
+
+`EditorSettings.tab_size` and `insert_spaces` were offered in Settings from M15 and read by
+nothing until now — the M15 finding, and the reason `check:editor` asserts a setting is *read*.
+Every buffer got `indentUnit.of('    ')`, which this space-indented repository never noticed and
+a tab-indented Godot project notices on the first Tab: Godot refuses a file that mixes the two.
+`ui/src/editor/indentDetect.ts` reads the buffer's own indentation off its text — tab-led lines
+against space-led ones, the most common positive step between lines for the width, ties to the
+smaller, alignment past eight columns ignored, blank lines never voting — and only a file with
+nothing indented falls back to the settings. The unit is decided in `EditorSurface`'s build
+effect from `source`, because the first Tab can land before any effect runs; `tabSize` (display
+width) always comes from the settings; a new `detectIndentation` toggle turns the detector off.
+Section 22 of `check:editor` drives it over fixtures and `indentWithTab` against a real
+`EditorState`, and pins that the three settings are read.
+
+### What was verified
+
+`cargo test -p cide-lsp` — 133 unit tests, six of them the crate's **first non-ignored
+end-to-end tests**: a fake server on `127.0.0.1:0` reaches `Ready` and is told `processId:
+null`; the drop path says `shutdown` and never `exit` and does not sit out the grace period on
+Godot's `-32601`; a port with nothing on it is `Unavailable` with the address and the hint in
+the sentence, said once, and `Ready` follows when a listener appears with nothing pressed; a
+socket closed after the handshake reconnects through the retry and never reaches the crash
+budget; a stop mid-wait returns inside a second; a request queued mid-wait is `ServerGone`, not
+`Timeout`. `tests/attach.rs` drives the public road with a builtin-shaped definition (located
+without touching PATH, refused without `project.godot`, refused off loopback, `Ready` through
+`LspHandle::start_with`, `pid()` `None` throughout). `cargo test -p cide-ext` (the five manifest
+refusals and the key-table pins, plus the sibling marketplace road with seven extensions),
+`-p cide-ipc` (the loopback rule and the `connect`-absent-unless-set wire shape), `-p cide-app --
+lsp` (the replay filter), workspace clippy under `-D warnings`, `codegen --check`,
+`contract-check` (no new command or event), `tsc`, `check:ext`, `check:ext-render`,
+`check:problems`, `check:editor` (5435 assertions, section 22 included), `check:selectors`,
+`check:completion`, and `pnpm build`.
+
+### What is NOT verified
+
+**Nothing here has been seen on a display, and no real Godot has been on the other end of the
+socket.** The fake server answers `initialize` the way the engine source says Godot does — a
+capabilities object, full-text sync, `-32601` to `shutdown` — and the custom notifications Godot
+sends after the handshake (`gdscript/capabilities`, `gdscript/show_native_symbol`) are dropped by
+`Session::on_message`'s existing unknown-notification arm, but the round trip that would prove
+diagnostics, completion and go-to-definition arrive from a real editor is the user's to make:
+`./run.sh`, connect the sibling marketplace by path, install `godot`, open a Godot project while
+the Godot editor has it open, break a `.gd` file. The reconnect replay has been driven only
+through its filter (`owned_documents`) and the fake server's second `didOpen`; whether Godot
+re-diagnoses a replayed document without a `didChange` is Godot's behaviour, not cide's. For a
+repository with `game/project.godot` one level down, cide sends the repository root as `rootUri`
+and Godot is expected to warn and still answer — expected, not seen. The three grammars have
+been checked for validity (every rule compiles, every tag has a role) and not for colour on
+screen. Tab in a tab-indented file inserts a tab against a real `EditorState`; that the Settings
+toggle reaches a live view through the compartment has not been pressed.
+
+Two things were found underfoot and are worth a line. The milestone tag this was written under
+was wrong for most of the session: a summary read early on put the journal at M48, the tag went
+in as M49 everywhere, and only a grep of this file's own headings — the count, and the only
+count — said M58. Every tag was re-stamped to M59 before landing. And `cargo fmt --all` formats
+a tree another session is mid-way through editing; their diffs read as substantive and not as
+whitespace, but a `--check` first would have made that a fact rather than a reading.
+
+
+## A task code in the scrollback is a link (M60)
+
+The request was *"task codes t-\<xxx\> (like t-503) should be highlighted in claude code session
+output, and clicking one opens the task dialog"*. The id is printed constantly — an agent naming
+what it is doing, a `cide_task_get` tool line, a `git log` — and until now the only way to open
+`t-503` was to find it in the Tasks panel by eye. The card and the store action already existed:
+the Agents panel's task chips call `select` on `tasksStore` and `App.tsx` mounts
+`TaskDetailHost` on it, outside the sidebar. What was missing was a road from a pane's buffer to
+them.
+
+### Three providers, and the order is the feature
+
+xterm's `Linkifier._removeIntersectingLinks` drops a *later* provider's link wherever it overlaps
+an earlier one, so a new provider's whole design is decided by where it registers. Task links are
+third and last, after the path links and the run links, and both overlaps are deliberate.
+`pathMatch.ts`'s `BODY` includes `-`, so `t-503` **is** a path candidate: a project that really
+contains a file of that name keeps its path link, which is the right precedence — a file on disk
+is a fact and a code on the board is a guess about what the text meant. And a code inside a tool
+line's title survives only because the run provider claims the glyph and the `#7` and nothing
+between them, which M42 did for the path provider's sake and which this feature inherits for
+free. Nothing pinned that order before; `check:task-links` does now, and the same pin is what
+asserts the run links are attached at all.
+
+One consequence of the registration order is worth writing down because it looks like a bug the
+first time it is seen: `pathLinks.ts` answers *asynchronously* — it probes the index before it
+believes a path — so xterm cannot adopt a synchronous answer from a later provider at the moment
+it is returned. It adopts it in the ordered fallback once every provider has replied. A task code
+therefore lights up one round trip after the pointer crosses it, and the provider must not be
+made async as well.
+
+### The rule is a module, not a callback
+
+`terminal/taskLinks.ts` is import-free and holds both halves: what counts as a code, and whether
+a code may be offered at all. The second half is the one that had nowhere else to live — a gate
+inside `provideLinks` is a rule in a DOM callback, which is the one place no check script can
+reach, and that is the mistake `clickGate.ts` was created to undo. The same argument moved the
+buffer walk out of `runLinkProvider.ts` into `bufferSpan.ts`, typed against local interfaces so
+it can be driven over a fake buffer; nothing pinned run links at all before, so the extraction is
+only safe because the move itself is now pinned.
+
+The pattern is `t-` and one to nine digits with a lookbehind and two lookaheads, and the first
+lookahead is the one it cannot do without. Greed alone is not enough at a cap: `t-5034` would
+read as `t-503` and `t-1234567890` as `t-123456789` — each a link to a real and *different*
+task, which opens the wrong card and looks entirely correct doing it. `t-5034` is a perfectly
+good id and must match as itself; ten digits must match nothing. The same failure returns at the
+line cap, where the lookahead cannot see what the slice removed, so a match ending exactly at
+`MAX_LINE` on a longer line is dropped — there is no way to tell a code that ends at 4096 from
+one that was cut there.
+
+Two rules that are about prose rather than correctness. The trailing `.` is refused only when a
+word character follows it, so `t-503.rs` is out and `Finished t-503.` is in — a flat refusal
+would have lost the single commonest shape in agent output, a code at the end of a sentence. And
+the boundary classes are `\p{L}\p{N}`, not `A-Za-z0-9`, because a code welded onto a non-ASCII
+word is still inside a word. That is the first lookbehind in `ui/src`; `pathMatch.ts` uses the
+`(^|[^…])` capture idiom instead, and the reason not to here is that every offset would then
+need `match[1].length` added to it, and the offsets are this module's load-bearing output.
+
+### Only ids on the board, and only this project's board
+
+A link that takes a click and does nothing is the failure this project has found sixteen times,
+so every doubt withholds the link rather than offering one and apologising later. The board is
+already in the webview — unlike a path, which has to be probed — so an unknown `t-999` costs
+nothing to refuse and stays plain text. The project gate is the one that was not obvious:
+`App.tsx` attaches `tasksStore` to `null` in a detached-pane window and mounts no
+`TaskDetailHost` there, so a code in a torn-out pane gets no underline at all. Mounting the card
+in that branch — which is what `check:json-log` teaches for `LogDetailCard`, and the tempting
+wrong fix — would only be correct together with attaching the store there, and that is a
+different change for a surface with no rail and no panel.
+
+The refusals moved into `chrome/taskReveal.ts`, one producer for a gesture that now has two
+roads, on the argument `cide_git::push`'s `openPushDialog` makes. What would have drifted first
+is not the action, which is one line, but which of the three refusals each road checked. The
+third is new and belongs to the terminal road: a task id is unique only *within* a project, and
+a link drawn in one project, clicked after a switch, would open this project's `t-503` — a
+different task, correctly rendered, with nothing to show it was the wrong one.
+
+### A defect found on the way in
+
+Reading `Linkifier.ts` to settle the gesture turned up a live bug in the M42 run links.
+`_handleMouseUp` checks neither the button nor the selection: it activates whenever a mousedown
+and a mouseup landed on the same link. So a right-click's mouseup opened `LogDetailCard` behind
+the pane's own context menu, a middle-click paste opened it instead of pasting, and dragging
+across the `● bash` glyph to copy the line opened it too. Three gestures nobody aimed there.
+Both providers now guard the button, ctrl/meta and a non-empty selection, and `check:task-links`
+pins all four conditions for both — the fix cannot come back in either.
+
+One rough edge was resolved rather than accepted. Because a task code is a path candidate, a
+ctrl+click on one reached `pathLinks.ts`'s miss notice and was answered *"t-503 does not name a
+file or folder cide can reach from this pane"* — true, and useless beside an underline that a
+plain click would have opened. That sentence now names the other gesture instead of the failed
+one.
+
+**Acceptance: the pure halves are asserted and nothing on this surface has been seen on a
+display.** The matcher, the gate and the span arithmetic are driven over a corpus whose negatives
+are the larger half, and the wiring is eleven source pins. What only a display can confirm is
+every pixel and every gesture of it: that the underline appears on hover, that a plain click
+opens the card, that a right-click, a middle-click and a drag-to-copy do *not*, that a code on a
+wrapped line gets a link spanning the wrap, that a detached pane offers none, and that the
+one-round-trip delay behind the path provider's probe reads as responsive rather than broken.
+
+
+## Quick documentation: one page for every language, and Godot's built-ins first (M60)
+
+The question after M59 was *"go to definition on `Dictionary` — can it open the docs?"* The answer
+is no twice over and yes once. Godot answers `textDocument/definition` for a built-in with an
+empty list, because there is no file; and cide had no request that could carry a description
+back, because the only thing it ever asked a server for was a place. The yes is that every
+server has symbols the user cannot open and a description of them — a JDK class in a jar,
+`std` in a registry, the engine's `Node` — and the description is markdown in every case but
+one. So the feature is not Godot's. It is a page.
+
+### The page (`cide_ipc::SymbolDocs`)
+
+Title, kind, a signature, a markdown body, a member list, links, the server that answered, and
+`reference` — how to ask for this very page again, when the provider can name it. `kind` is a
+word and not an enum, for the Docker rule: a kind a server adds renders as itself. Two providers
+fill it (`cide_lsp::docs`): **hover**, for every server, because `textDocument/hover` is markdown
+by contract and is where jdtls puts javadoc and rust-analyzer rustdoc; and **Godot's native
+symbols**, the richer road, because the engine sends a class with its members and their docs
+in its own BBCode. A third provider would fill the same struct and change nothing downstream.
+
+### Godot's road, and the waiter it needed
+
+Godot's documentation arrives as a *notification* — `gdscript/show_native_symbol`, sent while
+the editor handles `textDocument/declaration` — so it cannot ride the pending map by request
+id. Rather than a second map, `PendingKey` became an enum: a reply by id, or the next
+notification of a named method. `Requester::expect_notification` registers before the request
+is sent, for the reason `request` registers its waiter before writing: the notification can be
+in the socket before the reply is. A life ending releases both kinds of waiter through the one
+`cancel_pending`. `Session::on_message` now hands every unknown notification up as
+`Effect::Notification`, and the supervisor delivers it to a waiter or drops it — one map lookup,
+which is what dropping it cost before. If no notification comes inside half a second the editor
+setting `show_native_symbols_in_editor` is on (Godot opened its own Help tab) and the hover road
+answers instead. A page's references — `[method Node.add_child]` — are followed through
+`textDocument/nativeSymbol`, a request with a reply, so following needs no waiter.
+
+The BBCode converter (`docs::godot::bbcode_to_markdown`) recognises what the engine's own Help
+renderer recognises, read off `editor_help.cpp` rather than the documentation primer: the
+formatting tags, the reference family, and a bare `[ClassName]` that is a link when the word is
+shaped like one. Prose is **escaped** where the parser would read it — `snake_case` opens
+emphasis, `a[0]` opens a link, a line starting with `-` is a list — which the engine's own hover
+conversion does not do and lives with. C# blocks are dropped whole; `[img]` is a note, because
+the path is `res://`.
+
+### The tab and the gesture
+
+`TabKind::Docs { subject, title }` carries a *question* (`DocsSubject`: a `#ref` the server can
+follow, or a position in a file plus the word under the caret) and never the page — the Docker
+argument — and the pane asks on every mount. Unlike the Docker tabs it outlives a close: a
+native symbol is addressable by name for as long as the engine has the class, and a page the
+server can no longer answer draws its sentence and nothing worse. A reference followed inside a
+page stays in the tab with a Back trail, because `Node` has a hundred members and a tab each
+would be a hundred tabs. Pages named by reference are remembered per project (thirty-two, a few
+hundred kilobytes) so the tab that opens on an answer draws without a second round trip;
+pages asked for by position never are, because the buffer under that position moves.
+
+The gesture is `navigate.documentation` — IDEA's *Quick Documentation* — on **F1** under
+`editorFocused`, in the palette and the editor's context menu, and as **Go to definition's
+fallback**: a `notFound` now asks for documentation and opens a page when there is one, saying
+"no declaration, and nothing documents it" otherwise. F1 and not IDEA's Linux `ctrl+q`: that is
+XON in every terminal pane, and `platform_layer` would make it ⌘Q on a Mac.
+
+### What was verified
+
+`cargo test -p cide-lsp`: the converter over a corpus of class-reference shapes (fourteen
+assertions on tags, references, escaping, blocks and the page builder), the hover page in the
+protocol's three shapes and the title fallback, and — through the fake server in
+`tests/attach.rs` — the whole Godot road: a waiter registered, `declaration` sent, the
+notification arriving *before* the empty reply and coming back through the pending map, and
+`docs::lookup` producing the page the app draws. Workspace clippy, fmt, `codegen --check`,
+`contract-check` (three commands added), `tsc`, `check:commands` (the new id has its dispatch
+case), `check:keys`, `check:editor` (the menu item is wired and the definition fallback calls
+the helper), `check:tab-overflow`, `check:tab-drag`, `check:ui-scale`, `check:motion`,
+`check:casing`, `check:selectors`.
+
+### What is NOT verified
+
+**Nothing on a display, and no real Godot on the socket.** The fake server sends the
+notification with a three-field payload; a real `Node` payload has a hundred children and the
+converter has been run over invented snippets, not the engine's XML. The pane has been
+type-checked and never drawn: whether the member list reads well at two hundred rows, whether
+Back is where a hand expects it, and whether the markdown preview's `scrolls={false}` inside an
+outer scroller behaves are all questions for a chair. `textDocument/nativeSymbol` for a followed
+reference is expected from the engine source, not seen. Hover pages have been driven only with
+hand-written replies — no rust-analyzer or gopls hover has been rendered through this road, and
+the hover reply's `range` is ignored. The `#ref` fragment is handed to the preview's
+`onNavigate` and intercepted before any anchor scroll could look for it; that the preview does
+not *also* try to scroll to `ref/…` is read from `links.ts`, not watched.
+
+
+## Task ids are contiguous (M61)
+
+The report was *"why isn't the task number in creation order? I see some numbers are skipped — for
+example I don't see 775"*, about a board whose ids ran `t-1` … `t-38` and then `t-168`, `t-172`,
+`t-184`, `t-221`, `t-312`. The answer was in `high_water_mark`'s own comment, which folded `rev`
+into the mark so that deleting the newest task could not lower it, and admitted to "a gap after a
+delete or an out-of-process merge". But `rev` moves on every accepted mutation. On that board
+`t-774` was created at 14:55:55, dispatched a second later (todo → doing, `rev` 775) and `t-776`
+was created at 14:56:18; 775 was never a task. The first 38 were contiguous only because they were
+created in one batch before anything touched them. On a live board with agents commenting nearly
+every id skipped, and `rev` stood ten past the largest id.
+
+The fix separates the two facts. `TaskFile` carries `nextId`: the number the next create takes,
+advanced by a create (and by a repair's re-mint, which is a mint), lowered by nothing, the higher of
+the two sides in the merge. `rev` goes on saying how many times the file changed. `validate` refuses
+a counter that is not past every numeric id in the file, so a bug in `mint_id`, `merge` or `repair`
+fails the mutation rather than reusing a deleted id — which is the silent failure the old rule was
+built against and the one this change must not reintroduce.
+
+The migration is the part with a cost. A file written before the field deserialises to `0`, and
+`repair` settles it under the *old* rule, once — `max(largest id, rev) + 1`, not `largest + 1` —
+because under the old rule the numbers between the largest surviving id and `rev` may name tasks
+that were deleted and are still quoted in comments and commit messages, and the file cannot say
+which. So an existing board takes one last jump (the reporting one goes from `t-824` to `t-835`)
+and is contiguous from there. Deriving from the ids alone would have been contiguous one task
+sooner and wrong in the one direction the whole mechanism exists to be right in.
+
+## A thought is a collapsed row (M62)
+
+The report was *"need a think output text as collapsed row as 'Thought: XXXms' in agent read-only
+log"*, and it is the third report about the same pane. The first — *"it opens strange console with
+json output that isn't understandable"* — got M42's rendering. The second — *"hard to understand
+what it is doing right now"* — got the live `▸ working…` marker. This is the third, and what it
+names is the one arm M42 left as texture rather than record: a block of the model's reasoning
+rendered as `∴ ` plus the text, whitespace-flattened and clipped to 240 characters. Long, cut
+mid-sentence, unopenable, and one such line per thinking block pushing the tool calls and the
+model's actual words off the screen.
+
+So a thought is now one row and none of the thinking:
+
+```
+● bash  cargo test --workspace  1.2s #7
+∴ thought  4.1s #8
+● read  crates/cide-agents/src/harness.rs  8ms #9
+```
+
+The `#8` is the same handle a tool call carries — a sequence number into the per-session ring —
+so a click opens the whole block in the detail card under *The model thought*. That is the whole
+design: the row answers *how long*, the card answers *what*, and the two are one gesture apart.
+
+### The flag, which is why none of this worked at first
+
+It shipped correct and drew nothing. The report came back: *"still doesn't see thoughts"*, with a
+transcript of sixteen tool calls and two lines of prose and no `∴` row anywhere. The stream was
+the answer — that run's log holds 17 `step_start`, 16 `tool_use`, 16 `step_finish`, 2 `text` and
+**not one `reasoning` event**.
+
+The first reading was that the model had not reasoned. The run's own `step_finish` events say
+otherwise, and say it for free: `tokens.reasoning` over the twenty steps reads
+`[0, 76, 68, 0, 27, 0, 92, 1164, 0, 26, 90, 157, 0, 872, 2415, 520, 0, 163, 404, 355]` — **6,429
+reasoning tokens**, 2,415 of them in one step. The model thought hard and opencode printed none
+of it.
+
+The cause is in the CLI, and `strings` on the binary has it (1.18.31). The `run` command's event
+loop reads
+
+```js
+if (J.type === "reasoning" && J.time?.end && m) {
+  if (Z("reasoning", { part: J })) continue;
+  ...
+  let s = `Thinking: ${M}`;
+```
+
+and `m` is `q ? (j.thinking ?? true) : (j.thinking ?? false)` with `q = j.mini`. cide passes
+neither `--mini` nor `--thinking`, so `m` is false and the arm is never reached — the `reasoning`
+event is not suppressed at the renderer or thinned by the model, it is **never emitted**. So
+`child` now passes `--thinking`, beside `--format json` and for the same reason: it is not a
+display preference, it is what the channel carries. Without a flag the CLI shows its own
+`Thinking: …` block only when it is talking to a person, and cide is not a person.
+
+Two things fall out of that same source. `J.time?.end` is a *guard* on the emit, so a reasoning
+part cide ever sees is guaranteed to carry `time.end` — the stated duration this row wanted is
+always there. And the CLI's own label for the block is the word `Thinking:`, which is where the
+report's "Thought: XXXms" came from.
+
+The lesson is the one M42's own header should have taught: this pane's contents are a *channel*,
+and every argument about what the channel carries belongs beside `--format json`. A feature can
+be correct in every test, in both harnesses and in two languages, and still be invisible because
+nothing asked the CLI to send it.
+
+### What the run logs decided
+
+The obvious reading of "collapsed" is that reasoning arrives in fragments and several of them
+coalesce into one row. Fifty real run logs under `$XDG_STATE_HOME/cide-dev/run-logs/` say
+otherwise: opencode prints **one event per completed part**, each with a unique `part.id` and its
+own `time`, and no `part.id` appears twice in any of those files. A `text` part reads
+
+```json
+{"type":"text","timestamp":1789725630807,"part":{"id":"prt_…","type":"text",
+ "text":"I'll start by reading the task…","time":{"start":1789725630570,"end":1789725630800}}}
+```
+
+so a reasoning part is already a whole thinking block with a stated duration, and coalescing
+would have thrown away all but one block's text while gaining nothing. One row per event *is* one
+row per block. That deleted the accumulate-and-flush machinery the first design had, and with it
+the question of which of several handles the row should carry.
+
+### Stated beats measured
+
+opencode states a `time` on a part; codex states no clock on any item at all — not a start, not
+an end, not a duration, which `render_command` and `logDetailModel.ts` had both already written
+down. A row that could only print a stated duration would therefore be a feature that silently
+does not exist on codex, so there is a fallback, and it is the same one on both harnesses: the
+gap between the previous line that drew anything and this one — the interval in which the run
+produced nothing, which for a reasoning item is the thinking.
+
+The first design measured codex's differently, from an `item.started` naming a `reasoning` item.
+That was cut before it was written. No fixture in this repository contains such an event, the
+50 logs are all opencode, and a timer keyed by item *type* rather than by `item.id` attributes
+the wrong interval the moment two items overlap — a confident number about nothing, built on an
+event nobody here has seen. The silence is a measurement cide can actually make.
+
+Where neither is available — the first line of a run, or a caller that did not set the clock —
+the row prints **no duration at all**. `RenderState::now_unix_ms` is an `Option<u64>` for exactly
+that reason: the struct derives `Default`, a bare `u64` would be `0`, and a duration measured
+against 1970 is the plausible-looking wrong answer this whole family of comments exists to refuse.
+
+The clock reaches the renderer through `RenderState` because the render functions must stay pure
+functions of `(state, line, handle)` — that is what lets a test assert `3.2s` rather than a range
+— and it is read **once** per line, in `stream_hook`, and handed to both `logring::record_at` and
+the state. Two reads of `SystemTime::now()` for one line are two different answers to when it
+arrived.
+
+### What keeping reasoning costs
+
+Both `keep_event`s now say yes to reasoning, which is the inverse of why they said no: the
+rendering used to show a clipped copy, so the ring was a second one; now the row shows a duration
+and the ring is the only place the thinking survives. The ring's header budgeted "roughly 200
+bytes a line", and a block of reasoning is two to twenty kilobytes, so `CAP` alone would have let
+one session hold tens of megabytes until its *pane* closed. `BYTES_CAP` is the second cap, and
+the two answer different questions: the entry count is how far back a person may click, the byte
+budget is what the process will spend.
+
+The honest half is that eviction is now reachable long before two thousand lines, so a run that
+thinks hard ages out its own earlier tool-call handles and a click on a `#7` still on screen can
+answer *this line is no longer kept*. That is the price of keeping the thinking at all, and
+`a_ring_of_long_lines_is_bounded_by_bytes_as_well_as_entries` asserts it rather than leaving it
+to be discovered by a click.
+
+### The grammar, in two languages
+
+`ui/src/terminal/runLinks.ts` reads the handle off the buffer text, and its `RUN_LINE` matched
+`●` and `✗` only — so the row could have shipped with a `#8` that no click resolves, in Rust that
+compiles and a pane that looks right. The glyph class is widened to `[●✗∴]` and the row parses as
+a run line whose tool is the word `thought`, which is why no second grammar was needed; `∴` is
+one UTF-16 unit and one cell, so `toolEnd` and `spanOf`'s column arithmetic are untouched. That
+the *prefix* link survives `pathLinks.ts`'s earlier provider is not luck either: `plausible`
+refuses a candidate with fewer than two `/`-separated segments, so a bare word is never a path
+candidate.
+
+Two literals in two languages with no compiler between them is how a click quietly stops doing
+anything, so `check:json-log` now reads the row's format string **out of `render.rs`** and drives
+`parseRunLine` over it — `LOG_LINK_SCHEME`'s rule, one row over. Comments stripped first, and in
+this file that is mandatory rather than tidy: `render.rs`'s own prose spells the row, the tail and
+the budget that went away, so every one of those assertions could have passed by matching the
+documentation of the thing it was checking for.
+
+The cost of widening the glyph class, stated rather than hidden: a line of the model's own words
+beginning `∴ ` and ending ` #12` is now read as a run line and points at an unrelated ring entry.
+That has always been true of `●` and `✗`, and the alternative — a marker the model could not type
+— is an escape sequence `vt100` drops from every replay, which is the whole reason the token is
+plain text in the first place.
+
+### What is not verified
+
+**No captured run log in this repository contains a single opencode `reasoning` event** — fifty
+files, 4,546 `tool_use`, 844 `text`, and not one. That is now explained rather than mysterious:
+every one of those runs was spawned without `--thinking`. The shape the arm reads is taken from
+the CLI's own emit site (`Z("reasoning", {part: J})` around a part guarded on `time.end`), which
+is stronger than an inference from the `text` part but is still not a captured line. The first
+run of a reasoning model **with the flag** is what turns it into one, and the fixture at
+`the_rendering_reads_as_a_transcript_and_hides_no_failure` should be replaced with that line when
+it exists, the way every other opencode fixture in that file is a captured one.
+
+That the flag parses is checked without spending anything — `opencode run --thinking --format
+json --model nope/nope hi` reaches model resolution rather than refusing an unknown option — and
+`--thinking` is asserted in the argv test beside `--format json`. Two real turns on a
+`deepseek-v4-pro` (with and without `--variant high`) both came back `tokens.reasoning: 0`, so
+they confirm the flag is accepted and confirm nothing about the event.
+
+Nothing here has been seen on a display. The click, the card's heading, the row after a detach
+into its own window, and the row after a run is reopened from History are all untested by
+anything but the parser — `check:json-log` proves the grammar agrees across the two languages,
+not that xterm hands the press to this provider.
+
+## A drawing is a file tab (M63)
+
+The report was *"need implement support for .excalidraw, .excalidraw.json, .excalidraw.svg, and
+.excalidraw.png formats - when opening such file need to show an editor"* — the four suffixes the
+VS Code Excalidraw extension owns. Two of them opened as unhighlighted JSON in `EditorPane`,
+because no language claims `excalidraw`; the other two opened in `ImagePane`, because
+`imageKindFor` reads the last extension and a `.excalidraw.png` is, byte for byte, a picture.
+Neither could be drawn on. Now all four open in `ExcalidrawPane`, a live `@excalidraw/excalidraw`
+0.18.1 canvas, and Ctrl+S writes the file back in the format its name says — JSON, or an SVG or
+PNG with the scene embedded, so the file reopens as a drawing here and in Excalidraw itself.
+
+### The fork
+
+Nothing in Rust knows. `PaneBody` already forks a file tab by name — `imageKindFor` sends a
+`.png` to `ImagePane` — and its M18 comment explains why the fork is not a `PaneKind::Image`
+written by `tab_open_file`: a derived fact frozen into `workspace.json`, and a second extension
+table. The drawing fork is the same shape one line earlier, and the order is the whole point:
+`x.excalidraw.png` ends in `.png`, so asked second, the drawing rule never runs.
+`check:excalidraw` pins the order.
+
+The pane is a static import and the engine is not. `PaneBody`'s rule against a lazy *pane* — a
+pane that renders nothing for a frame is a pane the layout measures at zero — holds:
+`ExcalidrawPane` paints its full-size root and *Opening …* on the first frame. What it then
+`import()`s, in parallel with the file read, is `ExcalidrawSurface.tsx`, the one module that
+imports the package and its 144 KB stylesheet; 2.7 MB of JavaScript that no window pays for
+until somebody opens a drawing. The check asserts the single runtime import site and that the
+pane reaches it only dynamically — a static import anywhere else would put the engine in every
+window's entry chunk with nothing to notice.
+
+### Bytes as raw bodies
+
+A drawing is a PNG as often as it is JSON, and `file_read` — the text road — refuses a NUL in
+the first 8 KiB, correctly. `cide_ipc::image` states the rule for bytes and the IPC: never a
+JSON array of decimal numbers, never base64. The asset protocol was the answer for an `<img>`
+and is not available here: the pane needs a `Blob` in JavaScript for Excalidraw's
+`loadFromBlob`, and `fetch()` on `asset://` fails on Linux — wry registers the scheme as secure,
+not CORS-enabled, and `connect-src` does not name it.
+
+What holds is the reason rather than the letter. `tauri::ipc::Response::new(Vec<u8>)` travels
+as `application/octet-stream` over the same custom protocol the terminal's scrollback takes
+(`diag_echo_bytes`, `session_attach`), and `invoke(cmd, Uint8Array)` arrives as
+`InvokeBody::Raw` — neither JSON nor base64, one copy each way. Neither carries anything beside
+the bytes, and the pane needs a stamp beside the bytes it reads (the autosave precondition) and a
+path beside the bytes it writes; a request header would need percent-encoding for a Cyrillic file
+name. So `cide_ipc::frame`: `u32 LE n | n bytes of JSON head | payload`, the same envelope in
+both directions, with `FileBytesHead` and `FileBytesWrite` as the heads. Three commands:
+`file_read_bytes`, `file_write_bytes` and `file_stat`, the last for the git-status recheck,
+which must not re-read a PNG to compare a stamp. `document::read` and `document::write` are now
+thin wrappers over `read_bytes` and `write_bytes`, so the symlink, the mode bits and the
+`sync_all` before the rename are one rule for both roads.
+
+Every format is read as bytes and **sniffed** (`\x89PNG`, `<`, `{`, empty). The name decides the
+pane and the write format; the bytes decide the parser. A screenshot renamed `.excalidraw.png`
+says so by name instead of rendering blank; a `.excalidraw` renamed `.excalidraw.png` before
+its first save opens as JSON and is written as a PNG by that save, because the format is read
+from the path at save time. A zero-byte file — the tree's *New file* — is a blank canvas.
+
+### What is dirty
+
+Excalidraw's `onChange` fires for a selection, a pan, a zoom and a tool-colour change, and a
+tab that goes dirty when you look around a drawing is a close guard nobody trusts. What a save
+persists is the elements (`getSceneVersion` sums their versions; a deletion bumps one), the
+embedded files, and exactly four `appState` keys — the ones 0.18.1's `APP_STATE_STORAGE_CONF`
+marks `export: true`: `viewBackgroundColor`, `gridSize`, `gridStep`, `gridModeEnabled`. That is
+the fingerprint, in the import-free `excalidrawKinds.ts` where the check can drive it.
+
+Two things about the baseline were wrong before they were written down. It is not the first
+`onChange`: the engine measures its container on mount and reports an empty scene before the
+initial data lands. And it is not the loaded scene: the engine restores it again on mount and
+may re-version an element. So the baseline is the first `onChange` whose live element ids are
+the file's. After a save, the tab is clean only if the scene still matches the snapshot the save
+serialised — an edit made during a slow PNG export must not be silently clean.
+
+A reload is a remount under a new `key`, never `updateScene`: that keeps the undo stack, so
+after *Reload from disk* a Ctrl+Z would resurrect the pre-reload scene, which autosave then
+writes — the clobber the conflict bar exists to prevent. The viewport is carried across and undo
+resets, exactly as `read(true)` rebuilds the `EditorView`. Autosave is the editor's
+`shouldAutosave` on the idle timer and window deactivation only; there is no in-pane `focusout`
+trigger, because the engine's pickers are popovers portalled to `document.body` and each save is
+a canvas export. The conflict bar, the `cide://session-tool` reload and the throttled
+`cide://git-status` recheck are `EditorPane`'s — with one difference found on the way:
+`EditorPane.recheckOnDisk` compares `doc.stamp === stampRef.current`, two JSON-parsed objects,
+which is never true. The drawing pane compares by value (`sameStamp`); the editor is left for a
+change of its own.
+
+### The keys the canvas gets back
+
+A drawing pane is a `PaneKind::Editor` pane in a `TabKind::File` tab, so it satisfied
+`editorFocused`, and every binding carrying that clause swallowed a chord the canvas needed:
+`ctrl+g` (go to line; *group* to Excalidraw), `ctrl+equal` / `ctrl+minus` (fold; *zoom*),
+`alt+up` / `alt+down` (walk members in a buffer with none). Each reached `dispatch.ts`, found no
+caret, logged `did nothing`, and the drawing never saw the key. `drawingFocused` is a new context
+flag, derived by name off `focusedTabPath` the way `composeFileActive` is, and `editorFocused`
+is now "an editor pane that is not a drawing". `file.save`'s palette clause is
+`editorFocused || drawingFocused` — the first shipped clause with an `||`. Still cide's, and
+recorded rather than worked around: `ctrl+shift+bracketleft/right` (Excalidraw's send to
+back / bring to front), `ctrl+shift+e`, `ctrl+shift+d`, `ctrl+p` — rebindable in `keymap.json`.
+
+The canvas actions that end in a *Download* are hidden (`export`, `saveAsImage`): a wry webview
+drops `<a download>` and lacks `showSaveFilePicker`, and a button that does nothing is the state
+this codebase forbids. `loadScene` (loads into this tab, over the file), `saveToActiveFile`
+(Excalidraw's own Ctrl+S) and `toggleTheme` (the canvas follows cide's theme) go with them.
+Copy-as-PNG and copy-as-SVG survive in the canvas context menu. `handleKeyboardGlobally` and
+`autoFocus` stay false — every tab is mounted, and a restored workspace would otherwise hand
+focus to the last drawing to mount.
+
+### Fonts
+
+The engine loads its hand-drawn faces at runtime, lazily per font, from
+`window.EXCALIDRAW_ASSET_PATH`, and with it unset falls back to a CDN that the CSP
+(`font-src 'self' data:`) blocks **silently** — every label in a fallback face, nothing logged.
+234 woff2 files, 12.5 MiB, which do not belong in the repository. `vite.config.ts`'s
+`excalidrawFonts` plugin answers `/excalidraw/fonts/…` from the package under `vite dev` and
+copies the directory beside the bundle under `vite build` (not for the SSR builds the render
+checks make), and the pane spells `excalidraw/` once, relative to `document.baseURI`, so the
+URL is the same shape on both launch paths. Every packaged artefact grows by those 12.5 MiB;
+dropping a family later is a silent fallback face, so all of them ship. `optimizeDeps` names the
+package so its first open cannot trigger Vite's *new dependencies optimized, reloading*, which in
+this app drops every terminal's attachment.
+
+Not in this milestone, as decisions: an *Open as text* escape hatch (M18 journaled the same gap
+for SVG), a language-table entry for `excalidraw`, library persistence and the *Browse
+libraries* link, `.excalidrawlib`, a *New drawing* gesture. A rename to a non-drawing suffix
+unmounts the pane and drops unsaved edits, the hazard `x.png` → `x.txt` has today.
+
+### What was verified
+
+`cargo test -p cide-core document` (the bytes road round-trips a NUL-bearing buffer the text
+reader still refuses; the precondition refuses a moved stamp on both roads; the symlink and
+temp-file tests unchanged) and `commands` (the `||` clause validates against the vocabulary);
+`cargo test -p cide-ipc frame` (the envelope, the little-endian prefix as bytes, an empty
+payload, a short frame, a non-UTF-8 head, a Cyrillic path through the head); `cargo test -p
+cide-app -- framed_write json_body truncated_frame` (the write's parse, a JSON body refused by
+name); `cargo fmt`, `clippy -D warnings` on the three crates, `codegen --check`,
+`contract-check` (three commands added). `tsc`; `check:excalidraw` (new: the suffix table, the
+sniff, the fingerprint truth table, stamps by value, and every wiring pin above);
+`check:commands`, `check:select-opened`, `check:keys`, `check:keymap`, `check:editor`,
+`check:image`, `check:ui-scale`, `check:theme`, `check:motion`, `check:ui-icons`,
+`check:selectors`, `check:casing`, `check:css-prefix`, `check:boundary`, `check:paths`,
+`check:menus`, `check:switcher`. `pnpm build`: the fonts directory is copied and the engine is
+its own chunk, absent from the entry.
+
+### What is NOT verified
+
+**Nothing on a display.** Opening any of the four files; drawing; Ctrl+S; the PNG round trip
+through a real raw body on the real transport; fonts loading through the plugin in dev and from
+an AppImage; the engine's font-subsetting worker over `tauri://` versus its main-thread
+fallback; the conflict bar from a `sed -i` in a shell pane; the baseline handshake against the
+engine's real mount order (inferred from its source, not observed); the paste and keydown
+active-container guards with two drawings mounted; whether a *Browse libraries* `_blank` link
+navigates the webview away; the dark theme's canvas colours against cide's tokens. The
+`check:excalidraw` script drives the rules; it never imports the engine, which needs a canvas.
+
+## The file tree knows what it can make (M64)
+
+The report was *"File tree right click menu should contains a item ‘New’ with submenu — where
+will be listed all supported (including added with installed extensions) file extensions and
+excalidraw. This ‘New’ menu item should be before ‘New file…’"*.
+
+The tree's context menu offered *New File…*, which opens an inline box you type a whole name
+into — extension included. The extension is the one part of that name the application already
+knew: `cide_ipc::lang::builtins()` merged with whatever an extension contributes *is* the list
+of file types this installation supports, and since M22 it has been one table for exactly that
+reason. The *New scratch file…* picker had been listing it since M15. The tree had not.
+
+Now *New ▸* sits above *New File…* with one row per type — Rust, Go, TypeScript, JavaScript,
+Python, JSON, YAML, TOML, Markdown, Shell, Dockerfile, SQL, C, C++, Plain Text — then a rule,
+then *Drawing*. Picking one opens the same draft box the plain row opens, holding `.rs`, with
+the caret in front of it.
+
+### The list is the picker's list
+
+`SCRATCH_TYPES` is an exported `let` in `editor/languages.ts`, rebuilt by `registerLanguages`
+from the bootstrap's merged `ResolvedContributions.languages`. Reading it through
+`MenuItem.submenu`'s thunk — which exists so the code pane's *Send … to Claude ▸* can list
+live sessions — means the tree lists an extension's languages without this panel ever learning
+that extensions exist, and lists one installed since the right-click. A literal array here
+would have been the second copy `check:scratch` already forbids the picker, in the one place
+where the whole point is *what can this installation make*.
+
+The rows carry the label alone. A menu row has no second column and the scratch picker's
+argument for showing `.rs` inverts here: the extension is about to be visible in the box, which
+is a better place for it than a menu the user has already dismissed.
+
+### "Untouched" had to stop meaning "empty" first
+
+The draft box has shown its *destination* rather than a refusal while nothing has been typed
+since the draft row existed, for the reason its comment gives: a red *"Type a file name."* on a field nobody has
+touched reads as a failure before anything was attempted. That was spelled `draftName.trim() === ''`,
+which was the same thing right up until a box could open with something in it.
+
+A seeded box makes it the opposite. `checkName('.rs')` has plenty to say — *"a dot-file may be
+hidden by this project's ignore rules"* — all of it about a name the user has not written, so
+*New ▸ Rust* would have opened with a warning already on screen. The test is now against
+`draftSeed`, and the empty case deliberately keeps its own `.trim()` spelling rather than being
+folded in: a box holding only whitespace has been politely showing its destination since the
+draft row existed, and this was not the change to take that away.
+
+### And Enter on a bare `.rs` had to be refused
+
+Nothing refused it. A leading dot is a **note**, not an error, so `nameToSend('.rs')` returns
+`'.rs'` and the gesture would have created a hidden file called `.rs`, carrying that same
+ignore-rules warning about a file nobody had finished naming. For *Drawing* it is sharper
+still: `drawingKindFor` wants a stem in front of the suffix, so a file named exactly
+`.excalidraw` is a dotfile and would not open in the pane the row promised.
+
+The rule went into `checkName` as a fourth, defaulted argument rather than into the panel, and
+that placement is the point. `newEntry.ts` is import-free so `check:new-entry` can compile it
+alone and drive every edge; a branch inside a `useCallback` could only ever have been grepped
+for. As a bonus it needed no new code in `commitDraft` at all — an error is an error, and the
+existing `if (name === null)` refusal already leaves the box open with the sentence under it.
+
+`draftSeed` then had to go into `commitDraft`'s dependency array, which is the kind of thing
+this project has no lint for: without it the closure keeps the seed of the first draft the
+panel ever opened, and a later *New ▸ Go* compares `.go` against `.rs` and creates the very
+file the rule exists to refuse.
+
+### Two one-liners that are not cosmetic
+
+`el.setSelectionRange(0, 0)` in `DraftRow`'s ref. Where `focus()` leaves the caret, typing
+`parser` into a box holding `.rs` spells `.rsparser` — a perfectly legal filename, so nothing
+refuses it and the only symptom is a file with the wrong name. It is the mirror image of the
+rename input three hundred lines down, which keeps the extension *out* of its selection so a
+rename does not re-type it.
+
+And `DEFAULT_DRAWING_SUFFIX` in `excalidrawKinds.ts`, spelled into the `SUFFIXES` table rather
+than derived from it — two of the four arms are `'json'` and the obvious derivation answers
+`.excalidraw.json`. `check:excalidraw` pins it *through* `drawingKindFor`, in both directions:
+a file named from the seed routes to the drawing pane, and the seed alone routes nowhere.
+
+### What is not covered
+
+`check:scratch` grew a section for this, and `FileTree.tsx` is now read **comment-stripped**
+there — it was not, and every string the new assertions look for is one this panel's prose also
+spells, which is the way three assertions in this repository have already passed by matching
+their own explanation.
+
+**Nothing on a display.** That the submenu opens on hover, that its box lands beside the row
+rather than over it, that the caret is visibly before the dot, that `.dockerfile` — a real
+extension of the Dockerfile language, though a Dockerfile is normally matched by *filename* —
+is not surprising in the list, and that a freshly named `sketch.excalidraw` opens as a blank
+canvas rather than an empty buffer. The placement arithmetic is `check:menus`'s, driven
+without a DOM; the rest is source assertions.
+
 ## The chrome audit
 
 M3's stated acceptance criterion was a screenshot diff against the design mock at 1440x900 in

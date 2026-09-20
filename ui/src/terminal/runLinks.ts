@@ -6,6 +6,7 @@
  * ```text
  * ● bash  cargo test --workspace  1.2s #7
  * ✗ bash  cat ~/.cargo/config.toml  #9
+ * ∴ thought  4.1s #8
  * ```
  *
  * — and puts the call's input and whole output behind the `#7`: a handle into the same
@@ -44,8 +45,20 @@ export interface RunLine {
  * The glyph, one space, the tool name, then anything (the title, the duration, an exit code),
  * then one space and the token at the very end. The two spaces the renderer puts after the
  * tool name are not required, so a tool line with no title still parses.
+ *
+ * `∴` joined `●` and `✗` in M62, when a block of the model's reasoning became one collapsed row
+ * — `∴ thought  4.1s #8` — with the whole of the thinking behind the handle. It parses as a
+ * tool line whose `tool` is the word `thought`, which is what makes the prefix and the token
+ * clickable with no second grammar. All three glyphs are one UTF-16 unit and one cell, so
+ * `toolEnd` and `spanOf`'s column arithmetic are unchanged.
+ *
+ * The cost of widening the class: a line of the model's *own words* that begins `∴ ` and ends
+ * ` #12` is now read as a run line and points at an unrelated ring entry. That has always been
+ * true of `●` and `✗`; the glyphs are rare enough at the start of a sentence to be worth it,
+ * and the alternative — a marker the model could not accidentally type — is an escape sequence
+ * `vt100` drops from every replay, which is the whole reason this token is plain text.
  */
-const RUN_LINE = /^[●✗] (\S+)(?: .*)? #(\d+)$/u
+const RUN_LINE = /^[●✗∴] (\S+)(?: .*)? #(\d+)$/u
 
 /** The line's parts, or `null` for a line that is not a tool line with a handle. */
 export function parseRunLine(text: string): RunLine | null {

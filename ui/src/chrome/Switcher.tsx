@@ -147,6 +147,8 @@ function tabRow(tab: Tab | undefined): Row | null {
       }
     case 'settings':
       return { dot: null, mark: 'settings', name: 'Settings', detail: '' }
+    case 'docs':
+      return { dot: null, mark: 'book-open-text', name: tab.kind.title, detail: 'documentation' }
     default:
       // A `TabKind` variant added later. A row that says *something* beats a popup with a hole
       // in it, and `TabStrip.viewFor` is where the compiler is made to care.

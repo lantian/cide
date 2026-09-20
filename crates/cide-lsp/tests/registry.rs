@@ -32,6 +32,7 @@ fn def(binary: &str) -> cide_ipc::lang::LanguageServerDef {
         declares_watched_files: false,
         extra_path_hints: vec![],
         init_options: None,
+        connect: None,
     }
 }
 

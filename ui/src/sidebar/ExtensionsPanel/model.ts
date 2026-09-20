@@ -426,6 +426,7 @@ export const CAPABILITY_PROSE: Readonly<Record<string, string>> = {
   'editor:write': 'add highlighting, problems and an outline to files you have open',
   'fs:read': 'read files in your project',
   'git:read': 'read your git status and history',
+  'lsp:connect': 'connect to a language server already running on your machine',
   'process:spawn': 'run programs on your machine',
 }
 
@@ -445,6 +446,7 @@ export const CAPABILITY_SHORT: Readonly<Record<string, string>> = {
   'editor:write': 'annotates files',
   'fs:read': 'reads project',
   'git:read': 'reads git',
+  'lsp:connect': 'connects locally',
   'process:spawn': 'runs programs',
 }
 
@@ -452,9 +454,11 @@ export const CAPABILITY_SHORT: Readonly<Record<string, string>> = {
  * Whether a permission is one the user should look twice at.
  *
  * `process:spawn` alone, and it is not a judgement call: every other capability is a *read* of
- * something already on screen or already in the repository, and this one means the manifest names
- * a binary and cide runs it against the user's project. `cide_ipc::ext::Capability` says the same
- * from the other end, and `cide_ext::manifest` refuses a server contribution without it.
+ * something already on screen or already in the repository — or, since M59, a connection to a
+ * loopback port the user's own software opened (`lsp:connect`, which the manifest may not point
+ * anywhere else) — and this one means the manifest names a binary and cide runs it against the
+ * user's project. `cide_ipc::ext::Capability` says the same from the other end, and
+ * `cide_ext::manifest` refuses a server contribution without the capability its transport needs.
  */
 export function isStrongCapability(capability: string): boolean {
   return capability === 'process:spawn'

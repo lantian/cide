@@ -693,9 +693,9 @@ pub enum SessionBinding {
         /// tool call and the model's own words are worth keeping; a step marker is not.
         keep: fn(&str) -> bool,
         /// One event line → display text, with the state the rendering keeps between lines
-        /// (which step the run is in, whether a live marker is on screen) and the ring handle
-        /// for a line `keep` said yes to. `Drop` draws nothing; anything unrecognised comes back
-        /// verbatim.
+        /// (which step the run is in, whether a live marker is on screen, and the clock this
+        /// line arrived at) and the ring handle for a line `keep` said yes to. `Drop` draws
+        /// nothing; anything unrecognised comes back verbatim.
         render: fn(&mut RenderState, &str, Option<u64>) -> cide_pty::Rendered,
     },
 }
@@ -703,16 +703,31 @@ pub enum SessionBinding {
 /// What a [`SessionBinding::Harness`] rendering remembers from one line to the next. (M42)
 ///
 /// Owned by the app's stream hook, one per session, and handed to `render` by `&mut` — the
-/// function pointer itself stays stateless so the binding stays `Copy`. The two facts here are
+/// function pointer itself stays stateless so the binding stays `Copy`. The first two facts are
 /// what let a line-based renderer show *what the run is doing right now*: a step that has
 /// started and not finished is a run that is thinking or running tools, so a dim marker sits
 /// under the last line for as long as that is true, and every next line begins by erasing it.
+/// The last two are the clock M62's thought row needs, and they are here rather than in a
+/// parameter because the render functions must stay pure functions of `(state, line, handle)` —
+/// that is what lets a test assert an exact duration.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RenderState {
     /// A `step_start` has been seen and its `step_finish` has not.
     pub in_step: bool,
     /// The marker row is the last thing on screen, so the next rendering must erase it first.
     pub marker: bool,
+    /// The wall clock, in Unix milliseconds, as *this* line reached cide — written by the caller
+    /// immediately before `render` and read by nothing else. (M62)
+    ///
+    /// `Option`, emphatically, and not a bare `u64`: this struct derives `Default`, a `0` there
+    /// is 1970, and a duration measured against 1970 is a confident number about nothing —
+    /// which is the one shape [`render::thought_line`] exists to refuse. A caller that does not
+    /// set it leaves every duration unknown, which draws no duration at all.
+    pub now_unix_ms: Option<u64>,
+    /// When the previous line that actually drew something arrived, so the gap to this one can
+    /// be measured for a harness that states no clock. Maintained by `render::compose`, which
+    /// is the single funnel both harnesses' renderings pass through. (M62)
+    pub last_line_unix_ms: Option<u64>,
 }
 
 impl PartialEq for SessionBinding {

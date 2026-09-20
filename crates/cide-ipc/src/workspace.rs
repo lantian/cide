@@ -708,6 +708,16 @@ pub enum TabKind {
         target: crate::docker::InspectTarget,
         title: String,
     },
+    /// A symbol's documentation, read from a language server. (M60)
+    ///
+    /// `Docker`'s shape and `Docker`'s reason: the tab carries what to *ask* and never the page,
+    /// because a page is a claim about the server the user runs today and `workspace.json` is
+    /// for ever. `subject` is the question (`cide_ipc::DocsSubject`), `title` is written at open
+    /// time from the answer, so a restored tab has a label before the pane has asked again.
+    Docs {
+        subject: crate::docs::DocsSubject,
+        title: String,
+    },
     Settings {
         section: SettingsSection,
     },
@@ -827,6 +837,7 @@ impl TabKind {
             // because it came from a row that was already drawing it.
             Self::Docker { title, .. } => title.clone(),
             Self::DockerFiles { name, .. } => format!("{name} : files"),
+            Self::Docs { title, .. } => title.clone(),
         }
     }
 }
@@ -1278,6 +1289,15 @@ impl Direction {
 pub struct LogLineDetail {
     pub raw: String,
     pub pretty: String,
+    /// When the line reached cide, in milliseconds since the Unix epoch.
+    ///
+    /// The card's clock for a line that carries none of its own: a codex `item.completed` has
+    /// no timestamp at all, so without this a tool call opened from a run's pane could say what
+    /// ran and how it ended but not *when* — the first thing somebody reading a run back after
+    /// the fact wants to know. Stamped by `cide-app`'s `logring` as the line arrives, which is
+    /// the only moment that clock is honest. A `u64` and therefore a `bigint` on the wire, as
+    /// `AgentRun::started_unix_ms` is; the card converts it the way `AgentsPanel/adapt.ts` does.
+    pub recorded_unix_ms: u64,
 }
 
 #[cfg(test)]

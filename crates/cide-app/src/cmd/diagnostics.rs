@@ -9,7 +9,7 @@
 //! better than running `cargo check` — so the webview has to send it.
 //!
 //! [`diagnostics_did_change`] is therefore debounced **on the frontend**, at 300 ms, exactly as
-//! `claude_selection_changed` documents for a selection drag: a command per keystroke is an IPC
+//! `EditorPane` debounces its position notes for a scroll: a command per keystroke is an IPC
 //! round trip per keystroke.
 //!
 //! # None of these is `spawn_blocking`, and that is deliberate
@@ -72,9 +72,7 @@ pub fn diagnostics_did_open(
     let Some(diagnostics) = registry.get(project) else {
         return;
     };
-    diagnostics.notify_document(&path, |session, uri, language_id| {
-        session.did_open(uri, language_id, version, text.clone())
-    });
+    diagnostics.document_opened(&path, version, text);
 }
 
 /// The buffer changed. **Debounced on the frontend** — see the module docs.
@@ -101,9 +99,7 @@ pub fn diagnostics_did_change(
         );
         return;
     }
-    diagnostics.notify_document(&path, |session, uri, _| {
-        session.did_change(uri, version, text.clone())
-    });
+    diagnostics.document_changed(&path, version, text);
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -127,7 +123,122 @@ pub fn diagnostics_did_close(
     let Some(diagnostics) = registry.get(project) else {
         return;
     };
-    diagnostics.notify_document(&path, |session, uri, _| session.did_close(uri));
+    diagnostics.document_closed(&path);
+}
+
+/// How long Quick documentation waits before saying so. [`DEFINITION_TIMEOUT`]'s reason, one
+/// gesture over: it is behind a keystroke too.
+const DOCS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Documentation for what is under the caret. (M60)
+///
+/// `async` + `spawn_blocking` for [`diagnostics_definition`]'s reason, and never `Err` for its
+/// reason too: "still indexing", "no server for this file" and "nothing to say here" are three
+/// answers, each with its own sentence — see [`cide_ipc::DocsAnswer`]. `word` is what the editor
+/// found under the caret, which a hover page is titled by.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn docs_lookup(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    path: std::path::PathBuf,
+    line: u32,
+    column: u32,
+    word: String,
+) -> Result<cide_ipc::DocsAnswer, ()> {
+    let subject = cide_ipc::DocsSubject::Position {
+        path,
+        line,
+        column,
+        word,
+    };
+    docs_for(registry, project, subject).await
+}
+
+/// The page a documentation tab is about, asked again. (M60)
+///
+/// The tab carries a subject and never a page (`cide_ipc::TabKind::Docs`), so the pane asks on
+/// every mount — a tab restored from `workspace.json` a week later takes exactly this road. A
+/// page the project remembers answers without a round trip; see
+/// `ProjectDiagnostics::documentation` for which are remembered.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn docs_page(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    subject: cide_ipc::DocsSubject,
+) -> Result<cide_ipc::DocsAnswer, ()> {
+    docs_for(registry, project, subject).await
+}
+
+async fn docs_for(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    subject: cide_ipc::DocsSubject,
+) -> Result<cide_ipc::DocsAnswer, ()> {
+    // Read out of the managed state *before* the await — `diagnostics_definition`'s note.
+    let Some(diagnostics) = registry.get(project) else {
+        return Ok(cide_ipc::DocsAnswer::Unavailable {
+            reason: "No language server is running for this project.".to_string(),
+        });
+    };
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        diagnostics.documentation(&subject, DOCS_TIMEOUT)
+    })
+    .await
+    .unwrap_or(cide_ipc::DocsAnswer::Unavailable {
+        reason: "The lookup did not finish.".to_string(),
+    }))
+}
+
+/// Open a documentation tab, or activate the one already about this subject. (M60)
+///
+/// `docker_open_inspect`'s shape and its reason: matching on the *subject* rather than the title
+/// is what keeps a reference followed twice from minting two identical tabs, and `title` is a
+/// caption written from the answer the caller already has.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn tab_open_docs(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    subject: cide_ipc::DocsSubject,
+    title: String,
+) -> std::result::Result<cide_ipc::TabId, cide_core::CoreError> {
+    let wanted = subject;
+    state.update(|ws| {
+        let open = cide_core::workspace::project(ws, project)?;
+        let existing = open
+            .tabs
+            .iter()
+            .find(|tab| matches!(&tab.kind, cide_ipc::TabKind::Docs { subject, .. } if *subject == wanted))
+            .map(|tab| tab.id);
+        if let Some(id) = existing {
+            cide_core::workspace::activate_tab(ws, project, id)?;
+            return Ok(id);
+        }
+        let title = if title.trim().is_empty() {
+            wanted.label()
+        } else {
+            title
+        };
+        cide_core::workspace::open_tab(
+            ws,
+            project,
+            cide_ipc::TabKind::Docs {
+                subject: wanted.clone(),
+                title,
+            },
+            cide_ipc::Pane {
+                id: cide_ipc::PaneId::new(),
+                kind: cide_ipc::PaneKind::Editor,
+                role: cide_ipc::PaneRole::Auxiliary,
+                // No process — the page renders over the tree, as a Docker inspect page does.
+                session: None,
+                conversation: None,
+                conversation_since: None,
+                continues: None,
+                title: "docs".into(),
+                docker: None,
+            },
+        )
+    })
 }
 
 /// How long Go to Definition waits before saying so.

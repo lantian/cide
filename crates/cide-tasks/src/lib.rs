@@ -128,6 +128,11 @@ pub fn well_formed_id(id: &TaskId) -> bool {
 ///   would gate a task on itself, and two entries under one key would make [`union_links`]'
 ///   per-key reconciliation ambiguous (the duplicate-task-id argument, one level down —
 ///   tombstoned entries count, because they carry the key too).
+/// * **`next_id` is past every numeric id** — [`TaskFile::next_id`] is what keeps a deleted id
+///   from coming back, and it can only do that while it is ahead of every id it ever handed
+///   out. Only a hand edit or a bug in this crate's own [`mint_id`], [`merge`] or [`repair`]
+///   can put it behind (`settle_next_id` raises it on every read), and the failure that bug
+///   would cause is the silent one: the next create fills a gap that may be a deleted task.
 ///
 /// Two link states are **deliberately legal** here, refused only as gestures in
 /// [`TaskStore::edit`]:
@@ -175,6 +180,18 @@ pub fn validate(file: &TaskFile) -> Result<()> {
             )));
         }
         seen.push(task.id.as_str());
+        if let Some(n) = task
+            .id
+            .as_str()
+            .strip_prefix("t-")
+            .and_then(|n| n.parse::<u64>().ok())
+            && n >= file.next_id
+        {
+            return Err(CoreError::Invariant(format!(
+                "task {} is not below the file's next id {}",
+                task.id, file.next_id
+            )));
+        }
 
         for (i, entry) in task.links.iter().enumerate() {
             if !well_formed_id(&entry.target) {
@@ -305,10 +322,10 @@ const LEGACY_CREATE_NOTE: &str = "created this task";
 ///   otherwise freeze the tracker. A *dangling* target is not in this list — it is legal, see
 ///   [`validate`].
 fn repair(file: &mut TaskFile) {
-    // The high-water mark is read once, up front, and advanced by hand as ids are minted: a task
-    // re-minted mid-pass must not be able to collide with one further down the list that has not
-    // been visited yet.
-    let mut high_water = high_water_mark(file);
+    // Settled first, so that a re-mint below takes a number past every id in the file — including
+    // one further down the list that has not been visited yet — and so that a file written before
+    // the counter existed has one at all.
+    settle_next_id(file);
 
     // Every re-mint below, `was → now`, applied to link targets in a second pass: a reference
     // that is a field can follow the rename that a reference in prose never could.
@@ -317,8 +334,10 @@ fn repair(file: &mut TaskFile) {
     let mut kept: Vec<Task> = Vec::with_capacity(file.tasks.len());
     for mut task in std::mem::take(&mut file.tasks) {
         if !well_formed_id(&task.id) {
-            high_water += 1;
-            let minted = TaskId(format!("t-{high_water}"));
+            // A re-mint is a mint: it spends the counter, or the next create would hand out the
+            // id this task just took.
+            let minted = TaskId(format!("t-{}", file.next_id));
+            file.next_id += 1;
             tracing::warn!(
                 was = %task.id,
                 now = %minted,
@@ -472,45 +491,69 @@ fn repair(file: &mut TaskFile) {
     file.tasks = kept;
 }
 
-/// The largest `n` across every `t-<n>` in the file, and `rev`.
+/// The largest `n` across every `t-<n>` in the file.
 ///
-/// **`rev` is in here, and it is the half that survives a delete.** Taking the mark from the task
-/// list alone is what [`TaskId`]'s doc warns about one step removed: delete the newest task and
-/// the maximum drops, so the next mint reuses an id that comments, prompts and commit messages
-/// still name — a second `t-17` silently re-points every one of them. `rev` only ever increases
-/// (every accepted mutation bumps it, and [`merge`] sets it past both sides), and every create
-/// bumps it at least once, so `max(largest id, rev)` is a mark that a delete cannot lower.
-///
-/// The cost is that ids are not contiguous after a delete or an out-of-process merge — `t-1`,
-/// `t-2`, `t-4`. That is the correct direction to be wrong in: a gap is a curiosity, a reused id
-/// is a reference that points at the wrong work with nothing anywhere to detect it.
-///
-/// Non-numeric ids (a hand-written `spike`) contribute nothing to the mark, which is why
-/// [`next_id`] still has to check the candidate is actually free.
-fn high_water_mark(file: &TaskFile) -> u64 {
-    let largest = file
-        .tasks
+/// Non-numeric ids (a hand-written `spike`) contribute nothing, and `t-0007` contributes 7 while
+/// being a different string from `t-7` — which is why [`mint_id`] still has to check that its
+/// candidate is actually free.
+fn largest_numeric_id(file: &TaskFile) -> u64 {
+    file.tasks
         .iter()
         .filter_map(|task| task.id.as_str().strip_prefix("t-"))
         .filter_map(|n| n.parse::<u64>().ok())
         .max()
-        .unwrap_or(0);
-    largest.max(file.rev)
+        .unwrap_or(0)
 }
 
-/// The next free `t-<n>` for this file.
+/// Give the file a usable [`TaskFile::next_id`], whatever it arrived with. Part of [`repair`].
 ///
-/// The loop is not paranoia: `high_water_mark` ignores ids that are not `t-<digits>`, and a
-/// hand-edited file can perfectly legally contain `t-0007` — which parses as 7 for the mark but
-/// is a different string, so a mint of `t-7` would be a genuine duplicate rather than a shadow.
-pub fn next_id(file: &TaskFile) -> TaskId {
-    let mut n = high_water_mark(file);
+/// Two cases, and the first is the migration. **A file with no counter** — `0`, which is what
+/// every file written before M61 deserialises to — is settled under the rule those files were
+/// minted under: `max(largest id, rev) + 1`. Not `largest + 1`, though that is what a fresh file
+/// gets: under the old rule a delete never lowered the mark *because* `rev` was in it, so the
+/// numbers between the largest surviving id and `rev` may name tasks that were deleted and are
+/// still quoted in comments and commit messages — and the file cannot say which. The one safe
+/// floor is the old one. The cost is a single last jump, past a `rev` that comments have been
+/// advancing for as long as the board has existed, after which the counter moves only on a
+/// create.
+///
+/// **A counter behind the largest id** is a hand edit or a file copied from another board, and
+/// is raised past it. A mint from below would not duplicate — [`mint_id`] checks — but it would
+/// fill a gap, and a gap may be a deleted task for exactly the reason above.
+fn settle_next_id(file: &mut TaskFile) {
+    let floor = largest_numeric_id(file) + 1;
+    if file.next_id == 0 {
+        file.next_id = floor.max(file.rev + 1);
+        tracing::info!(
+            next_id = file.next_id,
+            "task file had no id counter; settled it past every id and past rev"
+        );
+    } else if file.next_id < floor {
+        tracing::warn!(
+            was = file.next_id,
+            now = floor,
+            "task file's id counter was behind its largest id; raised it"
+        );
+        file.next_id = floor;
+    }
+}
+
+/// Mint the next `t-<n>` and move the counter past it.
+///
+/// The loop is not paranoia: the counter is only guaranteed past every id that *parses* as
+/// `t-<digits>`, and a hand-edited file can perfectly legally contain `t-0007` — which parses as
+/// 7 but is a different string, so a mint of `t-7` would be a genuine duplicate rather than a
+/// shadow. The counter lands one past whatever was actually used, so the next mint is the next
+/// number and not a second walk over the same collision.
+fn mint_id(file: &mut TaskFile) -> TaskId {
+    let mut n = file.next_id.max(1);
     loop {
-        n += 1;
         let candidate = TaskId(format!("t-{n}"));
         if !file.tasks.iter().any(|task| task.id == candidate) {
+            file.next_id = n + 1;
             return candidate;
         }
+        n += 1;
     }
 }
 
@@ -999,6 +1042,12 @@ pub fn merge(mine: &TaskFile, theirs: &TaskFile) -> TaskFile {
         // panel mid-render — must see this as newer, and `TaskFile::rev`'s own doc is the contract
         // that says a receiver drops a snapshot whose rev is not newer.
         rev: mine.rev.max(theirs.rev) + 1,
+        // The higher of the two, and not past both: each side is past every id it minted, so the
+        // higher is past every id either minted, and — unlike `rev` — nobody compares this one
+        // for freshness. Two boards that each minted `t-50` since their common ancestor collided
+        // above, in `merge_task`, exactly as they did under the old rule; the counter neither
+        // causes nor cures that.
+        next_id: mine.next_id.max(theirs.next_id),
         tasks,
     }
 }
@@ -1797,7 +1846,7 @@ impl TaskStore {
             // `TaskNew::links` carries the argument.
             let links = validated_links(req.links.as_deref().unwrap_or(&[]), file, now)?;
             let task = Task {
-                id: next_id(file),
+                id: mint_id(file),
                 // Trimmed, because a title is one line drawn in a 320px panel and trailing space is
                 // invisible there but not in the file's diff.
                 title: req.title.trim().to_string(),
@@ -2093,7 +2142,7 @@ impl TaskStore {
 
     /// Remove a task.
     ///
-    /// The id is **not** returned to the pool — see `high_water_mark`. Deliberately not reachable
+    /// The id is **not** returned to the pool — see [`TaskFile::next_id`]. Deliberately not reachable
     /// from an MCP tool either: the file is the shared record of what happened, and deletion belongs
     /// to the user.
     ///
@@ -2424,11 +2473,14 @@ mod tests {
     }
 
     fn a_file(rev: u64, tasks: Vec<Task>) -> TaskFile {
-        TaskFile {
+        let mut file = TaskFile {
             schema_version: TaskFile::CURRENT_SCHEMA,
             rev,
+            next_id: 0,
             tasks,
-        }
+        };
+        settle_next_id(&mut file);
+        file
     }
 
     fn titles(file: &TaskFile) -> Vec<&str> {
@@ -3139,6 +3191,10 @@ mod tests {
         let file = TaskStore::open(dir.root()).snapshot();
         assert_eq!(file.tasks.len(), 2, "a repair must not lose a task");
         assert!(well_formed_id(&file.tasks[0].id), "{}", file.tasks[0].id);
+        // Settled past `rev` (5) as well as past `t-2`, so the re-mint is `t-6` — and the counter
+        // has moved past it, because a re-mint is a mint.
+        assert_eq!(file.tasks[0].id.as_str(), "t-6");
+        assert_eq!(file.next_id, 7);
         assert_eq!(file.tasks[1].title, "(untitled)");
         // The whole point of repairing: `update` validates and rolls back, so a file that stayed
         // invalid would refuse every later edit with nothing on screen saying why.
@@ -3765,6 +3821,7 @@ mod tests {
         let file = |task: &Task| TaskFile {
             schema_version: TaskFile::CURRENT_SCHEMA,
             rev: 1,
+            next_id: 2,
             tasks: vec![task.clone()],
         };
         let merged = merge(&file(&mine), &file(&theirs));
@@ -3798,21 +3855,155 @@ mod tests {
         let third = store
             .create(&new_task("three"), TaskAuthor::User)
             .expect("three");
-        assert_ne!(third.id, second.id, "the id of a deleted task came back");
+        assert_eq!(
+            third.id.as_str(),
+            "t-3",
+            "the id of a deleted task came back, or the delete cost a number"
+        );
 
-        // And it survives a restart, which is what taking `rev` into the high-water mark buys: a
-        // mark read from the task list alone would drop back to 1 the moment `t-2` was removed.
+        // And it survives a restart, which is what a counter *in the file* buys: a mark read
+        // from the task list alone would drop back to 1 the moment `t-2` was removed.
         store.write_now();
         let reopened = TaskStore::open(dir.root());
         let fourth = reopened
             .create(&new_task("four"), TaskAuthor::User)
             .expect("four");
-        assert!(
-            ![first.id.as_str(), second.id.as_str(), third.id.as_str()]
-                .contains(&fourth.id.as_str()),
-            "{} collided after a reopen",
-            fourth.id
+        assert_eq!(
+            fourth.id.as_str(),
+            "t-4",
+            "the counter did not survive the reopen"
         );
+    }
+
+    /// The M61 report: a board with agents on it went `t-772`, `t-774`, `t-776`, because the mark
+    /// folded `rev` in and `rev` moves on every comment and status change.
+    #[test]
+    fn ids_are_contiguous_across_every_other_kind_of_mutation() {
+        let dir = TempDir::new("contiguous");
+        let store = TaskStore::open(dir.root());
+        let first = store
+            .create(&new_task("one"), TaskAuthor::User)
+            .expect("one");
+        store
+            .edit(
+                &first.id,
+                TaskEdit::SetStatus {
+                    status: TaskStatus::Doing,
+                },
+                TaskAuthor::User,
+            )
+            .expect("status");
+        store
+            .edit(
+                &first.id,
+                TaskEdit::Comment {
+                    text: "on it".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("comment");
+        store
+            .edit(
+                &first.id,
+                TaskEdit::SetTitle {
+                    title: "one, renamed".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("title");
+        let second = store
+            .create(&new_task("two"), TaskAuthor::User)
+            .expect("two");
+        assert_eq!(
+            second.id.as_str(),
+            "t-2",
+            "a mutation between two creates spent a number"
+        );
+        assert!(
+            store.snapshot().rev > 2,
+            "the test only tests while rev has run ahead of the ids"
+        );
+
+        store.write_now();
+        let reopened = TaskStore::open(dir.root());
+        let third = reopened
+            .create(&new_task("three"), TaskAuthor::User)
+            .expect("three");
+        assert_eq!(third.id.as_str(), "t-3");
+    }
+
+    /// A file written before the counter existed is settled under the rule it was minted under,
+    /// once: past `rev`, because the numbers between the largest surviving id and `rev` may be
+    /// deleted tasks the file cannot name. Contiguous from there, and written back with the
+    /// counter so the next open has nothing to settle.
+    #[test]
+    fn a_file_without_a_counter_starts_past_its_rev_and_is_contiguous_from_there() {
+        let dir = TempDir::new("legacy-counter");
+        dir.plant(
+            r#"{"schemaVersion":1,"rev":12,"tasks":[
+                {"id":"t-3","title":"old","body":"","status":"todo","agent":null,
+                 "comments":[],"createdUnixMs":1,"updatedUnixMs":1}]}"#,
+        );
+        let store = TaskStore::open(dir.root());
+        assert_eq!(store.snapshot().next_id, 13);
+        let a = store.create(&new_task("a"), TaskAuthor::User).expect("a");
+        store
+            .edit(
+                &a.id,
+                TaskEdit::Comment {
+                    text: "spends nothing".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("comment");
+        let b = store.create(&new_task("b"), TaskAuthor::User).expect("b");
+        assert_eq!((a.id.as_str(), b.id.as_str()), ("t-13", "t-14"));
+
+        store.write_now();
+        let raw = fs::read_to_string(dir.tasks()).expect("read");
+        assert!(raw.contains("\"nextId\": 15"), "{raw}");
+    }
+
+    /// The other bad input: a counter behind the largest id — a hand edit, or a file copied from
+    /// another board. Raised past it rather than trusted, because a mint from below would fill a
+    /// gap that may be a deleted task.
+    #[test]
+    fn a_counter_behind_the_largest_id_is_raised_past_it() {
+        let dir = TempDir::new("low-counter");
+        dir.plant(
+            r#"{"schemaVersion":1,"rev":2,"nextId":2,"tasks":[
+                {"id":"t-9","title":"pasted in","body":"","status":"todo","agent":null,
+                 "comments":[],"createdUnixMs":1,"updatedUnixMs":1}]}"#,
+        );
+        let store = TaskStore::open(dir.root());
+        let file = store.snapshot();
+        assert_eq!(file.next_id, 10);
+        assert!(validate(&file).is_ok());
+        let next = store
+            .create(&new_task("next"), TaskAuthor::User)
+            .expect("create");
+        assert_eq!(next.id.as_str(), "t-10");
+    }
+
+    #[test]
+    fn a_counter_behind_a_live_id_is_refused_by_validate() {
+        let mut file = a_file(1, vec![a_task("t-4", "four", 1)]);
+        assert!(validate(&file).is_ok());
+        file.next_id = 4;
+        assert!(
+            validate(&file).is_err(),
+            "a counter that is not past every id will mint one of them again"
+        );
+    }
+
+    #[test]
+    fn the_merge_takes_the_higher_counter_from_either_side() {
+        let mut mine = a_file(5, vec![a_task("t-1", "one", 1)]);
+        let mut theirs = a_file(5, vec![a_task("t-1", "one", 1)]);
+        mine.next_id = 7;
+        theirs.next_id = 40;
+        assert_eq!(merge(&mine, &theirs).next_id, 40);
+        assert_eq!(merge(&theirs, &mine).next_id, 40);
     }
 
     #[test]

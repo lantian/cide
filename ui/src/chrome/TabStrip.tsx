@@ -723,6 +723,19 @@ function viewFor(kind: TabKind): TabView {
         audit: undefined,
       }
 
+    case 'docs':
+      return {
+        // A page about a symbol, in Settings' shape for the reason the arms around it give. (M60)
+        shape: styles.shapeSettings,
+        // The stored title — `Dictionary`, `Node.add_child` — written at open time from the
+        // answer, so a restored tab has a label before its pane has asked again.
+        body: <span>{kind.title}</span>,
+        closable: true,
+        // Read-only, and re-read on every mount; nothing in it can be unsaved.
+        dirty: false,
+        hint: 'documentation',
+        audit: undefined,
+      }
     case 'docker':
       return {
         // Settings' shape again, for the reason the OpenSpec arm above gives: this is a page

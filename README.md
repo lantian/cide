@@ -32,7 +32,8 @@ CodeMirror 6 surfaces over an LSP client written as threads rather than tokio. A
 second launch — and its own **gopls**; a source build uses whatever is on your `PATH`, and any
 other server can be contributed by an extension. Completion with lazily resolved auto-imports,
 diagnostics that follow the disk, go-to-definition and go-to-implementation, Find usages, folding,
-blame, an outline, a markdown preview, and Shift+Alt+F to reformat.
+blame, an outline, a markdown preview, an Excalidraw canvas for `.excalidraw` drawings (JSON,
+SVG or PNG, saved back in the same format), and Shift+Alt+F to reformat.
 
 ### Git, at the granularity you actually commit in
 

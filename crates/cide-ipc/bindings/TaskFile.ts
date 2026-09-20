@@ -4,9 +4,9 @@ import type { Task } from "./Task";
 /**
  * The whole of `.cide/tasks.json`.
  *
- * `{ "schemaVersion": 1, "rev": 42, "tasks": [ … ] }`, written with `to_vec_pretty`, because a
- * one-line JSON file makes every change a whole-file diff and this file's diffs are read by
- * people.
+ * `{ "schemaVersion": 1, "rev": 42, "nextId": 18, "tasks": [ … ] }`, written with
+ * `to_vec_pretty`, because a one-line JSON file makes every change a whole-file diff and this
+ * file's diffs are read by people.
  */
 export type TaskFile = { 
 /**
@@ -23,6 +23,28 @@ schemaVersion: number,
  * here the way it is for a single-writer registry.
  */
 rev: bigint, 
+/**
+ * The number the next created task takes: `t-<next_id>`. **Only a create advances it.**
+ *
+ * Until M61 there was no such field and the next id was `max(largest t-<n>, rev) + 1`. The
+ * `rev` half was there so that deleting the newest task could not lower the mark — a reused
+ * id silently re-points every comment, prompt and commit message that named the first one,
+ * and nothing anywhere can detect it. But `rev` moves on *every* accepted mutation, so each
+ * comment, assignment and status change between two creates spent a number, and a board
+ * with agents on it went `t-772`, `t-774`, `t-776`, `t-780` — the "gap after a delete" that
+ * rule's doc admitted to was in practice a gap after nearly everything. This counter keeps
+ * the two facts apart: `rev` says how many times the file changed, this says how many tasks
+ * were ever minted, and a delete lowers neither.
+ *
+ * **Zero means "not yet computed"** and is what a file written before the field existed
+ * deserialises to; this build never writes it, and `cide_tasks::repair` settles such a file
+ * under the old rule *once* — past `rev` as well as past every id, because an id deleted
+ * under the old rule is not in the file to be seen. So an existing board takes one last jump
+ * and is contiguous from there. A value behind the largest id in the file (a hand edit, a
+ * file copied from another board) is raised past it by the same repair, and `validate`
+ * refuses a file where it is not. The out-of-process merge takes the higher of the two sides'.
+ */
+nextId: bigint, 
 /**
  * **A list, not a map**, and the order is meaningful.
  *

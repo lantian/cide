@@ -128,8 +128,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::render::{
-    BOLD, CYAN, DIM, REASONING_BUDGET, RED, RESET, RUN_COLS, RUN_ROWS, TITLE_BUDGET, absorbs, clip,
-    compact_input, compose, one_line_of, prose, thousands,
+    BOLD, CYAN, DIM, RED, RESET, RUN_COLS, RUN_ROWS, TITLE_BUDGET, absorbs, clip, compact_input,
+    compose, measured_ms, one_line_of, prose, tail, thought_line, thousands,
 };
 use super::{
     ADHOC_PREAMBLE, ContinueSpec, Delivery, Harness, HarnessError, HarnessSpawn, Observation,
@@ -397,22 +397,22 @@ fn capture(line: &str) -> Option<String> {
 }
 
 /// Whether a person may later ask for this line's whole event — [`SessionBinding::Harness`]'s
-/// `keep`. Every completed item but a reasoning fragment, and the two failure shapes.
+/// `keep`. Every completed item, and the two failure shapes.
+///
+/// Reasoning was the one exclusion until M62, when the rendering stopped drawing any of it: the
+/// row is now a duration and a handle, so this ring is the only copy of what was thought. See
+/// `opencode::keep_event` for the pairing this has to hold with the row's handle.
+///
+/// `item.started`/`item.updated` stay out, and must: they arrive per streamed chunk, and keeping
+/// them would spend a ring slot each on a line the renderer deliberately draws nothing for.
 pub fn keep_event(line: &str) -> bool {
     let Some(event) = object_of(line) else {
         return false;
     };
-    match event.get("type").and_then(Value::as_str) {
-        Some("item.completed") => {
-            event
-                .get("item")
-                .and_then(|item| item.get("type"))
-                .and_then(Value::as_str)
-                != Some("reasoning")
-        }
-        Some("error") | Some("turn.failed") => true,
-        _ => false,
-    }
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("item.completed" | "error" | "turn.failed")
+    )
 }
 
 /// The line as a JSON object, or `None` for anything else — [`Event::parse`]'s rule, for the
@@ -444,13 +444,15 @@ fn object_of(line: &str) -> Option<serde_json::Map<String, Value>> {
 ///   `item.started` and `item.updated` draw nothing **and leave the marker alone** — they are
 ///   the streamed progress of one item, and redrawing the marker on every chunk would scroll
 ///   a pane doing nothing;
-/// * the model's own words pass whole, reasoning dimmed and clipped, `turn.completed` is one dim
+/// * the model's own words pass whole, a block of reasoning collapses to one dim row naming how
+///   long it took (M62 — the whole block is behind the handle), `turn.completed` is one dim
 ///   token count;
 /// * an event or item type this build has never heard of becomes a dim one-word marker, and a
 ///   line that is not JSON is kept verbatim — the CLI's own prose, which hiding would hide.
 ///
-/// The `#handle` tail is spelled as opencode spells it, at the end of the first line, because
-/// `ui/src/terminal/runLinks.ts` reads it off the end of a line beginning `●` or `✗`.
+/// The `#handle` tail is spelled as opencode spells it — by the same function, since M62 — at
+/// the end of the first line, because `ui/src/terminal/runLinks.ts` reads it off the end of a
+/// line beginning `●`, `✗` or `∴`.
 pub fn render_event(state: &mut RenderState, line: &str, handle: Option<u64>) -> Rendered {
     let Some(event) = object_of(line) else {
         return prose(state, line);
@@ -508,9 +510,12 @@ pub fn render_event(state: &mut RenderState, line: &str, handle: Option<u64>) ->
         // Progress of an item still running. Nothing drawn, and — deliberately not through
         // `compose` — the marker left where it is.
         "item.started" | "item.updated" => return Rendered::Drop,
+        // The thinking duration is resolved *here*, before `compose` moves the clock on, and
+        // handed down: `render_item` stays a function of the item alone, which is what its
+        // table of arms is readable as.
         "item.completed" => {
             let item = event.get("item").unwrap_or(&Value::Null);
-            match render_item(item, handle) {
+            match render_item(item, handle, measured_ms(state)) {
                 Some(text) => Some(text),
                 None => return Rendered::Drop,
             }
@@ -521,9 +526,12 @@ pub fn render_event(state: &mut RenderState, line: &str, handle: Option<u64>) ->
 }
 
 /// One completed item on one line (two for a failure), or `None` for one that draws nothing.
-fn render_item(item: &Value, handle: Option<u64>) -> Option<String> {
+///
+/// `thought_ms` is the gap since the previous rendered line, read by the reasoning arm alone —
+/// codex records no clock on any item, so it is the only duration there is.
+fn render_item(item: &Value, handle: Option<u64>, thought_ms: Option<u64>) -> Option<String> {
     let kind = item.get("type").and_then(Value::as_str).unwrap_or("item");
-    let tail = tail(handle);
+    let tail = tail(None, handle);
     Some(match kind {
         "agent_message" => {
             let text = text_of(item, "text");
@@ -533,12 +541,14 @@ fn render_item(item: &Value, handle: Option<u64>) -> Option<String> {
             }
             text.to_string()
         }
+        // One row, no prose — `opencode.rs`'s reasoning arm, over this shape. The duration is
+        // measured rather than stated because **no** codex item carries a clock (see
+        // `render_command`), so the only interval available is the silence this item ended.
         "reasoning" => {
-            let text = one_line_of(text_of(item, "text"));
-            if text.is_empty() {
+            if one_line_of(text_of(item, "text")).is_empty() {
                 return None;
             }
-            format!("{DIM}∴ {}{RESET}", clip(&text, REASONING_BUDGET))
+            thought_line(thought_ms, handle)
         }
         "command_execution" => render_command(item, &tail),
         "file_change" => render_file_change(item, &tail),
@@ -671,14 +681,6 @@ fn render_plan(item: &Value) -> String {
         })
         .unwrap_or_default();
     format!("{DIM}· plan {done}/{}{next}{RESET}", items.len())
-}
-
-/// The dim tail carrying the handle a click resolves. Last on the line and spelled `#<n>`
-/// because `ui/src/terminal/runLinks.ts` reads it off the end.
-fn tail(handle: Option<u64>) -> String {
-    handle
-        .map(|handle| format!("  {DIM}#{handle}{RESET}"))
-        .unwrap_or_default()
 }
 
 /// A string field, or the empty string.
@@ -1649,18 +1651,23 @@ mod tests {
             message, "The task is already in doing.\n\nChecking the build.",
             "the model's own words pass whole"
         );
-        let reasoning = replaced(render_event(&mut flat, ITEM_REASONING, None));
+        // A block of thinking is one row and **none** of the thinking: codex states no clock on
+        // any item, so the duration is the silence this item ended — the gap between the last
+        // line that drew something and this one. The collapse is the feature, so the assertion
+        // that the prose is gone matters as much as the duration.
+        let mut timed = RenderState {
+            now_unix_ms: Some(20_000),
+            last_line_unix_ms: Some(16_800),
+            ..RenderState::default()
+        };
+        let reasoning = replaced(render_event(&mut timed, ITEM_REASONING, Some(21)));
         assert!(reasoning.starts_with(DIM), "{reasoning:?}");
-        assert!(plain(&reasoning).starts_with("∴ **Planning** Read the task first."));
-        let mut long = role();
-        long.def.system_prompt.clear();
-        let long_line = format!(
-            r#"{{"type":"item.completed","item":{{"type":"reasoning","text":"{}"}}}}"#,
-            "word ".repeat(100)
-        );
-        let clipped = plain(&replaced(render_event(&mut flat, &long_line, None)));
-        assert!(clipped.ends_with('…'), "{clipped}");
-        assert!(clipped.chars().count() < 260, "{clipped}");
+        assert_eq!(plain(&reasoning), "∴ thought  3.2s #21");
+
+        // No clock at all — an unstamped caller, or the first line of a run — draws no duration
+        // rather than `0ms`, which would be a measurement cide did not make.
+        let unmeasured = plain(&replaced(render_event(&mut flat, ITEM_REASONING, Some(22))));
+        assert_eq!(unmeasured, "∴ thought  #22");
 
         let search = plain(&replaced(render_event(
             &mut flat,
@@ -1731,8 +1738,10 @@ mod tests {
         ] {
             assert!(keep_event(kept), "{kept}");
         }
+        // Reasoning joined the kept list in M62: the row draws none of it, so this ring is the
+        // only copy — and the row names the handle, which is the other half of the pairing.
+        assert!(keep_event(ITEM_REASONING));
         for dropped in [
-            ITEM_REASONING,
             THREAD_STARTED,
             TURN_STARTED,
             TURN_COMPLETED,

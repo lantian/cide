@@ -1783,6 +1783,7 @@ mod tests {
         TaskFile {
             schema_version: TaskFile::CURRENT_SCHEMA,
             rev: 7,
+            next_id: 100,
             tasks,
         }
     }

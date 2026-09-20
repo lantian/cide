@@ -85,7 +85,9 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
     let ids: Vec<&str> = market.entries.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(
         ids,
-        vec!["sql", "yaml", "proto", "graphql", "web", "showcase"],
+        vec![
+            "sql", "yaml", "proto", "graphql", "web", "showcase", "godot"
+        ],
         "every extension the index lists was read"
     );
     assert!(
@@ -115,6 +117,19 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             "{id} contributes a language server, so it must ask for process:spawn"
         );
     }
+    // The godot extension attaches to a server it does not start, so it asks for `lsp:connect`
+    // and **not** `process:spawn` — the install sheet would otherwise say "run programs on your
+    // machine" about an extension that runs none. (M59)
+    let godot = market
+        .entries
+        .iter()
+        .find(|e| e.id.as_str() == "godot")
+        .expect("godot");
+    assert_eq!(
+        godot.capabilities,
+        vec![cide_ipc::ext::Capability::LspConnect],
+        "a connect server needs exactly the capability its transport needs"
+    );
     // The showcase asks for everything, and that is the point of it: its Requests panel exists to
     // show what each capability answers.
     let showcase = market
@@ -144,7 +159,9 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
 
     // --- install all --------------------------------------------------------------------------
     let mut snapshot = snapshot;
-    for id in ["sql", "yaml", "proto", "graphql", "web", "showcase"] {
+    for id in [
+        "sql", "yaml", "proto", "graphql", "web", "showcase", "godot",
+    ] {
         let reference = cide_ipc::ext::ExtensionRef {
             marketplace: market.id.clone(),
             extension: cide_ipc::ids::ExtensionId(id.into()),
@@ -158,7 +175,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             .clone();
         snapshot = store.install(&reference, &granted).expect("install");
     }
-    assert_eq!(snapshot.extensions.len(), 6);
+    assert_eq!(snapshot.extensions.len(), 7);
     for installed in &snapshot.extensions {
         assert!(installed.enabled);
         assert!(
@@ -167,13 +184,14 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             installed.id,
             installed.unavailable
         );
-        if installed.id.extension.0 == "web" {
-            // The marketplace's first *declarative* extension: no worker, contributions only.
-            // A positive assertion rather than a skip, because "main is None and it still
+        if installed.id.extension.0 == "web" || installed.id.extension.0 == "godot" {
+            // The marketplace's declarative extensions: no worker, contributions only. A
+            // positive assertion rather than a skip, because "main is None and it still
             // contributes" is exactly the shape the manifest format promises is first-class.
             assert_eq!(
                 installed.main, None,
-                "web ships no worker — languages and servers are data"
+                "{} ships no worker — languages and servers are data",
+                installed.id
             );
         } else {
             assert_eq!(
@@ -225,7 +243,18 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
     // nor `json` — the builtin grammars are hook-based and better than the rule form — and a
     // `supersedes` appearing on any of these would mean it started displacing a builtin.
     for id in [
-        "proto", "graphql", "html", "css", "scss", "less", "vue", "svelte", "xml",
+        "proto",
+        "graphql",
+        "html",
+        "css",
+        "scss",
+        "less",
+        "vue",
+        "svelte",
+        "xml",
+        "gdscript",
+        "gdshader",
+        "godot-resource",
     ] {
         let binding = resolved
             .languages
@@ -251,7 +280,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
             .filter(|b| b.source == cide_ipc::ext::ContributionSource::Builtin)
             .count()
             >= 9,
-        "installing five language extensions displaced only the two languages with builtins"
+        "installing six language extensions displaced only the two languages with builtins"
     );
 
     let servers: Vec<&str> = resolved
@@ -290,6 +319,28 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
         ts_server.def.language_ids,
         vec!["typescript".to_string()],
         "bound to the builtin id — the whole point of the web extension's server half"
+    );
+    // The marketplace's first `connect` server (M59): reached, never run. The binding carries
+    // the endpoint and nothing a spawn would need, and the whole road — manifest validation
+    // (loopback, a marker, no `args`), install, resolve — let it through clean.
+    let godot_server = resolved
+        .servers
+        .iter()
+        .find(|s| s.def.binary == "godot")
+        .expect("godot reached the registry");
+    let endpoint = godot_server
+        .def
+        .connect
+        .as_ref()
+        .expect("a connect server carries its endpoint");
+    assert_eq!((endpoint.host.as_str(), endpoint.port), ("127.0.0.1", 6005));
+    assert!(
+        godot_server.def.args.is_empty(),
+        "nothing is spawned, so nothing takes arguments"
+    );
+    assert_eq!(
+        godot_server.def.project_markers,
+        vec!["project.godot".to_string()]
     );
     let css_server = resolved
         .servers
@@ -444,7 +495,7 @@ fn the_sibling_marketplace_installs_and_supersedes_two_builtins() {
 
     // --- uninstalling removes the files ------------------------------------------------------
     let snapshot = store.uninstall(&sql_ref).expect("uninstall");
-    assert_eq!(snapshot.extensions.len(), 5);
+    assert_eq!(snapshot.extensions.len(), 6);
     assert!(
         !cide_ext::install_path(&market.id, &cide_ipc::ids::ExtensionId("sql".into())).exists(),
         "and the directory this crate created is the directory it removed"

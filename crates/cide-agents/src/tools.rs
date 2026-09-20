@@ -426,7 +426,7 @@ pub trait TaskSink: Send + Sync {
     /// for "the tracker could not be read at all".
     fn get(&self, id: &TaskId) -> Result<Option<Task>, String>;
 
-    /// Add a task. The id is minted by the store from the file's own high-water mark.
+    /// Add a task. The id is minted by the store from the file's own counter (`TaskFile::next_id`).
     ///
     /// `body` is `&str` and not `Option<&str>`: [`Task::body`] is not nullable, and "no body" and
     /// "an empty body" are the same fact about a task.

@@ -9,4 +9,15 @@
  * belongs in a ticket or a grep, and reformatting those on the way out would be quietly
  * changing somebody's evidence.
  */
-export type LogLineDetail = { raw: string, pretty: string, };
+export type LogLineDetail = { raw: string, pretty: string, 
+/**
+ * When the line reached cide, in milliseconds since the Unix epoch.
+ *
+ * The card's clock for a line that carries none of its own: a codex `item.completed` has
+ * no timestamp at all, so without this a tool call opened from a run's pane could say what
+ * ran and how it ended but not *when* — the first thing somebody reading a run back after
+ * the fact wants to know. Stamped by `cide-app`'s `logring` as the line arrives, which is
+ * the only moment that clock is honest. A `u64` and therefore a `bigint` on the wire, as
+ * `AgentRun::started_unix_ms` is; the card converts it the way `AgentsPanel/adapt.ts` does.
+ */
+recordedUnixMs: bigint, };
