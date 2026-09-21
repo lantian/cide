@@ -5047,6 +5047,50 @@ impl AgentRegistry {
         }))
     }
 
+    /// Write down the harness a run is **actually** being forked with. (M78)
+    ///
+    /// # Why a run's harness is written twice
+    ///
+    /// `DispatchSpec::harness` is `agent.def.harness` — the committed file's answer — because at
+    /// dispatch there is no child and the definition is the only thing that has spoken. That is a
+    /// *plan*. A local override may redirect the role onto another CLI, and `start_child` has
+    /// always honoured it: `RunPlan::harness` is `resolved.harness`, and the comment there says
+    /// in as many words that reading the definition would "fork the harness the file names while
+    /// every other decision above was made for the one the user chose".
+    ///
+    /// Every other decision — except this one. The registry went on holding the definition's
+    /// answer for the life of the run, and `observe` reads it to pick the state machine that
+    /// interprets the child's output. So a role redirected from `opencode` to `codex` was forked
+    /// as codex and read as opencode: codex says `thread.started` and `item.completed`, opencode's
+    /// machine matches neither, every line answered `None`, and **the run never left
+    /// `RunState::Starting`** for its whole life. It worked perfectly and reported nothing — the
+    /// panel's mark is `circle-dashed`, which is a still glyph, so the visible symptom was a
+    /// spinner that never span. `holds_its_checkout` keeps a `Starting` run's worktree, so the
+    /// queue behind it also never moved.
+    ///
+    /// Written at the fork and not at the dispatch, because the fork is the moment the answer
+    /// stops being a plan: the override file is re-read there (a `git checkout` may have changed
+    /// it while the run sat in the queue), and a queued run has no child to be wrong about.
+    /// Every later reader wants the fact rather than the file — the stop route's `deliver`, the
+    /// transcript `Open` guards, the tools vocabulary spliced into the prompt, the label the row
+    /// draws, and the snapshot a restored run is rebuilt from.
+    fn note_harness(&self, run: RunId, harness: Harness) {
+        let mut inner = self.inner.lock();
+        let Some(live) = inner.runs.get_mut(&run) else {
+            return;
+        };
+        if live.harness == harness {
+            return;
+        }
+        tracing::debug!(
+            %run,
+            from = ?live.harness,
+            to = ?harness,
+            "a local override redirected this run onto another harness",
+        );
+        live.harness = harness;
+    }
+
     /// Write down the conversation id a harness minted for a run. Answers whether it was new.
     fn note_harness_session(&self, run: RunId, harness_session: String) -> bool {
         let mut inner = self.inner.lock();
@@ -5571,6 +5615,10 @@ fn start_child(
     if let Some(refusal) = resolved.refusal {
         return Err(CoreError::Io(refusal));
     }
+    // The registry has been holding the *definition's* harness since the dispatch. From here the
+    // run has a child, and the child is `resolved.harness`'s — above all for `observe`, which
+    // picks the state machine that reads this stream. See `note_harness`.
+    registry.note_harness(admission.run, resolved.harness);
     // The definition as the harness reads it: this machine's single-model and effort overrides
     // folded **into** it. Every harness reads `plan.agent.def.model` and `plan.agent.effort`, and
     // until this fold existed the resolution's `model` and `effort` were computed and read by
@@ -6738,6 +6786,116 @@ mod tests {
         // second Enter, which finding 8 already forbids upstream.
         assert_eq!(strip_enter(b"hi\r\r".to_vec()), (b"hi\r".to_vec(), true));
         assert_eq!(strip_enter(Vec::new()), (Vec::new(), false));
+    }
+
+    /// A role the file sends to one CLI and a local override sends to another is **read** by the
+    /// one it was forked with. (M78)
+    ///
+    /// The bug this pins had no error anywhere in it. `DispatchSpec::harness` is the committed
+    /// definition's, `RunPlan::harness` is the override's, and `observe` picks its state machine
+    /// from the registry — which held the definition's. A project that redirected every role from
+    /// `opencode` to `codex` therefore forked codex children and read them with opencode's
+    /// machine: codex's `turn.started` matches none of opencode's five event names, every line
+    /// answered `None`, and the run sat in `RunState::Starting` from the fork to the exit while
+    /// doing all of its work. The panel draws `starting` as `circle-dashed` — a deliberately
+    /// still mark — so what a person saw was a spinner that never span, in one project and not
+    /// another.
+    ///
+    /// Both halves are asserted, because only the pair says where the fault was: the same line,
+    /// against the same run, answers nothing before the stamp and `Running` after it.
+    #[test]
+    fn a_redirected_run_is_read_by_the_harness_it_was_forked_with() {
+        // Lifted verbatim from a run log written by the CLI this was reported from.
+        const TURN_STARTED: &str = r#"{"type":"turn.started"}"#;
+        const THREAD_STARTED: &str =
+            r#"{"type":"thread.started","thread_id":"01a0c54b-332d-7461-bdeb-648f2b2f9c10"}"#;
+
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut spec = spec(project, "gameplay-dev", 4, 4);
+        // What the committed `.cide/agents/gameplay-dev.md` says.
+        spec.harness = Harness::Opencode;
+        let run = registry.enqueue(spec);
+        let mut admitted = Vec::new();
+        admit_a_pass(&mut registry.inner.lock(), &mut admitted);
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        assert_eq!(state_of(&registry, run), RunState::Starting);
+
+        // The registry still holds the file's answer: opencode's machine, codex's words.
+        assert_eq!(
+            registry.observe(None, session, Observation::Line(TURN_STARTED)),
+            None,
+        );
+        assert_eq!(
+            registry.observe(None, session, Observation::Line(THREAD_STARTED)),
+            None,
+        );
+        assert_eq!(state_of(&registry, run), RunState::Starting);
+
+        // What `start_child` now does once the override has been resolved.
+        registry.note_harness(run, Harness::Codex);
+        assert_eq!(
+            registry.observe(None, session, Observation::Line(TURN_STARTED)),
+            Some((run, RunState::Running)),
+        );
+        assert_eq!(state_of(&registry, run), RunState::Running);
+    }
+
+    /// **And something does the stamping.** (M78)
+    ///
+    /// The structural half, and the only assertion that could have caught the original defect.
+    /// The test above drives `note_harness` by hand, so it goes on passing against a
+    /// `start_child` that never calls it — which is precisely the state this crate was in, and
+    /// is `the_workspace_flusher_is_started_from_setup`'s lesson arriving in a second place: a
+    /// value computed for nobody passes every behavioural test you can write about it.
+    ///
+    /// Comments stripped first, because the paragraph beside the call site spells the name —
+    /// **and the test module cut off before that**, because this assertion lives in the very
+    /// file it greps and its own needle is a string literal in it. `without_comments` does not
+    /// strip a literal, so the unsliced version passed against a `start_child` with the call
+    /// deleted: it was matching itself. That is `check:diff-render`'s trap and `check:docker`'s,
+    /// twice in one sitting, arriving in Rust — and `the_workspace_flusher_is_started_from_setup`
+    /// only escapes it by greping a different file than the one it lives in.
+    #[test]
+    fn the_resolved_harness_is_stamped_on_the_run_at_the_fork() {
+        let whole = crate::srcgrep::without_comments(include_str!("agents.rs"));
+        // The **module**, not the bare attribute: `#[cfg(test)]` also sits on a test-only
+        // helper far above the call site, and cutting at the first one hid the very line this
+        // is here to find. `find` and not `rfind`, so the identical literal a few lines below
+        // cannot move the cut past the module and let this match itself again.
+        let cut = whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file ends in a test module");
+        let source = &whole[..cut];
+        assert!(
+            source.contains("registry.note_harness(admission.run, resolved.harness)"),
+            "nothing writes the resolved harness onto the run, so `observe` reads a redirected \
+             child's output with the state machine of the CLI its definition names and the run \
+             never leaves `Starting`"
+        );
+    }
+
+    /// A run nothing redirected keeps the harness it was dispatched with, and the stamp is a
+    /// no-op rather than a second write — `note_harness` is called on **every** fork.
+    #[test]
+    fn a_run_nobody_redirected_is_left_exactly_as_it_was() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut spec = spec(project, "reviewer", 4, 4);
+        spec.harness = Harness::Opencode;
+        let run = registry.enqueue(spec);
+        registry.note_harness(run, Harness::Opencode);
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .runs
+                .get(&run)
+                .expect("the run")
+                .harness,
+            Harness::Opencode,
+        );
     }
 
     /// **One worktree per agent means one run at a time.**

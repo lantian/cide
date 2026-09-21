@@ -1241,7 +1241,12 @@ fn plan_dispatch(
     // was missing — so the tools *will* be attached, and the only open question is what this CLI
     // calls them. A role naming a harness this build cannot run was refused there too, so the
     // fallback here is unreachable; it drops the tool sentences rather than guessing a spelling.
-    let harness = cide_agents::harness::for_kind(agent.def.harness);
+    // The **resolved** harness, not the definition's: this decides what the opening prompt calls
+    // cide's tools, and a role a local override redirected onto another CLI would otherwise be
+    // handed the tool names of the CLI it is no longer running. `effective_harness` is the one
+    // producer the fork uses too. (M78)
+    let kind = cide_agents::overrides::effective_harness(agent, overrides);
+    let harness = cide_agents::harness::for_kind(kind);
     let prompt = opening_prompt(task.as_ref(), request.prompt.as_deref(), harness);
     if prompt.is_empty() {
         // Refused here as well as in `ClaudeHarness::spawn_spec`, which has the same guard for the
@@ -1257,7 +1262,11 @@ fn plan_dispatch(
         project: request.project,
         agent: agent.def.id.clone(),
         agent_label: agent.def.label.clone(),
-        harness: agent.def.harness,
+        // Resolved, so the queued row names the CLI that will actually be forked and the
+        // registry starts out agreeing with `RunPlan::harness`. The fork re-reads it anyway —
+        // see `AgentRegistry::note_harness` — because a run can sit in the queue across a
+        // `git checkout` that moves the override.
+        harness: kind,
         task: request.task.clone(),
         // Copied now, not looked up at spawn: it ends up in the child's terminal title and in
         // `/resume`, and those must still read correctly after the task has been renamed.
@@ -1854,6 +1863,31 @@ mod tests {
     /// their own test beside `effective_max_concurrent`'s in `cide-agents`.
     fn no_overrides() -> cide_ipc::ProjectOverrides {
         cide_ipc::ProjectOverrides::default()
+    }
+
+    /// The dispatch reads the **resolved** harness, not the committed file's. (M78)
+    ///
+    /// Structural, because every behavioural test in this module asserts a *refusal*: the
+    /// success path needs `cide-hook` beside the test binary, which is why they all stop short
+    /// of it. `effective_harness` itself is pinned in `cide-agents`, beside
+    /// `effective_max_concurrent`'s test, exactly where `no_overrides` says such a test belongs
+    /// — so what is left to guard is that this file calls it at all.
+    ///
+    /// The test module is cut off before the search, because this assertion lives in the file it
+    /// greps and its own needle is a string literal in it; see
+    /// `agents::tests::the_resolved_harness_is_stamped_on_the_run_at_the_fork`, which was
+    /// written without that slice and passed against the deleted line it existed to find.
+    #[test]
+    fn the_dispatch_folds_the_override_into_the_harness_it_plans() {
+        let whole = crate::srcgrep::without_comments(include_str!("agents.rs"));
+        let cut = whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file ends in a test module");
+        assert!(
+            whole[..cut].contains("overrides::effective_harness(agent, overrides)"),
+            "`plan_dispatch` reads the definition's harness, so a redirected role is queued, \
+             labelled and read as the CLI its file names rather than the one it will be forked as"
+        );
     }
 
     /// **The whole of M66 in one assertion.** A dispatch onto a task the role is already on is

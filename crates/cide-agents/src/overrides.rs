@@ -226,11 +226,31 @@ pub fn row_for<'a>(
 /// The pool is simply not applied and the caller may say so; refusing there would make switching
 /// a role to claude for an afternoon into an error about a setting the user did not touch.
 #[must_use]
+/// Which CLI this role actually runs as here. One producer, for [`effective_max_concurrent`]'s
+/// reason. (M78)
+///
+/// The fork resolved this and the **dispatch did not**, so `DispatchSpec::harness` carried the
+/// committed file's answer into the registry and stayed there. Two readers of one override
+/// disagreeing is how the queue's `max_concurrent` came to be computed here and obeyed nowhere;
+/// this is the same fold, one field along, and the damage was larger because `observe` picks the
+/// state machine that reads the child's output from it — a role redirected onto another CLI was
+/// read with the wrong one and never left `RunState::Starting`. See
+/// `AgentRegistry::note_harness`, which is the other half: the fork re-reads the file, because a
+/// `git checkout` can move it while a run sits in the queue.
+///
+/// Through [`row_for`], so the scope rule holds here too: a Claude Code subagent takes no
+/// override, and it takes none of this one either.
+pub fn effective_harness(agent: &LoadedAgent, overrides: &ProjectOverrides) -> Harness {
+    row_for(agent, overrides)
+        .and_then(|over| over.harness)
+        .unwrap_or(agent.def.harness)
+}
+
 pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSettings) -> Resolved {
     let empty = AgentOverride::default();
     let over: &AgentOverride = row_for(agent, overrides).unwrap_or(&empty);
 
-    let harness = over.harness.unwrap_or(agent.def.harness);
+    let harness = effective_harness(agent, overrides);
     let effort = over.effort.clone().or_else(|| agent.effort.clone());
     // Through `effective_max_concurrent` and not off `over` directly, because the *queue* reads
     // that function and this struct is read by the fork: two foldings of one override is how
@@ -369,6 +389,58 @@ mod tests {
             all: over,
             roles: Default::default(),
         }
+    }
+
+    /// [`effective_harness`] over the three cases its two callers depend on. (M78)
+    ///
+    /// This is the fold the dispatch was missing. The third case is the one that keeps the
+    /// **scope rule** in one place: a Claude Code subagent takes no override, so a project-wide
+    /// `harness` row must not move one onto another CLI — `row_for` is what refuses it, and a
+    /// second reader that folded `over.harness` directly would disagree with the roster about
+    /// which roles an override may touch.
+    #[test]
+    fn the_effective_harness_is_the_override_where_there_is_one() {
+        let committed = role(AgentScope::Project, Harness::Opencode);
+        assert_eq!(
+            effective_harness(&committed, &ProjectOverrides::default()),
+            Harness::Opencode,
+        );
+        assert_eq!(
+            effective_harness(
+                &committed,
+                &with(AgentOverride {
+                    harness: Some(Harness::Codex),
+                    ..AgentOverride::default()
+                }),
+            ),
+            Harness::Codex,
+        );
+        // And a Claude Code subagent keeps its own, whatever the project-wide row says.
+        let subagent = role(AgentScope::ClaudeProject, Harness::Claude);
+        assert_eq!(
+            effective_harness(
+                &subagent,
+                &with(AgentOverride {
+                    harness: Some(Harness::Codex),
+                    ..AgentOverride::default()
+                }),
+            ),
+            Harness::Claude,
+        );
+    }
+
+    /// And `resolve` answers the same thing, because it is the same producer — two foldings of
+    /// one override is how `max_concurrent` came to be computed twice and obeyed once.
+    #[test]
+    fn resolve_and_the_effective_harness_cannot_disagree() {
+        let agent = role(AgentScope::Project, Harness::Opencode);
+        let overrides = with(AgentOverride {
+            harness: Some(Harness::Codex),
+            ..AgentOverride::default()
+        });
+        let out = resolve(&agent, &overrides, &settings(Vec::new()));
+        assert_eq!(out.harness, effective_harness(&agent, &overrides));
+        assert_eq!(out.harness, Harness::Codex);
     }
 
     /// No override at all is exactly today's behaviour, field for field.
