@@ -2,6 +2,7 @@
 import type { Project } from "./Project";
 import type { ProjectId } from "./ProjectId";
 import type { Settings } from "./Settings";
+import type { ToolWindowState } from "./ToolWindowState";
 import type { WindowLabel } from "./WindowLabel";
 import type { WindowRole } from "./WindowRole";
 
@@ -22,4 +23,32 @@ rev: bigint, settings: Settings,
 /**
  * Insertion order **is** the header tab order.
  */
-projects: { [key in ProjectId]: Project }, windows: { [key in WindowLabel]: WindowRole }, };
+projects: { [key in ProjectId]: Project }, windows: { [key in WindowLabel]: WindowRole }, 
+/**
+ * The tool window of the shell that has **no project open** — the empty frame with a `+`
+ * in its header. (M74)
+ *
+ * # Why this does not reintroduce the bleed `cide_core::toolwindow` forbids
+ *
+ * That module's header argues at length that the panel may not live in [`Settings`],
+ * because `Settings` rides every `cide://workspace-changed` to **every** window, so a
+ * persisted "open" toggled in one `PerProject` window would open another window's panel.
+ * This field is global in exactly that way and is still safe, because of who reads it:
+ * only a shell drawing no project does, and [`crate::WindowMode`] cannot produce two of
+ * those. `PerProject` mints one shell per project, so every shell it builds has one;
+ * `Stacked` has a single shell in total. A second reader is therefore not a thing a
+ * setting could put on screen — it is a window that does not exist.
+ *
+ * It carries no `history`, and nothing here enforces that: a history tab names a file in
+ * a repository in a project, so `open_history` takes a [`ProjectId`] and there is no road
+ * to this state that could push one. `restoreTabs` repairs an `active` naming no tab, so
+ * a hand-edited document is drawn rather than trusted.
+ *
+ * `#[serde(default)]` and **no schema rung**, unlike the four in [`Self::CURRENT_SCHEMA`].
+ * Each of those bumped because a defaulted field would make an existing user's answer an
+ * inference from a constant that might later be narrowed. There is no such question here:
+ * a closed panel is what every document written before this field meant, and nobody will
+ * ever want a fresh install to open the empty frame's tool window uninvited — which is the
+ * claim `ToolWindowState::open`'s own doc already makes for the per-project one.
+ */
+toolWindow: ToolWindowState, };

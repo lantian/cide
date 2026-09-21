@@ -456,6 +456,11 @@ export interface AgentDefView {
   /** A model alias or full name, or `null` for the harness's own default. */
   model: string | null
   /**
+   * One of [`AGENT_HUES`] the definition asked for, or `null` — which means *derive one*, and is
+   * the ordinary case. Read through [`agentColor`] and never directly; see it for why.
+   */
+  color: string | null
+  /**
    * Why this role cannot be dispatched, as a sentence — or `null` when it can.
    *
    * This is `Command::unavailable` one layer down; see [`canDispatch`], which is the only thing
@@ -500,8 +505,29 @@ export interface RunView {
   phase: RunPhase
   /** The task this run was dispatched against. `null` for an ad-hoc run. */
   task: string | null
-  /** `AgentRun::startedUnixMs`, converted from `bigint` by `adapt.ts`. See the module header. */
+  /**
+   * `AgentRun::startedUnixMs`, converted from `bigint` by `adapt.ts`. See the module header.
+   *
+   * When the run was **dispatched**, which is a different question from how long it worked —
+   * see [`workedMs`]. This is what History sorts by, and it is deliberately not what the row's
+   * figure is any more.
+   */
   startedMs: number
+  /**
+   * Milliseconds this run has worked, over its **closed** working intervals only.
+   *
+   * Read with [`workingSinceMs`], never alone: the figure is this plus, when that stamp is set,
+   * the time since it. [`workedFor`] is the one place that sum happens.
+   */
+  workedMs: number
+  /**
+   * When the open working interval began, or `null` when this run is not working.
+   *
+   * `null` for a queued, idle, awaiting-permission, paused, interrupted, finished or failed
+   * run — Rust's `RunState::counts_as_work` is the definition and this mirrors its answer. Its
+   * being `null` is what makes those rows' figures *stop* rather than tick.
+   */
+  workingSinceMs: number | null
   /** `RunState::Paused`'s `sinceUnixMs`. `null` in every other phase. */
   pausedSinceMs: number | null
   /** `RunState::Finished`'s `code`. `null` in every other phase. */
@@ -598,6 +624,132 @@ export function rosterRoles(roster: Roster): Readonly<Record<string, string>> {
       .filter((def) => def.id.trim() !== '')
       .map((def) => [def.id, def.label.trim() !== '' ? def.label : def.id]),
   )
+}
+
+/* -------------------------------------------------------------------------- a role's colour */
+
+/**
+ * The colours a role may be drawn in, in the order a derived colour indexes them. (M75)
+ *
+ * **`cide_ipc::agents::AGENT_HUES` restated**, and `check:agents` scrapes that constant out of
+ * `crates/cide-ipc/src/agents.rs` and asserts the two lists are equal *in order* — not as sets,
+ * which is the usual shape of that assertion here and would be too weak: the index is what a
+ * derived colour is, so two lists holding the same eight words in different orders would recolour
+ * every uncoloured role in every tracker and fail nothing.
+ *
+ * Each name must have a `--agent-<name>` in **both** palette blocks of `tokens.css`; `check:theme`
+ * is what asserts it, and the failure without it is silent — an undefined custom property is not
+ * a colour, so the name would simply render in whatever it inherited.
+ */
+export const AGENT_HUES = [
+  'blue',
+  'green',
+  'orange',
+  'purple',
+  'cyan',
+  'red',
+  'yellow',
+  'pink',
+] as const
+
+/**
+ * The orchestrator's colour: the project's primary session, the one that decomposes and
+ * dispatches.
+ *
+ * **Reserved by not being in [`AGENT_HUES`]**, which is the whole mechanism. The user asked for a
+ * colour that "will never be conflicted with other agents' colours", and the way to promise that
+ * is to make it unreachable rather than to write a rule that skips it: no hash can return a hue
+ * that is not in the list it indexes, and no `color:` can name one either, because
+ * `cide_ipc::agents::hue` answers `None` for every word outside the eight.
+ *
+ * It is a slate rather than a ninth hue for the same reason. `check:theme` asserts it is at least
+ * 100 redmean units from all eight — it measures 110 in both themes — where the eight are only 70
+ * apart from each other. "Not one of the agents" has to read as a different *kind* of colour, not
+ * as the ninth one along.
+ */
+export const ORCHESTRATOR_COLOR = 'var(--agent-orchestrator)'
+
+/**
+ * A role's colour, as a CSS custom property reference.
+ *
+ * `var(--token)` and never a hex — `gitlog/logModel.ts`'s `laneColor` states the reason and it is
+ * the same one: the value has to follow the theme, and a hex resolved in JavaScript is a colour
+ * from whichever theme happened to be on when the component rendered.
+ *
+ * Two rungs, and the order between them is the feature. A definition that *declares* a colour
+ * gets it; everything else is derived from the role's **id**, which is the name the file is
+ * called and the key the roster is built on. Deriving means nobody has to choose, a fresh role is
+ * distinguishable the moment it exists, and the answer is identical in every window, every
+ * repository and for every person on the team without a byte being stored.
+ *
+ * The id rather than the label, deliberately. `TaskAuthor::Agent` carries a label *copied at
+ * write time* so an old comment still reads correctly after a rename, and colouring by the label
+ * would mean a role's own comments changed colour halfway down a log the day somebody edited
+ * `label:`. The id is what both the roster and the comment carry, so the panel and the card
+ * cannot disagree.
+ *
+ * FNV-1a over the code units: it is eight lines, it is stable across engines and releases, and
+ * the decision it informs is "give these names different colours", not a security question. The
+ * modulus is taken defensively in the same spirit as `laneColor`'s — `AGENT_HUES.length` is
+ * eight today, and an out-of-range index would select nothing and paint the inherited colour.
+ */
+export function agentColor(id: string, declared: string | null = null): string {
+  const named = declared === null ? null : declared.trim().toLowerCase()
+  if (named !== null && (AGENT_HUES as readonly string[]).includes(named)) {
+    return `var(--agent-${named})`
+  }
+  let hash = 0x811c9dc5
+  for (let i = 0; i < id.length; i += 1) {
+    hash ^= id.charCodeAt(i)
+    // FNV's 32-bit prime, as the shifts a 32-bit `Math.imul` would cost a polyfill for.
+    hash = (hash + (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24)) >>> 0
+  }
+  return `var(--agent-${AGENT_HUES[hash % AGENT_HUES.length]})`
+}
+
+/**
+ * Every role's colour, by id — [`rosterRoles`]' sibling, and deliberately not a widening of it.
+ *
+ * `roles` is pinned by `check:agents` as an id→label map and read from three other files; a
+ * second map of the same shape costs one `useMemo` and leaves that contract alone. Both are
+ * memoised on the roster's identity at every host that builds them, which is not tidiness:
+ * a selector that returns a fresh object re-renders for ever and ends at *Maximum update depth
+ * exceeded*, which unmounts the whole root. That is `check:selectors`' entire subject.
+ *
+ * A role the roster has never heard of is *absent* rather than defaulted, so a reader falls
+ * through to [`agentColor`] with the id alone — which is the right answer for a comment written
+ * by a role that has since been deleted, and is why every call site passes the id and not just a
+ * lookup.
+ *
+ * Built through `Object.fromEntries` and filtered on a blank id for [`rosterRoles`]' two reasons,
+ * restated because the two functions must not drift on the prototype question.
+ */
+export function rosterColors(roster: Roster): Readonly<Record<string, string>> {
+  if (roster.kind !== 'ready') return {}
+  return Object.fromEntries(
+    roster.agents
+      .filter((def) => def.id.trim() !== '')
+      .map((def) => [def.id, agentColor(def.id, def.color)]),
+  )
+}
+
+/**
+ * The colour a comment's, or a task's, author is drawn in.
+ *
+ * One function for all three arms so the card cannot answer differently in two places, and
+ * `null` for the user: "You" keeps `.logAuthorUser`'s `--accent`, which it has had since M21 and
+ * which is deliberately **outside** the separation gate — a reader is never in doubt about which
+ * lines are their own, so the colour there is a flourish and not a signal.
+ */
+export function authorColor(
+  author: { kind: string; agent?: string },
+  colors: Readonly<Record<string, string>>,
+): string | null {
+  if (author.kind === 'orchestrator') return ORCHESTRATOR_COLOR
+  if (author.kind !== 'agent') return null
+  const id = author.agent ?? ''
+  if (id.trim() === '') return null
+  return Object.hasOwn(colors, id) ? (colors[id] ?? agentColor(id)) : agentColor(id)
 }
 
 /**
@@ -1107,6 +1259,11 @@ function undefinedRole(run: RunView): AgentDefView {
     scope: 'project',
     harness: run.harness,
     description: '',
+    // Derived from the id, like every role with no `color:` — and that is why this row is the
+    // same colour here as it is above the comments the deleted role wrote. `agentColor` is keyed
+    // on the id, which a run carries, so a role that has gone does not change colour on its way
+    // out of the roster.
+    color: null,
     systemPrompt: '',
     model: null,
     unavailable: ROLE_UNDEFINED,
@@ -1258,8 +1415,19 @@ export function sections(roster: Roster, taskTitles: Readonly<Record<string, str
  */
 export function elapsed(nowMs: number, startedMs: number): string {
   if (!Number.isFinite(nowMs) || !Number.isFinite(startedMs)) return '—'
-  const ms = Math.max(0, nowMs - startedMs)
-  const totalSeconds = Math.floor(ms / 1000)
+  return span(Math.max(0, nowMs - startedMs))
+}
+
+/**
+ * A duration as `12s` / `4m` / `1h 04m`.
+ *
+ * The ladder, factored out of [`elapsed`] so that it and [`workedFor`] cannot drift into two
+ * vocabularies — one producer, the rule `cide_git::push::preview` states, applied to a pair of
+ * figures that appear in the same row and in the same tooltip. Non-finite input is the
+ * caller's to guard, because each of them has a different thing to check.
+ */
+function span(ms: number): string {
+  const totalSeconds = Math.floor(Math.max(0, ms) / 1000)
   if (totalSeconds < 60) return `${totalSeconds}s`
   const totalMinutes = Math.floor(totalSeconds / 60)
   if (totalMinutes < 60) return `${totalMinutes}m`
@@ -1268,6 +1436,91 @@ export function elapsed(nowMs: number, startedMs: number): string {
   // Zero-padded so `1h 04m` and `1h 40m` are the same width and a column of them does not
   // jitter as the minutes tick over.
   return `${hours}h ${minutes < 10 ? '0' : ''}${minutes}m`
+}
+
+/** The two halves of a run's worked clock, which is all these figures need of a run. */
+export type WorkedClock = Pick<RunView, 'workedMs' | 'workingSinceMs'>
+
+/**
+ * How long a run has **worked** — the figure the row draws.
+ *
+ * # Why this is not `elapsed(nowMs, startedMs)`
+ *
+ * It was, and that was wrong in three ways at once, all of them ordinary use. `startedMs` is
+ * stamped when a run is *dispatched* and never moves, so the old figure was age-since-dispatch:
+ * a run paused overnight accrued the night; a run that outlived a cide restart accrued the
+ * hours cide was shut; and a finished run's figure went on growing for ever, so a run that took
+ * ninety seconds and ended four hours ago read `4h 00m` on the History row whose own doc says
+ * "how long it took".
+ *
+ * # The sum, and why the wire carries two numbers instead of it
+ *
+ * `workedMs` is the closed total and `workingSinceMs` is the open interval. Rust could send the
+ * sum, but then the figure would only move when a roster broadcast happened to arrive, so a
+ * live run's row would sit still for seconds at a time and jump. Sending the halves lets the
+ * row tick off `nowMs` at one second while a run that is *not* working — `workingSinceMs` is
+ * `null` — draws a figure that does not move at all. That absence is the whole fix: the number
+ * stops when the work does, which is what makes a paused row static and a finished row final
+ * with no end timestamp anywhere in the system.
+ *
+ * A clock that has gone backwards yields the closed total rather than less than it, and a
+ * non-finite input an em dash — [`elapsed`]'s rules, for [`elapsed`]'s reasons.
+ */
+export function workedFor(nowMs: number, run: WorkedClock): string {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(run.workedMs)) return '—'
+  return span(workedMsAt(nowMs, run))
+}
+
+/** The sum, as a number. One producer for it, since three readers here want it. */
+function workedMsAt(nowMs: number, run: WorkedClock): number {
+  const open =
+    run.workingSinceMs !== null && Number.isFinite(run.workingSinceMs)
+      ? Math.max(0, nowMs - run.workingSinceMs)
+      : 0
+  return Math.max(0, run.workedMs) + open
+}
+
+/**
+ * The time cell's `title`: the phase in words, then what the two clocks say.
+ *
+ * # The phase word stays first, and stays
+ *
+ * `RunRow` carries the argument: the dot at the head of the line is the only other place a
+ * run's state is written, and a dot is not readable by a screen reader or by somebody who has
+ * not learned the glyphs. So this *appends* to that word rather than replacing it.
+ *
+ * # Why the row needs a tooltip at all now
+ *
+ * The row draws worked time, which is the honest answer to "how long did this agent work" and
+ * is *not* the answer to "how long has this been sitting there". Both are worth knowing, and a
+ * run paused overnight is exactly the case where they differ enough to confuse somebody who
+ * only has one of them. So the wall clock goes here, with the difference named.
+ *
+ * # A terminal run gets no excluded clause
+ *
+ * `nowMs - startedMs` goes on growing after a run has ended, while its worked figure is final,
+ * so their difference would be a number that rises for ever while claiming to describe a pause
+ * — the same lie in a new place as the figure this change removes. A finished run is told
+ * when it was dispatched and how long it worked, and nothing is inferred from the gap.
+ */
+export function timeTitle(nowMs: number, run: RunView, phrase: string): string {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(run.startedMs)) return phrase
+  const parts = [phrase, `dispatched ${elapsed(nowMs, run.startedMs)} ago`]
+  const worked = workedFor(nowMs, run)
+  if (worked !== '—') parts.push(`worked ${worked}`)
+  if (!isOver(run.phase)) {
+    const idle = Math.max(0, nowMs - run.startedMs) - workedMsAt(nowMs, run)
+    // A second of slop is not worth a clause, and the figure is a subtraction of two clocks
+    // that were read at different instants — so it is never exactly zero on a run that has
+    // done nothing but work.
+    if (idle >= 1000) parts.push(`${span(idle)} not working`)
+  }
+  return parts.join(' · ')
+}
+
+/** Whether this phase is one a run never leaves — the two the tooltip treats differently. */
+function isOver(phase: RunPhase): boolean {
+  return phase === 'finished' || phase === 'failed'
 }
 
 /**

@@ -7,8 +7,9 @@
 //! Every window loads the same `index.html` and reads its role from `?window=<label>`.
 //! There is exactly one webview per OS window — see `docs/adr/0001-no-multiwebview.md`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use cide_ipc::{SessionId, Theme, WindowLabel};
 use tauri::window::Color;
@@ -705,7 +706,7 @@ pub fn raise(app: &AppHandle, label: &WindowLabel) {
 /// injectable in a test; [`title_with`] below is split out so the part that can be wrong is
 /// testable anyway.
 ///
-/// `BTreeSet` rather than `HashSet` purely so [`awaiting_sessions`] hands the frontend a
+/// `BTreeMap` rather than `HashMap` purely so [`awaiting_sessions`] hands the frontend a
 /// stable order — the broadcast is compared against the last one in three windows, and an
 /// order that reshuffles on every insert would make every report look like a change.
 ///
@@ -713,9 +714,24 @@ pub fn raise(app: &AppHandle, label: &WindowLabel) {
 /// needs one bit of history that `SessionState` does not carry — see
 /// `ui/src/panes/awaitingRule.ts`. What Rust owns is the arithmetic that needs the workspace:
 /// which of these sessions is shown in which window.
-fn awaiting() -> &'static Mutex<BTreeSet<SessionId>> {
-    static AWAITING: OnceLock<Mutex<BTreeSet<SessionId>>> = OnceLock::new();
-    AWAITING.get_or_init(|| Mutex::new(BTreeSet::new()))
+///
+/// # Why each entry carries the moment it arrived (M72)
+///
+/// It was a `BTreeSet` until a device that is not a window started reading it. A window is
+/// always here: it observes every transition as it happens, so membership alone tells it
+/// everything. A phone is asleep for most of them and reconnects to a *set*, and from a set
+/// alone it cannot tell a wait it already announced from a session that went busy and finished
+/// again while it was away — leaving it to choose between a notification every time the socket
+/// drops and silence for the second wait. The stamp turns that into a comparison.
+///
+/// **Written on arrival and never touched while the entry stays.** Three windows observe the
+/// same transition and all three report it, which is harmless for membership and would not be
+/// harmless for a stamp: a repeat report that moved it would make one wait look like a stream
+/// of them, and the phone would buzz for each. That is why this is an `entry` and not an
+/// `insert`.
+fn awaiting() -> &'static Mutex<BTreeMap<SessionId, SystemTime>> {
+    static AWAITING: OnceLock<Mutex<BTreeMap<SessionId, SystemTime>>> = OnceLock::new();
+    AWAITING.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Record whether one session is waiting on the user. Returns whether the set changed.
@@ -724,9 +740,15 @@ pub fn set_awaiting(session: SessionId, waiting: bool) -> bool {
         .lock()
         .expect("the awaiting set is never poisoned");
     if waiting {
-        set.insert(session)
+        match set.entry(session) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(SystemTime::now());
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        }
     } else {
-        set.remove(&session)
+        set.remove(&session).is_some()
     }
 }
 
@@ -736,8 +758,28 @@ pub fn awaiting_sessions() -> Vec<SessionId> {
     awaiting()
         .lock()
         .expect("the awaiting set is never poisoned")
-        .iter()
+        .keys()
         .copied()
+        .collect()
+}
+
+/// The waiting set with its stamps, for a client that was not here when they arrived.
+///
+/// Deliberately a second function rather than a wider return from [`awaiting_sessions`]: that
+/// one's answer is the payload of `cide://session-awaiting`, which three windows already parse,
+/// and widening a wire shape to serve a reader that is not on that wire is how an event grows a
+/// field nobody reads.
+pub fn awaiting_since() -> Vec<cide_ipc::remote::AwaitingEntry> {
+    awaiting()
+        .lock()
+        .expect("the awaiting set is never poisoned")
+        .iter()
+        .map(|(session, since)| cide_ipc::remote::AwaitingEntry {
+            session: *session,
+            since_unix_ms: since
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        })
         .collect()
 }
 
@@ -751,6 +793,7 @@ pub fn forget_awaiting(session: SessionId) -> bool {
         .lock()
         .expect("the awaiting set is never poisoned")
         .remove(&session)
+        .is_some()
 }
 
 /// Whether any of `sessions` is waiting, counted once per session.
@@ -758,7 +801,7 @@ pub fn awaiting_among(sessions: &BTreeSet<SessionId>) -> usize {
     let set = awaiting()
         .lock()
         .expect("the awaiting set is never poisoned");
-    sessions.iter().filter(|s| set.contains(s)).count()
+    sessions.iter().filter(|s| set.contains_key(s)).count()
 }
 
 /// The OS window title for a base name and a count of waiting sessions.
@@ -1231,6 +1274,53 @@ mod tests {
 
         set_awaiting(survivor, false);
         assert_eq!(awaiting_among(&mine), 0);
+    }
+
+    /// A stamp records when the wait *began*, and three windows all reporting it must not make
+    /// that look like three waits.
+    ///
+    /// Every window observes the same `cide://session-state` transitions and every one of them
+    /// reports, which is harmless for membership and would not be harmless here: a phone
+    /// announces an entry whose stamp is newer than the last one it announced for that session,
+    /// so a stamp that moved on a repeat report would buzz once per window, per turn.
+    #[test]
+    fn a_repeat_report_does_not_move_the_stamp() {
+        use super::{awaiting_since, set_awaiting};
+
+        let session = SessionId::new();
+        assert!(set_awaiting(session, true));
+        let first = awaiting_since()
+            .into_iter()
+            .find(|entry| entry.session == session)
+            .expect("just inserted")
+            .since_unix_ms;
+
+        // Two more windows report the same transition, as they always do.
+        std::thread::sleep(std::time::Duration::from_millis(4));
+        assert!(!set_awaiting(session, true), "a repeat report is not news");
+        assert!(!set_awaiting(session, true));
+
+        let again = awaiting_since()
+            .into_iter()
+            .find(|entry| entry.session == session)
+            .expect("still waiting")
+            .since_unix_ms;
+        assert_eq!(again, first, "a repeat report moved the stamp");
+
+        // Leaving and re-entering the set *is* a second wait, and gets a second stamp.
+        set_awaiting(session, false);
+        std::thread::sleep(std::time::Duration::from_millis(4));
+        assert!(set_awaiting(session, true));
+        let second = awaiting_since()
+            .into_iter()
+            .find(|entry| entry.session == session)
+            .expect("waiting again")
+            .since_unix_ms;
+        assert!(
+            second > first,
+            "a second wait reused the first one's stamp: {second} against {first}"
+        );
+        set_awaiting(session, false);
     }
 
     /// The desktop, in the only two respects this feature depends on.

@@ -39,6 +39,33 @@ pub struct Workspace {
     /// Insertion order **is** the header tab order.
     pub projects: IndexMap<ProjectId, Project>,
     pub windows: IndexMap<WindowLabel, WindowRole>,
+    /// The tool window of the shell that has **no project open** — the empty frame with a `+`
+    /// in its header. (M74)
+    ///
+    /// # Why this does not reintroduce the bleed `cide_core::toolwindow` forbids
+    ///
+    /// That module's header argues at length that the panel may not live in [`Settings`],
+    /// because `Settings` rides every `cide://workspace-changed` to **every** window, so a
+    /// persisted "open" toggled in one `PerProject` window would open another window's panel.
+    /// This field is global in exactly that way and is still safe, because of who reads it:
+    /// only a shell drawing no project does, and [`crate::WindowMode`] cannot produce two of
+    /// those. `PerProject` mints one shell per project, so every shell it builds has one;
+    /// `Stacked` has a single shell in total. A second reader is therefore not a thing a
+    /// setting could put on screen — it is a window that does not exist.
+    ///
+    /// It carries no `history`, and nothing here enforces that: a history tab names a file in
+    /// a repository in a project, so `open_history` takes a [`ProjectId`] and there is no road
+    /// to this state that could push one. `restoreTabs` repairs an `active` naming no tab, so
+    /// a hand-edited document is drawn rather than trusted.
+    ///
+    /// `#[serde(default)]` and **no schema rung**, unlike the four in [`Self::CURRENT_SCHEMA`].
+    /// Each of those bumped because a defaulted field would make an existing user's answer an
+    /// inference from a constant that might later be narrowed. There is no such question here:
+    /// a closed panel is what every document written before this field meant, and nobody will
+    /// ever want a fresh install to open the empty frame's tool window uninvited — which is the
+    /// claim `ToolWindowState::open`'s own doc already makes for the per-project one.
+    #[serde(default)]
+    pub tool_window: ToolWindowState,
 }
 
 impl Workspace {
@@ -110,6 +137,7 @@ impl Default for Workspace {
             settings: Settings::default(),
             projects: IndexMap::new(),
             windows: IndexMap::new(),
+            tool_window: ToolWindowState::default(),
         }
     }
 }
@@ -284,7 +312,13 @@ pub const TOOL_WINDOW_MIN_HEIGHT: u16 = 120;
 /// is tall enough to honour it.
 pub const TOOL_WINDOW_MAX_HEIGHT: u16 = 900;
 
-/// The Git tool window's own state, per project. (M18)
+/// The Git tool window's own state, per project — and once more on [`Workspace`] itself, for
+/// the shell that has no project open. (M18, M74)
+///
+/// One type for both because the panel is one panel: the tab strip, the splitter, the repair
+/// pass and every command that moves any of it are written against this shape, and a second,
+/// narrower struct for the projectless frame would be a second set of arms for each of them.
+/// What differs is only which of them can be *reached* — see [`Workspace::tool_window`].
 ///
 /// Per project and not per window, deliberately. The panel is a view of *this project's*
 /// repositories, and the same project shown in two windows (which `Stacked` mode makes ordinary)
@@ -1062,6 +1096,21 @@ pub enum SettingsSection {
     Agents,
     Git,
     Terminal,
+    /// Whether a phone may reach this cide, and which devices have. (M74)
+    ///
+    /// **Last, and its own section.** Last because the nav order is this enum's order and the
+    /// newest section earns the bottom of a list somebody has already learned. Its own because it
+    /// is the only page here that grants a *capability to another machine* — every other section
+    /// changes how cide looks or behaves for the person sitting at it — and because it is the
+    /// only one that lists **devices**, which are neither cide's settings nor cide's objects but
+    /// a record of who has been let in.
+    ///
+    /// It draws [`crate::RemoteSettings`] and writes a [`crate::SettingsPatch`] like most of its
+    /// neighbours, and unlike [`Self::Models`] it holds no credential at all: the tokens live in
+    /// their own `0600` file, so this group can be an ordinary round-trippable one. That is the
+    /// difference [`crate::SettingsPatch::llm`] spends its doc comment regretting, avoided here
+    /// by keeping the secret out of the group rather than by masking it inside one.
+    Remote,
 }
 
 /// A tab's pane layout.

@@ -7,6 +7,7 @@ import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
 import type { ProxySettings } from "./ProxySettings";
+import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
@@ -96,4 +97,8 @@ confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: Terminal
  * role's own `model:` — so an upgraded workspace behaves identically, and a later change of
  * default touches new installs only.
  */
-llm: LlmSettings, };
+llm: LlmSettings, 
+/**
+ * How a phone reaches this cide, and whether one may. (M72)
+ */
+remote: RemoteSettings, };

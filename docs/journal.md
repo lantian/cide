@@ -4655,7 +4655,9 @@ history and an event per jump to every window, which is not worth it for gesture
 unmet: `WorkspaceState::flush_if_due` documents itself as "called from the app's tick and before
 quitting" and **is called from neither** — there is no app tick — so `workspace.json` is in fact
 written exactly once per run, at shutdown, and its 500 ms debounce is inert. The position store does
-not inherit that: it runs its own flusher thread rather than assuming a tick exists.
+not inherit that: it runs its own flusher thread rather than assuming a tick exists. *(Unmet from
+here until M73, which gave the workspace a flusher of that same shape. What the forty milestones in
+between cost is written up there.)*
 
 **A context menu no longer scrolls the buffer to the top.** Right-click in an editor, move the
 pointer over the menu, dismiss it, and the buffer used to jump to line 1 — but only if the pointer
@@ -11775,3 +11777,1083 @@ Specifically unconfirmed:
 - **Whether a model uses the tools well.** A roster that now carries a config line, a resolution
   per role and an LLM footer costs tokens in most orchestration turns; whether that pays for
   itself is not something a test can answer.
+
+## cide can be reached from another machine (M72), and what is not verified
+
+> *"Need to develop an mobile app (android/ios) that will allowe me to connect to cide and see
+> projects of opened cide and select the project and see it's activly running claude (and agents)
+> sessions, agents and tasks. Need to show what is in progress right now and to be able to open
+> session on phone. On finish notification - i should receive a phone notification that leads
+> (opens on touching notification) to session that finished. Also it should mark finished
+> sessions in the list until i open it. Opening on phone - also clears mark on cide. Make sure
+> that i able to connect to several running cide (for example to normal instance and for DEV
+> instance). In opened session i can type and select answers from claude session question."*
+
+The one thing a live Claude session does that a text buffer does not is *finish while you are not
+looking at it*, and until M72 the only two surfaces for that were an OS window title and a
+window-manager urgency hint — both of which require being at the machine. This milestone is the
+cide half of a companion app: a listener, a protocol, the screen as data, and a Settings page that
+grants another device access to this one.
+
+The cide half is complete: the server, the projection, the screen, the input, the orchestration
+gestures, the Settings page, the permission-prompt parser and the sealed transport. **The
+application does not exist** — there is no code at `/home/lantian/work/cide-mobile` — so nothing
+here has been seen by a phone. The last section says so again, with the rest of the honest list.
+
+### Two things were already true, and they are most of why this fits
+
+The design brief looked like it needed two new mechanisms and needed neither.
+
+**Sessions were already N-consumer.** `Session.sinks` is a list rather than a slot — the decision
+that made detach-into-a-window and survive-a-window-close one mechanism back in M5 — and
+`cide-pty` has kept a `vt100::Parser` mirror of every session since M3, five thousand lines deep,
+which `cide-headless run` already renders. A device is another reader of that mirror.
+
+**The finished-unseen marker was already shared across windows.** `windows.rs` holds the set,
+`cide://session-awaiting` broadcasts it, and `ui/src/panes/awaiting.ts` had already written down
+the rule that makes a third surface safe: *a surface reports per session and never its whole set,
+because a surface that has observed nothing would report its empty set and clear every marker in
+the application*. So "opening it on the phone clears the mark on the desktop" is not a feature
+built here; it is `report_awaiting`, extracted from `window_set_awaiting` so both roads are one
+function, and a fourth line in the attention chain saying which hand it was.
+
+### The device polls the mirror and never attaches a sink
+
+This is ADR 0015's first decision and the one an eager refactor will try to undo, because a remote
+consumer looks exactly like a detached window's sink.
+
+`cide-pty`'s backpressure is **structural and deliberate**: a full sink channel blocks the
+coalescer, then the reader, then the kernel buffer, then `claude`. That is right for a webview
+that cannot keep up and catastrophic for a phone on a train, where three seconds of stall would
+stall the agent being watched. Polling can skip a tick; a sink cannot skip a byte. Four more, any
+one sufficient: `ack` from inside `deliver` deadlocks the one thread every byte of every session
+flows through, and `cide-pty`'s own comment records M18 doing exactly that; a choked sink silently
+starts sending rendered screens instead of bytes, which that trait's doc says "silently corrupts
+any consumer that is parsing rather than painting"; there is no emulator on a phone to parse bytes
+with; and 8 ms / 8 KiB is tuned for a local IPC feeding xterm.
+
+So `cide_pty::screen` returns rows of styled runs and `cide-remote` diffs them per watcher. A
+device watching nothing costs nothing — no timer runs and no grid is read, which is the difference
+between an app somebody keeps and one they delete for eating the battery.
+
+### Three rules in the screen that are silent if got wrong
+
+**A wide cell emits its glyph once and its continuation never.** `vt100` models a double-width
+glyph as two cells; emitting the second as a space puts every CJK line one column right of where
+it belongs, from its first wide glyph onward, with all the text present and nothing logged.
+
+**The trailing blank is trimmed to the last *visible* cell, not with `trim_end`.** A screen is
+mostly empty, so a row that carried its width in spaces would be most of the payload — but a space
+with a background, an underline or the inverse bit is something the user can see, and trimming
+those frays the right edge of a selection, which is the one thing they are looking at when they
+notice. The loop is a loop because a foreground colour is invisible on a space, so the blank tail
+can be spread over two runs.
+
+**Paging scrollback moves the shared viewport**, the one `reattach_state` and `screen_state`
+render from. The restore is behind a drop guard because `parking_lot` does not poison, so a panic
+mid-walk would leave a mirror looking at the past and the next re-docked pane would paint history.
+The assertion is on the **bytes** `contents_formatted` produces and not on `scrollback() == 0`,
+because bytes are what the other readers actually emit.
+
+### A device is served projections, and the types make the alternative unsayable
+
+The obvious design forwards `cide://workspace-changed`. It carries `Settings`, and `Settings`
+carries provider API keys in plaintext — the whole reason `LlmProvider` has a hand-written `Debug`
+— and proxy URLs with passwords in them, the reason `persist`'s own test asserts `workspace.json`
+is `0600`. Forwarding it would put every credential on the machine onto the LAN, in the one
+feature whose premise is a listener another device can reach.
+
+`cide_ipc::remote` therefore cannot name the tree, `workspace-changed` is teed as a bare revision,
+and a device answers a revision by asking for a projection. Two tests keep that true as fields are
+added: `a_projection_carries_no_credential` plants a key in a fixture workspace and greps every
+frame the host can produce, and `xtask`'s `the_protocol_closure_can_never_reach_a_credential`
+refuses a `contract/protocol.ts` whose closure reaches `Workspace`, `Settings` or a provider.
+
+`contract/protocol.ts` is that closure — the transitive reach of `ClientFrame` and `ServerFrame`
+and nothing else, written by `cargo xtask codegen` beside its two existing outputs. It is a subset
+rather than a concatenation on purpose: a reviewer reading that file is reading the whole wire,
+and a type that stops being reachable from a frame leaves it without anybody having to remember.
+
+### Events reach a device through a tee on `emit.rs`, not a second surface
+
+`AppHandle::emit` reaches webviews and nothing else. The tempting fix — notify the remote server
+from wherever each event is produced — falsifies two things at once: `emit.rs`'s promise that
+every `cide://` event goes out through one file, and `cargo xtask contract-check`, which reads
+that file textually to find them.
+
+So the tee is inside `emit.rs`, one line after each `app.emit`, and it adds no `cide://` name. It
+is **bounded and `try_send`**, because the threads that reach there are the hook applier and the
+GTK main loop and neither may wait on a phone's socket; a full queue sends the device `Desync` and
+it re-reads. That is `cide-pty`'s credit protocol's argument one consumer further out. It is
+**lazy** — the event is built by a closure — so an installation with the feature off does not
+clone an awaiting set several times a second in order to drop it.
+
+### A stamp, because a set cannot tell a phone what is news
+
+`windows.rs`'s `BTreeSet<SessionId>` became a `BTreeMap<SessionId, SystemTime>`. A window is
+always present and observes every transition, so membership alone tells it everything; a phone is
+asleep for most of them and reconnects to a *set*, from which it cannot distinguish a wait it
+already announced from a session that went busy and finished again while it was away. Without the
+stamp it must choose between notifying on every reconnect and staying silent on the second wait.
+
+The stamp is written **only on arrival**. Three windows observe one transition and all three
+report it — harmless for membership, and not harmless for a stamp, which is why the insert is an
+`entry` and not an `insert`, and why `a_repeat_report_does_not_move_the_stamp` exists. The wire
+shape of `cide://session-awaiting` is byte-identical, so no webview changed.
+
+### The phone sends keys, not bytes
+
+Whether an arrow is `CSI A` or `SS3 A` depends on DECCKM, and whether a paste is bracketed depends
+on a mode the child asked for. Both live in the mirror. A device encoding its own bytes would be
+guessing at state it cannot see, and the symptom is an arrow key arriving in a TUI as a literal
+`A` — so `ScreenCapture` carries the two modes and `cide_remote::keys` does the encoding.
+
+That is a **second spelling** of terminal key encoding and the module says so at the top. It is
+not a duplicate of `ui/src/terminal/keys.ts`, which is cide's own chord handling layered over
+*xterm.js's* encoder — a thing cide does not own. One rule is genuinely shared, carries a
+cross-reference in both files, and is pinned on both sides: **Shift+Enter is `ESC CR`, never
+`CSI 13;2u`**.
+
+A key cide has no encoding for sends **nothing** and is answered by name. The alternative to an
+unknown key is a wrong key, and a wrong key in a terminal is an action.
+
+### The stop is cide's stop, for the reason M67 wrote down
+
+A remote Stop routes through `agents_stop_with`'s core rather than reimplementing it, and the
+decision that must not be reimplemented is `stop_route`'s: it refuses to *ask* a run that is
+`AwaitingPermission`, because the wind-down is typed text ending in a carriage return and at a
+permission prompt that return **is an approval**. A remote stop written as "type something at it"
+would have arrived at M67's bug through a new door. `StopBy::User` and not a new variant: that
+enum distinguishes whose decision a stop was, and a person pressing Stop on their phone is a
+person.
+
+### Off, loopback, derive the port — three decisions, not one switch
+
+Turning the listener on does not by itself put anything on a network: the bind is loopback until
+somebody chooses otherwise, choosing *this network* is the second decision, and a **public**
+address is a third behind its own toggle, because "the people in my house" and "everyone" are not
+one answer. A public bind is refused by name.
+
+The port is derived from the profile — which is what makes a real instance and a `[DEV]` instance
+both work with nothing configured — and the port actually bound is remembered, which is what makes
+a collision self-healing. A port the **user typed** that is taken is refused and named rather than
+slid past: a number somebody typed is a promise to a device that saved it, and quietly moving
+would point that device at whatever else is listening.
+
+And the socket exists only when there is somebody to serve: a paired device, or an open pairing
+window. A cide with the feature on and nobody paired is not on the network at all.
+
+### Pairing is eight characters, and a wrong one burns the code
+
+Crockford base32 without `I`, `L`, `O` and `U`, shown as `XXXX-XXXX` and accepted however it is
+typed back. About forty bits — strong against *one* guess and nothing more — so: one outstanding
+code, two minutes, single use, and **a wrong code spends it**. A retry budget is exactly what makes
+a short code guessable, and offering one is how a mechanism that looks careful stops being careful.
+Three failures in a minute lock pairing out for five, and the panel says so in words.
+
+The token is 32 bytes from the OS CSPRNG, stored as a `blake3` hash and compared with
+`subtle::ConstantTimeEq`. Not a UUID, on `cide_ide_mcp::lockfile`'s argument: a UUID's type
+contract is uniqueness rather than unpredictability, so a later "let us use v7 so they sort" turns
+the credential into a timestamp and a counter. Not a password KDF either, and that is correct
+rather than lazy — a 256-bit uniformly random secret has no dictionary.
+
+There is **no QR code yet**. The typed code is the documented fallback and costs no dependency on
+either side; a QR would want a Rust-generated matrix drawn as SVG rather than an npm package in
+the window's bundle, and `check:remote` asserts none has crept in.
+
+### The device list is its own file, and that is four arguments
+
+`SettingsPatch` patches per top-level field, so a screen editing anything in a group sends the
+whole group back — which makes a write-only credential unrepresentable there, the hazard
+`SettingsPatch::llm` already spends its doc comment regretting. `workspace.json` is also broadcast
+whole to every window on every mutation; `persist::load` moves a file it cannot parse aside and
+returns a default, which would silently unpair every device; and `run.sh --fresh` moves it to
+`.bak`, where losing a layout is the point and losing your paired phone is not.
+
+So `remote-devices.json`, `0600`, atomic with the mode on the temp file. `RemoteSettings` is then
+an ordinary round-trippable group because the secret is not in it — `LlmProvider`'s problem solved
+from the other end.
+
+### A check that failed on its own first draft
+
+`check:remote` strips comments before it searches anything, which in this repository is mandatory
+rather than tidy: the house style is to name the failure a rule prevents, so the words a check
+looks for are the words its own subject's documentation contains. `RemoteSection.tsx` uses the
+word "token" five times explaining why it never renders one.
+
+The first draft stripped comments with two regular expressions, and a lazy block-comment pattern
+swallowed everything from a `/*` inside a string literal to the next real close — taking the nav
+entry the check was looking for with it. It is a character scanner now, and the header says why.
+That is the fourth time an assertion in this repository has passed or failed on its own prose.
+
+### What a prompt is offering, read off the screen
+
+cide has modelled a permission prompt as **one boolean** since M5: three substrings matched in a
+`Notification` hook's message, and the session moves to `AwaitingPermission`. A person at the
+keyboard needs no more, because the options are in front of them. A person on a phone needs them
+as data, or the feature is a picture of a question with a keyboard under it.
+
+`cide_claude::permission` reads the rendered grid, and every rule in it is a reason to **refuse**.
+The asymmetry is not caution for its own sake: a log line `cide_core::jsonlog`'s detector wrongly
+claims is destroyed, which is bad and recoverable by scrolling; a prompt this one wrongly claims
+produces a button that sends a digit into a conversation and approves a tool call, and there is no
+scrolling back from that. When it refuses, the device shows the raw screen and the keyboard, which
+is exactly what a person at the desk has.
+
+The gate that does the most work is the one that is not a heuristic. A shell's own `select` menu
+is *structurally identical* to a permission prompt, and so is an ordered list in a file somebody
+is editing — nothing on the screen tells them apart. What does is that a shell pane and an editor
+never reach `AwaitingPermission`, because that state comes from a hook payload the screen cannot
+show.
+
+Two rules found by writing the negative corpus. A **ten-item list is refused whole** rather than
+read as its first nine: `10.` is not an option one keystroke can address, but the nine above it
+would otherwise finish as a perfectly well-formed block and a caller would be shown nine of ten
+options with nothing to say so — the partial parse the module promises never to return. And the
+terminator that does that is bounded to *exactly two digits*, because `2024. A year in review` is
+prose, and treating it as a list index would let an ordinary sentence discard a prompt below it.
+
+The answer is **one digit and no Return**. `agents.rs`'s `AWAITING_PERMISSION` constant records
+what the extra byte costs at a selection list: a lone `\r` *is* an answer. Whether the CLI needs
+one at all is the one fact here nobody has measured, and `tests/real_permission.rs` is where it
+gets settled — it needs no quota and no network, only a captured screen in a file.
+
+### The frames are sealed, not the socket
+
+The user asked for TLS with certificate pinning. React Native's `WebSocket` exposes no certificate
+hook on either platform, so pinning needs an Android network-security config *and* an iOS native
+module — and pinning **per paired instance**, which is what this feature actually requires, needs
+the native module on both. It would also have put the first testable version behind a paid Apple
+account. So the frames are boxed instead: XChaCha20-Poly1305, with the key agreed per connection.
+
+What that buys is worth stating plainly, because it is stronger than the thing it replaced.
+**After pairing, no credential is ever sent.** A device is identified in the handshake — public
+information — and authenticated by being able to seal a frame this cide can open. A client with
+the wrong key is not *told* it is wrong; it is not understood. The one moment a key crosses the
+wire is when it is handed over, inside a channel already established against the instance's
+public key, which is the one moment it is confidential.
+
+Three details, each a way to get it silently wrong. The nonce prefix is **derived, not sent** —
+which costs no round trip and, because it is a function of a transcript containing a fresh
+ephemeral key, means two connections under one long-lived key can never reuse a nonce. That is
+the one place a hand-rolled framing is catastrophic rather than merely broken, and
+`two_connections_never_reuse_a_nonce` is what watches it. The counter is checked for **exact**
+succession rather than mere increase, because a WebSocket delivers in order and drops nothing, so
+a gap is a bug or an attack and there is no reason to be lenient about which. And the counter is
+authenticated as associated data rather than merely read, or an observer could renumber frames
+and the cipher would not notice.
+
+The one thing said in the clear after the handshake is a refusal to a device this instance does
+not know. A revoked phone would otherwise get a socket that opens and goes silent, which is
+indistinguishable from a bad network; *you were removed* is a sentence somebody can act on, and it
+reveals nothing that was not in the handshake the client sent.
+
+The costs are in ADR 0015 and are real: the device's key is at rest whole rather than hashed,
+because it is mixed into every frame rather than presented; there is no forward secrecy across a
+re-pair; cide is writing its own framing; and sizes and timing leak.
+
+### The pairing code is a picture too, and the typed road never goes away
+
+The user asked for it in one line — *"cide can show QR code of ip address and an application
+can ask user how to enter ip - from the QR or manually"* — and the second half of that sentence
+is the design. The app asks **which road** before it asks for anything, because the two want
+different things: a scan wants a camera permission and nothing typed, and typing wants three
+fields, one of which is a key nobody would type. A screen offering both at once asks for all of
+it.
+
+**Typing is not a degraded road and is never removed.** Every failure arm on the camera side
+ends at it rather than at an apology: permission not yet asked, permission refused, permission
+refused permanently, and a symbol that is a QR but not ours. A camera can be denied, covered,
+broken or absent; cide may fail to encode; and the machine may be reached over a VPN whose
+address is nowhere near the one on its screen. So `qr` is an `Option` on `PairingInvite` — a
+convenience over a thing the user can always type — and `check:remote` asserts the fallback
+rather than assuming it, because an encoder able to block a pairing that has nothing wrong with
+it is the one way this feature could make things worse.
+
+The matrix is encoded in Rust and drawn by the webview. `qrcode` enters the manifest with
+`default-features = false`, which is the whole entry: the defaults are `image`, `pic` and `svg`,
+and `image` is the decoder suite this workspace refuses on principle. What is left is an
+encoder over bytes that draws nothing, so `QrMatrix { size, modules }` crosses as a flat
+row-major array and `RemoteSection` turns it into **one `<path>`** — a version-7 symbol is
+around two thousand dark modules, and two thousand elements in a settings dialog is a real cost
+for a picture that never changes. Horizontal runs are merged as they are walked, which halves
+it again.
+
+Three properties of that drawing are silent if got wrong, and each has an assertion.
+`shapeRendering="crispEdges"` is not cosmetic: antialiasing greys the boundary between a dark
+and a light module, and a scanner thresholding a photograph reads the grey as whichever side it
+lands on — the difference between a code that scans and one that scans *sometimes*. The
+four-module quiet zone is part of the symbol and is drawn inside the `viewBox`, so no
+surrounding layout can eat it. And both colours are stated rather than inherited: a scanner can
+invert, but not every one does, so a QR on a dark theme must still be dark-on-light.
+
+On the phone the scanner's decision is a pure module (`src/pairing/scan.ts`) for the reason the
+rest of `src/` is — a camera cannot be driven by a test and a decision can. It exists because a
+barcode scanner is a firehose: `expo-camera` reports the same symbol on every frame for as long
+as it is in shot, and a pairing code is **single use**. A handler acting on every callback would
+spend the code on the first frame and then report a wrong-code failure for each of the next
+forty, burning the code and explaining the failure wrongly. So the debounce is keyed on what has
+been *seen*, the scanned URI is passed as an argument rather than routed through state (a render
+is slower than the next frame), and `remember` is the caller's separate choice so a pairing that
+failed because the machine was asleep can be rescanned without moving the phone away and back.
+A foreign symbol — a parcel label, a Wi-Fi join code — is refused with a sentence that names the
+gesture on the machine and **does not echo the payload back**, because camera input is arbitrary
+text that may be somebody's and has no business being drawn in a sentence about pairing.
+
+### The typed pairing road asked for a key cide never printed
+
+The user found this by reading the screen: *"Why in app two fields for code? Key? where to get
+it? Cide shows only one code"*. They are not two codes — the typed road asked for an address, a
+key and a code — and the middle one was a dead end. `Invite` rendered `invite.grouped` and the
+addresses and nothing else, while the app's third field said *the key cide printed*, which cide
+did not.
+
+It was not cosmetic. `Mode::Pair` derives with an **empty** pre-shared key, so the channel comes
+entirely from `X25519(e, S)`: a client cannot seal its first frame without cide's static public
+key, and the eight-character code travels *inside* that channel, which is what keeps the device
+token off the wire. The QR carries `S` as `k=`. Typing had no way to get it, so the typed road
+had never worked against a real cide — and the emulator run that "proved" pairing worked read
+the key out of `fake_cide`'s stdout, which is exactly how a test environment hides the one thing
+it was meant to check.
+
+The cheap fix was to print the key: 43 mixed-case base64url characters, no checksum, and a
+single wrong character failing as *wrong code*. The road taken instead is the one the M72 plan
+had already specified and then not built — the Signal safety-number pattern.
+
+**cide now greets.** Every connection's first message is `"cide-hail" 02 | S_pub[32]`, in the
+clear, before the handshake is read. Nothing waits on it: the handshake does not depend on `S`
+and the greeting does not depend on `e`, so the two cross in flight and the pair costs no round
+trip. It is sent to *every* connection, not only a pairing one, because greeting selectively
+would make the key's absence a mode marker readable off the wire by anyone watching.
+
+**The greeting is a convenience and never evidence**, and that sentence is the whole design. A
+device that scanned the QR already holds `S`; it compares and refuses by name on a mismatch,
+which is a case the typed road cannot even have. A device given only an address adopts what it
+is handed — trust on first use, and exactly as weak as it sounds, because an attacker in the
+middle writes a greeting as easily as cide does.
+
+What closes it is six digits expanded from the same HKDF, shown on both screens. A relay runs
+two exchanges — its own `S` towards the phone, its own `e` towards cide — so the two transcripts
+differ and so do the two numbers, and `somebody_in_the_middle_makes_the_two_screens_disagree` is
+the test that says so. It is expanded from the key material rather than hashed from the
+transcript alone, which costs nothing and binds it to the Diffie-Hellman result as well.
+
+Five things about it are decisions rather than details.
+
+**It gates the code, not the connection.** `pair()` suspends before sending `Pair { code }` and
+resumes only on a yes. A confirmation collected afterwards would be a dialog reporting an attack
+it had already lost — so the test that matters is not that declining fails, it is that the code
+is *still redeemable afterwards*: single use, so if it still works, cide never saw it.
+
+**It is shown only where the key was not pinned.** A scanned pairing is authenticated by the key
+itself, and asking for a comparison that cannot fail is how people stop reading the one that
+can. The same reasoning keeps it off resumed connections, which have a pinned key and a token.
+
+**Neither button is the safe default**, and *No, stop* is listed first. There is no primary
+styling and no dismissal by tapping outside, because a person who taps without reading must not
+fall through to yes.
+
+**cide's side has no button at all.** It cannot tell whether the digits matched; only the person
+can, and the tap that withholds the code is on the phone. A *Confirm* here would change nothing,
+and the habit of pressing it is precisely the habit that defeats the check — `check:remote`
+asserts its absence.
+
+**The digits are tabular and grouped in one place.** A proportional `1` makes two identical
+numbers look different at a glance, and two screens spacing `418302` differently would turn a
+match into a mismatch — which is the failure that teaches somebody the check is noise.
+
+`SEAL_VERSION` is 2, so every key moved and `contract/seal-vectors.json` moved with it, which is
+the intended signal. The vectors now pin the **digits** as well as the sealed bytes: the typed
+road rests on two different implementations deriving the same number from the same exchange, and
+a divergence would break no connection and fail nothing on either side — it would show two
+numbers to a person, who would correctly conclude they were being attacked, and give up. That
+file is also no longer copied into the mobile repository by hand; `sync-protocol` carries both
+vendored files, because a stale vector is the worst kind of green.
+
+Two smaller things fell out. `ServerBody::Paired` now carries `instance` and `label`, because a
+device that pairs by a typed address has never been told which machine it reached — the QR
+carries both — and the alternative was inventing an instance id, which would make every typed
+pairing look like the same machine. And `Invite.serverPublic` is `Uint8Array | null`, so *which
+road this is* is a fact the type system carries rather than a convention: the typed road used to
+build a `cide://pair` URI with a faked key to hand to `parseInvite`, and a faked pinned key is
+indistinguishable from a real one at exactly the point the difference matters.
+
+### A stop that could be skipped, and a port cide refused to give back
+
+Reported from the phone, and the worst of the four because it is unrecoverable by anything the
+user can do: open a pairing window, fail to connect, press Cancel, press *Pair a device…* again
+— **port already in use**, for ever. Switching the whole feature off did not free it either.
+
+`reconcile` stops before it starts, and its comment says so: *"Stop first, always. A restart
+that bound before releasing would refuse itself with `AddrInUse`."* The comment was right and
+the code did not do it. `RemoteServer::shutdown` consumed `self`, so the caller had to own the
+server, so the stop went through `Arc::try_unwrap` — and **the event pump holds a clone for as
+long as its channel is open**, so the unwrap returned `Err` on every stop that mattered. The
+losing arm dropped a refcount under a comment claiming *"the sockets close either way"*, which
+is simply false: dropping one `Arc` while another is live closes nothing. The accept loop went
+on owning the `TcpListener` for the life of the process, and cide spent the rest of the session
+refusing itself.
+
+It is terminal with a **configured** port and merely invisible with a derived one. A port
+somebody typed is a promise to a device that saved it, so `bind_somewhere` refuses rather than
+sliding to another number — which is the right rule, and it is what turned a leak into a dead
+feature. A derived port walked the band and looked like it worked.
+
+`shutdown` now takes `&self`, which cost nothing: every line in it already worked through a
+shared reference, and `JoinHandle::abort` does too. The signature was the whole bug. It also
+**joins** the tasks it aborts, because `abort` only *requests* cancellation and the listener is
+released when the runtime next drops the task — which is after `reconcile` has already tried to
+re-bind. Joining is what makes "shutdown returned" mean "the port is free".
+
+The regression test binds a **fixed** port three times in a row, holding a second `Arc` across
+each stop to stand in for the pump. Both halves are load-bearing and the mutation proves it:
+remove the join and it fails with `Address already in use (os error 98)`, the user's own error.
+Asking for `:0` twice would have passed against a server that never stopped at all.
+
+### Ten addresses, and what a QR can actually be photographed at
+
+`cide-headless remote` on the author's machine prints ten: one network card and nine docker,
+libvirt, k8s and VPN bridges that no phone can reach. Carrying all ten broke two things, and
+neither looked like an address problem.
+
+**The scanner did nothing.** Not an error, not a rejection — a live viewfinder and silence,
+which is indistinguishable from a broken camera. The payload was 372 characters, a 69-module
+symbol, drawn at `22ch` ≈ 170px: about **2.5 screen pixels per module**, photographed off a
+monitor that has its own pixel grid. A camera cannot resolve that.
+
+The instinct is to shorten the payload, and the measurement says that is the smaller half:
+capping at four addresses takes 372 characters to 228, a 39% cut — and 69 modules to 61, which
+is 12%. QR versions step in coarse jumps and a symbol is sized to the first that fits. What
+made it readable was drawing it **twice as large** (`40ch`, floor 260px), which took it to about
+5 pixels per module. The cap stays because fewer modules is strictly better and the payload has
+no business carrying nine bridges, but on its own it would not have fixed anything. Both
+numbers are in the code, because the intuition here is wrong and the next person will have it.
+
+**And the app looked hung.** A pairing code is single use, so addresses are tried *in turn* and
+never raced — two connections would have one burn the code for the other — so nine unreachable
+addresses were nine fifteen-second timeouts behind a disabled spinner: two and a half minutes
+with no way out. Two fixes, and the second is the one that matters. The patience is now split:
+`OPEN_TIMEOUT` (3s) until the socket opens, because reaching a machine on a local network is
+fast or it is not happening, and the full `PAIR_TIMEOUT` once something answers, because being
+*served* is worth waiting for. And the attempt can be **abandoned** — the button becomes *Stop
+trying* rather than a dead spinner, aborting before the code is sent so it stays redeemable,
+which the test asserts by pairing again with the same code afterwards.
+
+The silent-scan case also now says something. After six seconds with nothing decoded the screen
+offers the reason — the code may be too small from here — and the way out. A camera that reads
+nothing had no way to distinguish itself from one nobody had pointed yet, and *point it at the
+code* forever reads as a broken app.
+
+### Two timeouts that counted a person as a network
+
+Both were found the same way, and neither by a test: pairing by hand on an emulator and taking
+a minute over the comparison, as somebody who has to *find* the pairing window would. Every
+automated test resolves the confirmation immediately, so the entire suite was blind to the
+interval the feature had just introduced.
+
+The first was on the phone. `PAIR_TIMEOUT` is fifteen seconds and it wrapped the whole attempt,
+so the clock was running while the six digits sat on screen waiting to be read. The digits
+matched, the tap landed, and the attempt had already been abandoned — reported as *cide did not
+answer in time*, which names the network. The clock is now stopped when the question is asked
+and started again for the answer's round trip: it measures packets, and the code's own two-minute
+life is the real limit on how long a person may take.
+
+The second was cide's, and it survived the first fix. `HANDSHAKE_TIMEOUT` gives an
+unauthenticated socket twenty seconds, which is generous for a handshake and wrong for a socket
+deliberately held open while somebody walks to a monitor. It closed underneath the comparison,
+and the app said *the connection failed* — again a network problem, again not one, and this time
+implying advice (try again, move closer) that would not help. `PAIRING_TIMEOUT` is
+`CODE_TTL` plus a margin, chosen so the bound is *the thing being waited for* rather than
+patience: the code is dead afterwards, so a socket outliving it waits for something that can no
+longer happen, and the margin puts the expiry on cide's clock rather than the socket's, because
+one place decides when a pairing window has closed and it is the one that minted the code.
+
+The test for the second asserts the two constants against **each other** — a pairing socket
+outlives the code it is waiting to redeem — rather than against a literal, so the claim survives
+either number moving. It also drives a real interval rather than only reading the constants,
+because the arm choosing between the two timeouts is the part that can be got wrong; it does so
+on tokio's pausable clock, which took it from twenty-two seconds to forty milliseconds and is
+why `test-util` is now a dev-dependency of `cide-remote` and of nothing else.
+
+The shared lesson is worth stating, because it will happen again the moment any other screen
+asks a person something mid-protocol: **a timeout that spans a human decision is measuring the
+wrong thing, and it fails by blaming the network.** Both messages were about connectivity, both
+were wrong, and both would have sent somebody to check their Wi-Fi.
+
+### A `query-string` that parses nothing, and four screens that were never the bug
+
+The mobile app rendered its first screen perfectly and died on the first tap, with
+`TypeError: undefined is not a function` reported against `BaseNavigationContainer` — a file in
+`node_modules` that is entirely innocent and names neither the dependency at fault nor any
+route. The typecheck, the lint and all ninety unit tests were green, because none of them
+navigate.
+
+expo-router 4.0.22 requires `query-string` — its `getPathFromState` fork does
+`__importStar(require("query-string"))` — and does **not declare it**, so it has to be added by
+hand, and `npm install query-string` gives version 9. Version 9 is pure ESM whose `index.js` is
+one line, `export default queryString`: a default export and no named ones. Under Metro's
+interop `.parse` is `undefined`, and the path from state is only computed on a *navigation* —
+which is why the landing screen was flawless and every route beyond it was a white rectangle.
+
+Two days of the bisect went into screens that were never the bug, and one of those bisects
+measured nothing at all: the package is `dev.cide.mobile` and the script had been counting
+errors from `com.cide.mobile`, which is not installed. The fix is one exact version, and the
+guard is `tools/check-interop.mjs` — which does not read the version string, because a version
+in a manifest is a wish. It `require()`s the installed package and asserts the functions are
+callable, then separately refuses a range where an exact version belongs.
+
+### What is not verified
+
+**It has now been seen by an emulator, and by no real phone.** The companion repository at
+`/home/lantian/work/cide-mobile` builds a release APK, and on a Pixel 4 XL emulator (API 33) the
+whole vertical slice runs against a real `RemoteServer` in another process: the pairing form is
+filled, the code is redeemed, the instance appears as *connected · 1 sessions*, its session list
+is drawn from the wire, and the session screen paints the `ScreenCapture` the server sent. The
+pairing chooser, the camera-permission arms and the viewfinder mount were each walked and
+screenshotted. Its 98 tests pass, and three of them are the ones worth naming: they spawn
+`cargo run -p cide-remote --example fake_cide` and drive a real `RemoteServer` over a real
+socket. One **pairs from an
+invite** — the `cide://pair?…` URI a Settings screen would print — redeems the code, comes away
+with a device id and a key it has never seen, and then opens a resumed connection with them. One
+checks that the same code a second time is refused in cide's own words. One checks that a
+connection is welcomed, served the projection, answered through the sealed channel and sent a
+screen repaint.
+
+**The whole road has been walked between two languages and two processes**: invite, pair,
+credentials, handshake, board, screen. What has not happened is any of it happening on a device.
+
+The suites: 67 in `cide-remote`, every one of them driving a real loopback socket, a real
+WebSocket **and the real sealed transport** against a fake host — a socket needs no binary on
+PATH, which is why none is `#[ignore]`d, and putting the handshake in the shared test helper
+means the key derivation and the counter discipline are exercised by all 67 rather than by the
+eleven that are about them. Then 16 in `cide_claude::permission`, 13 in `cide-pty` beside its
+existing ones, which pass **unmodified**; 6 in `cide-core::remote`, 5 in `cide-ipc`'s two new
+modules, 2 in `xtask`, and 3 in `cide-app`. `cargo test -p cide-app` is 585.
+`clippy -D warnings`, `xtask codegen --check`, `xtask contract-check`, `tsc --noEmit` and the UI
+checks — `check:remote`, `check:ext`, `check:theme`, `check:ui-scale`, `check:selectors`,
+`check:boundary`, `check:unlisten`, `check:ui-icons`, `check:motion`, `check:menus` — are green.
+`cargo test --workspace` is green.
+
+Specifically unconfirmed:
+
+* **The listener has never accepted a connection from another machine.** It has now served an
+  Android emulator across the host boundary at `10.0.2.2` — which is a second process and a
+  second network stack, but still this machine. `cide-headless remote` resolves and prints — it
+  named this machine's twelve interface addresses, the derived port for the `test` profile and the
+  device file's path, all correct — but resolving is not binding, and a LAN is not a loopback.
+* **Nothing has ever been typed into a session from a device.** The encoder is table-tested
+  against the sequences xterm sends; whether the Claude TUI likes them is a fact only a phone can
+  establish.
+* **The screen has been drawn once, and by one row.** The emulator painted a `ScreenCapture`
+  the server sent — so the transport, the row store and the monospace grid are connected — but
+  the fixture was a single unstyled line. Nothing has exercised the diff against a moving
+  screen, a style run, a wide character, a wrapped row or the alt buffer, and whether the rows
+  *look* like the terminal is still a thing only reading them has checked.
+* **The Settings section has not been rendered on a display.** It type-checks, its tokens resolve
+  under both palettes, and its layout is unseen.
+* **No pairing has ever completed against a real cide.** One has now completed against a real
+  `RemoteServer` — the `fake_cide` example, which is the genuine server class serving constant
+  projections — from a release APK on an emulator, by hand. What has never run is the **panel's**
+  half: `remote_pairing_start`, the invite it builds, the QR it draws and the six digits it shows
+  have not been on a display, so the string the phone was given was assembled by hand from the
+  server's own output rather than read off cide's screen. That emulator pairing also predates
+  M74 and used the *scanned* road's shape with a key read from the server's stdout — which is
+  precisely the arrangement that hid the missing key field for a milestone, and is why the typed
+  road's end-to-end tests now drive `fake_cide` with no key at all.
+* **Nobody has ever compared the six digits.** Both ends derive them, the vectors pin them across
+  the two languages, and a relayed exchange is asserted to produce two different ones — but the
+  mechanism is a person looking from a phone to a monitor, and that has not happened. What a test
+  cannot reach here is whether the number on cide's panel is findable while holding a phone, which
+  is the only property that decides whether the check is performed or waved through.
+* **The camera has never read a code.** The scanner's decision is unit-tested and its permission
+  arms and viewfinder were walked on the emulator, but the link from a frame to a pairing has not
+  run: this emulator's virtual-scene camera delivers no frames at all on this host, which was
+  established rather than assumed — the **stock camera app shows the same blank preview**. cide's
+  own encoder was rendered to a PNG and hung on the emulator's virtual-scene wall for that test,
+  so the image was there and nothing could see it. A real phone is the only instrument for this.
+* **The QR has never been scanned, or drawn.** `pairing_qr` is asserted on its modules, including
+  the three finder patterns in the three corners a scanner looks for and the fourth corner that
+  must not have one — which is the assertion a transposed or flipped grid cannot pass. What no
+  test can claim is that a phone camera reads the `<path>` the panel renders at the size the panel
+  renders it, which is a question about antialiasing, contrast and physical size, and therefore
+  about a display.
+* **The permission corpus is hand-written**, from the shapes Claude Code ships, and has never
+  been checked against a prompt a real `claude` drew. That is the gap `tests/real_permission.rs`
+  exists to close, and it is the cheapest unverified thing on this list: capture a pane to a file
+  and run one ignored test.
+* **Whether a digit alone picks an option** is unmeasured. If it turns out a Return is needed, the
+  fix is a *second* write taken after re-reading the screen and confirming the digest has not
+  moved — never one write of two bytes.
+* **The sealed transport has never carried a frame between two *machines*.** It has carried
+  plenty between two processes: `contract/seal-vectors.json` is generated by the Rust and checked
+  by the TypeScript, including the strong half — the JavaScript **seals to the same bytes** rather
+  than merely opening what Rust sealed, which pins the nonce prefix, the counter and the counter's
+  authentication rather than only the key — and `crates/cide-remote/examples/fake_cide.rs` is a
+  real server the companion repository's end-to-end test talks to over loopback. What is left
+  unproven is a network with latency, loss and a NAT in it.
+* **`fake_cide` serves constants.** It exercises the transport, the frame vocabulary and the
+  snapshot, and it exercises nothing about a real workspace, a real mirror or a real `claude` —
+  which is the point of it, and also its limit.
+* **The dispatch and task-write bridge has never run.** `on_the_runtime` blocks on the remote
+  runtime from a `spawn_blocking` thread; the argument for why that is legal is written out, and
+  the three gestures behind it have been exercised only against a fake host that never touches a
+  runtime.
+
+## Two settings that reached nothing (M73)
+
+> *"Check project ~/work/selfcraft — it seems it's agents doesn't use cide pool "o3-pool" but
+> should"*
+
+They did. `agent-runs.json` had the pool's three entries stamped on every selfcraft run, the live
+children carried `--model o3/AgentLLM-big`, and the one role that looked wrong — `engine-core`, on
+the pool's *second* model — was a run that had failed over from the first after opencode reported
+`SSE read timed out` against a provider that had also been answering `429` for an hour. The pool
+worked exactly as designed, which is the part of this that is only visible from the outside if you
+know to read the run's pool index.
+
+What was wrong was the **other half of the same override**. That project's `engine-core` row said
+`maxConcurrent: 3`, and two of its tasks sat `[queued]` behind one running sibling. The number the
+queue enforces is stamped at the dispatch, by `cmd::agents::plan_dispatch`, from
+`cide_agents::effective_max_concurrent` — which read `agent.def.max_concurrent` and had never
+heard of an override. Meanwhile `overrides::resolve` computed `Resolved::max_concurrent` correctly
+and nothing read it. This is `Resolved::apply`'s story a field along: `model` and `effort` were
+computed there and obeyed nowhere from M45 until M71, and the fix then was a fold at the one place
+overrides are resolved. The fix here is the mirror of it — one function, called by both readers,
+so the roster's row and the queue's arithmetic cannot disagree — plus `overrides::row_for`, which
+is now the single producer of the *scope* rule (a Claude Code subagent takes no override, and it
+must take none for concurrency for the same reason it takes none for harness).
+
+Stated because it is a real consequence: a run's limit is stamped when the run is minted, not read
+at admission (`LiveRun::agent_limit`'s rule, which exists so that a setting edited under a queued
+run does not change what that run is already doing). So raising the number does not release runs
+that are already waiting — they were minted against the old one. The next dispatch gets the new
+number.
+
+**And the workspace was being written once per run.** Following the first bug's evidence turned up
+a second: the dev instance had a provider and a pool configured in Settings that existed in its own
+memory and in no file — `workspace.json` had not been touched since two seconds *before* that
+instance started, three hours earlier. `WorkspaceState::flush_if_due` has documented itself as
+"called from the app's tick and before quitting" since M1, and there is no app tick; `grep -rn
+flush_if_due` found its definition and two module headers complaining about it. `positions_state`
+and `tasks_state` had each answered by starting their own flusher thread and writing down that the
+workspace had not. This journal recorded it as unmet under M31 and it stayed unmet for forty
+milestones, because nothing about it is visible while the app exits cleanly: `lifecycle::shutdown`
+calls `write_now` unconditionally, and `run.sh` stops the previous instance with SIGTERM. A crash,
+an OOM kill or a `SIGKILL` lost every layout change and every setting of the whole session, with
+nothing having failed and nothing logged — the write had simply never been asked for.
+
+The workspace now has a thread of the same shape as the other two, polling at 250 ms against the
+500 ms debounce. The test that would have caught it is not the behavioural one — a debounce that
+nothing drains passes every unit test you can write about it — it is the source assertion that
+`setup` names `start_flusher`, over `srcgrep::without_comments`, because the thing that was missing
+for forty milestones was a *caller* and what stood in for it was a sentence in a doc comment.
+
+**Not verified on a display.** Both fixes are covered by tests and neither has been watched in a
+running instance: that a role overridden to three now starts three, and that `workspace.json`'s
+mtime moves during a session rather than only at exit, are both one launch away from being
+confirmed and neither was.
+
+## The empty frame's two dead buttons (M74)
+
+> *"Settings button and bottom panel buttons are not working when project isn't opened"*
+
+Both were inert by construction rather than by accident, and the constructions were different.
+
+`App.tsx`'s rail handler read `if (next === 'settings' && activeProjectId)`, so with nothing open
+the ⚙ took a click and did nothing — no tab, no notice, no log line. The tool window's toggle read
+`if (!activeProject) return`, the same shape one prop along. `keys/dispatch.ts` matched both:
+`settings.open` and `settings.keymap` answered `unmet(command, 'no open project')`, and
+`view.toolWindow.toggle` did too. `cide_core::commands` carried the settings pair's `projectOpen`
+clause with a comment explaining it. Every one of those was written deliberately, and together
+they are the state `chrome/sidebarView.ts` already has a paragraph about: *a dead control is worse
+than either a real panel or an absent one*. The rail draws five buttons in the empty frame and two
+of them did nothing.
+
+**Settings are global; the tab was a container, never a scope.** `tab_open_settings` takes a
+`ProjectId` because `TabKind::Settings` is a tab of a project, and with no project there is
+genuinely nowhere to put one. Nothing follows from that about the *screen*, which reads
+`Settings` — one struct, on `Workspace`, the same in every window. So the screen is now drawn in
+the work area the empty frame otherwise leaves blank (`settings/SettingsFrame.tsx`), and
+`SettingsTab` takes `project: ProjectId | null`. Three things follow from the `null` and nothing
+else does: the section is remembered in a module-level `frameSection` rather than on a tab, and
+the two model probes — `agents_models` and `llm_test_model` — run in the user's own directory,
+which both already supported because `project_root(...).ok()` was an `Option` there from the
+start. The gesture is deliberately the same in both branches: ⚙ opens-or-re-shows, the `×`
+closes, exactly as a Settings tab opens-or-re-activates and closes on its own `×`. That symmetry
+is why ⚙ still does not light up — it never did (there is a user report in `selectView` about
+exactly that), and a rail button that lit only when the window happened to be empty would be a
+third behaviour for one control.
+
+**The tool window needed a second home, and the argument against one is still true.**
+`cide_core::toolwindow`'s header argues at length that this state may not live in `Settings`,
+because `Settings` rides every `workspace-changed` to every window and a persisted *open* toggled
+in one `PerProject` window would open another window's panel. `Workspace::tool_window` is global
+in exactly that way and is safe for a reason about windows rather than about scope: only a shell
+drawing no project reads it, and `WindowMode` cannot produce two of those — `PerProject` mints one
+shell per project, so every shell it builds has one, and `Stacked` has a single shell in total.
+That argument is written at the field, and the header now says not to read the old section as a
+general licence.
+
+It carries no history, and nothing enforces that: a history tab names a file in a repository in a
+project, so `open_history` and `close_history` keep a required `ProjectId` while `set_layout` and
+`activate` take an `Option`. What the projectless panel therefore has is exactly two tabs. Docker
+is fully live there — a daemon is a property of the machine, which is the whole reason
+`cide-docker`'s board has never been project-scoped — and the Log tab draws a sentence rather than
+an empty commit list, on `ProblemsPanel`'s rule that an empty list is a claim about a repository
+that was read. `LogTab` is not rendered with a `null` project rather than being taught to tolerate
+one: it opens a repository list, a branch list, a walk and an `fs-changed` subscription on mount,
+all keyed by project, and four "there is no project" arms would be four more places that can
+answer wrongly.
+
+`keys/dispatch.ts` reaches the frame through `chrome/panelRequests.ts`, which is the module that
+exists because a dispatcher is not inside React — the third registered opener in it, alongside the
+sidebar's and the amend payload's. A detached pane or tab window registers none, so
+`requestSettingsFrame` answers `false` and the command refuses honestly, which is the one refusal
+that survives.
+
+`Workspace::tool_window` is `#[serde(default)]` with **no schema rung**, unlike the four in
+`CURRENT_SCHEMA`. Each of those bumped because a defaulted field would make an existing user's
+answer an inference from a constant that might later be narrowed; there is no such question about
+a closed panel, and `a_workspace_saved_before_the_empty_frames_tool_window_existed_still_loads` is
+the standing proof that an older document loads rather than being quarantined. The neighbouring
+`filesAsTree` test had to learn about the new field, because its assertion is a `contains` over
+the whole document.
+
+`cide_core::toolwindow` had **no tests at all** before this, having claimed since M19 that
+everything is decided there "so it can be tested without a window". It has five now, and the two
+that matter are the mirror pair: a gesture in the empty frame must not reach a project's panel,
+and a project's must not reach the empty frame's. A swapped accessor passes either one alone.
+
+**Not verified on a display.** Everything here is covered by `check:toolwindow-render`'s new
+`noProject` story, the five Rust tests and the two persistence ones, and none of it has been
+watched in a running instance: that ⚙ fills the empty frame and the `×` empties it again, that ▤
+opens a panel whose Docker tab connects, and that opening a project from either state puts the
+project on screen rather than leaving the settings screen up, are all one launch away and none was
+taken.
+
+## A colour per role, and an author line you can find (M75)
+
+> *"All sub agents should have their own color … and this color should be used to mark this
+> agent name in agents list and in tasks (also in tasks comments, and this name should be bigger
+> size, coz now it's grey and small above comment). Also orchestrator text in task description
+> also should have one common color that will never be conflicted with other agents colors."*
+
+Two complaints in one sentence, and the second one is measurable. `.logAuthor` was `--fs-ui-11`
+in `var(--dim)`: a rung **below** the `--fs-ui-12` body it introduces, and below the `--fs-ui-12`
+*edited* marker sitting on the same line. The one word a person scans a conversation for was the
+smallest and faintest thing on the row that carried it. A tracker written by a person, an
+orchestrator and several subagents had nothing on screen that told the three apart at a glance,
+and the head was sized as though provenance were the least of it.
+
+### The colour is derived, and the key it can override already existed
+
+The obvious shape — a `color:` field, modelled end to end, a swatch in the Settings form — was
+not built, and both halves of why are worth recording.
+
+`color` is **Claude Code's own front-matter key**, and cide has carried it through a save
+untouched since M30: `claude_corpus`'s `the_split_between_modelled_and_carried_is_where_it_should_be`
+names it in the list of keys cide does not model, and `every_key_survives_a_save_with_its_block_intact`
+asserts it comes back byte-identical. Modelling it would mean `KNOWN_KEYS`, `canonical_key`,
+`render`, `AgentDraft`, `AgentField`, `agentsDraft.ts` and `tools.rs` all moving together, and
+cide re-spelling a key with its own quoting rules inside a committed file it did not author — to
+gain nothing a colour needs. So `read_definition` **reads** the key on the way past and leaves it
+in `extras`. `AgentDef::color` is the answer; `render` is untouched; the form still shows the key
+as the editable extra row it always was. The one thing that had to change is that cide's own
+dialect used to greet an unmodelled key with *"`color` is not a key cide reads"*, which stopped
+being true the moment the roster started reading it.
+
+And the default is **derived from the role's name**, not stored. `agentColor` hashes the id into
+one of eight hues, so a fresh role is distinguishable the moment it exists, nobody has to choose,
+and the answer is identical in every window, every repository and for every person on the team
+without a byte being written. The id and not the label, deliberately: `TaskAuthor::Agent` carries
+a label *copied at write time* so an old comment still reads correctly after a rename, and
+colouring by the label would have meant a role's own comments changing colour halfway down a log
+the day somebody edited `label:`.
+
+### The reserved colour is reserved by absence
+
+The orchestrator — `TaskAuthor::Orchestrator`, the project's primary session, which is what signs
+a comment written from any Claude pane — needed a colour "that will never be conflicted with
+other agents' colours". The way to promise that is not a rule that skips a hue; it is to make the
+hue unreachable. `AGENT_HUES` has eight entries and `--agent-orchestrator` is not one of them, so
+no hash can return it (the modulus indexes the list) and no definition can name it either
+(`cide_ipc::agents::hue` answers `None` for every word outside the eight, including
+`"orchestrator"` spelled by somebody who read the source). `check:agents` asserts that absence
+directly, because it is the mechanism and not a side effect of one.
+
+It is a slate rather than a ninth hue for the same reason. *Not one of the agents* has to read as
+a different kind of colour, not as the ninth one along — and the numbers say so: the eight are
+held 70 redmean units apart from each other and the orchestrator is held 100 from all of them,
+measuring 110 in both themes.
+
+### Three gates, all measured, none satisfiable by eye
+
+`--agent-*` is a new family rather than a reuse of `--lane-*`, although the job is the same
+shape. The lanes are frozen at eight by `check:log`, which asserts `--lane-8` does *not* exist,
+so the family could never grow; the lanes' dark orange and yellow sit **49** apart, which is
+under any floor worth setting for names a reader tells apart at a glance; and sharing them would
+mean a retune of the commit graph silently recolouring every agent in every tracker.
+
+`check:theme` gates the new family three ways, in both themes: the eight pairwise `>= 70`
+(measuring 74.6 light, 85.4 dark — 70 sits just under `cide_ipc::theme::MIN_SELECTION_DISTANCE`'s
+calibrated 72), the orchestrator `>= 100` from all eight, and every one of the nine clearing
+`INK_FLOOR`'s 3:1 against **both** `--panel` and `--sel` (4.26 light, 3.99 dark). Both grounds,
+because an author line is drawn over a selection as often as not — the failure `check:scheme`
+argues about one surface over, where the dark theme's comments sat at 1.73:1 on a selection from
+M3 to M24. The floor is 70 and not the notice edges' 100 because of arithmetic rather than a
+weaker standard: eight colours cannot be 100 apart pairwise in a range this narrow.
+
+The 100 floor is deliberately wider than the palette needs, and the assertion is not "is the
+palette fine" but "could this gate fail at all" — the discipline the notice-edge section already
+holds itself to with its below-the-floor `--red`/`--accent` pair. Both were verified by moving a
+token and watching them fire.
+
+### What is coloured, and what deliberately is not
+
+The role's name in the Agents panel; the run's label on an activity row; the **label inside** a
+task's chip; the assignee field; the creator line's name; and every comment's author. The chip's
+background and dot are untouched, and that is the one decision in the surface worth arguing:
+tone is a claim about the *run* — live, awaiting permission, stalled — and recolouring it by role
+would trade a fact for a name. The two signals stack. `check:agents-render` asserts both halves
+in the same pair of stories, because a build that coloured the chip instead of the word would
+pass the "who" assertion and destroy the "what" one silently.
+
+The user's own lines are the other deliberate exception. `.logAuthorUser` keeps `--accent`, which
+is close to `--agent-red` and `--agent-orange` and is allowed to be: "You" is a word no reader
+confuses with a role's name, so the colour there is a flourish and not the signal it is
+everywhere else. `authorColor` returns `null` for that arm precisely so the class goes on
+winning — an inline colour would overrule the stylesheet without changing anything visible enough
+to notice — and the render check pins the empty string for it beside the two that are colours.
+
+The author line itself is now `--fs-ui-13` at weight 600, one rung *above* the words it
+introduces rather than one below, and `edited` came down to `--fs-ui-11` so it stops out-sizing
+the name it qualifies.
+
+### Two things that had to be got right and are invisible if not
+
+**`RunRef` and `Chip` gained the agent's id**, beside the frozen label rather than instead of it.
+Colour and word answer different questions and have different provenance, and a chip that derived
+its colour from the label would have given two roles that share a word one colour.
+
+**The digest readers are attribute-order blind.** `smokeEntry`'s colour extractors find the tag
+first and read `style` out of it second, rather than matching one pattern across both — because
+JSX prop order decides attribute order in the markup, and a single ordered regex silently matches
+nothing the day somebody moves `style` above `data-audit`. That is the `data-current` trap from
+the diff pane arriving from the other side: there the fix was to freeze the order, here there was
+no reason to, so the reader was made indifferent instead.
+
+**Not verified on a display.** Everything above is covered by tests — the workspace suite, all 97
+frontend checks, the corpus that proves no `.claude/agents/*.md` changed shape — and none of it
+has been watched in a running instance. That the eight hues are actually distinguishable on a
+real screen at 11 and 13 pixels, rather than merely 70 redmean units apart in a script, is the
+one claim only a launch can settle.
+
+## A run's clock counts work, not waiting (M76)
+
+> *"when i pausing jobs - i can go for a while, for example for 24h, then i see that agent was
+> working for a 24h+xh time - this is wrong, we need properly count agent time without pauses"*
+
+### One timestamp, asked three questions it could not answer
+
+A run had exactly one clock: `AgentRun::started_unix_ms`, stamped in `insert_run` at the moment
+a dispatch is **enqueued** — while the run is still `Queued`, before any child exists — and
+never moved again. Not by a pause, not by a failover respawn, not by a restart; `respawn`'s own
+doc says so in as many words, and `restamp`, despite the name, only clears the pool fields.
+
+Two surfaces rendered a duration, and both computed it the same way:
+
+* `AgentsPanel/RunRow.tsx`, twice — `elapsed(nowMs, run.startedMs)`, on the live activity line
+  and on the History row whose own doc comment says *"how long it took"*.
+* `cide_agents::tools::render_run` — `started {age(now, run.started_unix_ms)}`, which is what
+  the orchestrator reads out of `cide_agent_runs`.
+
+So the figure was age since dispatch, and it overstated the work in four ways, all of them
+ordinary use:
+
+1. **A pause.** `freeze_run` marks `Paused` and SIGSTOPs the child; `finish_thaws` restores the
+   frozen state verbatim and drops `Frozen::at_unix_ms` without accumulating anything. Pause a
+   run overnight and the row gained the night. This is what was reported.
+2. **Being shut.** A run survives a restart as `Interrupted` with `started_unix_ms` carried
+   through `SavedRun`, so the hours cide was not running were counted as work.
+3. **No end.** There was no end timestamp anywhere in the workspace — `ended_unix_ms`,
+   `finished_unix_ms` and `ended_at` all grep to nothing across `crates/` and `ui/src/`. A
+   finished run's row therefore kept ticking: a run that took ninety seconds and ended four
+   hours ago read `4h 00m`, and would read `1d` the next day.
+4. **The queue.** The stamp is taken while `Queued`, so time spent waiting for a concurrency
+   slot was work — which made a role's figures depend on how busy the project was.
+
+### Two numbers, and the third and second bugs fall out of the first fix
+
+A run now carries `worked_ms`, the closed working intervals, and `working_since_unix_ms`, set
+**iff** it is working right now. The figure is the first plus, when the stamp is set, the time
+since it.
+
+The wire deliberately carries the halves rather than the sum. Rust could send one number, but
+then a live row would only move when a roster broadcast happened to arrive, and would sit still
+for seconds and jump; sending both lets the row tick off its own one-second clock. The other
+half of that choice is what pays for bugs (2) and (3) with no code of their own:
+
+* `working_since_unix_ms` is `None` in every state that is not work, so a **paused** row's
+  figure does not tick and a **finished** row's is final. There is still no end timestamp, and
+  there does not need to be one — the clock simply stops.
+* It is not persisted. Every restored run is `Interrupted`, which is not work, so it is `None`
+  by construction and the gap between two launches is excluded without a snapshot timestamp.
+
+`RunState::counts_as_work` is the definition, one exhaustive match in `cide-ipc` so a ninth
+variant is a compile error rather than a state silently counted as one thing or the other.
+`Starting` and `Running` are work. `AwaitingPermission` is not, and that was the one genuine
+call: the child is alive and its turn is open, which is the argument for counting it, but the
+interval is bounded by when somebody next looks at the screen — it is the same class as a pause
+and behaves like one, in that a run left overnight at a permission prompt would accrue the
+night. `Idle` is not, `Queued` is not, and that last one is bug (4).
+
+### `move_to` is the whole of it
+
+`AgentRegistry::set_state`'s doc already argued that it is *"the only place in the process that
+can see a transition rather than a state"* — an idle run is observed over and over, and each
+edge happens once. That is exactly the argument a clock needs, and the clock could not live in
+that method, because six callers write `live.state` inline under the lock and one of them,
+`plan_failover`, has a comment recording that it may not call `set_state` at all since that
+method takes the mutex it is already holding.
+
+So the bookkeeping is a free function over `&mut LiveRun` that takes no lock, and all seven
+assignments route through it. Both edges are handled, never one: accumulating on the way out
+without stamping on the way in loses every interval, stamping without accumulating loses every
+interval but the last, and **neither has a symptom** — the figure is just a smaller wrong number
+on a row nobody cross-checks against a stopwatch. Work→work is written as an explicit no-op arm,
+because a failover respawn is `Running → Starting` and is one run continuing: closing and
+reopening the interval there would give the same total only by accident of the two happening at
+one instant.
+
+`Frozen`, `freeze_may_have_killed_the_turn` and `STALE_FREEZE_MS` are untouched. Nothing
+subtracts a pause — the clock did not run — so `Frozen::at_unix_ms` keeps its single existing
+purpose.
+
+### Three things that are silent if got wrong
+
+**The snapshot closes the open interval and the restore does not reopen one**, and the two pull
+opposite ways, which is why one test asserts both. `write_snapshot_now` calls `worked_now`
+rather than copying `worked_ms`, or a run that was `Running` when cide quit loses everything it
+did since its last state change, at every restart, for ever. The restore sets `None`, or the
+hours between launches land in the figure. `worked_ms` is `#[serde(default)]`, the schema rung:
+a snapshot written before the field reads `0`, which understates those runs once and is the only
+honest answer available, and what must not happen is the whole file refusing to parse.
+
+**A backwards clock banks nothing.** This is wall clock and it steps — an NTP correction, a
+suspend and resume — and `saturating_sub` is `freeze_may_have_killed_the_turn`'s stated rule in
+a second place. The failure the other way is permanent: an enormous interval lands in
+`worked_ms` and nothing ever takes it out again.
+
+**The pure tables cannot see the bug they exist for.** `check:agents` pins `workedFor` and
+`timeTitle` as functions, and both would go on passing against a `RunRow` that had never stopped
+calling `elapsed(nowMs, startedMs)`. Only a rendering can see which one the row calls, so
+`smokeEntry` gained a `times` digest — each time cell's text and its `title` — and the fixtures
+were built so the two answers differ. `PAUSED` is dispatched 1h 04m ago and worked 49m of it;
+`FINISHED` is dispatched 2h 03m ago and worked 6m. The render check asserts `49m` and `6m`,
+which a fixture where the two agreed could not have done.
+
+### What the surfaces say now
+
+The row draws worked time and the tooltip carries the rest: the phase sentence still leads,
+because the dot at the head of the line is the only other place a run's state is written and a
+dot is readable by nobody who has not learned the glyphs, and the wall clock and the excluded
+time are appended to it. A **terminal** run gets no excluded clause — `now - startedMs` rises
+for ever while its worked figure is final, so their difference would be a number growing without
+bound while claiming to describe a pause, which is the same lie this milestone removes arriving
+in a new place.
+
+The MCP row keeps `started … ago` and gains `worked`. That figure was never wrong — it says
+"started" — and what was wrong was reading it as a duration; now both are on the row and a run
+paused overnight shows them differing by the night. `age`'s unit ladder was factored into a
+`span` so the two figures cannot drift into two vocabularies.
+
+`elapsed` itself is unchanged, signature and output, because `TasksPanel/TaskDetail` uses it for
+tracker timestamps and `check:agents` pins its table. What changed is which figure the run rows
+read. `startedMs` is unchanged too, and History still sorts by it: that section is *what
+happened when*, and sorting it by worked time would reorder the record by effort.
+
+**The epitaph was deliberately left alone.** `agent_rpc::epitaph` has a stated rule that its
+sentences are byte-stable, so a reader of an old board and a new one are told the same thing by
+the same words; splicing a duration in would have broken that for no gain, since every nudge line
+already points the orchestrator at `cide_agent_runs`. It is named here so the next reader does
+not "finish the job".
+
+**Not verified on a display.** The workspace suite and all 97 frontend checks cover the
+arithmetic, the persistence rung, the freeze-and-thaw round trip and the rendering. What has not
+been watched in a running instance is a real pause of a real run over real time — the test's
+freeze is injected instants, and only a launch can confirm that the figure on the row is still
+where it was after somebody comes back the next morning.
+
+## The colour a role picks, in the dialog that edits it (M77)
+
+> *"I doesn't see a color picker in agent editing modal window"*
+
+Correct, and it was a deliberate omission in M75 that read as one. That milestone's own journal
+entry has an *Out of scope* section arguing that a dedicated Color field would mean `KNOWN_KEYS`,
+`canonical_key`, `render`, `AgentDraft`, `AgentField`, `agentsDraft.ts` and `tools.rs` all moving
+together, and cide re-spelling a key in files it did not author — all true, and all of it an
+argument about **storage** that was then used to decline a **control**. Those are different
+questions, and the second one had a much cheaper answer.
+
+### A control over a carried key
+
+The picker edits the `color` entry of `AgentDraft::extras`. Nothing about M75's storage decision
+moves: `read_definition` still reads the key on the way past and leaves it carried, `render`
+still writes back the source lines the file already had, `claude_corpus` is still the promise
+that no `.claude/agents/*.md` is reordered by a save, and `AgentField` still has twelve variants.
+What is new is nine buttons and five pure functions.
+
+Two things had to be got right for that to be honest rather than a shortcut.
+
+**One key, one editor.** The Meta rows draw every unmodelled key, which now includes one with a
+control of its own above them — and a key with two editors is a key whose two editors disagree:
+type `chartreuse` into the raw row and the swatch silently reads *Automatic*. So `metaExtras`
+hides it and `withMetaExtras` folds the picker's value back over whatever the Meta rows hand
+back. Without the second half the two controls race through one array and a save drops the key
+the picker is still drawing — the Meta list is *built* from a filtered copy, so its edit returns
+a list with no colour in it at all. A `color` row typed into Meta by hand is dropped in favour of
+the picker's, which is the second editor the split exists to prevent.
+
+**Automatic removes the key, it does not blank it.** `cide_ipc::llm`'s rule — *blank is a key
+cide omits, never a value it writes* — and here it earns its place twice: a `color:` with nothing
+after it is a key `hue` answers `None` for, so the role derives anyway and the file has gained a
+line that does nothing; and on a Claude Code subagent it is a line cide added to somebody else's
+file to record the absence of a choice. The key also keeps its **position** when it is already
+there, because `isDirty` compares the extras array in order and moving a key is a change to the
+file; and its **spelling** (`Color:` stays `Color:`), because cide matches it folded and must not
+rewrite a committed file to suit its own preference.
+
+### Swatches, not a dropdown
+
+The one place this form departs from `Choice`. Every other closed vocabulary here is a list of
+*words* and a dropdown is right for those, because reading the word is how you choose. A colour
+is chosen by looking at it, and a menu of the word "cyan" makes somebody open the menu, pick,
+close it, and then go and look at another panel to find out what they picked.
+
+Three details are load-bearing and none is visible in a screenshot at rest. The selected ring is
+a `box-shadow` and not a `border`, or the row shifts two pixels as the selection moves along it.
+There are **two** rings, an inner one in the panel colour and an outer in `--accent`, because a
+single accent ring on `--agent-orange` is an orange ring on an orange dot. And *Automatic* is a
+dashed empty circle rather than a ninth colour, since what it means is the absence of a choice
+and drawing that as one more filled dot is the confusion the option exists to resolve.
+
+A value the file asked for that this build cannot use is a **note naming the word**, never a
+refusal and never a silent reset: the role runs, drawn in the hue its name derives, and the key
+is left exactly as the file has it until somebody chooses. Printing "not a colour cide knows"
+without the word would send the user back to the file to find out which line it meant.
+
+### One thing TypeScript would not have caught
+
+The note's audit hook was first written on `Note` itself, and `tsc --noEmit` passed — hyphenated
+attributes are exempt from JSX excess-property checking, so `data-audit` is accepted on any
+component. `Note` does not spread its props, so it would have been accepted there and dropped on
+the way to the DOM, and a render check would have looked for an element that never existed.
+Renaming it to `dataAuditXyz` is what proved the exemption rather than a missing check. It lives
+on a wrapper now.
+
+**Seen on a display, in the dark theme.** The picker opens on `docs.md`'s committed `color: blue`
+with blue ringed; choosing green rewrote exactly that line and left the other seven bytes for
+byte; choosing Automatic deleted the line rather than blanking it; a hand-written
+`color: chartreuse` drew the note with the word in it and survived a Cancel untouched. What is
+still unwatched is the light theme — the two-ring treatment is measured against `--panel-2` in
+both and was looked at in one.

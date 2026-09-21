@@ -287,6 +287,13 @@ fn run_teardown(app: &AppHandle) {
     //
     // Still on this thread, and still ahead of everything below it: it is the one ordering in
     // this function that another process can observe.
+    // And before that, the paired devices — for the neighbouring reason and one of its own. A
+    // phone that is told hears "the machine went away"; a phone whose socket simply drops says
+    // "something went wrong", and those are different sentences to read at the end of the day.
+    // Ahead of the child ladder because a device watching a session should learn that cide is
+    // going rather than watch a terminal stop for no stated reason. (M72)
+    crate::remote::stop(app);
+
     notice::say("Disconnecting Claude Code…");
     if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
         servers.stop_all();

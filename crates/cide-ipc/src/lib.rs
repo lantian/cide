@@ -31,6 +31,8 @@ pub mod overrides;
 pub mod positions;
 /// What a path *is* — the properties card's OS stat, text facts and git summary. (M70)
 pub mod properties;
+pub mod remote;
+pub mod screen;
 pub mod settings;
 pub mod settings_ops;
 /// Editor colour schemes — the `--tk-*` palette, as data. A different axis from [`Theme`],
@@ -53,9 +55,9 @@ pub use settings::{
     DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,
     GraphicsSettings, HighlightLevel, InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS,
     MAX_UI_FONT_SIZE, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, ProxyMode,
-    ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Settings,
-    SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, clamp_font_size,
-    clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
+    ProxyScope, ProxySettings, ProxyTarget, RemoteBind, RemoteSettings, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH, Settings, SeverityFilter, SidebarSettings, TerminalRenderer,
+    TerminalSettings, clamp_font_size, clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem, KeymapReport,

@@ -92,7 +92,11 @@ import type {
   PathSelection,
   PushOutcome,
   PushPreview,
+  PairingProgress,
+  PairingInvite,
   PushRequest,
+  RemoteDevice,
+  RemoteStatus,
   RepoId,
   RepoInfo,
   ShelfEntry,
@@ -1338,7 +1342,52 @@ export const session = {
  * Every payload carries `rev`. Two windows can now mutate one workspace, so a snapshot can
  * arrive out of order and the receiver drops anything older than what it already holds.
  */
+/**
+ * The remote listener, for the Settings screen that turns it on. (M72)
+ *
+ * Deliberately no `setEnabled`: turning the feature on is a settings change like any other and
+ * goes through `settings.set`, which reconciles the listener the way it re-walks an index when
+ * the explorer's toggles move. Two doors onto one switch is the split `push` already paid for.
+ */
+export const remote = {
+  /** What the listener is doing, including how many devices are connected right now. */
+  status: () => invoke<RemoteStatus>('remote_status'),
+  /** The paired devices. No token and no hash — the type cannot carry one. */
+  devices: () => invoke<RemoteDevice[]>('remote_devices'),
+  /**
+   * Open a pairing window, and bind a socket for it to be redeemed on.
+   *
+   * The second half is what makes the first pairing possible: the listener only binds when there
+   * is somebody to serve, and until a device exists an open window is the only somebody.
+   */
+  pairingStart: () => invoke<PairingInvite>('remote_pairing_start'),
+  pairingCancel: () => invoke<void>('remote_pairing_cancel'),
+  /**
+   * The device at the pairing step, or `null` while nothing has connected.
+   *
+   * Polled off `cide://remote-changed` rather than pushed, because neither half survives being
+   * cached. The six digits are only correct for the connection holding them right now — a device
+   * that replaced an earlier one carries different digits, and a stale number is the one value
+   * here worse than none, because it is the one somebody would accept. And `open` closes the
+   * modal: a code stops being usable by being redeemed, guessed wrong or simply running out, and
+   * only the first of those is anywhere near an event.
+   */
+  pairingProgress: () => invoke<PairingProgress>('remote_pairing_progress'),
+  deviceForget: (device: string) => invoke<void>('remote_device_forget', { device }),
+  deviceRename: (device: string, name: string) =>
+    invoke<void>('remote_device_rename', { device, name }),
+}
+
 export const events = {
+  /**
+   * The remote listener's state or its device list moved. **No payload** — the panel asks.
+   *
+   * A pushed device list would be a copy of that list in every window, and the live half of the
+   * readout is a property of a socket rather than a stored value, so a snapshot would be stale
+   * the moment it arrived.
+   */
+  onRemoteChanged: (handler: () => void) =>
+    listen<null>('cide://remote-changed', () => handler()),
   /** Fires in every window after any accepted mutation, whichever window caused it. */
   onWorkspaceChanged: (handler: (workspace: Workspace) => void) =>
     listen<{ rev: number; workspace: Workspace }>('cide://workspace-changed', (e) =>
@@ -3103,7 +3152,13 @@ export const toolWindow = {
    * flooding every window for a drag that ended where it started.
    */
   setLayout: (
-    project: ProjectId,
+    /**
+     * Whose panel. `null` is the **projectless shell's own** — the empty frame with a `+` in
+     * its header has a tool window since M74, and its state is `Workspace.toolWindow` rather
+     * than any project's. See `cide_core::toolwindow` for why one global field cannot bleed
+     * between windows here.
+     */
+    project: ProjectId | null,
     layout: { open?: boolean; height?: number; logSplit?: number; filesAsTree?: boolean },
   ) =>
     invoke<void>('tool_window_set_layout', {
@@ -3117,8 +3172,13 @@ export const toolWindow = {
       filesAsTree: layout.filesAsTree ?? null,
     }),
 
-  /** Bring a tab to the front, revealing the panel. `null` is the Log tab, which always exists. */
-  activate: (project: ProjectId, tab: HistoryTabId | null) =>
+  /**
+   * Bring a tab to the front, revealing the panel. `null` is the Log tab, which always exists.
+   *
+   * `project` of `null` is the projectless shell's panel, exactly as in [`setLayout`] — and
+   * `null`/`null` is the only pair it can be asked for, since that panel holds no history.
+   */
+  activate: (project: ProjectId | null, tab: HistoryTabId | null) =>
     invoke<void>('tool_window_activate', { project, tab }),
 
   /**
@@ -4144,8 +4204,13 @@ export const agentDefs = {
    *
    * Note that a *missing* `opencode` is **not** this `null`: that comes back as an ordinary
    * answer with `problem` set, so the form can say which of the two happened.
+   *
+   * `project` of `null` runs the probe in the user's own directory rather than a project's,
+   * which is what the Settings screen asks for when it is open with no project. The root only
+   * ever contributed a project-local `opencode.json`; the providers and keys it is really about
+   * are global.
    */
-  models: (project: ProjectId, harness: Harness) =>
+  models: (project: ProjectId | null, harness: Harness) =>
     pendingCommand<AgentModels | null>(
       'agents_models',
       () => invoke<AgentModels>('agents_models', { project, harness }),
@@ -4163,7 +4228,8 @@ export const agentDefs = {
    * Answers a verdict rather than rejecting, so both outcomes are one sentence beside the row;
    * `null` is only a build with no such handler, exactly as `models` above.
    */
-  testModel: (project: ProjectId, model: string) =>
+  /** One real turn against one model. `project` of `null` for `models`' reason above. */
+  testModel: (project: ProjectId | null, model: string) =>
     pendingCommand<LlmModelTest | null>(
       'llm_test_model',
       () => invoke<LlmModelTest>('llm_test_model', { project, model }),

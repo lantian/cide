@@ -382,10 +382,14 @@ pub async fn agent_overrides_set(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn llm_test_model(
     state: State<'_, WorkspaceState>,
-    project: ProjectId,
+    project: Option<ProjectId>,
     model: String,
 ) -> Result<cide_ipc::LlmModelTest> {
-    let root = project_root(&state, project).ok();
+    // `None` since M74: the Settings screen opens with no project open, and the root was already
+    // an `Option` here because a project that has gone away answers the same way. The probe runs
+    // in the user's own directory then, which is what a global setting is about anyway — the
+    // root only ever contributed a project-local `opencode.json`.
+    let root = project.and_then(|id| project_root(&state, id).ok());
     // Read on the caller's thread, like `agents_models` beside it, so no workspace guard crosses
     // the await. The document handed to the test is the one a run gets.
     let llm = state.with(|ws| Ok::<_, CoreError>(ws.settings.llm.clone()))?;
@@ -403,10 +407,11 @@ pub async fn llm_test_model(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn agents_models(
     state: State<'_, WorkspaceState>,
-    project: ProjectId,
+    project: Option<ProjectId>,
     harness: cide_ipc::Harness,
 ) -> Result<cide_ipc::agents::AgentModels> {
-    let root = project_root(&state, project).ok();
+    // `None` for the reason `llm_test_model` above states.
+    let root = project.and_then(|id| project_root(&state, id).ok());
     // Read on the caller's thread, like `root`, so no workspace guard crosses the await —
     // `crate::agents::facts` takes the same lock for the same reason. Without it the probe would
     // list only the providers the user configured by hand, and cide's own would be invisible in
@@ -640,7 +645,16 @@ pub(crate) async fn dispatch_or_duplicate(
             .task
             .as_ref()
             .and_then(|task| lookup.run_holding(project, &request.agent, task));
-        plan_dispatch(&root, &store, held.as_ref(), &request)
+        // This project's local redirections, read on the worker with the rest of the disk. The
+        // same file `crate::agents::facts` reads at the fork, so the concurrency the queue
+        // enforces and the pool the child is forked with come from one answer — and read *per
+        // dispatch* rather than cached, because it is hand-editable and a `git checkout` cannot
+        // touch it but a text editor can (`nudge_orchestrator`'s rule about the committed
+        // config, one directory along).
+        let overrides =
+            cide_core::persist::load_agent_overrides(&cide_core::persist::agent_overrides_path())
+                .project(&root.to_string_lossy());
+        plan_dispatch(&root, &store, held.as_ref(), &overrides, &request)
     })
     .await?;
 
@@ -719,6 +733,30 @@ pub(crate) async fn agents_stop_with(
             .unwrap_or(Duration::ZERO)
     };
 
+    stop_with_grace(&app, &agents, project, run, by, reason, force, grace)
+}
+
+/// The stop itself, once the grace is in hand.
+///
+/// Extracted in M72 so a paired device stops a run through **exactly** this code and not through
+/// a second spelling of it. What differs between the callers is only how they come by the grace:
+/// [`agents_stop_with`] is on a Tauri command worker and must reach the disk through `blocking`,
+/// while [`agents_stop_blocking`] is already on a blocking thread and reads it directly. The
+/// decision that must not differ is the one inside [`crate::agents::AgentRegistry::stop`] —
+/// `stop_route` refuses to *ask* a run that is `AwaitingPermission`, because the wind-down's lone
+/// `\r` would approve the very tool call the stop was meant to prevent, and kills it instead. A
+/// remote stop that typed something itself would arrive at that bug by a new door.
+#[allow(clippy::too_many_arguments)]
+fn stop_with_grace(
+    app: &AppHandle,
+    agents: &Arc<AgentRegistry>,
+    project: ProjectId,
+    run: RunId,
+    by: StopBy,
+    reason: Option<String>,
+    force: bool,
+    grace: Duration,
+) -> Result<Stopped> {
     let request = StopRequest {
         by,
         // One line, at the door: this text is typed into a TUI and the harness ends it with
@@ -730,7 +768,37 @@ pub(crate) async fn agents_stop_with(
         force,
         grace,
     };
-    agents.stop(&app, project, run, &request)
+    agents.stop(app, project, run, &request)
+}
+
+/// [`agents_stop_with`] for a caller that is already on a blocking thread.
+///
+/// The remote surface's road. `RemoteHost` is synchronous by design — its header says why — so
+/// this reads the project's stop grace inline rather than through `blocking`, which would be a
+/// runtime hop taken from a thread whose whole job is to block.
+pub(crate) fn agents_stop_blocking(
+    app: &AppHandle,
+    project: ProjectId,
+    run: RunId,
+    by: StopBy,
+    reason: Option<String>,
+    force: bool,
+) -> Result<Stopped> {
+    let agents = app
+        .try_state::<Arc<AgentRegistry>>()
+        .map(|state| Arc::clone(&state))
+        .ok_or_else(|| CoreError::Io("this window has no agent registry".into()))?;
+
+    // `force` never reads the file, for [`agents_stop_with`]'s reason: the grace it would find
+    // changes nothing, and a stop is the gesture people reach for when something has gone wrong.
+    let grace = if force {
+        Duration::ZERO
+    } else {
+        project_root(&app.state::<WorkspaceState>(), project)
+            .map(|root| cide_agents::load_project(&root).config.agents.stop_grace())
+            .unwrap_or(Duration::ZERO)
+    };
+    stop_with_grace(app, &agents, project, run, by, reason, force, grace)
 }
 
 /// Close this project's dispatch queue and freeze its children — or freeze one run.
@@ -1053,10 +1121,17 @@ fn duplicate_refusal(agent: &AgentId, task: Option<&TaskId>, held: &HeldPair) ->
 /// live lock and this function is disk and decision, so the fact arrives as a value and the
 /// tests can put any state in it. It is only half the guard; the other half, the half that wins
 /// the race, is `AgentRegistry::enqueue_unique`. (M66)
+///
+/// `overrides` arrives the same way and for a second reason besides: it is this *profile's*
+/// file, in the config directory and not in the checkout, so a function that read it itself
+/// would read the developer's own overrides in every test that called it. The caller loads it —
+/// `cide_agents::overrides`' standing arrangement, "the caller loads the overrides at the edge
+/// and hands them in". (M73)
 fn plan_dispatch(
     root: &Path,
     store: &TaskStore,
     held: Option<&HeldPair>,
+    overrides: &cide_ipc::ProjectOverrides,
     request: &DispatchRequest,
 ) -> Result<DispatchSpec> {
     let project = cide_agents::load_project(root);
@@ -1200,7 +1275,7 @@ fn plan_dispatch(
         // when the run was dispatched. The old worktree clamp to 1 is gone — worktrees are
         // per task now, and the two-children-one-checkout hazard it guarded against is the
         // checkout gate's business, below.
-        agent_limit: cide_agents::effective_max_concurrent(agent, &project.config.agents),
+        agent_limit: cide_agents::effective_max_concurrent(agent, overrides),
         project_limit: project.config.agents.max_concurrent,
         // The directory this run will stand in, for the admission gate: two runs may never
         // share a checkout, and under worktree isolation the checkout is named by the
@@ -1774,6 +1849,13 @@ mod tests {
         }
     }
 
+    /// No local redirections — the state of a machine that has never opened the Agents screen,
+    /// and what every refusal test here is about. The overrides that *do* say something get
+    /// their own test beside `effective_max_concurrent`'s in `cide-agents`.
+    fn no_overrides() -> cide_ipc::ProjectOverrides {
+        cide_ipc::ProjectOverrides::default()
+    }
+
     /// **The whole of M66 in one assertion.** A dispatch onto a task the role is already on is
     /// refused, and the refusal names the run that is already going.
     ///
@@ -1785,9 +1867,15 @@ mod tests {
         let (root, store, project, task) = with_a_role("duplicate-refused");
         let live = held(RunState::Running);
 
-        let why = plan_dispatch(&root, &store, Some(&live), &request(project, &task))
-            .expect_err("the role is already on this task")
-            .to_string();
+        let why = plan_dispatch(
+            &root,
+            &store,
+            Some(&live),
+            &no_overrides(),
+            &request(project, &task),
+        )
+        .expect_err("the role is already on this task")
+        .to_string();
 
         assert!(why.contains(&live.run.to_string()), "{why}");
         assert!(why.contains("[running]"), "{why}");
@@ -1816,6 +1904,7 @@ mod tests {
             &root,
             &store,
             Some(&held(RunState::Running)),
+            &no_overrides(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -1825,9 +1914,15 @@ mod tests {
 
         let mut ghost = request(project, &task);
         ghost.agent = AgentId("nobody".into());
-        let why = plan_dispatch(&root, &store, Some(&held(RunState::Running)), &ghost)
-            .expect_err("refused")
-            .to_string();
+        let why = plan_dispatch(
+            &root,
+            &store,
+            Some(&held(RunState::Running)),
+            &no_overrides(),
+            &ghost,
+        )
+        .expect_err("refused")
+        .to_string();
         assert!(why.contains("defines no role named"), "{why}");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1845,6 +1940,7 @@ mod tests {
             &root,
             &store,
             Some(&held(RunState::Running)),
+            &no_overrides(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -1876,6 +1972,7 @@ mod tests {
             &root,
             &store,
             Some(&held(RunState::Idle)),
+            &no_overrides(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -1887,6 +1984,7 @@ mod tests {
             &root,
             &store,
             Some(&held(RunState::Paused { since_unix_ms: 1 })),
+            &no_overrides(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -1899,6 +1997,7 @@ mod tests {
             &root,
             &store,
             Some(&held(RunState::Queued)),
+            &no_overrides(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -1927,6 +2026,7 @@ mod tests {
             &root,
             &store,
             None,
+            &no_overrides(),
             &DispatchRequest {
                 project: ProjectId::new(),
                 agent: AgentId("game-designer".into()),
@@ -1963,6 +2063,7 @@ mod tests {
             &root,
             &store,
             None,
+            &no_overrides(),
             &DispatchRequest {
                 project: ProjectId::new(),
                 agent: cide_ipc::AgentId("developer".into()),

@@ -59,6 +59,7 @@ import { ColorSchemeRow } from './ColorSchemeRow'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
 import { ProxySection } from './ProxySection'
+import { RemoteSection } from './RemoteSection'
 import { WindowModeCards } from './WindowModeCards'
 
 /** Nav order and headings. The order is the mock's and is not alphabetical. */
@@ -130,6 +131,11 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     description: 'What Update project does when your branch has diverged, and how conflicts open.',
   },
   { id: 'terminal', title: 'Terminal', description: 'Every pane running a shell or a TUI.' },
+  {
+    id: 'remote',
+    title: 'Remote access',
+    description: 'Whether a phone may reach this cide, and which devices have.',
+  },
 ]
 
 export interface SectionProps {
@@ -765,6 +771,11 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       return <Git {...props} />
     case 'terminal':
       return <Terminal {...props} />
+    case 'remote':
+      // Takes the group and the patch like most sections, and reads the listener's live state
+      // itself — that part is not in `Settings` and cannot be: how many devices are connected
+      // is a property of a socket, not of a stored value.
+      return <RemoteSection settings={props.settings.remote} patch={props.patch} />
     default:
       // A `SettingsSection` variant with no case here.
       //

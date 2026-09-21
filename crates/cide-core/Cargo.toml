@@ -19,6 +19,7 @@ ts-rs = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }
+qrcode = { workspace = true }
 # Reading a `.vsix` for `scheme::import`. `flate2` is here to *choose* zip's inflate backend,
 # not to be used directly — the root manifest has the argument.
 zip = { workspace = true }

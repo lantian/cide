@@ -71,7 +71,7 @@ pub use tools::{Content, TaskSink, ToolResult, descriptors, dispatch};
 
 use std::path::Path;
 
-use cide_ipc::AgentId;
+use cide_ipc::{AgentId, ProjectOverrides};
 
 /// Everything cide knows about one project's subagents, read fresh.
 #[derive(Debug, Clone, Default)]
@@ -199,7 +199,22 @@ pub fn is_dangerous(agent: &LoadedAgent) -> bool {
     agent.permission_mode.as_deref() == Some(defs::BYPASS_PERMISSIONS)
 }
 
-/// How many runs of this role may be live at once: its own `max-concurrent`, floored at 1.
+/// How many runs of this role may be live at once: this machine's override, else the role's own
+/// `max-concurrent`, floored at 1.
+///
+/// # The override is folded *here*, at the one function the queue reads
+///
+/// `AgentOverride::max_concurrent` exists for the direction a committed file cannot know about —
+/// more parallelism against a local model that costs nothing, less against a metered one — and
+/// for two milestones it reached nothing: `overrides::resolve` computed it into
+/// [`overrides::Resolved::max_concurrent`], which nobody read, while `cmd::agents::plan_dispatch`
+/// stamped the queue from the definition alone. So a role overridden to three ran one at a time
+/// and its siblings sat `[queued]` with a note about a limit the user had already raised. This
+/// function is what the dispatch calls and what `resolve` now calls, so the roster's row and the
+/// queue's arithmetic cannot disagree.
+///
+/// The scope rule comes from [`overrides::row_for`]: a Claude Code subagent takes no override at
+/// all.
 ///
 /// This used to clamp to 1 under worktree isolation — one worktree per *agent* meant a second
 /// concurrent run of the role would be a second process editing one checkout — and the clamp
@@ -211,8 +226,11 @@ pub fn is_dangerous(agent: &LoadedAgent) -> bool {
 /// than a per-role number: the registry's admission holds a run whose checkout is occupied, in
 /// the queue, until it is not. A dispatch with no task takes no checkout at all
 /// ([`run_checkout`], M40) and is bounded by this number and the project's alone.
-pub fn effective_max_concurrent(agent: &LoadedAgent, _config: &AgentsConfig) -> u16 {
-    agent.def.max_concurrent.max(1)
+pub fn effective_max_concurrent(agent: &LoadedAgent, overrides: &ProjectOverrides) -> u16 {
+    overrides::row_for(agent, overrides)
+        .and_then(|over| over.max_concurrent)
+        .unwrap_or(agent.def.max_concurrent)
+        .max(1)
 }
 
 /// The worktree a (role, task) pair stands in, as the name `cide_git::worktree` builds a path
@@ -311,7 +329,7 @@ pub fn run_checkout(
 mod tests {
     use super::*;
 
-    use cide_ipc::{AgentDef, Harness};
+    use cide_ipc::{AgentDef, AgentOverride, Harness};
     use std::path::PathBuf;
 
     fn role(permission_mode: Option<&str>, unavailable: Option<&str>) -> LoadedAgent {
@@ -324,6 +342,7 @@ mod tests {
                 description: "Implements one task end to end.".into(),
                 system_prompt: "You are the developer agent.".into(),
                 model: None,
+                color: None,
                 unavailable: unavailable.map(str::to_string),
                 max_concurrent: 3,
                 worktree: true,
@@ -470,21 +489,109 @@ mod tests {
         );
     }
 
-    /// `max-concurrent` means what it says under both isolations. The worktree clamp this test
-    /// used to pin is gone — per-task checkouts ([`checkout_name`]) dissolved its premise — and
-    /// the remaining floor is 1, because a malformed `max-concurrent: 0` must not make a role
+    /// `max-concurrent` means what it says where nothing overrides it, and the floor is 1.
+    ///
+    /// The worktree clamp this test used to pin is gone — per-task checkouts ([`checkout_name`])
+    /// dissolved its premise, and with it the isolation this function used to be asked about.
+    /// The floor stays, because a malformed `max-concurrent: 0` must not make a role
     /// undispatchable with nothing anywhere saying why.
     #[test]
-    fn a_roles_declared_concurrency_stands_under_both_isolations() {
-        let agent = role(None, None);
-        let config = enabled();
+    fn a_roles_declared_concurrency_stands_where_nothing_overrides_it() {
+        let mut agent = role(None, None);
+        let none = ProjectOverrides::default();
         assert_eq!(agent.def.max_concurrent, 3);
-        assert_eq!(effective_max_concurrent(&agent, &config), 3);
-        let shared = AgentsConfig {
-            isolation: Isolation::Shared,
-            ..config
+        assert_eq!(effective_max_concurrent(&agent, &none), 3);
+
+        agent.def.max_concurrent = 0;
+        assert_eq!(
+            effective_max_concurrent(&agent, &none),
+            1,
+            "a role that can never dispatch is not an answer"
+        );
+    }
+
+    /// **An override's `maxConcurrent` reaches the queue.** (M73)
+    ///
+    /// The reported shape exactly: a project whose `all` row named a pool and whose
+    /// `engine-core` row raised the role to three ran one at a time, because the dispatch
+    /// stamped the queue from the definition alone while `overrides::resolve` computed the
+    /// raised number for nobody. Both readings now come from this function, so the row the
+    /// roster draws and the number the admission gate counts against are one answer.
+    #[test]
+    fn an_overrides_concurrency_reaches_the_number_the_queue_enforces() {
+        let agent = role(None, None);
+        let raised = |over: AgentOverride| ProjectOverrides {
+            roles: std::collections::BTreeMap::from([("developer".to_string(), over)]),
+            ..Default::default()
         };
-        assert_eq!(effective_max_concurrent(&agent, &shared), 3);
+
+        assert_eq!(
+            effective_max_concurrent(
+                &agent,
+                &raised(AgentOverride {
+                    max_concurrent: Some(6),
+                    ..Default::default()
+                })
+            ),
+            6
+        );
+        // The floor applies to the override too: it is typed into a hand-editable file.
+        assert_eq!(
+            effective_max_concurrent(
+                &agent,
+                &raised(AgentOverride {
+                    max_concurrent: Some(0),
+                    ..Default::default()
+                })
+            ),
+            1
+        );
+        // A row that says nothing about concurrency leaves the definition's number alone, even
+        // while it redirects everything else — `for_role`'s replace-outright rule must not read
+        // as "and zero for whatever it omits".
+        assert_eq!(
+            effective_max_concurrent(
+                &agent,
+                &raised(AgentOverride {
+                    pool: Some("cheap-first".into()),
+                    ..Default::default()
+                })
+            ),
+            3
+        );
+        // The project-wide row reaches a role with no row of its own.
+        assert_eq!(
+            effective_max_concurrent(
+                &agent,
+                &ProjectOverrides {
+                    all: AgentOverride {
+                        max_concurrent: Some(2),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            ),
+            2
+        );
+    }
+
+    /// A Claude Code subagent takes no override, concurrency included. (M73)
+    ///
+    /// `overrides::row_for`'s rule, asserted through this reader as well as through `resolve`:
+    /// the scope that cannot be moved onto another harness cannot be moved onto another number
+    /// either, and the two must not disagree about which roles an override may touch.
+    #[test]
+    fn a_claude_code_subagent_keeps_its_own_concurrency() {
+        let mut agent = role(None, None);
+        agent.def.scope = cide_ipc::agents::AgentScope::ClaudeProject;
+        let over = ProjectOverrides {
+            all: AgentOverride {
+                max_concurrent: Some(9),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(effective_max_concurrent(&agent, &over), 3);
     }
 
     /// The checkout mapping: deterministic, grammar-safe, and falling back rather than minting.

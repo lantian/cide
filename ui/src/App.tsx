@@ -31,7 +31,7 @@ import {
   type ActivityView,
   type SidebarState,
 } from '@/chrome/sidebarView'
-import { registerPanelHost } from '@/chrome/panelRequests'
+import { registerPanelHost, registerSettingsFrameHost } from '@/chrome/panelRequests'
 import { StatusBar } from '@/chrome/StatusBar'
 import {
   formatClaude,
@@ -123,7 +123,8 @@ import { GitDiffPane } from '@/panes/GitDiffPane'
 import { changeNavPresent, subscribeChangeNav } from '@/panes/changeNav'
 import { focusPaneDom } from '@/panes/paneFocus'
 import { liveHosts } from '@/layout/paneHosts'
-import { SettingsTab } from '@/settings/SettingsTab'
+import { SettingsTab, lastFrameSection } from '@/settings/SettingsTab'
+import { SettingsFrame } from '@/settings/SettingsFrame'
 import { toggleTheme as togglePersistedTheme } from '@/settings/useSettings'
 import {
   app as appApi,
@@ -142,6 +143,7 @@ import {
   type PaneRestore,
   type Project,
   type ProjectId,
+  type SettingsSection,
   type SplitIntent,
   type Tab,
   type TabId,
@@ -677,6 +679,44 @@ export function App() {
         ? boot.role.active
         : boot.role.project
   const activeProject = activeProjectId ? (boot?.workspace.projects[activeProjectId] ?? null) : null
+
+  /*
+   * Whether the empty frame is showing the Settings screen. (M74)
+   *
+   * Webview state, and one of the two kinds `store/workspace.ts`'s header says the webview
+   * legitimately owns: which surface is up, for the length of a session. Rust could not hold it
+   * even if it should — a Settings *tab* is a tab of a project, which is the whole reason this
+   * exists (see `settings/SettingsFrame.tsx`) — and a relaunch with nothing open is a fresh
+   * start, so there is nothing to persist.
+   *
+   * The render is gated on `activeProject === null` as well, so opening a project reveals the
+   * project rather than the settings screen; the effect below clears the flag behind that gate,
+   * or closing the last project again would bring back a screen nobody asked for a second time.
+   */
+  const [settingsFrame, setSettingsFrame] = useState<SettingsSection | null>(null)
+  useEffect(() => {
+    if (activeProjectId !== null) setSettingsFrame(null)
+  }, [activeProjectId])
+  // Stable, because `WorkspaceContent` is memoised and a fresh closure per render would defeat
+  // that for every surface it draws — the reason `runCommand` beside it is a `useCallback` too.
+  const closeSettingsFrame = useCallback(() => setSettingsFrame(null), [])
+  /*
+   * The seam `keys/dispatch.ts` reaches this through — `settings.open` and `settings.keymap`
+   * are not inside React, which is the whole of what `registerSettingsFrameHost` is for.
+   *
+   * `null` means *wherever it was left*, read from `SettingsTab`'s own memory. That is why a
+   * plain ⚙ or `settings.open` while the screen is already up changes no state and therefore
+   * remounts nothing: the value it sets is the value already there. `settings.keymap` does set
+   * a different one, and the remount that follows is the screen opening on the section that was
+   * asked for — see `SettingsFrame`'s `key`.
+   */
+  useEffect(() => {
+    if (boot?.role.kind !== 'shell') return
+    registerSettingsFrameHost((section) =>
+      setSettingsFrame((section as SettingsSection | null) ?? lastFrameSection()),
+    )
+    return () => registerSettingsFrameHost(null)
+  }, [boot?.role.kind])
 
   /*
    * The tabs THIS window draws — `windows/windowTabs.ts` holds the rule and says why it is
@@ -1574,21 +1614,46 @@ export function App() {
               // this component can perform: Settings is a workspace *tab* rather than a
               // sidebar view, so choosing it also opens (or re-activates) the project's tab.
               setSidebar((s) => selectView(s, next))
-              if (next === 'settings' && activeProjectId) {
-                // The tab appears on the mutation's own broadcast — no re-read.
-                void settingsApi.openTab(activeProjectId)
+              if (next === 'settings') {
+                if (activeProjectId) {
+                  // The tab appears on the mutation's own broadcast — no re-read.
+                  void settingsApi.openTab(activeProjectId)
+                } else {
+                  /*
+                   * No project, so no tab to put it in — the frame instead. (M74)
+                   *
+                   * This branch used to be the `&& activeProjectId` half of the condition
+                   * above, which made the button take a click and do nothing whenever the
+                   * window was empty. Set rather than toggled, so ⚙ behaves the same way in
+                   * both branches: with a project it opens-or-activates a tab, and here it
+                   * opens-or-keeps the frame. The `×` is the way out of either.
+                   */
+                  setSettingsFrame(lastFrameSection())
+                }
               }
             }}
-            toolWindowOpen={activeProject?.toolWindow.open ?? false}
+            /*
+             * The projectless shell's panel is `Workspace.toolWindow` — a real second home for
+             * this state, not a fallback. `?? false` for the frame before bootstrap resolves.
+             */
+            toolWindowOpen={
+              (activeProject?.toolWindow ?? boot?.workspace.toolWindow)?.open ?? false
+            }
             onToggleToolWindow={() => {
               // Straight to Rust, with no local mirror: the panel's state lives on
               // `Project::tool_window`, so the answer comes back as a `cide://workspace-changed`
               // snapshot like every other workspace mutation. A `useState` here would be a
               // second copy of one boolean, which is the shape `chrome/sidebarView.ts` records
               // going wrong.
-              if (!activeProject) return
+              //
+              // `null` for the empty frame rather than a refusal: this used to be
+              // `if (!activeProject) return`, which is why the button was inert with nothing
+              // open. Which panel a `null` names is Rust's answer and only Rust's — see
+              // `cide_core::toolwindow`.
+              const state = activeProject?.toolWindow ?? boot?.workspace.toolWindow
+              if (state === undefined) return
               void toolWindowApi
-                .setLayout(activeProject.id, { open: !activeProject.toolWindow.open })
+                .setLayout(activeProject?.id ?? null, { open: !state.open })
                 .catch(() => {})
             }}
           />
@@ -1842,6 +1907,8 @@ export function App() {
             <div className={styles.content}>
               <WorkspaceContent
                 activeProject={activeProject}
+                settingsFrame={settingsFrame}
+                onCloseSettingsFrame={closeSettingsFrame}
                 visibleTabs={visibleTabs}
                 tabRole={tabRole}
                 tabWindow={tabWindow}
@@ -1881,15 +1948,25 @@ export function App() {
               * without it two windows would share one project's panel — the exact cross-window
               * bleed that keeping the state on `Project` exists to prevent.
               */}
-            {!benchMode() && !auditMode() && boot?.role.kind === 'shell' && activeProject !== null
-              && activeProject.toolWindow.open && (
+            {/*
+              * `project` of `null` is the empty frame's own panel (M74), whose state is
+              * `Workspace.toolWindow`. The `activeProject !== null` guard that used to be in
+              * this condition is what made the rail's ▤ button inert with nothing open. Its Log
+              * tab draws a sentence rather than a commit list — there are no repositories to
+              * walk — and its Docker tab is exactly as live as it is anywhere else, because a
+              * daemon is a property of the machine and not of a checkout.
+              */}
+            {!benchMode() && !auditMode() && boot?.role.kind === 'shell'
+              && (activeProject?.toolWindow ?? boot.workspace.toolWindow).open && (
               <PanelBoundary
                 name="the git tool window"
                 onClose={() => {
-                  void toolWindowApi.setLayout(activeProject.id, { open: false }).catch(() => {})
+                  void toolWindowApi
+                    .setLayout(activeProject?.id ?? null, { open: false })
+                    .catch(() => {})
                 }}
               >
-                <ToolWindowHost project={activeProject.id} />
+                <ToolWindowHost project={activeProject?.id ?? null} />
               </PanelBoundary>
             )}
           </div>
@@ -2247,6 +2324,8 @@ export function App() {
  */
 const WorkspaceContent = memo(function WorkspaceContent({
   activeProject,
+  settingsFrame,
+  onCloseSettingsFrame,
   visibleTabs,
   tabRole,
   tabWindow,
@@ -2256,6 +2335,14 @@ const WorkspaceContent = memo(function WorkspaceContent({
   openTerminalPath,
 }: {
   activeProject: Project | null
+  /**
+   * Whether the empty frame is showing the Settings screen. (M74)
+   *
+   * A boolean and a stable callback, so the memo above still holds — see its header for why a
+   * new prop here has to be one of those two shapes.
+   */
+  settingsFrame: SettingsSection | null
+  onCloseSettingsFrame: () => void
   visibleTabs: readonly Tab[]
   tabRole: Extract<WindowRole, { kind: 'detachedTab' }> | null
   tabWindow: boolean
@@ -2290,6 +2377,20 @@ const WorkspaceContent = memo(function WorkspaceContent({
     () => (activeProject === null ? undefined : openTerminalPath(activeProject.id)),
     [openTerminalPath, activeProject],
   )
+
+  /*
+   * The Settings screen with no project open. (M74)
+   *
+   * It stands where the tab strip and the tab content stand, and it is only reachable in the
+   * one state where neither of those is drawn — `TabStrip` and `TabContent` below are both
+   * gated on `activeProject`, so this is the empty work area filled rather than anything
+   * covered up. The two mode flags are the same two the grid carries: `CIDE_AUDIT=1` measures
+   * the chrome against a mock that has no such screen, and the IPC bench should not be racing a
+   * settings probe.
+   */
+  if (!tabWindow && !auditMode() && !benchMode() && activeProject === null && settingsFrame) {
+    return <SettingsFrame section={settingsFrame} onClose={onCloseSettingsFrame} />
+  }
 
   return (
     <>

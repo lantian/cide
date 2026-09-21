@@ -25,13 +25,13 @@
 //!
 //! # Why the store polls itself instead of hanging off a tick
 //!
-//! There is no app tick. `WorkspaceState::flush_if_due` documents itself as "called from the
-//! app's tick and before quitting" and **is called from neither** — `grep -rn flush_if_due`
-//! finds the definition and one mention inside a comment. So `workspace.json` is in fact
-//! written exactly once per run, on shutdown, and its debounce is inert. That is a real defect
-//! (recorded in `docs/journal.md`) and it is *not* fixed by pretending a tick exists here: this store
-//! flushes from the thread that already owns the write, on a timer it starts itself, so its
-//! debounce works whether or not anyone ever builds that tick.
+//! There is no app tick. `WorkspaceState::flush_if_due` documented itself as "called from the
+//! app's tick and before quitting" and was called from **neither**, so `workspace.json` was in
+//! fact written exactly once per run, on shutdown, with its debounce inert — a real defect, and
+//! one this store deliberately did not wait on: it flushes from the thread that already owns the
+//! write, on a timer it starts itself, so its debounce works whether or not anyone ever builds
+//! that tick. Nobody ever did. M73 gave the workspace a thread of this same shape instead
+//! (`WorkspaceState::start_flusher`), which is the pattern rather than the exception now.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

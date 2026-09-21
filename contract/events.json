@@ -11,6 +11,7 @@
   "cide://ipc-degraded",
   "cide://keymap-changed",
   "cide://mouse-nav",
+  "cide://remote-changed",
   "cide://schemes-changed",
   "cide://session-awaiting",
   "cide://session-state",

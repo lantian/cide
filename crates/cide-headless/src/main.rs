@@ -47,6 +47,7 @@ usage:
   cide-headless ext                       render marketplaces, extensions and contributions
   cide-headless docker                    resolve a Docker daemon and render what it holds
   cide-headless properties <path>         what the properties card would say about a path
+  cide-headless remote                    what a remote listener would bind, and who is paired
   cide-headless version                   print this binary's version";
 
 fn main() {
@@ -69,6 +70,7 @@ fn main() {
         "ext" => ext(),
         "docker" => docker(rest),
         "properties" => properties(rest),
+        "remote" => remote(),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         "version" | "-V" | "--version" => emit(&format!("{}\n", version())),
         other => {
@@ -1536,6 +1538,107 @@ fn bytes(size: i64) -> String {
     }
 }
 
+/// What a launch of the remote listener would resolve to, and who may connect.
+///
+/// `docker`'s shape and its reason: the answer depends on this machine — its profile, its
+/// interfaces, what is already listening — so it cannot be asserted in a test, and a way to
+/// print it is the difference between a feature that can be diagnosed and one that can only be
+/// guessed at. Diff it against `ip addr` and against the Settings panel.
+///
+/// Also the standing proof, extended. `cide-headless` links `cide-remote` so that "only
+/// `cide-app` may depend on tauri" covers it — this binary's own manifest records the same
+/// omission being made for four crates across four milestones, and a crate it does not link is a
+/// crate the proof does not cover.
+fn remote() {
+    let mut out = String::new();
+    let profile = cide_core::profile::active();
+    out.push_str("instance\n");
+    out.push_str(&format!(
+        "  profile       {}\n",
+        profile.unwrap_or("default")
+    ));
+    out.push_str(&format!(
+        "  name          {}\n",
+        cide_core::remote::display_name()
+    ));
+    out.push_str(&format!(
+        "  id            {}\n",
+        cide_core::remote::instance_id()
+    ));
+
+    let derived = cide_core::remote::port_for_profile(profile);
+    let path = cide_core::persist::state_dir().join("remote-devices.json");
+    let store = cide_remote::DeviceStore::load(path.clone());
+
+    out.push_str("\nport\n");
+    out.push_str(&format!("  derived       {derived}\n"));
+    match &store {
+        Ok(store) => match store.remembered_port() {
+            Some(port) if port != derived => out.push_str(&format!(
+                "  remembered    {port}  (preferred — the derived one was taken once)\n"
+            )),
+            Some(port) => out.push_str(&format!("  remembered    {port}\n")),
+            None => out.push_str("  remembered    none yet\n"),
+        },
+        Err(error) => out.push_str(&format!("  remembered    unreadable: {error}\n")),
+    }
+
+    out.push_str("\naddresses a device could use\n");
+    let addresses = cide_core::remote::local_addresses();
+    if addresses.is_empty() {
+        // Not an error. A machine with no non-loopback interface is one nothing can reach, which
+        // is worth saying in those words rather than as an empty list.
+        out.push_str("  none — this machine has no address a phone could reach it on\n");
+    }
+    for address in &addresses {
+        let verdict = cide_core::remote::bind_policy(*address);
+        let note = match verdict {
+            cide_core::remote::BindVerdict::Private => "private",
+            cide_core::remote::BindVerdict::Unspecified => "unspecified",
+            cide_core::remote::BindVerdict::Public => "PUBLIC — needs the separate toggle",
+        };
+        let shown = if address.is_ipv6() {
+            format!("[{address}]")
+        } else {
+            address.to_string()
+        };
+        out.push_str(&format!("  {shown}:{derived}  ({note})\n"));
+    }
+
+    out.push_str("\npaired devices\n");
+    match &store {
+        Err(error) => out.push_str(&format!("  unreadable: {error}\n")),
+        Ok(store) => {
+            let devices = store.devices();
+            if devices.is_empty() {
+                out.push_str("  none — with nobody to serve, nothing is listening\n");
+            }
+            for device in devices {
+                // No token and no hash, here as everywhere. There is nothing to redact because
+                // `Device`'s `Debug` and this renderer both take the same view of what a device
+                // *is* to anybody reading a screen.
+                let seen = if device.last_seen_unix_ms == 0 {
+                    "never connected".to_owned()
+                } else {
+                    format!("last seen {} ms", device.last_seen_unix_ms)
+                };
+                out.push_str(&format!(
+                    "  {}  ({}) — {seen}{}\n",
+                    device.name,
+                    device.platform,
+                    if device.last_addr.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" from {}", device.last_addr)
+                    },
+                ));
+            }
+        }
+    }
+    out.push_str(&format!("\nfile  {}\n", path.display()));
+    emit(&out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1962,6 +2065,7 @@ mod tests {
                 description: "does the work".into(),
                 system_prompt: "You are a developer.".into(),
                 model: None,
+                color: None,
                 unavailable: unavailable.map(str::to_string),
                 max_concurrent: 1,
                 worktree: true,

@@ -14,8 +14,9 @@
  * Consumed by `ui/scripts/check-toolwindow-render.mjs`; nothing in the app imports this file, so
  * it is tree-shaken out of the bundle.
  */
+import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { ToolWindowView } from './ToolWindow'
+import { ToolWindowNoProject, ToolWindowView } from './ToolWindow'
 import { openHistory, showLog, tabRow, TABS_INITIAL, type ToolWindowTabs } from './toolWindowModel'
 
 export interface FrameDigest {
@@ -34,7 +35,7 @@ export interface FrameDigest {
   tabRoles: number
 }
 
-function digest(story: string, tabs: ToolWindowTabs): FrameDigest {
+function digest(story: string, tabs: ToolWindowTabs, body?: ReactNode): FrameDigest {
   const rows = tabRow(tabs)
   const html = renderToStaticMarkup(
     <ToolWindowView
@@ -43,7 +44,7 @@ function digest(story: string, tabs: ToolWindowTabs): FrameDigest {
       onClose={() => {}}
       onHide={() => {}}
     >
-      <div>body for {rows.find((r) => r.active)?.label ?? 'nothing'}</div>
+      {body ?? <div>body for {rows.find((r) => r.active)?.label ?? 'nothing'}</div>}
     </ToolWindowView>,
   )
   const tabs_ = [
@@ -73,6 +74,15 @@ const digests: FrameDigest[] = [
   digest('twoHistories', two),
   // The Log tab back in front while two history tabs stay open — the state a close falls back to.
   digest('logInFront', showLog(two)),
+  /*
+   * The shell with **no project open**. (M74)
+   *
+   * The whole claim is in the tab row and the body together: there are exactly two tabs, Log
+   * and Docker, because a projectless panel can hold no history — and the Log tab's body is a
+   * sentence rather than a commit list, because there are no repositories to walk. A version
+   * that drew an empty list instead would pass every assertion above this one.
+   */
+  digest('noProject', TABS_INITIAL, <ToolWindowNoProject />),
 ]
 
 console.log(JSON.stringify(digests))

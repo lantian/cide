@@ -64,6 +64,8 @@
  */
 import { useRef, useState, type JSX } from 'react'
 import {
+  agentColor,
+  authorColor,
   canOpen,
   canPause,
   elapsed,
@@ -100,6 +102,7 @@ import {
   statusLabel,
   statusTone,
   type Chip,
+  type CommentAuthor,
   type EditIntent,
   type EditableField,
   type FieldEdit,
@@ -514,6 +517,11 @@ function asRun(chip: Chip): RunView {
     phase: (chip.phase ?? '') as RunPhase,
     task: null,
     startedMs: 0,
+    // Inert like `startedMs` beside it: the card draws no duration for a chip, so these exist
+    // only to satisfy the shape. `null` rather than a stamp, because the pair's invariant is
+    // that a stamp means *this run is working* and the chip is not a claim about that.
+    workedMs: 0,
+    workingSinceMs: null,
     pausedSinceMs: null,
     exitCode: null,
     failure: null,
@@ -572,6 +580,14 @@ export interface TaskDetailProps {
   runs: readonly RunRef[]
   /** Agent id → label, for the assignee list and the chip's fallback ladder. */
   roles: Readonly<Record<string, string>>
+  /**
+   * Agent id → the role's colour, as a `var(--agent-…)` string. (M75)
+   *
+   * `roles`' sibling, from `AgentsPanel/model.ts`'s `rosterColors`. Every reader goes through
+   * `authorColor` or falls back to `agentColor` on the id, so a role this map has never heard
+   * of — deleted since it commented — is coloured and not blank.
+   */
+  roleColors: Readonly<Record<string, string>>
   /**
    * Why the assignee list is short — `model.ts::assigneeHint`'s sentence, or `null`/absent when
    * the list speaks for itself. Drawn in the assignee editor only: at rest the row already reads
@@ -793,6 +809,22 @@ function runIntent(props: TaskDetailProps, intent: EditIntent): void {
  * The scrim's dismiss is a **deliberate close**, so a field left mid-edit is committed rather
  * than discarded — `closeCard`'s rule, not this component's.
  */
+/**
+ * The inline colour for an author's name, or `undefined` for one that keeps its class's.
+ *
+ * A thin wrapper over `authorColor` so the three places that draw a name — the comment head, the
+ * creator line, and the assignee field — cannot each decide for themselves what "no colour"
+ * looks like. `undefined` rather than `{}`, because an empty style object is a new object on
+ * every render and every one of them is a prop that changed.
+ */
+function authorStyle(
+  author: CommentAuthor,
+  colors: Readonly<Record<string, string>>,
+): { color: string } | undefined {
+  const colour = authorColor(author, colors)
+  return colour === null ? undefined : { color: colour }
+}
+
 export function TaskDetailModal(props: TaskDetailProps) {
   const { task, roles, editing = null } = props
   return (
@@ -900,6 +932,7 @@ export function TaskDetail(props: TaskDetailProps) {
     task,
     runs,
     roles,
+    roleColors,
     nowMs,
     editing = null,
     onAddComment,
@@ -1070,7 +1103,17 @@ export function TaskDetail(props: TaskDetailProps) {
           data-audit="tasksCreator"
           data-creator={task.createdBy.kind}
         >
-          Created by {authorLabel(task.createdBy)}
+          {/* The words stay `--faint` — this line is provenance, not content — and only the
+              *name* takes the author's colour, which is the same colour the same author's
+              comments carry further down. `authorStyle` is the one producer for both. */}
+          Created by{' '}
+          <span
+            className={styles.detailCreatorName}
+            style={authorStyle(task.createdBy, roleColors)}
+            data-audit="tasksCreatorName"
+          >
+            {authorLabel(task.createdBy)}
+          </span>
         </span>
         {/*
           * The change this task implements. (M28)
@@ -1801,11 +1844,25 @@ export function TaskDetail(props: TaskDetailProps) {
                   key={comment.id}
                 >
                   <div className={styles.logHead}>
+                    {/*
+                      * Who wrote it, **in their own colour and at the head's largest rung**.
+                      * (M75) It was `--fs-ui-11` in `--dim` — smaller than the `--fs-ui-12` body
+                      * it introduces and smaller than the *edited* marker beside it — which made
+                      * the one thing a reader scans a log for the hardest thing on the line to
+                      * find.
+                      *
+                      * The colour comes from `authorColor`, which answers all three arms in one
+                      * place so the card cannot say one thing here and another on the creator
+                      * line. `null` is the user, and `.logAuthorUser`'s `--accent` stays: see
+                      * that function for why "You" is deliberately outside the separation gate.
+                      */}
                     <span
                       className={cx(
                         styles.logAuthor,
                         comment.author.kind === 'user' ? styles.logAuthorUser : undefined,
                       )}
+                      style={authorStyle(comment.author, roleColors)}
+                      data-audit="tasksCommentAuthor"
                     >
                       {authorLabel(comment.author)}
                     </span>
@@ -2408,6 +2465,20 @@ function FieldRow({
             styles.fieldValue,
             isFieldEmpty(task, field) ? styles.fieldValueEmpty : undefined,
           )}
+          /*
+           * The assignee row, and **only** that row, takes the role's colour. (M75) A title or
+           * a body is the user's prose whoever it is assigned to; the assignee *is* the role's
+           * name, so it is the same word the chip above it and the comments below it draw, and
+           * the three disagreeing about its colour would read as three different roles.
+           *
+           * Nothing when the task is unassigned: `restText` answers `UNASSIGNED` there, which is
+           * a sentence and not a name, and `isFieldEmpty` has already dimmed it.
+           */
+          style={
+            field === 'assignee' && task.agent !== null && task.agent.trim() !== ''
+              ? { color: props.roleColors[task.agent] ?? agentColor(task.agent) }
+              : undefined
+          }
           data-audit="taskFieldValue"
           data-field={field}
         >

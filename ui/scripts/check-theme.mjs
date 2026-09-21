@@ -523,6 +523,94 @@ try {
     )
   }
 
+  // --- a role's colour is one of eight a reader can tell apart, and the orchestrator's is not one
+  //
+  // Three gates over one family, because this palette has three jobs the notice edges above do
+  // not. It is *categorical* — eight colours a person has to tell apart at a glance, where the
+  // edges are three; it is *ink* — an agent's name is text on `--panel` and, when the comment is
+  // selected, on `--sel`; and one member of it is **reserved**, which is a claim that only a
+  // measurement can support.
+  //
+  // Every failure here is silent. Two hues that converge give two roles the same face with no
+  // error anywhere; a hue that stops clearing the ink floor is a name nobody can read on the one
+  // surface it exists for; and an orchestrator colour that drifts towards the eight breaks the
+  // only promise the reserved colour makes, quietly, for whichever role landed on that hue.
+  //
+  // The floor is 70 rather than the edges' 100, and the difference is the arithmetic and not a
+  // weaker standard: eight colours cannot be 100 apart pairwise in a range this narrow — the git
+  // lane palette, tuned for exactly this job, has a dark pair at 49 — and 70 sits just under
+  // `cide_ipc::theme::MIN_SELECTION_DISTANCE`'s 72, which is this repository's calibrated point
+  // for "a difference the eye registers". The measured minimum is 74.6 light and 85.4 dark, so
+  // the margin is real rather than a floor drawn under wherever the palette happened to land.
+  const AGENT_APART = 70
+  const ORCHESTRATOR_APART = 100
+  {
+    const hues = [...(readFileSync('../crates/cide-ipc/src/agents.rs', 'utf8').match(
+      /pub const AGENT_HUES: &\[&str\] = &\[([^\]]*)\]/,
+    )?.[1] ?? '').matchAll(/"([a-z]+)"/g)].map((m) => `--agent-${m[1]}`)
+    ok(hues.length === 8, `read ${hues.length} agent hues out of Rust — the scan still matches`)
+    const ORCH = '--agent-orchestrator'
+
+    for (const name of ['dark', 'light']) {
+      const palette = resolveTheme(docRules, name, [...hues, ORCH, '--panel', '--sel'])
+
+      // Pairwise, and the failure message names both values: a converged pair is fixed by moving
+      // one of them, and which one is a judgement the reader has to be able to make.
+      const close = []
+      for (let i = 0; i < hues.length; i += 1) {
+        for (let j = i + 1; j < hues.length; j += 1) {
+          const d = apart(palette[hues[i]], palette[hues[j]])
+          if (d === null || d < AGENT_APART) {
+            close.push(
+              `${hues[i]}=${palette[hues[i]]} vs ${hues[j]}=${palette[hues[j]]} ` +
+                `${d === null ? '(not a hex colour)' : d.toFixed(0)}`,
+            )
+          }
+        }
+      }
+      eq(
+        close,
+        [],
+        `the ${name} agent hues are mutually distinguishable (>= ${AGENT_APART} apart). Two ` +
+          `roles the same colour is two roles the reader cannot tell apart in a log`,
+      )
+
+      // The reserved colour, against every one of the eight. A wider floor than the eight hold
+      // each other to, because this is not "two roles" — it is "a role and not a role", and the
+      // whole value of the orchestrator's colour is that it is never read as somebody's agent.
+      const near = hues
+        .map((hue) => [hue, apart(palette[hue], palette[ORCH])])
+        .filter(([, d]) => d === null || d < ORCHESTRATOR_APART)
+        .map(([hue, d]) => `${hue}=${palette[hue]} ${d === null ? '(not a hex)' : d.toFixed(0)}`)
+      eq(
+        near,
+        [],
+        `the ${name} \`${ORCH}\` is >= ${ORCHESTRATOR_APART} from every hue a role can have. ` +
+          `The user asked for a colour that "will never be conflicted with other agents' ` +
+          `colours"; \`AGENT_HUES\` makes it unreachable and this makes it unmistakable`,
+      )
+
+      // And as ink. Both grounds, because a comment's author line is drawn over a selection as
+      // often as not — which is the failure `check:scheme` argues about one surface over, where
+      // the dark theme's comments sat at 1.73:1 on a selection from M3 to M24.
+      for (const groundToken of ['--panel', '--sel']) {
+        const ground = palette[groundToken]
+        const dim = [...hues, ORCH]
+          .map((token) => [token, palette[token], contrast(palette[token], ground)])
+          .filter(([, , ratio]) => ratio === null || ratio < INK_FLOOR)
+          .map(([token, value, ratio]) =>
+            `${token}=${value} ${ratio === null ? '(not a hex)' : `${ratio.toFixed(2)}:1`}`,
+          )
+        eq(
+          dim,
+          [],
+          `every agent colour clears ${INK_FLOOR}:1 on the ${name} theme's ${groundToken} ` +
+            `${ground} — these are ink, never a fill`,
+        )
+      }
+    }
+  }
+
   // --- typography: never ask the engine for a face this app did not bundle ----------------
   //
   // Same class of bug as the palette above, and the same reason it lives in a script: it

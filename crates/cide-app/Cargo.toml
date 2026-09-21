@@ -20,6 +20,7 @@ cide-core = { workspace = true }
 cide-ipc = { workspace = true }
 cide-claude = { workspace = true }
 cide-ide-mcp = { workspace = true }
+cide-remote = { workspace = true }
 cide-pty = { workspace = true }
 cide-fs = { workspace = true }
 cide-search = { workspace = true }

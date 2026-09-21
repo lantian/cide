@@ -7,8 +7,9 @@
  *
  * # Why there is no store
  *
- * The panel's state is **Rust-owned**, on `Project::tool_window`, so the workspace mirror already
- * *is* the store: a toggle bumps `rev`, `emit::workspace_changed` reaches every window, and
+ * The panel's state is **Rust-owned** — on `Project::tool_window`, or on
+ * `Workspace::tool_window` for the shell with no project open, which is the same field in the
+ * one place a project cannot be named — so the workspace mirror already *is* the store: a toggle bumps `rev`, `emit::workspace_changed` reaches every window, and
  * `store/workspace.ts` mirrors it. A zustand store beside that would be a second copy of one
  * fact, and `chrome/sidebarView.ts` records what happens when a boolean has two sources. The
  * commands are therefore called straight from here and from `keys/dispatch.ts`, and neither holds
@@ -22,7 +23,7 @@ import { logWalk, toolWindow as toolWindowApi } from '@/ipc/client'
 import type { HistoryTabId, ProjectId, RepoId } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { LogTab } from '@/gitlog/LogTab'
-import { ToolWindowView } from './ToolWindow'
+import { ToolWindowNoProject, ToolWindowView } from './ToolWindow'
 import { ToolWindowSplitter } from './ToolWindowSplitter'
 import {
   DOCKER_TAB,
@@ -42,11 +43,26 @@ import { useExtPanels } from '@/ext/extStore'
 import { useState } from 'react'
 
 export interface ToolWindowHostProps {
-  project: ProjectId
+  /**
+   * Whose panel this is, or `null` for the shell that has **no project open**. (M74)
+   *
+   * That frame's state is `Workspace.toolWindow` rather than any project's, and every command
+   * below takes the same `null` through to Rust — `cide_core::toolwindow` resolves it, so this
+   * component holds no second answer about which panel a gesture is for.
+   *
+   * What a `null` cannot produce is a history tab: `openHistory` takes a repository and a path,
+   * so there is no road from here to one. The Log tab therefore draws a sentence instead of a
+   * list, and Docker draws what it always draws — the daemon is a property of the machine.
+   */
+  project: ProjectId | null
 }
 
 export function ToolWindowHost({ project }: ToolWindowHostProps) {
-  const state = useWorkspace((s) => s.boot?.workspace.projects[project]?.toolWindow ?? null)
+  const state = useWorkspace((s) =>
+    project === null
+      ? (s.boot?.workspace.toolWindow ?? null)
+      : (s.boot?.workspace.projects[project]?.toolWindow ?? null),
+  )
 
   const panels = useExtPanels().filter((panel) => panel.def.location === 'bottom')
   /*
@@ -95,6 +111,10 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
   )
   const onClose = useCallback(
     (id: string) => {
+      // Unreachable with no project — that panel has no history tab to close — and guarded
+      // rather than asserted, because both commands below take a `ProjectId` and neither has
+      // anything to answer without one.
+      if (project === null) return
       // Cancel first, then close. A walk over a deep repository outlives the tab that asked for
       // it by seconds, and nothing else would ever stop it: the registry's other cancellation is
       // *supersession* — the next `page` for the same key — and a closed tab issues no next page.
@@ -166,13 +186,22 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
            */
           <DockerPanel placement="bottom" />
         ) : extPanel === null ? (
-          <LogTab
-            key={active?.id ?? 'log'}
-            project={project}
-            tab={walkTab(active?.id ?? null)}
-            repo={active === null ? null : (active.repo as RepoId)}
-            path={active === null ? null : active.path}
-          />
+          project === null ? (
+            // `LogTab` is not rendered with a `null` project rather than being taught to
+            // tolerate one. It opens a repository list, a branch list, a walk and an
+            // `fs-changed` subscription on mount, all keyed by project; every one of those
+            // would need a "there is no project" arm, and each arm would be a second place
+            // that can answer wrongly. The sentence is the whole of the projectless Log tab.
+            <ToolWindowNoProject />
+          ) : (
+            <LogTab
+              key={active?.id ?? 'log'}
+              project={project}
+              tab={walkTab(active?.id ?? null)}
+              repo={active === null ? null : (active.repo as RepoId)}
+              path={active === null ? null : active.path}
+            />
+          )
         ) : (
           // Keyed by the view id for the same reason `LogTab` is keyed by its tab: switching tabs
           // remounts rather than re-points, so one extension's rows are never on screen under

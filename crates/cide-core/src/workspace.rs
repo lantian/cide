@@ -1788,6 +1788,82 @@ pub fn find_pane(ws: &Workspace, pane: PaneId) -> Option<(ProjectId, TabId)> {
     })
 }
 
+/// A pane that holds a session, with the project and tab that own it.
+///
+/// Borrowed rather than owned because the two callers want different fields — the quit
+/// dialog wants the project's name and the pane's title, the remote surface wants the pane's
+/// id and role — and a struct carrying the union of both would grow a field every time a
+/// third caller appeared.
+pub struct SessionPane<'a> {
+    pub project: ProjectId,
+    pub project_name: &'a str,
+    /// `None` for a detached pane: it has an OS window of its own and is in no tab's tree.
+    pub tab: Option<TabId>,
+    /// What the tab strip calls the tab this pane is in, or `None` for a detached pane. (M75)
+    ///
+    /// Carried because a pane's own `title` is not a name a person recognises — every Claude
+    /// console is called `claude` — and the thing that tells two of them apart is the tab they
+    /// are in. A device listing consoles showed three identical rows without it.
+    pub tab_title: Option<String>,
+    pub pane: &'a Pane,
+    pub session: SessionId,
+}
+
+/// Every pane in the workspace holding a session — **tabs and detached panes alike**.
+///
+/// The `detached` half is the whole reason this exists. A torn-out pane is *removed* from its
+/// tab's tree (the tree invariant is that every leaf is present) and lives in
+/// [`Project::detached`], so a walk over `tabs` alone silently misses it — which is exactly
+/// what `cmd::app::live_sessions` did, and why the quit dialog never once warned about a busy
+/// `claude` in a detached window.
+///
+/// The opposite requirement exists too, and it is not this function's. `cmd::window::sessions_of`
+/// answers *what is this window showing* and skips `detached` deliberately, because those panes
+/// have windows of their own and counting them there would announce one waiting session from two
+/// places. A workspace-wide enumeration wants every session exactly once; a per-window one wants
+/// every session in the window it is drawn in. Both are right, so neither may be written in terms
+/// of the other.
+///
+/// Order is projects in workspace order, each project's tabs in tab order, then its detached
+/// panes. Two panes mirroring one child yield two entries carrying one `session` — de-duplicate
+/// at the caller, which is the only place that knows whether it is counting panes or
+/// conversations.
+pub fn session_panes(ws: &Workspace, only: Option<ProjectId>) -> Vec<SessionPane<'_>> {
+    let mut out = Vec::new();
+    for (id, project) in &ws.projects {
+        if only.is_some_and(|wanted| wanted != *id) {
+            continue;
+        }
+        for tab in &project.tabs {
+            for pane in tab.tree.panes.values() {
+                if let Some(session) = pane.session {
+                    out.push(SessionPane {
+                        project: *id,
+                        project_name: &project.name,
+                        tab: Some(tab.id),
+                        tab_title: Some(tab.kind.title()),
+                        pane,
+                        session,
+                    });
+                }
+            }
+        }
+        for pane in project.detached.values() {
+            if let Some(session) = pane.session {
+                out.push(SessionPane {
+                    project: *id,
+                    project_name: &project.name,
+                    tab: None,
+                    tab_title: None,
+                    pane,
+                    session,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Check every workspace invariant, including each tab's pane tree.
 ///
 /// Used by tests, by `persist` after loading a file written by an older build, and by the
@@ -3665,6 +3741,65 @@ mod tests {
             Some(WindowRole::DetachedPane { pane, .. }) if *pane == extra
         ));
         validate(&ws).expect("valid");
+    }
+
+    /// The bug this function exists for: a torn-out pane is out of the tree and still holds a
+    /// live child, so a walk over `tabs` alone reports it as nothing at all.
+    #[test]
+    fn session_panes_sees_a_detached_panes_session() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let docked = tab(&ws, id, console).expect("exists").tree.focused;
+        let extra = split_console(&mut ws, id);
+
+        let stays = SessionId::new();
+        let goes = SessionId::new();
+        bind_session(&mut ws, id, console, docked, stays).expect("binds");
+        bind_session(&mut ws, id, console, extra, goes).expect("binds");
+        detach_pane(&mut ws, id, console, extra).expect("detaches");
+
+        let found = session_panes(&ws, None);
+        let sessions: Vec<SessionId> = found.iter().map(|f| f.session).collect();
+        assert!(
+            sessions.contains(&goes),
+            "the detached pane's session is missing: {sessions:?}"
+        );
+        assert!(sessions.contains(&stays));
+
+        // And it is reported as belonging to no tab, because it belongs to no tab.
+        let detached = found
+            .iter()
+            .find(|f| f.session == goes)
+            .expect("just asserted");
+        assert_eq!(detached.tab, None);
+        assert_eq!(detached.project, id);
+        assert_eq!(
+            found
+                .iter()
+                .find(|f| f.session == stays)
+                .expect("just asserted")
+                .tab,
+            Some(console)
+        );
+    }
+
+    #[test]
+    fn session_panes_can_be_narrowed_to_one_project() {
+        let mut ws = Workspace::default();
+        let mine = open(&mut ws, "/home/dev/work/cide");
+        let theirs = open(&mut ws, "/home/dev/work/other");
+        let here = console_tab(&ws, mine).expect("exists");
+        let there = console_tab(&ws, theirs).expect("exists");
+        let here_pane = tab(&ws, mine, here).expect("exists").tree.focused;
+        let there_pane = tab(&ws, theirs, there).expect("exists").tree.focused;
+        bind_session(&mut ws, mine, here, here_pane, SessionId::new()).expect("binds");
+        bind_session(&mut ws, theirs, there, there_pane, SessionId::new()).expect("binds");
+
+        let narrowed = session_panes(&ws, Some(mine));
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].project, mine);
+        assert_eq!(session_panes(&ws, None).len(), 2);
     }
 
     #[test]

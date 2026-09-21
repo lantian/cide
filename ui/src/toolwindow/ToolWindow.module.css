@@ -117,3 +117,31 @@
   color: var(--dim);
   font-size: var(--fs-ui-13);
 }
+
+/*
+ * The Log tab's body with no project open. (M74)
+ *
+ * Padded rather than centred: the panel is 260px by default and can be dragged to 120, and a
+ * vertically centred block in a short box reads as a loading state. The type ladder is the
+ * sidebar panels' (`--fs-ui-13` claim over `--fs-ui-12` detail), because it is the same kind of
+ * sentence in the same kind of surface — see `check:ui-scale` for why neither is a bare px.
+ */
+.noProject {
+  padding: 14px 16px;
+  overflow: auto;
+}
+
+.claim {
+  margin: 0;
+  font-size: var(--fs-ui-13);
+  font-weight: 500;
+  color: var(--text-hi);
+}
+
+.detail {
+  margin: 4px 0 0;
+  max-width: 62ch;
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--faint);
+}

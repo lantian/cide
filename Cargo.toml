@@ -6,6 +6,7 @@ members = [
     "crates/cide-pty",
     "crates/cide-claude",
     "crates/cide-ide-mcp",
+    "crates/cide-remote",
     "crates/cide-git",
     "crates/cide-fs",
     "crates/cide-search",
@@ -43,6 +44,7 @@ cide-core = { path = "crates/cide-core" }
 cide-pty = { path = "crates/cide-pty" }
 cide-claude = { path = "crates/cide-claude" }
 cide-ide-mcp = { path = "crates/cide-ide-mcp" }
+cide-remote = { path = "crates/cide-remote" }
 cide-git = { path = "crates/cide-git" }
 cide-fs = { path = "crates/cide-fs" }
 cide-search = { path = "crates/cide-search" }
@@ -238,6 +240,24 @@ tokio-tungstenite = "0.30.0"
 # `WebSocketStream`'s `Stream`/`Sink` impls come from here, so driving a socket at all needs
 # the traits named. Already in the graph as tokio-tungstenite's own dependency.
 futures-util = { version = "0.3.33", default-features = false, features = ["std", "sink"] }
+# The sealed transport: every frame between cide and a paired device is an AEAD box. (M72)
+#
+# XChaCha20-Poly1305 rather than TLS, and the argument is in ADR 0015: React Native's `WebSocket`
+# exposes no certificate hook on either platform, so pinning a self-signed cert needs native work
+# on both — and pinning *per paired instance*, which is what this feature actually requires, needs
+# it twice. Sealing the frames instead is pure Rust here and pure JS there.
+#
+# 0.10 rather than 0.11 on purpose: it is the line whose `aead`, `cipher` and `universal-hash`
+# this workspace's lockfile already resolves, so the marginal build is four small pure-Rust
+# crates and no C.
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "getrandom"] }
+# The key agreement. `curve25519-dalek` underneath it is the same implementation everything else
+# in the ecosystem uses, and `static_secrets` is what lets the instance keep a long-lived key.
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+# Deriving four keys and two nonce prefixes from one shared secret. `sha2` is already here.
+hkdf = "0.12.4"
+# So a key that goes out of scope does not stay in the heap for whatever reads it next.
+zeroize = "1.8"
 subtle = "2.6.1"
 
 # --- data ---
@@ -256,6 +276,17 @@ parking_lot = "0.12.5"
 smallvec = "1"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 blake3 = "1.8.6"
+
+# The pairing QR, encoded in `cide_core::remote::qr`. `default-features = false` is the whole
+# point of the entry: the defaults are `image`, `pic` and `svg`, and `image` is the decoder
+# suite this workspace refuses on principle (see `png` above, and `image::encode_png`). What is
+# left is a pure encoder over bytes, which is unit-testable and draws nothing — the webview
+# turns the module grid into SVG rects itself.
+#
+# It is also deliberately optional in the design rather than load-bearing: if this ever cannot
+# be trimmed to an encoder, drop it and show the code and `host:port` as large text, which is
+# eight characters typed once per device. Nothing else depends on the matrix existing.
+qrcode = { version = "0.14.1", default-features = false }
 # For the checksum `cargo xtask package --run` prints beside each release artefact. sha256
 # rather than the blake3 above it, because the number is for a release page: it is what
 # `sha256sum -c` and GitHub's own attestations speak, and a checksum a downloader cannot verify

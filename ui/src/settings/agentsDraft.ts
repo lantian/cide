@@ -212,6 +212,139 @@ export function isClosedVocabulary(field: AgentFieldKey): boolean {
   return Object.prototype.hasOwnProperty.call(CLOSED_VOCABULARIES, field)
 }
 
+/* ------------------------------------------------------------------- the colour a role picks */
+
+/**
+ * The front-matter key a role's colour lives in. (M77)
+ *
+ * **Claude Code's own key**, which is why it is a string here and not a field on [`Draft`]:
+ * `cide_agents::defs` reads it and deliberately leaves it in `extras`, so `render` writes back
+ * the source lines the file already had and no `.claude/agents/*.md` is reordered by a save.
+ * The picker is therefore a *control over one extra*, not a modelled field — and everything
+ * below is what makes that honest rather than a shortcut.
+ */
+export const COLOR_KEY = 'color'
+
+/**
+ * The eight a role may pick, in `cide_ipc::agents::AGENT_HUES`' order.
+ *
+ * A third restatement of that list — Rust, `AgentsPanel/model.ts`, here — and the reason there
+ * is no import is the reason this file has none at all: `check:settings-agents` compiles it
+ * standalone. The check pins all three against the Rust constant, **in order**, because the
+ * order is what a derived colour indexes.
+ *
+ * `--agent-orchestrator` is not here, and its absence is the reservation: a picker that offered
+ * it would let a role be given the one colour that exists to mean *not a role*.
+ */
+export const AGENT_HUES: readonly string[] = [
+  'blue',
+  'green',
+  'orange',
+  'purple',
+  'cyan',
+  'red',
+  'yellow',
+  'pink',
+]
+
+/**
+ * The colour a draft has asked for, or `null` for *derive one from the name*.
+ *
+ * `null` covers three states the picker draws the same way and must not confuse: no `color:` at
+ * all, an empty one, and a value this build does not recognise. Only the first two are
+ * *writable* as `null` — see [`withColor`], which leaves an unrecognised value alone.
+ */
+export function colorOf(draft: Draft): string | null {
+  const raw = draft.extras.find((extra) => extra.key.trim().toLowerCase() === COLOR_KEY)
+  if (raw === undefined) return null
+  const folded = raw.value.trim().toLowerCase()
+  return AGENT_HUES.includes(folded) ? folded : null
+}
+
+/**
+ * The value a definition wrote that this build cannot use, or `null` when there is nothing to
+ * say.
+ *
+ * Separate from [`colorOf`] because the picker has to draw two different sentences over one
+ * `null`: *nothing was asked for* and *`chartreuse` was asked for and is not one of the eight*.
+ * Collapsing them would make a hand-written mistake look like an ordinary unset field, and the
+ * user would never learn why the row is not the colour they typed.
+ */
+export function unknownColor(draft: Draft): string | null {
+  const raw = draft.extras.find((extra) => extra.key.trim().toLowerCase() === COLOR_KEY)
+  if (raw === undefined) return null
+  const value = raw.value.trim()
+  if (value === '') return null
+  return AGENT_HUES.includes(value.toLowerCase()) ? null : value
+}
+
+/**
+ * The extras list with the colour set, or with the key **removed** for `null`.
+ *
+ * Removed and never written blank: `cide_ipc::llm`'s rule — *blank is a key cide omits, never a
+ * value it writes* — and here it is load-bearing twice over. A `color:` with nothing after it is
+ * a key `cide_ipc::agents::hue` answers `None` for, so the role derives anyway and the file has
+ * gained a line that does nothing; and on a Claude Code subagent it is a line cide added to
+ * somebody else's file to record the absence of a choice.
+ *
+ * The key keeps its **position** when it is already there, because `isDirty` compares the extras
+ * array in order and moving a key is a change to the file. A new one is appended, which is where
+ * `render` would put it anyway.
+ *
+ * The spelling of an existing key is preserved (`Color:` stays `Color:`) for the same reason
+ * `defs.rs` matches it folded: cide reads the key case-insensitively and must not rewrite a file
+ * to suit its own preference.
+ */
+export function withColor(extras: readonly Extra[], color: string | null): Extra[] {
+  const at = extras.findIndex((extra) => extra.key.trim().toLowerCase() === COLOR_KEY)
+  if (color === null) return extras.filter((_, i) => i !== at).map((extra) => ({ ...extra }))
+  const next = extras.map((extra) => ({ ...extra }))
+  if (at === -1) {
+    next.push({ key: COLOR_KEY, value: color })
+    return next
+  }
+  next[at] = { key: next[at]?.key ?? COLOR_KEY, value: color }
+  return next
+}
+
+/**
+ * The extras the **Meta** rows draw: everything but the colour.
+ *
+ * The colour has a control of its own now, and a key with two editors is a key whose two editors
+ * disagree — type `chartreuse` into the raw row and the swatch above it silently says
+ * *Automatic*. This is the one key the Meta list hides, and it hides it only because something
+ * else on the same screen shows it; `AgentDraft`'s rule that a preserved key must be visible is
+ * satisfied by the picker, not waived.
+ */
+export function metaExtras(extras: readonly Extra[]): Extra[] {
+  return extras
+    .filter((extra) => extra.key.trim().toLowerCase() !== COLOR_KEY)
+    .map((extra) => ({ ...extra }))
+}
+
+/**
+ * The Meta rows' edit, folded back over the colour the picker owns.
+ *
+ * Without this the two controls race through one array: the Meta list is built from
+ * [`metaExtras`], so an edit there hands back a list with no `color` in it and saving would drop
+ * the key the picker is still drawing. Adding a row called `color` by hand is therefore also
+ * refused — it would be the second editor this split exists to prevent — and the raw row is
+ * simply dropped in favour of what the picker holds.
+ */
+export function withMetaExtras(current: readonly Extra[], meta: readonly Extra[]): Extra[] {
+  const kept = current.find((extra) => extra.key.trim().toLowerCase() === COLOR_KEY)
+  const next = meta
+    .filter((extra) => extra.key.trim().toLowerCase() !== COLOR_KEY)
+    .map((extra) => ({ ...extra }))
+  if (kept === undefined) return next
+  // Re-inserted at its old index, or appended when the colour is newer than every meta row —
+  // `isDirty` compares order, so a key that hopped to the end on every unrelated edit would
+  // report a dirty draft for a change nobody made.
+  const at = current.findIndex((extra) => extra.key.trim().toLowerCase() === COLOR_KEY)
+  next.splice(Math.min(at, next.length), 0, { ...kept })
+  return next
+}
+
 /** Every field the form draws, in the order it draws them. Pinned to `AgentField` in Rust. */
 export const AGENT_FIELDS: readonly AgentFieldKey[] = [
   'scope',

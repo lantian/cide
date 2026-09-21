@@ -732,13 +732,20 @@
   min-width: 0;
 }
 
+/*
+ * The role's name, drawn in the role's own colour. (M75)
+ *
+ * No `color` here on purpose: the value is set inline by `AgentsPanel.tsx` out of `agentColor`,
+ * and a `--text-hi` in this rule would be a declaration of the same specificity losing to the
+ * inline style on every row — present, dead, and read by the next person as the colour the name
+ * has. `check:theme` is what guarantees the eight it can be are legible on `--panel`.
+ */
 .roleName {
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
   font-size: var(--fs-ui-12);
-  color: var(--text-hi);
 }
 
 /*

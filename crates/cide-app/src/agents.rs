@@ -202,6 +202,19 @@ struct LiveRun {
     change: Option<String>,
     state: RunState,
     started_unix_ms: u64,
+    /// Milliseconds this run has worked, over its **closed** working intervals.
+    ///
+    /// Maintained by [`move_to`] and nothing else, which is the whole of the correctness here:
+    /// it is the only thing in this process that assigns [`Self::state`], so it is the only
+    /// thing that can see the transition an interval opens or closes on. See
+    /// [`RunState::counts_as_work`] for which states count, and [`cide_ipc::AgentRun::worked_ms`]
+    /// for why a run needs this clock beside [`Self::started_unix_ms`] at all.
+    worked_ms: u64,
+    /// When the open working interval began, or `None` when this run is not working.
+    ///
+    /// `Some` in exactly the states [`RunState::counts_as_work`] admits. Not persisted: a
+    /// restored run is `Interrupted`, which is not working.
+    working_since_unix_ms: Option<u64>,
     /// The last prompt delivered — the opening one today, a follow-up once the queue can send
     /// them. Kept because the retry a frozen turn offers has to re-send *this* text: a retry
     /// that recomposed the prompt from the task would silently drop whatever extra instruction
@@ -586,6 +599,10 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             change: spec.change,
             state: RunState::Queued,
             started_unix_ms: now_unix_ms(),
+            // Correct by construction: a new run is `Queued`, which is not work, so there is no
+            // interval open and nothing accumulated. Every later change goes through `move_to`.
+            worked_ms: 0,
+            working_since_unix_ms: None,
             prompt: spec.prompt,
             note: (ahead > 0).then(|| {
                 format!("{ahead} ahead of it in this role's queue; runs start as slots free")
@@ -715,6 +732,12 @@ impl LiveRun {
             state: self.state.clone(),
             task: self.task.clone(),
             started_unix_ms: self.started_unix_ms,
+            // Both verbatim, and no `now` is needed to build a row — which is the point of
+            // splitting the closed total from the open stamp. A consumer adds the time since
+            // the stamp at render, so a live figure ticks between broadcasts and a paused or
+            // finished one does not tick at all.
+            worked_ms: self.worked_ms,
+            working_since_unix_ms: self.working_since_unix_ms,
             notify: self.notify.clone(),
             stale_turn: self.stale_turn,
             // The stop's sentence, then the pool's, then the run's: a run that has been asked
@@ -1040,7 +1063,9 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
                 queue.pop_front();
             }
             let live = inner.runs.get_mut(&run).expect("just read above");
-            live.state = RunState::Starting;
+            // The edge that opens the worked clock: everything before this was queue, and the
+            // queue is not work — a run that sat behind two others did nothing in the wait.
+            move_to(live, RunState::Starting, now_unix_ms());
             live.slot = true;
             live.note = None;
             // A resumed interrupted run continues its old conversation; one that never had a
@@ -1677,7 +1702,7 @@ impl AgentRegistry {
             )
         );
         let over = matches!(next, RunState::Finished { .. } | RunState::Failed { .. });
-        live.state = next;
+        move_to(live, next, now_unix_ms());
         if over {
             // A frozen child that died under the freeze is not frozen any more, and leaving the
             // record behind would put a dead session on `thaw_for_shutdown`'s list and leave the
@@ -2258,6 +2283,59 @@ fn freeze_may_have_killed_the_turn(frozen: &RunState, paused_at_ms: u64, now_ms:
         && now_ms.saturating_sub(paused_at_ms) >= STALE_FREEZE_MS
 }
 
+/// Move a run to `next`, keeping its worked clock. **The one place `LiveRun::state` is assigned.**
+///
+/// A run's worked clock runs only while [`RunState::counts_as_work`] admits its state, and the
+/// only moment that clock can be started or stopped is the *transition* — a state observed over
+/// and over says nothing about how long it has been held. [`AgentRegistry::set_state`] already
+/// makes that argument for the slot release and the orchestrator nudge; this is the same
+/// argument for the clock, factored out because six callers write the state inline, under the
+/// lock, without going through that method.
+///
+/// Takes `&mut LiveRun` and no lock, so it is callable from every one of them — including
+/// `plan_failover`, whose comment records that it may not call `set_state` because that method
+/// takes the mutex it is already holding.
+///
+/// # Both edges, never one
+///
+/// Accumulating on the way out without stamping on the way in loses every interval, and
+/// stamping without accumulating loses every interval but the last. Neither has a symptom: the
+/// figure is simply a smaller wrong number than the one this replaces, on a row nobody
+/// cross-checks against a stopwatch. A `_ => {}` arm for work→work and wait→wait is correct and
+/// is written as one, because a transition between two working states (`Running` → `Starting`,
+/// which is what a failover respawn does) must leave the open interval alone: closing and
+/// reopening it would be the same total, but only by accident of the two happening at one
+/// instant.
+fn move_to(live: &mut LiveRun, next: RunState, now_ms: u64) {
+    match (live.state.counts_as_work(), next.counts_as_work()) {
+        (true, false) => {
+            if let Some(since) = live.working_since_unix_ms.take() {
+                // `saturating_sub`, for `freeze_may_have_killed_the_turn`'s stated reason in a
+                // second place: this is wall clock and it can go backwards — an NTP step, a
+                // suspend and resume — and a backwards clock must read as no time passed rather
+                // than as an enormous interval that lands permanently in a run's total.
+                live.worked_ms = live.worked_ms.saturating_add(now_ms.saturating_sub(since));
+            }
+        }
+        (false, true) => live.working_since_unix_ms = Some(now_ms),
+        (true, true) | (false, false) => {}
+    }
+    live.state = next;
+}
+
+/// What this run's worked figure is **right now**, closing the open interval if there is one.
+///
+/// One producer for the sum, because two places computing a number give two plausible answers —
+/// the rule `cide_git::push::preview` states. The wire deliberately carries the two halves
+/// rather than this, so a live row can tick between broadcasts; this is for the callers that
+/// need a single closed number, which today is the snapshot.
+fn worked_now(live: &LiveRun, now_ms: u64) -> u64 {
+    live.worked_ms.saturating_add(
+        live.working_since_unix_ms
+            .map_or(0, |since| now_ms.saturating_sub(since)),
+    )
+}
+
 /// Freeze one run, under the lock. `None` when there is nothing to freeze.
 ///
 /// The write half of the ordering the module header describes: by the time this returns, the run
@@ -2278,9 +2356,13 @@ fn freeze_run(live: &mut LiveRun, now_ms: u64) -> Option<SessionId> {
         state: live.state.clone(),
         at_unix_ms: now_ms,
     });
-    live.state = RunState::Paused {
-        since_unix_ms: now_ms,
-    };
+    move_to(
+        live,
+        RunState::Paused {
+            since_unix_ms: now_ms,
+        },
+        now_ms,
+    );
     Some(session)
 }
 
@@ -2582,7 +2664,12 @@ impl AgentRegistry {
             };
             // Restored verbatim rather than re-derived: the run is exactly where it was, and
             // asking the harness would answer from a hook frame that never arrived.
-            live.state = frozen.state.clone();
+            //
+            // Through `move_to`, so a run that was working when it was frozen opens a *fresh*
+            // interval here — which is what excludes the freeze. Note that nothing subtracts a
+            // pause: the clock simply did not run, so `Frozen::at_unix_ms` keeps its one
+            // existing purpose and this needs no arithmetic of its own.
+            move_to(live, frozen.state.clone(), now_ms);
             if freeze_may_have_killed_the_turn(&frozen.state, frozen.at_unix_ms, now_ms) {
                 watch.push((thaw.session, run));
             }
@@ -2711,7 +2798,7 @@ impl AgentRegistry {
             live.session = Some(next);
             live.frozen = None;
             live.stale_turn = false;
-            live.state = RunState::Starting;
+            move_to(live, RunState::Starting, now_unix_ms());
             if pool_changed {
                 restamp(live);
             }
@@ -2855,7 +2942,11 @@ impl AgentRegistry {
                 live.note = Some(why);
                 continue;
             }
-            live.state = RunState::Queued;
+            // `Interrupted` → `Queued`: both are waiting, so this is a clock no-op today. It
+            // goes through `move_to` anyway, because the invariant is that *every* assignment
+            // does — a site that writes the state inline is the one that silently stops being a
+            // no-op the day `counts_as_work` moves.
+            move_to(live, RunState::Queued, now_unix_ms());
             live.continuing = true;
             live.note = Some(
                 "resuming after a cide restart; a new child continues the same conversation"
@@ -3382,7 +3473,11 @@ impl AgentRegistry {
         // Written inline rather than through `set_state`: that method takes this same lock, and
         // `Running → Starting` is neither the handed-back edge nor an `over` transition, so there
         // is nothing of its bookkeeping to run.
-        live.state = RunState::Starting;
+        //
+        // It does go through `move_to`, which takes no lock and so is reachable from here. The
+        // transition is work → work, which leaves the open interval alone — a respawn onto the
+        // next candidate is one run continuing, and the figure must not restart with the child.
+        move_to(live, RunState::Starting, now_unix_ms());
 
         // A first-turn failure abandons its conversation, and that is the cheap, common case: the
         // session holds exactly the prompt cide just sent and one failed assistant message, so
@@ -3686,6 +3781,20 @@ struct SavedRun {
     task_title: Option<String>,
     prompt: String,
     started_unix_ms: u64,
+    /// The run's worked total, with any interval that was open at shutdown already closed —
+    /// see [`worked_now`], which the write calls rather than copying the field raw. Copying it
+    /// raw would lose the whole of the session a run was in the middle of when cide quit.
+    ///
+    /// `#[serde(default)]` is the schema rung: a snapshot written before this field existed
+    /// reads `0`, which understates a pre-existing run's figure exactly once and is the only
+    /// honest answer available — nothing on disk records what those runs did.
+    ///
+    /// There is deliberately **no** saved counterpart to `LiveRun::working_since_unix_ms`.
+    /// Every restored run comes back [`RunState::Interrupted`], which is not work, so the
+    /// stamp is `None` by construction and the hours cide spent shut add nothing to the
+    /// figure. The offline case needs no field and no code.
+    #[serde(default)]
+    worked_ms: u64,
     /// Recorded limits, kept for [`admit_a_pass`]'s stated reason: admission must not read
     /// disk under the lock, and a config edited across the restart must not release a slot
     /// that was never taken.
@@ -4046,6 +4155,11 @@ impl AgentRegistry {
 
     /// The unconditional half, which only the two callers above may reach.
     fn write_snapshot_now(&self, path: &std::path::Path) {
+        // Read once, outside the lock and before the walk, so every run in one snapshot closes
+        // its open working interval against the *same* instant. A clock read per run would
+        // give the last row a few milliseconds the first row did not get, which is harmless
+        // and is still two answers to one question.
+        let snapshot_now = now_unix_ms();
         let file = {
             let inner = self.inner.lock();
             let mut paused: Vec<ProjectId> = inner.paused_projects.iter().copied().collect();
@@ -4081,6 +4195,10 @@ impl AgentRegistry {
                         task_title: live.task_title.clone(),
                         prompt: live.prompt.clone(),
                         started_unix_ms: live.started_unix_ms,
+                        // Closed here, not copied: a run that was `Running` when cide quit has
+                        // an interval open, and `live.worked_ms` alone would throw away
+                        // everything it did since its last state change.
+                        worked_ms: worked_now(live, snapshot_now),
                         agent_limit: live.agent_limit,
                         project_limit: live.project_limit,
                         pool: live.pool.clone(),
@@ -4238,6 +4356,10 @@ impl AgentRegistry {
                     turns: 1,
                     state,
                     started_unix_ms: saved.started_unix_ms,
+                    worked_ms: saved.worked_ms,
+                    // A restored run is `Interrupted` — not work — so no interval is open and
+                    // the gap between the snapshot and this launch is excluded by construction.
+                    working_since_unix_ms: None,
                     prompt: saved.prompt,
                     note,
                     slot: false,
@@ -6725,6 +6847,108 @@ mod tests {
     /// overwrote the file with the shutdown's own kills recorded as outcomes. Two paused runs
     /// restored as history, and Resume had nothing to resume. The seal is the fix, and this
     /// drives the exact sequence.
+    /// **The time cide spent shut is not work, and the work before it is not lost.**
+    ///
+    /// Two halves of one claim, and they pull in opposite directions — which is why they are
+    /// asserted together. The snapshot must *close* the interval a running run had open, or
+    /// everything it did since its last state change is thrown away at every restart; and the
+    /// restore must *not* reopen one, or the hours between the two launches land in the figure.
+    /// Both fall out of the shape rather than out of code: `worked_now` closes, and a restored
+    /// run is `Interrupted`, which is not work.
+    #[test]
+    fn a_restart_keeps_the_work_and_drops_the_hours_cide_was_shut() {
+        let dir = std::env::temp_dir().join(format!("cide-run-worked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        registry.bind_session(run, SessionId::new());
+        assert!(registry.set_state(None, run, RunState::Running));
+
+        // Wind the open interval back an hour, so the snapshot has something to close that the
+        // test can name. (The stamp is wall clock — `admit_a_pass` and `set_state` read the
+        // real one — so it is moved rather than injected.)
+        const HOUR: u64 = 3_600_000;
+        {
+            let mut live = clocked(&registry, run);
+            live.worked_ms = 0;
+            live.working_since_unix_ms = Some(now_unix_ms() - HOUR);
+        }
+        registry.write_snapshot_now(&path);
+
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        assert_eq!(state_of(&after, run), RunState::Interrupted);
+        let live = clocked(&after, run);
+        assert!(
+            live.worked_ms.abs_diff(HOUR) < 5_000,
+            "the snapshot must close the open interval, or a run loses everything it did since \
+             its last state change at every restart: {}",
+            live.worked_ms
+        );
+        assert_eq!(
+            live.working_since_unix_ms, None,
+            "a restored run is `Interrupted`, which is not work — this is what excludes the \
+             hours cide spent shut, with no snapshot timestamp and no code of its own"
+        );
+        // And the figure does not move, however long the process has been up since.
+        let banked = live.worked_ms;
+        drop(live);
+        assert_eq!(
+            worked_now(&clocked(&after, run), now_unix_ms() + 10 * HOUR),
+            banked
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A snapshot written before the worked clock existed still loads.**
+    ///
+    /// The schema rung. `#[serde(default)]` reads a missing `workedMs` as zero, which
+    /// understates those runs' figures exactly once and is the only honest answer available —
+    /// nothing on disk records what they did. What must not happen is the whole file failing to
+    /// parse, which would lose every run in it.
+    #[test]
+    fn a_snapshot_written_before_the_worked_clock_still_loads() {
+        let dir = std::env::temp_dir().join(format!("cide-run-rung-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        registry.bind_session(run, SessionId::new());
+        registry.write_snapshot_now(&path);
+
+        // The field, struck out of the file exactly as a build without it would have written.
+        let text = std::fs::read_to_string(&path).expect("written");
+        assert!(text.contains("workedMs"), "the field is in a fresh file");
+        let old: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("\"workedMs\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!old.contains("workedMs"));
+        std::fs::write(&path, &old).expect("rewrite");
+
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        assert_eq!(
+            state_of(&after, run),
+            RunState::Interrupted,
+            "the run came back at all — the failure this guards is the whole file refusing"
+        );
+        assert_eq!(clocked(&after, run).worked_ms, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_sealed_snapshot_ignores_the_shutdowns_own_kills() {
         let dir = std::env::temp_dir().join(format!("cide-run-seal-{}", std::process::id()));
@@ -7739,6 +7963,168 @@ mod tests {
         assert!(
             registry.dispatching(project),
             "a refused single-run pause shut the whole project's queue"
+        );
+    }
+
+    // ==========================================================================================
+    // The worked clock. `move_to` is the whole of it, so the arithmetic is driven directly over
+    // injected instants; the registry tests below assert the *invariant* it keeps, which is what
+    // a wall-clock opening stamp still lets a test see.
+    // ==========================================================================================
+
+    /// A run to drive `move_to` over, with its clock wound back to a known zero.
+    ///
+    /// Minted through the registry rather than built as a literal, so the fields under test are
+    /// the ones a dispatch really produces — a hand-built `LiveRun` would go on compiling after
+    /// `insert_run` stopped initialising them.
+    fn clocked(registry: &AgentRegistry, run: RunId) -> parking_lot::MappedMutexGuard<'_, LiveRun> {
+        parking_lot::MutexGuard::map(registry.inner.lock(), |inner| {
+            inner.runs.get_mut(&run).expect("the run is listed")
+        })
+    }
+
+    /// **A pause adds nothing, and the run resumes where its figure left off.**
+    ///
+    /// The reported bug, as arithmetic. The run works four minutes, is frozen for a day, works
+    /// one more minute and ends: the figure is five minutes, not a day and five minutes.
+    #[test]
+    fn a_pause_adds_nothing_to_the_worked_figure() {
+        const MINUTE: u64 = 60_000;
+        const DAY: u64 = 24 * 60 * MINUTE;
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 1));
+        let mut live = clocked(&registry, run);
+
+        // Dispatched and queued. Nothing is open, because the queue is not work.
+        assert_eq!(live.worked_ms, 0);
+        assert_eq!(live.working_since_unix_ms, None);
+
+        move_to(&mut live, RunState::Starting, 0);
+        assert_eq!(live.working_since_unix_ms, Some(0), "the clock opens here");
+        move_to(&mut live, RunState::Running, MINUTE);
+        assert_eq!(
+            (live.worked_ms, live.working_since_unix_ms),
+            (0, Some(0)),
+            "work → work leaves the open interval alone; closing and reopening it would be the \
+             same total only by accident of the two happening at one instant"
+        );
+
+        move_to(
+            &mut live,
+            RunState::Paused {
+                since_unix_ms: 4 * MINUTE,
+            },
+            4 * MINUTE,
+        );
+        assert_eq!(live.worked_ms, 4 * MINUTE, "four minutes banked");
+        assert_eq!(live.working_since_unix_ms, None, "and nothing left running");
+
+        // A day of freeze. The clock is not running, so there is no interval to subtract — which
+        // is why `Frozen::at_unix_ms` keeps its one existing purpose and this needs no
+        // arithmetic of its own.
+        move_to(&mut live, RunState::Running, 4 * MINUTE + DAY);
+        assert_eq!(
+            live.worked_ms,
+            4 * MINUTE,
+            "the day the run spent frozen must not land in its total"
+        );
+
+        move_to(&mut live, RunState::Finished { code: 0 }, 5 * MINUTE + DAY);
+        assert_eq!(live.worked_ms, 5 * MINUTE);
+        assert_eq!(live.working_since_unix_ms, None);
+        assert_eq!(
+            worked_now(&live, 5 * MINUTE + DAY + 10 * DAY),
+            5 * MINUTE,
+            "a finished run's figure is final however far the clock moves — the history row's \
+             whole claim, and the reason this change needs no end timestamp"
+        );
+    }
+
+    /// **Queue wait is not work.**
+    ///
+    /// The third way the single figure overstated, and the quietest: a run that sat behind two
+    /// others for twenty minutes did nothing in them, and counting the queue would make a role's
+    /// figures depend on how busy the project was rather than on what the role did.
+    #[test]
+    fn the_wait_for_a_slot_is_not_work() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 1));
+        let mut live = clocked(&registry, run);
+        // Twenty minutes queued, then admitted.
+        move_to(&mut live, RunState::Starting, 20 * 60_000);
+        assert_eq!(live.worked_ms, 0);
+        assert_eq!(live.working_since_unix_ms, Some(20 * 60_000));
+        assert_eq!(
+            worked_now(&live, 20 * 60_000),
+            0,
+            "a run admitted after a long wait has worked none of it"
+        );
+    }
+
+    /// **A backwards clock reads as no time passed.**
+    ///
+    /// `freeze_may_have_killed_the_turn`'s rule in a second place. This is wall clock and it
+    /// steps — an NTP correction, a suspend and resume — and the failure the other way is
+    /// permanent: an enormous interval lands in `worked_ms` and nothing ever takes it out again.
+    #[test]
+    fn a_clock_that_went_backwards_banks_nothing() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 1));
+        let mut live = clocked(&registry, run);
+        move_to(&mut live, RunState::Running, 10_000);
+        move_to(&mut live, RunState::Idle, 4_000);
+        assert_eq!(live.worked_ms, 0, "not a huge number, and not a panic");
+        assert_eq!(worked_now(&live, 1_000), 0);
+    }
+
+    /// **A frozen run holds no open interval, and a thawed one opens a fresh one.**
+    ///
+    /// The structural half, through the real freeze and thaw rather than through `move_to` —
+    /// which is what proves the two paths call it at all. The instants are injected, so the
+    /// claim does not depend on how long the test took to run.
+    #[test]
+    fn a_freeze_shuts_the_worked_clock_and_a_thaw_restarts_it() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 1));
+        registry.take_admissions();
+        registry.bind_session(run, SessionId::new());
+        assert!(registry.set_state(None, run, RunState::Running));
+        assert!(
+            clocked(&registry, run).working_since_unix_ms.is_some(),
+            "a running run has an interval open"
+        );
+
+        let banked = {
+            registry
+                .take_freezes(project, Some(run), None, 1_000)
+                .expect("the run is live");
+            let live = clocked(&registry, run);
+            assert_eq!(
+                live.working_since_unix_ms, None,
+                "a frozen run's clock must be shut, or the freeze accrues"
+            );
+            live.worked_ms
+        };
+
+        let thaws = registry
+            .plan_thaws(project, Some(run))
+            .expect("the run is frozen");
+        // An hour later.
+        registry.finish_thaws(project, false, &thaws, 1_000 + 3_600_000);
+        let live = clocked(&registry, run);
+        assert_eq!(live.state, RunState::Running, "restored verbatim");
+        assert_eq!(
+            live.worked_ms, banked,
+            "the hour the run spent frozen is not in its total"
+        );
+        assert_eq!(
+            live.working_since_unix_ms,
+            Some(1_000 + 3_600_000),
+            "and the new interval starts at the thaw, not at the freeze"
         );
     }
 

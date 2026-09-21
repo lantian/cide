@@ -484,6 +484,50 @@ try {
   }
 
   /*
+   * ===== A role's colour reaches the markup, on every row and on both rungs. ===============
+   *
+   * Every failure here is silent and three of them are total. A name with no inline colour draws
+   * in whatever it inherited, which is what the panel looked like before M75 and which no other
+   * assertion in this file can see. A build that read `AgentDef.color` and then ignored it draws
+   * a *plausible* colour — the derived one — on every row, so only the declared half can catch
+   * it. And two roles one colour is two roles a reader cannot tell apart in a log, which is
+   * `check:theme`'s subject for the palette and this one's for the mapping onto it.
+   */
+  {
+    for (const story of Object.keys(agents)) {
+      for (const role of agents[story].roles ?? []) {
+        ok(
+          /^var\(--agent-[a-z]+\)$/.test(role.nameColor),
+          `${story}/${role.id}: the role's name carries an inline \`var(--agent-…)\`. An ` +
+            `uncoloured one is not a rendering bug anybody will see — it simply inherits`,
+        )
+        ok(
+          role.nameColor !== 'var(--agent-orchestrator)',
+          `${story}/${role.id}: and never the orchestrator's, which no role may have`,
+        )
+      }
+    }
+
+    const d = a('role-declared-colour')
+    const byId = Object.fromEntries((d.roles ?? []).map((r) => [r.id, r]))
+    eq(
+      byId.designer?.nameColor,
+      'var(--agent-green)',
+      "a definition's own `color:` is what its row is drawn in — the rung a build that ignored " +
+        'the field entirely would still pass without',
+    )
+    eq(
+      byId.developer?.nameColor,
+      'var(--agent-red)',
+      'while a role that declares nothing derives its hue from its id',
+    )
+    ok(
+      byId.designer?.nameColor !== byId.developer?.nameColor,
+      'and the two differ — the story is worth nothing if the declared hue is the derived one',
+    )
+  }
+
+  /*
    * ===== The cross-link, which is half a link with either half missing. ====================
    */
   {
@@ -627,6 +671,60 @@ try {
       d.buttons?.includes(RESUME_ALL),
       'and the header offers the project-scope Resume beside it: one frozen run is something ' +
         'frozen, whatever the queue is doing',
+    )
+  }
+
+  /*
+   * ===== The figure a row draws is **worked** time, not age since dispatch. ================
+   *
+   * The end-to-end half. `model.ts`'s own tables pin `workedFor` and `timeTitle` as functions,
+   * and they would go on passing against a `RunRow` that had never stopped calling
+   * `elapsed(nowMs, startedMs)` — which is the bug. Only a rendering can see which one the row
+   * actually calls, so the fixtures are built so the two answers differ and this asserts on
+   * which one came out.
+   *
+   * `PAUSED` was dispatched 1h 04m ago and worked 49m of it; `FINISHED` was dispatched 2h 03m
+   * ago and worked 6m. The old figure drew the first number of each pair, and for the finished
+   * run it drew a number that rose by an hour every hour the panel stayed open — on the row
+   * whose own doc comment says "how long it took".
+   */
+  {
+    const paused = a('role-paused').times ?? []
+    eq(paused.length, 1, 'one run, one time cell')
+    eq(paused[0]?.drawn, '49m', 'a paused row draws what the run worked, not how long ago it began')
+    ok(
+      paused[0]?.title?.includes('dispatched 1h 04m ago'),
+      `and the wall clock it no longer draws is one hover away: ${paused[0]?.title}`,
+    )
+    // The phase text still **leads**, because the dot at the head of the line is the only other
+    // place a run's state is written and a dot is readable by nobody who has not learned the
+    // glyphs. The clock clauses are appended to it, never in front of it — and what leads here
+    // is the *hint* rather than the word `Paused`, which is `RunRow`'s existing precedence: the
+    // one phase whose word is not the whole truth, since a frozen child can have a model call
+    // still finishing server-side.
+    ok(
+      paused[0]?.title?.startsWith('The child process is frozen'),
+      `the phase sentence leads, and the hint outranks the word: ${paused[0]?.title}`,
+    )
+    ok(
+      paused[0]?.title?.indexOf('dispatched') > 0,
+      `so the clocks are appended to it: ${paused[0]?.title}`,
+    )
+
+    const over = a('role-finished-only').times ?? []
+    eq(over.length, 2, 'the finished run and the failed one')
+    eq(over[0]?.drawn, '6m', 'a History row’s figure is the run’s duration and is final')
+    ok(
+      !over.some((cell) => cell.title?.includes('not working')),
+      'and a run that is over is never described as "not working" for the rest of time — that ' +
+        'clause is a difference of two clocks, and one of them keeps moving',
+    )
+
+    const queued = a('role-queued').times ?? []
+    eq(
+      queued[0]?.drawn,
+      '0s',
+      'and the wait for a slot is not work, however long a run has been queued',
     )
   }
 
@@ -935,11 +1033,56 @@ try {
       'and from the lit chip’s — stalled must not read as working, which is the original ' +
         'most-important assertion extended to the third rendering',
     )
+
+    /*
+     * The role's colour on the chip's **label**, and the tone still on the chip. (M75)
+     *
+     * The pair is the assertion. The label's colour is identical across the two stories, because
+     * it is a fact about *who* and one run apart is the same role either way; the tone differs,
+     * because that is a fact about *what is happening*. A build that coloured the chip by role
+     * instead of the word would pass the first and destroy the second — silently, since a
+     * recoloured chip is still a chip and every class assertion above reads the class list.
+     */
+    for (const [name, d] of [['list', idle], ['list-with-live-run', live]]) {
+      for (const colour of d.chipLabelColors ?? []) {
+        ok(
+          /^var\(--agent-[a-z]+\)$/.test(colour),
+          `${name}: every chip label carries an inline \`var(--agent-…)\``,
+        )
+        ok(
+          colour !== 'var(--agent-orchestrator)',
+          `${name}: and never the reserved colour — a chip names a role, never the orchestrator`,
+        )
+      }
+    }
+    eq(
+      idle.chipLabelColors,
+      live.chipLabelColors,
+      'the label colours are identical across the two stories, exactly as the labels are: a ' +
+        'run starting does not change who the task is assigned to',
+    )
+    ok(
+      (idle.chipLabelColors?.length ?? 0) === (idle.chipLabels?.length ?? 0) &&
+        (idle.chipLabelColors?.length ?? 0) > 0,
+      'and there is one colour per label — a chip whose word is uncoloured inherits, which is ' +
+        'the state this whole section exists to make visible',
+    )
     eq(idle.rows?.length, 4, 'every task reaches the DOM')
     eq(
       idle.groups,
       ['Doing|1', 'Review|1', 'Todo|1', 'Done|1'],
       'grouped in GROUP_ORDER — active first, because the panel answers "what is happening"',
+    )
+    /*
+     * Every group collapses — a long Todo hides Doing below the fold just as Done once hid
+     * everything — but only Done starts that way. Both halves are pinned because both are
+     * silent: a group that stopped collapsing draws exactly the same heading, and a group that
+     * started collapsed opens the panel onto a board with nothing on it.
+     */
+    eq(
+      idle.groupsOpen,
+      ['Doing|true', 'Review|true', 'Todo|true', 'Done|false'],
+      'and only Done is collapsed on arrival: it grows without bound and is read least',
     )
     eq(idle.meta, '3/4', 'the header says how much is left and how big the tracker is')
   }
@@ -1021,6 +1164,30 @@ try {
       ],
       'the log is oldest first — a log out of time order reads as a different conversation, and ' +
         'this file is committed, so a merge can interleave two agents’ lines',
+    )
+    /*
+     * And each of those three lines is signed in a different colour. (M75)
+     *
+     * One story, three arms, three right answers — which is why this is asserted as a *list* and
+     * not three lookups: the reported defect was that every author read alike, and a list is the
+     * only shape in which "these are all the same" fails.
+     *
+     * The user's empty string is the load-bearing entry. `.logAuthorUser`'s `--accent` is a
+     * class, so an inline colour on that line would win over it silently — the author would go on
+     * being coloured, just never in the colour the stylesheet says. `authorColor` returns `null`
+     * there for exactly this reason and this is what holds it to it.
+     */
+    eq(
+      rest.commentAuthorColors,
+      ['user|', 'orchestrator|var(--agent-orchestrator)', 'agent|var(--agent-red)'],
+      'the three author arms sign in three different colours — the user off her class, the ' +
+        'orchestrator in the one colour no role can have, and the agent in its own',
+    )
+    eq(
+      rest.creatorColor,
+      '',
+      'and the creator line of the user’s own task takes no inline colour either, so it keeps ' +
+        'the `--faint` the row beside it is in',
     )
     /*
      * The per-comment controls, and why they are counted rather than looked for. (M21)
@@ -1144,6 +1311,19 @@ try {
       'orchestrator|Created by Orchestrator',
       'and a task nobody is assigned to still names who asked for it — the creator is not the ' +
         'assignee, and this is the half of that pair where the two differ',
+    )
+    /*
+     * The orchestrator's own line, in the orchestrator's own colour — the half of the creator
+     * pair that *is* coloured, against `card`'s user half that is not. (M75)
+     *
+     * This is also the only place in the suite where the reserved colour is asserted on a
+     * surface rather than measured in a palette, and the two together are the whole claim the
+     * user asked for: a colour for the orchestrator that no agent can ever be given.
+     */
+    eq(
+      bare.creatorColor,
+      'var(--agent-orchestrator)',
+      "the orchestrator's name is drawn in the reserved colour, here as in the log below it",
     )
 
     const live = t('card-with-live-run')

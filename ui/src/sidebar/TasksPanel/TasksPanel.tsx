@@ -73,7 +73,7 @@ import {
   type StatusFilter,
   type TaskView,
 } from './model'
-import { glyphSpins, phaseGlyph, type RunPhase } from '@/sidebar/AgentsPanel/model'
+import { agentColor, glyphSpins, phaseGlyph, type RunPhase } from '@/sidebar/AgentsPanel/model'
 import { DeleteControl, TONE_CLASS, chipClass, cx } from './TaskDetail'
 import type { ProjectId } from '@/ipc/client'
 import { Icon, asIcon } from '@/icons/Icon'
@@ -99,6 +99,15 @@ export interface TasksPanelViewProps {
   runs?: readonly RunRef[] | undefined
   /** Agent id → label. */
   roles?: Readonly<Record<string, string>> | undefined
+  /**
+   * Agent id → the role's colour, as a `var(--agent-…)` string. (M75)
+   *
+   * `rosterRoles`' sibling and not a widening of it; `AgentsPanel/model.ts`'s `rosterColors` is
+   * the one producer. Optional and defaulting to `{}` like `roles`, so a story that says nothing
+   * about colour gets the *derived* one from the id — which is the ordinary case anyway, and is
+   * why no story had to change to keep drawing a chip.
+   */
+  roleColors?: Readonly<Record<string, string>> | undefined
   /**
    * Which task's card is open, or `null` for none.
    *
@@ -171,6 +180,7 @@ export function TasksPanelView({
   board = BOARD_UNKNOWN,
   runs = [],
   roles = {},
+  roleColors = {},
   selected = null,
   filter = null,
   onFilter,
@@ -511,6 +521,7 @@ export function TasksPanelView({
                       task={task}
                       runs={runs}
                       roles={roles}
+                      roleColors={roleColors}
                       onSelect={onSelectTask}
                       /* The card is a modal over this list, so the row it came from has to be
                          findable behind the scrim. */
@@ -526,24 +537,36 @@ export function TasksPanelView({
                   ))}
                 </div>
               )
-              /* Done is collapsed: it grows without bound and is read least. A `<details>`,
-                 so the collapse costs no state and this component stays pure. */
-              return group.status === 'done' ? (
-                <details className={styles.doneGroup} data-audit="tasksGroup" key={group.status}>
-                  <summary className={styles.doneSummary}>
+              /*
+               * Every group collapses, and the collapse costs no state: a native `<details>`,
+               * so this component stays a function of its props. Done starts closed — it grows
+               * without bound and is read least — and the rest start open.
+               *
+               * `open` here is an *initial* value and not a controlled prop: React DOM has no
+               * special handling for `<details>` (only inputs, selects and textareas are
+               * controlled), so it writes the attribute on mount and then only when the value
+               * it was given changes. It never changes — it is a constant per status, and the
+               * element's key is the status — so a group the user collapsed stays collapsed
+               * through every board refresh, and reopening the panel starts from the defaults
+               * again, which is where the Done rule was already.
+               */
+              return (
+                <details
+                  className={styles.group}
+                  data-audit="tasksGroup"
+                  key={group.status}
+                  open={group.status !== 'done'}
+                >
+                  <summary className={styles.groupHead}>
+                    {/* One mark, rotated by `[open]`, rather than two names swapped in JS: a
+                        disclosure that changed element would be a second thing to keep in step
+                        with the state the browser owns. */}
+                    <Icon name={asIcon('chevron-right')} size={0} className={styles.groupTwisty ?? ""} />
                     <span className={styles.groupTitle}>{group.label}</span>
                     <span className={styles.groupCount}>{group.tasks.length}</span>
                   </summary>
                   {rows}
                 </details>
-              ) : (
-                <div className={styles.group} data-audit="tasksGroup" key={group.status}>
-                  <div className={styles.groupHead}>
-                    <span className={styles.groupTitle}>{group.label}</span>
-                    <span className={styles.groupCount}>{group.tasks.length}</span>
-                  </div>
-                  {rows}
-                </div>
               )
             })}
           </div>
@@ -582,6 +605,7 @@ function TaskLine({
   task,
   runs,
   roles,
+  roleColors,
   onSelect,
   open,
   armed,
@@ -591,6 +615,7 @@ function TaskLine({
   task: TaskView
   runs: readonly RunRef[]
   roles: Readonly<Record<string, string>>
+  roleColors: Readonly<Record<string, string>>
   onSelect?: ((task: string | null) => void) | undefined
   /** Is this the row whose card is open? See the prop's doc on `selected`. */
   open: boolean
@@ -651,7 +676,25 @@ function TaskLine({
               <Icon name={asIcon(phaseGlyph((chip.phase ?? '') as RunPhase))} size={0} />
             </span>
           )}
-          <span className={styles.chipLabel}>{chip.label}</span>
+          {/*
+            * The role's colour on the **label**, never on the chip. (M75)
+            *
+            * The chip's tone is a claim about the *run* — live, awaiting permission, stalled —
+            * and the dot and background are where it is made. Recolouring those by role would
+            * trade a fact for a name. So the two signals stack: the chip still says what is
+            * happening, the word inside it says who.
+            *
+            * `roleColors` first and `agentColor` behind it, which is not a fallback so much as
+            * the same function reached two ways: the map is where a definition's own `color:`
+            * can be honoured, and a role the roster has never heard of — deleted, or a board
+            * read that landed before the roster's — still gets its derived colour from the id.
+            */}
+          <span
+            className={styles.chipLabel}
+            style={{ color: roleColors[chip.agent] ?? agentColor(chip.agent) }}
+          >
+            {chip.label}
+          </span>
         </span>
       )}
     </>

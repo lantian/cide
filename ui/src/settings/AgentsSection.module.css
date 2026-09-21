@@ -697,3 +697,76 @@
   flex-wrap: wrap;
   padding: 6px 0 2px;
 }
+
+/*
+ * The role's colour: nine swatches and, when the file asked for something this build cannot use,
+ * a note under them. (M77)
+ */
+.colorChoice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.colorSwatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+/*
+ * One swatch.
+ *
+ * **The ring is `box-shadow`, not `border`**, and that is not a preference: a border on the
+ * selected state only would change the element's box and shift every swatch beside it by two
+ * pixels as the selection moved along the row. `box-shadow` is drawn outside the box and costs
+ * no layout, so the row is still while the choice moves through it.
+ *
+ * Two rings rather than one, because the selected swatch has to read against **both** grounds:
+ * the inner one is the panel colour, which separates the ring from the swatch, and the outer is
+ * `--accent`. A single accent ring on `--agent-orange` is an orange ring on an orange dot.
+ *
+ * `appearance: none` does not reset a button's UA padding in WebKit — the rule `check:ui-icons`
+ * documents one surface over — so the padding is stated, and it is zero here because the swatch
+ * *is* the mark rather than a box around one.
+ */
+.colorSwatch {
+  appearance: none;
+  flex: none;
+  width: calc(20px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  /* Paint only — `check:motion` bans the rest, and a swatch that animated its ring would
+     interpolate the shadow under the pointer on every hover. */
+  transition: box-shadow var(--dur-1) ease;
+}
+
+.colorSwatch:hover {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3px var(--dim);
+}
+
+.colorSwatch[data-on='true'],
+.colorSwatch[data-on='true']:hover {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 4px var(--accent);
+}
+
+.colorSwatch:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 4px var(--accent);
+}
+
+/*
+ * Automatic: a ringed empty circle, never a ninth colour.
+ *
+ * What it means is the *absence* of a choice — the colour is derived from the role's name — and
+ * drawing that as one more filled dot would make "no colour" look like a colour, which is
+ * exactly the confusion the option exists to resolve. Dashed, so it reads as a placeholder at a
+ * glance without needing its label read.
+ */
+.colorAuto {
+  background: transparent;
+  border: 1px dashed var(--dim);
+}

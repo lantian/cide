@@ -62,6 +62,10 @@ function role(over: Partial<AgentDefView> & Pick<AgentDefView, 'id' | 'label'>):
     description: 'Implements one task end to end and reports back on it.',
     systemPrompt: 'You are the developer agent for this project. …',
     model: 'sonnet',
+    // No `color:` in the definition, which is the ordinary case and the one worth being the
+    // default: every story below therefore exercises the *derived* colour, and the one story
+    // that declares one says so on its own line.
+    color: null,
     unavailable: null,
     maxConcurrent: 1,
     // The wire's own default. A role that isolates is the ordinary role, and a story that had
@@ -116,13 +120,32 @@ const RESEARCHER = role({
   description: 'Reads around a question and reports what it found.',
 })
 
+/**
+ * The phases in which a run's worked clock is running — `RunState::counts_as_work`'s answer,
+ * restated here because this module imports nothing but `model.ts`.
+ *
+ * The fixtures respect the invariant rather than setting the two clock fields freely: a story
+ * carrying `workingSinceMs` on a paused row would be asserting on a row no registry can
+ * produce, and the render check would then be pinning a rendering of an impossible state.
+ */
+const WORKING_PHASES: readonly RunView['phase'][] = ['starting', 'running']
+
 function run(over: Partial<RunView> & Pick<RunView, 'run' | 'agent' | 'agentLabel'>): RunView {
+  const phase = over.phase ?? 'running'
+  const startedMs = over.startedMs ?? NOW_MS - 125_000
+  // The default is a run that has worked every millisecond since it was dispatched, which is
+  // both a real state and the one that leaves each existing story's figure where it was. The
+  // rows where the two clocks *diverge* say so explicitly below — that divergence is what this
+  // panel now draws, so it has to be in the corpus rather than implied by a default.
+  const working = WORKING_PHASES.includes(phase)
   return {
     harness: 'claude',
     session: null,
     phase: 'running',
     task: null,
     startedMs: NOW_MS - 125_000,
+    workedMs: working ? 0 : Math.max(0, NOW_MS - startedMs),
+    workingSinceMs: working ? startedMs : null,
     pausedSinceMs: null,
     exitCode: null,
     failure: null,
@@ -156,6 +179,8 @@ const QUEUED = run({
   phase: 'queued',
   task: 't-15',
   startedMs: NOW_MS - 8_000,
+  // Eight seconds old and none of it work: the queue is a wait, and the old figure counted it.
+  workedMs: 0,
   note: 'Waiting for a free worktree.',
 })
 
@@ -175,6 +200,7 @@ const QUEUED_BY_PAUSE = run({
   phase: 'queued',
   task: 't-15',
   startedMs: NOW_MS - 8_000,
+  workedMs: 0,
   note: "this project's agents are paused; nothing starts until Resume",
 })
 
@@ -186,6 +212,11 @@ const PAUSED = run({
   phase: 'paused',
   task: 't-14',
   startedMs: NOW_MS - 3_845_000,
+  // **The row this change exists for.** An hour and four minutes since dispatch, forty-nine of
+  // them worked and fifteen frozen — so the figure drawn is `49m` where it used to be `1h 04m`,
+  // and a fixture where the two agreed could not see that. The gap is `pausedSinceMs`'s, which
+  // until now was carried to the view and read by nothing.
+  workedMs: 2_945_000,
   pausedSinceMs: NOW_MS - 900_000,
 })
 
@@ -262,6 +293,10 @@ const FINISHED = run({
   phase: 'finished',
   task: 't-15',
   startedMs: NOW_MS - 7_400_000,
+  // Dispatched two hours ago, ran for six minutes, has been over ever since. A History row's
+  // figure is **final**, and this one is two hours short of what the old one drew — which rose
+  // by another hour every hour the panel stayed open.
+  workedMs: 372_000,
   exitCode: 0,
 })
 
@@ -404,6 +439,7 @@ export type AgentsStoryName =
   | 'role-multi-run'
   | 'role-unavailable'
   | 'role-claude-code'
+  | 'role-declared-colour'
   | 'role-undefined'
   | 'stale-turn'
   | 'rogue-phase'
@@ -514,6 +550,19 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
    * stoppable; it is refused a dispatch with a sentence of its own, because there is no
    * definition to dispatch from.
    */
+  /*
+   * A role whose definition asked for a colour, beside one that did not. (M75)
+   *
+   * The whole story is the pair: `developer` derives its hue from a hash of its id — what every
+   * role with no `color:` gets, and what every *other* story in this file therefore already
+   * exercises — while `designer` declares `green`, which is deliberately not the hue its own
+   * id would derive to (`cyan`). Without the second half, a build that silently ignored `AgentDef.color`
+   * would pass every assertion in this file, because the derived colour is right either way.
+   */
+  'role-declared-colour': story({
+    roster: ready([RUNNING], [DEVELOPER, { ...QA, id: 'designer', label: 'Designer', color: 'green' }]),
+  }),
+
   'role-undefined': story({ roster: ready([RUNNING, GHOST]) }),
 
   /*

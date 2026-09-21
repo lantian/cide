@@ -57,6 +57,38 @@ session: SessionId | null, state: RunState,
  */
 task: TaskId | null, startedUnixMs: bigint, 
 /**
+ * Milliseconds this run has **worked**, over its closed working intervals only.
+ *
+ * Read together with [`Self::working_since_unix_ms`]: the figure to show is this plus, when
+ * that stamp is set, the time since it. Splitting a closed total from an open stamp is what
+ * lets a live row tick between broadcasts without the producer sending a new number every
+ * second, and what makes a paused or finished row's figure *stop* rather than freeze at
+ * whatever the last event carried.
+ *
+ * [`RunState::counts_as_work`] is the definition of "working", and its doc carries the
+ * argument for where the line is drawn.
+ *
+ * **This does not replace [`Self::started_unix_ms`]**, which stays exactly what it was: the
+ * moment the run was dispatched. That is a real fact, it is what the panel's History sorts
+ * by, and it is what `cide_agents::tools`' run list means by `started … ago` — which was
+ * never wrong, because it says "started". What was wrong was rendering it as the run's
+ * duration.
+ */
+workedMs: bigint, 
+/**
+ * When the current working interval began, or `None` when this run is not working.
+ *
+ * `Some` in exactly the states [`RunState::counts_as_work`] admits, which is the invariant
+ * `cide_app::agents::move_to` exists to keep — it is the only thing in the process that
+ * assigns a run's state, and it opens and closes this stamp on the transition.
+ *
+ * Deliberately **not** persisted across a cide restart. Every restored run comes back
+ * `Interrupted`, which is not working, so this is `None` by construction and the hours cide
+ * spent shut add nothing to the figure — the offline case needs no snapshot timestamp and
+ * no code of its own.
+ */
+workingSinceUnixMs: bigint | null, 
+/**
  * Where cide announces this run's turn endings — the nudge `agent_rpc::note_run_over` types
  * into a Claude pane. Recorded at dispatch and carried on the wire so the run list can say
  * which runs will never announce themselves. (M40)

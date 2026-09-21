@@ -1,0 +1,45 @@
+[package]
+name = "cide-remote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The listener a paired phone talks to: bind, handshake, frames, devices.
+#
+# Deliberately knows nothing about cide. It has no `cide-core`, no `cide-pty`, no `cide-claude`
+# and above all no `tauri` — everything it serves arrives through `RemoteHost`, which the
+# application implements. That is the same discipline `cide-ide-mcp` states for itself ("this
+# crate answers the question and does not act on it"), and here it buys something concrete: the
+# whole server can be tested against a fake host, with no workspace, no PTY and no `claude` on
+# PATH.
+[dependencies]
+cide-ipc = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+getrandom = { workspace = true }
+blake3 = { workspace = true }
+# The sealed transport. See `seal` for why the frames are boxed rather than the socket.
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `test-util` for tokio's pausable clock, and only here: one test waits out a twenty-second
+# timeout, and sleeping for it would make this file twenty times slower than the rest of the
+# workspace's tests put together. It is a dev-dependency feature, so nothing shipped can reach
+# `tokio::time::pause` — a paused clock in a running cide would stop every timer in the server.
+tokio = { workspace = true, features = ["test-util"] }
+# The cross-language vectors are a JSON document another implementation reads.
+serde_json = { workspace = true }

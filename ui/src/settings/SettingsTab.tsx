@@ -30,9 +30,36 @@ import { SECTIONS, renderSection } from './sections'
 import { useSettings, useSettingsActions } from './useSettings'
 import styles from './SettingsTab.module.css'
 
+/**
+ * The section the projectless frame was last left on, for the length of this session. (M74)
+ *
+ * Module scope because the frame unmounts when it is closed and there is nowhere durable to put
+ * this: `TabKind::Settings { section }` is the bookmark with a project, and with none there is
+ * no tab to carry one. A `useState` in the frame would forget on every close, so reopening
+ * would always land on Appearance — the exact behaviour the stored section exists to avoid.
+ *
+ * Deliberately *not* promoted to `Workspace`: a relaunch with no project open is a fresh start,
+ * and a persisted section would be a new field, a new default and a new way for a hand-edited
+ * document to be wrong, bought for a nav click.
+ */
+let frameSection: SettingsSection = 'appearance'
+
+/** Where the projectless Settings frame should open. See [`frameSection`]. */
+export function lastFrameSection(): SettingsSection {
+  return frameSection
+}
+
 export interface SettingsTabProps {
-  /** The project owning this tab. Settings are global; the tab is not. */
-  project: ProjectId
+  /**
+   * The project owning this tab. Settings are global; the tab is not.
+   *
+   * `null` is the **projectless frame** (M74): with nothing open there is no tab to put this
+   * screen in, so `App.tsx` draws it in the work area instead and the screen is otherwise
+   * identical. Three things follow from it and nothing else does — the section is remembered in
+   * [`frameSection`] rather than on a tab, and the two model probes run in the user's own
+   * directory rather than a project's, which is what a global setting is about anyway.
+   */
+  project: ProjectId | null
   /** The section the tab was last left on. */
   section: SettingsSection
 }
@@ -157,6 +184,11 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   const select = useCallback(
     (next: SettingsSection) => {
       setActive(next)
+      if (project === null) {
+        // The projectless frame: no tab to record it on, so it is remembered for the session.
+        frameSection = next
+        return
+      }
       // Fire and forget: the section is a bookmark, and failing to record it costs the user
       // one nav click after a relaunch. Blocking the click on it would cost every click.
       void settingsApi.openTab(project, next).catch(() => {})

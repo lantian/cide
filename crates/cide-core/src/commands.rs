@@ -1449,10 +1449,23 @@ fn build() -> Vec<Command> {
             .keywords(&["scratch", "buffer", "temporary", "playground"]),
         Command::new("palette.commands", "Show all commands", VIEW),
         Command::new("theme.toggle", "Toggle light/dark theme", VIEW),
-        // Settings opens as a *tab inside a project*, so with no project open there is
-        // nowhere to put it.
-        Command::new("settings.open", "Open settings", VIEW).when("projectOpen"),
-        Command::new("settings.keymap", "Open keyboard shortcuts", VIEW).when("projectOpen"),
+        /*
+         * **No `when` clause since M74**, and the removal is the fix rather than a tidy-up.
+         *
+         * The clause used to read `projectOpen`, because Settings opens as a *tab inside a
+         * project* and with none there was nowhere to put it. There is now: a shell drawing no
+         * project draws the settings screen in the frame instead (`App.tsx`'s
+         * `settingsFrame`), which is the same surface reached the same way, and settings were
+         * always global — the tab was a container, never a scope.
+         *
+         * Note what the bare clause does *not* buy, which is the point `palette.commands`
+         * makes above: `OverlayHost` is mounted only with a project, so the palette cannot be
+         * raised without one and these rows are in practice only ever *picked* by somebody who
+         * has one. The half that now works is the bound key, which is exactly the state the
+         * command is most wanted in — a window with nothing open and a preference to change.
+         */
+        Command::new("settings.open", "Open settings", VIEW),
+        Command::new("settings.keymap", "Open keyboard shortcuts", VIEW),
         /*
          * The About box: `cide <version>` and the `claude --version` line beside it.
          *

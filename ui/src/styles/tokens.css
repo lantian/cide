@@ -94,6 +94,46 @@
   --lane-5: #a8324e;
   --lane-6: #7a6a10;
   --lane-7: #4a5568;
+  /*
+   * A role's colour, and the one colour no role can have. (M75)
+   *
+   * Named after **Claude Code's own `color:` vocabulary** — `cide_ipc::agents::AGENT_HUES` is the
+   * same eight words in the same order — so a subagent that already declares one needs no
+   * translation table, and a role with no `color:` of its own is drawn in the hue a hash of its
+   * name indexes. That makes the *order* of the Rust list API and these eight tokens the thing it
+   * indexes into: a name declared here and not there paints nothing at all, because an undefined
+   * custom property is not a colour.
+   *
+   * **A separate family from `--lane-*` rather than a reuse of it**, although the job is the same
+   * shape. The lanes are frozen at eight by `check:log`, which asserts `--lane-8` does *not*
+   * exist, so this family could never grow; and the lanes' dark orange and yellow sit 49 redmean
+   * units apart, which is under any floor worth setting for names a reader has to tell apart at a
+   * glance. Sharing them would also mean a retune of the commit graph silently recolouring every
+   * agent in every tracker.
+   *
+   * Three gates in `check:theme`, all measured, none of them satisfiable by eye:
+   *   - the eight are pairwise >= 70 redmean apart (74.6 here, 85.4 dark) — near
+   *     `cide_ipc::theme::MIN_SELECTION_DISTANCE`'s 72, which is the calibrated point below which
+   *     a difference stops registering;
+   *   - `--agent-orchestrator` is >= 100 from all eight (110 in both themes), because the whole
+   *     value of the reserved colour is that it is never mistaken for a role's;
+   *   - every one clears `INK_FLOOR` (3:1) against **both** `--panel` and `--sel` (4.26 light,
+   *     3.99 dark), since these are ink and a comment's author line is drawn over a selection as
+   *     often as not.
+   *
+   * The orchestrator's slate is outside the eight *by absence*: `AGENT_HUES` has no entry for it,
+   * so no hash and no `color:` can reach it. A ninth entry plus a rule saying "not that one"
+   * would be the same claim written where it can be forgotten.
+   */
+  --agent-blue: #1f5fbf;
+  --agent-green: #2f7a3d;
+  --agent-orange: #b0532a;
+  --agent-purple: #7a3fa8;
+  --agent-cyan: #0f7a86;
+  --agent-red: #a8324e;
+  --agent-yellow: #7a6a10;
+  --agent-pink: #b03a7d;
+  --agent-orchestrator: #4a5568;
   --red: #c0332b;
   --cyan: #0f6c7c;
   /*
@@ -343,6 +383,16 @@
   --lane-5: #f07178;
   --lane-6: #dfae68;
   --lane-7: #9aa5b8;
+  /* A role's colour and the orchestrator's; see the light block for the three gates. */
+  --agent-blue: #7aa2f7;
+  --agent-green: #8fbf7a;
+  --agent-orange: #e08a4c;
+  --agent-purple: #bb9af7;
+  --agent-cyan: #5fd4d0;
+  --agent-red: #f07178;
+  --agent-yellow: #d9c86a;
+  --agent-pink: #f094c8;
+  --agent-orchestrator: #9aa5b8;
   --red: #e06c75;
   --cyan: #6fb3c0;
   /*

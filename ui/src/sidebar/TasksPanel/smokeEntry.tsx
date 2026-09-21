@@ -81,6 +81,15 @@ export interface TasksDigest {
   writeControls: number
   /** Group headings, in the order drawn: `<label>|<count>`. */
   groups: string[]
+  /**
+   * Which groups are drawn open, in the same order: `<label>|<open>`.
+   *
+   * Every group is a `<details>` now, so which of them starts closed is a claim the markup
+   * makes and nothing else can. Getting it backwards is silent — the panel still draws four
+   * headings and every row is still in the DOM — and the failure is a user opening the panel
+   * onto a board with nothing on it.
+   */
+  groupsOpen: string[]
   /** One entry per list row: `<status>|<icon name>|<id>|<title>`. */
   rows: string[]
   /** Each chip's class attribute, verbatim. Hashed, but stable within one bundle. */
@@ -96,10 +105,27 @@ export interface TasksDigest {
   chipTone: string[]
   /** Each chip's label. */
   chipLabels: string[]
+  /**
+   * The inline colour on each chip's **label**, in the same order. (M75)
+   *
+   * The label and not the chip: the chip's background and dot say what the *run* is doing and
+   * must not be recoloured by role, so asserting the colour landed on the word is also asserting
+   * it did not land on the tone.
+   */
+  chipLabelColors: string[]
   /** Comment log lines, in the order drawn: `<author kind>|<text>`. The text is the rendered
    *  markdown flattened back to prose, so `**bold**` digests as `bold` — which is itself the
    *  assertion that the syntax was consumed rather than printed. */
   comments: string[]
+  /**
+   * The inline colour on each comment's author name, in the order drawn: `<kind>|<colour>`. (M75)
+   *
+   * The kind rides along because the three arms have three different right answers and only one
+   * of them is a colour at all: a role's hue, the orchestrator's reserved slate, and — for the
+   * user — **nothing**, because `.logAuthorUser`'s `--accent` is a class and an inline colour
+   * there would silently overrule it.
+   */
+  commentAuthorColors: string[]
   /**
    * How many per-comment Edit and Delete controls are drawn, and how many action rows hold them.
    *
@@ -190,6 +216,8 @@ export interface TasksDigest {
    * creator line that string-matched a role called "you" would print it for an agent's.
    */
   creator: string
+  /** The inline colour on the creator line's name, or `''` for the user's own tasks. (M75) */
+  creatorColor: string
   /** The ids of list rows marked as the open one. At most one, and only in the list stories. */
   openRows: string[]
   /** Whether the live-run strip is drawn. */
@@ -382,6 +410,13 @@ function digest(
       const n = [...group.matchAll(/data-audit="tasksRow"/g)].length
       return `${text(label)}|${n}`
     }),
+    /* Read off the opening tag alone — `group` is the whole element, and a row's own markup
+       must never be able to answer this. */
+    groupsOpen: all(html, 'tasksGroup').map((group) => {
+      const label = /class="[^"]*groupTitle[^"]*"[^>]*>([^<]*)</.exec(group)?.[1] ?? ''
+      const head = group.slice(0, group.indexOf('>') + 1)
+      return `${text(label)}|${/\sopen(=|\s|>)/.test(head)}`
+    }),
     rows,
     chipClasses: [...html.matchAll(/class="([^"]*)"\s+data-audit="tasksChip"/g)].map((m) => m[1] ?? ''),
     chipLit: [...html.matchAll(/data-audit="tasksChip"[^>]*data-lit="([^"]*)"/g)].map((m) => m[1] ?? ''),
@@ -389,11 +424,21 @@ function digest(
     chipLabels: all(html, 'tasksChip').map((chip) =>
       text(/class="[^"]*chipLabel[^"]*"[^>]*>([^<]*)</.exec(chip)?.[1] ?? ''),
     ),
+    chipLabelColors: all(html, 'tasksChip').map(
+      (chip) =>
+        /<span[^>]*class="[^"]*chipLabel[^"]*"[^>]*>/
+          .exec(chip)?.[0]
+          ?.match(/style="[^"]*\bcolor:\s*([^";]*)/)?.[1]
+          ?.trim() ?? '',
+    ),
     /* The whole `tasksCommentText` element, not a slice-to-`</p>`: a comment renders as
        markdown now, so its container holds block elements of its own and the first close tag
        is no longer the end of the text. */
     comments: all(html, 'tasksComment').map(
       (entry) => `${attr(entry, 'data-author')}|${text(all(entry, 'tasksCommentText')[0] ?? '')}`,
+    ),
+    commentAuthorColors: all(html, 'tasksComment').map(
+      (entry) => `${attr(entry, 'data-author')}|${inlineColor(entry, 'tasksCommentAuthor')}`,
     ),
     commentEdits: count(html, 'data-audit="tasksCommentEdit"'),
     commentDeletes: count(html, 'data-audit="tasksCommentDelete"'),
@@ -448,6 +493,7 @@ function digest(
       return / disabled(?:=|\s|\/|>)/.test(button) ? 'off' : 'on'
     })(),
     composeCancel: html.includes('data-audit="taskComposeCancel"'),
+    creatorColor: inlineColor(html, 'tasksCreatorName'),
     creator: all(html, 'tasksCreator')
       .map((span) => `${attr(span, 'data-creator')}|${text(span)}`)
       .join(''),
@@ -612,6 +658,18 @@ function digest(
  * slicing to the next marker: a group contains its rows and a row contains its chip, so
  * slice-to-next-marker would attribute one element's children to another.
  */
+/**
+ * The `color:` of the inline style on the element carrying this audit hook, or `''`.
+ *
+ * `AgentsPanel/smokeEntry.tsx` has the twin of this and its header carries the argument: two
+ * steps, because JSX prop order decides attribute order and a single ordered pattern silently
+ * matches nothing the day somebody moves `style`.
+ */
+function inlineColor(html: string, audit: string): string {
+  const tag = new RegExp(`<[a-z]+\\b[^>]*data-audit="${audit}"[^>]*>`).exec(html)?.[0] ?? ''
+  return /style="[^"]*\bcolor:\s*([^";]*)/.exec(tag)?.[1]?.trim() ?? ''
+}
+
 function all(html: string, hook: string): string[] {
   return [...html.matchAll(new RegExp(`data-audit="${hook}"`, 'g'))].map((m) => outer(html, m.index))
 }

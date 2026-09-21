@@ -41,6 +41,7 @@ fn role(prompt: &str) -> LoadedAgent {
             description: "Answers one word.".into(),
             system_prompt: prompt.into(),
             model: None,
+            color: None,
             unavailable: None,
             max_concurrent: 1,
             worktree: false,

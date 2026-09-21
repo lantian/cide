@@ -70,6 +70,30 @@ systemPrompt: string,
  */
 model: string | null, 
 /**
+ * The role's colour, as one of the eight hue names in `AgentsPanel/model.ts`'s `AGENT_HUES`
+ * — or `None`, which means *derive one from the name*. (M75)
+ *
+ * # A presentation hint that cide reads and never writes
+ *
+ * `color` is **Claude Code's own front-matter key**, and [`AgentExtra`] already carries it
+ * through a save untouched — `claude_corpus` asserts it by name among the keys cide does not
+ * model. That does not change here, in either dialect: the key stays an extra, `render` goes
+ * on emitting it verbatim from the source lines it occupied, and this field is a *read* of
+ * it taken on the way past. Modelling it properly would mean cide re-spelling a key with its
+ * own quoting rules in a committed file it did not author, to gain nothing a colour needs.
+ *
+ * So the value is normalised (trimmed, lowercased) and matched against the eight names; a
+ * value that is not one of them — `automatic`, a hex, a typo, a colour Claude adds next
+ * month — is `None` and the name's hash answers instead. Never a
+ * [`Self::unavailable`] sentence: a role that could not be dispatched over a colour would be
+ * absurd, and a role with no colour is exactly the ordinary case.
+ *
+ * It is deliberately **not** in `cide_agents::overrides::ChildSettings`. That type's
+ * equality decides whether a paused run must be re-forked, and recolouring a role must not
+ * cost somebody an in-flight turn.
+ */
+color?: string, 
+/**
  * Why this role cannot be dispatched, as a sentence — or `None` when it can.
  *
  * **This is [`crate::Command::unavailable`] one layer down, and for the identical reason.**

@@ -24,6 +24,7 @@
 pub mod headless;
 pub mod hook;
 pub mod orphans;
+pub mod permission;
 pub mod prompt;
 pub mod roster;
 pub mod session;

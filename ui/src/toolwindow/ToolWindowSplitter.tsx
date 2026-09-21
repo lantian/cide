@@ -164,12 +164,19 @@ export function cachedToolWindowOpen(): boolean {
 // --- the component --------------------------------------------------------------------------
 
 export interface ToolWindowSplitterProps {
-  /** Whose panel this is. The height is per project — see `cide_core::toolwindow`. */
-  project: ProjectId
+  /**
+   * Whose panel this is. The height is per project — see `cide_core::toolwindow`.
+   *
+   * `null` is the projectless shell's own panel, whose height lives on `Workspace.toolWindow`.
+   * The *painted* height is per window either way (`TOOL_CACHE_KEY` is keyed by window label),
+   * so nothing about the gesture changes with it.
+   */
+  project: ProjectId | null
 }
 
 export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
   const stored = useWorkspace((s) => {
+    if (project === null) return s.boot?.workspace.toolWindow ?? null
     const p = s.boot?.workspace.projects[project]
     return p?.toolWindow ?? null
   })

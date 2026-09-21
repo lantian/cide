@@ -104,6 +104,9 @@ pub struct Settings {
     /// role's own `model:` — so an upgraded workspace behaves identically, and a later change of
     /// default touches new installs only.
     pub llm: crate::llm::LlmSettings,
+
+    /// How a phone reaches this cide, and whether one may. (M72)
+    pub remote: RemoteSettings,
 }
 
 impl Default for Settings {
@@ -126,6 +129,7 @@ impl Default for Settings {
             inspections: InspectionSettings::default(),
             git: GitSettings::default(),
             llm: crate::llm::LlmSettings::default(),
+            remote: RemoteSettings::default(),
         }
     }
 }
@@ -1164,6 +1168,66 @@ impl Default for ProxyScope {
             git: ProxyTarget::Untouched,
         }
     }
+}
+
+/// How a phone reaches this cide. (M72)
+///
+/// **Off by default, and the toggle is a capability grant rather than a preference.** Everything
+/// else on the Settings screen changes what cide looks like or how it behaves for the person
+/// sitting at it; this one decides whether a second device may read the sessions on this machine
+/// and type into them. The panel says so in words next to the switch.
+///
+/// No credential lives here, and that is structural. [`crate::SettingsPatch`] patches per
+/// top-level field, so a screen editing anything in a group sends the whole group back — which
+/// makes a masked, write-only value unrepresentable, the hazard [`crate::SettingsPatch::llm`]
+/// already documents. Paired devices and their token hashes live in their own `0600` file in the
+/// state directory instead; `cide-remote`'s `devices` module has the four reasons.
+/// # The default is the whole safety story
+///
+/// Off, loopback, and *derive the port*. Derived rather than hand-written because every field's
+/// own `Default` already says the right thing and a second spelling of them could drift — but
+/// the values are not incidental, so they are argued here: turning the listener on does not by
+/// itself put anything on a network, because the bind is still this machine only; and the port
+/// is not a number anybody promised, because nobody typed it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct RemoteSettings {
+    /// Whether the listener runs at all.
+    pub enabled: bool,
+    /// Which addresses it answers on.
+    pub bind: RemoteBind,
+    /// `0` means *derive one from the profile*, which is what makes a real instance and a `[DEV]`
+    /// instance both work with nothing configured. A number the user typed is a promise to a
+    /// device that saved it, so a configured port that is taken **refuses and says so** rather
+    /// than sliding to another — `cide_core::remote::port_for_profile` has the argument.
+    pub port: u16,
+    /// Permit binding an address that is routable from the internet.
+    ///
+    /// A separate switch from [`Self::enabled`] on purpose. "The people on my network" and
+    /// "everyone" are different decisions, and a single toggle that quietly meant the second
+    /// would be the kind of default nobody chose.
+    pub allow_non_private: bool,
+}
+
+/// Which addresses the remote listener answers on.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum RemoteBind {
+    /// This machine only. Useless to a phone, and therefore the safe default: turning the
+    /// feature on does not by itself put anything on a network.
+    #[default]
+    Loopback,
+    /// Every interface. What a laptop that changes networks needs, because the address it will
+    /// have tomorrow is not knowable today.
+    Network,
+    /// One address, spelled out.
+    Address { address: String },
 }
 
 /// Proxy configuration, applied to every child cide spawns — `$SHELL` panes and `claude`

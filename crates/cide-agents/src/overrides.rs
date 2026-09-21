@@ -25,7 +25,15 @@ pub struct Resolved {
     pub model: Option<String>,
     /// `--variant`/`--effort`.
     pub effort: Option<String>,
-    /// This role's concurrency cap.
+    /// This role's concurrency cap, as [`crate::effective_max_concurrent`] folds it.
+    ///
+    /// The number is *enforced* at the dispatch, by the queue — a run is stamped with it when it
+    /// is minted and the admission gate counts against that stamp. This copy is the same
+    /// answer for a reader that already has a `Resolved` (the roster's row), and it is the same
+    /// answer because both come from that one function: from M45 to M73 this field was computed
+    /// here and read by nothing, exactly as `model` and `effort` were before `apply` — so an
+    /// override that said "three of this role here" wrote a file, drew a value, and left the
+    /// queue admitting one.
     pub max_concurrent: u16,
     /// Why this run cannot start, or `None`.
     ///
@@ -171,6 +179,27 @@ impl ChildSettings {
     }
 }
 
+/// The override row that applies to this role, or `None` where no override may apply.
+///
+/// A Claude Code subagent is forced to claude at load (`defs`'s "there is no second answer"), so
+/// an override must not move it. Answered here rather than at each reader so none can forget,
+/// and stated as a *scope* test rather than by comparing harnesses, because a cide-scope role
+/// that happens to name claude is perfectly overridable.
+///
+/// One producer, because two readers ask this question at two different moments —
+/// [`resolve`] at the fork and [`crate::effective_max_concurrent`] at the dispatch — and a
+/// scope rule spelled twice is a rule that holds in one of them.
+#[must_use]
+pub fn row_for<'a>(
+    agent: &LoadedAgent,
+    overrides: &'a ProjectOverrides,
+) -> Option<&'a AgentOverride> {
+    match agent.def.scope.is_claude_code() {
+        true => None,
+        false => Some(overrides.for_role(agent.id().as_str())),
+    }
+}
+
 /// Fold a role, its project's config, this project's overrides and the global pools into what
 /// will actually run.
 ///
@@ -198,20 +227,15 @@ impl ChildSettings {
 /// a role to claude for an afternoon into an error about a setting the user did not touch.
 #[must_use]
 pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSettings) -> Resolved {
-    // A Claude Code subagent is forced to claude at load (`defs`'s "there is no second answer"),
-    // so an override must not move it. Answered here rather than at the call sites so no caller
-    // can forget, and stated as a *scope* test rather than by comparing harnesses, because a
-    // cide-scope role that happens to name claude is perfectly overridable.
-    let locked = agent.def.scope.is_claude_code();
     let empty = AgentOverride::default();
-    let over: &AgentOverride = match locked {
-        true => &empty,
-        false => overrides.for_role(agent.id().as_str()),
-    };
+    let over: &AgentOverride = row_for(agent, overrides).unwrap_or(&empty);
 
     let harness = over.harness.unwrap_or(agent.def.harness);
     let effort = over.effort.clone().or_else(|| agent.effort.clone());
-    let max_concurrent = over.max_concurrent.unwrap_or(agent.def.max_concurrent);
+    // Through `effective_max_concurrent` and not off `over` directly, because the *queue* reads
+    // that function and this struct is read by the fork: two foldings of one override is how
+    // this field came to be computed here and obeyed nowhere — see `Resolved::max_concurrent`.
+    let max_concurrent = crate::effective_max_concurrent(agent, overrides);
 
     // A pool is opencode's alone: no other harness takes a `provider/model`, and applying one
     // would hand a CLI an id it does not parse.
@@ -307,6 +331,7 @@ mod tests {
                 description: "d".into(),
                 system_prompt: "p".into(),
                 model: Some("committed-model".into()),
+                color: None,
                 unavailable: None,
                 max_concurrent: 2,
                 worktree: true,

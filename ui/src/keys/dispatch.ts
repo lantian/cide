@@ -83,7 +83,7 @@ import { focusPaneDom } from '@/panes/paneFocus'
 import { useGitCount } from '@/chrome/gitCountStore'
 import { toggleBlame } from '@/editor/blameStore'
 import { requestFocus } from '@/chrome/focusRequests'
-import { panelHostPresent, requestPanel } from '@/chrome/panelRequests'
+import { panelHostPresent, requestPanel, requestSettingsFrame } from '@/chrome/panelRequests'
 import {
   agentRuns as agentRunsApi,
   agents as agentsApi,
@@ -1617,10 +1617,17 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (boot()?.role.kind !== 'shell') {
           return unmet(command, 'this window has no tool window')
         }
+        /*
+         * `null` is the shell that has no project open, whose panel is `Workspace.toolWindow`.
+         * (M74) It refused here until then, which was the keyboard half of the inert ▤ button
+         * on the rail — and the Docker tab it opens onto is about the machine, not a checkout.
+         */
         const project = activeProjectOf(boot())
-        if (project === null) return unmet(command, 'no open project')
-        const open = project.toolWindow.open
-        void toolWindowApi.setLayout(project.id, { open: !open }).catch(() => {})
+        const state = project?.toolWindow ?? boot()?.workspace.toolWindow
+        if (state === undefined) return unmet(command, 'no workspace yet')
+        void toolWindowApi
+          .setLayout(project?.id ?? null, { open: !state.open })
+          .catch(() => {})
         return
       }
 
@@ -2060,10 +2067,26 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       case 'settings.open':
       case 'settings.keymap': {
-        // Settings is a tab inside a project, so it needs one to open into.
-        const project = activeProjectOf(boot())
-        if (project === null) return unmet(command, 'no open project')
         const section = command === 'settings.keymap' ? 'keymap' : null
+        const project = activeProjectOf(boot())
+        if (project === null) {
+          /*
+           * No project, so no tab to open into — the shell's own Settings frame instead. (M74)
+           *
+           * This used to be `unmet(command, 'no open project')`, and the commands carried a
+           * `projectOpen` clause to match. Both were about where a Settings *tab* can live,
+           * which was never a statement about settings: they are global, and the one window
+           * state in which somebody most wants to change one — a freshly launched cide with
+           * nothing open — was the one state that refused.
+           *
+           * `false` is a real refusal and stays one: a detached pane or tab window has no work
+           * area to draw the screen in and registers no host.
+           */
+          if (!requestSettingsFrame(section)) {
+            return unmet(command, 'this window cannot show settings')
+          }
+          return
+        }
         // The tab appears on the mutation's own broadcast — no re-read.
         void settingsApi.openTab(project.id, section)
         return

@@ -77,6 +77,23 @@ const ROLES: Readonly<Record<string, string>> = {
 }
 
 /**
+ * The two roles' colours, as `rosterColors` would build them. (M75)
+ *
+ * `developer` is **derived** from its id — the ordinary case, and the one the panel takes for
+ * every role whose author never thought about colour — while `qa` declares one, so the pair
+ * exercises both rungs of `agentColor` in every story that draws a chip or a comment. A literal
+ * here rather than a call to `agentColor`: this file is a fixture, and a fixture that computes
+ * its expectation from the function under test asserts nothing.
+ */
+const ROLE_COLORS: Readonly<Record<string, string>> = {
+  // What a hash of `developer` answers, which is what a definition with no `color:` gets.
+  developer: 'var(--agent-red)',
+  // What `qa`'s definition asked for. Deliberately **not** the hue its id derives to (`pink`),
+  // or a story could not tell the declared rung from the derived one.
+  qa: 'var(--agent-blue)',
+}
+
+/**
  * `id` is derived from the timestamp rather than minted, so a story renders byte-identically on
  * every run — `check-agents-render.mjs` compares a digest, and a uuid per call would make every
  * comparison fail for a reason that has nothing to do with the panel.
@@ -311,6 +328,7 @@ const LIVE: readonly RunRef[] = [
   {
     run: 'r-0001',
     task: 't-14',
+    agent: 'developer',
     agentLabel: 'Developer',
     phase: 'running',
     session: 's-0001',
@@ -442,7 +460,17 @@ function story(over: Partial<TasksPanelViewProps>): TasksPanelViewProps {
 }
 
 function card(over: Partial<TaskDetailProps> & Pick<TaskDetailProps, 'task'>): TaskDetailProps {
-  return { runs: [], roles: ROLES, nowMs: NOW_MS, ...CARD_HANDLERS, ...over }
+  // `ROLE_COLORS` rather than `{}`: the derived colour is what an empty map would give, and
+  // every story would then be asserting the same fallback the panel takes for a role the roster
+  // has not caught up with. One story declares a `color:`; see `ROLE_COLORS`.
+  return {
+    runs: [],
+    roles: ROLES,
+    roleColors: ROLE_COLORS,
+    nowMs: NOW_MS,
+    ...CARD_HANDLERS,
+    ...over,
+  }
 }
 
 function compose(draft: TaskDraft, over: Partial<TaskComposeProps> = {}): TaskComposeProps {

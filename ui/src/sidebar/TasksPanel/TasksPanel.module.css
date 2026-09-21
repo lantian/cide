@@ -385,10 +385,21 @@
   margin-top: 14px;
 }
 
+/*
+ * Every group is a `<details>`: the collapse costs no state, so the panel stays a function of
+ * its props, and Done is no longer the only heading that is worth putting away — a long Todo
+ * hides Doing below the fold just as effectively.
+ *
+ * `display: block` and a margin on the rows rather than a flex column with a gap: WebKit has a
+ * history of rendering a `<details>` badly when its `display` is changed, and the one thing
+ * this element has to do is show and hide its own content.
+ */
 .group {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+  display: block;
+}
+
+.group > .rows {
+  margin-top: 3px;
 }
 
 .groupHead {
@@ -399,6 +410,40 @@
   letter-spacing: 0;
   text-transform: none;
   color: var(--dim);
+  cursor: pointer;
+  /* The twisty is the affordance; without this Chromium draws its own triangle beside it, and
+     that one sits outside the flow and pulls the heading off the left edge the rows start on. */
+  list-style: none;
+}
+
+.groupHead::-webkit-details-marker {
+  display: none;
+}
+
+.groupHead:hover {
+  color: var(--text);
+}
+
+.groupHead:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--r-2);
+}
+
+/*
+ * The disclosure mark. `align-self: center` because the head is baseline-aligned for its text
+ * and an icon has no baseline worth sharing; no transition on the rotation, because
+ * `check-motion.mjs` is the rule and a twisty that animates while the rows below it appear
+ * instantly reads as lag rather than as motion.
+ */
+.groupTwisty {
+  flex: none;
+  align-self: center;
+  color: var(--faint);
+}
+
+.group[open] > .groupHead .groupTwisty {
+  transform: rotate(90deg);
 }
 
 .groupTitle {
@@ -416,28 +461,6 @@
   letter-spacing: 0;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
-}
-
-/* Done is a `<details>`: the collapse costs no state, so this component stays a function of
-   its props, and it is the group that grows without bound and is read least. */
-.doneGroup {
-  display: block;
-}
-
-.doneSummary {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  cursor: pointer;
-  font-size: var(--fs-ui-12);
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--dim);
-  list-style: none;
-}
-
-.doneSummary::-webkit-details-marker {
-  display: none;
 }
 
 .rows {
@@ -774,12 +797,35 @@
  * task this is, and neither should compete with the title below. Deliberately **not** styled the
  * way `.logAuthorUser` styles the user's own comments: the accent there exists so a person can
  * scan a conversation for their own lines, and there is nothing to scan in a single line.
+ *
+ * M75 kept that for the *words* and reversed it for the **name**, which `TaskDetail.tsx` now
+ * wraps and colours through the same `authorStyle` the log below uses. The reason above is
+ * unchanged and still correct — this is not a line anybody scans — but the colour is no longer
+ * an emphasis: it is the identity of a role, and the card naming `developer` in one colour here
+ * and another on every comment it wrote would read as two roles. Size, weight and the `--faint`
+ * of the sentence around it are all untouched, so the line is no louder than it was.
  */
 .detailCreator {
   flex: none;
   font-size: var(--fs-ui-11);
   color: var(--faint);
   white-space: nowrap;
+}
+
+/*
+ * The name inside that line, and only the name. (M75)
+ *
+ * `--w-bold` and no size change: the sentence around it stays `--fs-ui-11` `--faint`, so the row
+ * is exactly as quiet as it was and the colour lands on one word. The weight is what keeps the
+ * name legible once it leaves `--faint` for a hue — a 600 at 11px reads where a 400 in the same
+ * colour would look like a rendering accident.
+ *
+ * No `color` here for `.logAuthor`'s reason: `TaskDetail.tsx` sets it inline from `authorStyle`,
+ * and `undefined` for the user's own tasks is what lets this line inherit `--faint` — which is
+ * the posture the comment above `.detailCreator` argues for and M75 deliberately kept.
+ */
+.detailCreatorName {
+  font-weight: var(--w-bold);
 }
 
 /*
@@ -1135,17 +1181,45 @@
   color: var(--faint);
 }
 
+/*
+ * Who wrote the comment: the largest thing on the head row, and the only coloured one. (M75)
+ *
+ * It was `--fs-ui-11` in `--dim` — a rung *below* the `--fs-ui-12` body it introduces, and below
+ * the `edited` marker beside it — which inverted the head: the one word a reader scans a log for
+ * was the hardest to see on the line. `--fs-ui-13` puts it one rung above the words it
+ * introduces, which is the same relationship `.fieldValueBody` has with `.fieldLabel`.
+ *
+ * `--fs-ui-13` is a *declared* rung and not a new one; `check:ui-scale` fails on a bare pixel
+ * size here and on a rung nothing uses.
+ *
+ * **No `color`.** It is set inline by `TaskDetail.tsx` from `authorColor`, which answers all
+ * three author arms in one place; a declaration here would lose to it on every agent and
+ * orchestrator line and read, to the next person, as the colour the name has. The one arm that
+ * still takes its colour from a class is the user's, below.
+ *
+ * `font-weight` and not just size: an author line that is only larger reads as a heading for the
+ * whole log rather than for the comment under it, and the weight is what ties it to one entry.
+ */
 .logAuthor {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  color: var(--dim);
+  font-size: var(--fs-ui-13);
+  font-weight: 600;
 }
 
-/* The user's own lines, styled off `TaskAuthor::User` rather than off the name — which is
-   what the wire carries a three-armed author enum for. */
+/*
+ * The user's own lines, styled off `TaskAuthor::User` rather than off the name — which is
+ * what the wire carries a three-armed author enum for.
+ *
+ * Still a class rather than an inline colour, and that is the one asymmetry in this surface:
+ * `authorColor` answers `null` for the user precisely so this rule keeps winning. `--accent` is
+ * deliberately **outside** `check:theme`'s agent separation gate — it is close to `--agent-red`
+ * and `--agent-orange` and that is allowed, because "You" is a word no reader confuses with a
+ * role's name, so the colour there is a flourish and not the signal it is everywhere else.
+ */
 .logAuthorUser {
   color: var(--accent);
 }
@@ -1536,7 +1610,12 @@
  */
 .logEdited {
   color: var(--dim);
-  font-size: var(--fs-ui-12);
+  /*
+   * `--fs-ui-11`, the head's own rung, and down one from where it was. (M75) At 12 it was larger
+   * than the author's name beside it, which is the size inversion this surface was reported for;
+   * a provenance mark must not out-size the name it qualifies.
+   */
+  font-size: var(--fs-ui-11);
   font-style: italic;
 }
 

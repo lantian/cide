@@ -16,8 +16,9 @@
  *
  * # What actually differs, and why none of it is laziness
  *
- * * **`bigint` → `number`.** `AgentRun::startedUnixMs` and `RunState::Paused::sinceUnixMs` are
- *   `u64` in Rust, and ts-rs renders a `u64` as **`bigint`**. Both are `number` in `model.ts`,
+ * * **`bigint` → `number`.** `AgentRun::startedUnixMs`, `AgentRun::workedMs`,
+ *   `AgentRun::workingSinceUnixMs` and `RunState::Paused::sinceUnixMs` are `u64` in Rust, and
+ *   ts-rs renders a `u64` as **`bigint`**. All four are `number` in `model.ts`,
  *   because `elapsed(nowMs, startedMs)` subtracts them from a `Date.now()`: mixing a `bigint`
  *   with a `number` in an arithmetic expression throws a `TypeError` rather than coercing, and
  *   a throw out of a render unmounts the whole tree under React 19 — a blank window rather than
@@ -94,6 +95,13 @@ function def(from: WireDef): AgentDefView {
     // ask "did the author name a model", and the two would drift.
     model: from.model,
     /*
+     * `#[ts(optional)]` in Rust, so an absent colour arrives as `undefined` and the view's
+     * `null` is the spelling this side keeps. Normalised here rather than at the reader for
+     * `AgentDefView`'s stated reason: two ways to ask "did the definition choose a colour"
+     * is one way too many, and `agentColor` takes `null`.
+     */
+    color: from.color ?? null,
+    /*
      * The dispatchability sentence, carried across verbatim and **not** interpreted here.
      * `canDispatch` is the only thing allowed to read it, and it lives in `model.ts` so the
      * check script can drive it. A conversion that decided anything about this field would be
@@ -164,6 +172,11 @@ function run(from: WireRun): RunView {
     ...state(from.state),
     task: from.task,
     startedMs: ms(from.startedUnixMs),
+    workedMs: ms(from.workedMs),
+    // `null` is a run that is not working, and it must stay `null` rather than become `0`:
+    // `workedFor` reads the distinction, not the value — a `0` stamp would be a working
+    // interval that began at the epoch and a figure of fifty-six years.
+    workingSinceMs: from.workingSinceUnixMs === null ? null : ms(from.workingSinceUnixMs),
     staleTurn: from.staleTurn,
     note: from.note,
     openable: from.openable,

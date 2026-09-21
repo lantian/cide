@@ -27,6 +27,7 @@ fn role() -> LoadedAgent {
             description: "Answers one word.".into(),
             system_prompt: "You answer with exactly one word and nothing else.".into(),
             model: None,
+            color: None,
             unavailable: None,
             max_concurrent: 1,
             worktree: false,

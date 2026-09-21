@@ -2240,6 +2240,13 @@ mod tests {
                 .expect("toolWindow")
                 .remove("filesAsTree");
         }
+        // And the root's own panel, which is the projectless shell's (M74). An older document
+        // has neither, and the `contains` assertion below is over the whole file — so leaving
+        // this one in would fail it for a field this test is not about.
+        doc.get_mut("toolWindow")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the workspace's own toolWindow")
+            .remove("filesAsTree");
         let stripped = serde_json::to_string_pretty(&doc).expect("re-serialise");
         assert!(
             !stripped.contains("filesAsTree"),
@@ -2302,6 +2309,39 @@ mod tests {
             *restored,
             cide_ipc::ToolWindowState::default(),
             "and gets exactly the default rather than a half-built one"
+        );
+    }
+
+    /// A `workspace.json` written before the **projectless** panel existed still loads. (M74)
+    ///
+    /// The whole justification for not bumping `CURRENT_SCHEMA` a fifth time, and the same claim
+    /// the test above makes for the per-project field. If this fails, `Workspace::tool_window` is
+    /// missing its `#[serde(default)]` and every existing workspace is quarantined on the first
+    /// launch after the upgrade — which is the one failure mode this ladder exists to prevent.
+    #[test]
+    fn a_workspace_saved_before_the_empty_frames_tool_window_existed_still_loads() {
+        let dir = TempDir::new("root-tool-window-absent");
+        let path = dir.join("workspace.json");
+
+        save_atomic(&path, &fixture()).expect("save");
+
+        let raw = fs::read_to_string(&path).expect("read");
+        let mut value: Value = serde_json::from_str(&raw).expect("parse");
+        value
+            .as_object_mut()
+            .expect("the document is an object")
+            .remove("toolWindow");
+        fs::write(&path, serde_json::to_string_pretty(&value).expect("render")).expect("write");
+
+        let back = load(&path);
+        assert_eq!(
+            back.tool_window,
+            cide_ipc::ToolWindowState::default(),
+            "a document that never had one gets the default — closed, and no history"
+        );
+        assert!(
+            !back.projects.is_empty(),
+            "and the rest of the document survived, rather than the file being quarantined"
         );
     }
 

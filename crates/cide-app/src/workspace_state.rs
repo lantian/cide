@@ -12,13 +12,22 @@
 //! bump even when its mutator forgot — so every broadcast carries a strictly newer `rev`.
 
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use cide_core::persist::{self, Debouncer};
 use cide_core::workspace;
 use cide_ipc::Workspace;
 use parking_lot::Mutex;
 use std::sync::OnceLock;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
+
+/// How often the flusher thread wakes to ask whether a write is owed.
+///
+/// 250 ms, half [`persist::SAVE_DEBOUNCE`], so a due write waits at most a quarter of a second
+/// past its deadline — the relationship `tasks_state::POLL` and `POSITION_DEBOUNCE`/`POLL`
+/// already have, one file over.
+const POLL: Duration = Duration::from_millis(250);
 
 pub struct WorkspaceState {
     inner: Mutex<Workspace>,
@@ -56,6 +65,51 @@ impl WorkspaceState {
             debounce: Debouncer::new(persist::SAVE_DEBOUNCE),
             app: OnceLock::new(),
         }
+    }
+
+    /// Start the background flusher. Call once, from `setup`.
+    ///
+    /// # Why this exists, and what was broken until it did (M73)
+    ///
+    /// [`Self::flush_if_due`] documented itself as "called from the app's tick and before
+    /// quitting" and was called by **neither**: there is no app tick, so the 500 ms debounce
+    /// was inert and `workspace.json` was written exactly once per run, at teardown. Two
+    /// stores had already worked around it by polling themselves — `positions_state` and
+    /// `tasks_state` both say so in their headers — and the workspace, the one file whose loss
+    /// costs a layout nobody can re-derive, was the one still relying on a clean exit.
+    ///
+    /// What that cost, measured on the machine this was found on: an instance three hours into
+    /// a session had a provider and a model pool configured through Settings that existed in
+    /// its own memory and nowhere on disk. `run.sh`'s SIGTERM would have saved them; a crash,
+    /// an OOM kill or a `SIGKILL` would have lost every setting and every layout change of the
+    /// session, with nothing anywhere having reported a failure — the write had simply never
+    /// been asked for.
+    ///
+    /// A thread rather than a Tauri async task, and a daemon rather than a joined one, for
+    /// `PositionsState::start_flusher`'s reasons exactly: the work is a blocking file write,
+    /// and [`crate::lifecycle::shutdown`] performs the final write itself rather than relying
+    /// on this loop to notice. It holds an `AppHandle` rather than the state, because this
+    /// state is managed by value and the handle is the only `'static` road back to it.
+    pub fn start_flusher(app: AppHandle) {
+        thread::Builder::new()
+            .name("cide-workspace".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(POLL);
+                    // `try_state` rather than `state`: the handle outlives nothing here, but a
+                    // panic on a teardown race would be a panic in a thread nobody joins, for
+                    // a write the shutdown is about to make anyway.
+                    if let Some(state) = app.try_state::<Self>() {
+                        state.flush_if_due();
+                    }
+                }
+            })
+            // A failure to spawn costs the debounce, not the file: the shutdown flush still
+            // runs, which is exactly the behaviour this whole session had before.
+            .map(|_| ())
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "no workspace flusher; the workspace will be written on quit only");
+            });
     }
 
     /// Give the state a handle to broadcast through. Called once, from `setup`.
@@ -186,7 +240,10 @@ impl WorkspaceState {
         outcome
     }
 
-    /// Write if the debounce has elapsed. Called from the app's tick and before quitting.
+    /// Write if the debounce has elapsed. Called from [`Self::start_flusher`]'s thread.
+    ///
+    /// It said "from the app's tick" until M73 and there has never been an app tick — see
+    /// `start_flusher` for what that cost.
     pub fn flush_if_due(&self) {
         if self.debounce.take() {
             self.write_now();
@@ -227,6 +284,79 @@ mod tests {
             debounce: Debouncer::new(persist::SAVE_DEBOUNCE),
             app: OnceLock::new(),
         }
+    }
+
+    /// **The debounce is only a debounce if something drains it.** (M73)
+    ///
+    /// The behavioural half of `start_flusher`'s argument: a mutation is not on the disk
+    /// immediately, is on it once the debounce has elapsed and a flush is asked for, and a
+    /// second flush with nothing new does not rewrite the file. Until M73 the middle step had
+    /// no caller in the whole binary, so every line of this was true and none of it ever ran.
+    #[test]
+    fn a_mutation_reaches_the_disk_on_the_debounce_and_not_before() {
+        let mut s = state();
+        // Its own file: every other test here shares one path and writes to none of it, and a
+        // test that asserts on mtimes must not be readable by another test's `remove_file`.
+        s.path = std::env::temp_dir().join("cide-workspace-flush-test.json");
+        let _ = std::fs::remove_file(&s.path);
+
+        s.update(|ws| {
+            // `Dark`, because `Theme::default()` is `Light` and `update` suppresses a mutation
+            // that changed nothing — a no-op notes no change, owes no write, and would make
+            // every assertion below pass against a file that was never written.
+            ws.settings.theme = Theme::Dark;
+            Ok(())
+        })
+        .expect("a theme change is a change");
+
+        s.flush_if_due();
+        assert!(
+            !s.path.exists(),
+            "a write inside the debounce is the per-gesture cost the debounce exists to avoid"
+        );
+
+        std::thread::sleep(persist::SAVE_DEBOUNCE);
+        s.flush_if_due();
+        let written = persist::load(&s.path);
+        assert_eq!(
+            written.settings.theme,
+            Theme::Dark,
+            "and then it is on the disk"
+        );
+        assert_eq!(written.rev, s.rev());
+
+        // Nothing owed, nothing written: the debouncer is taken, not merely read.
+        let stamp = std::fs::metadata(&s.path)
+            .and_then(|meta| meta.modified())
+            .expect("written above");
+        std::thread::sleep(persist::SAVE_DEBOUNCE);
+        s.flush_if_due();
+        assert_eq!(
+            std::fs::metadata(&s.path)
+                .and_then(|meta| meta.modified())
+                .expect("still there"),
+            stamp,
+            "an idle flusher must not rewrite the file on every poll"
+        );
+
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    /// **And something does drain it.** (M73)
+    ///
+    /// The structural half, and the assertion that would have caught the original defect: the
+    /// flusher is a thread started from `setup`, which no test can call. `flush_if_due` said it
+    /// was "called from the app's tick" for three milestones while there was no tick and no
+    /// caller — a sentence in a doc comment is not a caller, and only a source assertion can
+    /// tell the two apart. Comments stripped first, because the paragraph above says the name.
+    #[test]
+    fn the_workspace_flusher_is_started_from_setup() {
+        let lib = crate::srcgrep::without_comments(include_str!("lib.rs"));
+        assert!(
+            lib.contains("WorkspaceState::start_flusher("),
+            "nothing starts the workspace flusher, so `workspace.json` is written once per run \
+             and a session that does not exit cleanly loses every change it made"
+        );
     }
 
     #[test]

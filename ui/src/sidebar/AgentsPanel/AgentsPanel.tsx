@@ -106,6 +106,7 @@ import {
   OFF_FOR_THIS_PROJECT,
   RECENT_CAP,
   ROSTER_UNKNOWN,
+  agentColor,
   isDonePhase,
   metaFigure,
   scopeBadge,
@@ -831,7 +832,24 @@ function RoleLine({
         >
           <Icon name={asIcon(role.glyph)} size={1} />
         </span>
-        <span className={styles.roleName} title={def.id}>
+        {/*
+          * The role's own colour, and the reason the row has one. (M75)
+          *
+          * An inline `style` rather than a class, because the colour is a *value* — one of eight
+          * tokens chosen per role — and a class per hue would be eight rules that must stay in
+          * step with `AGENT_HUES`. `gitlog/LogView.tsx` draws a repo chip the same way for the
+          * same reason, and what crosses is a `var(--agent-…)` string and never a hex, so the
+          * colour follows the theme.
+          *
+          * `agentColor` and not a lookup in the roster's colour map: this row *is* the roster, so
+          * the definition is in hand and the map would be an indirection back to the same answer.
+          */}
+        <span
+          className={styles.roleName}
+          style={{ color: agentColor(def.id, def.color) }}
+          data-audit="agentsRoleName"
+          title={def.id}
+        >
           {def.label}
         </span>
         {/*

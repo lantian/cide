@@ -182,6 +182,7 @@ try {
     localProblems,
     modalFor,
     modalTitle,
+    metaExtras,
     modelPlaceholder,
     problemsByField,
     restoredModal,
@@ -191,8 +192,14 @@ try {
     shouldRestore,
     titleCase,
     toWire,
+    unknownColor,
     usability,
     usabilityLabel,
+    withColor,
+    withMetaExtras,
+    AGENT_HUES,
+    COLOR_KEY,
+    colorOf,
   } = await import(`file://${join(out, 'agentsDraft.js')}`)
 
   const agentsRs = shipping(read('../../crates/cide-ipc/src/agents.rs'))
@@ -999,6 +1006,130 @@ try {
     console.error(`\ncheck-settings-agents: ${failed} failure(s)`)
     process.exit(1)
   }
+  /* ------------------------------------------------------------ the colour picker (M77) */
+
+  /*
+   * The colour is a **control over a carried extra**, not a modelled field, and every assertion
+   * below defends one half of that: the picker must own the key completely (or two editors
+   * disagree about it), and it must never damage the file (or M75's whole storage argument is
+   * undone by the form that was supposed to expose it).
+   */
+  {
+    // The vocabulary, pinned to Rust *in order* — the same assertion `check:agents` makes about
+    // `AgentsPanel/model.ts`, because this is the third restatement of one list and a picker
+    // offering them in another order would still look fine.
+    const fromRust = [...(/pub const AGENT_HUES: &\[&str\] = &\[([^\]]*)\]/
+      .exec(agentsRs)?.[1] ?? '').matchAll(/"([a-z]+)"/g)].map((m) => m[1])
+    eq(fromRust.length, 8, 'read eight hues out of Rust — the scan still matches')
+    eq([...AGENT_HUES], fromRust, 'AGENT_HUES is `cide_ipc::agents::AGENT_HUES`, in order')
+    ok(
+      !AGENT_HUES.includes('orchestrator'),
+      'the picker cannot offer the orchestrator’s colour, because the list it draws has no ' +
+        'entry for it — the reservation is the absence, here as in the panel',
+    )
+
+    const withKey = (value) => ({
+      ...blankDraft('claudeProject'),
+      extras: [
+        { key: 'maxTurns', value: '12' },
+        { key: 'color', value },
+        { key: 'hooks', value: '\n  PreToolUse: []' },
+      ],
+    })
+
+    // Reading: the eight, folded and trimmed; everything else is `null` *and* reported.
+    eq(colorOf(withKey('cyan')), 'cyan', 'a declared hue is read')
+    eq(colorOf(withKey('  CYAN  ')), 'cyan', 'folded and trimmed, because a person typed it')
+    eq(colorOf(blankDraft('project')), null, 'no key at all is Automatic')
+    eq(colorOf(withKey('')), null, 'and an empty one is too')
+    eq(colorOf(withKey('chartreuse')), null, 'a value outside the eight selects nothing')
+    eq(
+      unknownColor(withKey('chartreuse')),
+      'chartreuse',
+      'but it is reported by name, so the note can print the word the user typed rather than ' +
+        'leaving them to find the line themselves',
+    )
+    eq(unknownColor(withKey('cyan')), null, 'a recognised value has nothing to report')
+    eq(unknownColor(withKey('')), null, 'and neither does an empty one — that is just Automatic')
+    eq(unknownColor(blankDraft('project')), null, 'nor an absent one')
+
+    // Writing: Automatic **removes** the key rather than blanking it.
+    const set = withColor(withKey('cyan').extras, 'red')
+    eq(set.map((e) => e.key), ['maxTurns', 'color', 'hooks'], 'the key keeps its position')
+    eq(set[1].value, 'red', 'and takes the new hue')
+    const cleared = withColor(withKey('cyan').extras, null)
+    eq(
+      cleared.map((e) => e.key),
+      ['maxTurns', 'hooks'],
+      'Automatic REMOVES the key — `cide_ipc::llm`’s rule, and a `color:` with nothing after ' +
+        'it would be a line cide added to somebody else’s file to record the absence of a choice',
+    )
+    eq(
+      withColor([], 'blue'),
+      [{ key: 'color', value: 'blue' }],
+      'a role that had none gains one',
+    )
+    eq(withColor([], null), [], 'and clearing one that was never there writes nothing')
+    eq(
+      withColor([{ key: 'Color', value: 'cyan' }], 'red'),
+      [{ key: 'Color', value: 'red' }],
+      'the file’s own spelling of the key survives — cide reads it folded and must not rewrite ' +
+        'a committed file to suit its own preference',
+    )
+
+    // The split with the Meta rows: one key, one editor, and no edit on either side drops it.
+    eq(
+      metaExtras(withKey('cyan').extras).map((e) => e.key),
+      ['maxTurns', 'hooks'],
+      'the Meta rows do not draw the colour — the picker above them owns it, and a key with ' +
+        'two editors is a key whose two editors disagree',
+    )
+    const draft = withKey('cyan')
+    const edited = withMetaExtras(draft.extras, [
+      { key: 'maxTurns', value: '20' },
+      { key: 'hooks', value: '\n  PreToolUse: []' },
+    ])
+    eq(
+      edited.map((e) => `${e.key}=${e.value}`),
+      ['maxTurns=20', 'color=cyan', 'hooks=\n  PreToolUse: []'],
+      'an edit in the Meta rows keeps the colour, at its own index — without this the two ' +
+        'controls race through one array and a save drops the key the picker is still drawing',
+    )
+    eq(
+      withMetaExtras(draft.extras, [{ key: 'color', value: 'pink' }]).map((e) => e.value),
+      ['cyan'],
+      'and a `color` row typed by hand into Meta is dropped in favour of the picker’s, which ' +
+        'is the second editor this split exists to prevent',
+    )
+    eq(
+      withMetaExtras([], [{ key: 'maxTurns', value: '2' }]).map((e) => e.key),
+      ['maxTurns'],
+      'a draft with no colour is unchanged by the fold',
+    )
+
+    // And the section draws it, with the control this file can only grep for.
+    ok(
+      sectionCode.includes('<ColorChoice'),
+      'AgentsSection draws the picker rather than leaving `color` to the Meta rows',
+    )
+    ok(
+      sectionCode.includes('metaExtras(draft.extras)') &&
+        sectionCode.includes('withMetaExtras(draft.extras'),
+      'and routes the Meta rows through both halves of the fold — either one alone loses a key',
+    )
+    ok(
+      /style=\{\{ background: `var\(--agent-\$\{hue\}\)` \}\}/.test(sectionCode),
+      'a swatch is painted from the `--agent-*` token and never a hex spelled here, which is ' +
+        'what makes it follow the theme (`laneColor`’s rule)',
+    )
+    ok(
+      !/COLOR_KEY|'color'/.test(sectionCode.replace(/colorOf|withColor|unknownColor/g, '')) ||
+        sectionCode.includes('colorOf(draft)'),
+      'the section asks ./agentsDraft for the colour rather than restating the key',
+    )
+    eq(COLOR_KEY, 'color', 'and the key is Claude Code’s own, which is why it is not modelled')
+  }
+
   console.log(
     `check-settings-agents: ok (${rustFields.length} AgentField variants drawn and answerable, ` +
       `${SCOPES.length + HARNESSES.length + PERMISSION_MODES.length} values across 3 closed ` +
@@ -1006,7 +1137,8 @@ try {
       `2 required fields refused locally and ${5} rules deliberately left to Rust, ` +
       `${paired.length + 3} rows answered ready/shadowed/blocked, ` +
       `${4} dialog states derived from the draft, Escape asking on ${1} of 2 dirtinesses, ` +
-      `${6} focus resolutions and ${4} orderings of request against dialog)`,
+      `${6} focus resolutions, ${4} orderings of request against dialog, and ` +
+      `${AGENT_HUES.length} role colours the picker offers)`,
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

@@ -10,6 +10,11 @@
 //! and those are the blocking calls, already on `spawn_blocking`. Making a state mutation `async`
 //! would put a lock acquisition behind the runtime for no gain.
 //!
+//! **`project` is optional on the two a projectless shell can reach.** A shell with no project
+//! open has a tool window of its own since M74 — [`cide_ipc::Workspace::tool_window`] — and
+//! `null` names it. The other two keep a required [`ProjectId`]: a history tab names a file in a
+//! repository in a project, so there is no gesture that could ask for one without one.
+//!
 //! Every one of them bumps `rev` and broadcasts through `state.update`, so a toggle in one window
 //! reaches the others. That is a real cost worth naming: a tool window is toggled dozens of times
 //! an hour, so this is a more frequent broadcast than most — but it is the same class every tab
@@ -33,7 +38,7 @@ type Result<T> = cide_core::Result<T>;
 #[tauri::command(rename_all = "camelCase")]
 pub fn tool_window_set_layout(
     state: State<'_, WorkspaceState>,
-    project: ProjectId,
+    project: Option<ProjectId>,
     open: Option<bool>,
     height: Option<u16>,
     log_split: Option<u16>,
@@ -44,11 +49,13 @@ pub fn tool_window_set_layout(
     })
 }
 
-/// Bring a tab to the front, revealing the panel. `tab` of `None` is the Log tab.
+/// Bring a tab to the front, revealing the panel. `tab` of `None` is the Log tab, and
+/// `project` of `None` is the projectless shell's own panel — where `None`/`None` is the only
+/// pair it can be asked for, since that panel holds no history.
 #[tauri::command(rename_all = "camelCase")]
 pub fn tool_window_activate(
     state: State<'_, WorkspaceState>,
-    project: ProjectId,
+    project: Option<ProjectId>,
     tab: Option<HistoryTabId>,
 ) -> Result<()> {
     state.update(|ws| cide_core::toolwindow::activate(ws, project, tab))

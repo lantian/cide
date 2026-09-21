@@ -7,6 +7,7 @@ import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
 import type { ProxySettings } from "./ProxySettings";
+import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
@@ -95,4 +96,12 @@ git?: GitSettings,
  * against the first. What survives is the rule `ClaudeCliSection` states: a value you cannot
  * see is a value you cannot correct.
  */
-llm?: LlmSettings, };
+llm?: LlmSettings, 
+/**
+ * Whether a phone may reach this cide, and how. (M72)
+ *
+ * Sent whole like every other group, and unlike [`Self::llm`] that costs nothing here:
+ * there is no credential in it. The device list and its token hashes live in their own
+ * `0600` file precisely so this field can be an ordinary, round-trippable group.
+ */
+remote?: RemoteSettings, };

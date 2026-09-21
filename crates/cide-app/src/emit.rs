@@ -44,6 +44,9 @@ pub fn workspace_changed(app: &AppHandle, workspace: &Workspace) {
     if let Err(error) = app.emit(WORKSPACE_CHANGED, payload) {
         tracing::debug!(%error, "workspace broadcast reached no window");
     }
+    // The revision only. See the tee's own header.
+    let rev = workspace.rev;
+    tee(|| cide_remote::RemoteEvent::WorkspaceRev { rev });
 }
 
 // --- session events ---------------------------------------------------------------------
@@ -103,6 +106,9 @@ pub fn session_state(app: &AppHandle, session: &str, state: cide_ipc::SessionSta
     if let Err(error) = app.emit(SESSION_STATE, payload) {
         tracing::debug!(%error, "session-state reached no window");
     }
+    if let Ok(session) = session.parse::<cide_ipc::SessionId>() {
+        tee(|| cide_remote::RemoteEvent::SessionState { session, state });
+    }
 }
 
 pub fn session_status(app: &AppHandle, session: &str, status: serde_json::Value) {
@@ -144,6 +150,13 @@ pub fn session_awaiting(app: &AppHandle, sessions: Vec<cide_ipc::SessionId>) {
     if let Err(error) = app.emit(SESSION_AWAITING, SessionAwaiting { sessions }) {
         tracing::debug!(%error, "session-awaiting reached no window");
     }
+    // Read back rather than derived from the argument: the wire shape three windows parse is a
+    // list of ids, and a device needs each entry's arrival stamp to tell news from what it has
+    // already announced. Widening the event to carry both would put a field on a payload nobody
+    // on that wire reads. The set's lock was released before this call.
+    tee(|| cide_remote::RemoteEvent::Awaiting {
+        entries: crate::windows::awaiting_since(),
+    });
 }
 
 pub fn session_tool(app: &AppHandle, session: &str, paths: Vec<String>) {
@@ -595,6 +608,10 @@ pub fn tasks_changed(
         rev,
         board: board.clone(),
     };
+    // The project and nothing else. The board itself may not cross that wire — it is rows now,
+    // but the rule is about the *shape of the promise*, not today's size — so a device is told
+    // its board moved and re-reads a projection. (M75)
+    tee(|| cide_remote::RemoteEvent::TasksChanged { project });
     if let Err(error) = app.emit(TASKS_CHANGED, payload) {
         tracing::debug!(%error, "tasks-changed reached no window");
     }
@@ -653,6 +670,9 @@ pub fn agents_changed(
         project,
         roster: roster.clone(),
     };
+    // See `tasks_changed`: the project, and the device re-reads. An `AgentRoster` carries every
+    // role's whole system prompt, which is exactly what `RemoteAgent` exists to leave behind.
+    tee(|| cide_remote::RemoteEvent::AgentsChanged { project });
     if let Err(error) = app.emit(AGENTS_CHANGED, payload) {
         tracing::debug!(%error, "agents-changed reached no window");
     }
@@ -771,5 +791,123 @@ pub fn docker_changed(app: &AppHandle, board: &cide_ipc::docker::DockerBoard) {
     };
     if let Err(error) = app.emit(DOCKER_CHANGED, payload) {
         tracing::debug!(%error, "docker-changed reached no window");
+    }
+}
+
+/// The remote listener's state, or its device list, moved.
+///
+/// Carries **no payload**: the panel asks. Three reasons, and the first is the one that decides
+/// it — a payload here would be the device list, and a device list is the one thing on this
+/// surface a webview has no business holding more copies of than it must. The second is that the
+/// panel is open on one screen at most, so pushing a list to every window is work for nobody.
+/// The third is that the readout has a live part (how many devices are connected) which is read
+/// from the socket rather than stored, so a pushed snapshot would be stale the moment it landed.
+pub const REMOTE_CHANGED: &str = "cide://remote-changed";
+
+pub fn remote_changed(app: &AppHandle) {
+    if let Err(error) = app.emit(REMOTE_CHANGED, ()) {
+        tracing::debug!(%error, "remote-changed reached no window");
+    }
+}
+
+// --- the remote tee ---------------------------------------------------------------------
+//
+// `AppHandle::emit` reaches this process's webviews and nothing else, so a paired device cannot
+// subscribe to any of the above. The answer is a tee *here* rather than a second event surface,
+// and that placement is the whole point: this module's header promises that every `cide://` event
+// goes out through one file, `cargo xtask contract-check` reads that file textually to find them,
+// and a parallel set of notifications emitted from wherever they happened to be convenient would
+// quietly falsify both.
+//
+// Four properties make it safe to put a network consumer on this path:
+//
+// * **It adds no `cide://` name.** `scan_events` looks for the `pub const … = "cide://…"`
+//   literals; the tee introduces none, so the contract file is untouched by the mechanism.
+// * **It never blocks the emitter.** The channel is bounded and the send is `try_send`. The
+//   threads that reach here are the hook applier and the GTK main loop, and neither may be made
+//   to wait on a phone's socket. A full queue is not an error: `cide-remote` tells the device it
+//   fell behind and the device re-reads. That is `cide-pty`'s credit protocol's argument, one
+//   consumer further out.
+// * **It carries no `Workspace`.** The tree holds `Settings`, which holds provider API keys and
+//   proxy passwords in plaintext. `workspace_changed` tees its *revision* and nothing else, and a
+//   device answers a revision by asking for a projection.
+// * **It is absent when the feature is off**, which is the default, so an installation with no
+//   paired device pays one uncontended read lock per emit.
+
+use parking_lot::RwLock;
+use std::sync::OnceLock;
+
+type Tee = RwLock<Option<tokio::sync::mpsc::Sender<cide_remote::RemoteEvent>>>;
+
+fn remote_tee() -> &'static Tee {
+    static TEE: OnceLock<Tee> = OnceLock::new();
+    TEE.get_or_init(|| RwLock::new(None))
+}
+
+/// Send a copy of every teed event to `tx`. Called by `remote.rs` when the listener starts.
+pub fn install_remote_tee(tx: tokio::sync::mpsc::Sender<cide_remote::RemoteEvent>) {
+    *remote_tee().write() = Some(tx);
+}
+
+/// Stop teeing. Called when the listener stops, and on shutdown.
+pub fn clear_remote_tee() {
+    *remote_tee().write() = None;
+}
+
+/// Hand one event to the remote pump, if there is one.
+///
+/// The event is built by a closure rather than passed in, so an installation with the feature off
+/// does not clone an awaiting set several times a second in order to drop it.
+fn tee(make: impl FnOnce() -> cide_remote::RemoteEvent) {
+    let held = remote_tee().read();
+    let Some(tx) = held.as_ref() else {
+        return;
+    };
+    if let Err(error) = tx.try_send(make()) {
+        // Expected under load and handled downstream by a `Desync` to the device. Not a warning:
+        // it would be one per dropped frame, from the thread least able to afford them.
+        tracing::debug!(%error, "remote tee: an event was dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One test rather than four, because the tee is a process-global and four tests would race
+    /// each other for it. `cargo test` runs a crate's tests in threads by default, and a shared
+    /// `static` is exactly the thing that makes that visible.
+    #[test]
+    fn the_tee_is_lazy_when_absent_built_when_present_and_lossy_when_full() {
+        static BUILT: AtomicUsize = AtomicUsize::new(0);
+        let event = || {
+            BUILT.fetch_add(1, Ordering::Relaxed);
+            cide_remote::RemoteEvent::WorkspaceRev { rev: 9 }
+        };
+
+        // Absent: the event is never built. This is the case that is true on every installation
+        // with the feature off, several times a second during a turn.
+        clear_remote_tee();
+        tee(event);
+        assert_eq!(BUILT.load(Ordering::Relaxed), 0);
+
+        // Present: it arrives.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        install_remote_tee(tx);
+        tee(event);
+        assert_eq!(BUILT.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(cide_remote::RemoteEvent::WorkspaceRev { rev: 9 })
+        ));
+
+        // Full: dropped, and — the property the emitter depends on — the call still returns.
+        // A blocking send here would be the hook-apply thread waiting on a phone's socket.
+        for _ in 0..8 {
+            tee(event);
+        }
+        assert!(rx.try_recv().is_ok());
+        clear_remote_tee();
     }
 }

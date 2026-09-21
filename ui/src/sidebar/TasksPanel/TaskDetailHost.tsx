@@ -64,7 +64,7 @@ import { notify, notifyFailure } from '@/chrome/notices'
 import { useTasks } from '@/sidebar/tasksStore'
 import { useWorkspace } from '@/store/workspace'
 import { useAgents } from '@/sidebar/agentsStore'
-import { rosterRoles } from '@/sidebar/AgentsPanel/model'
+import { rosterColors, rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TaskDetailModal, TaskDetailPendingModal } from './TaskDetail'
 import { useSpec } from '../specStore'
 import {
@@ -138,6 +138,13 @@ function TaskDetailHostImpl() {
   const pauseRun = useAgents((s) => s.pause)
   const resumeRun = useAgents((s) => s.resume)
   const roles = useMemo(() => rosterRoles(roster), [roster])
+  /*
+   * Every role's colour, by id. (M75) `rosterRoles`' sibling rather than a widening of it — that
+   * map is pinned by `check:agents` as id→label and read from three other surfaces — and memoised
+   * on the same identity for the same reason: a fresh object out of a selector re-renders for
+   * ever and unmounts the root.
+   */
+  const roleColors = useMemo(() => rosterColors(roster), [roster])
   /*
    * A role's own sentence, for the picker's second line. Derived here rather than added to
    * `rosterRoles`, which is pinned by `check:agents` as an id→label map and read by three other
@@ -654,6 +661,7 @@ function TaskDetailHostImpl() {
       task={detail}
       runs={runs}
       roles={roles}
+      roleColors={roleColors}
       assigneeHint={hint}
       onOpenRun={(run) => guarded(openRun(run))}
       onPauseRun={(run) => guarded(pauseRun(run))}

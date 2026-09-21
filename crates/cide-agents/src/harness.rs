@@ -1286,6 +1286,7 @@ mod tests {
                     description: "Implements one task end to end.".into(),
                     system_prompt: BRIEF.into(),
                     model: None,
+                    color: None,
                     unavailable: None,
                     max_concurrent: 1,
                     worktree: true,

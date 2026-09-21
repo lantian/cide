@@ -86,7 +86,7 @@ import { basename, type StagedAttachment } from './model'
 import { useTasks } from '@/sidebar/tasksStore'
 import { useSpec } from '../specStore'
 import { useAgents } from '@/sidebar/agentsStore'
-import { rosterRoles } from '@/sidebar/AgentsPanel/model'
+import { rosterColors, rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TasksPanelView } from './TasksPanel'
 import { TaskComposeModal } from './TaskCompose'
 import { assigneeHint, filterAfterCreate, linkableTargets, queryAfterCreate } from './model'
@@ -164,6 +164,13 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    */
   const roster = useAgents((s) => s.roster)
   const roles = useMemo(() => rosterRoles(roster), [roster])
+  /*
+   * Every role's colour, by id. (M75) `rosterRoles`' sibling rather than a widening of it — that
+   * map is pinned by `check:agents` as id→label and read from three other surfaces — and memoised
+   * on the same identity for the same reason: a fresh object out of a selector re-renders for
+   * ever and unmounts the root.
+   */
+  const roleColors = useMemo(() => rosterColors(roster), [roster])
   /*
    * The changes the picker offers. (M28) Selected as the board and mapped in a `useMemo`, never
    * in the selector itself: a selector that built a fresh array would re-render for ever and end
@@ -334,6 +341,7 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
         board={board}
         runs={runs}
         roles={roles}
+        roleColors={roleColors}
         selected={selected}
         filter={filter}
         onFilter={setFilter}

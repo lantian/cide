@@ -43,6 +43,7 @@ pub mod profile;
 /// What a path *is* — OS stat, and what one pass over a text file's bytes says. (M70)
 pub mod properties;
 pub mod proxy;
+pub mod remote;
 /// Editor colour schemes: importing a VS Code theme, and the imported ones on disk.
 pub mod scheme;
 pub mod scratch;

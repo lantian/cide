@@ -65,6 +65,7 @@ pub fn settings_set(
         was_memory_limit,
         was_cli,
         was_job_notify,
+        was_remote,
     ) = state.with(|ws| {
         (
             ws.settings.theme,
@@ -74,6 +75,7 @@ pub fn settings_set(
             ws.settings.inspections.server_memory_limit_mb,
             ws.settings.claude.cli.binary.clone(),
             ws.settings.terminal.job_notify_after_secs,
+            ws.settings.remote.clone(),
         )
     });
     state.update(|ws| {
@@ -92,6 +94,13 @@ pub fn settings_set(
     // list, and the workspace lock is `parking_lot` and not reentrant.
     if settings.theme != was_theme {
         windows::apply_theme(&app, settings.theme);
+    }
+    // The remote listener is reconciled rather than toggled: *is what is running what was asked
+    // for* is one question, and answering it in one place is what stops a port change and an
+    // enable arriving separately from leaving two listeners or none. Only when the group moved —
+    // this tears a socket down and puts it back, and a keystroke in an unrelated field must not.
+    if settings.remote != was_remote {
+        crate::remote::reconcile(&app, &settings.remote);
     }
     // The file tree's two visibility toggles are the only settings whose value is not enough:
     // the rows they ask for were never walked, so the index has to be built again. See
@@ -257,6 +266,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         inspections,
         git,
         llm,
+        remote,
     } = patch;
 
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
@@ -330,6 +340,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // A restart here would be a restart for a value nothing running can read.
     if let Some(v) = llm {
         settings.llm = v.cleaned();
+    }
+    if let Some(v) = remote {
+        settings.remote = v;
     }
     // The one patched field that is clamped rather than taken at face value.
     //

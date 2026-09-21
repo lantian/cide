@@ -434,6 +434,13 @@ export interface RunRef {
   run: string
   /** The task this run was dispatched against, or `null` for an ad-hoc run. */
   task: string | null
+  /**
+   * `AgentRun::agent` — the role's **id**, which is what [`Chip.agent`] is coloured from. (M75)
+   *
+   * Beside the frozen label rather than derived from it: the label is a word that may have been
+   * edited since, and two roles may share one. The id is the key.
+   */
+  agent: string
   /** `AgentRun::agentLabel`, copied at dispatch so it still reads after a role is renamed. */
   agentLabel: string
   phase: string
@@ -523,6 +530,19 @@ export interface Chip {
   session: string | null
   /** `RunRef::openable`, carried through so `canOpen` reads the wire's fact and not a guess. */
   openable: boolean
+  /**
+   * The **id** of the role this chip is about, for the colour the label is drawn in. (M75)
+   *
+   * Beside `label` rather than instead of it, because the two answer different questions and
+   * have different provenance: the label is the word, copied at dispatch and deliberately frozen
+   * so an old chip does not rename itself, while the id is the key both the roster and
+   * `TaskAuthor::Agent` carry — so colouring by it is what makes a role the same colour on its
+   * row here as it is above every comment it wrote.
+   *
+   * Never empty when the chip exists: the live arm takes the run's agent and the two assigned
+   * arms take `task.agent`, which is what got them past the `roleLabel` gate in the first place.
+   */
+  agent: string
 }
 
 /**
@@ -611,6 +631,13 @@ export function agentChip(
       live.agentLabel.trim() !== '' ? live.agentLabel : (roleLabel(roles, task.agent) ?? 'Agent')
     return {
       label,
+      // The run's own agent, falling back to the task's assignee for a run whose agent is blank
+      // — the same ladder the label above takes, one rung shorter because there is no word to
+      // invent at the end of it: a colour derived from an empty string is still a colour.
+      // `?? ''` although the type says `string`: this function's header promises it never
+      // throws *for any input*, and its callers include a check script driving it with
+      // hand-built objects and a wire payload from a build that predates the field.
+      agent: (live.agent ?? '').trim() !== '' ? live.agent : (task.agent ?? ''),
       lit: true,
       tone: live.phase === 'awaitingPermission' ? 'attention' : 'live',
       phase: live.phase,
@@ -636,6 +663,7 @@ export function agentChip(
   if (task.status === 'doing' && !engaged) {
     return {
       label: assigned,
+      agent: task.agent ?? '',
       lit: false,
       tone: 'attention',
       phase: null,
@@ -647,6 +675,7 @@ export function agentChip(
 
   return {
     label: assigned,
+    agent: task.agent ?? '',
     lit: false,
     tone: 'assigned',
     phase: null,

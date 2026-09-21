@@ -61,6 +61,7 @@ const UI = resolve(import.meta.dirname, '..')
 const out = mkdtempSync(join(tmpdir(), 'cide-agents-'))
 
 let failed = 0
+let hues = 0
 const fail = (what, detail) => {
   failed += 1
   console.error(`FAIL ${what}${detail === undefined ? '' : `\n  ${detail}`}`)
@@ -155,6 +156,11 @@ try {
     ROSTER_UNKNOWN,
     OFF_FOR_THIS_PROJECT,
     rosterRoles,
+    rosterColors,
+    AGENT_HUES,
+    ORCHESTRATOR_COLOR,
+    agentColor,
+    authorColor,
     RECENT_CAP,
     RESTING_GLYPH,
     RESTING_LABEL,
@@ -176,6 +182,8 @@ try {
     metaFigure: rosterFigure,
     sections,
     elapsed,
+    workedFor,
+    timeTitle,
     staleTurnLine,
   } = agents
 
@@ -552,6 +560,10 @@ try {
     phase: 'running',
     task: 't-14',
     startedMs: 1_700_000_000_000,
+    // The clock's two halves, respecting the invariant a running run has: the closed total is
+    // zero and the interval is open from the dispatch. A story that needs them apart says so.
+    workedMs: 0,
+    workingSinceMs: 1_700_000_000_000,
     pausedSinceMs: null,
     exitCode: null,
     failure: null,
@@ -726,6 +738,7 @@ try {
   const ref = (over) => ({
     run: 'r1',
     task: 't-14',
+    agent: 'developer',
     agentLabel: 'Developer',
     phase: 'running',
     session: 's1',
@@ -1177,6 +1190,89 @@ try {
   eq(elapsed(3_600_000, 0), '1h 00m', 'then hours, zero-padded so a column does not jitter')
   eq(elapsed(3_840_000, 0), '1h 04m', 'and the mock’s own figure')
   eq(elapsed(Number.NaN, 0), '—', 'a non-finite input prints an em dash, never `NaNs`')
+
+  /*
+   * The worked clock, which is what the row actually draws.
+   *
+   * `elapsed(nowMs, startedMs)` used to be that figure, and it was wrong in three ways at once,
+   * all of them ordinary use: a run paused overnight accrued the night, a run that outlived a
+   * cide restart accrued the hours cide was shut, and a finished run's figure grew for ever —
+   * so a run that took ninety seconds read `4h 00m` on the History row whose own doc says "how
+   * long it took". `elapsed` is untouched above because `TasksPanel/TaskDetail` still uses it
+   * for tracker timestamps; what changed is which figure the run rows read.
+   *
+   * The load-bearing property is that an **open** clock ticks and a **shut** one does not, so
+   * each case is asserted at two different `nowMs`.
+   */
+  {
+    const open = { workedMs: 60_000, workingSinceMs: 1_000 }
+    eq(workedFor(1_000, open), '1m', 'the closed total alone, at the instant the interval opens')
+    eq(workedFor(61_000, open), '2m', 'and an open interval ticks with the clock')
+
+    const shut = { workedMs: 60_000, workingSinceMs: null }
+    eq(workedFor(61_000, shut), '1m', 'a run that is not working draws its closed total')
+    eq(
+      workedFor(61_000 + 86_400_000, shut),
+      '1m',
+      'and goes on drawing it a day later — a paused row does not tick, and a finished row is ' +
+        'final, which is why this change needs no end timestamp anywhere',
+    )
+
+    eq(
+      workedFor(0, open),
+      '1m',
+      'a clock that went backwards yields the closed total, never less than it',
+    )
+    eq(workedFor(Number.NaN, open), '—', 'a non-finite now prints an em dash, as `elapsed` does')
+    eq(workedFor(1_000, { workedMs: Number.NaN, workingSinceMs: null }), '—', 'and so does a NaN total')
+    eq(
+      workedFor(61_000, { workedMs: 0, workingSinceMs: null }),
+      '0s',
+      'a queued run has worked nothing, however long it has been queued',
+    )
+  }
+
+  /*
+   * The tooltip. It carries what the row no longer says, and the phase word it always said.
+   */
+  {
+    const now = 1_700_000_000_000 + 3_840_000
+    const paused = run({
+      phase: 'paused',
+      startedMs: 1_700_000_000_000,
+      workedMs: 2_945_000,
+      workingSinceMs: null,
+      pausedSinceMs: now - 900_000,
+    })
+    const title = timeTitle(now, paused, 'Paused')
+    ok(title.startsWith('Paused'), `the phase word leads, for a screen reader: ${title}`)
+    ok(title.includes('dispatched 1h 04m ago'), `the wall clock is one hover away: ${title}`)
+    ok(title.includes('worked 49m'), `and what it actually did: ${title}`)
+    ok(title.includes('not working'), `with the difference named: ${title}`)
+
+    // A terminal run gets no excluded clause: `now - startedMs` rises for ever while the worked
+    // figure is final, so their difference would be a number that grows without bound while
+    // claiming to describe a pause — the same lie this change removes, in a new place.
+    const finished = run({
+      phase: 'finished',
+      exitCode: 0,
+      startedMs: 1_700_000_000_000,
+      workedMs: 372_000,
+      workingSinceMs: null,
+    })
+    const over = timeTitle(now + 86_400_000, finished, 'Finished')
+    ok(over.includes('worked 6m'), `a finished run still says what it did: ${over}`)
+    ok(
+      !over.includes('not working'),
+      `a run that is over is not "not working" for the rest of time: ${over}`,
+    )
+
+    eq(
+      timeTitle(Number.NaN, paused, 'Paused'),
+      'Paused',
+      'an unusable clock falls back to the word alone, never to a sentence full of em dashes',
+    )
+  }
 
   eq(
     staleTurnLine(run({ staleTurn: false })),
@@ -2648,6 +2744,172 @@ try {
     eq(dropZoneAt({ x: 100, y: 100 }, []), null, 'and no zones is nowhere')
   }
 
+  /* == 14 ====================================================== a role's colour is total == */
+
+  /*
+   * The eight hues, the one reserved colour, and the two rungs of `agentColor`. (M75)
+   *
+   * Every failure this section is written against is silent. An undefined custom property is not
+   * a colour, so a hue that lost its token paints whatever the name inherited; a list that drifted
+   * out of Rust's order recolours every uncoloured role in every tracker; and a hash that could
+   * reach the orchestrator's slate would break the one promise the reserved colour makes, on some
+   * role nobody has created yet.
+   */
+  {
+    const rustHues = /pub const AGENT_HUES: &\[&str\] = &\[([^\]]*)\]/.exec(agentsRs)
+    ok(rustHues !== null, 'found `pub const AGENT_HUES` in crates/cide-ipc/src/agents.rs')
+    const fromRust = [...(rustHues?.[1] ?? '').matchAll(/"([a-z]+)"/g)].map((m) => m[1])
+    ok(fromRust.length === 8, `read ${fromRust.length} hues out of Rust — the scan still matches`)
+
+    /*
+     * **In order**, not as sets — which is the usual shape of this assertion in this file and is
+     * deliberately too weak here. A derived colour *is* an index into this list, so two lists
+     * holding the same eight words in different orders agree on every set comparison and give
+     * every role a different colour than the one it had yesterday.
+     */
+    eq(
+      [...AGENT_HUES],
+      fromRust,
+      'AGENT_HUES is `cide_ipc::agents::AGENT_HUES`, in order — the order is what a hash indexes',
+    )
+
+    const tokens = read('../src/styles/tokens.css')
+    for (const hue of AGENT_HUES) {
+      ok(
+        new RegExp(`--agent-${hue}\\s*:`).test(tokens),
+        `--agent-${hue} is declared in tokens.css — an undeclared one paints nothing at all`,
+      )
+    }
+    ok(
+      /--agent-orchestrator\s*:/.test(tokens),
+      '--agent-orchestrator is declared; check:theme is what measures it against the eight',
+    )
+
+    /*
+     * The reserved colour is unreachable **by absence**, and this is the assertion that says so.
+     * It is not a rule inside `agentColor` that a refactor could drop: no hue named it, so no
+     * index and no declared value can produce it.
+     */
+    ok(
+      !AGENT_HUES.includes('orchestrator'),
+      'the orchestrator is not one of the hues — that absence is what reserves its colour',
+    )
+    eq(ORCHESTRATOR_COLOR, 'var(--agent-orchestrator)', 'and it is the token, never a hex')
+
+    // Total, deterministic, and always a declared hue — over a corpus wide enough to include
+    // the shapes a role id can actually take, plus the ones it cannot.
+    const allowed = new Set(AGENT_HUES.map((hue) => `var(--agent-${hue})`))
+    const ids = [
+      'developer',
+      'qa',
+      'reviewer',
+      'architect',
+      'planner',
+      'a',
+      '',
+      'constructor',
+      '__proto__',
+      'role-with-a-very-long-name-indeed',
+      'Ünicode-rôle',
+      '0',
+    ]
+    let colours = 0
+    for (const id of ids) {
+      const first = agentColor(id)
+      ok(allowed.has(first), `agentColor(${JSON.stringify(id)}) is one of the eight`)
+      eq(agentColor(id), first, `and it is the same answer twice for ${JSON.stringify(id)}`)
+      ok(first !== ORCHESTRATOR_COLOR, 'and never the orchestrator’s')
+      colours += 1
+    }
+
+    // The two rungs. A declared hue wins; everything else falls through to the hash, which is
+    // why a typo is invisible rather than fatal — and why the test asserts the *fallback* value
+    // rather than merely that something came back.
+    eq(agentColor('developer', 'cyan'), 'var(--agent-cyan)', 'a declared hue wins over the hash')
+    eq(agentColor('developer', 'CYAN'), 'var(--agent-cyan)', 'folded, because a person types it')
+    eq(agentColor('developer', ' cyan '), 'var(--agent-cyan)', 'and trimmed, for the same reason')
+    eq(
+      agentColor('developer', 'automatic'),
+      agentColor('developer'),
+      "Claude Code's own `automatic` is not a colour — it means derive one",
+    )
+    eq(
+      agentColor('developer', '#ff0000'),
+      agentColor('developer'),
+      'a hex is not one of the eight, so it derives rather than paints an undeclared token',
+    )
+    eq(
+      agentColor('developer', 'orchestrator'),
+      agentColor('developer'),
+      'and a definition cannot name the reserved colour, however it spells it',
+    )
+    eq(agentColor('developer', null), agentColor('developer'), 'null is the ordinary case')
+
+    // Two different roles should not routinely collide. Eight buckets over five plausible role
+    // names is not a guarantee and is not asserted as one — what is asserted is that the corpus
+    // the fixtures and the docs use does not collide, because a check that let it would let the
+    // screenshots in the journal be wrong.
+    const distinct = new Set(
+      ['developer', 'qa', 'reviewer', 'architect', 'planner'].map((id) => agentColor(id)),
+    )
+    eq(distinct.size, 5, 'the five roles this repository writes about get five different colours')
+
+    // `rosterColors` honours a declared colour and derives the rest, and answers `{}` for a
+    // roster nobody has read — the same posture `rosterRoles` takes, for the same reason.
+    const roster = {
+      kind: 'ready',
+      agents: [
+        { id: 'developer', label: 'Developer', color: null },
+        { id: 'qa', label: 'QA', color: 'blue' },
+        { id: '   ', label: 'Blank', color: null },
+      ],
+      runs: [],
+    }
+    const colorMap = rosterColors(roster)
+    eq(colorMap.developer, agentColor('developer'), 'a role with no colour derives one')
+    eq(colorMap.qa, 'var(--agent-blue)', "and one with a colour gets the one it asked for")
+    ok(!Object.hasOwn(colorMap, '   '), 'a blank id is skipped, as in rosterRoles')
+    eq(rosterColors(ROSTER_UNKNOWN), {}, 'and an unread roster carries no colours')
+
+    /*
+     * `authorColor` is the card's one producer for all three arms. The user's `null` is the
+     * load-bearing one: it is what keeps `.logAuthorUser`'s `--accent` winning, and a colour
+     * returned there would silently overrule the class with an inline style.
+     */
+    eq(authorColor({ kind: 'user' }, colorMap), null, 'the user keeps the class colour')
+    eq(
+      authorColor({ kind: 'orchestrator' }, colorMap),
+      ORCHESTRATOR_COLOR,
+      'the orchestrator gets the one colour no role can have',
+    )
+    eq(
+      authorColor({ kind: 'agent', agent: 'qa' }, colorMap),
+      'var(--agent-blue)',
+      "an agent in the roster gets its definition's colour",
+    )
+    eq(
+      authorColor({ kind: 'agent', agent: 'ghost' }, colorMap),
+      agentColor('ghost'),
+      'and one the roster has never heard of — deleted since it commented — still gets a colour',
+    )
+    eq(
+      authorColor({ kind: 'agent', agent: '' }, colorMap),
+      null,
+      'a blank agent id is no colour rather than an arbitrary one',
+    )
+    eq(
+      authorColor({ kind: 'agent' }, colorMap),
+      null,
+      'and a payload with no agent at all does not throw',
+    )
+    eq(
+      authorColor({ kind: 'whateverComesNext' }, colorMap),
+      null,
+      'an author arm this build has never heard of is uncoloured, never mis-coloured',
+    )
+    hues = colours
+  }
+
   if (failed > 0) {
     console.error(`\ncheck-agents: ${failed} failure(s)`)
     process.exit(1)
@@ -2655,7 +2917,8 @@ try {
   console.log(
     `check-agents: ok (${TASK_STATUSES.length} statuses, ${LINK_KINDS.length} link kinds and ${RUN_PHASES.length} phases pinned ` +
       `to Rust, ${tableEntries} table entries non-empty, ${gated} role×roster pairs through ` +
-      `the gate, ${chips} agentChip inputs survived, ${wired} commands wired end to end)`,
+      `the gate, ${chips} agentChip inputs survived, ${hues} role ids coloured, ` +
+      `${wired} commands wired end to end)`,
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

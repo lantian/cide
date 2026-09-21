@@ -119,6 +119,13 @@ pub struct SettingsPatch {
     /// see is a value you cannot correct.
     #[ts(optional)]
     pub llm: Option<crate::llm::LlmSettings>,
+    /// Whether a phone may reach this cide, and how. (M72)
+    ///
+    /// Sent whole like every other group, and unlike [`Self::llm`] that costs nothing here:
+    /// there is no credential in it. The device list and its token hashes live in their own
+    /// `0600` file precisely so this field can be an ordinary, round-trippable group.
+    #[ts(optional)]
+    pub remote: Option<crate::settings::RemoteSettings>,
 }
 
 /// Two or more commands competing for one keystroke in one context.

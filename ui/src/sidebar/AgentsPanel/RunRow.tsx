@@ -50,10 +50,12 @@
  * open a pane must not be given a button that pretends it can.
  */
 import {
-  elapsed,
+  agentColor,
   glyphSpins,
   harnessLabel,
   isDonePhase,
+  timeTitle,
+  workedFor,
   type RunRow as RunRowData,
   type Tone,
 } from './model'
@@ -163,13 +165,20 @@ export function ActivityRow({
           <Icon name={asIcon(row.glyph)} size={1} />
         </span>
         <TaskLink row={row} onRevealTask={onRevealTask} />
-        {/* `title` carries the phase in words, because the dot at the head of the line is the
-            only other place this run's state is written and a dot is not readable by a screen
-            reader or by somebody who has not learned the glyphs. `hint` outranks the word for
-            the one phase whose word is not the whole truth — a paused child with a model call
-            still finishing server-side; see `phaseHint`. */}
-        <span className={styles.elapsed} data-audit="agentsElapsed" title={row.hint ?? row.label}>
-          {elapsed(nowMs, run.startedMs)}
+        {/* The figure is **worked** time, not age since dispatch — see `workedFor`, which
+            carries the three ways the old figure lied. `title` still leads with the phase in
+            words, because the dot at the head of the line is the only other place this run's
+            state is written and a dot is not readable by a screen reader or by somebody who has
+            not learned the glyphs; `hint` outranks the word for the one phase whose word is not
+            the whole truth — a paused child with a model call still finishing server-side; see
+            `phaseHint`. `timeTitle` appends what the two clocks say, so the wall clock a paused
+            run's row no longer draws is one hover away. */}
+        <span
+          className={styles.elapsed}
+          data-audit="agentsElapsed"
+          title={timeTitle(nowMs, run, row.hint ?? row.label)}
+        >
+          {workedFor(nowMs, run)}
         </span>
         <RunControls
           row={row}
@@ -231,6 +240,14 @@ export function RunRow({
             which in Recent is an ordinary state rather than an edge case. */}
         <span
           className={styles.agentLabel}
+          /*
+           * Coloured off `run.agent` — the **id** — while the word drawn is `run.agentLabel`.
+           * (M75) That is not an inconsistency: `agentColor`'s doc argues the id is the key
+           * precisely so a row keeps its colour through a rename, which is the same promise the
+           * frozen label above makes about the word. Both survive a deleted role, because
+           * neither needs the roster.
+           */
+          style={{ color: agentColor(run.agent) }}
           data-audit="agentsRunLabel"
           title={row.hint ?? row.label}
         >
@@ -240,8 +257,16 @@ export function RunRow({
           ·
         </span>
         <span className={styles.harness}>{harnessLabel(run.harness)}</span>
-        <span className={styles.elapsed} data-audit="agentsElapsed" title={row.hint ?? row.label}>
-          {elapsed(nowMs, run.startedMs)}
+        {/* A record, so this figure is **final**: a terminal run has no open interval, and
+            `workedFor` therefore answers the same thing however long ago it ended. The old
+            `elapsed(nowMs, startedMs)` rose for ever on a row whose doc says "how long it
+            took" — a run that took ninety seconds read `4h 00m` four hours later. */}
+        <span
+          className={styles.elapsed}
+          data-audit="agentsElapsed"
+          title={timeTitle(nowMs, run, row.hint ?? row.label)}
+        >
+          {workedFor(nowMs, run)}
         </span>
       </div>
 

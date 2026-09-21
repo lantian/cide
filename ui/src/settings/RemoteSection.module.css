@@ -1,0 +1,116 @@
+.status {
+  display: grid;
+  gap: var(--sp-1);
+}
+
+.line {
+  margin: 0;
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
+.addresses,
+.devices {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: var(--sp-1);
+}
+
+.address {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
+/*
+ * Wide, and spaced. This is read off a screen and typed into a phone by hand, which is the one
+ * place in the application where legibility beats density — the alphabet already excludes the
+ * characters that are read wrongly, and the tracking is the other half of that.
+ */
+.code {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-ui-20);
+  letter-spacing: 0.12em;
+  color: var(--text);
+}
+
+.device {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+}
+
+.name {
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
+.meta {
+  grid-column: 1;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/* The symbol is sized in `ch` rather than px so it follows the UI font size like every other
+   box in this panel — a QR that stayed 180px while the rest of the dialog grew would be the
+   one element a user with large type cannot scan. `max-width` keeps it from filling a wide
+   settings pane, where a very large code is no easier to scan and merely looks wrong. */
+.qr {
+  /* Big, and this is a legibility requirement rather than taste. A QR is photographed off a
+     monitor that has its own pixel grid, so what matters is *screen pixels per module*: below
+     about four the camera cannot resolve the grid and the code reads as nothing at all — no
+     error, no feedback, just somebody holding a phone at it. 22ch was around 170px, which for
+     a payload carrying several addresses is barely two pixels a module, and it did exactly
+     that. `min-width` rather than a plain width so it cannot be squeezed under that floor by a
+     narrow settings pane. */
+  width: 40ch;
+  min-width: 260px;
+  max-width: 100%;
+  aspect-ratio: 1;
+  border-radius: var(--r-1);
+  justify-self: start;
+}
+
+/* The top rung of the chrome ladder, which is also what the pairing code uses: this is a
+   comparison somebody makes across two screens at arm's length and it wants to be big, but a
+   rung added for one element is the drift the closed ladder exists to prevent, and 20 is the
+   top. Tabular figures so 1 and 7 occupy the same width as 0 and 8 — a proportional 1 makes two
+   equal numbers look unequal at a glance, which is the exact misread this must not produce. */
+.sas {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-20);
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+.addr {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.compare {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-2);
+  background: var(--panel);
+}
+
+.invite {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+}

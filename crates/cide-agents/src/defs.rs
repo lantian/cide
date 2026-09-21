@@ -736,6 +736,8 @@ struct Parsed {
     permission_mode: Option<String>,
     max_concurrent: Option<u16>,
     worktree: Option<bool>,
+    /// The role's colour, read out of a key cide keeps in `extras` rather than models. (M75)
+    color: Option<String>,
     /// Every key this file carried that cide does not model, in the order it carried them.
     extras: Vec<AgentExtra>,
 }
@@ -880,6 +882,19 @@ fn read_definition(
                 key: field.key.clone(),
                 value: extra_value(&field.raw),
             });
+            // `color` is **read here and modelled nowhere** — see `AgentDef::color`. It stays in
+            // `extras` in both dialects, so `render` writes back the source lines it occupied and
+            // `claude_corpus`'s byte-identical round-trip is untouched; this is a look at the
+            // value on the way past, for the roster to draw the row with.
+            //
+            // Before both complaint arms, and that is the point of the position rather than an
+            // accident of it: cide's own dialect greets an unmodelled key with *"`color` is not a
+            // key cide reads"*, which stopped being true the moment the roster started reading it.
+            // An unrecognised value is silently `None` and the name's hash answers instead.
+            if field.key == "color" {
+                parsed.color = cide_ipc::agents::hue(value);
+                continue;
+            }
             if claude {
                 // Claude's vocabulary in Claude's directory. Two keys are worth a word anyway,
                 // because each looks like something cide would act on and does not.
@@ -1196,6 +1211,7 @@ fn read_definition(
                 description: parsed.description,
                 system_prompt: doc.body,
                 model: parsed.model,
+                color: parsed.color,
                 unavailable,
                 // 1 rather than 0-means-unlimited: a default a user cannot regret beats one
                 // that starts two `claude` processes the first time somebody presses the
@@ -2740,6 +2756,144 @@ You are the developer agent for this project.
 
 Work one task at a time.
 ";
+
+    /// `color:` is read into the roster and **stays an extra**, in both dialects. (M75)
+    ///
+    /// The two halves are one claim and neither is worth much alone. Read, because the panel
+    /// draws the row in it; carried, because `render` must go on writing the key back out of the
+    /// source lines it occupied — for a Claude Code subagent that is somebody else's file and
+    /// `claude_corpus` is the promise about it, and for cide's own dialect it is what keeps the
+    /// Settings form showing the key it preserved.
+    ///
+    /// The third assertion is the one that would have been forgotten: cide's own directory greets
+    /// an unmodelled key with *"`color` is not a key cide reads"*, which stopped being true the
+    /// moment the roster started reading it, and a warning on every coloured role would be noise
+    /// nobody can silence without deleting the colour.
+    #[test]
+    fn a_colour_is_read_out_of_a_key_that_is_still_carried() {
+        let dir = temp("colour");
+        write(
+            &dir.join("project"),
+            "developer.md",
+            "---\nname: developer\nharness: claude\ndescription: d\ncolor: Cyan\n---\n\nYou are the developer.\n",
+        );
+        // A hue outside the eight, in a file cide does not own. `hue` answers `None` and the
+        // roster derives instead — never a problem, because this is presentation and a role that
+        // could not be dispatched over a colour would be absurd.
+        write(
+            &dir.join("claude-project"),
+            "reviewer.md",
+            "---\nname: reviewer\ndescription: r\ncolor: chartreuse\n---\n\nYou review.\n",
+        );
+
+        let scopes = vec![
+            (AgentScope::Global, dir.join("global")),
+            (AgentScope::Project, dir.join("project")),
+            (AgentScope::ClaudeProject, dir.join("claude-project")),
+        ];
+        let catalog = load_from(&scopes, Harness::Claude, present);
+
+        let developer = agent(&catalog, "developer");
+        assert_eq!(
+            developer.def.color.as_deref(),
+            Some("cyan"),
+            "read, and folded on the way — cide's own dialect models nothing new to do it"
+        );
+        assert!(
+            developer.extras.iter().any(|e| e.key == "color"),
+            "and still carried, so a save writes the user's own line back"
+        );
+
+        let reviewer = agent(&catalog, "reviewer");
+        assert_eq!(
+            reviewer.def.color, None,
+            "a value outside the eight derives rather than painting an undeclared token"
+        );
+        assert!(
+            reviewer.extras.iter().any(|e| e.key == "color"),
+            "and is carried untouched — cide does not correct a key it does not own"
+        );
+
+        let complaints = messages(&catalog);
+        assert!(
+            !complaints.contains("color"),
+            "and neither dialect complains about the key any more: {complaints}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Settings picker's whole road: a colour chosen in the form reaches the roster. (M77)
+    ///
+    /// The picker edits the `color` entry of `AgentDraft::extras`, because that is where M75 left
+    /// the key — so what has to hold is that an extra written by the form survives `render`,
+    /// comes back through `parse_draft` as the same extra, and is *also* read onto
+    /// `AgentDef::color` by the loader. Three functions, and no test covered the join.
+    ///
+    /// Asserted through the **rendered text** as well as the parsed value: a `color:` line that
+    /// landed inside the prompt, or after the closing `---`, would parse back as no colour at all
+    /// and the picker would silently do nothing.
+    #[test]
+    fn a_colour_chosen_in_the_form_survives_a_render_and_reaches_the_roster() {
+        let dir = temp("colour-form");
+        let draft = AgentDraft {
+            scope: AgentScope::Project,
+            name: AgentId("developer".into()),
+            original: None,
+            label: None,
+            harness: Some(Harness::Claude),
+            description: "Implements one task end to end.".into(),
+            model: None,
+            effort: None,
+            tools: Vec::new(),
+            permission_mode: None,
+            max_concurrent: None,
+            worktree: None,
+            system_prompt: "You are the developer.".into(),
+            extras: vec![AgentExtra {
+                key: "color".into(),
+                value: "cyan".into(),
+            }],
+        };
+
+        let text = render(&draft);
+        assert!(
+            text.contains("\ncolor: cyan\n"),
+            "the key is written on its own line in the front matter: {text}"
+        );
+
+        // Back through the form's own reader, which is what a second Edit of the same file gets.
+        let reparsed = parse_draft(&text, AgentScope::Project).expect("drafts");
+        assert_eq!(
+            reparsed
+                .extras
+                .iter()
+                .find(|e| e.key == "color")
+                .map(|e| e.value.as_str()),
+            Some("cyan"),
+            "and comes back as the same extra, so the picker re-opens on the colour it wrote"
+        );
+
+        // And through the loader, which is what the panel draws from.
+        write(&dir.join("project"), "developer.md", &text);
+        let catalog = load_from(
+            &two(&dir.join("global"), &dir.join("project")),
+            Harness::Claude,
+            present,
+        );
+        assert_eq!(
+            agent(&catalog, "developer").def.color.as_deref(),
+            Some("cyan"),
+            "the roster reads it — the half that makes the picker do anything at all"
+        );
+        assert!(
+            catalog.errors().next().is_none(),
+            "and cide's own dialect does not complain about it: {}",
+            messages(&catalog)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The whole point of the format: the prompt survives verbatim, with its paragraphs, and the
     /// switches around it are all readable.

@@ -353,18 +353,55 @@ pub fn window_set_awaiting(
     session: SessionId,
     awaiting: bool,
 ) -> Result<(), CoreError> {
-    // Second of the three attention-chain lines — see the note in `hooks.rs`. Logged BEFORE the
-    // early return, because "the webview reported and the set did not move" is a different
-    // failure from "the webview never reported" and the two are indistinguishable afterwards.
-    tracing::info!(%session, awaiting, "attention: the webview reported");
+    report_awaiting(&app, &state, session, awaiting, AwaitingReporter::Webview);
+    Ok(())
+}
+
+/// Which surface reported. Carried only so the attention chain's log line says so.
+///
+/// Third surface, third sentence. `hooks.rs`'s note explains why these lines exist at all: when
+/// the marker does not appear, "the hook is not installed" is what everyone guesses and it has
+/// never once been true, so each link in the chain says something a grep can tell apart.
+#[derive(Debug, Clone, Copy)]
+pub enum AwaitingReporter {
+    Webview,
+    /// A paired device, over the remote surface. (M72)
+    Device,
+}
+
+/// Record that one session is, or is no longer, waiting on the user — and make every surface
+/// agree.
+///
+/// Extracted from [`window_set_awaiting`] in M72 so that a phone acknowledging a session takes
+/// **exactly** the road a click in a pane takes: the same set, the same retitle of every window,
+/// the same broadcast that makes three windows converge. A second implementation would be a
+/// second answer to *is this session still waiting*, and the two would disagree on the day it
+/// mattered.
+pub(crate) fn report_awaiting(
+    app: &AppHandle,
+    state: &WorkspaceState,
+    session: SessionId,
+    awaiting: bool,
+    by: AwaitingReporter,
+) {
+    // Second of the attention-chain lines — see the note in `hooks.rs`. Logged BEFORE the early
+    // return, because "the surface reported and the set did not move" is a different failure from
+    // "the surface never reported" and the two are indistinguishable afterwards.
+    match by {
+        AwaitingReporter::Webview => {
+            tracing::info!(%session, awaiting, "attention: the webview reported");
+        }
+        AwaitingReporter::Device => {
+            tracing::info!(%session, awaiting, "attention: a paired device acknowledged");
+        }
+    }
     if !windows::set_awaiting(session, awaiting) {
         // Nothing moved. Retitling every window and re-broadcasting on a repeat report would
         // put one round trip per window per tool call in front of the user's keystrokes.
-        return Ok(());
+        return;
     }
-    retitle(&app, &state.snapshot());
-    crate::emit::session_awaiting(&app, windows::awaiting_sessions());
-    Ok(())
+    retitle(app, &state.snapshot());
+    crate::emit::session_awaiting(app, windows::awaiting_sessions());
 }
 
 /// The sessions this process currently believes are waiting for the user.

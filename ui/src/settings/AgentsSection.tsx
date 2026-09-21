@@ -102,6 +102,7 @@ import {
   TextField,
 } from './controls'
 import {
+  AGENT_HUES,
   EFFORT_SUGGESTIONS,
   HARNESSES,
   PERMISSION_MODES,
@@ -110,12 +111,14 @@ import {
   canSave,
   closeRequest,
   effectiveHarness,
+  colorOf,
   fileKey,
   fromWire,
   harnessLabel,
   isClaudeScope,
   isDirty,
   localProblems,
+  metaExtras,
   modalFor,
   modalTitle,
   modelPlaceholder,
@@ -129,6 +132,9 @@ import {
   shouldRestore,
   titleCase,
   toWire,
+  unknownColor,
+  withColor,
+  withMetaExtras,
   usability,
   usabilityLabel,
   type AgentFieldKey,
@@ -1580,6 +1586,38 @@ function RoleForm({
         />
 
         {/*
+          * **The role's colour.** (M77)
+          *
+          * Beside the label because it answers the same question — what this role looks like in
+          * a list — and because the two are read together: the colour marks the name in the
+          * Agents panel, on a task's chip and above every comment the role writes.
+          *
+          * It edits `extras`, not a field of its own, and that is the storage decision M75 made
+          * rather than an omission: `color:` is Claude Code's own key, `cide_agents::defs` reads
+          * it and leaves it carried, so a save writes the file's own line back and no
+          * `.claude/agents/*.md` has its keys reordered. The Meta rows below hide the key while
+          * this control owns it — see `metaExtras`, which argues why that is not the same as
+          * hiding it.
+          *
+          * `errorsFor('extras')` and no `AgentField` of its own: there is nothing here that can
+          * be refused. Every reachable value is one of the eight or *Automatic*, and a value a
+          * hand-edited file wrote that this build cannot use is a **note**, not a refusal — the
+          * role still runs, it is simply drawn in the colour its name derives.
+          */}
+        <Field
+          label="Colour"
+          hint="What marks this role's name in the Agents panel, on a task's chip and above its comments. Automatic derives one from the role's name — stable, the same for everybody, and never the colour reserved for the orchestrator. Stored as Claude Code's own `color:` key, so a subagent that already has one arrives with it set."
+          errors={errorsFor('extras')}
+          control={
+            <ColorChoice
+              value={colorOf(draft)}
+              unknown={unknownColor(draft)}
+              onChange={(color) => onEdit('extras', { extras: withColor(draft.extras, color) })}
+            />
+          }
+        />
+
+        {/*
           * **No harness control for a subagent**, and this is the one place on the screen where
           * a field disappears rather than greying out. The others grey because the question is
           * still meaningful and the answer is fixed; here the question does not exist. A Claude
@@ -1764,14 +1802,102 @@ function RoleForm({
           errors={errorsFor('extras')}
           control={
             <ExtraRows
-              extras={draft.extras}
-              onChange={(extras) => onEdit('extras', { extras })}
+              extras={metaExtras(draft.extras)}
+              onChange={(extras) =>
+                onEdit('extras', { extras: withMetaExtras(draft.extras, extras) })
+              }
             />
           }
         />
       </Group>
 
     </>
+  )
+}
+
+/**
+ * The role's colour, as nine swatches and a note.
+ *
+ * **Swatches and not a `<select>`**, which is the one place this form departs from `Choice`.
+ * Every other closed vocabulary here is a list of *words* — a harness, a permission mode — and a
+ * dropdown is right for those because reading the word is how you choose. A colour is chosen by
+ * looking at it, and a menu of the word "cyan" makes somebody open the menu, pick, close it, and
+ * check the row in another panel to find out what they picked.
+ *
+ * Each swatch is a real `<button type="button">`. A `<div onClick>` would be off the tab order
+ * and silent to a screen reader, and this control has no text of its own at all — `aria-label`
+ * is the only thing naming any of them, and `aria-pressed` the only thing saying which is on.
+ *
+ * The colours are drawn from the same `--agent-<hue>` tokens the panel paints with, never from a
+ * hex spelled here: a swatch that stated its own colour would be this file's opinion of what
+ * `cyan` looks like, and it would be one theme's opinion at that. `check:theme` gates those
+ * tokens and knows nothing about this component.
+ *
+ * **Automatic leads**, because it is the default, it is what every role has until somebody
+ * chooses, and — being the only option that *removes* the key — it is the one a reader needs to
+ * find when they change their mind. It is drawn as a ringed empty circle rather than a ninth
+ * colour, since the thing it means is the absence of a choice and not another choice.
+ */
+function ColorChoice({
+  value,
+  unknown,
+  onChange,
+}: {
+  value: string | null
+  unknown: string | null
+  onChange: (color: string | null) => void
+}) {
+  return (
+    <div className={styles.colorChoice} data-audit="agentColorChoice">
+      <div className={styles.colorSwatches} role="group" aria-label="Role colour">
+        <button
+          type="button"
+          className={cx(styles.colorSwatch, styles.colorAuto)}
+          data-audit="agentColorAuto"
+          aria-label="Automatic — derived from the role's name"
+          aria-pressed={value === null}
+          data-on={value === null ? 'true' : 'false'}
+          title="Automatic — derived from the role's name"
+          onClick={() => onChange(null)}
+        />
+        {AGENT_HUES.map((hue) => (
+          <button
+            key={hue}
+            type="button"
+            className={styles.colorSwatch}
+            data-audit="agentColorSwatch"
+            data-hue={hue}
+            /* The token, never a hex — see the header. */
+            style={{ background: `var(--agent-${hue})` }}
+            aria-label={titleCase(hue)}
+            aria-pressed={value === hue}
+            data-on={value === hue ? 'true' : 'false'}
+            title={titleCase(hue)}
+            onClick={() => onChange(hue)}
+          />
+        ))}
+      </div>
+      {/*
+        * A value the file asked for that this build cannot use. Named in full, because the
+        * *point* of the sentence is that the user can see the word they typed and correct it —
+        * "not a colour cide knows" without the word would send them back to the file to find out
+        * which line it meant. It is a `Note` and not a refusal: the role runs, and it is drawn
+        * in the colour its name derives, which is the same thing that would happen if the key
+        * were absent. Nothing here rewrites it; choosing a swatch is what replaces it.
+        */}
+      {unknown !== null && (
+        /* The hook goes on a wrapper, not on `Note`. TypeScript lets a hyphenated attribute
+           through on any component — `data-*` is exempt from JSX excess-property checking — but
+           `Note` does not spread its props, so it would be accepted here, dropped there, and the
+           render check would look for an element that never existed. */
+        <div data-audit="agentColorUnknown">
+          <Note tone="warn">
+            <code>{unknown}</code> is not one of the eight, so this role is drawn in the colour
+            its name derives. The key is kept exactly as the file has it until you choose above.
+          </Note>
+        </div>
+      )}
+    </div>
   )
 }
 

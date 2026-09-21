@@ -318,6 +318,15 @@ pub fn app_quit_requested(
 /// Empty when the user has turned `confirm_close_with_live_session` off, or when no hook
 /// server is running. Split out of [`app_quit_requested`] so that the setting is consulted
 /// in exactly one place and the unsaved-tab half cannot accidentally inherit it.
+///
+/// The enumeration is [`cide_core::workspace::session_panes`] and not a walk over `tabs`,
+/// which is what this did until M72 — and a walk over `tabs` misses `project.detached`
+/// entirely, so a busy `claude` in a torn-out window was never once mentioned by this dialog.
+/// The failure is silent in the direction that costs work: the warning that does not appear
+/// is the one that would have stopped the quit.
+///
+/// De-duplicated by session, `cmd::window::sessions_of`'s rule: two panes mirroring one child
+/// are the one conversation they are, and listing them twice would offer to interrupt it twice.
 fn live_sessions(
     app: &tauri::AppHandle,
     state: &State<'_, WorkspaceState>,
@@ -338,27 +347,18 @@ fn live_sessions(
 
     state.with(|ws| {
         let mut out = Vec::new();
-        for (id, p) in &ws.projects {
-            if project.is_some_and(|only| only != *id) {
+        let mut seen = std::collections::HashSet::new();
+        for found in cide_core::workspace::session_panes(ws, project) {
+            if !live.contains(&found.session) || !seen.insert(found.session) {
                 continue;
             }
-            for tab in &p.tabs {
-                for pane in tab.tree.panes.values() {
-                    let Some(session) = pane.session else {
-                        continue;
-                    };
-                    if !live.contains(&session) {
-                        continue;
-                    }
-                    out.push(cide_ipc::SessionSummary {
-                        session,
-                        project: *id,
-                        project_name: p.name.clone(),
-                        pane_title: pane.title.clone(),
-                        state: hooks.state(session),
-                    });
-                }
-            }
+            out.push(cide_ipc::SessionSummary {
+                session: found.session,
+                project: found.project,
+                project_name: found.project_name.to_owned(),
+                pane_title: found.pane.title.clone(),
+                state: hooks.state(found.session),
+            });
         }
         out
     })

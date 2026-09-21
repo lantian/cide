@@ -33,6 +33,7 @@ fn role() -> LoadedAgent {
             description: "Counts slowly.".into(),
             system_prompt: "You do exactly what you are asked and nothing else.".into(),
             model: None,
+            color: None,
             unavailable: None,
             max_concurrent: 1,
             worktree: false,

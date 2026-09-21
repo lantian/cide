@@ -42,6 +42,8 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+pub mod screen;
+
 pub mod jobs;
 pub use jobs::{JobEvent, JobWatch};
 
@@ -2079,6 +2081,57 @@ mod tests {
     /// running, which made `reports_exit_after_the_child_finishes` fail once and pass on the
     /// next three runs — a flaky test being strictly worse than no test.
     const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Does a real program's output reach the **scrollback ring**, and does a Claude console's?
+    ///
+    /// A device reported a Claude console it could not page back through while a shell beside it
+    /// paged fine, and cide answered `depth: 0` for it. The unit tests in [`crate::screen`] drive
+    /// the arithmetic over a hand-fed parser and cannot see this: the question is whether the
+    /// bytes a real child writes make this mirror *scroll* at all, which is a claim about two
+    /// programs and a pty rather than about any code here.
+    ///
+    /// Run it deliberately:
+    /// `cargo test -p cide-pty a_real_child_fills_the_ring -- --ignored --nocapture`.
+    /// It starts `claude` and **sends it nothing**, so no turn is taken and no quota is spent.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawns real programs, including the claude CLI; run deliberately"]
+    fn a_real_child_fills_the_ring() {
+        fn depth_after(spec: SpawnSpec, settle: Duration) -> u32 {
+            let session = PtySession::spawn(spec).expect("spawn");
+            let (sink, _out) = collect_sink();
+            session.attach(sink);
+            thread::sleep(settle);
+            let depth = session.scrollback_depth();
+            session.kill();
+            depth
+        }
+
+        // A shell that prints five hundred lines into a twenty-four row terminal: whatever the
+        // ring does, this must fill it.
+        let shell = depth_after(
+            SpawnSpec::new("/bin/bash", std::env::temp_dir())
+                .arg("--norc")
+                .arg("-c")
+                .arg("seq 1 500; sleep 30"),
+            Duration::from_millis(1500),
+        );
+        println!("shell depth: {shell}");
+        assert!(shell > 100, "a shell printing 500 lines scrolled {shell}");
+
+        // And the CLI, drawing its own interface into a terminal far too short for it. Nothing
+        // is typed at it.
+        let claude = depth_after(
+            SpawnSpec::new("claude", std::env::temp_dir()).geometry(Geometry {
+                rows: 10,
+                cols: 80,
+                cell_width: 8,
+                cell_height: 16,
+            }),
+            Duration::from_secs(6),
+        );
+        println!("claude depth: {claude}");
+    }
 
     /// A real `bash`, a real job, and the two events a pane needs to notify.
     ///

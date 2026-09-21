@@ -94,3 +94,28 @@ export function ToolWindowView({
     </section>
   )
 }
+
+/**
+ * The Log tab's body in the shell that has no project open. (M74)
+ *
+ * The panel is reachable from the empty frame now, and the Docker tab is genuinely live there —
+ * a daemon is a property of the machine, not of a checkout. A commit log is not: it walks *this
+ * project's* repositories, and there are none.
+ *
+ * So the tab says which of the two it is rather than drawing an empty list, on
+ * `ProblemsPanel`'s recorded rule: an empty list is a claim about a repository that was read,
+ * and nothing here has read one. It is pure and lives beside the frame so the smoke entry can
+ * render it — the body is the half `check:toolwindow` cannot see.
+ */
+export function ToolWindowNoProject() {
+  return (
+    <div className={styles.noProject} data-audit="toolWindowNoProject">
+      <p className={styles.claim}>No project open</p>
+      <p className={styles.detail}>
+        The commit log walks the open project’s repositories. Open one from the header’s{' '}
+        <b>+</b> button — or stay here: the <b>Docker</b> tab is about this machine and works
+        either way.
+      </p>
+    </div>
+  )
+}

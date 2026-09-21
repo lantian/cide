@@ -94,6 +94,25 @@ const BUILTINS_JSON: &str = "crates/cide-ipc/bindings/builtins.json";
 /// read eleven records.
 const BUILTIN_LANGUAGES_TS: &str = "ui/src/editor/builtinLanguages.ts";
 
+/// The protocol a paired device speaks, as TypeScript.
+///
+/// A **third** generated file, and a subset rather than a concatenation: it is the transitive
+/// closure of the frames in [`PROTOCOL_ROOTS`] and nothing else. That is what makes it readable
+/// as the protocol — a reviewer opening it sees exactly the types the wire can carry, and a type
+/// that stops being reachable from a frame leaves it without anybody having to remember.
+///
+/// It lives beside `contract/commands.json` and `contract/events.json` because it is the same
+/// kind of thing: a wire surface this repository promises not to change by accident. The mobile
+/// repository vendors it by copy — never a submodule, which would make that repository's CI
+/// depend on this one's layout.
+const PROTOCOL_TS: &str = "contract/protocol.ts";
+
+/// Where the protocol number is declared, so the emitted constant cannot disagree with it.
+const PROTOCOL_VERSION_SRC: &str = "crates/cide-ipc/src/remote.rs";
+
+/// The frames. Everything else in `protocol.ts` is reachable from one of these.
+const PROTOCOL_ROOTS: &[&str] = &["ClientFrame", "ServerFrame"];
+
 const HANDLER_SRC: &str = "crates/cide-app/src/lib.rs";
 const EMIT_SRC: &str = "crates/cide-app/src/emit.rs";
 const COMMANDS_JSON: &str = "contract/commands.json";
@@ -236,6 +255,13 @@ fn workspace_root() -> Result<PathBuf> {
 struct Block {
     name: String,
     body: String,
+    /// The sibling types this one names, read off the `import type` lines before they are
+    /// stripped.
+    ///
+    /// Thrown away until M72, because `generated.ts` is the concatenation of *everything* and a
+    /// dependency edge tells it nothing. `contract/protocol.ts` is a **subset** — the transitive
+    /// closure of the frames — and a subset cannot be taken without the edges.
+    deps: BTreeSet<String>,
 }
 
 fn codegen(check: bool) -> Result<()> {
@@ -255,6 +281,9 @@ fn codegen(check: bool) -> Result<()> {
 
     let builtins_target = root.join(BUILTIN_LANGUAGES_TS);
     let builtins_expected = render_builtins(&root)?;
+
+    let protocol_target = root.join(PROTOCOL_TS);
+    let protocol_expected = render_protocol(&root, &blocks)?;
 
     if check {
         let current = match fs::read_to_string(&target) {
@@ -280,6 +309,19 @@ fn codegen(check: bool) -> Result<()> {
         if current != builtins_expected {
             bail!("{BUILTIN_LANGUAGES_TS} is stale — run `cargo xtask codegen`");
         }
+        let current = match fs::read_to_string(&protocol_target) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("{PROTOCOL_TS} is missing — run `cargo xtask codegen`");
+            }
+            Err(e) => return Err(e).context(format!("reading {}", protocol_target.display())),
+        };
+        if current != protocol_expected {
+            bail!(
+                "{PROTOCOL_TS} is stale — run `cargo xtask codegen`\n{}",
+                describe_drift(&current, &protocol_expected)
+            );
+        }
         return Ok(());
     }
 
@@ -295,6 +337,14 @@ fn codegen(check: bool) -> Result<()> {
     fs::write(&builtins_target, &builtins_expected)
         .context(format!("writing {}", builtins_target.display()))?;
     println!("codegen: wrote {BUILTIN_LANGUAGES_TS}");
+
+    if let Some(parent) = protocol_target.parent() {
+        fs::create_dir_all(parent).context(format!("creating {}", parent.display()))?;
+    }
+    let protocol_types = protocol_expected.matches("\nexport ").count();
+    fs::write(&protocol_target, &protocol_expected)
+        .context(format!("writing {}", protocol_target.display()))?;
+    println!("codegen: wrote {PROTOCOL_TS} ({protocol_types} declarations)");
     Ok(())
 }
 
@@ -331,6 +381,88 @@ export const BUILTIN_LANGUAGES: readonly LanguageDef[] = {languages}
 
 export const BUILTIN_SERVERS: readonly LanguageServerDef[] = {servers}
 "
+    ))
+}
+
+/// Render the wire a paired device speaks, as one self-contained TypeScript module.
+///
+/// The closure, not the concatenation. `generated.ts` is every DTO in `cide-ipc` because the
+/// webview is inside this repository and may legitimately name any of them; a device is not, and
+/// the set it may name is exactly what the frames reach. Taking the closure rather than listing
+/// the types by hand is what stops the file from rotting in the one direction nobody notices — a
+/// frame that grows a field naming a new type brings the type with it, and a list would have
+/// silently omitted it.
+///
+/// `PROTOCOL_VERSION` is read out of the Rust source rather than restated here, because the whole
+/// value of the number is that both ends agree about it, and two places to write it down is one
+/// place too many.
+fn render_protocol(root: &Path, blocks: &[Block]) -> Result<String> {
+    let by_name: BTreeMap<&str, &Block> = blocks.iter().map(|b| (b.name.as_str(), b)).collect();
+
+    let mut wanted: BTreeSet<&str> = BTreeSet::new();
+    let mut queue: Vec<&str> = PROTOCOL_ROOTS.to_vec();
+    while let Some(name) = queue.pop() {
+        if !wanted.insert(name) {
+            continue;
+        }
+        let Some(block) = by_name.get(name) else {
+            bail!(
+                "{PROTOCOL_TS}: `{name}` is named by the protocol but has no ts-rs binding — is it \
+                 missing `#[ts(export)]`?"
+            );
+        };
+        for dep in &block.deps {
+            queue.push(dep.as_str());
+        }
+    }
+
+    let version = protocol_version(root)?;
+    let mut out = format!(
+        "// GENERATED FILE — DO NOT EDIT.
+//
+// cide's remote wire, written by `cargo xtask codegen` from `#[derive(TS)]` types in
+// `crates/cide-ipc`. This is the **whole** vocabulary and nothing but it: the transitive
+// closure, in name order, of
+//     {roots}
+// A type that is not reachable from a frame is not on this wire and is not in this file, which
+// is what makes reading this file the same thing as reading the protocol.
+//
+// Notably absent, and structurally so: `Workspace` and everything under it. It carries
+// `Settings`, which carries provider API keys and proxy passwords in plaintext. Nothing on this
+// wire can name it. See `crates/cide-ipc/src/remote.rs`.
+//
+// The companion application vendors this file by copy and compares PROTOCOL_VERSION against what
+// a server announces in its `welcome` frame. The rules are in `crates/cide-remote`: adding a
+// variant or an optional field keeps this number, removing or renaming anything bumps it.
+//
+// CI runs `cargo xtask codegen --check`, so a Rust rename that never reached this file fails the
+// build rather than surfacing as an `undefined` on somebody's phone.
+
+export const PROTOCOL_VERSION = {version}
+",
+        roots = PROTOCOL_ROOTS.join(", "),
+    );
+
+    for name in &wanted {
+        let block = by_name[name];
+        out.push('\n');
+        out.push_str(block.body.trim_start_matches(TS_RS_BANNER).trim_start());
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// `pub const PROTOCOL_VERSION: u32 = N;`, read from the source that declares it.
+fn protocol_version(root: &Path) -> Result<u32> {
+    let path = root.join(PROTOCOL_VERSION_SRC);
+    let text = fs::read_to_string(&path).context(format!("reading {}", path.display()))?;
+    let marker = "pub const PROTOCOL_VERSION: u32 = ";
+    let Some(rest) = text.split(marker).nth(1) else {
+        bail!("{PROTOCOL_VERSION_SRC} no longer declares `{marker}…`");
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().context(format!(
+        "{PROTOCOL_VERSION_SRC}: `{digits}` is not a version"
     ))
 }
 
@@ -399,9 +531,16 @@ fn read_blocks(bindings: &Path) -> Result<Vec<Block>> {
         let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
+        let deps = text
+            .lines()
+            .filter_map(sibling_import_of)
+            .filter(|m| names.contains(*m))
+            .map(str::to_owned)
+            .collect();
         blocks.push(Block {
             name,
             body: strip_sibling_imports(&text, &names),
+            deps,
         });
     }
     blocks.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1068,6 +1207,48 @@ fn bench_ipc(release: bool, build: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The rule `crates/cide-ipc/src/remote.rs` is written around, enforced where the file is
+    /// actually produced.
+    ///
+    /// A projection that grew a field reaching into the tree would pull `Workspace` — and with
+    /// it `Settings`, and with that every provider API key and the proxy password — into the
+    /// closure, and the only visible symptom would be a bigger generated file. This is what
+    /// notices.
+    #[test]
+    fn the_protocol_closure_can_never_reach_a_credential() {
+        let root = workspace_root().expect("a workspace root");
+        let blocks = read_blocks(&root.join(BINDINGS_DIR)).expect("bindings");
+        let rendered = render_protocol(&root, &blocks).expect("renders");
+
+        for forbidden in [
+            "Workspace",
+            "Settings",
+            "LlmSettings",
+            "LlmProvider",
+            "ProxySettings",
+            "apiKey",
+            "noProxy",
+        ] {
+            assert!(
+                !rendered.contains(&format!("export type {forbidden} ")),
+                "{forbidden} is reachable from a remote frame"
+            );
+        }
+        assert!(rendered.contains("export const PROTOCOL_VERSION = "));
+        assert!(rendered.contains("export type ClientFrame ="));
+        assert!(rendered.contains("export type ServerFrame ="));
+    }
+
+    /// The number is declared once, in Rust, and read from there.
+    #[test]
+    fn the_emitted_protocol_version_is_the_declared_one() {
+        let root = workspace_root().expect("a workspace root");
+        let declared = protocol_version(&root).expect("declared");
+        let blocks = read_blocks(&root.join(BINDINGS_DIR)).expect("bindings");
+        let rendered = render_protocol(&root, &blocks).expect("renders");
+        assert!(rendered.contains(&format!("export const PROTOCOL_VERSION = {declared}\n")));
+    }
+
     use super::*;
 
     /// The verdict parser, which is the only part of `verify-cli` that has a rule in it.
@@ -1256,10 +1437,12 @@ mod tests {
     fn rendering_is_stable_across_runs() {
         let blocks = vec![
             Block {
+                deps: BTreeSet::new(),
                 name: "A".into(),
                 body: format!("{TS_RS_BANNER}\n\nexport type A = string;"),
             },
             Block {
+                deps: BTreeSet::new(),
                 name: "B".into(),
                 body: format!("{TS_RS_BANNER}\n\nexport type B = number;"),
             },
@@ -1273,15 +1456,18 @@ mod tests {
     #[test]
     fn drift_is_reported_per_type() {
         let old = render(&[Block {
+            deps: BTreeSet::new(),
             name: "A".into(),
             body: format!("{TS_RS_BANNER}\n\nexport type A = string;"),
         }]);
         let new = render(&[
             Block {
+                deps: BTreeSet::new(),
                 name: "A".into(),
                 body: format!("{TS_RS_BANNER}\n\nexport type A = number;"),
             },
             Block {
+                deps: BTreeSet::new(),
                 name: "B".into(),
                 body: format!("{TS_RS_BANNER}\n\nexport type B = number;"),
             },
@@ -1295,6 +1481,7 @@ mod tests {
     #[test]
     fn identical_types_with_a_different_banner_still_report_something() {
         let block = Block {
+            deps: BTreeSet::new(),
             name: "A".into(),
             body: format!("{TS_RS_BANNER}\n\nexport type A = string;"),
         };

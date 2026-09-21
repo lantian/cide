@@ -60,6 +60,41 @@ pub enum Harness {
     Codex,
 }
 
+/// The colours a role may be drawn in, in the order a derived colour indexes them. (M75)
+///
+/// **Claude Code's own `color:` vocabulary**, deliberately, so a subagent that already declares
+/// one needs no translation table and no second spelling. `ui/src/styles/tokens.css` declares
+/// `--agent-<name>` for every entry in **both** palette blocks, and `AgentsPanel/model.ts`
+/// restates this list; `check:agents` scrapes this constant and asserts the two are equal, and
+/// `check:theme` asserts every name resolves to a token under both themes.
+///
+/// **The order is API.** A role with no `color:` of its own is drawn in the hue this list's
+/// *index* answers for a hash of its name, so reordering this list silently recolours every
+/// uncoloured role in every tracker. Append, never reorder — and appending is not free either,
+/// since the modulus moves with the length.
+///
+/// Eight, and not nine, because the ninth colour is the one reserved for the orchestrator:
+/// `--agent-orchestrator` is outside this list precisely so that no role can ever be given it,
+/// which is a property this list's *absence* of an entry enforces and a rule beside it would not.
+pub const AGENT_HUES: &[&str] = &[
+    "blue", "green", "orange", "purple", "cyan", "red", "yellow", "pink",
+];
+
+/// One of [`AGENT_HUES`] for a value a definition wrote, or `None` for anything else.
+///
+/// Trimmed and lowercased first, because a person types `Blue` and Claude Code's own UI offers
+/// `automatic` — which is not a colour and correctly answers `None`, meaning *derive one*. Every
+/// other miss (a hex, a typo, a colour Claude adds next month) takes the same road for the same
+/// reason: see [`AgentDef::color`] for why a bad value here is never an error.
+#[must_use]
+pub fn hue(raw: &str) -> Option<String> {
+    let folded = raw.trim().to_ascii_lowercase();
+    AGENT_HUES
+        .iter()
+        .find(|name| ***name == *folded)
+        .map(|name| (*name).to_string())
+}
+
 /// One role, as the panel draws it.
 ///
 /// The wire projection of `.cide/agents/<name>.md` (or its global twin beside `keymap.json`) —
@@ -116,6 +151,30 @@ pub struct AgentDef {
     /// A model alias or full name from the definition. `None` means the harness's own default,
     /// which is the right answer for a role whose author did not care.
     pub model: Option<String>,
+    /// The role's colour, as one of the eight hue names in `AgentsPanel/model.ts`'s `AGENT_HUES`
+    /// — or `None`, which means *derive one from the name*. (M75)
+    ///
+    /// # A presentation hint that cide reads and never writes
+    ///
+    /// `color` is **Claude Code's own front-matter key**, and [`AgentExtra`] already carries it
+    /// through a save untouched — `claude_corpus` asserts it by name among the keys cide does not
+    /// model. That does not change here, in either dialect: the key stays an extra, `render` goes
+    /// on emitting it verbatim from the source lines it occupied, and this field is a *read* of
+    /// it taken on the way past. Modelling it properly would mean cide re-spelling a key with its
+    /// own quoting rules in a committed file it did not author, to gain nothing a colour needs.
+    ///
+    /// So the value is normalised (trimmed, lowercased) and matched against the eight names; a
+    /// value that is not one of them — `automatic`, a hex, a typo, a colour Claude adds next
+    /// month — is `None` and the name's hash answers instead. Never a
+    /// [`Self::unavailable`] sentence: a role that could not be dispatched over a colour would be
+    /// absurd, and a role with no colour is exactly the ordinary case.
+    ///
+    /// It is deliberately **not** in `cide_agents::overrides::ChildSettings`. That type's
+    /// equality decides whether a paused run must be re-forked, and recolouring a role must not
+    /// cost somebody an in-flight turn.
+    #[ts(optional)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// Why this role cannot be dispatched, as a sentence — or `None` when it can.
     ///
     /// **This is [`crate::Command::unavailable`] one layer down, and for the identical reason.**
@@ -289,6 +348,57 @@ pub enum RunState {
     Failed { reason: String },
 }
 
+impl RunState {
+    /// Whether a run in this state is doing work that its **worked clock** should count.
+    ///
+    /// The one definition, and it is exhaustive so a ninth variant is a compile error here
+    /// rather than a state silently counted as one thing or the other. Read by
+    /// `cide_app::agents::move_to`, which is the only thing that assigns a run's state, and by
+    /// the two surfaces that render the figure.
+    ///
+    /// # Why a run needs a second clock at all
+    ///
+    /// [`AgentRun::started_unix_ms`] is stamped once, at enqueue, and never moves. Every
+    /// duration cide showed for a run used to be `now - started`, which is *age since dispatch*
+    /// and answers a different question from *how long did this agent work*. The two diverge
+    /// without bound in three ways, all of them ordinary use: a run paused overnight accrued
+    /// the night; a run that outlived a cide restart accrued the hours cide was shut; and a
+    /// finished run's figure went on growing for ever, so a run that took ninety seconds and
+    /// ended four hours ago read `4h 00m` on the row whose own doc said "how long it took".
+    ///
+    /// # Where the line is drawn, and why it is not drawn further out
+    ///
+    /// `Starting` and `Running` are the states in which a child of this run's own exists and is
+    /// progressing. Everything else is waiting, and each kind of waiting was considered:
+    ///
+    /// * `Queued` — waiting on a concurrency slot. There is no child. A run that sat behind two
+    ///   others for twenty minutes did no work in them, and counting the queue would make a
+    ///   role's figures depend on how busy the project was rather than on what the role did.
+    /// * `AwaitingPermission` — blocked on a human answering a prompt. The child is alive and
+    ///   its turn is open, which is the argument for counting it, but the interval is bounded by
+    ///   when somebody next looks at the screen: it is the same class as a pause and behaves
+    ///   like one, in that a run left overnight at a permission prompt would accrue the night.
+    /// * `Idle` — the turn was handed back. The run is holding its checkout waiting for the
+    ///   queue to give it another turn, which is waiting, not working.
+    /// * `Paused` — SIGSTOPped. The reported bug.
+    /// * `Interrupted` — no process at all; cide restarted out from under it.
+    /// * `Finished` / `Failed` — over. Answering `false` here is what makes a history row's
+    ///   figure **final** with no end stamp anywhere in the workspace: the clock simply stops,
+    ///   and the two bugs above it are fixed by the same absence rather than by three fixes.
+    pub fn counts_as_work(&self) -> bool {
+        match self {
+            Self::Starting | Self::Running => true,
+            Self::Queued
+            | Self::Idle
+            | Self::AwaitingPermission
+            | Self::Paused { .. }
+            | Self::Interrupted
+            | Self::Finished { .. }
+            | Self::Failed { .. } => false,
+        }
+    }
+}
+
 /// One dispatched execution, as the panel draws it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -335,6 +445,34 @@ pub struct AgentRun {
     /// seeing.
     pub task: Option<TaskId>,
     pub started_unix_ms: u64,
+    /// Milliseconds this run has **worked**, over its closed working intervals only.
+    ///
+    /// Read together with [`Self::working_since_unix_ms`]: the figure to show is this plus, when
+    /// that stamp is set, the time since it. Splitting a closed total from an open stamp is what
+    /// lets a live row tick between broadcasts without the producer sending a new number every
+    /// second, and what makes a paused or finished row's figure *stop* rather than freeze at
+    /// whatever the last event carried.
+    ///
+    /// [`RunState::counts_as_work`] is the definition of "working", and its doc carries the
+    /// argument for where the line is drawn.
+    ///
+    /// **This does not replace [`Self::started_unix_ms`]**, which stays exactly what it was: the
+    /// moment the run was dispatched. That is a real fact, it is what the panel's History sorts
+    /// by, and it is what `cide_agents::tools`' run list means by `started … ago` — which was
+    /// never wrong, because it says "started". What was wrong was rendering it as the run's
+    /// duration.
+    pub worked_ms: u64,
+    /// When the current working interval began, or `None` when this run is not working.
+    ///
+    /// `Some` in exactly the states [`RunState::counts_as_work`] admits, which is the invariant
+    /// `cide_app::agents::move_to` exists to keep — it is the only thing in the process that
+    /// assigns a run's state, and it opens and closes this stamp on the transition.
+    ///
+    /// Deliberately **not** persisted across a cide restart. Every restored run comes back
+    /// `Interrupted`, which is not working, so this is `None` by construction and the hours cide
+    /// spent shut add nothing to the figure — the offline case needs no snapshot timestamp and
+    /// no code of its own.
+    pub working_since_unix_ms: Option<u64>,
     /// Where cide announces this run's turn endings — the nudge `agent_rpc::note_run_over` types
     /// into a Claude pane. Recorded at dispatch and carried on the wire so the run list can say
     /// which runs will never announce themselves. (M40)
@@ -1011,6 +1149,56 @@ pub struct AgentModels {
 mod tests {
     use super::*;
 
+    /// The eight are the only eight, and a value outside them derives rather than paints.
+    ///
+    /// The negative half is the specification, the way it is for the failover classifier and the
+    /// JSON-log detector: this function's whole job is to be **unsure safely**, because the
+    /// vocabulary it validates against belongs to Claude Code and will grow without asking.
+    #[test]
+    fn a_hue_is_one_of_the_eight_or_it_is_nothing() {
+        assert_eq!(
+            AGENT_HUES.len(),
+            8,
+            "eight, because the ninth colour is the orchestrator's"
+        );
+        assert!(
+            !AGENT_HUES.contains(&"orchestrator"),
+            "the reserved colour is not in the list a role indexes — that absence is the reservation"
+        );
+        for name in AGENT_HUES {
+            assert_eq!(hue(name).as_deref(), Some(*name), "{name} names itself");
+        }
+
+        assert_eq!(
+            hue("Cyan").as_deref(),
+            Some("cyan"),
+            "folded — a person types it"
+        );
+        assert_eq!(
+            hue("  cyan  ").as_deref(),
+            Some("cyan"),
+            "and trimmed, for the same reason"
+        );
+
+        for outside in [
+            // Claude Code's own UI offers this, and it is not a colour: it means derive one.
+            "automatic",
+            // A hex is a perfectly sensible thing to write and is still not one of the eight;
+            // painting it would put an unvalidated colour on `--panel` with no contrast gate.
+            "#ff0000",
+            // The reserved colour, spelled by somebody who read the source. Refused here as well
+            // as unreachable by hash, because a definition must not be able to claim it.
+            "orchestrator",
+            // A colour a future Claude release adds. A warning would be noise about a key cide
+            // does not model; the name simply derives its hue, which is a perfectly good colour.
+            "teal",
+            "",
+            "   ",
+        ] {
+            assert_eq!(hue(outside), None, "{outside:?} is not one of the eight");
+        }
+    }
+
     #[test]
     fn a_run_round_trips_under_its_wire_names() {
         let run = AgentRun {
@@ -1025,6 +1213,9 @@ mod tests {
             },
             task: Some(TaskId("t-14".into())),
             started_unix_ms: 1_699_999_000_000,
+            worked_ms: 125_000,
+            // Paused, so no interval is open — the pair's invariant, asserted below.
+            working_since_unix_ms: None,
             notify: RunNotify::Primary,
             stale_turn: true,
             note: None,
@@ -1032,10 +1223,56 @@ mod tests {
         };
         let json = serde_json::to_string(&run).expect("serialize");
         // snake_case on both sides would round-trip happily and read `undefined` in the webview.
-        for wire in ["agentLabel", "startedUnixMs", "staleTurn", "sinceUnixMs"] {
+        for wire in [
+            "agentLabel",
+            "startedUnixMs",
+            "workedMs",
+            "workingSinceUnixMs",
+            "staleTurn",
+            "sinceUnixMs",
+        ] {
             assert!(json.contains(wire), "missing {wire} in {json}");
         }
         assert_eq!(serde_json::from_str::<AgentRun>(&json).unwrap(), run);
+    }
+
+    #[test]
+    fn only_a_run_with_a_child_of_its_own_is_working() {
+        // The table in `counts_as_work`'s doc, as assertions. Every variant appears, so this
+        // fails to compile-and-pass rather than silently omitting a new one — the match itself
+        // is exhaustive, and this is what pins *which* answer each arm gives.
+        for working in [RunState::Starting, RunState::Running] {
+            assert!(working.counts_as_work(), "{working:?} is work");
+        }
+        for waiting in [
+            RunState::Queued,
+            RunState::Idle,
+            RunState::AwaitingPermission,
+            RunState::Paused {
+                since_unix_ms: 1_700_000_000_000,
+            },
+            RunState::Interrupted,
+            RunState::Finished { code: 0 },
+            RunState::Failed {
+                reason: "no worktree".into(),
+            },
+        ] {
+            assert!(!waiting.counts_as_work(), "{waiting:?} is not work");
+        }
+    }
+
+    #[test]
+    fn a_finished_runs_figure_is_final_because_its_clock_is_shut() {
+        // The history row's whole claim, and the reason this change needs no end timestamp:
+        // a terminal state opens no interval, so `worked_ms` is the answer for ever and
+        // `working_since_unix_ms` has nothing to add to it however far the clock moves.
+        assert!(!RunState::Finished { code: 0 }.counts_as_work());
+        assert!(
+            !RunState::Failed {
+                reason: "spawn failed".into()
+            }
+            .counts_as_work()
+        );
     }
 
     #[test]

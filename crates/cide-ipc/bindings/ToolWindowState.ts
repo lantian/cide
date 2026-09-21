@@ -3,7 +3,13 @@ import type { HistoryTab } from "./HistoryTab";
 import type { HistoryTabId } from "./HistoryTabId";
 
 /**
- * The Git tool window's own state, per project. (M18)
+ * The Git tool window's own state, per project — and once more on [`Workspace`] itself, for
+ * the shell that has no project open. (M18, M74)
+ *
+ * One type for both because the panel is one panel: the tab strip, the splitter, the repair
+ * pass and every command that moves any of it are written against this shape, and a second,
+ * narrower struct for the projectless frame would be a second set of arms for each of them.
+ * What differs is only which of them can be *reached* — see [`Workspace::tool_window`].
  *
  * Per project and not per window, deliberately. The panel is a view of *this project's*
  * repositories, and the same project shown in two windows (which `Stacked` mode makes ordinary)

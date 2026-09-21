@@ -49,6 +49,15 @@ export interface AgentsDigest {
   text: string
   /** One entry per run row — activity lines and Recent alike: `<phase>|<glyph>|<row text>`. */
   rows: string[]
+  /**
+   * The time cell of every run row: what it draws, and what its `title` says.
+   *
+   * Its own field rather than a substring of [`rows`], because it is the one thing on a row
+   * that is computed from a clock and the only end-to-end proof that `RunRow` calls
+   * `workedFor` at all — the model's own tables cannot see a row that went on calling
+   * `elapsed(nowMs, startedMs)`, which is precisely the bug being fixed.
+   */
+  times: { drawn: string; title: string }[]
   /** How many Open controls exist **as elements**. A resting role must contribute zero. */
   opens: number
   /** How many Dispatch buttons exist. */
@@ -117,6 +126,31 @@ export interface AgentsRoleDigest {
   badge: string
   /** The scope the chip claims, so the check can tell the two Claude scopes apart. */
   badgeScope: string
+  /**
+   * The inline colour on the role's name, verbatim — `var(--agent-…)`, or `''`. (M75)
+   *
+   * Read off the **style attribute** and not a class, because the colour is a value chosen per
+   * role rather than one of a fixed set of rules; a class digest would be identical for every
+   * row and would prove nothing. The `''` case is a failure the check names out loud: a name
+   * with no inline colour is drawn in whatever it inherited, which is what every role looked
+   * like before this existed.
+   */
+  nameColor: string
+}
+
+/**
+ * The `color:` of the inline style on the element carrying this audit hook, or `''`.
+ *
+ * Two steps — find the tag, then read the attribute out of it — rather than one regex spanning
+ * both, because JSX prop order decides attribute order in the markup and a single ordered
+ * pattern silently matches nothing the day somebody moves `style` above `data-audit`. That is
+ * exactly the trap `cell()`'s `data-current` rule in the diff pane is written about, arriving
+ * here from the other side: there the fix was to freeze the order, and here there is no reason
+ * to, so the reader is made order-blind instead.
+ */
+function inlineColor(html: string, audit: string): string {
+  const tag = new RegExp(`<[a-z]+\\b[^>]*data-audit="${audit}"[^>]*>`).exec(html)?.[0] ?? ''
+  return /style="[^"]*\bcolor:\s*([^";]*)/.exec(tag)?.[1]?.trim() ?? ''
 }
 
 const digests = (Object.keys(AGENTS_STORIES) as AgentsStoryName[]).map((story) =>
@@ -145,6 +179,11 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
     badge: text(/data-audit="agentsRoleBadge"[^>]*>([^<]*)</.exec(role)?.[1] ?? ''),
     badgeScope:
       /data-audit="agentsRoleBadge"[^>]*\bdata-scope="([^"]*)"/.exec(role)?.[1] ?? '',
+    nameColor: inlineColor(role, 'agentsRoleName'),
+  }))
+  const times = all(html, 'agentsElapsed').map((cell) => ({
+    drawn: text(/>([^<]*)</.exec(cell)?.[1] ?? ''),
+    title: attr(cell, 'title'),
   }))
   const empty = all(html, 'agentsEmpty')[0] ?? ''
   const bars = all(html, 'agentsStaleBar')
@@ -155,6 +194,7 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
     buttons: [...html.matchAll(/<button\b[^>]*>([\s\S]*?)<\/button>/g)].map((m) => text(m[1] ?? '')),
     text: text(html),
     rows,
+    times,
     opens: count(html, 'data-audit="agentsOpen"'),
     dispatches: count(html, 'data-audit="agentsDispatch"'),
     configures: count(html, 'data-audit="agentsConfigure"'),

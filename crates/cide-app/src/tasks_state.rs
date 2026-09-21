@@ -16,12 +16,14 @@
 //!
 //! # Why the flusher exists, and the mistake it is written not to repeat
 //!
-//! There is no app tick. `WorkspaceState::flush_if_due` documents itself as "called from the
-//! app's tick and before quitting" and is called by **neither** — `grep -rn flush_if_due` finds
-//! its definition and a mention inside a comment — so `workspace.json` is in fact written
-//! exactly once per run, on shutdown, and its 500 ms debounce is inert. That is a real defect
-//! (`docs/journal.md` records it), and `positions_state::PositionsState` answered it by starting its
-//! own thread rather than by pretending a tick exists. This does the same.
+//! There is no app tick, and for three milestones nothing noticed: `WorkspaceState::flush_if_due`
+//! documented itself as "called from the app's tick and before quitting" and was called by
+//! **neither**, so `workspace.json` was written exactly once per run, on shutdown, and its 500 ms
+//! debounce was inert. `positions_state::PositionsState` answered that by starting its own thread
+//! rather than by pretending a tick exists; this does the same, and in M73 the workspace itself
+//! finally did too (`WorkspaceState::start_flusher`, which carries what the defect cost). Three
+//! stores, three threads, no tick — which is the arrangement to keep, because each one's timer is
+//! chosen for what its own file is worth.
 //!
 //! It matters more here than for either of those, because this store is the only one in the
 //! process whose file **has writers cide does not control**. A `git pull`, a teammate's commit,

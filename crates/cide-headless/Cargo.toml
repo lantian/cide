@@ -38,3 +38,6 @@ cide-ext = { workspace = true }
 # differs between machines and is the first thing to ask for when a panel says there is no Docker
 # on a machine where `docker ps` works.
 cide-docker = { workspace = true }
+# M72. Linked so the no-tauri proof covers the remote surface too — this manifest's own note
+# above records the same omission being made for four crates across four milestones.
+cide-remote = { workspace = true }

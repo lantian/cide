@@ -4072,6 +4072,11 @@ fn render_run(run: &AgentRun, now: u64) -> String {
         },
         age(now, run.started_unix_ms),
     );
+    // A second figure, because the first one answers a different question and was being read as
+    // this one. `started … ago` is wall clock since dispatch and includes every pause, every
+    // hour cide was shut and the wait for a concurrency slot; `worked` is the time this run
+    // actually had a child progressing. On a run paused overnight the two differ by the night.
+    line.push_str(&format!(" | worked {}", span(worked_ms(run, now))));
     if let Some(detail) = run_state_detail(&run.state) {
         line.push_str(&format!(" | {detail}"));
     }
@@ -4161,13 +4166,50 @@ pub fn run_state_detail(state: &RunState) -> Option<String> {
 /// future timestamp — a clock that moved backwards, or a run whose row outlived a suspend —
 /// reads as `just now` rather than as a negative number nobody can act on.
 fn age(now: u64, then: u64) -> String {
-    let seconds = now.saturating_sub(then) / 1_000;
-    match seconds {
-        0..=44 => "just now".to_string(),
-        45..=5_399 => format!("{}m ago", (seconds + 30) / 60),
-        5_400..=172_799 => format!("{}h ago", (seconds + 1_800) / 3_600),
-        _ => format!("{}d ago", (seconds + 43_200) / 86_400),
+    match now.saturating_sub(then) {
+        // `span` answers `a moment` for anything under 45 seconds, which is the right word for
+        // a duration and the wrong one for a point in time — nobody says "a moment ago" meaning
+        // forty seconds ago, they say "just now". The one phrase the two readings do not share.
+        ms if ms / 1_000 <= 44 => "just now".to_string(),
+        ms => format!("{} ago", span(ms)),
     }
+}
+
+/// A duration, in the coarsest unit that still says something.
+///
+/// The unit ladder [`age`] is written over, factored out so the run list's two figures — when a
+/// run started and how long it has worked — cannot drift into two vocabularies. One producer,
+/// for `cide_git::push::preview`'s stated reason.
+///
+/// Rounded to nearest and never more precise than the unit above it, which is [`age`]'s
+/// argument unchanged: an orchestrator asks *is this wedged* or *has this done anything*, and
+/// `2h` answers either, while `2h 14m 3s` costs tokens to say the same thing.
+fn span(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    match seconds {
+        // Distinct from a zero, and deliberately not `0m`: a run admitted this second has
+        // genuinely worked no measurable time, and a bare `0m` reads as a broken counter.
+        0..=44 => "a moment".to_string(),
+        45..=5_399 => format!("{}m", (seconds + 30) / 60),
+        5_400..=172_799 => format!("{}h", (seconds + 1_800) / 3_600),
+        _ => format!("{}d", (seconds + 43_200) / 86_400),
+    }
+}
+
+/// How long this run has **worked**, from the two halves the wire carries.
+///
+/// `worked_ms` is the closed total and `working_since_unix_ms` is the open interval, set only
+/// while [`RunState::counts_as_work`] admits the run's state. So a paused, queued, idle or
+/// finished run's figure is simply `worked_ms` — it does not advance, which is the whole of the
+/// fix: the number stops when the work does.
+///
+/// `saturating_sub` throughout, for the reason `cide_app::agents::move_to` states: this is wall
+/// clock, it can step backwards, and a backwards clock must read as no time passed.
+fn worked_ms(run: &AgentRun, now: u64) -> u64 {
+    run.worked_ms.saturating_add(
+        run.working_since_unix_ms
+            .map_or(0, |since| now.saturating_sub(since)),
+    )
 }
 
 /// A commit id, short enough to read and long enough to `git show`.
@@ -7265,6 +7307,7 @@ mod tests {
             description: description.to_string(),
             system_prompt: "You are …".to_string(),
             model: None,
+            color: None,
             unavailable: unavailable.map(str::to_string),
             max_concurrent: 1,
             worktree: true,
@@ -7299,7 +7342,22 @@ mod tests {
         }
     }
 
-    fn run(agent: &str, state: RunState, task: Option<&str>, minutes_ago: u64) -> AgentRun {
+    /// One run, dispatched `minutes_ago` and having worked `worked_minutes` of that.
+    ///
+    /// The two are separate arguments because they are separate facts, and a helper that
+    /// derived one from the other could not build the fixture this change exists for: a run
+    /// dispatched a day ago that worked fourteen minutes of it. `working_since` is set from
+    /// the state rather than passed, because the pair's invariant is that it is `Some` in
+    /// exactly the states [`RunState::counts_as_work`] admits — a helper able to violate that
+    /// would let a test assert on a row no registry can produce.
+    fn run(
+        agent: &str,
+        state: RunState,
+        task: Option<&str>,
+        minutes_ago: u64,
+        worked_minutes: u64,
+    ) -> AgentRun {
+        let working = state.counts_as_work();
         AgentRun {
             run: RunId::new(),
             agent: AgentId(agent.to_string()),
@@ -7310,6 +7368,14 @@ mod tests {
             state,
             task: task.map(|id| TaskId(id.to_string())),
             started_unix_ms: NOW - minutes_ago * 60_000,
+            // A working run carries part of its total in the open interval, so the row is built
+            // from both halves the way a real one is; a run that is not working carries it all
+            // in `worked_ms` and its figure does not move when `now` does.
+            worked_ms: match working {
+                true => 0,
+                false => worked_minutes * 60_000,
+            },
+            working_since_unix_ms: working.then(|| NOW - worked_minutes * 60_000),
             notify: RunNotify::Primary,
             stale_turn: false,
             note: None,
@@ -7335,9 +7401,13 @@ mod tests {
                 ),
             ],
             runs: vec![
-                run("developer", RunState::Running, Some("t-1"), 4),
-                run("developer", RunState::Queued, Some("t-2"), 1),
-                run("qa", RunState::Finished { code: 0 }, Some("t-3"), 90),
+                run("developer", RunState::Running, Some("t-1"), 4, 4),
+                // Queued for a minute and therefore has worked none of it — the queue is not
+                // work, which is one of the three ways the old single figure overstated.
+                run("developer", RunState::Queued, Some("t-2"), 1, 0),
+                // Dispatched an hour and a half ago, worked two minutes of it. The divergence
+                // this whole change is about, in the fixture the row assertions read.
+                run("qa", RunState::Finished { code: 0 }, Some("t-3"), 90, 2),
             ],
             definitions: vec![draft("developer", AgentScope::Project)],
             written: Mutex::new(Vec::new()),
@@ -7758,11 +7828,11 @@ mod tests {
         eprintln!("{text}");
         assert!(text.starts_with("2 run(s)."), "{text}");
         assert!(
-            text.contains("[running] `developer` | on t-1 | started 4m ago"),
+            text.contains("[running] `developer` | on t-1 | started 4m ago | worked 4m"),
             "{text}"
         );
         assert!(
-            text.contains("[queued] `developer` | on t-2 | started 1m ago"),
+            text.contains("[queued] `developer` | on t-2 | started 1m ago | worked a moment"),
             "{text}"
         );
         assert!(!text.contains("t-3"), "a finished run is hidden: {text}");
@@ -7774,9 +7844,14 @@ mod tests {
         ));
         assert!(with_finished.starts_with("3 run(s)."), "{with_finished}");
         assert!(
-            with_finished.contains("[finished] `qa` | on t-3 | started 2h ago | exit 0"),
+            with_finished
+                .contains("[finished] `qa` | on t-3 | started 2h ago | worked 2m | exit 0"),
             "{with_finished}"
         );
+        // The two figures on one row, differing by an hour and a half. A fixture where they
+        // agree cannot see this bug, which is why the qa run is built to disagree — and a
+        // finished run's `worked` is **final**: no interval is open, so it reads `2m` however
+        // long ago the run ended, where the old single figure read `2h` and rose every day.
 
         let one_role = text_of(&ask(tool::AGENT_RUNS, json!({ "agent": "qa" }), &sink));
         // Nothing of qa's is live, and saying "0 runs" would read as “nothing was ever
@@ -7804,12 +7879,21 @@ mod tests {
                 },
                 Some("t-1"),
                 9,
+                3,
             )],
             ..roster()
         };
         let text = text_of(&ask(tool::AGENT_RUNS, json!({}), &sink));
         assert!(text.contains("[paused]"), "{text}");
         assert!(text.contains("only the user can resume it"), "{text}");
+        // Dispatched nine minutes ago, worked three of them, frozen for the rest. The reported
+        // bug in one assertion: a paused run's figure is the work, not the wait, and it does
+        // not move for as long as the freeze lasts — which for a run paused overnight is the
+        // difference between `3m` and `24h`.
+        assert!(
+            text.contains("started 9m ago | worked 3m"),
+            "a pause is excluded from the worked figure: {text}"
+        );
     }
 
     #[test]

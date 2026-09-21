@@ -1734,6 +1734,7 @@ mod tests {
             description: description.to_string(),
             system_prompt: "You are …".into(),
             model: None,
+            color: None,
             unavailable: None,
             max_concurrent: 1,
             worktree: true,

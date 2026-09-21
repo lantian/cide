@@ -106,6 +106,28 @@ try {
     'and leaves them exactly where they were',
   )
 
+  // --- the shell with no project open (M74) ------------------------------------------------
+  //
+  // The rail's tool-window button was inert with nothing open, because the panel's state lived
+  // only on `Project`. It lives on `Workspace` too now, and the two claims that make the
+  // projectless panel honest are both here rather than in the model: a panel that cannot hold a
+  // history tab draws exactly Log and Docker, and its Log tab says there is no project instead
+  // of drawing an empty commit list — an empty list is a claim about a repository that was read.
+
+  eq(
+    byName.noProject.labels,
+    ['Log', 'Docker'],
+    'the projectless panel has exactly the two tabs that are not a project’s',
+  )
+  eq(byName.noProject.closable, [], 'and neither of them can be closed')
+  eq(
+    byName.noProject.body,
+    'No project open'
+      + 'The commit log walks the open project’s repositories. Open one from the header’s '
+      + '+ button — or stay here: the Docker tab is about this machine and works either way.',
+    'the Log tab states which of the two tabs cannot work here, and that the other one can',
+  )
+
   // --- the body follows the selection ----------------------------------------------------
   //
   // The host slots the active tab's view in here. If the frame drew the wrong one the panel

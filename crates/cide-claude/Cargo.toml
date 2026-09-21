@@ -18,6 +18,10 @@ cide-core = { workspace = true }
 # A second copy of either is a second thing to get wrong on the next CLI release.
 cide-ide-mcp = { workspace = true }
 cide-pty = { workspace = true }
+# The digest that guards a permission answer against a prompt that moved. A real hash rather than
+# the screen's own line digests, because this one is a safety check and not a repaint
+# optimisation — see `permission`.
+blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -27,6 +31,9 @@ uuid = { workspace = true }
 [dev-dependencies]
 # The real-CLI test mints a session id to demand back from the hook payload.
 uuid = { workspace = true }
+# The permission corpus is written as the *text a prompt draws*, run through a real parser, so a
+# fixture reads as the screen it is rather than as a page of serialised rows. See `permission`.
+vt100 = { workspace = true }
 
 # A *dev*-dependency, and it was a normal one until `orphans::arm` moved to
 # `cide_core::child_env`. Nothing this crate compiles calls libc any more — the one remaining

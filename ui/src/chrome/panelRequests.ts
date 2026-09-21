@@ -416,5 +416,49 @@ export function quoteDraft(message: string): string {
 export function __resetPanelRequests(): void {
   parked = null
   host = null
+  settingsHost = null
   listeners.clear()
+}
+
+// --- the Settings screen in a window with no project ------------------------------------------
+
+/**
+ * Show the projectless Settings screen. (M74)
+ *
+ * The third registered opener in this file's shape, for the same reason as the first: revealing
+ * it is a `useState` setter in `App.tsx`, and `keys/dispatch.ts` is not inside React. Without
+ * this seam `settings.open` and `settings.keymap` could only refuse with nothing open — which
+ * is what they did, and why they carried a `projectOpen` clause that has now gone.
+ *
+ * The section is a `string` rather than a `SettingsSection` for the reason stated at the top of
+ * this file: it must resolve under a bare `tsc` with no `paths`, and `@/ipc/generated` would
+ * not. `null` means *wherever it was left* — `settings/SettingsTab.tsx` holds that memory.
+ */
+export type SettingsFrameHost = (section: string | null) => void
+
+/** One slot, not a listener list — `registerPanelHost`'s rule, and for its reason. */
+let settingsHost: SettingsFrameHost | null = null
+
+/**
+ * Install the window's Settings opener, or `null` on unmount.
+ *
+ * Registered only by a shell window. A detached pane or tab window imports this module too and
+ * has no work area to draw the screen in, so it must answer `false` rather than swallow the
+ * gesture — `registerPanelHost` says the same thing about the sidebar.
+ */
+export function registerSettingsFrameHost(show: SettingsFrameHost | null): void {
+  settingsHost = show
+}
+
+/**
+ * Show it, from anywhere. `false` means this window cannot, and the caller should say so.
+ *
+ * Note what this does **not** do: toggle. `chrome/sidebarView.ts` records the rule — a command
+ * that names a surface reveals it — and it matches the gesture with a project open, where
+ * `settings.open` opens or re-activates the Settings tab and never closes it.
+ */
+export function requestSettingsFrame(section: string | null): boolean {
+  if (settingsHost === null) return false
+  settingsHost(section)
+  return true
 }

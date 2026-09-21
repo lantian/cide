@@ -56,6 +56,7 @@ pub mod logring;
 pub mod lsp;
 pub mod notes;
 pub mod positions_state;
+pub mod remote;
 pub mod scratches;
 // Comment stripping for this crate's structural source assertions. Test-only: a source
 // assertion is a gate, not a product feature, and shipping the stripper in the binary would
@@ -323,6 +324,16 @@ pub fn run() {
         }
     };
 
+    // The remote listener, on the same trade as the IDE subsystem above: a failure here costs a
+    // feature that is off by default, and refusing to launch over it would be absurd.
+    let remote = match remote::PendingRemote::new() {
+        Ok(pending) => Some(pending),
+        Err(error) => {
+            tracing::error!(%error, "could not start the remote subsystem; no device can connect");
+            None
+        }
+    };
+
     builder = builder.manage(SessionRegistry::default());
     // The raw text behind rendered log lines, one bounded ring per session. See `logring`.
     builder = builder.manage(std::sync::Arc::new(logring::JsonLogRing::default()));
@@ -574,6 +585,13 @@ pub fn run() {
             cmd::window::window_close,
             cmd::window::window_list,
             cmd::window::window_set_awaiting,
+            cmd::remote::remote_status,
+            cmd::remote::remote_devices,
+            cmd::remote::remote_pairing_start,
+            cmd::remote::remote_pairing_progress,
+            cmd::remote::remote_pairing_cancel,
+            cmd::remote::remote_device_forget,
+            cmd::remote::remote_device_rename,
             cmd::window::window_awaiting_sessions,
             cmd::fs::fs_index,
             cmd::fs::fs_close,
@@ -824,10 +842,15 @@ pub fn run() {
                 });
             }
 
-            // The view-position store's own flusher. Its own thread and its own timer because
-            // there is no app tick to hang it on — `WorkspaceState::flush_if_due` documents one
-            // and is called by nobody, which is why `workspace.json` is in fact written once
-            // per run. See `positions_state.rs`.
+            // The workspace's own flusher, and it is first because it is the file whose loss
+            // costs the most: until M73 nothing called `flush_if_due` at all — there is no app
+            // tick — so `workspace.json` was written exactly once per run, at teardown, and a
+            // session that did not exit cleanly lost every layout change and every setting it
+            // had made. See `workspace_state::start_flusher`.
+            WorkspaceState::start_flusher(app.handle().clone());
+
+            // The view-position store's own flusher. Its own thread and its own timer, for the
+            // same reason and by the same pattern. See `positions_state.rs`.
             app.state::<std::sync::Arc<positions_state::PositionsState>>()
                 .start_flusher();
 
@@ -918,6 +941,14 @@ pub fn run() {
                 let ws = app.state::<WorkspaceState>().snapshot();
                 // Ensuring and managing are one call because they were two, and the bug was
                 // that they could disagree. See `ide::PendingIdeServers`.
+                pending.install(app.handle(), &ws);
+            }
+
+            // And the remote listener, from the same snapshot and for the same reason the block
+            // above gives: a subsystem installed only by a command is one every restoring launch
+            // comes up without, and this one's whole job is to be there before anybody looks.
+            if let Some(pending) = remote {
+                let ws = app.state::<WorkspaceState>().snapshot();
                 pending.install(app.handle(), &ws);
             }
 
