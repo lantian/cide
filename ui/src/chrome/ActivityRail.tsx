@@ -139,6 +139,7 @@ const EXTENSION_FALLBACK: IconName = 'puzzle'
 const ITEMS: readonly RailItem[] = [
   { id: 'files', icon: 'file-text', label: 'Files' },
   { id: 'git', icon: 'git-branch', label: 'Git' },
+  { id: 'gitlab', path: 'M12 22 2 14l2-11 4 8h8l4-8 2 11-10 8ZM2 14h20M8 11l4 11 4-11', label: 'GitLab merge requests' },
   { id: 'search', icon: 'search', label: 'Search' },
   { id: 'problems', icon: 'triangle-alert', label: 'Problems' },
   /*

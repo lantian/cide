@@ -5071,3 +5071,18 @@ export const dockerEvents = {
       handler(event.payload.board),
     ),
 }
+
+
+export const gitlab = {
+  openDocument: (project: ProjectId, document: import('./generated').GitLabDocument) =>
+    invoke<TabId>('gitlab_open_document', { project, document }),
+  openUrl: (url: string) => invoke<void>('gitlab_open_url', { url }),
+  request: (request: import('./generated').GitLabRequest) =>
+    invoke<import('./generated').GitLabResponse>('gitlab_request', { request }),
+  afterPush: (project: string, repo: string, remote: string, branch: string) =>
+    invoke<unknown>('gitlab_after_push', { project, repo, remote, branch }),
+  localFile: (review: string, project: string, sourceUrl: string, path: string) =>
+    invoke<string | null>('gitlab_local_file', { review, project, sourceUrl, path }),
+  onChanged: (handler: (board: import('./generated').GitLabBoard) => void) =>
+    listen<import('./generated').GitLabBoard>('cide://gitlab-changed', e => handler(e.payload)),
+}

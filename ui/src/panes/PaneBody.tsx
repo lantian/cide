@@ -1,3 +1,5 @@
+import { ReviewEditor } from '@/gitlab/ReviewEditor'
+import { documentFromKey } from '@/gitlab/store'
 /**
  * What goes inside a pane frame.
  *
@@ -238,6 +240,9 @@ export function PaneBody({
   // dirty flag: saving in one would clear the close guard while the other still held
   // unsaved text. Keying on the pane means a File tab has exactly one editor, which is what
   // makes one dirty flag per tab the right shape rather than a race.
+  if (diff?.origin.kind === 'gitLab' && pane.kind === 'diff') {
+    return <ReviewEditor document={documentFromKey(diff.origin.document)} project={project ?? null} visible={onScreen ?? true} />
+  }
   if (editor && pane.kind === 'editor') {
     /*
      * An image is a file tab too, and the fork is here rather than in Rust. (M18)

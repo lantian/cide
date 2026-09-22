@@ -238,6 +238,9 @@ impl Drop for ReleaseClaim {
 /// calling thread for a signal or a `RunEvent::Exit`. Nothing here touches the event loop, so
 /// it is correct on either — and that is the property that lets the loop keep painting.
 fn run_teardown(app: &AppHandle) {
+    if let Some(gitlab) = app.try_state::<crate::cmd::gitlab::GitLabState>() {
+        gitlab.shutdown(app);
+    }
     // The profile claim goes back when this function leaves, by whichever of its exits it
     // takes — hence a guard rather than a line at the bottom, which the early return below
     // would skip. A file left behind is not a failure (the next start finds a dead pid and

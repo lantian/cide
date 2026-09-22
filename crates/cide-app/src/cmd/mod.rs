@@ -82,3 +82,5 @@ pub mod ext;
 // a separate crate apply one layer up as well.
 pub mod docker;
 pub mod spec;
+
+pub mod gitlab;

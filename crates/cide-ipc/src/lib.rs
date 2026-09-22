@@ -8,6 +8,7 @@
 //! This crate must never depend on `tauri`.
 
 pub mod git;
+pub mod gitlab;
 pub mod headless;
 // The Git tool window: the commit log and its graph, one commit's contents, revisions, blame and
 // the commit-level actions. (M18)

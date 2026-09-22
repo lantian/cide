@@ -271,6 +271,8 @@ try {
     { key: 'ctrl+alt+shift+n', command: 'picker.symbols', when: null },
     { key: 'alt+down', command: 'navigate.nextMember', when: 'editorFocused' },
     { key: 'alt+up', command: 'navigate.prevMember', when: 'editorFocused' },
+    { key: 'alt+pagedown', command: 'gitlab.nextFile', when: 'gitlabReviewActive && !overlayOpen' },
+    { key: 'alt+pageup', command: 'gitlab.previousFile', when: 'gitlabReviewActive && !overlayOpen' },
     // The complement: the same two keys are the pane moves everywhere a buffer is not
     // focused, and Alt+Enter is the maximize toggle under the same clause — inside a buffer
     // that chord is CodeMirror's *send lines to Claude*, which the capture gate would kill
@@ -474,6 +476,8 @@ try {
     // that the one that is bound is passed through in a terminal.
     { code: 'F7', key: 'F7' },
     { code: 'Digit1', key: '1' },
+    { code: 'PageUp', key: 'PageUp' },
+    { code: 'PageDown', key: 'PageDown' },
     { code: 'ArrowUp', key: 'ArrowUp' },
     { code: 'ArrowDown', key: 'ArrowDown' },
     { code: 'ArrowLeft', key: 'ArrowLeft' },
@@ -526,6 +530,8 @@ try {
     { terminalFocused: true },
     { editorFocused: true },
     { editorFocused: true, overlayOpen: true },
+    { gitlabReviewActive: true },
+    { gitlabReviewActive: true, overlayOpen: true },
     { claudePaneFocused: true, repoOpen: true },
     /*
      * A shell window with a terminal focused, which is where every M14 binding is both

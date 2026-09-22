@@ -8,6 +8,7 @@
   "cide://fs-changed",
   "cide://fs-status",
   "cide://git-status",
+  "cide://gitlab-changed",
   "cide://ipc-degraded",
   "cide://keymap-changed",
   "cide://mouse-nav",

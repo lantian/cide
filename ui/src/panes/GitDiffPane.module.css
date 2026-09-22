@@ -908,3 +908,8 @@
   border-color: var(--accent-hi);
   color: var(--bg);
 }
+
+.reviewLine { color: inherit; font: inherit; padding: 0; border: 0; background: transparent; cursor: pointer; width: 100%; text-align: right; }
+.reviewLine:hover, .reviewLine[aria-pressed='true'] { color: var(--accent); background: var(--selection, #6688bb33); }
+
+.reviewAnnotation { white-space: normal; font-family: var(--font-ui, sans-serif); color: var(--text); background: var(--panel); padding: 8px 12px; overflow-wrap: anywhere; min-width: 0; }

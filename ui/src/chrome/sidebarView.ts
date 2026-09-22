@@ -64,12 +64,13 @@
  */
 type ExtensionView = `ext:${string}`
 
-export type ActivityView = BuiltinView | ExtensionView
+export type ActivityView = BuiltinView | ExtensionView | `mr:${string}`
 
 /** The views cide ships. */
 export type BuiltinView =
   | 'files'
   | 'git'
+  | 'gitlab'
   | 'search'
   | 'problems'
   | 'agents'

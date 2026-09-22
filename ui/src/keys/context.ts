@@ -86,6 +86,7 @@ export const HOST_FLAGS = [
 
 /** Flags [`deriveContext`] computes. Every one is a fact about the workspace mirror. */
 export const DERIVED_FLAGS = [
+  'gitlabReviewActive',
   'paneFocused',
   'claudePaneFocused',
   'terminalFocused',
@@ -132,6 +133,7 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
   const drawing = kind === 'editor' && focusedPath !== null && drawingKindFor(focusedPath) !== null
 
   return {
+    gitlabReviewActive: kind === 'diff' && focused?.tab.kind.kind === 'diff' && focused.tab.kind.spec.origin.kind === 'gitLab',
     paneFocused: focused !== null,
     claudePaneFocused: kind === 'claude',
     // A Claude pane is an xterm too, so "a terminal has focus" is true for both — and false

@@ -335,6 +335,7 @@ pub fn run() {
     };
 
     builder = builder.manage(SessionRegistry::default());
+    builder = builder.manage(cmd::gitlab::GitLabState::default());
     // The raw text behind rendered log lines, one bounded ring per session. See `logring`.
     builder = builder.manage(std::sync::Arc::new(logring::JsonLogRing::default()));
     // Empty until a project asks to be indexed; managed from the start so that a `fs.*`
@@ -420,6 +421,11 @@ pub fn run() {
         // main loop — see `caps::ClaudeVersion`.
         .manage(caps::ClaudeVersion::default())
         .invoke_handler(tauri::generate_handler![
+            cmd::gitlab::gitlab_request,
+            cmd::gitlab::gitlab_open_document,
+            cmd::gitlab::gitlab_open_url,
+            cmd::gitlab::gitlab_after_push,
+            cmd::gitlab::gitlab_local_file,
             cmd::app::app_quit_requested,
             cmd::app::app_ready,
             cmd::app::app_get_bootstrap,

@@ -1,3 +1,4 @@
+import { GitLabSettings } from '@/gitlab/GitLabSettings'
 /**
  * The sections of the Settings tab, in `SettingsSection`'s order — which is the mock's for the
  * seven it drew, plus the ones later milestones added.
@@ -596,6 +597,7 @@ function Git({ settings, patch }: SectionProps) {
 
   return (
     <>
+      <GitLabSettings />
       <Group title="Update project">
         <Row
           label="When your branch has diverged"

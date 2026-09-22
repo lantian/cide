@@ -56,6 +56,8 @@ export type OverlayKind =
    * Reads `Bootstrap.capabilities` off the boot the host was mounted with and asks Rust nothing.
    */
   | 'about'
+  | 'gitlabOpen'
+  | 'gitlabInfo'
 
 interface OverlayStore {
   open: OverlayKind | null

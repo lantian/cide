@@ -18,6 +18,7 @@
 }
 
 .tabs {
+  overflow-x: auto;
   height: var(--h-toolwindow-tabs);
   flex: none;
   display: flex;
@@ -29,6 +30,7 @@
 }
 
 .tab {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   /* The close button tucks against its tab's right edge rather than floating in the gap. */

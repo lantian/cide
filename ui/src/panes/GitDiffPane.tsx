@@ -442,6 +442,11 @@ export interface GitDiffStagingProps extends GitDiffViewCommon {
  * the question does not apply, which a total function cannot say.
  */
 export interface GitDiffReadOnlyProps extends GitDiffViewCommon {
+  /** Content anchored immediately below a source line, outside the code row's grid. */
+  renderAfterLine?: ((oldLine: number | null, newLine: number | null, side: 'old' | 'new' | 'both') => ReactNode) | undefined
+  /** Review integrations can attach an inline comment to either side of a displayed row. */
+  onReviewLine?: ((side: 'old' | 'new', line: number) => void) | undefined
+  reviewLine?: { side: 'old' | 'new'; line: number } | undefined
   readOnly: true
   diff: RevisionDiff | null
   /**
@@ -759,7 +764,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
       const tops: number[] = []
       for (const child of Array.from(content.children)) {
         if (!(child instanceof HTMLElement)) continue
-        if (child.dataset['audit'] === 'gitDiffInsertMark') continue
+        if (child.dataset['audit'] === 'gitDiffInsertMark' || child.dataset['audit'] === 'gitDiffAnnotation') continue
         tops.push(child.offsetTop)
       }
       tops.push(column.scrollHeight)
@@ -854,7 +859,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
       const tops: number[] = []
       for (const child of Array.from(content.children)) {
         if (!(child instanceof HTMLElement)) continue
-        if (child.dataset['audit'] === 'gitDiffInsertMark') continue
+        if (child.dataset['audit'] === 'gitDiffInsertMark' || child.dataset['audit'] === 'gitDiffAnnotation') continue
         tops.push(child.offsetTop)
       }
       tops.push(content.offsetHeight)
@@ -1337,10 +1342,21 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
      * Unified is the layout that stages, which is also where the hunk boxes live; split is the
      * one that reads. Requested in exactly those terms.
      */
+    const reviewNumber = (side: 'old' | 'new', number: number | null) => {
+      const handler = props.readOnly === true ? props.onReviewLine : undefined
+      return handler && number !== null
+        ? <button type="button" className={styles.reviewLine}
+            data-review-side={side} data-review-line={number}
+            aria-label={`Comment on ${side} line ${number}`}
+            aria-pressed={props.readOnly === true && props.reviewLine?.side === side && props.reviewLine.line === number}
+            onClick={() => handler(side, number)}>{number}</button>
+        : number ?? ''
+    }
     const boxSide = selectable && which !== 'old'
+    const annotation = props.readOnly === true ? props.renderAfterLine?.(line.oldLineno, line.newLineno, which) : null
     return (
+      <Fragment key={key}>
       <div
-        key={key}
         className={`${className} ${rowClass(line.origin)}`}
         {...(at === null
           ? {}
@@ -1366,7 +1382,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
           * these fragments and the per-side track lists in the stylesheet are one decision
           * written in two files, and `check:diff-render` reads the order back off the markup.
           */}
-        {which === 'new' && <span className={styles.lineno}>{numbered ?? ''}</span>}
+        {which === 'new' && <span className={styles.lineno}>{reviewNumber('new', numbered)}</span>}
         {boxSide && (
           <button
             type="button"
@@ -1427,8 +1443,8 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
         )}
         {which === 'both' && (
           <>
-            <span className={styles.lineno}>{line.oldLineno ?? ''}</span>
-            <span className={styles.lineno}>{line.newLineno ?? ''}</span>
+            <span className={styles.lineno}>{reviewNumber('old', line.oldLineno)}</span>
+            <span className={styles.lineno}>{reviewNumber('new', line.newLineno)}</span>
           </>
         )}
         <span className={styles.sign}>
@@ -1472,8 +1488,10 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
           * this is a real reordering of the children and `.column[data-side='old'] .half`
           * carries the matching track list.
           */}
-        {which === 'old' && <span className={styles.lineno}>{numbered ?? ''}</span>}
+        {which === 'old' && <span className={styles.lineno}>{reviewNumber('old', numbered)}</span>}
       </div>
+      {annotation && <div className={styles.reviewAnnotation} data-audit="gitDiffAnnotation">{annotation}</div>}
+      </Fragment>
     )
   }
 
@@ -1964,7 +1982,7 @@ export function GitDiffPane({ project, spec, visible }: GitDiffPaneProps): React
  * its tokens spell: a row the previous text no longer describes draws plain, and one it still
  * describes draws runs that are, by construction, that exact string's.
  */
-function useDiffTokens(diff: DrawnDiff | null): DiffTokens | null {
+export function useDiffTokens(diff: DrawnDiff | null): DiffTokens | null {
   const [tokens, setTokens] = useState<DiffTokens | null>(null)
   const path = diff?.path ?? null
   const oldPath = diff?.oldPath ?? null
