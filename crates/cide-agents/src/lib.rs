@@ -60,12 +60,12 @@ pub mod tools;
 // that is an enum and not a `write()` method. A trait that had assumed stdin would have had to be
 // reopened here instead of extended.
 
-pub use config::{AgentsConfig, CideConfig, Isolation};
+pub use config::{AgentsConfig, CideConfig, Isolation, Unattended};
 pub use defs::{AgentProblem, Catalog, LoadedAgent, Severity};
 pub use harness::{
     ClaudeHarness, CodexHarness, ContinueSpec, Delivery, ERASE_MARKER, FailoverReason, Harness,
-    HarnessError, HarnessSpawn, Observation, OpencodeHarness, QwenHarness, RenderState, RunPlan,
-    SessionBinding, for_kind, registry,
+    HarnessError, HarnessSpawn, MimoHarness, Observation, OpencodeHarness, QwenHarness,
+    RenderState, RunPlan, SessionBinding, for_kind, registry,
 };
 pub use tools::{Content, TaskSink, ToolResult, descriptors, dispatch};
 
@@ -162,16 +162,19 @@ pub fn dispatch_refusal(
     if let Some(reason) = &agent.def.unavailable {
         return Some(reason.clone());
     }
-    // `skip_permissions` passes this gate too, and that is coherence rather than a hole: while
-    // the project's own default sends every unattended child out promptless, a role that wrote
-    // the same stance down cannot be the one thing refused for it. The two-acts rule bites only
-    // where it means something — a project that switched skipping off. See the field's doc.
-    if is_dangerous(agent) && !config.allow_dangerous_permissions && !config.skip_permissions {
+    // A project whose own default is bypass passes this gate too. That is coherence rather than
+    // a hole: while the project sends every unattended child out with no brake, a role that
+    // wrote the same stance down cannot be the one thing refused for it. Under the default
+    // `auto` the two-acts rule applies again, because that project has not agreed to bypass.
+    if is_dangerous(agent)
+        && !config.allow_dangerous_permissions
+        && config.unattended() != config::Unattended::Bypass
+    {
         return Some(format!(
             "`{}` asks for `permission-mode: {}`, which lets it edit, delete and run anything \
-             without asking. This project has switched `agents.skipPermissions` off and has not \
-             authorised this role either: set `agents.allowDangerousPermissions` to true in \
-             `{}/config.json` if you mean it.",
+             without asking. This project runs unattended children in `agents.permissionMode` \
+             `auto` or `manual`, and has not authorised this role either: set \
+             `agents.allowDangerousPermissions` to true in `{}/config.json` if you mean it.",
             agent.def.id,
             defs::BYPASS_PERMISSIONS,
             config::CIDE_DIR
@@ -449,32 +452,34 @@ mod tests {
         let agent = role(Some(defs::BYPASS_PERMISSIONS), None);
         assert!(is_dangerous(&agent));
 
-        // The default project skips prompts for every unattended child
-        // (`AgentsConfig::skip_permissions`, and its doc carries the measurement), so a role
-        // that wrote the same stance down passes — refusing it would be a refusal about
-        // nothing, and the gate's own comment says so.
-        assert_eq!(dispatch_refusal(&agent, &enabled(), bridge()), None);
-
-        // The two-acts rule bites where it means something: a project that switched skipping
-        // off is exactly the project that meant to be asked.
-        let asking = AgentsConfig {
-            skip_permissions: false,
-            ..enabled()
-        };
-        let why = dispatch_refusal(&agent, &asking, bridge()).expect("refused");
+        // The default project runs unattended children on `auto`, which has not agreed to
+        // bypass, so the two-acts rule applies. (M82; under `skipPermissions` it did not.)
+        let why = dispatch_refusal(&agent, &enabled(), bridge()).expect("refused");
         assert!(
             why.contains("allowDangerousPermissions"),
             "the refusal has to name its own fix: {why}"
         );
         assert!(
-            why.contains("skipPermissions"),
+            why.contains("permissionMode"),
             "and the switch that armed the gate: {why}"
         );
+        // A project whose own default is bypass lets a role write the same stance down.
+        let bypassing = AgentsConfig {
+            permission_mode: Some(defs::BYPASS_PERMISSIONS.into()),
+            ..enabled()
+        };
+        assert_eq!(dispatch_refusal(&agent, &bypassing, bridge()), None);
+
+        let asking = AgentsConfig {
+            permission_mode: Some("manual".into()),
+            ..enabled()
+        };
+        let why = dispatch_refusal(&agent, &asking, bridge()).expect("refused");
         assert!(why.contains("developer"), "and the role: {why}");
 
         let authorised = AgentsConfig {
             allow_dangerous_permissions: true,
-            ..asking
+            ..asking.clone()
         };
         assert_eq!(dispatch_refusal(&agent, &authorised, bridge()), None);
 

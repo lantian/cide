@@ -245,9 +245,82 @@ struct Inner {
     /// the number on screen must always be the one belonging to the connection that would
     /// redeem the code, or it is worse than showing nothing.
     pairing: Mutex<Option<(u64, cide_ipc::remote::PairingAttempt)>>,
+    /// The newest session state and awaiting set this server has fanned out, each with the
+    /// sequence number it went out under. See [`Ordered`].
+    ordered: Mutex<Ordered>,
+}
+
+/// What the event stream last said about each session, so a snapshot can never contradict it.
+///
+/// **A snapshot is read on a blocking thread and queued after the read, while an event is queued
+/// the instant it happens**, so the two race and the loser is the phone. The case that was
+/// reported: a reviewer tab's last tool call bumps the workspace, the coalescer starts reading
+/// the session list, the `Stop` hook lands and its `AwaitingInput` is queued at once — and then
+/// the list, read a moment *before* the `Stop`, is queued behind it and replaces the row with
+/// `busy`. Nothing moves that session again, so the phone said *working* over a finished turn
+/// until something else happened to it. The awaiting set has the same shape: a stale snapshot
+/// queued after an acknowledgement's `Awaiting` frame puts the marker straight back.
+///
+/// The fix is ordering, not a second read. Every state event is recorded and fanned out
+/// **under this lock**, and after a snapshot is queued, whatever was recorded since the moment
+/// the snapshot started is queued again **under the same lock** — so on every connection's
+/// queue the newest word about a session is always the last one. An event recorded before the
+/// mark was applied to the host before it was sent here (the emitter writes its own state first),
+/// so the host's read already reflects it or something newer.
+///
+/// The map holds one entry per session this process has ever reported, which is the number of
+/// panes opened since launch — small, and pruning it would need to know that no snapshot is in
+/// flight, which is the one thing this exists not to guess.
+#[derive(Default)]
+struct Ordered {
+    seq: u64,
+    states: std::collections::HashMap<cide_ipc::SessionId, (u64, cide_ipc::SessionState)>,
+    awaiting: Option<(u64, Vec<cide_ipc::remote::AwaitingEntry>)>,
+}
+
+impl Ordered {
+    /// Everything recorded after `mark`, as the frames that said it.
+    fn since(&self, mark: u64) -> Vec<ServerBody> {
+        let mut out: Vec<ServerBody> = self
+            .states
+            .iter()
+            .filter(|(_, (seq, _))| *seq > mark)
+            .map(|(session, (_, state))| ServerBody::SessionState {
+                session: *session,
+                state: *state,
+            })
+            .collect();
+        if let Some((seq, entries)) = &self.awaiting
+            && *seq > mark
+        {
+            out.push(ServerBody::Awaiting {
+                entries: entries.clone(),
+            });
+        }
+        out
+    }
 }
 
 impl Inner {
+    /// The sequence number a snapshot about to be read starts from.
+    fn mark(&self) -> u64 {
+        self.ordered.lock().seq
+    }
+
+    /// Queue again whatever was said after `mark`, behind the snapshot that has just been queued.
+    ///
+    /// `try_send` for [`Self::fan_out`]'s reason, and a full queue is the same `desynced` it is
+    /// there: the device asks again for everything, which is also the cure for this.
+    fn replay_since(&self, mark: u64, out: &mpsc::Sender<ServerFrame>, desynced: &AtomicBool) {
+        let ordered = self.ordered.lock();
+        for body in ordered.since(mark) {
+            if out.try_send(ServerFrame { id: None, body }).is_err() {
+                desynced.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
     /// Offer a frame to every authenticated connection, letting each decide by what it asked for.
     ///
     /// `try_send` and never `send`. The callers reach here from [`RemoteServer::notify`], which is
@@ -360,6 +433,7 @@ impl RemoteServer {
             workspace_dirty: Arc::new(AtomicBool::new(false)),
             pairing: Mutex::new(None),
             projects_dirty: Mutex::new(std::collections::HashSet::new()),
+            ordered: Mutex::new(Ordered::default()),
         });
         let accept = tokio::spawn(accept_loop(listener, Arc::clone(&inner)));
         let coalescer = tokio::spawn(coalesce_workspace(Arc::clone(&inner)));
@@ -428,6 +502,11 @@ impl RemoteServer {
                 self.inner.workspace_dirty.store(true, Ordering::Relaxed);
             }
             RemoteEvent::SessionState { session, state } => {
+                // Recorded and sent under one lock — see `Ordered` for the race this closes.
+                let mut ordered = self.inner.ordered.lock();
+                ordered.seq += 1;
+                let seq = ordered.seq;
+                ordered.states.insert(session, (seq, state));
                 // Not narrowed by subscription: a device's notification rule and its "what is in
                 // progress" screen both read across every session it can see.
                 self.inner
@@ -439,6 +518,9 @@ impl RemoteServer {
                 self.inner.projects_dirty.lock().insert(project);
             }
             RemoteEvent::Awaiting { entries } => {
+                let mut ordered = self.inner.ordered.lock();
+                ordered.seq += 1;
+                ordered.awaiting = Some((ordered.seq, entries.clone()));
                 self.inner.fan_out(|_| {
                     Some(ServerBody::Awaiting {
                         entries: entries.clone(),
@@ -557,6 +639,8 @@ async fn coalesce_workspace(inner: Arc<Inner>) {
         let (rev, projects) = ask(&inner, |host| host.projects()).await;
         for conn in conns {
             let only = lone(&conn.subscribed);
+            // Before the read, so anything said while it runs is said again after it. `Ordered`.
+            let mark = inner.mark();
             let sessions = ask(&inner, move |host| host.sessions(only)).await;
             for body in [
                 ServerBody::Projects {
@@ -569,6 +653,7 @@ async fn coalesce_workspace(inner: Arc<Inner>) {
                     conn.desynced.store(true, Ordering::Relaxed);
                 }
             }
+            inner.replay_since(mark, &conn.out, &conn.desynced);
         }
     }
 }
@@ -980,7 +1065,7 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
                 // Flipped only once the welcome is away, so the fan-out cannot interleave a state
                 // change ahead of the snapshot that establishes what it is about.
                 authenticated.store(true, Ordering::Relaxed);
-                if send_snapshot(&out_tx, &inner, None, Vec::new())
+                if send_snapshot(&out_tx, &desynced, &inner, None, Vec::new())
                     .await
                     .is_err()
                 {
@@ -1016,7 +1101,10 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
                     *held = projects;
                     (lone(&held), held.clone())
                 };
-                if send_snapshot(&out_tx, &inner, only, wanted).await.is_err() {
+                if send_snapshot(&out_tx, &desynced, &inner, only, wanted)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1631,10 +1719,14 @@ async fn send_frame(
 /// the two it received last would be a bug nobody could reproduce on purpose.
 async fn send_snapshot(
     out: &mpsc::Sender<ServerFrame>,
+    desynced: &AtomicBool,
     inner: &Arc<Inner>,
     only: Option<cide_ipc::ProjectId>,
     projects: Vec<cide_ipc::ProjectId>,
 ) -> Result<(), ()> {
+    // Before either read, so a state or an acknowledgement that lands while they run is queued
+    // again behind them rather than overwritten by them. See `Ordered`.
+    let mark = inner.mark();
     let (rev, open) = ask(inner, |host| host.projects()).await;
     say(
         out,
@@ -1649,6 +1741,7 @@ async fn send_snapshot(
     say(out, None, ServerBody::Sessions { sessions }).await?;
     let entries = ask(inner, |host| host.awaiting()).await;
     say(out, None, ServerBody::Awaiting { entries }).await?;
+    inner.replay_since(mark, out, desynced);
     // Runs, roles and tasks, for **every** project this device is interested in.
     //
     // Not just for a lone subscription. These three reads are per project, and an earlier cut
@@ -1796,6 +1889,9 @@ mod tests {
         details: Mutex<std::collections::HashMap<String, cide_ipc::TaskDetail>>,
         refuse_writes: Mutex<Option<String>>,
         scrollback: Mutex<std::collections::HashMap<SessionId, Vec<cide_ipc::screen::ScreenLine>>>,
+        /// Holds the next `sessions` read open: it says so on the first channel and waits on the
+        /// second. The race `Ordered` closes needs an event to land *during* a read.
+        gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
 
     impl FakeHost {
@@ -1826,6 +1922,7 @@ mod tests {
                 tasks: Mutex::new(Vec::new()),
                 dispatching: Mutex::new(true),
                 details: Mutex::new(std::collections::HashMap::new()),
+                gate: Mutex::new(None),
             });
             (host, first, second)
         }
@@ -1903,6 +2000,11 @@ mod tests {
 
         fn sessions(&self, only: Option<ProjectId>) -> Vec<RemoteSession> {
             self.asked.lock().push(only);
+            let gate = self.gate.lock().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             self.sessions
                 .iter()
                 .filter(|s| only.is_none_or(|wanted| wanted == s.project))
@@ -2971,6 +3073,74 @@ mod tests {
             }
             other => panic!("expected SessionState, got {other:?}"),
         }
+    }
+
+    /// A snapshot read *before* a transition and queued *after* it must not have the last word.
+    ///
+    /// The reported shape: a reviewer's turn ends, the session list is being re-read for an
+    /// unrelated workspace change, and the `Stop`'s `AwaitingInput` is queued ahead of a list that
+    /// still says what the host held a moment earlier — so the phone showed *working* over a
+    /// finished turn for good. The same test covers the awaiting set, whose stale copy put a
+    /// marker back that an acknowledgement had just cleared.
+    #[tokio::test]
+    async fn a_snapshot_read_during_a_transition_is_followed_by_the_transition() {
+        let (h, _first, _second) = harness().await;
+        let (device, key) = pair(&h).await;
+        let mut ws = resumed(&h, &device, &key).await;
+        hello(&mut ws).await;
+        for _ in 0..3 {
+            heard(&mut ws).await.expect("the snapshot");
+        }
+
+        let target = h.host.sessions[0].session;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *h.host.gate.lock() = Some((entered_tx, release_rx));
+        h.server.notify(RemoteEvent::WorkspaceRev { rev: 1 });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("joins")
+            .expect("the read began");
+
+        // Mid-read: the host's copy already moved (it always does, before the emit), the list
+        // being read did not.
+        h.server.notify(RemoteEvent::SessionState {
+            session: target,
+            state: SessionState::AwaitingInput,
+        });
+        h.server.notify(RemoteEvent::Awaiting { entries: vec![] });
+        release_tx.send(()).expect("releases");
+
+        let mut last_state = None;
+        let mut last_awaiting = None;
+        let mut saw_sessions = false;
+        while let Ok(Some(body)) =
+            tokio::time::timeout(Duration::from_millis(400), heard(&mut ws)).await
+        {
+            match body {
+                ServerBody::Sessions { sessions } => {
+                    saw_sessions = true;
+                    let row = sessions.iter().find(|s| s.session == target).expect("row");
+                    last_state = Some(row.state);
+                }
+                ServerBody::SessionState { session, state } if session == target => {
+                    last_state = Some(state);
+                }
+                ServerBody::Awaiting { entries } => last_awaiting = Some(entries.len()),
+                _ => {}
+            }
+        }
+        assert!(saw_sessions, "the re-read never arrived");
+        assert_eq!(
+            last_state,
+            Some(SessionState::AwaitingInput),
+            "the stale list had the last word about a finished turn"
+        );
+        assert_eq!(
+            last_awaiting,
+            Some(0),
+            "a stale awaiting set had the last word"
+        );
     }
 
     /// The fan-out reaches *paired* devices. A socket that has connected and not proved anything

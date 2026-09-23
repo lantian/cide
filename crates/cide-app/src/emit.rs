@@ -98,7 +98,38 @@ struct SessionTool {
     paths: Vec<String>,
 }
 
+/// The last state [`session_state`] announced for each session.
+///
+/// Kept for the remote surface, which has to answer *what is every session doing* for a device
+/// that heard none of the transitions. The hook server's own map cannot answer it: it holds only
+/// what hooks said, so a shell's jobs, an exit and a pause are not in it, and the remote read
+/// only its *live* subset (`Busy`/`AwaitingPermission`) — every finished turn went out as
+/// `Spawning`, which a phone draws as nothing at all. This is the one place every transition
+/// passes, so it is the one record that agrees with what the windows were told.
+///
+/// Written **before** the event is emitted or teed, and that order is load-bearing:
+/// `cide_remote`'s `Ordered` replays only what arrived after a snapshot began, on the promise
+/// that anything earlier is already visible to the snapshot's read.
+fn last_states()
+-> &'static parking_lot::Mutex<std::collections::HashMap<String, cide_ipc::SessionState>> {
+    static LAST: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, cide_ipc::SessionState>>,
+    > = std::sync::OnceLock::new();
+    LAST.get_or_init(Default::default)
+}
+
+/// Every session's last announced state. See [`last_states`].
+pub fn last_session_states()
+-> std::collections::HashMap<cide_ipc::SessionId, cide_ipc::SessionState> {
+    last_states()
+        .lock()
+        .iter()
+        .filter_map(|(session, state)| Some((session.parse().ok()?, *state)))
+        .collect()
+}
+
 pub fn session_state(app: &AppHandle, session: &str, state: cide_ipc::SessionState) {
+    last_states().lock().insert(session.to_owned(), state);
     let payload = SessionStateChanged {
         session: session.to_owned(),
         state,

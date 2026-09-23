@@ -364,6 +364,14 @@ struct LiveRun {
     /// restored run is `Interrupted`, and this flag exists only on the short walk from Resume
     /// to admission.
     continuing: bool,
+    /// What the next admission forks, when a child's opening prompt never started a turn and
+    /// the run went back to the queue for it. See [`AgentRegistry::abandon_unsubmitted`].
+    /// Taken at admission and read nowhere else; never persisted, for `continuing`'s reason.
+    requeued: Option<Requeued>,
+    /// How many times this run has been put back on the queue for an opening that never took.
+    /// Bounded by [`OPENING_REQUEUES`], because a child that cannot be given a prompt twice
+    /// running is failing for a reason a third fork will not change.
+    opening_requeues: u8,
     /// Whether this run's abnormal end has already been written to its task as a comment
     /// (P2 of the debug-report plan: a task stuck in `doing` after its run died was invisible
     /// until someone opened the Agents panel). A latch, not persisted: a restored row starts
@@ -381,6 +389,22 @@ struct LiveRun {
     /// [`AgentRegistry::open_plan`] asks the filesystem again at the click, so a `true` that
     /// has gone stale costs a sentence on the row, never a pane that fails after it opened.
     reopenable: bool,
+    /// What this run's **last completed step** reported it spent. (M80)
+    ///
+    /// Written by [`AgentRegistry::note_usage`] from the stream hook — `cide_agents::Harness`'s
+    /// `usage`, a third reading of the same lines beside `observe` and `diagnose` — and read by
+    /// exactly one thing: [`AgentRegistry::log_run_info`], which answers the card a click on a
+    /// `#7` opens.
+    ///
+    /// **Last, never a sum.** A conversation's spend is not the total of its steps: each step's
+    /// prompt *contains* the last one's, so adding them counts the same tokens once per turn and
+    /// the figure grows quadratically with a conversation that is merely long. The last step is
+    /// the honest one, and it is what [`cide_ipc::TokenUsage::context`] is defined over.
+    ///
+    /// `None` for a run that has not finished a step, for every `claude` and `qwen` run — cide
+    /// never parses their output — and after a restore. Not persisted: the number describes a
+    /// child that no longer exists, and the run's next one starts a fresh context.
+    usage: Option<cide_ipc::TokenUsage>,
 }
 
 /// What was asked for when a run was stopped. See [`LiveRun::stop`]. (M67)
@@ -492,6 +516,15 @@ pub enum StopHow {
     /// a run whose turn had *already ended*. Harmless while that sentence meant nothing in
     /// particular; a lie the moment it came to mean **nobody asked**.
     Reclaimed,
+    /// An idle child ended because its task reached `done`, which is also not a stop anybody
+    /// asked for. See [`AgentRegistry::retire_done`].
+    ///
+    /// Its own spelling and not `Reclaimed`'s, because the two differ in what they leave on the
+    /// board: a reclaim is news to the task it interrupted, while a retirement happens to a task
+    /// that is already closed — so [`AgentRegistry::death_facts`] writes no epitaph for it and
+    /// `note_run_over` types no line, where either would be one comment and one knock per
+    /// finished task, saying only that the work that was done is done.
+    Retired,
 }
 
 impl StopHow {
@@ -548,6 +581,7 @@ fn harness_label(harness: Harness) -> &'static str {
         Harness::Opencode => "opencode",
         Harness::Qwen => "Qwen Code",
         Harness::Codex => "Codex",
+        Harness::Mimo => "MiMo Code",
     }
 }
 
@@ -564,7 +598,7 @@ fn checkout_dir(root: &std::path::Path, checkout: Option<&str>) -> PathBuf {
 fn conversation_of(live: &LiveRun, cwd: &std::path::Path) -> Option<HarnessSession> {
     let id = match live.harness {
         Harness::Claude | Harness::Qwen => live.session.map(|session| session.to_string()),
-        Harness::Opencode | Harness::Codex => live.harness_session.clone(),
+        Harness::Opencode | Harness::Codex | Harness::Mimo => live.harness_session.clone(),
     }?;
     Some(HarnessSession {
         harness: live.harness,
@@ -631,12 +665,44 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             stale_turn: false,
             harness_session: None,
             continuing: false,
+            requeued: None,
+            opening_requeues: 0,
             death_noted: false,
             reopenable: false,
+            // Nothing has run, so nothing has been spent. The stream hook is the only writer.
+            usage: None,
         },
     );
     inner.queues.entry(key).or_default().push_back(run);
     run
+}
+
+/// The context window a **custom** provider's declaration gives this candidate, in tokens. (M80)
+///
+/// The only window cide can honestly state, and the narrowness is the point. A
+/// [`cide_ipc::LlmProvider::Custom`] model is one the user described themselves — its
+/// `limit.context` is a number they typed, written into the document opencode is given, and
+/// therefore the window this very child is running against. A catalogued model's window lives in
+/// opencode's catalog, which cide deliberately keeps no copy of (see that variant's doc: a copy
+/// is a list cide gets wrong the week after), and an external provider's belongs to a plugin.
+///
+/// Matched on the provider id **and** the model id as two separate keys, never by splitting the
+/// joined `provider/model` — [`cide_ipc::PoolEntry`]'s header refuses to own that parser, and a
+/// model id may contain both `/` and `:`.
+///
+/// `None` rather than a guess, and the card then draws a token count with no percentage. A
+/// percentage of an invented window is the one shape here that is worse than no number at all:
+/// it looks like a measurement.
+fn context_limit(providers: &[cide_ipc::LlmProvider], entry: &cide_ipc::PoolEntry) -> Option<u32> {
+    providers.iter().find_map(|provider| match provider {
+        cide_ipc::LlmProvider::Custom { id, models, .. } if *id == entry.provider => models
+            .iter()
+            .find(|model| model.id == entry.model)
+            // `0` is opencode's "write no limit key" — see `LlmModel::context` — so it is an
+            // absence here too, not a window of nothing.
+            .and_then(|model| (model.context > 0).then_some(model.context)),
+        _ => None,
+    })
 }
 
 /// The run holding `(project, agent, task)`, read from an `Inner` the caller already has. (M66)
@@ -691,7 +757,7 @@ fn holds_a_pair(state: &RunState) -> bool {
 fn viewed_by(inner: &Inner, sessions: &SessionRegistry, live: &LiveRun) -> Option<SessionId> {
     let id = match live.harness {
         Harness::Claude | Harness::Qwen => live.session?.to_string(),
-        Harness::Opencode | Harness::Codex => live.harness_session.clone()?,
+        Harness::Opencode | Harness::Codex | Harness::Mimo => live.harness_session.clone()?,
     };
     let viewer = *inner.viewers.get(&(live.harness, id))?;
     sessions
@@ -839,6 +905,17 @@ struct ResumePoint {
     /// What the harness's `respawn_spec` is handed: the claude session id, or opencode's
     /// `ses_…`.
     conversation: String,
+}
+
+/// The child a stuck opening is replaced by. See [`AgentRegistry::abandon_unsubmitted`].
+#[derive(Debug, Clone)]
+struct Requeued {
+    /// The conversation the lost child was continuing, as a **fork** (`rebind: None`), or
+    /// `None` when it was starting one. A fork rather than the old id: the dying child is still
+    /// filed under that id, and its exit must find no run that owns it.
+    resume: Option<ResumePoint>,
+    /// The prompt the lost child was typed and never submitted.
+    prompt: String,
 }
 
 /// One run about to be continued by a second child. See [`AgentRegistry::plan_respawn`].
@@ -1071,9 +1148,11 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             // A resumed interrupted run continues its old conversation; one that never had a
             // conversation to continue (it was still queued when cide quit) starts fresh with
             // its original prompt, which is the honest reading of "nothing happened yet".
-            let resume = match live.continuing {
-                true => resume_point(live),
-                false => None,
+            let requeued = live.requeued.take();
+            let resume = match (&requeued, live.continuing) {
+                (Some(requeued), _) => requeued.resume.clone(),
+                (None, true) => resume_point(live),
+                (None, false) => None,
             };
             live.continuing = false;
             if let Some(point) = resume.as_ref() {
@@ -1086,18 +1165,23 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
                     "resume: admitting a continuing child on an existing conversation"
                 );
             }
-            let prompt = match resume.is_some() {
-                true => continuation_prompt(
-                    live.task.as_ref(),
-                    live.task_title.as_deref(),
-                    // Both facts the sentence needs: whether a bridge will be attached at all,
-                    // and what this run's CLI calls the tool. `start_child` refuses a bridgeless
-                    // run outright, so the `None` arm is a belt-and-braces answer rather than a
-                    // state a user reaches.
-                    cide_hook_binary().and_then(|_| cide_agents::harness::for_kind(live.harness)),
-                    Restarted::Cide,
-                ),
-                false => live.prompt.clone(),
+            let prompt = match requeued {
+                // Exactly what the lost child was meant to be told: it never read a word of it.
+                Some(requeued) => requeued.prompt,
+                None => match resume.is_some() {
+                    true => continuation_prompt(
+                        live.task.as_ref(),
+                        live.task_title.as_deref(),
+                        // Both facts the sentence needs: whether a bridge will be attached at all,
+                        // and what this run's CLI calls the tool. `start_child` refuses a bridgeless
+                        // run outright, so the `None` arm is a belt-and-braces answer rather than a
+                        // state a user reaches.
+                        cide_hook_binary()
+                            .and_then(|_| cide_agents::harness::for_kind(live.harness)),
+                        Restarted::Cide,
+                    ),
+                    false => live.prompt.clone(),
+                },
             };
             admitted.push(Admission {
                 run,
@@ -1121,7 +1205,7 @@ fn resume_point(live: &LiveRun) -> Option<ResumePoint> {
             rebind: Some(session),
             conversation: session.to_string(),
         }),
-        Harness::Opencode | Harness::Codex => {
+        Harness::Opencode | Harness::Codex | Harness::Mimo => {
             live.harness_session
                 .clone()
                 .map(|conversation| ResumePoint {
@@ -1962,6 +2046,14 @@ impl AgentRegistry {
         // gate generally would put an automatic line on every clean run, and a board where every
         // run carries one is a board where the lines that matter are buried.
         let stopped = live.stop.clone();
+        // A retired run's task is `done`: there is nothing left to report to it. See
+        // `StopHow::Retired`.
+        if stopped
+            .as_ref()
+            .is_some_and(|stop| stop.how == StopHow::Retired)
+        {
+            return None;
+        }
         let code = match live.state {
             RunState::Failed { .. } => None,
             RunState::Finished { code } if code != 0 => Some(code),
@@ -2104,7 +2196,7 @@ impl AgentRegistry {
                 Harness::Claude | Harness::Qwen => live
                     .session
                     .is_some_and(|session| transcript(live.harness, &cwd, session)),
-                Harness::Opencode | Harness::Codex => true,
+                Harness::Opencode | Harness::Codex | Harness::Mimo => true,
             };
             if can {
                 return Ok(RunOpen::Continue { conversation });
@@ -2126,7 +2218,7 @@ impl AgentRegistry {
                 .to_string()
         } else {
             match live.harness {
-                Harness::Opencode | Harness::Codex => {
+                Harness::Opencode | Harness::Codex | Harness::Mimo => {
                     "this run never reported a conversation id, so there is \
                                       nothing to open. Its harness mints its own id and prints \
                                       it, and this child ended before printing one."
@@ -3419,10 +3511,14 @@ impl AgentRegistry {
         //   and failing it over would spend a candidate on a turn that succeeded. The code is a
         //   guard and never the trigger — a non-zero exit with nothing classified still ends the
         //   run as it always did.
+        //   mimo breaks that contract and says so through `failure_exits_zero`: its error line is
+        //   terminal and its exit is 0 either way, so for it the latch alone decides. (M81)
+        let clean_is_final =
+            cide_agents::for_kind(live.harness).is_some_and(|harness| harness.failure_exits_zero());
         if live.stopping
             || self.snapshot_sealed.load(Ordering::SeqCst)
             || !matches!(live.state, RunState::Starting | RunState::Running)
-            || code == 0
+            || (code == 0 && !clean_is_final)
         {
             return None;
         }
@@ -3566,6 +3662,77 @@ impl AgentRegistry {
     /// Last writer wins: a turn that met two refusals is a turn whose *last* one its exit is
     /// about. Moves nothing — [`cide_agents::Harness::observe`] owns every state transition, and
     /// the line this is derived from is one that harness deliberately answers `None` to.
+    /// Write down what this run's last completed step spent. (M80)
+    ///
+    /// Last writer wins, which is the whole of it: [`LiveRun::usage`] is a *position*, not a
+    /// running total, for the reason that field states at length.
+    ///
+    /// Moves nothing, exactly as [`Self::note_provider_failure`] moves nothing — a token count
+    /// is not a state transition, and a step ending is emphatically not a turn ending (opencode
+    /// emits `step_finish` from nested subagents; run 06202dd6 is what reading one as the end of
+    /// a turn cost). No event is emitted either: the figure is read on demand by a card somebody
+    /// opened, and broadcasting a roster to every window per step would be a redraw per model
+    /// call for a number nothing on screen is showing.
+    fn note_usage(&self, run: RunId, usage: cide_ipc::TokenUsage) {
+        if let Some(live) = self.inner.lock().runs.get_mut(&run) {
+            live.usage = Some(usage);
+        }
+    }
+
+    /// Which harness, which model, and how much context — for the card a `#7` opens. (M80)
+    ///
+    /// Keyed by session because that is all the card has: `session_log_detail` is handed the
+    /// pane's session and a ring handle, and a pane knows nothing about runs. `None` for a
+    /// session no run stands on, which is every shell pane in the application and is the
+    /// ordinary answer.
+    ///
+    /// # Read off the run, never off the role's file
+    ///
+    /// [`LiveRun::harness`] is the harness the child was **forked with** — `note_harness` keeps
+    /// it true against a local override — and the model is resolved from the run's own pool
+    /// position and the settings it was forked with. Reading `agent.def` here would reproduce
+    /// M78's bug in the one place built to explain a run after the fact: a card naming the
+    /// committed file's harness beside a conversation held by another one.
+    ///
+    /// A **finished** run still answers, deliberately. Its row has left the live list, its
+    /// child is gone, and its pane is exactly where somebody reads it back — which is the whole
+    /// occasion this card exists for.
+    pub fn log_run_info(&self, session: SessionId) -> Option<cide_ipc::LogRunInfo> {
+        let inner = self.inner.lock();
+        let live = inner
+            .runs
+            .values()
+            .find(|run| run.session == Some(session))?;
+        let candidate = live.pool.get(live.pool_index);
+        Some(cide_ipc::LogRunInfo {
+            harness: live.harness,
+            // One ladder, in the order the fork resolves them: the pool's candidate outranks the
+            // single model (`harness::opencode`'s argv says so in as many words), and the single
+            // model is already the override's-then-the-role's with opencode's own default folded
+            // in — `Resolved::with_default_model`. `model_flag` is the join, so this spells the
+            // candidate exactly as the child was told it and invents no `provider/model` of its
+            // own (`PoolEntry`'s header: cide only ever joins).
+            model: match candidate {
+                Some(entry) => Some(entry.model_flag()),
+                None => live
+                    .forked_with
+                    .as_ref()
+                    .and_then(|settings| settings.model.clone()),
+            },
+            // `1 of 3`, and only where there is a pool. Without it the card would name a model
+            // nobody chose and say nothing about the two that refused before it.
+            pool_position: candidate
+                .map(|_| format!("{} of {}", live.pool_index + 1, live.pool.len())),
+            usage: live.usage,
+            context_limit: candidate.and_then(|entry| {
+                live.forked_with
+                    .as_ref()
+                    .and_then(|settings| settings.providers.as_ref())
+                    .and_then(|providers| context_limit(providers, entry))
+            }),
+        })
+    }
+
     fn note_provider_failure(&self, run: RunId, reason: cide_agents::FailoverReason) {
         if let Some(live) = self.inner.lock().runs.get_mut(&run) {
             tracing::warn!(%run, ?reason, "this run's provider refused");
@@ -4294,7 +4461,9 @@ impl AgentRegistry {
                     ),
                     _ => false,
                 },
-                Harness::Opencode | Harness::Codex => saved.harness_session.is_some(),
+                Harness::Opencode | Harness::Codex | Harness::Mimo => {
+                    saved.harness_session.is_some()
+                }
             };
             // History restores as history; everything that still had a child restores as
             // `Interrupted` — see `SavedRun::state`. A terminal row keeps its session only
@@ -4375,8 +4544,13 @@ impl AgentRegistry {
                     stale_turn: false,
                     harness_session: saved.harness_session,
                     continuing: false,
+                    requeued: None,
+                    opening_requeues: 0,
                     death_noted: false,
                     reopenable,
+                    // Not persisted — see the field. The figure described a child this process
+                    // never met, and the resume's child starts a context of its own.
+                    usage: None,
                 },
             );
             restored.insert(format!("{}.log", saved.run));
@@ -4500,7 +4674,7 @@ struct Facts {
     ///
     /// Read here with everything else, on the thread that already holds the lock, because a
     /// provider edited under a queued run must not change what that run is already doing — the
-    /// rule `skip_permissions` states beside the `RunPlan` literal below.
+    /// rule `unattended` states beside the `RunPlan` literal below.
     llm: cide_ipc::LlmSettings,
     /// This project's local, uncommitted role redirections. (M45)
     ///
@@ -4518,6 +4692,9 @@ struct Facts {
     /// pick" and a Resume comparison to "nothing to compare"; the log has the sentence.
     /// See `cide_agents::harness::opencode::UserConfig` for why every opencode child needs it.
     opencode: std::cell::OnceCell<Option<cide_agents::harness::opencode::UserConfig>>,
+    /// The same answer from `mimo`, the opencode fork, asked of *its* binary: the two CLIs keep
+    /// separate configuration files, so one project has two defaults. (M81)
+    mimo: std::cell::OnceCell<Option<cide_agents::harness::opencode::UserConfig>>,
     hook_bin: Option<PathBuf>,
     hook_sock: Option<PathBuf>,
     agent_sock: Option<PathBuf>,
@@ -4574,6 +4751,7 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
         .project(&root_key),
         llm,
         opencode: std::cell::OnceCell::new(),
+        mimo: std::cell::OnceCell::new(),
         hook_bin: cide_hook_binary(),
         hook_sock: app
             .try_state::<crate::hooks::HookServer>()
@@ -4590,34 +4768,45 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
 }
 
 impl Facts {
-    /// opencode's resolved configuration for this project, read once. See the field.
-    fn opencode(&self) -> Option<&cide_agents::harness::opencode::UserConfig> {
-        self.opencode
-            .get_or_init(|| match cide_agents::harness::opencode::user_config(&self.root) {
+    /// An opencode-shaped CLI's resolved configuration for this project, read once per flavour.
+    /// See the fields. `None` for a harness that is not one.
+    fn user_config(&self, harness: Harness) -> Option<&cide_agents::harness::opencode::UserConfig> {
+        let flavor = cide_agents::harness::opencode::Flavor::of(harness)?;
+        let cell = match harness {
+            Harness::Mimo => &self.mimo,
+            _ => &self.opencode,
+        };
+        cell.get_or_init(
+            || match cide_agents::harness::opencode::user_config(flavor, &self.root) {
                 Ok(config) => Some(config),
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        "opencode could not say what it resolves as this project's configuration; \
-                         its children will run on whatever it picks, and a Resume cannot compare it"
+                        harness = flavor.program(),
+                        "the harness could not say what it resolves as this project's \
+                         configuration; its children will run on whatever it picks, and a Resume \
+                         cannot compare it"
                     );
                     None
                 }
-            })
-            .as_ref()
+            },
+        )
+        .as_ref()
     }
 
-    /// The role as it resolves here, with opencode's own default folded in where cide names no
-    /// model — `Resolved::with_default_model`, fed from the one place that can read it.
+    /// The role as it resolves here, with the CLI's own default folded in where cide names no
+    /// model — `Resolved::with_default_model`, fed from the one place that can read it. Only a
+    /// harness that reads the provider document has such a default; `user_config` answers
+    /// `None` for every other, and `with_default_model` ignores them anyway.
     fn resolve(&self, agent: &cide_agents::LoadedAgent) -> cide_agents::overrides::Resolved {
         let resolved = cide_agents::overrides::resolve(agent, &self.overrides, &self.llm);
-        match resolved.harness {
-            Harness::Opencode => {
-                let default = self.opencode().and_then(|config| config.model.clone());
-                resolved.with_default_model(default)
-            }
-            Harness::Claude | Harness::Codex | Harness::Qwen => resolved,
+        if !resolved.harness.reads_provider_document() {
+            return resolved;
         }
+        let default = self
+            .user_config(resolved.harness)
+            .and_then(|config| config.model.clone());
+        resolved.with_default_model(default)
     }
 
     /// What a child of `resolved` is forked with, for the record every fork keeps and the
@@ -4626,11 +4815,11 @@ impl Facts {
         &self,
         resolved: &cide_agents::overrides::Resolved,
     ) -> cide_agents::overrides::ChildSettings {
-        let opencode = match resolved.harness {
-            Harness::Opencode => self.opencode(),
-            Harness::Claude | Harness::Codex | Harness::Qwen => None,
+        let config = match resolved.harness.reads_provider_document() {
+            true => self.user_config(resolved.harness),
+            false => None,
         };
-        resolved.child_settings(&self.llm, opencode)
+        resolved.child_settings(&self.llm, config)
     }
 }
 
@@ -4736,6 +4925,16 @@ impl AgentRegistry {
         // Cloned out before `admission` moves into the fork's closure; wanted again only if the
         // child comes up.
         let task = admission.task.clone();
+        // And what this child would be forked with again, should its opening never take — see
+        // `abandon_unsubmitted`. A fork of the same conversation (`rebind: None`) and the same
+        // prompt: the child that loses them has read neither.
+        let requeue = Requeued {
+            resume: resume.clone().map(|conversation| ResumePoint {
+                rebind: None,
+                conversation,
+            }),
+            prompt: admission.prompt.clone(),
+        };
 
         let facts = match facts(&app, project) {
             Ok(facts) => facts,
@@ -4785,8 +4984,17 @@ impl AgentRegistry {
         // does not exist yet, and a chunk this long read whole off the boot buffer is bundled
         // as a paste with its Enter eaten — a run that starts, idles at a full composer, and
         // holds its slot and worktree while reporting nothing. See the helper's measurements.
+        //
+        // `type_opening_line` rather than the plain helper, because that measurement is not the
+        // whole story: under load the paste trap still springs, and the run it springs on holds
+        // its concurrency slot for ever — see `type_opening_line` for the selfcraft queue it
+        // stalled.
         if let Some(opening) = started.opening {
-            type_submitted_line(&app, session_id, &started.session, opening);
+            let registry = Arc::clone(self);
+            let for_stuck = app.clone();
+            type_opening_line(&app, session_id, &started.session, opening, move || {
+                registry.abandon_unsubmitted(&for_stuck, run, session_id, requeue);
+            });
         }
 
         // The event tap, for a harness that reports through a file rather than through hooks
@@ -4813,6 +5021,56 @@ impl AgentRegistry {
         }
         tracing::info!(%run, session = %session_id, cwd = %started.cwd.display(), "subagent run started");
         self.mark_changed(&app, project);
+    }
+
+    /// Put a run whose opening prompt never started a turn back on its queue, giving its slot
+    /// back. Called by [`type_opening_line`] once its Enter retries are spent.
+    ///
+    /// # Why a requeue and not a failure
+    ///
+    /// Nothing about the *work* went wrong: the child was never told what the work was. A
+    /// failure would hand a person a retry that cide can do itself, and a loaded machine — the
+    /// case that springs this — is also the case in which several runs lose their opening at
+    /// once. So the run goes back to the **front** of its role's queue (it had already waited its
+    /// turn) and is admitted again as slots allow, forked with the same conversation and the
+    /// same prompt ([`Requeued`]). Only after [`OPENING_REQUEUES`] of those does it fail, with a
+    /// sentence, because a child that cannot be handed a prompt that many times running is not
+    /// failing for a reason one more fork will change.
+    ///
+    /// # The order under the lock, and why the kill comes after it
+    ///
+    /// Decided by [`opening_never_took`], because this thread has been asleep for most of a
+    /// minute and the run may have moved on in any direction. Then, before the lock is dropped,
+    /// the session is **unbound**: the dying child's exit then belongs to nobody, rather than
+    /// finding its run `Queued` and answering `Finished` over it — `respawn`'s rebind-before-kill
+    /// rule. The successor is a fresh cide session that forks the conversation, which is what
+    /// makes the unbinding safe for a `claude` continuation whose id *was* the session.
+    fn abandon_unsubmitted(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        run: RunId,
+        session: SessionId,
+        requeue: Requeued,
+    ) {
+        let outcome = {
+            let mut inner = self.inner.lock();
+            match inner.runs.get(&run) {
+                Some(live) if opening_never_took(live, session) => {}
+                _ => return,
+            }
+            requeue_unsubmitted(&mut inner, run, requeue)
+        };
+        match outcome {
+            OpeningOutcome::Requeued(attempt) => {
+                tracing::warn!(%run, %session, attempt, "an opening prompt never started a turn; requeued the run");
+                self.kill_child(app, Some(session));
+                after_transition(app, self, run);
+            }
+            OpeningOutcome::GiveUp => {
+                self.finish_failed(app, run, OPENING_NEVER_SUBMITTED.to_string());
+                self.kill_child(app, Some(session));
+            }
+        }
     }
 
     /// Fail a run that never reached a child, tell the windows, and let the queue move on.
@@ -5024,6 +5282,13 @@ impl AgentRegistry {
             // on this thread. (M45)
             if let Some(reason) = diagnoser.and_then(|harness| harness.diagnose(line)) {
                 registry.note_provider_failure(run, reason);
+            }
+            // And what the step spent, latched the same way and for the same reason: it moves
+            // nothing, and the card that reads it is opened by a person long after this line
+            // scrolled past. (M80) `usage`'s own first act is a substring test, so the ordinary
+            // line costs no parse on this thread — `diagnose`'s rule one statement up.
+            if let Some(spent) = diagnoser.and_then(|harness| harness.usage(line)) {
+                registry.note_usage(run, spent);
             }
             // The wall clock, read once, on the coalescer thread, at the only moment this line
             // is in hand — `logring`'s module header makes the whole argument, and M62 gave the
@@ -5348,6 +5613,122 @@ impl AgentRegistry {
                 grace_secs: 0,
             });
         }
+    }
+
+    /// End every idle child of `project` whose task the board now calls `done`.
+    ///
+    /// # Why an idle run needs ending at all
+    ///
+    /// A `claude` run hands its turn back and goes `Idle` with its child **still alive** at the
+    /// prompt — `RunState::Idle`'s whole content — and the only ways out were a Stop, a reclaim
+    /// (`idle_children_in`, which fires only when another run needs *that* checkout, and never
+    /// does once worktrees went per-task) and cide quitting. So on a project run through the
+    /// claude harness every finished task left a gray `Idle` row and a live process behind it,
+    /// under its role, for the rest of the session: selfcraft had fourteen at once, their tasks
+    /// integrated and closed. opencode, mimo and codex never showed it, because each of their
+    /// turns is a child that exits.
+    ///
+    /// `done` and not `review`, deliberately: a task in review may be sent back, and the idle
+    /// child is exactly what a send-back is typed into, with its whole context still loaded.
+    /// Once a task is done nothing will be.
+    ///
+    /// # What is left alone
+    ///
+    /// A run whose session a pane is showing (`shown`): somebody opened that conversation to read
+    /// it or to take the next turn by hand, and closing it under them is a lost message. A run
+    /// that still holds its checkout (`holds_its_checkout`, the admission gate's own predicate):
+    /// that is a stop mid-wind-down, and it must end its own way. And a run already carrying a
+    /// stop record — every other stop has its own words, and this must not overwrite them.
+    ///
+    /// Called from the two places a board is broadcast (`tasks_state::broadcast` and
+    /// `cmd::tasks::answer`), which between them are every road a task's status changes by:
+    /// the panel, a run's tool, the orchestrator's, an integrate, and an edit made on disk.
+    pub fn retire_done(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        board: &cide_ipc::TaskBoard,
+    ) {
+        let cide_ipc::TaskBoard::Ready { tasks, .. } = board else {
+            return;
+        };
+        let done: HashSet<&TaskId> = tasks
+            .iter()
+            .filter(|row| row.status == cide_ipc::TaskStatus::Done)
+            .map(|row| &row.id)
+            .collect();
+        if done.is_empty() {
+            return;
+        }
+        let Some(sessions) = app.try_state::<SessionRegistry>() else {
+            return;
+        };
+        let shown: HashSet<SessionId> = app
+            .try_state::<crate::workspace_state::WorkspaceState>()
+            .map(|state| {
+                state.with(|ws| {
+                    cide_core::workspace::session_panes(ws, Some(project))
+                        .into_iter()
+                        .map(|found| found.session)
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        for session in self.plan_retire(project, |task| done.contains(task), &shown) {
+            if let Some(pty) = sessions.get(session) {
+                tracing::info!(%session, "ending an idle run whose task is done");
+                pty.kill();
+            }
+        }
+    }
+
+    /// The half of [`Self::retire_done`] that decides, under the lock, and marks each run it
+    /// picks **before** any signal — `mark_reclaimed`'s rule, so the exit this causes is read as
+    /// what it was.
+    fn plan_retire(
+        &self,
+        project: ProjectId,
+        is_done: impl Fn(&TaskId) -> bool,
+        shown: &HashSet<SessionId>,
+    ) -> Vec<SessionId> {
+        let mut inner = self.inner.lock();
+        let mut picked = Vec::new();
+        for live in inner.runs.values_mut() {
+            let Some(session) = live.session else {
+                continue;
+            };
+            if live.project != project
+                || live.state != RunState::Idle
+                || live.stop.is_some()
+                || holds_its_checkout(live)
+                || shown.contains(&session)
+                || !live.task.as_ref().is_some_and(&is_done)
+            {
+                continue;
+            }
+            // Latched with the record, as `plan_stop` does: the exit is not a provider's fault
+            // and must not spend a pool candidate forking a successor.
+            live.stopping = true;
+            live.stop = Some(StopRecord {
+                // Nobody's hand, as with `Reclaimed`; read by nothing for this arm.
+                by: StopBy::User,
+                reason: None,
+                how: StopHow::Retired,
+                grace_secs: 0,
+            });
+            picked.push(session);
+        }
+        picked
+    }
+
+    /// Was `run` ended by [`Self::retire_done`]? `note_run_over` asks, to type no line for it.
+    pub fn was_retired(&self, run: RunId) -> bool {
+        self.inner
+            .lock()
+            .runs
+            .get(&run)
+            .and_then(|live| live.stop.as_ref())
+            .is_some_and(|stop| stop.how == StopHow::Retired)
     }
 
     /// Write down that a wind-down ended in a kill after all. See `stop`'s `Err` arm.
@@ -5677,10 +6058,10 @@ fn start_child(
         // plan claims are the same CLI. A redirected role would otherwise be refused by the very
         // harness it was deliberately routed to. See `RunPlan::harness`.
         harness: resolved.harness,
-        // From the same fresh `load_project` the refusal above used, so the flag a child runs
-        // with is the file as it stood at this fork — a `git checkout` flipping
-        // `agents.skipPermissions` is honoured from the next dispatch, never cached past it.
-        skip_permissions: project.config.agents.skip_permissions,
+        // From the same fresh `load_project` the refusal above used, so the mode a child runs
+        // with is the file as it stood at this fork. A `git checkout` that changes
+        // `agents.permissionMode` is honoured from the next dispatch, never cached past it.
+        unattended: project.config.agents.unattended(),
     };
 
     // `resolved.harness`, not `agent.def.harness`: a local override may have redirected this role
@@ -5919,6 +6300,153 @@ pub(crate) fn type_submitted_line(
     pty: &Arc<PtySession>,
     bytes: Vec<u8>,
 ) {
+    type_line(app, session, pty, bytes, None);
+}
+
+/// How long after an opening prompt's Enter the session has to show that a turn began before
+/// the Enter is sent again. See [`type_opening_line`].
+///
+/// A submit is announced by `UserPromptSubmit`, which the CLI raises before it calls any model,
+/// so this is a hook's round trip through `cide-hook` — generous for a machine booting a dozen
+/// CLIs at once, and short against a slot held for the life of the process.
+const OPENING_CONFIRM: Duration = Duration::from_secs(8);
+
+/// How many extra Enters an opening prompt may be given. Bounded because an Enter the TUI
+/// ignores is not evidence of anything, and a child that never reports a turn after three is
+/// wrong in a way another keystroke will not fix.
+const OPENING_RETRIES: u32 = 3;
+
+/// [`type_submitted_line`] for a run's **opening** prompt: the same text-then-lone-Enter, and
+/// then a check that the Enter actually started a turn, repeating the Enter until one does.
+///
+/// # Why the measurement above is not enough
+///
+/// The Enter waits for `SessionStart` and a 250 ms gap, and that separates the two writes only
+/// if the TUI *reads* its input within the gap. A TUI that is up but busy — the typical case is
+/// a cide restart resuming fifteen runs at once, each `claude --resume` loading a transcript of
+/// half a megabyte — reads the text and the `\r` in one chunk, bundles them as a paste, and sits
+/// at a full composer. The run has gone `Starting → Idle` on `SessionStart`, which by design
+/// releases nothing (the module header's slot note), so it holds its concurrency slot **for
+/// ever** while reporting `idle`. On selfcraft two runs did exactly this after a restart, and
+/// with three real runs they filled the project's five slots: fifteen queued runs, nothing
+/// working, no error anywhere. One of the two transcripts shows the resume's session metadata
+/// written at the restart and no user message after it.
+///
+/// # Why another Enter is the safe repair
+///
+/// A lone `\r` on a composer holding the pasted text submits it, which is the repair; on an
+/// empty composer it does nothing at all. Re-typing the text instead would double it on the
+/// composer the paste filled. Only a run's opening gets this: the same helper types nudges into
+/// the product owner's own pane, where a spare Enter would submit whatever the person was
+/// half-way through writing.
+///
+/// # And when even that fails, the run is ended
+///
+/// `on_stuck` runs if no retry produced a turn. The caller fails the run, which is what gives
+/// its slot back: a run idling on a composer nothing will ever submit is not a run, and leaving
+/// it holding a slot is the silent stall above with a longer fuse. See
+/// [`AgentRegistry::abandon_unsubmitted`].
+fn type_opening_line(
+    app: &AppHandle,
+    session: SessionId,
+    pty: &Arc<PtySession>,
+    bytes: Vec<u8>,
+    on_stuck: impl FnOnce() + Send + 'static,
+) {
+    type_line(app, session, pty, bytes, Some(Box::new(on_stuck)));
+}
+
+/// How many times a run is put back on the queue for an opening that never took before it is
+/// failed instead. See [`AgentRegistry::abandon_unsubmitted`].
+const OPENING_REQUEUES: u8 = 2;
+
+/// The row's sentence for a run [`AgentRegistry::abandon_unsubmitted`] gave up on.
+const OPENING_NEVER_SUBMITTED: &str = "its opening prompt was typed but never submitted, three \
+     children in a row: each sat at an idle composer holding a concurrency slot, so cide ended \
+     it to let the queue move. Dispatch it again.";
+
+/// What [`requeue_unsubmitted`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum OpeningOutcome {
+    /// Back at the front of its queue; the number is which requeue this was.
+    Requeued(u8),
+    /// Out of requeues. The caller fails it, and `finish_failed` releases the slot.
+    GiveUp,
+}
+
+/// The whole of a stuck opening's requeue, under the lock the caller already holds. Free rather
+/// than a method so a test drives it with a registry and no app.
+///
+/// Unbinds the session, releases the slot, and puts the run at the **front** of its role's
+/// queue, carrying the fork to make. `GiveUp` touches nothing: the failure path owns the rest.
+fn requeue_unsubmitted(inner: &mut Inner, run: RunId, requeue: Requeued) -> OpeningOutcome {
+    let Some(live) = inner.runs.get_mut(&run) else {
+        return OpeningOutcome::GiveUp;
+    };
+    if live.opening_requeues >= OPENING_REQUEUES {
+        return OpeningOutcome::GiveUp;
+    }
+    live.opening_requeues += 1;
+    let attempt = live.opening_requeues;
+    live.session = None;
+    move_to(live, RunState::Queued, now_unix_ms());
+    live.requeued = Some(requeue);
+    live.note = Some(
+        "its opening prompt was never submitted; back in the queue to start again".to_string(),
+    );
+    let held = std::mem::replace(&mut live.slot, false);
+    let (key, project) = (live.key(), live.project);
+    if held {
+        release(inner, &key, project);
+    }
+    inner.queues.entry(key).or_default().push_front(run);
+    OpeningOutcome::Requeued(attempt)
+}
+
+/// Is this run still the one a stuck opening left behind? All four, or the timer is stale.
+///
+/// * **The same child** — a respawn, a failover or a restart rebinds the run to a new session,
+///   and that child's opening is its own thread's business.
+/// * **Still holding its slot** — the one fact that separates `Starting → Idle` (the
+///   `SessionStart` window, which releases nothing) from a turn handed back, which releases on
+///   the edge. An idle run without a slot has worked and is exactly where it should be.
+/// * **`Starting` or `Idle`** — any other state is a turn in progress, a freeze, or an ending.
+/// * **Not being stopped** — a stop in flight has its own ending and its own sentence.
+fn opening_never_took(live: &LiveRun, session: SessionId) -> bool {
+    live.session == Some(session)
+        && live.slot
+        && live.stop.is_none()
+        && matches!(live.state, RunState::Starting | RunState::Idle)
+}
+
+/// Whether the session has shown that a submitted prompt reached the CLI.
+///
+/// `AwaitingInput` counts: [`cide_claude::next_state`] produces it only from `Busy`, so a turn
+/// quick enough to begin and end between two polls still left this behind. `Exited` and
+/// `Paused` stop the retries for their own reasons — nothing to submit into, and a frozen child
+/// would read the keystrokes out of order on resume.
+fn opening_settled(state: Option<SessionState>) -> bool {
+    matches!(
+        state,
+        Some(
+            SessionState::Busy
+                | SessionState::AwaitingInput
+                | SessionState::AwaitingPermission
+                | SessionState::Exited { .. }
+                | SessionState::Paused
+        )
+    )
+}
+
+fn type_line(
+    app: &AppHandle,
+    session: SessionId,
+    pty: &Arc<PtySession>,
+    bytes: Vec<u8>,
+    // `Some` for a run's opening: confirm the submit, retry the Enter, and call this if no
+    // retry started a turn. `None` for everything typed into a pane a person may be using.
+    on_stuck: Option<Box<dyn FnOnce() + Send>>,
+) {
     let (text, enter) = strip_enter(bytes);
     pty.write(text);
     if !enter {
@@ -5930,18 +6458,46 @@ pub(crate) fn type_submitted_line(
     let spawned = std::thread::Builder::new()
         .name("cide-type-enter".into())
         .spawn(move || {
+            let state_of = || {
+                app.try_state::<crate::hooks::HookServer>()
+                    .map(|hooks| hooks.state(session))
+            };
             let deadline = Instant::now() + ENTER_BOOT_DEADLINE;
             while Instant::now() < deadline {
-                let state = app
-                    .try_state::<crate::hooks::HookServer>()
-                    .map(|hooks| hooks.state(session));
-                if state != Some(SessionState::Spawning) {
+                if state_of() != Some(SessionState::Spawning) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             std::thread::sleep(ENTER_GAP);
             for_thread.write(b"\r".to_vec());
+            let Some(on_stuck) = on_stuck else {
+                return;
+            };
+            for attempt in 1..=OPENING_RETRIES {
+                let deadline = Instant::now() + OPENING_CONFIRM;
+                while Instant::now() < deadline {
+                    if opening_settled(state_of()) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                tracing::warn!(
+                    %session,
+                    attempt,
+                    "an opening prompt started no turn; pressing Enter again"
+                );
+                for_thread.write(b"\r".to_vec());
+            }
+            // One last look after the final Enter, which gets the same wait as the others.
+            let deadline = Instant::now() + OPENING_CONFIRM;
+            while Instant::now() < deadline {
+                if opening_settled(state_of()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            on_stuck();
         });
     if let Err(error) = spawned {
         // No thread means no gap: write the Enter now and say so. A maybe-eaten submit beats a
@@ -6081,6 +6637,123 @@ mod tests {
             live.harness_session = Some("ses_first".into());
         }
         (project, run, session)
+    }
+
+    // ==========================================================================================
+    // What the card a `#7` opens is told about the run behind the line. (M80)
+    // ==========================================================================================
+
+    /// The harness the child was **forked with**, the candidate it is on, and the last step's
+    /// spend — all read off the run and none of them off the role's file.
+    ///
+    /// M78's bug is the reason for the first assertion: `spec()` dispatches on `Harness::Claude`
+    /// and the fork resolved an override onto opencode, so a card reading the definition would
+    /// caption an opencode conversation `claude` — in the one surface built to explain a run
+    /// after the fact.
+    #[test]
+    fn a_log_line_names_the_harness_model_and_spend_of_the_run_behind_it() {
+        let registry = AgentRegistry::default();
+        let (_project, run, session) = run_on_a_pool(&registry, 3);
+        registry.note_harness(run, Harness::Opencode);
+        registry.note_usage(
+            run,
+            cide_ipc::TokenUsage {
+                input: 4_000,
+                output: 300,
+                reasoning: 200,
+                cache_read: 1_000,
+                cache_write: 64,
+            },
+        );
+
+        let info = registry
+            .log_run_info(session)
+            .expect("the run behind the line");
+        assert_eq!(
+            info.harness,
+            Harness::Opencode,
+            "the fork's answer, not the file's"
+        );
+        assert_eq!(
+            info.model.as_deref(),
+            Some("openrouter/model-0"),
+            "the candidate, joined as the child was told it"
+        );
+        assert_eq!(info.pool_position.as_deref(), Some("1 of 3"));
+        assert_eq!(info.usage.map(|spent| spent.context()), Some(5_500));
+        assert_eq!(
+            info.context_limit, None,
+            "nothing in this fixture's configuration states a window"
+        );
+
+        // A failover moves the model the card names — which is the whole reason the position is
+        // carried beside it.
+        registry.note_provider_failure(run, cide_agents::FailoverReason::RateLimited);
+        registry
+            .plan_failover(session, 1)
+            .expect("a candidate is left");
+        let info = registry.log_run_info(session).expect("still the same run");
+        assert_eq!(info.model.as_deref(), Some("openrouter/model-1"));
+        assert_eq!(info.pool_position.as_deref(), Some("2 of 3"));
+
+        // A session no run stands on is the ordinary case — every shell pane in the application.
+        assert!(registry.log_run_info(SessionId::new()).is_none());
+    }
+
+    /// With no pool, the model is what the child was forked with, and a custom provider's own
+    /// declaration is the one context window cide will state.
+    #[test]
+    fn a_run_with_no_pool_names_its_single_model_and_only_a_declared_window() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&run).expect("the run");
+            live.forked_with = Some(forked_on(Harness::Claude, "sonnet"));
+        }
+        let info = registry.log_run_info(session).expect("the run");
+        assert_eq!(info.model.as_deref(), Some("sonnet"));
+        assert_eq!(info.pool_position, None, "no pool, no position");
+        assert_eq!(info.usage, None, "nothing has finished a step");
+
+        // A window is stated only where a *custom* provider's declaration names one, matched on
+        // the provider and the model as two keys — never by splitting `provider/model`.
+        let providers = vec![cide_ipc::LlmProvider::Custom {
+            id: "lmstudio".into(),
+            label: String::new(),
+            enabled: true,
+            npm: String::new(),
+            base_url: "http://127.0.0.1:1234/v1".into(),
+            api_key: String::new(),
+            models: vec![cide_ipc::LlmModel {
+                id: "openai/gpt-oss-20b".into(),
+                label: String::new(),
+                context: 32_768,
+                output: 4_096,
+            }],
+        }];
+        let entry = pool_entry("lmstudio", "openai/gpt-oss-20b");
+        assert_eq!(context_limit(&providers, &entry), Some(32_768));
+        // `0` is opencode's "write no limit", so it is an absence here too.
+        let entry_zero = pool_entry("lmstudio", "nothing-declared");
+        assert_eq!(context_limit(&providers, &entry_zero), None);
+        // A catalogued provider's window is the catalog's business and cide keeps no copy.
+        let catalogued = vec![cide_ipc::LlmProvider::Catalog {
+            id: "openrouter".into(),
+            label: String::new(),
+            enabled: true,
+            api_key: String::new(),
+        }];
+        assert_eq!(
+            context_limit(
+                &catalogued,
+                &pool_entry("openrouter", "anthropic/claude-sonnet-5")
+            ),
+            None
+        );
     }
 
     /// The ordinary failover: the next candidate is taken, the run keeps its slot, and no queued
@@ -6485,6 +7158,56 @@ mod tests {
         assert!(messy.contains("one two three"), "{messy}");
     }
 
+    /// An idle run whose task is done is ended; one in review, one a pane is showing, and one
+    /// somebody already stopped are not. See `AgentRegistry::retire_done`.
+    #[test]
+    fn only_an_idle_run_on_a_done_task_nobody_is_watching_is_retired() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let idle_on = |task: &str| {
+            let run = registry.enqueue(spec(project, "developer", 8, 8));
+            let session = SessionId::new();
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&run).expect("the run");
+            live.state = RunState::Idle;
+            live.task = Some(TaskId::from(task.to_string()));
+            live.session = Some(session);
+            (run, session)
+        };
+        let (done, done_session) = idle_on("t-1");
+        let (in_review, _) = idle_on("t-2");
+        let (watched, watched_session) = idle_on("t-3");
+        let (stopped, _) = idle_on("t-4");
+        registry.inner.lock().runs.get_mut(&stopped).unwrap().stop = Some(StopRecord {
+            by: StopBy::Orchestrator,
+            reason: None,
+            how: winding(),
+            grace_secs: 60,
+        });
+        let is_done = |task: &TaskId| ["t-1", "t-3", "t-4"].contains(&task.0.as_str());
+        let shown = HashSet::from([watched_session]);
+
+        assert_eq!(
+            registry.plan_retire(project, is_done, &shown),
+            vec![done_session]
+        );
+        assert!(registry.was_retired(done));
+        for run in [in_review, watched, stopped] {
+            assert!(!registry.was_retired(run));
+        }
+        // Marked before the signal, and latched: a second board broadcast before the reaper
+        // reports picks nothing, and the exit writes no comment on the closed task.
+        assert!(registry.plan_retire(project, is_done, &shown).is_empty());
+        registry.inner.lock().runs.get_mut(&done).unwrap().state = RunState::Finished { code: 129 };
+        assert!(registry.death_facts(done).is_none());
+        // Another project's board touches nothing here.
+        assert!(
+            registry
+                .plan_retire(ProjectId::new(), |_| true, &HashSet::new())
+                .is_empty()
+        );
+    }
+
     /// The admission gate and the reclaim ask one question, and it is this one.
     #[test]
     fn a_winding_down_run_holds_its_checkout_and_an_idle_one_does_not() {
@@ -6664,6 +7387,33 @@ mod tests {
         );
     }
 
+    /// mimo exits 0 after a fatal provider error, so for it the latch alone decides — and the
+    /// latch is still the trigger: a clean mimo exit with nothing classified spends nothing.
+    /// (M81)
+    #[test]
+    fn a_mimo_candidate_fails_over_on_its_clean_exit() {
+        let registry = AgentRegistry::default();
+        let (_, run, session) = run_on_a_pool(&registry, 3);
+        registry.note_harness(run, Harness::Mimo);
+        registry.note_provider_failure(run, cide_agents::FailoverReason::Unreachable);
+        assert!(
+            registry.plan_failover(session, 0).is_some(),
+            "mimo reports a dead endpoint with an error line and exit 0"
+        );
+
+        let registry = AgentRegistry::default();
+        let (_, _run, session) = run_on_a_pool(&registry, 3);
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.values_mut().next().unwrap();
+            live.harness = Harness::Mimo;
+        }
+        assert!(
+            registry.plan_failover(session, 0).is_none(),
+            "a clean mimo exit with no verdict is a finished turn"
+        );
+    }
+
     /// No classified failure is no failover, however the child died. The exit code is a guard,
     /// never the trigger.
     #[test]
@@ -6786,6 +7536,125 @@ mod tests {
         // second Enter, which finding 8 already forbids upstream.
         assert_eq!(strip_enter(b"hi\r\r".to_vec()), (b"hi\r".to_vec(), true));
         assert_eq!(strip_enter(Vec::new()), (Vec::new(), false));
+    }
+
+    /// A stuck opening ends the run only while the run is still that stuck opening: the same
+    /// child, the slot never released, and no turn since. Every way out of that state — a turn
+    /// handed back, a rebind, a stop — turns the late timer into a no-op.
+    #[test]
+    fn only_a_run_still_waiting_on_its_opening_is_abandoned() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        assert_eq!(registry.take_admissions().len(), 1);
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        let stuck = |registry: &AgentRegistry, session| {
+            opening_never_took(&registry.inner.lock().runs[&run], session)
+        };
+
+        assert!(stuck(&registry, session), "Starting, holding its slot");
+        // `SessionStart` at a composer nothing submits: the selfcraft stall.
+        assert!(registry.set_state(None, run, RunState::Idle));
+        assert!(
+            stuck(&registry, session),
+            "Idle from Starting releases nothing"
+        );
+        assert!(!stuck(&registry, SessionId::new()), "another child's timer");
+
+        // The opening did land, just late: the turn and its hand-back take it out for good.
+        assert!(registry.set_state(None, run, RunState::Running));
+        assert!(!stuck(&registry, session), "a turn is in progress");
+        assert!(registry.set_state(None, run, RunState::Idle));
+        assert!(!stuck(&registry, session), "a turn was handed back");
+    }
+
+    /// A lost opening puts the run back at the **front** of its queue with its slot released and
+    /// its session unbound, carrying the fork and prompt to start again with — and after
+    /// `OPENING_REQUEUES` of those, gives up rather than looping.
+    #[test]
+    fn a_lost_opening_goes_back_to_the_front_of_the_queue() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        let behind = registry.enqueue(spec(project, "developer", 1, 4));
+        assert_eq!(registry.take_admissions().len(), 1);
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        assert!(registry.set_state(None, run, RunState::Idle));
+
+        let requeue = || Requeued {
+            resume: Some(ResumePoint {
+                rebind: None,
+                conversation: session.to_string(),
+            }),
+            prompt: "Work on task t-1".into(),
+        };
+        let outcome = requeue_unsubmitted(&mut registry.inner.lock(), run, requeue());
+        assert_eq!(outcome, OpeningOutcome::Requeued(1));
+        {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            assert_eq!(live.state, RunState::Queued);
+            assert_eq!(
+                live.session, None,
+                "the dying child's exit must find no run"
+            );
+            assert!(!live.slot);
+        }
+
+        // The slot is free and the lost run is first in line — ahead of the one that queued
+        // behind it while it sat — and it is forked from the same conversation, same prompt.
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].run, run);
+        assert_eq!(admitted[0].prompt, "Work on task t-1");
+        let point = admitted[0]
+            .resume
+            .as_ref()
+            .expect("the conversation is continued");
+        assert_eq!(
+            point.rebind, None,
+            "a fork under a fresh session, never the old id"
+        );
+        assert_eq!(point.conversation, session.to_string());
+        assert_eq!(state_of(&registry, behind), RunState::Queued);
+
+        // Once more, then the bound: the third loss is a failure for the caller to report.
+        assert_eq!(
+            requeue_unsubmitted(&mut registry.inner.lock(), run, requeue()),
+            OpeningOutcome::Requeued(2)
+        );
+        assert_eq!(
+            requeue_unsubmitted(&mut registry.inner.lock(), run, requeue()),
+            OpeningOutcome::GiveUp
+        );
+    }
+
+    /// When an opening prompt's retry stops pressing Enter. The two states it must keep pressing
+    /// through are the selfcraft stall itself: `Idle` is `SessionStart` at a composer the paste
+    /// filled, and `Spawning` is a TUI whose hooks have not reported in yet — and `Idle` is also
+    /// the state a quick turn ends in, which is why `AwaitingInput`, the one only a `Busy` can
+    /// reach, is what proves a turn that finished between two polls.
+    #[test]
+    fn an_opening_is_settled_only_by_evidence_of_a_turn() {
+        for pressing_on in [
+            None,
+            Some(SessionState::Spawning),
+            Some(SessionState::Splash),
+            Some(SessionState::Idle),
+        ] {
+            assert!(!opening_settled(pressing_on), "{pressing_on:?}");
+        }
+        for settled in [
+            SessionState::Busy,
+            SessionState::AwaitingInput,
+            SessionState::AwaitingPermission,
+            SessionState::Exited { code: 0 },
+            SessionState::Paused,
+        ] {
+            assert!(opening_settled(Some(settled)), "{settled:?}");
+        }
     }
 
     /// A role the file sends to one CLI and a local override sends to another is **read** by the
@@ -9477,6 +10346,7 @@ mod tests {
             pool: Vec::new(),
             model: Some(model.into()),
             effort: None,
+            permission_mode: None,
             providers: None,
             opencode: None,
         }
@@ -9666,6 +10536,7 @@ mod tests {
                 pool: pool.to_vec(),
                 model: None,
                 effort: effort.map(str::to_string),
+                permission_mode: None,
                 providers: Some(Vec::new()),
                 opencode: None,
             }
@@ -9882,6 +10753,7 @@ mod tests {
             pool: pool.to_vec(),
             model: None,
             effort: None,
+            permission_mode: None,
             providers: Some(Vec::new()),
             opencode: None,
         };

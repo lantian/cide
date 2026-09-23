@@ -8,7 +8,37 @@ import type { RepoId } from "./RepoId";
 import type { SettingsSection } from "./SettingsSection";
 import type { SpecSubject } from "./SpecSubject";
 
-export type TabKind = { "kind": "claudeHome" } | { "kind": "claudeFull", title: string, } | { "kind": "file", path: string, dirty: boolean, } | { "kind": "diff", spec: DiffSpec, 
+export type TabKind = { "kind": "claudeHome" } | { "kind": "claudeFull", title: string, 
+/**
+ * Whether closing this tab **ends** the `claude` in it. (M79)
+ *
+ * # Why a tab cide opened by itself has to be different
+ *
+ * Closing a tab does not kill anything. `cmd::project::tab_close` records the whole
+ * tree, session bindings and all, into `ClosedTabs` so that Ctrl+Shift+T re-adopts the
+ * same conversation — `ui/src/store/workspace.ts` states it outright: *"A closed tab's
+ * hosts stay parked on purpose."* For a tab a person opened, that is the feature.
+ *
+ * M79 opens tabs **by itself**: one per finished subagent turn, and one per quiet
+ * period. At that rate "parked, recoverable" is a `claude` leaked per run, alive and
+ * billed-for until the app quits, in a tab the user closed precisely to say they were
+ * done with it. So these are marked, and the mark decides both halves — the sessions
+ * are killed *and* no `ClosedTabs` record is written, because a reopened tab naming a
+ * session the registry has forgotten is the hole `closed_tabs.rs`' header describes.
+ *
+ * A **field and not a variant**, because a `TabKind` variant is four arms and two of
+ * them get forgotten (`chrome/TabStrip.tsx`'s and `closed_tabs::remembered`'s), and
+ * because everything else about this tab genuinely is a `ClaudeFull` — it splits into
+ * new sessions, it is closable, it draws the same way.
+ *
+ * `#[serde(default)]` **on the member**, not just on the container: every
+ * `workspace.json` written before M79 has a `claudeFull` object with a `title` and no
+ * `ephemeral`, and a container's `default` does not supply a member a *present* object
+ * happens not to mention — `TerminalSettings::job_notify_after_secs`' rule, which was
+ * learnt the same way. `false` is also the right answer for such a tab: the user opened
+ * it.
+ */
+ephemeral: boolean, } | { "kind": "file", path: string, dirty: boolean, } | { "kind": "diff", spec: DiffSpec, 
 /**
  * A **preview** tab: the one slot a single click in the git panel is allowed to
  * re-point at another file. VS Code's preview tab, and taken deliberately.

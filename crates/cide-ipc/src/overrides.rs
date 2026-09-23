@@ -16,9 +16,16 @@
 //! # What this is not
 //!
 //! Not a second role format. An override may only *redirect* what the definition already
-//! declares — it cannot supply a prompt, a tool list or a permission mode, because those are the
-//! part of a role that must be reviewable. `cide_agents::defs` remains the only thing that says
-//! what a role *is*.
+//! declares. It cannot supply a prompt or a tool list, because those are the part of a role that
+//! must be reviewable. `cide_agents::defs` remains the only thing that says what a role *is*.
+//!
+//! The **permission mode** is the exception (M82), and the reason it may be overridden is the
+//! reason the pool may. How much an unattended process is trusted to do *on this machine* is the
+//! decision of the person whose machine it is. A committed file cannot make it for them, and it
+//! must not be able to make it for a teammate. The two-acts rule for `bypassPermissions`
+//! (`AgentsConfig::allow_dangerous_permissions`) guards a mode that *arrives* in a committed
+//! file with a `git pull`. An override arrives by nobody's hand but the user's, so it does not
+//! pass through that gate.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -82,6 +89,20 @@ pub struct AgentOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub max_concurrent: Option<u16>,
+    /// The permission mode this role runs under here, in claude's vocabulary
+    /// (`cide_agents::defs::PERMISSION_MODES`). (M82)
+    ///
+    /// Beats the role's own `permission-mode:` and the project's `agents.permissionMode`, and is
+    /// folded into the role before any harness reads it, so each harness maps it exactly as it
+    /// maps a mode the role wrote. The module header argues why this one field of a role's
+    /// behaviour may be overridden.
+    ///
+    /// An unknown word is **ignored with a warning** rather than refused. An override is a
+    /// convenience, and `cide_agents::overrides::resolve` refuses nothing but a missing pool.
+    /// The role then runs on what its file says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub permission_mode: Option<String>,
 }
 
 impl AgentOverride {
@@ -97,6 +118,7 @@ impl AgentOverride {
             && self.model.is_none()
             && self.effort.is_none()
             && self.max_concurrent.is_none()
+            && self.permission_mode.is_none()
     }
 }
 

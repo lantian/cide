@@ -336,7 +336,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // No live reaction below, and that is deliberate rather than an omission.
     // `OPENCODE_CONFIG_CONTENT` is composed at the fork and a running child's environment
     // cannot change, so an edited provider is honoured from the *next* dispatch — the rule
-    // `project.config.agents.skip_permissions` already states beside the `RunPlan` literal.
+    // `project.config.agents.unattended()` already states beside the `RunPlan` literal.
     // A restart here would be a restart for a value nothing running can read.
     if let Some(v) = llm {
         settings.llm = v.cleaned();

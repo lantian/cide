@@ -279,3 +279,90 @@ function codexItemView(item: Record<string, unknown> | null): View | null {
       return null
   }
 }
+
+// ==========================================================================================
+// Who ran it, on what, and how full the context is by now. (M80)
+// ==========================================================================================
+
+/**
+ * One harness's token figures for its last completed step, as numbers.
+ *
+ * `cide_ipc::TokenUsage` on the wire, whose `u64`s arrive as `bigint` — the card converts them
+ * the way it already converts `recordedUnixMs`, and this module stays import-free so
+ * `check:json-log` can drive it. The normalisation is Rust's and is stated there at length: the
+ * cached half of a prompt is counted in [`cacheRead`] and never inside [`input`], whichever CLI
+ * reported it.
+ */
+export interface TokenSpend {
+  readonly input: number
+  readonly output: number
+  readonly reasoning: number
+  readonly cacheRead: number
+  readonly cacheWrite: number
+}
+
+/**
+ * `5725` → `5,725`.
+ *
+ * Hand-rolled rather than `toLocaleString` for `stamp`'s reason one function up, which is
+ * `overlays/format.ts`': a desktop application whose numbers change shape with `LC_ALL` is
+ * guessing, and a figure somebody is about to compare against another figure on the same screen
+ * must not be grouped one way here and another way there.
+ *
+ * Grouped and never abbreviated. The pane's own row says `5.7k tok`, which is right for a line
+ * in a stream and wrong here: this card is where somebody came *because* they wanted the number.
+ */
+export function groupDigits(n: number): string {
+  if (!Number.isFinite(n)) return '—'
+  const digits = Math.round(Math.abs(n)).toString()
+  let grouped = ''
+  for (let i = 0; i < digits.length; i += 1) {
+    // Counted from the right, which is where the grouping is defined from.
+    if (i > 0 && (digits.length - i) % 3 === 0) grouped += ','
+    grouped += digits[i]
+  }
+  return n < 0 ? `-${grouped}` : grouped
+}
+
+/** Roughly what was in the window when the step ended — `cide_ipc::TokenUsage::context`'s twin. */
+export function contextTokens(spend: TokenSpend): number {
+  return spend.input + spend.cacheRead + spend.output + spend.reasoning
+}
+
+/**
+ * The headline figure: `6,112 tokens`, or `6,112 of 32,768 tokens · 19%` where this machine's
+ * configuration states a window.
+ *
+ * The percentage appears **only** with a stated limit, and `LogRunInfo::context_limit` is
+ * `None` for every model whose window cide does not hold a number for — a percentage of a
+ * guessed window is the one shape here worse than no percentage at all, because it reads as a
+ * measurement. Rounded to whole percent: a tenth of a percent of a context window is precision
+ * about an estimate.
+ */
+export function contextLine(spend: TokenSpend, limit: number | null): string {
+  const used = contextTokens(spend)
+  if (limit === null || limit <= 0) return `${groupDigits(used)} tokens`
+  const percent = Math.round((used / limit) * 100)
+  return `${groupDigits(used)} of ${groupDigits(limit)} tokens · ${percent}%`
+}
+
+/**
+ * What that figure is made of: `4,000 prompt · 1,000 cached · 300 written · 200 thinking`.
+ *
+ * Each part is drawn only when it is non-zero, so codex — which reports no reasoning figure and
+ * no cache writes — shows two parts rather than four zeroes claiming to be measurements. A spend
+ * of nothing at all still answers a sentence, because a step that finished having spent nothing
+ * measurable is a real and different state from a run that has never reported one.
+ *
+ * `cacheWrite` is named but is deliberately *not* part of [`contextLine`]: those tokens went
+ * into the provider's cache, not into this conversation's window.
+ */
+export function spendLine(spend: TokenSpend): string {
+  const parts: string[] = []
+  if (spend.input > 0) parts.push(`${groupDigits(spend.input)} prompt`)
+  if (spend.cacheRead > 0) parts.push(`${groupDigits(spend.cacheRead)} cached`)
+  if (spend.output > 0) parts.push(`${groupDigits(spend.output)} written`)
+  if (spend.reasoning > 0) parts.push(`${groupDigits(spend.reasoning)} thinking`)
+  if (spend.cacheWrite > 0) parts.push(`${groupDigits(spend.cacheWrite)} cache write`)
+  return parts.length === 0 ? 'nothing measurable' : parts.join(' · ')
+}

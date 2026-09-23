@@ -581,6 +581,35 @@ pub enum TabKind {
     /// A closable full-screen Claude tab. Splitting it creates *new* sessions.
     ClaudeFull {
         title: String,
+        /// Whether closing this tab **ends** the `claude` in it. (M79)
+        ///
+        /// # Why a tab cide opened by itself has to be different
+        ///
+        /// Closing a tab does not kill anything. `cmd::project::tab_close` records the whole
+        /// tree, session bindings and all, into `ClosedTabs` so that Ctrl+Shift+T re-adopts the
+        /// same conversation — `ui/src/store/workspace.ts` states it outright: *"A closed tab's
+        /// hosts stay parked on purpose."* For a tab a person opened, that is the feature.
+        ///
+        /// M79 opens tabs **by itself**: one per finished subagent turn, and one per quiet
+        /// period. At that rate "parked, recoverable" is a `claude` leaked per run, alive and
+        /// billed-for until the app quits, in a tab the user closed precisely to say they were
+        /// done with it. So these are marked, and the mark decides both halves — the sessions
+        /// are killed *and* no `ClosedTabs` record is written, because a reopened tab naming a
+        /// session the registry has forgotten is the hole `closed_tabs.rs`' header describes.
+        ///
+        /// A **field and not a variant**, because a `TabKind` variant is four arms and two of
+        /// them get forgotten (`chrome/TabStrip.tsx`'s and `closed_tabs::remembered`'s), and
+        /// because everything else about this tab genuinely is a `ClaudeFull` — it splits into
+        /// new sessions, it is closable, it draws the same way.
+        ///
+        /// `#[serde(default)]` **on the member**, not just on the container: every
+        /// `workspace.json` written before M79 has a `claudeFull` object with a `title` and no
+        /// `ephemeral`, and a container's `default` does not supply a member a *present* object
+        /// happens not to mention — `TerminalSettings::job_notify_after_secs`' rule, which was
+        /// learnt the same way. `false` is also the right answer for such a tab: the user opened
+        /// it.
+        #[serde(default)]
+        ephemeral: bool,
     },
     /// A file, by absolute path. **Nothing here says the file is in the project.**
     ///
@@ -852,7 +881,7 @@ impl TabKind {
     pub fn title(&self) -> String {
         match self {
             Self::ClaudeHome => "Claude".into(),
-            Self::ClaudeFull { title } => title.clone(),
+            Self::ClaudeFull { title, .. } => title.clone(),
             Self::File { path, .. } => path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -1347,6 +1376,19 @@ pub struct LogLineDetail {
     /// the only moment that clock is honest. A `u64` and therefore a `bigint` on the wire, as
     /// `AgentRun::started_unix_ms` is; the card converts it the way `AgentsPanel/adapt.ts` does.
     pub recorded_unix_ms: u64,
+    /// The harness, model and token spend behind this line, when it came out of an agent run.
+    /// (M80)
+    ///
+    /// `None` for every line a shell pane rendered — the structured-log case this card was
+    /// built for, which belongs to no run — and for a run whose child is gone, since the facts
+    /// are read off the live registry rather than kept per line. Stated once here rather than
+    /// per field so the card can draw the whole block or none of it: a card that named a
+    /// harness and left the model blank would read as a lookup that half failed.
+    ///
+    /// Filled by `cmd::session::session_log_detail` from `AgentRegistry`, which is why this
+    /// answer costs no second round trip: the card opens on one command and either has the
+    /// block or knows there is none.
+    pub run: Option<crate::LogRunInfo>,
 }
 
 #[cfg(test)]

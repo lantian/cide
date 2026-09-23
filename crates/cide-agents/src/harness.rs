@@ -72,7 +72,7 @@ mod render;
 
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
-pub use opencode::OpencodeHarness;
+pub use opencode::{MimoHarness, OpencodeHarness};
 pub use qwen::QwenHarness;
 
 /// The name cide's MCP server is registered under, on **every** harness.
@@ -162,7 +162,12 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
      nothing, and a comment is markdown a person reads: give a report of any length structure. \
      Before you start, comment your plan on the task, and commit each coherent step of \
      the work as you finish it: a run can die mid-turn, and the plan comment plus your branch's \
-     commits are the only record of how far you got. When the work is done, set the task's status to review and comment what you did \
+     commits are the only record of how far you got. If you notice something wrong that is \
+     not this task, do not fix it and do not let it go: open a task for it with \
+     {cide_task_create} saying what you saw and where, then carry on with yours — widening \
+     your own task makes a branch nobody can review, and a comment about it is read once and \
+     lost. \
+     When the work is done, set the task's status to review and comment what you did \
      and where; done is the reviewer's call, not yours.";
 
 /// Every tracker tool cide's prose is allowed to name.
@@ -481,6 +486,23 @@ pub trait Harness: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Whether a provider failure this harness reports through [`Self::diagnose`] still ends the
+    /// child with exit **0**. (M81)
+    ///
+    /// The failover gate refuses a clean exit, on opencode's measured behaviour: both probed
+    /// provider failures exit 1, and a zero exit after an error line is a turn opencode retried
+    /// internally and *finished* — failing that over would spend a candidate on a success. mimo,
+    /// the fork, does not keep that contract. Measured on 0.1.15: a dead endpoint and a typo'd
+    /// model both print their `error` event and exit 0, and its internal retries are silent (no
+    /// error line until the last one), so for it the error line **is** the verdict. Without this
+    /// answer a mimo pool would never fail over, with nothing logged: every candidate's death
+    /// would read as a clean end.
+    ///
+    /// Defaulted to `false`, which is the gate as it stood for every harness before mimo.
+    fn failure_exits_zero(&self) -> bool {
+        false
+    }
+
     /// What one output line says about this run's **provider**, as distinct from its state. (M45)
     ///
     /// [`Self::observe`] answers *where is this run*; this answers *did the endpoint refuse, in a
@@ -497,6 +519,34 @@ pub trait Harness: Send + Sync + 'static {
     /// the honest answer for a CLI cide has not taught to report its provider's verdict, and it
     /// degrades to exactly the behaviour every harness had before pools existed.
     fn diagnose(&self, line: &str) -> Option<FailoverReason> {
+        let _ = line;
+        None
+    }
+
+    /// What one output line says about this run's **token spend**. (M80)
+    ///
+    /// A third reading of the same stream, beside [`Self::observe`] and [`Self::diagnose`], and
+    /// separate for their reason: it moves nothing and latches nothing about the run's state.
+    /// Both CLIs announce a completed step with the figures for it — opencode's `step_finish`,
+    /// codex's `turn.completed` — and the answer is a value the app keeps on the run so a log
+    /// line's card can say how much of the model's context this conversation is now taking.
+    ///
+    /// The answer is **normalised** — see [`cide_ipc::TokenUsage`], whose header carries the
+    /// whole of why: the two CLIs disagree about whether a cached prompt counts inside the
+    /// input or beside it, and a card drawing both raw would report the same conversation as
+    /// two different sizes depending on which harness read it.
+    ///
+    /// # Defaulted, and the default is honest
+    ///
+    /// `None` is [`Self::diagnose`]'s kind of default rather than [`Self::tool_name`]'s: it is
+    /// the true answer for a CLI cide cannot read a spend off — every `claude` and `qwen` run,
+    /// whose output is a TUI cide never parses — and it degrades to exactly what the card did
+    /// before this existed, which is say nothing about tokens.
+    ///
+    /// Called on the coalescer thread, once per output line, so an implementation **must** open
+    /// with a substring test the way `opencode::failover` does and parse nothing in the
+    /// overwhelmingly common case.
+    fn usage(&self, line: &str) -> Option<cide_ipc::TokenUsage> {
         let _ = line;
         None
     }
@@ -627,13 +677,15 @@ pub struct RunPlan<'a> {
     /// `cide_agents::overrides::resolve` is what folds the two, and it is the only thing that
     /// may: a Claude Code subagent is pinned to `Claude` there for `defs`' stated reason.
     pub harness: cide_ipc::Harness,
-    /// [`crate::config::AgentsConfig::skip_permissions`], read fresh at this spawn.
+    /// [`crate::config::AgentsConfig::unattended`], read fresh at this spawn. (M82)
     ///
-    /// Carried on the plan rather than looked up here for the module's stated reason — nothing
-    /// in this crate reads disk — and what it turns on is per-harness: `--permission-mode
-    /// bypassPermissions` for a `claude` run whose role names no mode of its own, `--auto` for
-    /// an `opencode` run. The config field's doc carries the measured argument for the default.
-    pub skip_permissions: bool,
+    /// Applies only where the role, after any local override has been folded into it
+    /// (`overrides::Resolved::apply`), names no `permission-mode` of its own. Carried on the plan
+    /// rather than looked up here, because nothing in this crate reads disk. What each
+    /// value turns into is per harness, and each harness's mapping carries its own argument:
+    /// `claude` takes `auto` literally, and the CLIs with no classifier keep their promptless
+    /// flag for it.
+    pub unattended: crate::config::Unattended,
 }
 
 /// How the real harness is put back on a conversation, as `session_spawn` wants it. (M42)
@@ -971,6 +1023,7 @@ static CLAUDE: ClaudeHarness = ClaudeHarness;
 static OPENCODE: OpencodeHarness = OpencodeHarness;
 static QWEN: QwenHarness = QwenHarness;
 static CODEX: CodexHarness = CodexHarness;
+static MIMO: MimoHarness = MimoHarness;
 
 /// The registry itself, as a `const` rather than built in [`registry`].
 ///
@@ -978,7 +1031,7 @@ static CODEX: CodexHarness = CodexHarness;
 /// temporary and will not compile: const-promotion does not reach through the unsizing coercion
 /// to `&dyn Harness`. A `const` gives the slice `'static` storage, which is what the signature
 /// promises.
-const REGISTRY: &[&dyn Harness] = &[&CLAUDE, &OPENCODE, &QWEN, &CODEX];
+const REGISTRY: &[&dyn Harness] = &[&CLAUDE, &OPENCODE, &QWEN, &CODEX, &MIMO];
 
 /// Every harness this build has.
 ///
@@ -1052,6 +1105,7 @@ mod tests {
             cide_ipc::Harness::Opencode,
             cide_ipc::Harness::Qwen,
             cide_ipc::Harness::Codex,
+            cide_ipc::Harness::Mimo,
         ];
 
         for kind in EVERY.iter().copied() {
@@ -1245,14 +1299,25 @@ mod tests {
             "{TRACKER_PREAMBLE}"
         );
 
+        // **A run that finds something outside its task files it**, rather than fixing it (a
+        // branch nobody can review) or mentioning it in passing (a comment read once by the
+        // reviewer and never again). Asserted because it is one sentence in a paragraph that
+        // has a budget, and the budget is the pressure that would quietly delete it. (M79)
+        assert!(
+            TRACKER_PREAMBLE.contains("not this task"),
+            "{TRACKER_PREAMBLE}"
+        );
+
         // Prepended to every turn of every run for ever. A budget rather than a measurement, so
         // that growing it is a deliberate edit to this line rather than a paragraph that crept.
-        // Raised from 900 when the review-workflow sentence was added, and from 1000 when the
+        // Raised from 900 when the review-workflow sentence was added, from 1000 when the
         // checkpoint sentence was (the debug report's runs died mid-turn leaving no plan comment
-        // and no commits, so nothing said how far they got) — each raise is the deliberate edit
-        // the budget exists to force.
+        // and no commits, so nothing said how far they got), and from 1300 in M79 for the
+        // out-of-scope sentence above — which earns its ~160 characters because the alternative
+        // is the two failures it names, both of which cost a review each time they happen. Each
+        // raise is the deliberate edit the budget exists to force.
         assert!(
-            TRACKER_PREAMBLE.len() < 1_300,
+            TRACKER_PREAMBLE.len() < 1_500,
             "{} characters is a page, not a paragraph",
             TRACKER_PREAMBLE.len()
         );
@@ -1328,7 +1393,7 @@ mod tests {
                 harness: agent.def.harness,
                 // Off in the fixture, so every argv assertion below is about what the role
                 // and the plan actually said; the skip default has tests of its own.
-                skip_permissions: false,
+                unattended: crate::config::Unattended::Ask,
             }
         }
 

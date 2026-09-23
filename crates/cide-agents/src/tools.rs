@@ -988,8 +988,8 @@ pub fn description(name: &str) -> &'static str {
              run already queued starts without being re-dispatched."
         }
         tool::AGENT_OVERRIDE => {
-            "Point a role at a different harness, model, pool or effort **on this machine only**. \
-             Unlike cide_agent_update, which edits the role's committed definition file, this \
+            "Point a role at a different harness, model, pool, effort or permission mode **on this \
+             machine only**. Unlike cide_agent_update, which edits the role's committed definition file, this \
              writes a local file no commit carries \u{2014} which makes it the right tool for trying \
              something, and the wrong one for a decision the project should keep. Name an `agent` \
              for one role, or leave it out to set the default for every role in this project that \
@@ -1478,6 +1478,23 @@ pub fn input_schema(name: &str) -> Value {
                     "description":
                         "How many tasks this role may work on at once, here. Pass null to take \
                          the number in its definition back.",
+                },
+                "permissionMode": {
+                    "type": ["string", "null"],
+                    "enum": crate::defs::PERMISSION_MODES
+                        .iter()
+                        .filter(|mode| **mode != crate::defs::BYPASS_PERMISSIONS)
+                        .map(|mode| json!(mode))
+                        .chain(std::iter::once(Value::Null))
+                        .collect::<Vec<_>>(),
+                    "description": format!(
+                        "How this role's runs answer permission prompts here, beating both its \
+                         definition and the project's `agents.permissionMode`. `auto` lets \
+                         Claude's classifier approve on the user's behalf. `{}` cannot be set \
+                         from this tool; only the user can grant it, in Settings. Pass null to \
+                         take the role's own mode back.",
+                        crate::defs::BYPASS_PERMISSIONS
+                    ),
                 },
             },
         }),
@@ -2584,12 +2601,17 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
 /// dispatch's own answer.
 fn resolved_sentence(resolved: &crate::overrides::Resolved) -> String {
     let harness = harness_wire(resolved.harness);
-    if let Some(pool) = &resolved.pool_name {
-        return format!("{harness} pool `{}`", one_line(pool));
-    }
-    match &resolved.model {
-        Some(model) => format!("{harness} {}", one_line(model)),
-        None => format!("{harness} (its default model)"),
+    let runs = match (&resolved.pool_name, &resolved.model) {
+        (Some(pool), _) => format!("{harness} pool `{}`", one_line(pool)),
+        (None, Some(model)) => format!("{harness} {}", one_line(model)),
+        (None, None) => format!("{harness} (its default model)"),
+    };
+    // Said only where the role or its override names one. With neither, the project's
+    // `agents.permissionMode` decides, and that is one fact about the project that does not
+    // need repeating on every row.
+    match &resolved.permission_mode {
+        Some(mode) => format!("{runs}, permission mode `{}`", one_line(mode)),
+        None => runs,
     }
 }
 
@@ -3000,10 +3022,21 @@ fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         ));
     }
 
+    // `..Default::default()` and not a field per key, and the omission is the point: every
+    // other key in this struct is `None` here **for ever**, not until somebody gets round to it.
+    //
+    // `enabled` is refused by name above, loudly. The five M79 keys are refused by silence, and
+    // they are the stronger case of the two: `autoSpin` starts a billed `claude` off a *timer*,
+    // `autoSpinPrompt` decides what that process is told, and `finishInNewTab` puts a tab on the
+    // user's screen. A model that could set any of them could arrange to be woken up, and write
+    // its own wake-up call. They are the user's, through Settings, and a `..Default::default()`
+    // that quietly widened would hand them over — so if a key is ever added here it must be
+    // added with an argument for why a model may hold it.
     let patch = OrchestrationPatch {
         enabled: None,
         max_concurrent,
         harness,
+        ..Default::default()
     };
     match sink.set_config(patch) {
         Ok(config) => ToolResult::text(format!(
@@ -3097,16 +3130,50 @@ fn agent_override(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(field) => field,
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
     };
+    let permission_mode = match nullable_string(arguments, "permissionMode") {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE)),
+    };
+    if let Field::Value(mode) = &permission_mode {
+        // Refused by name, `enabled`'s rule: a schema that leaves a value out of its enum is
+        // still sent it by most clients. A model granting unattended runs bypass is exactly the
+        // escalation `allowDangerousPermissions` exists to make a person decide. An override
+        // skips that gate because a person set it, so this road must never be a model's.
+        if mode == crate::defs::BYPASS_PERMISSIONS {
+            return ToolResult::error(format!(
+                "{}: `permissionMode: {}` is not something this tool may set. It lets an \
+                 unattended process edit, delete and run anything without asking, and only the \
+                 user may grant that, in Settings → Agents. Nothing was written.",
+                tool::AGENT_OVERRIDE,
+                crate::defs::BYPASS_PERMISSIONS
+            ));
+        }
+        if !crate::defs::PERMISSION_MODES.contains(&mode.as_str()) {
+            return ToolResult::error(format!(
+                "{}: `permissionMode` must be one of {}, or null to clear it; `{}` is not a \
+                 mode. Nothing was written.",
+                tool::AGENT_OVERRIDE,
+                crate::defs::PERMISSION_MODES
+                    .iter()
+                    .filter(|m| **m != crate::defs::BYPASS_PERMISSIONS)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                one_line(mode)
+            ));
+        }
+    }
     if matches!(harness, Field::Absent)
         && matches!(pool, Field::Absent)
         && matches!(model, Field::Absent)
         && matches!(effort, Field::Absent)
         && matches!(max_concurrent, Field::Absent)
+        && matches!(permission_mode, Field::Absent)
     {
         return ToolResult::error(format!(
-            "{}: name at least one of `harness`, `pool`, `model`, `effort` or `maxConcurrent` — \
-             as a value to set it, or as null to clear it. {} reports what each role resolves to \
-             now.",
+            "{}: name at least one of `harness`, `pool`, `model`, `effort`, `maxConcurrent` or \
+             `permissionMode` — as a value to set it, or as null to clear it. {} reports what \
+             each role resolves to now.",
             tool::AGENT_OVERRIDE,
             tool::AGENTS_LIST
         ));
@@ -3137,6 +3204,7 @@ fn agent_override(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
     row.harness = harness.onto(row.harness);
     row.effort = effort.onto(row.effort);
     row.max_concurrent = max_concurrent.onto(row.max_concurrent);
+    row.permission_mode = permission_mode.onto(row.permission_mode);
 
     // The displacement, said out loud. A row that silently kept a pool under a newly named model
     // would be a row whose two halves disagree, and `resolve` reads the pool first.
@@ -3215,6 +3283,9 @@ fn override_sentence(row: &AgentOverride) -> String {
     }
     if let Some(max) = row.max_concurrent {
         parts.push(format!("up to {max} at once"));
+    }
+    if let Some(mode) = &row.permission_mode {
+        parts.push(format!("permission mode `{}`", one_line(mode)));
     }
     match parts.is_empty() {
         true => "nothing overridden".to_string(),
@@ -4145,9 +4216,19 @@ pub fn run_state_detail(state: &RunState) -> Option<String> {
         RunState::Paused { .. } => {
             Some("frozen by the user, and only the user can resume it".to_string())
         }
-        RunState::Idle => {
-            Some("its turn ended; read the task's comments for what it did".to_string())
-        }
+        // **Names the road out**, because this is the one state whose obvious reading is
+        // wrong: an idle run's child is parked at its prompt and will sit there until something
+        // ends it, so "wait for it to end" — the advice the duplicate refusal carries for every
+        // other live state — is advice to wait for ever. It is also the commonest state a
+        // hand-back lands a caller in, which is how it was found: a reviewer told to dispatch
+        // the role again was refused, and improvised its way through three more refusals and a
+        // stop it had no reason to believe in. One sentence, so it can be followed.
+        RunState::Idle => Some(format!(
+            "its turn ended and its child is parked at its prompt, so it will not end on its \
+             own; read the task's comments for what it did, and to give it more work stop it \
+             with {} and dispatch again",
+            tool::AGENT_STOP,
+        )),
         RunState::Interrupted => Some(
             "its child ended with a cide restart; the user can resume it, which continues the \
              same conversation in a new child"
@@ -4224,6 +4305,7 @@ fn harness_wire(harness: Harness) -> &'static str {
         Harness::Opencode => "opencode",
         Harness::Qwen => "qwen",
         Harness::Codex => "codex",
+        Harness::Mimo => "mimo",
     }
 }
 
@@ -5656,6 +5738,7 @@ mod tests {
             model: model.map(str::to_string),
             effort: None,
             max_concurrent: 1,
+            permission_mode: None,
             refusal: None,
         }
     }
@@ -5849,6 +5932,58 @@ mod tests {
             !sink.overrides.lock().roles.contains_key("developer"),
             "an emptied row was left behind"
         );
+    }
+
+    /// A permission mode is set and cleared like any other field, but `bypassPermissions` is
+    /// refused by name: only a person may grant an unattended run no brake at all. (M82)
+    #[test]
+    fn an_override_sets_a_permission_mode_but_never_bypass() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "permissionMode": "auto" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(
+            text_of(&answer).contains("permission mode `auto`"),
+            "{}",
+            text_of(&answer)
+        );
+        assert_eq!(
+            sink.overrides.lock().roles["developer"]
+                .permission_mode
+                .as_deref(),
+            Some("auto")
+        );
+
+        for refused in ["bypassPermissions", "yolo"] {
+            let answer = ask(
+                tool::AGENT_OVERRIDE,
+                json!({ "agent": "developer", "permissionMode": refused }),
+                &sink,
+            );
+            assert!(answer.is_error, "{refused} was accepted");
+            assert!(
+                text_of(&answer).contains("Nothing was written"),
+                "{}",
+                text_of(&answer)
+            );
+            assert_eq!(
+                sink.overrides.lock().roles["developer"]
+                    .permission_mode
+                    .as_deref(),
+                Some("auto"),
+                "{refused} reached the file"
+            );
+        }
+
+        let _ = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "agent": "developer", "permissionMode": null }),
+            &sink,
+        );
+        assert!(!sink.overrides.lock().roles.contains_key("developer"));
     }
 
     /// One list of models or one model, never both — and the two ways that can be asked for.
@@ -7237,7 +7372,7 @@ mod tests {
         fn config(&self) -> Result<OrchestrationConfig, String> {
             match &self.broken {
                 Some(why) => Err(why.clone()),
-                None => Ok(*self.config.lock()),
+                None => Ok(self.config.lock().clone()),
             }
         }
 
@@ -7257,7 +7392,7 @@ mod tests {
             if let Some(enabled) = patch.enabled {
                 config.enabled = enabled;
             }
-            Ok(*config)
+            Ok(config.clone())
         }
 
         fn overrides(&self) -> Result<ProjectOverrides, String> {
@@ -7430,6 +7565,7 @@ mod tests {
                 enabled: true,
                 max_concurrent: 2,
                 harness: Harness::Claude,
+                ..Default::default()
             }),
             overrides: Mutex::new(ProjectOverrides::default()),
             llm: Mutex::new(LlmSettings::default()),
@@ -7668,6 +7804,35 @@ mod tests {
             sink.dispatched.lock().is_empty(),
             "a refused dispatch reached the queue"
         );
+    }
+
+    /// An idle run is the one live state that never ends on its own, and the commonest one a
+    /// caller meets: a hand-back leaves the child parked at its prompt. Measured on a real
+    /// board, a reviewer told to dispatch the role again was refused by this very row, and read
+    /// the refusal's general advice — *wait for it to end* — as something it could do. It spent
+    /// three more refused dispatches and a stop nobody asked for finding out otherwise. (M79)
+    #[test]
+    fn an_idle_run_is_told_how_to_be_given_more_work() {
+        let detail = run_state_detail(&RunState::Idle).expect("idle says more than its word");
+        assert!(
+            detail.contains(tool::AGENT_STOP),
+            "the way out is named, not implied: {detail}"
+        );
+        assert!(
+            detail.contains("will not end on its own"),
+            "and the wrong reading is closed off: {detail}"
+        );
+        for state in [
+            RunState::Queued,
+            RunState::Starting,
+            RunState::Running,
+            RunState::Finished { code: 0 },
+        ] {
+            assert!(
+                !run_state_detail(&state).is_some_and(|detail| detail.contains(tool::AGENT_STOP)),
+                "only the parked state names the stop: {state:?}"
+            );
+        }
     }
 
     /// The rule is in the tool's own description, because that is the only place a model reads
@@ -8507,6 +8672,7 @@ mod tests {
             Harness::Opencode,
             Harness::Qwen,
             Harness::Codex,
+            Harness::Mimo,
         ];
 
         let expected = json!(EVERY.iter().copied().map(harness_wire).collect::<Vec<_>>());
@@ -8646,6 +8812,7 @@ mod tests {
                     enabled: true,
                     max_concurrent: 2,
                     harness: Harness::Claude,
+                    ..Default::default()
                 })
             }
 

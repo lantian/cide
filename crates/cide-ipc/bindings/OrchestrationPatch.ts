@@ -8,6 +8,8 @@ import type { Harness } from "./Harness";
  * `#[ts(optional)]`, so a caller flipping one switch need not restate the other two — and it is
  * allowed to, because none of these three fields is itself nullable. That is the exact test
  * [`crate::TaskEdit`] fails and explains at length.
+ *
+ * `Clone` rather than `Copy` since M79, for [`OrchestrationConfig`]'s reason.
  */
 export type OrchestrationPatch = { 
 /**
@@ -16,4 +18,13 @@ export type OrchestrationPatch = {
  * build on there, and a silent fallback to a shared tree is how two agents clobber one file
  * with nobody told.
  */
-enabled?: boolean, maxConcurrent?: number, harness?: Harness, };
+enabled?: boolean, maxConcurrent?: number, harness?: Harness, finishInNewTab?: boolean, autoSpin?: boolean, 
+/**
+ * Clamped by `AgentsConfig::apply` rather than refused, `max_concurrent`'s trade.
+ */
+autoSpinAfterSecs?: number, 
+/**
+ * Flattened to one line by `AgentsConfig::apply` before it reaches the file: this string is
+ * typed into a terminal, where a newline is another Enter.
+ */
+autoSpinPrompt?: string, autoSpinAcceptPlan?: boolean, };

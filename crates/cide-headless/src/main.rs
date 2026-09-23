@@ -811,6 +811,50 @@ fn render_agents_config(root: &Path, present: bool, roster: &ProjectAgents) -> S
             config.allow_dangerous_permissions.to_string(),
         ),
         ("nudgeOrchestrator", config.nudge_orchestrator.to_string()),
+        // Every remaining key of `AgentsConfig`, and the list is now the whole struct on
+        // purpose. It had drifted three milestones behind — `autoDispatch` (M30),
+        // `skipPermissions` and `stopGraceSecs` (M67) were all settable, all load-bearing and
+        // none of them printed, so the one tool for the question *what does this checkout
+        // actually say* answered it incompletely. A partial answer here is worse than none:
+        // somebody reading it concludes the key is absent from the file.
+        ("autoDispatch", config.auto_dispatch.to_string()),
+        // The key as the file states it, then what it resolves to. The old `skipPermissions`
+        // is printed too, because it is what an unset `permissionMode` falls back to.
+        (
+            "permissionMode",
+            config
+                .permission_mode
+                .clone()
+                .unwrap_or_else(|| "(unset)".to_string()),
+        ),
+        (
+            "skipPermissions",
+            config
+                .skip_permissions
+                .map_or_else(|| "(unset)".to_string(), |skip| skip.to_string()),
+        ),
+        ("unattended", format!("{:?}", config.unattended())),
+        ("stopGraceSecs", config.stop_grace_secs.to_string()),
+        ("finishInNewTab", config.finish_in_new_tab.to_string()),
+        ("autoSpin", config.auto_spin.to_string()),
+        // The **clamped** dwell as well as the stored one when they differ, because the stored
+        // number is what the file says and the clamped one is what the timer will use, and a
+        // hand-edited `5` in a file is exactly the case somebody runs this to understand.
+        (
+            "autoSpinAfterSecs",
+            match config.spin_after().as_secs() {
+                clamped if clamped == u64::from(config.auto_spin_after_secs) => clamped.to_string(),
+                clamped => format!("{} (clamped to {clamped})", config.auto_spin_after_secs),
+            },
+        ),
+        (
+            "autoSpinAcceptPlan",
+            config.auto_spin_accept_plan.to_string(),
+        ),
+        // The prompt as it will be *sent*, so a blank in the file reads as the shipped default
+        // rather than as an empty prompt — `AgentsConfig::spin_prompt`'s decision, shown rather
+        // than restated.
+        ("autoSpinPrompt", clip_prompt(config.spin_prompt())),
     ] {
         rows.push(Row {
             label: format!("  {key}"),
@@ -821,6 +865,20 @@ fn render_agents_config(root: &Path, present: bool, roster: &ProjectAgents) -> S
 }
 
 /// The `serde` spelling of an isolation mode, which is what the file on disk holds.
+/// A prompt on one line of a terminal table.
+///
+/// The default is several hundred characters, and a row that wide reflows the whole table into
+/// something unreadable. The head is what identifies which prompt this is.
+fn clip_prompt(prompt: &str) -> String {
+    const BUDGET: usize = 60;
+    if prompt.chars().count() <= BUDGET {
+        return prompt.to_string();
+    }
+    // `chars`, not bytes: a byte slice of a UTF-8 prompt panics on a boundary.
+    let kept: String = prompt.chars().take(BUDGET).collect();
+    format!("{}…", kept.trim_end())
+}
+
 fn isolation_name(isolation: Isolation) -> &'static str {
     match isolation {
         Isolation::Worktree => "worktree",

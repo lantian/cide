@@ -1539,6 +1539,79 @@ const TITLE_BUDGET: usize = 72;
 /// Turns that have ended and not yet been announced. One per process; see [`NudgeCoalescer`].
 static NUDGES: NudgeCoalescer = NudgeCoalescer::new();
 
+/// The review tab a task already has open. One per process, beside [`NUDGES`] and for its
+/// reason — this is read from the same background thread, and a table found through `try_state`
+/// would be a *second* reviewer opened whenever the lookup missed. (M79)
+///
+/// # The bug this closes, measured on a real board
+///
+/// Every hand-back opened a tab, and a claude run hands back once per turn — so a task sent
+/// back once and reworked twice collected three reviewers, each told by [`review_prompt`] that
+/// *nobody else is reviewing it*, which was simply false. On one observed task four of them ran
+/// at once and two acted: one dispatched the role afresh while the other, reviewing the same
+/// task from the same worktree, posted a contradicting verdict, **stopped a live child** and
+/// then had its own dispatch refused three times. Two owners of one task is the shape of that
+/// failure, and it is the one thing a reviewer's brief cannot recover from, because each of them
+/// is correct about everything it can see.
+///
+/// So a task has **one** reviewer at a time. A later burst for a task that already has a live
+/// one is typed into that conversation instead ([`nudge_line`], the console road's own line),
+/// which is both cheaper and better: it is the context that read the task, and it is already
+/// holding the thread it would otherwise have to pick up from the comments.
+///
+/// A `Vec` rather than a map because it holds one entry per *open* review tab — single digits,
+/// pruned against the session registry on every read, so a row never outlives the tab a person
+/// closed. Keyed on the task, which is what a reviewer owns; a burst whose last turn had no task
+/// is never deduplicated, because a task-less run (M40) stands in the project root and two of
+/// them have nothing in common to collide over.
+static REVIEWERS: Mutex<Vec<Reviewer>> = Mutex::new(Vec::new());
+
+/// One open review tab: the task it owns and the claude in it.
+struct Reviewer {
+    project: ProjectId,
+    task: TaskId,
+    session: SessionId,
+}
+
+/// The live reviewer for this task, if the tab is still open — pruning every row whose session
+/// has gone, which is what a closed tab looks like from here. (M79)
+///
+/// The liveness question is asked of the [`SessionRegistry`] rather than remembered, for
+/// `deliver_nudge`'s reason one step along: a tab can be closed at any moment, including in the
+/// two seconds a burst spends settling, and a remembered answer would route a note into a
+/// session nobody can read.
+fn reviewer_for(app: &AppHandle, project: ProjectId, task: &TaskId) -> Option<SessionId> {
+    let sessions = app.try_state::<SessionRegistry>()?;
+    let alive = |session: SessionId| sessions.get(session).is_some_and(|pty| !pty.has_exited());
+    live_reviewer(&mut REVIEWERS.lock(), project, task, alive)
+}
+
+/// The rule, over the table and a liveness answer — pure, so every row of it is a test rather
+/// than a claim about a live registry. [`nudge_target`]'s shape, for [`nudge_target`]'s reason.
+///
+/// It prunes as it reads: a row whose session has gone is a tab somebody closed, and leaving it
+/// would suppress that task's next reviewer for the life of the process.
+fn live_reviewer(
+    open: &mut Vec<Reviewer>,
+    project: ProjectId,
+    task: &TaskId,
+    alive: impl Fn(SessionId) -> bool,
+) -> Option<SessionId> {
+    open.retain(|reviewer| alive(reviewer.session));
+    open.iter()
+        .find(|reviewer| reviewer.project == project && &reviewer.task == task)
+        .map(|reviewer| reviewer.session)
+}
+
+/// Record the tab just opened, so the next burst for the same task finds it.
+fn remember_reviewer(project: ProjectId, task: TaskId, session: SessionId) {
+    REVIEWERS.lock().push(Reviewer {
+        project,
+        task,
+        session,
+    });
+}
+
 /// A subagent's turn ended — handed back, finished, or failed. Tell the pane the run's
 /// [`RunNotify`] names, once per burst — or nobody, for a run dispatched `notify: none`.
 ///
@@ -1579,6 +1652,14 @@ pub fn note_run_over(app: &AppHandle, project: ProjectId, run: RunId) {
     // the comment must not inherit either refusal — the board is the durable record, the nudge
     // is a courtesy knock. Its own dedupe is the registry's `death_noted` latch.
     note_death(app, project, run);
+    // A run cide ended because its task was done is not news to anybody. See
+    // `StopHow::Retired`.
+    if app
+        .try_state::<Arc<AgentRegistry>>()
+        .is_some_and(|registry| registry.was_retired(run))
+    {
+        return;
+    }
     // The facts are read *now*, while they are still true, rather than at flush time: a run can
     // be stopped, finished or forgotten in the two seconds the burst is settling, and a line
     // composed from what the registry says afterwards would describe the wrong thing or nothing.
@@ -1736,6 +1817,12 @@ fn epitaph(run: RunId, facts: &DeathFacts) -> String {
             "run {run} ({who}) was wound down to give its worktree to another task{exit}; its \
              turn had already ended, so nothing was interrupted"
         ),
+        // Unreachable through `note_death`, which `death_facts` refuses for this arm; spelled
+        // anyway so the table stays total and a later caller gets a true sentence.
+        StopHow::Retired => format!(
+            "run {run} ({who}) was ended because its task is done{exit}; its turn had already \
+             ended, so nothing was interrupted"
+        ),
     }
 }
 
@@ -1852,8 +1939,80 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
         return;
     };
 
-    if !nudge_allowed(&root) {
+    // Read once, here, and off the disk — `nudge_allowed`'s rule applied to the whole block
+    // rather than to one key of it. `.cide/config.json` is committed, so a teammate's commit or
+    // a `git checkout` can change any of this under a running app, and a value cached at
+    // dispatch would announce a run the way somebody had already stopped asking for.
+    let config = cide_agents::config::load(&root).agents;
+
+    if !config.nudge_orchestrator {
         tracing::debug!(%project, "the orchestrator nudge is off for this project");
+        return;
+    }
+
+    // The fork. (M79)
+    //
+    // **Above `nudge_target` and above `may_be_typed_into`, and both omissions are deliberate.**
+    // Those two gates exist because the console road writes into a conversation somebody else
+    // is using: it has to find which one, and it has to wait until that one is not mid-turn.
+    // This road creates the conversation it writes into, so there is nothing to find and nothing
+    // to wait for — and, correspondingly, nothing to *hold*: a burst that cannot be delivered
+    // now goes back into the coalescer, and a burst that opens its own tab has already been
+    // delivered.
+    //
+    // It **replaces** the console line rather than joining it. Two announcements of one fact
+    // cost two turns and give two readers the same job, and the reader with the empty context is
+    // the one this feature exists to reach.
+    if config.finish_in_new_tab {
+        // **One reviewer per task**, and the second burst is told rather than duplicated —
+        // [`REVIEWERS`] carries the whole argument and the board it was measured on. Asked
+        // before the prompt is built, because the two roads say different things: a tab that
+        // does not exist yet needs the brief, and one that is already reading this task needs
+        // the news.
+        let task = turns.last().and_then(|turn| turn.task.clone());
+        if let Some(session) = task
+            .as_ref()
+            .and_then(|task| reviewer_for(app, project, task))
+        {
+            return note_to_reviewer(app, project, session, turns);
+        }
+        let prompt = review_prompt(&turns, title_of(app, project, &turns).as_deref());
+        match crate::claude_tab::open_with_prompt(
+            app,
+            project,
+            &review_tab_title(&turns),
+            &prompt,
+            // The project's own stance for an unattended child, read from the same file in the
+            // same breath as the switch that opened this tab. A reviewer that parks on a
+            // permission prompt nobody will answer is the failure `permission_mode` documents,
+            // and its brief tells it not to edit anything — `TabMode::Direct`'s doc carries the
+            // trade, because this one stands in the project root rather than a worktree.
+            crate::claude_tab::TabMode::Direct {
+                unattended: config.unattended(),
+            },
+            // The worktree the run under review worked in, so the reviewer starts *in* the
+            // branch — and so its transcript files beside that work instead of in the project's
+            // own Claude history, which is the reported bug. `None` for a task-less run, which
+            // had no checkout of its own (M40), and the helper falls back to the root for a
+            // worktree that has since gone.
+            review_checkout(&root, &turns),
+        ) {
+            Ok((session, tab)) => {
+                tracing::info!(%project, %session, %tab, turns = turns.len(), "a finished run opened its own reviewer");
+                // After the tab exists and never before: a row naming a session that failed to
+                // spawn would suppress the *next* burst's tab for a reviewer that never opened.
+                if let Some(task) = task {
+                    remember_reviewer(project, task, session);
+                }
+            }
+            // Dropped rather than held, and never silently: holding would wait for a condition
+            // that does not exist (this road has no busy session to wait on), and falling back
+            // to the console road would type into the pane the project asked cide not to use.
+            // The death comment `note_death` already wrote is the durable record either way.
+            Err(error) => {
+                tracing::warn!(%project, %error, "no review tab for a finished run; nobody was told");
+            }
+        }
         return;
     }
 
@@ -1891,10 +2050,7 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
         return;
     }
 
-    let title = turns
-        .last()
-        .and_then(|turn| turn.task.as_ref())
-        .and_then(|task| task_title(app, project, task));
+    let title = title_of(app, project, &turns);
     let Some(bytes) = submit(&nudge_line(&turns, title.as_deref())) else {
         return;
     };
@@ -1913,17 +2069,71 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
     crate::agents::type_submitted_line(app, session, &pty, bytes);
 }
 
-/// Rule 4: does this project still want to be typed at?
+/// Tell the review tab that already owns this task, instead of opening a second one. (M79)
 ///
-/// **Read off the disk on every nudge, and cached nowhere** — `cide_agents::config`'s module
-/// header makes the argument in general and it is sharpest here of anywhere. `.cide/config.json`
-/// is a committed file, so a teammate's commit, a `git checkout` or the user's own editor can
-/// switch this off under a running app, and a value read once at dispatch would go on typing
-/// into somebody who had already said no. It costs one `read` of a small file per burst, on a
-/// background thread, and the whole read path is written not to fail (a missing or unparseable
-/// file answers the default, which is on).
-fn nudge_allowed(root: &Path) -> bool {
-    cide_agents::config::load(root).agents.nudge_orchestrator
+/// It gets [`nudge_line`] — the console road's own line — and not [`review_prompt`]: this
+/// conversation was given the brief when it opened, has read the task, and is very likely
+/// holding the thread the new turn continues. Repeating the whole brief would spend its context
+/// re-stating what it already knows and read as a *different* job to do.
+///
+/// The two gates the tab road deliberately omits both come back here, because this road has
+/// what that one lacks — a conversation somebody else is already using. Mid-turn it **holds**,
+/// for the console road's reason: the reviewer's own next `Idle` edge re-arms the flusher
+/// through [`note_session_ready`], so the news waits rather than landing in whatever the
+/// reviewer is composing.
+fn note_to_reviewer(app: &AppHandle, project: ProjectId, session: SessionId, turns: Vec<Turn>) {
+    let Some(hooks) = app.try_state::<crate::hooks::HookServer>() else {
+        return;
+    };
+    let state = hooks.state(session);
+    if !may_be_typed_into(state) {
+        tracing::debug!(%project, %session, ?state, "the task's reviewer is mid-turn; holding");
+        NUDGES.hold(turns);
+        return;
+    }
+    let title = title_of(app, project, &turns);
+    let Some(bytes) = submit(&nudge_line(&turns, title.as_deref())) else {
+        return;
+    };
+    let Some(pty) = app
+        .try_state::<SessionRegistry>()
+        .and_then(|sessions| sessions.get(session))
+    else {
+        return;
+    };
+    tracing::info!(%project, %session, turns = turns.len(), "telling the task's open reviewer");
+    crate::agents::type_submitted_line(app, session, &pty, bytes);
+}
+
+/// The worktree the run being reviewed stood in, if it had one. (M79)
+///
+/// **The same composite a dispatch's checkout gets**, through `cide_agents::checkout_name` and
+/// `cide_git::worktree::path_of` — the two producers that built the directory in the first place
+/// — so the reviewer is by construction standing in the checkout that run committed to, exactly
+/// as `RegistrySink::integrate` merges by construction the branch it committed to.
+///
+/// `None` when the run had no task: such a run works in the project root (M40) and has no
+/// checkout of its own, so there is nothing to stand in that the root is not.
+///
+/// This reads the *last* turn of the burst, which is the one the prompt is about — the same
+/// choice `title_of` makes beside it, and for the same reason.
+fn review_checkout(root: &std::path::Path, turns: &[Turn]) -> Option<std::path::PathBuf> {
+    let turn = turns.last()?;
+    let task = turn.task.as_ref()?;
+    let name = cide_agents::checkout_name(&turn.agent, Some(task));
+    Some(cide_git::worktree::path_of(root, &name))
+}
+
+/// The title of the task the most recent ended turn was for, if there is one and it is known.
+///
+/// One producer for both roads (M79). The console line and the review tab name the same task, so
+/// two lookups would be two chances for them to name it differently — and the second would be
+/// taken a few milliseconds later, which is exactly long enough for a run to have renamed it.
+fn title_of(app: &AppHandle, project: ProjectId, turns: &[Turn]) -> Option<String> {
+    turns
+        .last()
+        .and_then(|turn| turn.task.as_ref())
+        .and_then(|task| task_title(app, project, task))
 }
 
 /// One ended turn, as the edge recorded it.
@@ -1938,6 +2148,15 @@ struct Turn {
     /// Whose conversation the line goes into — copied off the run at the edge, for the reason
     /// the label is: what the run *asked for* at dispatch, not what a later lookup would say.
     route: NudgeRoute,
+    /// The role's **id**, which is what a dispatch names and what its checkout is built from.
+    ///
+    /// Carried beside the label rather than derived from it, because they are different strings
+    /// and only one of them is a name anything answers to: a role labelled `3D Artist` has the
+    /// id `3d-artist`, and `cide_agents::checkout_name` builds `cide/3d-artist-t-1060` from the
+    /// id and a slug of the task. The first cut of the review prompt interpolated the label and
+    /// told a reviewer to diff `cide/3D Artist-t-1060` — a branch that has never existed, with a
+    /// space in it, which `cide_git::worktree`'s own whitelist would refuse outright.
+    agent: AgentId,
     agent_label: String,
     task: Option<TaskId>,
     outcome: TurnOutcome,
@@ -2000,6 +2219,7 @@ fn turn_of(app: &AppHandle, project: ProjectId, run: RunId) -> Option<Turn> {
         .map(|(live, route)| Turn {
             project,
             route,
+            agent: live.agent,
             agent_label: live.agent_label,
             task: live.task,
             outcome: match live.state {
@@ -2144,12 +2364,169 @@ fn nudge_line(turns: &[Turn], title: Option<&str>) -> String {
     one_line(&line)
 }
 
+/// What the review tab is called. (M79)
+///
+/// The role and the task, because a session that opens five of these over an afternoon needs to
+/// tell them apart in the strip, and those are the two facts that differ. Clipped through
+/// [`clip`] for its reason: a task title is written by whoever created the task — a person, or
+/// another model — so it is a string this process did not choose and must not let set the width
+/// of a tab.
+fn review_tab_title(turns: &[Turn]) -> String {
+    let Some(last) = turns.last() else {
+        return "Review".to_string();
+    };
+    let who = one_line(&last.agent_label);
+    let who = if who.is_empty() { "subagent" } else { &who };
+    match &last.task {
+        Some(task) => clip(&format!("Review: {who} · {task}")),
+        None => clip(&format!("Review: {who}")),
+    }
+}
+
+/// What the review tab's `claude` is told. **One line, always.** (M79)
+///
+/// # Why this is longer than [`nudge_line`] rather than the same sentence
+///
+/// `nudge_line` is short on purpose, and its doc says why: the console session already knows
+/// what the tools are, because `cmd::session`'s roster paragraph named every one of them in its
+/// system prompt at spawn. Restating the vocabulary would spend that context repeating itself.
+///
+/// **A review tab knows none of that.** Its conversation is empty, and — the part that decides
+/// the shape of this string — **nobody else is going to finish the job.** The console is not
+/// being told; that is what `finishInNewTab` means. So this cannot be a request for an opinion:
+/// a verdict written into a comment that nothing reads is the same loop ending in *and then the
+/// user happens to notice* that the whole feature exists to close.
+///
+/// So the tab **owns the task from here**. It has exactly two ways to put it down:
+///
+/// * satisfied — comment the verdict, **merge the branch** with `cide_agent_integrate`, and
+///   set the task `done`. The merge is not an afterthought and is the part that was missing
+///   first: accepting work means taking it into the branch, and a reviewer that said *"the
+///   branch isn't merged yet; I left that to you"* had handed the job back to the one person
+///   this feature exists to keep out of the loop. `integrate` computes the merge in memory and
+///   refuses on conflict without writing a byte, so the failure arm is safe to fold into the
+///   hand-back road; or
+/// * not satisfied — comment what is left **and hand the task back to the role that did it**,
+///   with `cide_agent_dispatch` carrying that feedback as the run's brief.
+///
+/// The second arm is what makes this a loop rather than a report, and it closes on itself: the
+/// re-dispatched run ends, opens another review tab, and that one reads the comments this one
+/// wrote. Which is also the escape hatch — the comments are the record, so a reviewer that can
+/// see the task has already been sent back for the same reason is told to stop and leave it for
+/// a person. That is the only bound available, and it is the right one: cide cannot judge
+/// whether a third attempt is progress, and a loop counter in Rust would stop a task that was
+/// genuinely converging.
+///
+/// It names the tools by their exact `mcp__cide__…` handles and nothing else about them — one
+/// line of prompt against a paragraph of description that would go stale — and it names the
+/// role by **id**, because that is what a dispatch answers to.
+///
+/// # The branch
+///
+/// [`cide_agents::checkout_name`] and never a `format!` here: a run's checkout is
+/// `cide/<role-id>-<slug of the task id>`, where the slug is the task id forced through the
+/// worktree grammar. The first cut spelled it by hand from the *label*, and told a reviewer to
+/// diff `cide/3D Artist-t-1060` — a branch with a space in it that has never existed and that
+/// `cide_git::worktree`'s whitelist would refuse. One producer, and the composite is only
+/// meaningful for a run that had a task: a task-less run stands in the project root (M40).
+///
+/// Flattened as a whole by [`one_line`], for [`nudge_line`]'s reason and with more at stake:
+/// this string is built from an agent label out of a committed markdown file and a task title
+/// out of a tracker any agent may write, and a newline in either is a second Enter that would
+/// submit the first half of the instructions as its own turn.
+fn review_prompt(turns: &[Turn], title: Option<&str>) -> String {
+    let last = turns.last();
+    let who = last
+        .map(|turn| turn.agent_label.as_str())
+        .map(one_line)
+        .filter(|label| !label.is_empty())
+        .map_or_else(|| "a subagent".to_string(), |label| format!("`{label}`"));
+
+    let ended = match last.map(|turn| &turn.outcome) {
+        None | Some(TurnOutcome::HandedBack) => "handed its turn back".to_string(),
+        Some(TurnOutcome::Finished { code }) => format!("finished (exit {code})"),
+        Some(TurnOutcome::Failed) => "failed".to_string(),
+    };
+
+    let also = match turns.len() {
+        0 | 1 => String::new(),
+        many => format!(
+            " {} other subagent turn(s) ended in the same moment; mcp__cide__cide_agent_runs \
+             lists them and each needs the same treatment.",
+            many - 1
+        ),
+    };
+
+    let Some(turn) = last else {
+        return one_line(
+            "A subagent turn just ended and cide could not say which. Check \
+             mcp__cide__cide_agent_runs and the tasks they commented on.",
+        );
+    };
+
+    let line = match turn.task.as_ref() {
+        Some(id) => {
+            let named = match title.map(one_line).filter(|title| !title.is_empty()) {
+                Some(title) => format!("task {id} ({})", clip(&title)),
+                None => format!("task {id}"),
+            };
+            let branch = cide_agents::checkout_name(&turn.agent, Some(id));
+            let role = &turn.agent.0;
+            format!(
+                "A subagent just {ended}: {who}, on {named}. You own that task now — nobody \
+                 else is reviewing it and the product owner has not been told, so it is yours \
+                 to finish or to send back. **There is nobody at the keyboard and nobody will \
+                 answer you**: decide every question yourself from what you can read, and never \
+                 end your turn by asking what to do — a turn that ends in a question is a task \
+                 nobody picks up. First find out what actually happened: read the \
+                 task with mcp__cide__cide_task_get and read its comments, which are the only \
+                 place the run reported; then diff the branch cide/{branch} against the base to \
+                 see what changed rather than what was claimed, and run whatever this repository \
+                 uses to check itself. Then take one of exactly two actions. If the work is done \
+                 and correct and did what the task asked rather than something adjacent: \
+                 comment your verdict with mcp__cide__cide_task_comment, then **merge it \
+                 yourself** with mcp__cide__cide_agent_integrate (agent `{role}`, task {id}) — \
+                 accepting work means taking it into this branch, and leaving a merge for \
+                 somebody to do later is the same as not accepting it — and only then set the \
+                 task to done with mcp__cide__cide_task_update. If that merge reports conflicts \
+                 it has changed nothing, and the task is not done: treat it as the other case \
+                 below, naming the conflicting paths. If it says there was nothing to merge, \
+                 that is a normal answer and not a problem to report — the branch is already \
+                 in, usually because an earlier review merged it — so check the work is present \
+                 and close the task. If the work is not right: comment exactly \
+                 what is wrong and \
+                 what is still needed, set the task back to doing with \
+                 mcp__cide__cide_task_update, and hand it back to the same role with \
+                 mcp__cide__cide_agent_dispatch (agent `{role}`, task {id}) passing that same \
+                 feedback as the instructions — do not fix it yourself, the role that built it \
+                 has the context. One exception, and read the comments for it before you \
+                 dispatch: if this task has already been sent back for the same reason, stop, \
+                 say so plainly in a comment, leave it in review and do not dispatch again. \
+                 Anything you notice that is wrong but is *not* this task — something the run \
+                 broke elsewhere, a gap it revealed, work this one turns out to depend on — goes \
+                 on the board as its own task with mcp__cide__cide_task_create, rather than into \
+                 this task's verdict where it is read once and lost.{also}"
+            )
+        }
+        None => format!(
+            "A subagent just {ended}: {who}, dispatched with no task, so it stood in the project \
+             root and has no branch of its own. You are reviewing it with fresh context and \
+             nobody else is, and nobody will answer a question — decide yourself from what you \
+             can read. Check mcp__cide__cide_agent_runs for what it was asked to do, then \
+             look at the working tree with git status and git diff to see what it left behind. \
+             Say plainly whether that is what was wanted. There is no task to record this on, so \
+             if something is wrong say what, and what you would dispatch to fix it.{also}"
+        ),
+    };
+    one_line(&line)
+}
+
 /// Whatever it is handed, on one line, with runs of whitespace collapsed.
 ///
 /// `split_whitespace` is what does the work and it is chosen for covering `\r` as well as `\n`:
 /// a lone carriage return in a task title is *also* an Enter to a PTY, and a filter that only
 /// looked for `\n` would leave the more obscure half of the bug in place.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -3236,15 +3613,108 @@ mod tests {
         ended_turn(project, agent, task, TurnOutcome::HandedBack)
     }
 
+    // --------------------------------------------------------------------------------------
+    // One reviewer per task. (M79)
+    // --------------------------------------------------------------------------------------
+
+    fn reviewer(project: ProjectId, task: &str, session: SessionId) -> Reviewer {
+        Reviewer {
+            project,
+            task: TaskId(task.to_string()),
+            session,
+        }
+    }
+
+    #[test]
+    fn a_task_with_an_open_reviewer_is_told_rather_than_given_a_second_one() {
+        let project = ProjectId::new();
+        let session = SessionId::new();
+        let mut open = vec![reviewer(project, "t-12", session)];
+        assert_eq!(
+            live_reviewer(&mut open, project, &TaskId("t-12".into()), |_| true),
+            Some(session),
+            "the burst goes to the tab that already owns this task"
+        );
+    }
+
+    #[test]
+    fn another_task_in_the_same_project_gets_its_own_reviewer() {
+        let project = ProjectId::new();
+        let mut open = vec![reviewer(project, "t-12", SessionId::new())];
+        assert_eq!(
+            live_reviewer(&mut open, project, &TaskId("t-13".into()), |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_same_task_id_in_another_project_is_a_different_task() {
+        let mine = ProjectId::new();
+        let mut open = vec![reviewer(ProjectId::new(), "t-12", SessionId::new())];
+        assert_eq!(
+            live_reviewer(&mut open, mine, &TaskId("t-12".into()), |_| true),
+            None,
+            "task ids are per project; a row from another one must not suppress this tab"
+        );
+    }
+
+    #[test]
+    fn a_closed_tab_stops_suppressing_its_tasks_next_reviewer() {
+        let project = ProjectId::new();
+        let mut open = vec![reviewer(project, "t-12", SessionId::new())];
+        assert_eq!(
+            live_reviewer(&mut open, project, &TaskId("t-12".into()), |_| false),
+            None,
+            "the session is gone, so the tab was closed and the task has no reviewer"
+        );
+        assert!(
+            open.is_empty(),
+            "and the row is pruned rather than re-tested for the life of the process"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_the_tabs_that_are_still_open() {
+        let project = ProjectId::new();
+        let live = SessionId::new();
+        let dead = SessionId::new();
+        let mut open = vec![
+            reviewer(project, "t-1", dead),
+            reviewer(project, "t-2", live),
+        ];
+        assert_eq!(
+            live_reviewer(&mut open, project, &TaskId("t-2".into()), |session| session
+                == live),
+            Some(live)
+        );
+        assert_eq!(open.len(), 1, "only the closed one went");
+        assert_eq!(open[0].session, live);
+    }
+
+    /// `agent` is the role's **label**; its id is derived the way a real definition's is, by
+    /// lowercasing and replacing what the grammar refuses — so a fixture labelled `3D Artist`
+    /// carries the id `3d-artist`, which is the pair that caught the branch bug.
     fn ended_turn(
         project: ProjectId,
         agent: &str,
         task: Option<&str>,
         outcome: TurnOutcome,
     ) -> Turn {
+        let id: String = agent
+            .chars()
+            .map(|c| {
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
         Turn {
             project,
             route: NudgeRoute::Primary,
+            agent: AgentId(id.trim_matches('-').to_string()),
             agent_label: agent.to_string(),
             task: task.map(|id| TaskId(id.to_string())),
             outcome,
@@ -3259,6 +3729,207 @@ mod tests {
     /// line interpolates is chosen by this process — an agent label comes out of a committed
     /// markdown file, a task title out of a tracker any agent may write — so both are asserted
     /// with the hostile shapes in them, `\r` as well as `\n`.
+    /// **The review prompt is one line too, and it has more strings to be wrong about.**
+    ///
+    /// `the_nudge_is_one_line_whatever_the_task_is_called` makes this claim for the console
+    /// road; this is the same claim for the tab road, and it matters at least as much. The tab's
+    /// prompt interpolates an agent label *twice* — once as prose and once inside a branch name
+    /// — plus a task id and a task title, none of which this process chooses. A newline in any
+    /// of them is a second Enter that submits the first half of the reviewer's instructions as
+    /// its own turn, leaving a fresh `claude` answering a fragment with no idea what it is for.
+    #[test]
+    fn the_review_prompt_is_one_line_whatever_anybody_called_anything() {
+        let project = ProjectId::new();
+        let hostile = "Fix the parser\nand then\r\nrewrite the lexer";
+
+        for prompt in [
+            review_prompt(&[turn(project, "developer", Some("t-17"))], Some(hostile)),
+            review_prompt(&[turn(project, "dev\neloper", Some("t-17"))], Some(hostile)),
+            review_prompt(&[turn(project, "developer", None)], Some(hostile)),
+            review_prompt(&[], None),
+            review_prompt(
+                &[
+                    ended_turn(project, "developer", Some("t-1"), TurnOutcome::Failed),
+                    ended_turn(
+                        project,
+                        "qa",
+                        Some("t-2"),
+                        TurnOutcome::Finished { code: 0 },
+                    ),
+                ],
+                Some(hostile),
+            ),
+        ] {
+            assert!(!prompt.contains('\n'), "a newline survived: {prompt}");
+            assert!(
+                !prompt.contains('\r'),
+                "a carriage return survived: {prompt}"
+            );
+        }
+    }
+
+    /// The prompt names the run's branch, because that is what turns "go and look at the work"
+    /// into a `git diff` — and it must **not** invent one for a task-less run, which stands in
+    /// the project root and has no branch at all (M40).
+    #[test]
+    fn the_review_prompt_names_the_branch_only_when_there_is_one() {
+        let project = ProjectId::new();
+
+        let with_task = review_prompt(&[turn(project, "developer", Some("t-9"))], Some("Wire it"));
+        assert!(
+            with_task.contains("cide/developer-t-9"),
+            "the reviewer was not told where to look: {with_task}"
+        );
+        assert!(with_task.contains("t-9"));
+        assert!(with_task.contains("Wire it"));
+
+        let adhoc = review_prompt(&[turn(project, "developer", None)], None);
+        assert!(
+            !adhoc.contains("cide/"),
+            "a branch was invented for a run that has none: {adhoc}"
+        );
+        assert!(adhoc.contains("no task"));
+    }
+
+    /// **The branch is the one `cide_agents::checkout_name` builds, not the label.**
+    ///
+    /// The reported bug, and the shape of it is worth keeping: a role *labelled* `3D Artist`
+    /// has the id `3d-artist`, and the first cut interpolated the label — so the reviewer was
+    /// told to diff `cide/3D Artist-t-1060`, a branch with a space and capitals in it that has
+    /// never existed and that `cide_git::worktree`'s whitelist refuses by construction. The
+    /// task id is slugged into it too, which a hand-written `format!` also skipped.
+    #[test]
+    fn the_branch_is_the_one_the_worktree_actually_builds() {
+        let project = ProjectId::new();
+        let prompt = review_prompt(
+            &[turn(project, "3D Artist", Some("T-1060"))],
+            Some("Seamless sand"),
+        );
+
+        let expected = cide_agents::checkout_name(
+            &AgentId("3d-artist".into()),
+            Some(&TaskId("T-1060".into())),
+        );
+        assert_eq!(expected, "3d-artist-t-1060", "the composer itself moved");
+        assert!(
+            prompt.contains(&format!("cide/{expected}")),
+            "the reviewer was sent to a branch that does not exist: {prompt}"
+        );
+        assert!(
+            !prompt.contains("cide/3D Artist"),
+            "the label leaked into a ref name: {prompt}"
+        );
+        // The label still names *who*, because that is what a person reads.
+        assert!(prompt.contains("`3D Artist`"), "{prompt}");
+    }
+
+    /// **The reviewer is told to finish the task, not to have an opinion about it.**
+    ///
+    /// `finishInNewTab` means the console is *not* told, so a verdict written into a comment
+    /// that nothing reads would end the loop exactly where M18 found it. The prompt therefore
+    /// names both ways to put the task down — done, or back to the role that built it — and
+    /// names the role by **id**, which is what `cide_agent_dispatch` answers to.
+    #[test]
+    fn the_reviewer_is_told_how_to_finish_or_hand_back() {
+        let project = ProjectId::new();
+        let prompt = review_prompt(&[turn(project, "3D Artist", Some("t-1060"))], None);
+
+        for handle in [
+            "mcp__cide__cide_task_get",
+            "mcp__cide__cide_task_comment",
+            "mcp__cide__cide_task_update",
+            "mcp__cide__cide_agent_dispatch",
+            // The one that was missing, and whose absence produced a reviewer reporting that
+            // the branch "isn't merged into main yet; I left that to you".
+            "mcp__cide__cide_agent_integrate",
+        ] {
+            assert!(prompt.contains(handle), "{handle} is not named: {prompt}");
+        }
+        // Both the dispatch and the merge have to be addressable: the id, not the label.
+        assert!(prompt.contains("`3d-artist`"), "{prompt}");
+        // Both outcomes, and the loop's one bound.
+        assert!(prompt.contains("set the task to done"), "{prompt}");
+        assert!(prompt.contains("hand it back"), "{prompt}");
+        // The merge comes *before* done, or a task is closed over work that never landed.
+        let merged = prompt.find("cide_agent_integrate").expect("the merge");
+        let done = prompt.find("set the task to done").expect("the close");
+        assert!(
+            merged < done,
+            "the task is closed before the branch is merged: {prompt}"
+        );
+        assert!(
+            prompt.contains("already been sent back for the same reason"),
+            "nothing stops a reviewer re-dispatching for ever: {prompt}"
+        );
+        // Out-of-scope findings go on the board, not into the verdict. Without this a reviewer
+        // has two bad options for something it noticed in passing — widen the task it is about
+        // to close, or write it into a comment that is read once and never again.
+        assert!(
+            prompt.contains("mcp__cide__cide_task_create"),
+            "a reviewer has nowhere to put what it noticed in passing: {prompt}"
+        );
+        // **"Nothing to merge" is a normal answer, not a fault to report.** It is what
+        // `Integrated::UpToDate` says, and on a real project it is common: a re-dispatched run
+        // that added no commits leaves a branch already in `main`, usually merged by the review
+        // before this one. Without this the reviewer reported it to the user as a problem —
+        // "the branch isn't merged; I left that to you" wearing its opposite face.
+        assert!(
+            prompt.contains("nothing to merge"),
+            "the reviewer will read an up-to-date branch as a failure: {prompt}"
+        );
+        // And it must not invite the reviewer to do the work itself — that is a second author
+        // on a branch the role still holds a checkout of.
+        assert!(prompt.contains("do not fix it yourself"), "{prompt}");
+    }
+
+    /// A burst says how many others ended with it, so the reviewer knows to look further —
+    /// but a single turn must not be decorated with "0 other turns", which reads as a bug.
+    #[test]
+    fn a_lone_turn_mentions_no_others() {
+        let project = ProjectId::new();
+        let one = review_prompt(&[turn(project, "developer", Some("t-1"))], None);
+        assert!(!one.contains("other subagent"), "{one}");
+
+        let three = review_prompt(
+            &[
+                turn(project, "a", Some("t-1")),
+                turn(project, "b", Some("t-2")),
+                turn(project, "c", Some("t-3")),
+            ],
+            None,
+        );
+        assert!(three.contains("2 other subagent turn(s)"), "{three}");
+        assert!(three.contains("mcp__cide__cide_agent_runs"), "{three}");
+    }
+
+    /// The tab is named for the run, so five of them in a strip can be told apart — and the
+    /// title is clipped, because a task id is cide's and a task title is anybody's.
+    #[test]
+    fn the_review_tab_is_named_for_the_run() {
+        let project = ProjectId::new();
+        assert_eq!(
+            review_tab_title(&[turn(project, "developer", Some("t-12"))]),
+            "Review: developer · t-12"
+        );
+        assert_eq!(
+            review_tab_title(&[turn(project, "developer", None)]),
+            "Review: developer"
+        );
+        // A label that is all whitespace is not a name; the tab still says what it is.
+        assert_eq!(
+            review_tab_title(&[turn(project, "  ", None)]),
+            "Review: subagent"
+        );
+        assert_eq!(review_tab_title(&[]), "Review");
+
+        let long = review_tab_title(&[turn(project, &"x".repeat(400), Some("t-1"))]);
+        assert!(
+            long.chars().count() <= TITLE_BUDGET + 1,
+            "a role could set the tab width: {} chars",
+            long.chars().count()
+        );
+    }
+
     #[test]
     fn the_nudge_is_one_line_whatever_the_task_is_called() {
         let project = ProjectId::new();
@@ -3625,22 +4296,25 @@ mod tests {
         // A project that has never heard of the key. On, because the loop it closes is the
         // feature — see `AgentsConfig::nudge_orchestrator`.
         assert!(
-            nudge_allowed(&root),
+            cide_agents::config::load(&root).agents.nudge_orchestrator,
             "the default is the way out, not the way in"
         );
 
         std::fs::write(&config, r#"{ "agents": { "nudgeOrchestrator": false } }"#).expect("write");
-        assert!(!nudge_allowed(&root), "a project that said no was typed at");
+        assert!(
+            !cide_agents::config::load(&root).agents.nudge_orchestrator,
+            "a project that said no was typed at"
+        );
 
         std::fs::write(&config, r#"{ "agents": { "nudgeOrchestrator": true } }"#).expect("write");
         assert!(
-            nudge_allowed(&root),
+            cide_agents::config::load(&root).agents.nudge_orchestrator,
             "the answer was cached across a checkout"
         );
 
         // And a file nothing can parse does not silently take the feature away either.
         std::fs::write(&config, "{{{ not json").expect("write");
-        assert!(nudge_allowed(&root));
+        assert!(cide_agents::config::load(&root).agents.nudge_orchestrator);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -368,7 +368,7 @@ notify?: RunNotify, };
  * More are expected; adding one is a variant here, an `impl Harness` there and one insert into
  * the registry. That is the shape the trait was chosen for.
  */
-export type Harness = "claude" | "opencode" | "qwen" | "codex";
+export type Harness = "claude" | "opencode" | "qwen" | "codex" | "mimo";
 
 /**
  * Which cide a device is talking to.

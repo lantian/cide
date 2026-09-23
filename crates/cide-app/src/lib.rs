@@ -16,6 +16,9 @@ pub mod agents;
 ///
 /// `cide --help` used to start a whole IDE; its header records what that cost. Runs in `main`,
 /// after `edit_wait::cli` and before anything touches GTK.
+/// A Claude tab cide opened by itself — the reviewer a finished run gets, the planner a quiet
+/// project gets. Its header argues why a pane built in Rust is right here and was not in M42.
+mod claude_tab;
 pub mod cli;
 pub mod closed_tabs;
 pub mod cmd;
@@ -39,6 +42,11 @@ pub mod ext_state;
 mod spec_reveal;
 mod spec_state;
 mod spec_triggers;
+/// The timer that wakes a project which has gone quiet with work still open. (M79)
+///
+/// The one thing in cide that acts on *nothing happening*; its header argues the dwell and the
+/// five conditions, and `should_spin` is where the rules actually live.
+pub mod spinner;
 // M8: one file index, picker and watcher per project.
 pub mod files;
 pub mod graphics;
@@ -925,6 +933,15 @@ pub fn run() {
                     tracing::error!(%error, "no edit socket; $EDITOR is left to the user's own")
                 }
             }
+
+            // The spinner, **after** the three sockets and deliberately so: a project it wakes
+            // gets a `claude` that needs `CIDE_HOOK_SOCK` and `CIDE_AGENT_SOCK` in its
+            // environment at exec — without the first it reports no state and the spun tab's
+            // own pane never counts as busy, and without the second the run it is being asked
+            // to plan has no tracker tools to plan with. It sleeps a full `POLL` before its
+            // first pass, so nothing here is racing it, but the ordering states the dependency
+            // rather than relying on that.
+            spinner::start(app.handle().clone());
 
             // One IDE server per restored project, for the same ordering reason as the hook
             // socket above and with the same consequence for getting it wrong: a pane spawns

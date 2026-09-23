@@ -301,6 +301,80 @@ export function ActionButton({ label, onClick, disabled }: ActionButtonProps) {
 }
 
 /**
+ * A [`TextField`] for text that is a paragraph rather than a token.
+ *
+ * # Why this exists beside `TextField` rather than as a prop on it
+ *
+ * The two differ in one thing that is not styling: **what Enter means.** `TextField` commits on
+ * Enter, which is right for an id, a URL or a key — there is one line and pressing Enter means
+ * "that is the value". Here Enter is a newline, because the thing being edited is prose, and a
+ * control that committed on it could not hold a second sentence. Making that a `multiline` flag
+ * would put a branch on the one keystroke the two disagree about, in the one place a reader
+ * would not think to look for it.
+ *
+ * So: **commits on blur and on Escape only**, and Escape reverts the draft exactly as
+ * `TextField`'s does. Blur-commit is not a style choice — `TextField`'s header argues it — and
+ * it matters more here, because this control's one caller writes a **file in the user's
+ * repository** on every commit.
+ *
+ * # Newlines
+ *
+ * It does not strip them, deliberately. What a newline *means* is the caller's question, and for
+ * the spinner's prompt Rust already answers it: `AgentsConfig::apply` flattens the string before
+ * it reaches `.cide/config.json`, because the prompt is typed at a terminal where a newline is a
+ * second Enter. A control that flattened on its own would be a second implementation of that
+ * rule, in the realm that cannot see why it is needed — and the box would fight the person as
+ * they typed. Here they type freely, the file holds one line, and the box shows what the file
+ * holds after the round trip.
+ */
+export function TextArea({
+  label,
+  hint,
+  value,
+  placeholder,
+  rows,
+  onCommit,
+}: {
+  label: string
+  hint?: ReactNode
+  value: string
+  placeholder?: string
+  rows?: number
+  onCommit: (next: string) => void
+}) {
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = (text: string) => {
+    setDraft(null)
+    const next = text.trim()
+    // Guarded, so tabbing through an untouched field is not a write and a broadcast —
+    // `TextField`'s rule, and here the write is a file in the user's repository.
+    if (next !== value) onCommit(next)
+  }
+  return (
+    <label className={styles.field}>
+      <span className={styles.fieldLabel}>{label}</span>
+      <textarea
+        className={styles.fieldArea}
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        rows={rows ?? 5}
+        placeholder={placeholder ?? ''}
+        value={draft ?? value}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
+        onKeyDown={(e) => {
+          // No Enter arm: see the header. Escape throws the draft away, which is the only way
+          // back out of a half-typed paragraph that does not involve retyping the old one.
+          if (e.key === 'Escape') setDraft(null)
+        }}
+      />
+      {hint !== undefined && <span className={styles.fieldHint}>{hint}</span>}
+    </label>
+  )
+}
+
+/**
  * A stacked label + input + hint that commits on blur, Enter or Escape.
  *
  * Promoted out of `ClaudeCliSection` in M45 — this was its third caller, and this file's header

@@ -84,8 +84,8 @@
 //! re-binds `.git`, `.codex` and `.agents` **read-only even inside the writable root**, and a
 //! cide worktree's `.git` is a file pointing into the parent's `.git/worktrees/<name>` outside
 //! the root in any case — so a sandboxed run cannot `git commit`, which the tracker paragraph
-//! asks every task run to do. `RunPlan::skip_permissions` therefore means
-//! `--dangerously-bypass-approvals-and-sandbox`, and the argument is `opencode.rs`'s `--auto`
+//! asks every task run to do. `RunPlan::unattended` therefore means
+//! `--dangerously-bypass-approvals-and-sandbox` for both `auto` and `bypassPermissions`, and the argument is `opencode.rs`'s `--auto`
 //! paragraph word for word: a refusal that ends the work is not a safety property in a headless
 //! child, and the containment for an unattended run is what it always actually was, the
 //! worktree. A role that names a sandboxed mode gets it, and its task runs will not satisfy the
@@ -135,6 +135,7 @@ use super::{
     ADHOC_PREAMBLE, ContinueSpec, Delivery, Harness, HarnessError, HarnessSpawn, Observation,
     RenderState, RunPlan, SERVER, SessionBinding, spec_preamble, tracker_preamble,
 };
+use crate::config::Unattended;
 
 /// The Codex CLI as a harness. A unit struct: it holds nothing, and must not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -239,6 +240,10 @@ impl Harness for CodexHarness {
         }
     }
 
+    fn usage(&self, line: &str) -> Option<cide_ipc::TokenUsage> {
+        usage(line)
+    }
+
     /// `codex debug models`, run for real.
     ///
     /// A probe and not a table, for `opencode.rs`'s reason: the catalog is a property of this
@@ -290,6 +295,44 @@ impl Harness for CodexHarness {
 
         model_slugs(&String::from_utf8_lossy(&filtered.stdout))
     }
+}
+
+/// What a `turn.completed` line says the turn spent. (M80)
+///
+/// `usage: {input_tokens, cached_input_tokens, output_tokens}` — and the one thing to know
+/// about it is that **`cached_input_tokens` is a part of `input_tokens`, not a figure beside
+/// it**: the measured line carries `5696` input of which `4096` were cached, which is a prompt
+/// of 5,696 tokens and not one of 9,792. opencode counts the other way round (see its `usage`),
+/// so the subtraction happens here, once, and both harnesses hand
+/// [`cide_ipc::TokenUsage`] the same shape. Carried raw, an identical conversation would read
+/// 72% larger under codex and nothing on screen would say why.
+///
+/// A saturating subtraction, not a bare one: the figures come off another program's wire, and a
+/// release that ever reported more cached than input would otherwise panic the coalescer
+/// thread — the thread every byte of every session flows through.
+///
+/// codex reports no reasoning count and no cache *writes* at all, so both are zero: a number
+/// derived from the output would be cide inventing a measurement the CLI never took.
+pub fn usage(line: &str) -> Option<cide_ipc::TokenUsage> {
+    let line = line.trim();
+    // Cheap first — `opencode::failover`'s rule, on the coalescer thread for its reason.
+    if !line.starts_with('{') || !line.contains("\"turn.completed\"") {
+        return None;
+    }
+    let event: Value = serde_json::from_str(line).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("turn.completed") {
+        return None;
+    }
+    let usage = event.get("usage")?;
+    let at = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let cached = at("cached_input_tokens");
+    Some(cide_ipc::TokenUsage {
+        input: at("input_tokens").saturating_sub(cached),
+        output: at("output_tokens"),
+        reasoning: 0,
+        cache_read: cached,
+        cache_write: 0,
+    })
 }
 
 /// One sentence for a [`cide_core::child_env::FilterError`], read in a settings dialog.
@@ -726,7 +769,7 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     }
     // Refused before anything is built too, so a role naming a mode this harness cannot honour
     // is refused at dispatch with the mode in the sentence, not started under some other one.
-    let policy = permission_policy(plan.agent.permission_mode.as_deref(), plan.skip_permissions)?;
+    let policy = permission_policy(plan.agent.permission_mode.as_deref(), plan.unattended)?;
 
     // A bare name, resolved by the OS at this spawn: codex updates itself underneath a running
     // app (`codex update`), and `defs::installed` probed for the same name.
@@ -897,7 +940,7 @@ pub(crate) fn developer_brief(plan: &RunPlan<'_>) -> String {
 /// through without asking.
 fn permission_policy(
     mode: Option<&str>,
-    skip_permissions: bool,
+    unattended: Unattended,
 ) -> Result<&'static [&'static str], HarnessError> {
     const BYPASS: &[&str] = &["--dangerously-bypass-approvals-and-sandbox"];
     const WORKSPACE: &[&str] = &["-s", "workspace-write"];
@@ -921,8 +964,16 @@ fn permission_policy(
                 what: format!("`permission-mode: {other}`"),
             });
         }
-        None if skip_permissions => BYPASS,
-        None => DEFAULT,
+        // The project default. `auto` here is the promptless flag and not `--approve-for-me`,
+        // and the choice is deliberate. That flag keeps the `workspace-write` sandbox, which
+        // re-binds `.git` read-only, so a task run could never make the commit its brief asks
+        // for (the module header). The project chose "an unattended run keeps working", and
+        // on this CLI the only way to keep that is the bypass it always had. A *role* that
+        // writes `auto` gets the literal mapping above.
+        None => match unattended {
+            Unattended::Auto | Unattended::Bypass => BYPASS,
+            Unattended::Ask => DEFAULT,
+        },
     })
 }
 
@@ -1020,7 +1071,7 @@ mod tests {
             llm: cide_ipc::LlmSettings::default(),
             choice: None,
             harness: agent.def.harness,
-            skip_permissions: false,
+            unattended: Unattended::Ask,
         }
     }
 
@@ -1318,11 +1369,11 @@ mod tests {
     #[test]
     fn the_definitions_vocabulary_maps_to_sandbox_flags_or_refuses() {
         let session = SessionId::new();
-        let sandbox_of = |mode: Option<&str>, skip: bool| -> Vec<String> {
+        let sandbox_of = |mode: Option<&str>, unattended: Unattended| -> Vec<String> {
             let mut agent = role();
             agent.permission_mode = mode.map(str::to_string);
             let mut plan = plan_for(&agent, session);
-            plan.skip_permissions = skip;
+            plan.unattended = unattended;
             let args = CodexHarness.spawn_spec(&plan).expect("spawnable").spec.args;
             let start = at(&args, "--skip-git-repo-check") + 1;
             let end = args
@@ -1332,25 +1383,40 @@ mod tests {
         };
 
         assert_eq!(
-            sandbox_of(Some("bypassPermissions"), false),
+            sandbox_of(Some("bypassPermissions"), Unattended::Ask),
             ["--dangerously-bypass-approvals-and-sandbox"]
         );
         assert_eq!(
-            sandbox_of(Some("acceptEdits"), false),
+            sandbox_of(Some("acceptEdits"), Unattended::Ask),
             ["-s", "workspace-write"]
         );
         assert_eq!(
-            sandbox_of(Some("dontAsk"), false),
+            sandbox_of(Some("dontAsk"), Unattended::Ask),
             ["-s", "workspace-write"]
         );
-        assert_eq!(sandbox_of(Some("plan"), true), ["-s", "read-only"]);
-        assert_eq!(sandbox_of(Some("auto"), false), ["--approve-for-me"]);
         assert_eq!(
-            sandbox_of(None, true),
+            sandbox_of(Some("plan"), Unattended::Bypass),
+            ["-s", "read-only"]
+        );
+        assert_eq!(
+            sandbox_of(Some("auto"), Unattended::Ask),
+            ["--approve-for-me"]
+        );
+        assert_eq!(
+            sandbox_of(None, Unattended::Bypass),
             ["--dangerously-bypass-approvals-and-sandbox"],
             "the project default for unattended children"
         );
-        assert!(sandbox_of(None, false).is_empty(), "the CLI's own default");
+        assert_eq!(
+            sandbox_of(None, Unattended::Auto),
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            "a project default of `auto` keeps a run able to commit, which `--approve-for-me` \
+             cannot"
+        );
+        assert!(
+            sandbox_of(None, Unattended::Ask).is_empty(),
+            "the CLI's own default"
+        );
 
         let mut manual = role();
         manual.permission_mode = Some("manual".into());
@@ -1550,6 +1616,41 @@ mod tests {
             h.observe(RunState::Finished { code: 0 }, Observation::Exit(0)),
             None
         );
+    }
+
+    /// A turn's figures, and the subtraction that is the whole of this function. (M80)
+    ///
+    /// The measured line says `input_tokens: 5696` of which `cached_input_tokens: 4096` — one
+    /// prompt of 5,696 tokens, reported two ways. Read as opencode reports its own (`input`
+    /// beside the cache rather than over it) the same turn would come back as 9,792, and the
+    /// card would show a conversation 72% larger on one harness than the other with nothing
+    /// anywhere saying why.
+    #[test]
+    fn a_completed_turn_reports_what_it_spent() {
+        let spent = usage(TURN_COMPLETED).expect("a turn.completed carries its usage");
+        assert_eq!(spent.input, 5_696 - 4_096, "the cached half comes out");
+        assert_eq!(spent.cache_read, 4_096);
+        assert_eq!(spent.output, 412);
+        assert_eq!(
+            spent.context(),
+            5_696 + 412,
+            "the prompt as codex counted it, plus what the model wrote"
+        );
+        // Nothing is invented for what the CLI does not measure.
+        assert_eq!(spent.reasoning, 0);
+        assert_eq!(spent.cache_write, 0);
+
+        // Another program's wire, so more cached than input must not panic the coalescer
+        // thread — it is zero uncached input, which is the only reading that is not a lie.
+        let impossible = r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":99,"output_tokens":1}}"#;
+        assert_eq!(usage(impossible).expect("still read").input, 0);
+
+        // A turn that reports no usage object at all says nothing, rather than zero: "this run
+        // has never reported" and "this step spent nothing" are different claims.
+        assert_eq!(usage(r#"{"type":"turn.completed"}"#), None);
+        for quiet in [TURN_STARTED, ITEM_MESSAGE, ITEM_CMD_DONE, BANNER, "{}"] {
+            assert_eq!(usage(quiet), None, "{quiet}");
+        }
     }
 
     /// The rendering: one line per completed item with the handle at its end, the marker

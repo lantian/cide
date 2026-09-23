@@ -1646,7 +1646,7 @@ pub fn resumable_on(
         cide_ipc::Harness::Qwen => {
             transcript_of(harness, cwd, session).is_some_and(|path| path.is_file())
         }
-        cide_ipc::Harness::Opencode | cide_ipc::Harness::Codex => false,
+        cide_ipc::Harness::Opencode | cide_ipc::Harness::Codex | cide_ipc::Harness::Mimo => false,
     }
 }
 
@@ -1674,7 +1674,7 @@ pub fn transcript_of(
                 .join("chats")
                 .join(format!("{session}.jsonl")),
         ),
-        cide_ipc::Harness::Opencode | cide_ipc::Harness::Codex => None,
+        cide_ipc::Harness::Opencode | cide_ipc::Harness::Codex | cide_ipc::Harness::Mimo => None,
     }
 }
 

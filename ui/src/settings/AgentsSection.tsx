@@ -82,6 +82,7 @@ import {
   type AgentModels,
   type AgentOverride,
   type OrchestrationConfig,
+  type OrchestrationPatch,
   type ProjectId,
   type ProjectOverrides,
 } from '@/ipc/client'
@@ -99,7 +100,9 @@ import {
   PathReadout,
   Row as SettingRow,
   Select,
+  TextArea,
   TextField,
+  ToggleRow,
 } from './controls'
 import {
   AGENT_HUES,
@@ -600,8 +603,16 @@ function AgentsEditor({ project }: { project: ProjectId }) {
     [project],
   )
 
+  /**
+   * Every write to `.cide/config.json` this screen makes.
+   *
+   * `Partial<OrchestrationPatch>` rather than a hand-listed union since M79: there are six
+   * settable keys now, and a signature enumerating them a second time is a second place for the
+   * list to go stale — which would fail as a *type* error at the call site rather than as the
+   * silent one, but would still be two lists.
+   */
   const patchConfig = useCallback(
-    (patch: { maxConcurrent: number }) => {
+    (patch: OrchestrationPatch) => {
       setConfigError(null)
       void agentsApi
         .setConfig(project, patch)
@@ -940,6 +951,104 @@ function AgentsEditor({ project }: { project: ProjectId }) {
                 />
               }
             />
+          )}
+          {config !== null && (
+            <ToggleRow
+              label="Review finished runs in a new tab"
+              hint={
+                'When a subagent hands its turn back, open a fresh Claude tab to check the ' +
+                'work instead of typing a line into this project\u2019s console. The new ' +
+                'conversation starts empty, so it reads the task and the diff with nothing ' +
+                'else in its context \u2014 and the tab stays until you close it, which ends ' +
+                'the Claude in it. Off, the console is told instead, exactly as before.'
+              }
+              checked={config.finishInNewTab}
+              onChange={(next) => patchConfig({ finishInNewTab: next })}
+            />
+          )}
+          {config !== null && (
+            <ToggleRow
+              label="Wake this project when it goes quiet"
+              hint={
+                'With subagents on and tasks still open, if nothing has been running for the ' +
+                'period below, open a Claude in plan mode and ask it to check what was done ' +
+                'and put the next tasks on the roles. It never fires while a run is live, ' +
+                'while a Claude pane is working, or while agents are paused.'
+              }
+              checked={config.autoSpin}
+              onChange={(next) => patchConfig({ autoSpin: next })}
+            />
+          )}
+          {config !== null && config.autoSpin && (
+            <>
+              <SettingRow
+                label="Quiet for"
+                hint={
+                  'Minutes of nothing happening before it fires. The clock restarts whenever ' +
+                  'the project looks busy, so this is a dwell and not an interval.'
+                }
+                control={
+                  <NumberField
+                    label="Quiet for"
+                    /*
+                     * Seconds on the wire, minutes in the box. The file holds seconds because
+                     * every other duration in it does (`stopGraceSecs`), and the box holds
+                     * minutes because nobody means "nine hundred". `Math.round` on the way in
+                     * so a hand-written 90 seconds draws as 2 rather than as 1.5, which
+                     * `NumberField` would commit back as 1.
+                     */
+                    value={Math.round(config.autoSpinAfterSecs / 60)}
+                    min={1}
+                    max={1440}
+                    onChange={(next) =>
+                      patchConfig({ autoSpinAfterSecs: Math.round(next) * 60 })
+                    }
+                  />
+                }
+              />
+              {/*
+                * A `TextArea` and not a `TextField`, which reverses what M79 first shipped.
+                *
+                * The argument for one line was that the prompt is *typed at a terminal*, where a
+                * newline is a second Enter — so a control that could not hold one was the
+                * constraint expressed in the form. That reasoning was sound about the file and
+                * wrong about the person: the default prompt is some five hundred characters, and
+                * a 26px box is the wrong shape to read it in, let alone rewrite it. Reported as
+                * exactly that.
+                *
+                * Nothing about the constraint moved, because it was never this control's to
+                * keep: `AgentsConfig::apply` flattens the string before it reaches
+                * `.cide/config.json`, which is why the flattening went *there* rather than at
+                * the spawn. So the box can hold whatever somebody types, the file holds one
+                * line, and the box shows that line back after the round trip — which is also
+                * what makes the hint below true rather than a warning nobody can act on.
+                */}
+              <TextArea
+                label="What to tell it"
+                hint={
+                  'The first prompt for the new Claude. Leave it empty to use the one cide ' +
+                  'ships, which tells it to survey the board and the git log first, judge ' +
+                  'whether the work is going the right way, and only then assign. Line breaks ' +
+                  'become spaces when it is saved \u2014 it is typed into a terminal, where a ' +
+                  'newline would submit half a sentence.'
+                }
+                value={config.autoSpinPrompt}
+                placeholder="Use cide's own prompt"
+                onCommit={(next) => patchConfig({ autoSpinPrompt: next })}
+              />
+              <ToggleRow
+                label="Accept its plan automatically"
+                hint={
+                  'Plan mode ends at an approval that a person would normally give, and there ' +
+                  'is nobody there. cide reads that prompt and answers it \u2014 for this one ' +
+                  'session, only when it recognises the plan question, and only the option that ' +
+                  'says yes. Any other prompt is left alone. Off, the tab waits at its plan ' +
+                  'with the pane marked and you approve it yourself.'
+                }
+                checked={config.autoSpinAcceptPlan}
+                onChange={(next) => patchConfig({ autoSpinAcceptPlan: next })}
+              />
+            </>
           )}
           {configError !== null && (
             <Note
@@ -2129,8 +2238,8 @@ function ModelField({
 /** The sentence under the Model box, which changes with the harness and with what a probe said. */
 function modelHint(harness: HarnessName, answer: AgentModels | null): string {
   const base =
-    harness === 'opencode'
-      ? 'An id in opencode’s own spelling, provider/model. The menu is what `opencode models` ' +
+    harness === 'opencode' || harness === 'mimo'
+      ? `An id in ${harness}’s own spelling, provider/model. The menu is what \`${harness} models\` ` +
         'reports on this machine, so it lists the providers you have configured.'
       : harness === 'codex'
         ? 'A model slug in Codex’s own spelling. The menu is what `codex debug models` lists on ' +
@@ -2371,7 +2480,8 @@ function isEmptyOverride(value: AgentOverride): boolean {
     value.pool == null &&
     value.model == null &&
     value.effort == null &&
-    value.maxConcurrent == null
+    value.maxConcurrent == null &&
+    value.permissionMode == null
   )
 }
 
@@ -2397,7 +2507,7 @@ function withField<K extends keyof AgentOverride>(
   return out
 }
 
-/** The five fields of one override, drawn identically for the project row and a role's own. */
+/** The six fields of one override, drawn identically for the project row and a role's own. */
 function OverrideFields({
   title,
   value,
@@ -2521,6 +2631,29 @@ function OverrideFields({
         placeholder="leave as committed"
         onCommit={(effort: string) =>
           onChange(withField(value, 'effort', effort === '' ? undefined : effort))
+        }
+      />
+
+      <SettingRow
+        label="Permission mode"
+        hint={
+          'How runs answer permission prompts here. Beats the role file and the project default ' +
+          '(auto). auto lets Claude’s classifier approve on your behalf; bypassPermissions lets a ' +
+          'run do anything without asking. codex and qwen map each word onto their own modes ' +
+          '(codex has nobody to ask, so it refuses manual), and opencode ignores it.'
+        }
+        control={
+          <Select
+            label="Permission mode"
+            value={value.permissionMode ?? ''}
+            options={[
+              { value: '', label: 'Leave as committed' },
+              ...PERMISSION_MODES.map((mode) => ({ value: mode, label: mode })),
+            ]}
+            onChange={(next) =>
+              onChange(withField(value, 'permissionMode', next === '' ? undefined : next))
+            }
+          />
         }
       />
 

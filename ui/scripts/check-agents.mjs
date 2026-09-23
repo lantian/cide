@@ -305,7 +305,7 @@ try {
 
   ok(rustStatuses.length === 4, `read ${rustStatuses.length} TaskStatus variants — the scan still matches`)
   ok(rustPhases.length === 9, `read ${rustPhases.length} RunState variants — the scan still matches`)
-  ok(rustHarnesses.length === 4, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
+  ok(rustHarnesses.length === 5, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
 
   eq(
     sorted(TASK_STATUSES),

@@ -31,6 +31,13 @@ import type { Harness } from "./Harness";
  * in *this* struct will eventually be drawn too, and when they are they will still be a
  * per-project file write and still not a [`crate::SettingsPatch`]. The rule the paragraph above
  * is really stating survives intact: nothing about a project rides `Workspace.settings`.
+ *
+ * # Why this is `Clone` and no longer `Copy` (M79)
+ *
+ * It was `Copy` until [`Self::auto_spin_prompt`] arrived, and a prompt is a `String` a person
+ * wrote. The alternative — keeping `Copy` by leaving the prompt off the wire — would have put
+ * the one field on this screen that a user actually composes behind a hand edit of a JSON file,
+ * which is the state `AgentDraft` exists to get *out* of.
  */
 export type OrchestrationConfig = { 
 /**
@@ -49,4 +56,34 @@ maxConcurrent: number,
 /**
  * The harness a role gets when its definition does not name one.
  */
-harness: Harness, };
+harness: Harness, 
+/**
+ * A finished run's note opens a fresh Claude tab instead of typing into the console. (M79)
+ *
+ * `cide_agents::config::AgentsConfig::finish_in_new_tab` carries the argument; this is the
+ * same key, on the wire because the user asked for it in Settings. Note it is **under**
+ * `nudgeOrchestrator`, which stays disk-only: that key answers *announce my subagents at
+ * all*, this one answers *where*.
+ */
+finishInNewTab: boolean, 
+/**
+ * cide wakes this project when it goes quiet with work still open. (M79)
+ */
+autoSpin: boolean, 
+/**
+ * How long that quiet must last, in seconds. The **stored** number, not the clamped one —
+ * `AgentsConfig::to_wire` says why.
+ */
+autoSpinAfterSecs: number, 
+/**
+ * What the spun run is told. Empty means *use the one cide ships*, decided in
+ * `AgentsConfig::spin_prompt` and never here.
+ */
+autoSpinPrompt: string, 
+/**
+ * cide reads the spun run's plan approval off its screen and answers it. (M79)
+ *
+ * `cide_agents::config::AgentsConfig::auto_spin_accept_plan` carries the argument, including
+ * why this is not the blind write the stop code refuses.
+ */
+autoSpinAcceptPlan: boolean, };

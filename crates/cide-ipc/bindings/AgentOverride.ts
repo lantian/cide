@@ -55,4 +55,18 @@ effort?: string,
  * Useful in the direction the committed file cannot know about: more parallelism against a
  * local model that costs nothing, less against a metered one.
  */
-maxConcurrent?: number, };
+maxConcurrent?: number, 
+/**
+ * The permission mode this role runs under here, in claude's vocabulary
+ * (`cide_agents::defs::PERMISSION_MODES`). (M82)
+ *
+ * Beats the role's own `permission-mode:` and the project's `agents.permissionMode`, and is
+ * folded into the role before any harness reads it, so each harness maps it exactly as it
+ * maps a mode the role wrote. The module header argues why this one field of a role's
+ * behaviour may be overridden.
+ *
+ * An unknown word is **ignored with a warning** rather than refused. An override is a
+ * convenience, and `cide_agents::overrides::resolve` refuses nothing but a missing pool.
+ * The role then runs on what its file says.
+ */
+permissionMode?: string, };

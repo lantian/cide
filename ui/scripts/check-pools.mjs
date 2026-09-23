@@ -465,7 +465,7 @@ try {
       /pub ([a-z_]+):/g,
     ),
   ].map((m) => m[1].replace(/_([a-z])/g, (_, c) => c.toUpperCase()))
-  ok(overrideFields.length === 5, `read ${overrideFields.length} AgentOverride fields`)
+  ok(overrideFields.length === 6, `read ${overrideFields.length} AgentOverride fields`)
   for (const field of overrideFields) {
     ok(
       agentsSection.includes(`'${field}'`),

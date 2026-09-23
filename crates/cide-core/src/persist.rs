@@ -2040,6 +2040,7 @@ mod tests {
             id: TabId::new(),
             kind: TabKind::ClaudeFull {
                 title: "shop-db-1".into(),
+                ephemeral: false,
             },
             tree: PaneTree {
                 root: LayoutNode::Leaf { pane: pane.id },
@@ -2342,6 +2343,104 @@ mod tests {
         assert!(
             !back.projects.is_empty(),
             "and the rest of the document survived, rather than the file being quarantined"
+        );
+    }
+
+    /// **A `claudeFull` tab saved before `ephemeral` existed still loads, and loads as the
+    /// user's.** (M79)
+    ///
+    /// `TabKind::ClaudeFull` grew a member, and a container's `#[serde(default)]` does **not**
+    /// supply a member a *present* object happens not to mention — `TerminalSettings`'
+    /// `job_notify_after_secs` learnt that the expensive way. Without `#[serde(default)]` on the
+    /// member itself every `workspace.json` in existence would fail to parse its Claude tabs,
+    /// which `load` answers by starting clean: every tab, pane and session binding gone, at
+    /// launch, with nothing on screen saying why.
+    ///
+    /// `false` is also the only right answer for such a tab. `ephemeral` means *cide opened this
+    /// by itself and closing it ends the child*; a tab from before the feature was opened by a
+    /// person, and a `true` here would kill a conversation they expected Ctrl+Shift+T to bring
+    /// back.
+    #[test]
+    fn a_claude_tab_saved_before_ephemeral_existed_loads_as_the_users() {
+        let dir = TempDir::new("claude-full-no-ephemeral");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = fixture();
+        let project_id = *workspace.projects.keys().next().expect("a project");
+        let pane = Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Claude,
+            role: PaneRole::Auxiliary,
+            session: None,
+            conversation: None,
+            conversation_since: None,
+            continues: None,
+            title: "cide : claude".into(),
+            docker: None,
+        };
+        let tab_id = TabId::new();
+        workspace
+            .projects
+            .get_mut(&project_id)
+            .expect("the project")
+            .tabs
+            .push(Tab {
+                id: tab_id,
+                kind: TabKind::ClaudeFull {
+                    title: "scratch".into(),
+                    ephemeral: false,
+                },
+                tree: PaneTree {
+                    root: LayoutNode::Leaf { pane: pane.id },
+                    focused: pane.id,
+                    maximized: None,
+                    panes: IndexMap::from_iter([(pane.id, pane)]),
+                },
+            });
+        save_atomic(&path, &workspace).expect("save");
+
+        // Take the member back out, so the file is byte-shaped like one a pre-M79 cide wrote.
+        let raw = fs::read_to_string(&path).expect("read");
+        let mut value: Value = serde_json::from_str(&raw).expect("parse");
+        let mut removed = false;
+        for project in value["projects"]
+            .as_object_mut()
+            .expect("projects is an object")
+            .values_mut()
+        {
+            for tab in project["tabs"].as_array_mut().expect("tabs is an array") {
+                // `TabKind` is internally tagged, so a tab's `kind` is an object whose own
+                // `kind` names the variant and whose members sit beside it.
+                let kind = tab["kind"].as_object_mut().expect("kind is an object");
+                if kind.get("kind").and_then(Value::as_str) == Some("claudeFull")
+                    && kind.remove("ephemeral").is_some()
+                {
+                    removed = true;
+                }
+            }
+        }
+        assert!(
+            removed,
+            "the fixture no longer writes the member this test exists to remove"
+        );
+        fs::write(&path, serde_json::to_string_pretty(&value).expect("render")).expect("write");
+
+        let back = load(&path);
+        let tab = back
+            .projects
+            .get(&project_id)
+            .expect("the project survived")
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .expect("the Claude tab survived — a missing member quarantined the whole document");
+        assert_eq!(
+            tab.kind,
+            TabKind::ClaudeFull {
+                title: "scratch".into(),
+                ephemeral: false,
+            },
+            "a tab the user opened must not be killed by its own close"
         );
     }
 

@@ -193,3 +193,74 @@
   font-size: var(--fs-ui-13);
   line-height: 1.5;
 }
+
+/*
+ * Who ran it, on what, and how full the context is. (M80) A footer rather than another
+ * `.section`, because it is provenance and not content: it is the same for every line of a run
+ * and must not push the output — the thing somebody opened the card for — further down the card
+ * as it grows.
+ *
+ * Outside `.body`, so it stays put while a long output scrolls under it. `flex: none` for the
+ * same reason `.head` has it.
+ */
+.foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 18px 12px;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+.footRow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The label column, so the two rows' values line up without a table. */
+.footLabel {
+  flex: none;
+  width: 4.5em;
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.footValue {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A model id is the harness's own vocabulary — `anthropic/claude-sonnet-5` — so it is mono. */
+.footModel {
+  font-family: var(--font-mono);
+}
+
+/*
+ * The Context row wraps instead of ellipsing. The row above it is a model id — one token, more
+ * useful truncated than folded, and readable in full from the `title` — while this one is a
+ * sentence of several parts, and an ellipsis there would hide the breakdown on a narrow card
+ * while still looking like a complete line.
+ */
+.footWrap {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* What the figure is made of, and the word `default` where cide named no model. */
+.footAside {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}

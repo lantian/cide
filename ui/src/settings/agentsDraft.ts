@@ -56,7 +56,7 @@ export function isClaudeScope(scope: Scope): boolean {
 }
 
 /** `cide_ipc::Harness`. Which CLI actually runs a role. */
-export type HarnessName = 'claude' | 'opencode' | 'qwen' | 'codex'
+export type HarnessName = 'claude' | 'opencode' | 'qwen' | 'codex' | 'mimo'
 
 /**
  * `cide_ipc::AgentField` — which box on the form a refusal belongs to.
@@ -156,7 +156,7 @@ export const SCOPES: readonly Scope[] = [
 ]
 
 /** `cide_ipc::Harness`, as a set. Pinned to the Rust enum by the check script. */
-export const HARNESSES: readonly HarnessName[] = ['claude', 'opencode', 'qwen', 'codex']
+export const HARNESSES: readonly HarnessName[] = ['claude', 'opencode', 'qwen', 'codex', 'mimo']
 
 /**
  * `cide_agents::defs::PERMISSION_MODES`, in that module's order.
@@ -950,6 +950,8 @@ export function harnessLabel(harness: HarnessName | null): string {
       return 'qwen'
     case 'codex':
       return 'Codex'
+    case 'mimo':
+      return 'MiMo Code'
     // A trailing `: 'opencode'` is what this used to be, and it was a mislabel waiting for the
     // third harness: every CLI cide had not heard of would have been drawn as opencode, in a
     // dropdown, with nothing anywhere saying so. A `never` makes the next one a compile error.
@@ -1001,6 +1003,9 @@ export function modelPlaceholder(harness: HarnessName): string {
     // box is read from on this machine. (M44)
     case 'codex':
       return 'gpt-5.5'
+    // opencode's `provider/model`, from `mimo models` — the fork keeps the spelling. (M81)
+    case 'mimo':
+      return 'xiaomi/mimo-v2.6-flash'
     default: {
       const unreachable: never = harness
       return unreachable

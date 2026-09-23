@@ -91,6 +91,7 @@
 //! before anything "tidies up" by normalising the cwd: it would silently orphan every transcript
 //! the agent had accumulated.
 
+use crate::config::Unattended;
 use cide_claude::HookEvent;
 use cide_core::claude_cli::Injection;
 use cide_ipc::{RunState, SessionState};
@@ -497,14 +498,25 @@ fn assemble(
     {
         args.push("--permission-mode".into());
         args.push(mode.clone());
-    } else if plan.agent.permission_mode.is_none() && plan.skip_permissions {
-        // The project's default for unattended children (`agents.skipPermissions`, on unless
-        // switched off): a headless run cannot answer a prompt, and a claude run that hits
-        // one parks in AwaitingPermission holding its slot and its role's only worktree
-        // until a human opens its pane. The config field's doc carries the whole argument;
-        // the spelling is the same validated mode a role could have written itself.
-        args.push("--permission-mode".into());
-        args.push(crate::defs::BYPASS_PERMISSIONS.into());
+    } else if plan.agent.permission_mode.is_none() {
+        // The project's default for unattended children (`agents.permissionMode`, `auto`
+        // unless the file says otherwise). A headless run cannot answer a prompt, and a claude
+        // run that hits one parks in AwaitingPermission, holding its slot and its role's only
+        // worktree, until a human opens its pane. The config field's doc carries the whole
+        // argument. Each word is one a role could have written itself. `Ask` passes nothing,
+        // which is the CLI's own default.
+        //
+        // Not skipped for a subagent. The branch above is, because the CLI reads the file's
+        // own `permissionMode`, and this branch runs only when that key is absent.
+        let mode = match plan.unattended {
+            Unattended::Auto => Some("auto"),
+            Unattended::Bypass => Some(crate::defs::BYPASS_PERMISSIONS),
+            Unattended::Ask => None,
+        };
+        if let Some(mode) = mode {
+            args.push("--permission-mode".into());
+            args.push(mode.into());
+        }
     }
     // Variadic, and safe here only because every token written after it begins with `-`. An
     // argument added below this line has to think about that.
@@ -867,7 +879,7 @@ mod tests {
             harness: agent.def.harness,
             // Off in the fixture, so every argv assertion below is about what the role
             // and the plan actually said; the skip default has tests of its own.
-            skip_permissions: false,
+            unattended: Unattended::Ask,
         }
     }
 
@@ -1118,25 +1130,34 @@ mod tests {
         );
     }
 
-    /// The project default (`agents.skipPermissions`) reaches the argv when the role said
-    /// nothing — and the role's own word, whatever it is, always wins over it.
+    /// The project default (`agents.permissionMode`) reaches the argv when the role said
+    /// nothing, and the role's own word, whatever it is, always wins over it. (M82)
     #[test]
-    fn the_skip_default_injects_bypass_and_the_roles_word_wins() {
+    fn the_unattended_default_reaches_the_argv_and_the_roles_word_wins() {
         let agent = role();
         let mut plan = plan_for(&agent, SessionId::new());
-        plan.skip_permissions = true;
-        assert_eq!(
-            value_of(&spawn(&plan).spec.args, "--permission-mode"),
-            crate::defs::BYPASS_PERMISSIONS,
-            "an unattended child cannot answer a prompt — the config field's doc has the measurement"
-        );
+        for (unattended, expected) in [
+            (Unattended::Auto, Some("auto")),
+            (Unattended::Bypass, Some(crate::defs::BYPASS_PERMISSIONS)),
+            (Unattended::Ask, None),
+        ] {
+            plan.unattended = unattended;
+            let args = spawn(&plan).spec.args;
+            match expected {
+                Some(mode) => assert_eq!(value_of(&args, "--permission-mode"), mode),
+                None => assert!(
+                    !args.iter().any(|a| a == "--permission-mode"),
+                    "`manual` is the CLI's own default and passes nothing: {args:?}"
+                ),
+            }
+        }
 
-        // The author's word wins — including a *restrictive* one, which an override here would
+        // The author's word wins, including a *restrictive* one, which an override here would
         // silently widen into exactly the behaviour their file says they did not want.
         let mut strict = role();
         strict.permission_mode = Some("plan".into());
         let mut plan = plan_for(&strict, SessionId::new());
-        plan.skip_permissions = true;
+        plan.unattended = Unattended::Bypass;
         assert_eq!(
             value_of(&spawn(&plan).spec.args, "--permission-mode"),
             "plan"
@@ -1556,12 +1577,9 @@ mod tests {
         let mut agent = subagent();
         agent.permission_mode = None;
         let mut plan = plan_for(&agent, SessionId::new());
-        plan.skip_permissions = true;
+        plan.unattended = Unattended::Auto;
         let args = spawn(&plan).spec.args;
-        assert_eq!(
-            value_of(&args, "--permission-mode"),
-            crate::defs::BYPASS_PERMISSIONS
-        );
+        assert_eq!(value_of(&args, "--permission-mode"), "auto");
     }
 
     /// A cide role is untouched by any of it — the four flags are back and `--agent` is not.

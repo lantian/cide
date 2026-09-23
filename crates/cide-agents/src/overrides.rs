@@ -35,6 +35,12 @@ pub struct Resolved {
     /// override that said "three of this role here" wrote a file, drew a value, and left the
     /// queue admitting one.
     pub max_concurrent: u16,
+    /// The role's `permission-mode`, with the override's folded over it. (M82)
+    ///
+    /// `None` means neither said anything, and the project's `agents.permissionMode` then
+    /// decides (`RunPlan::unattended`). Reaches a harness only through [`Self::apply`], for the
+    /// reason that doc gives about `model` and `effort`.
+    pub permission_mode: Option<String>,
     /// Why this run cannot start, or `None`.
     ///
     /// The **only** refusal this module produces, and it is deliberately narrow: an override that
@@ -67,12 +73,14 @@ impl Resolved {
         llm: &LlmSettings,
         opencode: Option<&UserConfig>,
     ) -> ChildSettings {
-        let for_opencode = self.harness == Harness::Opencode;
+        // `reads_provider_document`, not `== Opencode`: mimo reads the same document. (M81)
+        let for_opencode = self.harness.reads_provider_document();
         ChildSettings {
             harness: self.harness,
             pool: self.pool.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            permission_mode: self.permission_mode.clone(),
             // Only opencode reads the provider document (`harness::opencode::provider_members`),
             // so only an opencode child is a different child when a provider changes. Carrying
             // the providers for every harness would restart a `claude` run over a key it never
@@ -93,7 +101,7 @@ impl Resolved {
     /// override and the role are both silent, so nothing a person wrote is displaced by it.
     #[must_use]
     pub fn with_default_model(mut self, default: Option<String>) -> Self {
-        if self.harness == Harness::Opencode && self.pool.is_empty() && self.model.is_none() {
+        if self.harness.reads_provider_document() && self.pool.is_empty() && self.model.is_none() {
             self.model = default.filter(|model| !model.trim().is_empty());
         }
         self
@@ -121,6 +129,7 @@ impl Resolved {
         let mut folded = agent.clone();
         folded.def.model = self.model.clone();
         folded.effort = self.effort.clone();
+        folded.permission_mode = self.permission_mode.clone();
         folded
     }
 }
@@ -142,11 +151,21 @@ pub struct ChildSettings {
     pub pool: Vec<PoolEntry>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The resolved `permission-mode`. A mode is fixed on the argv at the fork, so a paused run
+    /// whose override moved it is a different child. (M82)
+    pub permission_mode: Option<String>,
     /// `Some` for opencode, `None` for every harness that never reads the provider document.
     pub providers: Option<Vec<LlmProvider>>,
     /// What opencode itself resolved — its default model and its providers — for an opencode
     /// child; `None` for every other harness, and for an opencode child forked while the
     /// binary could not be asked.
+    ///
+    /// **For a mimo child it is what *mimo* resolved** (`mimo debug config`, through the same
+    /// `user_config` with the other flavour). The name stayed because the family did: the
+    /// field means "this opencode-shaped CLI's own configuration", and a second field that is
+    /// `None` whenever this one is `Some` would be a comparison with two halves that can never
+    /// both be filled. `harness` sits beside it, so a mimo config never compares equal to an
+    /// opencode one as the same child. (M81)
     pub opencode: Option<UserConfig>,
 }
 
@@ -168,6 +187,9 @@ impl ChildSettings {
         }
         if self.effort != other.effort {
             changed.push("effort");
+        }
+        if self.permission_mode != other.permission_mode {
+            changed.push("permission mode");
         }
         if self.providers != other.providers {
             changed.push("providers");
@@ -256,10 +278,28 @@ pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSetti
     // that function and this struct is read by the fork: two foldings of one override is how
     // this field came to be computed here and obeyed nowhere — see `Resolved::max_concurrent`.
     let max_concurrent = crate::effective_max_concurrent(agent, overrides);
+    // The override's mode, when it is a word the CLIs know, then the role's own. An unknown word
+    // is dropped with a warning rather than refused: this module refuses only a missing pool,
+    // and handing an unvalidated string to `--permission-mode` is the silent behaviour change
+    // `defs::PERMISSION_MODES`' doc refuses for a role file.
+    let permission_mode = match over.permission_mode.as_deref().map(str::trim) {
+        Some(mode) if crate::defs::PERMISSION_MODES.contains(&mode) => Some(mode.to_string()),
+        Some(other) => {
+            if !other.is_empty() {
+                tracing::warn!(
+                    role = %agent.def.id,
+                    value = other,
+                    "a local permission-mode override is not a mode cide knows; ignoring it"
+                );
+            }
+            agent.permission_mode.clone()
+        }
+        None => agent.permission_mode.clone(),
+    };
 
     // A pool is opencode's alone: no other harness takes a `provider/model`, and applying one
     // would hand a CLI an id it does not parse.
-    let wants_pool = harness == Harness::Opencode;
+    let wants_pool = harness.reads_provider_document();
 
     let mut refusal = None;
     let mut pool = Vec::new();
@@ -316,6 +356,7 @@ pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSetti
         model,
         effort,
         max_concurrent,
+        permission_mode,
         refusal,
     }
 }
@@ -332,7 +373,7 @@ pub fn inert_pool(agent: &LoadedAgent, overrides: &ProjectOverrides) -> bool {
     }
     let over = overrides.for_role(agent.id().as_str());
     let harness = over.harness.unwrap_or(agent.def.harness);
-    over.pool.as_deref().is_some_and(|name| !name.is_empty()) && harness != Harness::Opencode
+    over.pool.as_deref().is_some_and(|name| !name.is_empty()) && !harness.reads_provider_document()
 }
 
 #[cfg(test)]
@@ -618,6 +659,7 @@ mod tests {
                 model: Some("other".into()),
                 effort: Some("high".into()),
                 max_concurrent: Some(9),
+                permission_mode: Some("plan".into()),
             });
             let out = resolve(
                 &agent,
@@ -629,12 +671,67 @@ mod tests {
             assert_eq!(out.model.as_deref(), Some("committed-model"), "{scope:?}");
             assert_eq!(out.effort.as_deref(), Some("committed-effort"), "{scope:?}");
             assert_eq!(out.max_concurrent, 2, "{scope:?}");
+            assert_eq!(out.permission_mode, None, "{scope:?}");
             assert!(out.refusal.is_none(), "{scope:?}");
             assert!(
                 inert_pool(&agent, &overrides),
                 "and the screen says the pool does nothing"
             );
         }
+    }
+
+    /// The override's permission mode beats the role's own, reaches the harness through
+    /// `apply`, and an unknown word leaves the role's alone rather than reaching an argv. (M82)
+    #[test]
+    fn an_override_permission_mode_beats_the_roles_and_is_folded_in() {
+        let mut agent = role(AgentScope::Project, Harness::Claude);
+        agent.permission_mode = Some("acceptEdits".into());
+
+        let out = resolve(
+            &agent,
+            &ProjectOverrides::default(),
+            &LlmSettings::default(),
+        );
+        assert_eq!(out.permission_mode.as_deref(), Some("acceptEdits"));
+
+        let out = resolve(
+            &agent,
+            &with(AgentOverride {
+                permission_mode: Some("auto".into()),
+                ..Default::default()
+            }),
+            &LlmSettings::default(),
+        );
+        assert_eq!(out.permission_mode.as_deref(), Some("auto"));
+        assert_eq!(out.apply(&agent).permission_mode.as_deref(), Some("auto"));
+
+        let out = resolve(
+            &agent,
+            &with(AgentOverride {
+                permission_mode: Some("yolo".into()),
+                ..Default::default()
+            }),
+            &LlmSettings::default(),
+        );
+        assert_eq!(out.permission_mode.as_deref(), Some("acceptEdits"));
+    }
+
+    /// A paused run whose override moved its mode is a different child, so Resume restarts it.
+    #[test]
+    fn a_changed_permission_mode_is_a_different_child() {
+        let agent = role(AgentScope::Project, Harness::Claude);
+        let llm = LlmSettings::default();
+        let before = resolve(&agent, &ProjectOverrides::default(), &llm).child_settings(&llm, None);
+        let after = resolve(
+            &agent,
+            &with(AgentOverride {
+                permission_mode: Some("plan".into()),
+                ..Default::default()
+            }),
+            &llm,
+        )
+        .child_settings(&llm, None);
+        assert_eq!(before.changed_fields(&after), vec!["permission mode"]);
     }
 
     #[test]

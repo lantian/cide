@@ -68,6 +68,7 @@
 //! desktop launch because a child's `PATH` carries `toolchain::discovered_dirs` — the login
 //! shell's directories, which is where nvm puts its `bin` — and `node` lives beside it.
 
+use crate::config::Unattended;
 use cide_ipc::{HarnessSession, RunState};
 use cide_pty::{Geometry as PtyGeometry, SpawnSpec};
 use serde::Deserialize;
@@ -319,8 +320,7 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
             what: format!("an effort level (`effort: {effort}`)"),
         });
     }
-    if let Some(mode) = approval_mode(plan.agent.permission_mode.as_deref(), plan.skip_permissions)?
-    {
+    if let Some(mode) = approval_mode(plan.agent.permission_mode.as_deref(), plan.unattended)? {
         args.push("--approval-mode".into());
         args.push(mode.into());
     }
@@ -379,12 +379,12 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
 /// The CLI's approval mode for a definition's claude-vocabulary permission mode, or for the
 /// project default when the definition names none.
 ///
-/// The role's own word always wins; the project's `agents.skipPermissions` fills in only when
+/// The role's own word always wins. The project's `agents.permissionMode` fills in only when
 /// the role wrote nothing, and `None` there is the CLI's own default (ask), which is the safe
 /// end of the range.
 fn approval_mode(
     mode: Option<&str>,
-    skip_permissions: bool,
+    unattended: Unattended,
 ) -> Result<Option<&'static str>, HarnessError> {
     let refuse = |what: String| HarnessError::NoEquivalent {
         harness: cide_ipc::Harness::Qwen,
@@ -399,8 +399,14 @@ fn approval_mode(
         Some(other) => {
             return Err(refuse(format!("`permission-mode: {other}`")));
         }
-        None if skip_permissions => Some("yolo"),
-        None => None,
+        // The project default. `auto` keeps `yolo`, which this default always gave a qwen
+        // run. qwen's own `auto` mode was never measured in a headless child, and an
+        // unmeasured mode is not something to switch every unattended run onto at once. A
+        // *role* that writes `auto` gets the literal mapping above.
+        None => match unattended {
+            Unattended::Auto | Unattended::Bypass => Some("yolo"),
+            Unattended::Ask => None,
+        },
     })
 }
 
@@ -485,7 +491,7 @@ mod tests {
             llm: cide_ipc::LlmSettings::default(),
             choice: None,
             harness: agent.def.harness,
-            skip_permissions: false,
+            unattended: Unattended::Ask,
         }
     }
 
@@ -606,7 +612,7 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--session-id"));
         assert_eq!(args[at(args, "-i") + 1], plan.prompt);
 
-        plan.skip_permissions = true;
+        plan.unattended = Unattended::Bypass;
         let args = QwenHarness.spawn_spec(&plan).expect("spawnable").spec.args;
         assert_eq!(args[at(&args, "--approval-mode") + 1], "yolo");
 

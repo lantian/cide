@@ -116,8 +116,8 @@ pub mod agents;
 pub mod tasks;
 
 pub use agents::{
-    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, LlmModelTest, OrchestrationConfig,
-    OrchestrationPatch, RunNotify, RunOpen, RunState,
+    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, LlmModelTest, LogRunInfo,
+    OrchestrationConfig, OrchestrationPatch, RunNotify, RunOpen, RunState, TokenUsage,
 };
 pub use tasks::{
     ATTACHMENTS_DIR, ATTACHMENTS_LEAF, AttachTarget, AttachmentKind, LinkType, StagedFile,

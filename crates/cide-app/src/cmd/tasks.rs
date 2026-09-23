@@ -585,5 +585,10 @@ pub async fn task_attachment_reveal(
 fn answer(app: &tauri::AppHandle, project: ProjectId, store: &TaskStore) -> TaskBoard {
     let (rev, board) = tasks_state::versioned_board(store);
     crate::emit::tasks_changed(app, project, rev, &board);
+    // Every board change passes here or through `tasks_state::broadcast`, so this is where an idle
+    // run whose task just closed is ended. See `AgentRegistry::retire_done`.
+    if let Some(registry) = app.try_state::<std::sync::Arc<crate::agents::AgentRegistry>>() {
+        registry.retire_done(app, project, &board);
+    }
     board
 }

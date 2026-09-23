@@ -1034,9 +1034,16 @@ fn read_definition(
                     problems.push(AgentProblem::error(
                         path,
                         line,
+                        // From the registry, never a literal: this sentence said "claude,
+                        // opencode" through three more harnesses. (M81)
                         format!(
                             "`{value}` is not a harness this build has. Known harnesses are \
-                             claude, opencode."
+                             {}.",
+                            crate::harness::registry()
+                                .iter()
+                                .map(|h| harness_name(h.kind()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     ));
                     // Loaded and greyed rather than dropped, because "cide does not have that
@@ -1258,6 +1265,7 @@ pub fn harness_from_str(value: &str) -> Option<Harness> {
         "opencode" => Some(Harness::Opencode),
         "qwen" => Some(Harness::Qwen),
         "codex" => Some(Harness::Codex),
+        "mimo" => Some(Harness::Mimo),
         _ => None,
     }
 }
@@ -1269,6 +1277,7 @@ pub fn harness_name(harness: Harness) -> &'static str {
         Harness::Opencode => "opencode",
         Harness::Qwen => "qwen",
         Harness::Codex => "codex",
+        Harness::Mimo => "mimo",
     }
 }
 
@@ -1306,6 +1315,7 @@ pub fn harness_binary(harness: Harness) -> &'static str {
         Harness::Opencode => "opencode",
         Harness::Qwen => "qwen",
         Harness::Codex => "codex",
+        Harness::Mimo => "mimo",
     }
 }
 
@@ -3362,6 +3372,7 @@ Work one task at a time.
         Harness::Opencode,
         Harness::Qwen,
         Harness::Codex,
+        Harness::Mimo,
     ];
 
     /// The second half is read straight off the two functions rather than through a catalog,

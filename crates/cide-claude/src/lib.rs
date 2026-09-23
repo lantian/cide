@@ -25,6 +25,8 @@ pub mod headless;
 pub mod hook;
 pub mod orphans;
 pub mod permission;
+/// Which option on a plan-approval prompt means *yes, proceed*. (M79)
+pub mod plan;
 pub mod prompt;
 pub mod roster;
 pub mod session;

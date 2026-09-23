@@ -82,7 +82,7 @@ impl SessionFacts {
     /// `windows.rs` aggregates (`ui/src/panes/awaiting.ts` argues it at length). A second
     /// derivation here would be a fourth surface disagreeing with the other three.
     pub fn gather(
-        hooks: Option<&HookServer>,
+        states: HashMap<SessionId, SessionState>,
         agents: Option<&AgentRegistry>,
         ws: &Workspace,
         only: Option<ProjectId>,
@@ -101,20 +101,10 @@ impl SessionFacts {
             }
         }
         Self {
-            states: HashMap::new(),
+            states,
             awaiting: crate::windows::awaiting_sessions().into_iter().collect(),
             runs,
         }
-        .with_hooks(hooks)
-    }
-
-    fn with_hooks(mut self, hooks: Option<&HookServer>) -> Self {
-        if let Some(hooks) = hooks {
-            for session in hooks.live_sessions() {
-                self.states.insert(session, hooks.state(session));
-            }
-        }
-        self
     }
 
     /// A session's state, or `Spawning` — which is [`HookServer::state`]'s own default and is
@@ -230,10 +220,13 @@ impl AppRemoteHost {
     /// up, and a hook server that has not started yet means *no session has said anything yet*,
     /// which is exactly what `SessionState::Spawning` says.
     fn facts(&self, ws: &Workspace, only: Option<ProjectId>) -> SessionFacts {
-        let hooks = self.app.try_state::<HookServer>();
         let agents = self.app.try_state::<std::sync::Arc<AgentRegistry>>();
         let agents = agents.as_deref().map(std::sync::Arc::as_ref);
-        SessionFacts::gather(hooks.as_deref(), agents, ws, only)
+        // Every state a window was told, not the hook server's map: that one holds only what
+        // hooks said, and was read here through `live_sessions` — `Busy`/`AwaitingPermission`
+        // alone — so every finished turn reached a phone as `Spawning`. See
+        // `emit::last_session_states`.
+        SessionFacts::gather(crate::emit::last_session_states(), agents, ws, only)
     }
 }
 
@@ -1065,7 +1058,7 @@ mod tests {
     #[test]
     fn a_projection_carries_no_credential() {
         let ws = workspace_holding_a_key();
-        let facts = SessionFacts::gather(None, None, &ws, None);
+        let facts = SessionFacts::gather(HashMap::new(), None, &ws, None);
 
         let mut everything = serde_json::to_string(&projects(&ws)).expect("serialises");
         everything.push_str(&serde_json::to_string(&sessions(&ws, &facts, None)).expect("ser"));
@@ -1088,7 +1081,7 @@ mod tests {
     #[test]
     fn a_session_with_no_hook_server_reads_as_spawning() {
         let ws = workspace_holding_a_key();
-        let facts = SessionFacts::gather(None, None, &ws, None);
+        let facts = SessionFacts::gather(HashMap::new(), None, &ws, None);
         let found = sessions(&ws, &facts, None);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].state, SessionState::Spawning);

@@ -83,7 +83,7 @@ fn a_real_turn_ends_in_a_result_event_and_the_child_stays_interactive() {
         llm: cide_ipc::LlmSettings::default(),
         choice: None,
         harness: agent.def.harness,
-        skip_permissions: true,
+        unattended: cide_agents::config::Unattended::Bypass,
     };
     let spawn = QwenHarness.spawn_spec(&plan).expect("spawnable");
     let pty = PtySession::spawn(spawn.spec).expect("spawn qwen");

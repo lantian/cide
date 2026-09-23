@@ -70,6 +70,8 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
             // A codex conversation re-opened is `codex resume <id>`: opencode's shape, a
             // program in a terminal. (M44)
             cide_ipc::Harness::Codex => (PaneKind::Shell, "codex"),
+            // MiMo Code is an opencode fork, and its TUI is re-opened the same way. (M81)
+            cide_ipc::Harness::Mimo => (PaneKind::Shell, "mimo"),
         },
         SplitIntent::Shell => (PaneKind::Shell, "bash"),
         // A `Shell` pane, deliberately — see `cide_ipc::Pane::docker` for why a container's pane
@@ -108,7 +110,8 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
                 // and a qwen TUI is not one, so it is bound at the spawn like a shell's.
                 cide_ipc::Harness::Opencode
                 | cide_ipc::Harness::Qwen
-                | cide_ipc::Harness::Codex => None,
+                | cide_ipc::Harness::Codex
+                | cide_ipc::Harness::Mimo => None,
             },
             _ => None,
         },

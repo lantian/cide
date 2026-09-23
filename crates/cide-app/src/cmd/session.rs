@@ -374,6 +374,11 @@ fn orchestrator_paragraph(
     project: cide_ipc::ProjectId,
     resume: Option<SessionId>,
     forking: bool,
+    // `Some(Voice::Acting)` for a tab cide opened itself; `None` for every spawn the webview
+    // asks for, which is inferred from the tree below exactly as it always was. An override
+    // rather than a widened predicate because `is_primary_console_spawn` answers a question
+    // about the *console*, and this pane is not one and must not be mistaken for one.
+    voice: Option<Voice>,
 ) -> Option<String> {
     let state = app.try_state::<crate::workspace_state::WorkspaceState>()?;
     // One lock acquisition, and the disk read happens after it is released: `WorkspaceState::with`
@@ -382,14 +387,21 @@ fn orchestrator_paragraph(
     // is served the orchestration tools (`agent_rpc`'s scope table) and a pane with tools and no
     // manual is the model guessing. What the console predicate still decides is the *opening
     // sentence*: the product owner is told it is, and any other pane is told it may act as one.
-    let (root, primary) = state.with(|ws| {
+    let (root, inferred) = state.with(|ws| {
         let primary = is_primary_console_spawn(ws, registry, project, resume, forking);
         let root = cide_core::workspace::project(ws, project)
             .ok()?
             .roots
             .first()
             .map(|root| root.path.clone())?;
-        Some((root, primary))
+        Some((
+            root,
+            if primary {
+                Voice::ProductOwner
+            } else {
+                Voice::Pane
+            },
+        ))
     })?;
 
     // Read fresh, here, for `cide_agents`' stated reason: `.cide/*` is committed, so a teammate's
@@ -404,7 +416,33 @@ fn orchestrator_paragraph(
     }
 
     let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
-    Some(roster_paragraph(&roles, primary))
+    Some(roster_paragraph(&roles, voice.unwrap_or(inferred)))
+}
+
+/// Which opening sentence a pane's roster paragraph gets. (M79)
+///
+/// Two of these until M79, decided by a `bool`. The third arrived because cide started opening
+/// Claude tabs **of its own accord** — a reviewer when a subagent finishes, a planner when the
+/// project has been quiet — and neither of the two existing sentences is true of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Voice {
+    /// The project's console. *You are the product owner.*
+    ProductOwner,
+    /// Any other Claude pane the **user** opened. *You may act as one.*
+    ///
+    /// Hedged deliberately, and the hedge is load-bearing for this case alone: a task's
+    /// conversation pane opened from the Tasks panel has just been handed a task to *work*, and
+    /// two identities in one prompt is a model guessing which to be.
+    Pane,
+    /// A tab **cide** opened to do the product owner's job. *You are acting as it, right now.*
+    ///
+    /// The hedge above is exactly wrong here, and was reported as such: these tabs are opened
+    /// with a brief that tells them to read a task, judge it, merge the branch, close it or
+    /// dispatch it back — which *is* the job — and a system prompt that meanwhile describes them
+    /// as a bystander who *could* orchestrate leaves the model arguing with itself about whether
+    /// it is allowed to. There is no second identity to be confused with, because nobody handed
+    /// this session a task to work; cide opened it to run the loop.
+    Acting,
 }
 
 /// The paragraph itself, as a pure function of the roles and of which pane is being told.
@@ -418,7 +456,7 @@ fn orchestrator_paragraph(
 /// as one — without being told it *is*, because a task's conversation pane opened from the Tasks
 /// panel has just been handed a task to work, and two identities in one prompt is a model
 /// guessing which to be.
-fn roster_paragraph(roles: &[&cide_ipc::AgentDef], primary: bool) -> String {
+fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice) -> String {
     let roles = if roles.is_empty() {
         // Said rather than omitted: a session told it is the product owner and handed no roles
         // would call `cide_agents_list`, get an empty answer, and have no idea whether that is a
@@ -450,14 +488,25 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], primary: bool) -> String {
     // turn. Every mechanic named here is real (each has a pointer to the code that makes it
     // true); a sentence here that outlives its mechanism is a model confidently doing the wrong
     // thing, so treat this prose as code.
-    let opening = if primary {
-        "You are the product owner for this project in cide. You do not have to do everything \
-         yourself: this project has subagents, and you can decompose a goal into tasks, hand each \
-         one to a role, and check the result."
-    } else {
-        "This is a Claude pane of a project in cide that has subagents, and you can hand work to \
-         its roles exactly as the project's product owner — its primary Claude pane — does: \
-         decompose a goal into tasks, hand each one to a role, and check the result."
+    let opening = match voice {
+        Voice::ProductOwner => {
+            "You are the product owner for this project in cide. You do not have to do \
+             everything yourself: this project has subagents, and you can decompose a goal into \
+             tasks, hand each one to a role, and check the result."
+        }
+        Voice::Pane => {
+            "This is a Claude pane of a project in cide that has subagents, and you can hand \
+             work to its roles exactly as the project's product owner — its primary Claude pane \
+             — does: decompose a goal into tasks, hand each one to a role, and check the result."
+        }
+        Voice::Acting => {
+            "You are acting as the product owner for this project in cide. cide opened this tab \
+             by itself, with nobody at the keyboard, to run the orchestration loop: the \
+             instructions you were given are the job, and you carry them out yourself rather \
+             than reporting what somebody else should do. This project has subagents — decompose \
+             a goal into tasks, hand each one to a role, take finished work back, and check the \
+             result."
+        }
     };
 
     format!(
@@ -483,7 +532,11 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], primary: bool) -> String {
          wins. Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
          write this project's shared task tracker at `.cide/tasks.json`: create the task before \
          you hand it to anybody, because a run is pointed at its task and reads the statement of \
-         the work from there. Assigning a todo or doing task to a role — with \
+         the work from there. The board is also where anything you notice in passing goes — a \
+         defect, a gap, a piece of work something else turns out to need: open a task for it \
+         with `mcp__cide__cide_task_create` the moment you see it, rather than folding it into \
+         whatever is in flight or keeping it in this conversation, because a conversation ends \
+         and the board does not. Assigning a todo or doing task to a role — with \
          `mcp__cide__cide_task_assign` or `mcp__cide__cide_task_update`, by creating the task \
          with an assignee, or by @mentioning a role in a task's body or a comment — starts that \
          role on it automatically; `mcp__cide__cide_agent_dispatch` (a role and a task id, \
@@ -650,6 +703,87 @@ pub async fn session_spawn(
     // for the same reason; see below.
     continues: Option<cide_ipc::HarnessSession>,
 ) -> Result<SessionId, SessionError> {
+    // The command is a **shape**, and the work is below it. The split exists because M79 needs
+    // this exact machinery — the user's `claude_cli` arguments, the folded system prompt, the
+    // inline `--settings` that installs cide's hooks, the proxy pass, the exit watcher — from a
+    // background thread with no webview in the story at all. Every one of those is a rule
+    // somebody paid for, and a second spawn path would be a second place to forget them.
+    //
+    // Nothing moved except the signature: the body is `spawn_session` verbatim.
+    spawn_session(
+        &app,
+        &registry,
+        SpawnRequest {
+            program,
+            args,
+            cwd,
+            geometry,
+            project,
+            resume,
+            fork,
+            continues,
+            // Inferred from the tree, as it always was: a webview cannot tell cide which pane
+            // it is, and `is_primary_console_spawn` is the answer to that question.
+            voice: None,
+            // No caller on the wire can ask for extra environment, deliberately: a webview able
+            // to set arbitrary variables on a `claude` sets them on a process that inherits
+            // cide's own authentication.
+            env: Vec::new(),
+        },
+    )
+    .await
+}
+
+/// Everything a spawn needs, as one value. (M79)
+///
+/// A struct here and a flat parameter list on the command above, which is the opposite of the
+/// usual advice and is right for the stated reason: the command's parameters *are* its JSON, and
+/// this is an internal call where the `too_many_arguments` allow would be buying nothing.
+pub(crate) struct SpawnRequest {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub geometry: Geometry,
+    pub project: Option<cide_ipc::ProjectId>,
+    pub resume: Option<SessionId>,
+    pub fork: Option<bool>,
+    pub continues: Option<cide_ipc::HarnessSession>,
+    /// Which opening sentence the roster paragraph gets, when the caller knows better than the
+    /// tree does. `None` infers it, which is every spawn the webview asks for. (M79)
+    pub voice: Option<Voice>,
+    /// Extra variables for this child alone, applied last.
+    ///
+    /// Empty for every caller today, and kept because the alternative — reaching back into this
+    /// function's body from a second spawn path — is the duplication the extraction removed. A
+    /// variable set here outranks every pass above it; see the fold at the end of the body.
+    pub env: Vec<(String, String)>,
+}
+
+/// Spawn a child for a pane. The body of [`session_spawn`], callable from Rust. (M79)
+///
+/// Takes `&AppHandle` and `&SessionRegistry` rather than Tauri's `State`, which is the whole of
+/// the difference: every `try_state` below resolves off a plain handle, and `registry` is touched
+/// in three places. A caller on a background OS thread reaches this through
+/// `tauri::async_runtime::block_on`, which is legal off the runtime and off the GTK loop —
+/// `agent_rpc`'s header states that rule.
+pub(crate) async fn spawn_session(
+    app: &tauri::AppHandle,
+    registry: &SessionRegistry,
+    request: SpawnRequest,
+) -> Result<SessionId, SessionError> {
+    let SpawnRequest {
+        program,
+        args,
+        cwd,
+        geometry,
+        project,
+        resume,
+        fork,
+        continues,
+        voice,
+        env: extra_env,
+    } = request;
+    let app = app.clone();
     // Read before the blocking closure: `WorkspaceState` is Tauri-managed state and the
     // closure below is `spawn_blocking`, which cannot hold a `State<'_, _>` across the await.
     // One bool's worth of work on the caller's thread, and it decides which way round the
@@ -827,7 +961,7 @@ pub async fn session_spawn(
         && plan.inject.has(cide_core::claude_cli::Injection::McpConfig)
         && let Some(project) = project
         && let Some(paragraph) =
-            orchestrator_paragraph(&app, &registry, project, resume, wants_fork(fork))
+            orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
     {
         if carries_append_system_prompt_file(&plan.args) {
             // Degrade, do not refuse: the two flags cannot coexist and the CLI refuses the pair
@@ -1030,6 +1164,16 @@ pub async fn session_spawn(
             agents.socket().to_string_lossy().to_string(),
         );
         spec = with_task_tools(spec, &plan.inject, agent_mcp_config);
+    }
+
+    // The caller's own variables, **last**, so they outrank everything composed above. (M79)
+    //
+    // Last rather than first because a variable a caller states by name is the most specific
+    // thing anybody said about this child, and the passes above are defaults: the proxy
+    // environment, the toolchain `PATH`, the hook socket. Empty for every spawn the webview asks
+    // for — `SpawnRequest::env` says why.
+    for (key, value) in extra_env {
+        spec = spec.env(key, value);
     }
 
     // What a restored *shell* gets instead of a resume. `resume` on a non-Claude program has
@@ -1697,6 +1841,7 @@ pub fn session_kill(
 #[tauri::command(rename_all = "camelCase")]
 pub fn session_log_detail(
     logs: State<'_, Arc<crate::logring::JsonLogRing>>,
+    agents: State<'_, Arc<crate::agents::AgentRegistry>>,
     session: SessionId,
     handle: u64,
 ) -> Option<cide_ipc::LogLineDetail> {
@@ -1715,6 +1860,13 @@ pub fn session_log_detail(
         raw,
         pretty,
         recorded_unix_ms,
+        // Who ran it, on what, and how full the context is by now. (M80) Asked here rather than
+        // through a second command for the reason the card's own header gives about `pretty`:
+        // the one place that can answer is the one place that answers, and the card opens on a
+        // single round trip with either the whole block or the knowledge that there is none.
+        // `None` for every line a shell pane rendered, which is the case this card was built
+        // for — see `LogLineDetail::run`.
+        run: agents.log_run_info(session),
     })
 }
 
@@ -1745,7 +1897,7 @@ mod tests {
     fn the_roster_paragraph_names_the_roles_and_the_namespaced_tools() {
         let developer = role("developer", "Implements one task\n  end to end.");
         let qa = role("qa", "");
-        let paragraph = roster_paragraph(&[&developer, &qa], true);
+        let paragraph = roster_paragraph(&[&developer, &qa], Voice::ProductOwner);
         // Printed on purpose: this is prose handed to a language model, and the assertions below
         // check fragments of it. `cargo test -p cide-app roster_paragraph -- --nocapture`.
         eprintln!("{paragraph}");
@@ -1825,6 +1977,14 @@ mod tests {
         assert!(paragraph.contains("sets the task to review"), "{paragraph}");
         // ...the goal lives on the board, not in the context window...
         assert!(paragraph.contains("plan of record"), "{paragraph}");
+        // Anything noticed in passing goes on the board. (M79) The orchestrator's half of the
+        // rule `TRACKER_PREAMBLE` states for a run: a conversation ends and the board does not,
+        // so a defect that lives only in this session's context is a defect nobody sees again.
+        assert!(
+            paragraph.contains("mcp__cide__cide_task_create"),
+            "{paragraph}"
+        );
+
         // ...and the way to summon the user is to end the turn asking (`windows::set_awaiting`
         // badges the pane and retitles the window).
         assert!(
@@ -1839,8 +1999,8 @@ mod tests {
     #[test]
     fn a_second_pane_is_told_it_may_orchestrate_and_everything_else_is_the_same() {
         let developer = role("developer", "Implements one task end to end.");
-        let console = roster_paragraph(&[&developer], true);
-        let pane = roster_paragraph(&[&developer], false);
+        let console = roster_paragraph(&[&developer], Voice::ProductOwner);
+        let pane = roster_paragraph(&[&developer], Voice::Pane);
 
         assert!(
             console.starts_with("You are the product owner"),
@@ -1863,9 +2023,54 @@ mod tests {
         assert!(tail(&pane).is_some());
     }
 
+    /// **A tab cide opened is told it *is* acting as the product owner.** (M79)
+    ///
+    /// `Voice::Pane`'s sentence is hedged — *you may act as one* — and the hedge is right for
+    /// the case it was written for: a conversation pane the user opened onto a task has been
+    /// handed work to *do*, and two identities in one prompt is a model guessing which to be.
+    ///
+    /// It is exactly wrong for a reviewer or a planner cide opened by itself. Those arrive with
+    /// a brief telling them to judge a task, merge its branch, close it or dispatch it back —
+    /// which is the job — and a system prompt meanwhile describing them as a bystander who
+    /// *could* orchestrate left the model arguing with itself about whether it was allowed to.
+    /// Reported as "the opened console still thinks it isn't an orchestrator, but it is".
+    #[test]
+    fn a_tab_cide_opened_is_told_it_is_acting_as_the_product_owner() {
+        let developer = role("developer", "Implements one task end to end.");
+        let acting = roster_paragraph(&[&developer], Voice::Acting);
+        let pane = roster_paragraph(&[&developer], Voice::Pane);
+        let console = roster_paragraph(&[&developer], Voice::ProductOwner);
+
+        assert!(
+            acting.starts_with("You are acting as the product owner"),
+            "{acting}"
+        );
+        // The three are distinct, and the failure this guards is two of them collapsing: a
+        // build where `Acting` fell through to `Pane` would pass every other test here.
+        assert_ne!(acting, pane);
+        assert_ne!(acting, console);
+
+        // It is told the instructions are the job, because the reported symptom was a tab that
+        // reported what somebody else should do instead of doing it.
+        assert!(acting.contains("carry them out yourself"), "{acting}");
+        assert!(acting.contains("nobody at the keyboard"), "{acting}");
+        // And that taking finished work back is part of it — the merge the first cut left out.
+        assert!(acting.contains("take finished work back"), "{acting}");
+
+        // Everything after the opening sentence is byte-identical across all three, so a rule
+        // taught to one is taught to all: the same claim `a_second_pane_is_told…` makes.
+        let tail = |text: &str| {
+            text.split_once("That list was read")
+                .map(|(_, tail)| tail.to_string())
+        };
+        assert_eq!(tail(&acting), tail(&console), "only the opening may differ");
+        assert_eq!(tail(&acting), tail(&pane), "only the opening may differ");
+        assert!(tail(&acting).is_some());
+    }
+
     #[test]
     fn a_project_with_no_roles_gets_a_paragraph_that_says_so_and_names_the_file() {
-        let paragraph = roster_paragraph(&[], true);
+        let paragraph = roster_paragraph(&[], Voice::ProductOwner);
         assert!(paragraph.contains(".cide/agents/<name>.md"), "{paragraph}");
         assert!(paragraph.contains("nobody to dispatch to"), "{paragraph}");
     }
@@ -1921,7 +2126,7 @@ mod tests {
     #[test]
     fn the_paragraph_folds_into_the_users_own_append_system_prompt() {
         let developer = role("developer", "Implements one task end to end.");
-        let paragraph = roster_paragraph(&[&developer], true);
+        let paragraph = roster_paragraph(&[&developer], Voice::ProductOwner);
 
         let mut args = vec![
             "--append-system-prompt".to_string(),
@@ -2497,7 +2702,7 @@ mod tests {
     /// so a future edit that moves the paragraph out from behind the gate has to answer for it.
     #[test]
     fn the_roster_paragraph_is_only_worth_sending_with_the_tools_that_back_it() {
-        let paragraph = roster_paragraph(&[], true);
+        let paragraph = roster_paragraph(&[], Voice::ProductOwner);
         for tool in ["mcp__cide__cide_agents_list", "mcp__cide__cide_task_"] {
             assert!(paragraph.contains(tool), "{paragraph}");
         }

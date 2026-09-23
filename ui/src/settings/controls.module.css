@@ -370,6 +370,42 @@
   color: var(--faint);
 }
 
+/* A `TextField` that has to hold a paragraph.
+ *
+ * Everything but the box is `.fieldInput`'s, so the two read as one control: the same border,
+ * radius, ground, mono face and `--fs-ui-12`. What differs is the height and the wrapping, and
+ * `height` is what it cannot share — `.fieldInput` pins one row, and a `<textarea>` with a
+ * pinned height is a scroll box the size of a line.
+ *
+ * `min-height` rather than `height`, with `resize: vertical`, so somebody editing a long prompt
+ * can drag it taller and somebody reading a short one is not given eight empty rows. The minimum
+ * scales with `--ui-scale` like every other box on this screen, and `line-height` is stated
+ * because a mono face's default leading makes multi-line text in a small box hard to scan —
+ * which is the whole reason this control exists. */
+.fieldArea {
+  display: block;
+  width: 100%;
+  min-height: calc(92px * var(--ui-scale));
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.fieldArea::placeholder {
+  color: var(--faint);
+}
+
+.fieldArea:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
 .fieldInput:focus {
   outline: 0;
   border-color: var(--accent);

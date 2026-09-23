@@ -92,6 +92,73 @@ pub const DEFAULT_STOP_GRACE_SECS: u16 = 60;
 /// or careless version still works.
 pub const MAX_STOP_GRACE_SECS: u16 = 600;
 
+/// The default for [`AgentsConfig::auto_spin_after_secs`]. Fifteen minutes.
+///
+/// Long, because the thing on the other end of this timer is a **billed `claude` process** that
+/// starts planning without being asked. Fifteen minutes is past every ordinary lull — a long
+/// build, a code review, lunch — and short enough that a project left overnight is picked up
+/// rather than abandoned.
+pub const DEFAULT_SPIN_AFTER_SECS: u32 = 900;
+
+/// The least a project may ask for, and it is not cosmetic.
+///
+/// The run-end nudge coalesces with a two-second debounce and a **ten-second ceiling**
+/// (`cide_app::agent_rpc`'s `NUDGE_COALESCE`/`NUDGE_CEILING`), so a burst of runs finishing
+/// together is still settling for up to ten seconds after the last child exits. A spinner
+/// allowed to fire inside that window would look at a project that is between two states and
+/// plan for neither. Sixty gives the whole burst room and then some.
+pub const MIN_SPIN_AFTER_SECS: u32 = 60;
+
+/// And the ceiling, for [`MAX_STOP_GRACE_SECS`]' reason: a typo'd number must degrade to
+/// something a person could have meant. A day.
+pub const MAX_SPIN_AFTER_SECS: u32 = 86_400;
+
+/// What a spun `claude` is told, when the project has not written its own.
+///
+/// **One line, and it has to be**: this is typed into a terminal, where a newline is another
+/// Enter — `cide_app::cmd::agents::opening_prompt`'s rule, and the reason the Settings control
+/// for it is a single-line field rather than a textarea.
+///
+/// The shape is *survey, judge, then plan*, in that order, and the order is the whole point.
+/// A prompt that opened with "assign the next tasks" would get a model planning from the board's
+/// titles alone — which is exactly the state the board is in when nobody has been checking, and
+/// is how a project drifts confidently in the wrong direction. So it is told to read what
+/// happened first, say plainly whether it is going the right way, and only then decide what
+/// happens next.
+pub const DEFAULT_SPIN_PROMPT: &str = "Nothing is running in this project and there is open \
+     work on the board, and there is nobody at the keyboard — decide every question yourself \
+     from what you can read, and do not end your turn by asking what to do. Before planning \
+     anything, survey what has actually happened: read the \
+     board with mcp__cide__cide_task_list, read the comments on the tasks in review or doing, \
+     and check git log and git status to see what landed. Then judge it — say plainly whether \
+     the work so far is going the way this project needs, and say so even if the answer is no. \
+     Only then plan what happens next: create or re-scope tasks with \
+     mcp__cide__cide_task_create and mcp__cide__cide_task_update, and put them on the roles \
+     mcp__cide__cide_agents_list knows about with mcp__cide__cide_task_assign, which is what \
+     starts them working.";
+
+/// What [`AgentsConfig::permission_mode`] may say. Checked in order by nothing; listed for the
+/// sentence a bad value produces.
+pub const UNATTENDED_MODES: &[&str] = &["auto", crate::defs::BYPASS_PERMISSIONS, "manual"];
+
+/// The project's stance for an unattended child whose role names no permission mode. (M82)
+///
+/// Three values and not the whole of [`crate::defs::PERMISSION_MODES`]. A project default is
+/// mapped onto every harness, and `plan` or `acceptEdits` as a default for *every* role would
+/// be a restriction nobody can see from the role that hits it. A role that wants one of those
+/// names it itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Unattended {
+    /// Claude's classifier mode. The default. See [`AgentsConfig::permission_mode`] for what
+    /// it becomes on a harness without one.
+    #[default]
+    Auto,
+    /// No prompts and no classifier.
+    Bypass,
+    /// The CLI's own default, which asks. Nothing is passed.
+    Ask,
+}
+
 /// The `agents` block of `.cide/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -128,11 +195,11 @@ pub struct AgentsConfig {
     /// load would make the role vanish from the roster, and a user staring at a missing agent has
     /// no thread to pull; a greyed row that names this key is a fix they can act on.
     ///
-    /// [`Self::skip_permissions`] is the stated exception: while it is on (the default), the
-    /// project has already declared that every unattended child runs promptless, so refusing a
-    /// role for *writing down* the same stance would be a refusal about nothing. The two-acts
-    /// rule bites only in a project that switched skipping off — which is exactly the project
-    /// that meant to be asked.
+    /// A project whose own default is `bypassPermissions` ([`Self::permission_mode`]) is the
+    /// stated exception. It has already declared that every unattended child runs with no brake,
+    /// so refusing a role for writing down the same stance would be a refusal about nothing.
+    /// Under the default `auto` the exception does not apply, because a project on `auto` has
+    /// not agreed to bypass.
     pub allow_dangerous_permissions: bool,
     /// Whether a subagent finishing its turn types one line into the product owner's terminal.
     ///
@@ -177,29 +244,63 @@ pub struct AgentsConfig {
     /// same two reasons: no panel round trip can silently reset it, and a teammate's commit
     /// switching it off is honoured from the next edit onward.
     pub auto_dispatch: bool,
-    /// Whether a dispatched child runs with permission prompts switched off — `--permission-mode
-    /// bypassPermissions` for a `claude` run whose role names no mode of its own, `--auto` for
-    /// an `opencode` run.
+    /// The permission mode an unattended child runs under when its role names none. (M82)
     ///
-    /// # On by default, which reverses a stance — and the reversal was measured, not argued
+    /// One of [`UNATTENDED_MODES`]: `"auto"` (the default), `"bypassPermissions"` or
+    /// `"manual"`. [`Self::unattended`] reads it, and it is the only reader. The role's own
+    /// `permission-mode:` always wins over this value, and a local override
+    /// (`cide_ipc::AgentOverride::permission_mode`) wins over both.
     ///
-    /// [`Self::allow_dangerous_permissions`] exists so that a *role file* asking for bypass takes
-    /// two deliberate acts, and that rule stands unchanged for what a role asks. This key is
-    /// about what happens when the role asks nothing: the child is **unattended**, and an
-    /// unattended child cannot answer a prompt. What that costs was measured live, per harness:
-    /// `opencode run` auto-rejects the request and the **turn ends right there** — two real runs
-    /// died mid-investigation on their first out-of-project command, task never reported, which
-    /// reads on the board as an agent that did nothing — and a `claude` run parks in
-    /// `AwaitingPermission`, holding its slot and its role's only worktree, until a human
-    /// happens to open its pane. Neither is a safety property; both are the autonomy failing
-    /// silently. The blast-radius containment for an unattended child is worktree isolation,
-    /// which is on by default and refused outside a git repository.
+    /// # Why an unattended child must not prompt, measured
     ///
-    /// The role's own `permission-mode:` always wins over this default — an author who wrote a
-    /// mode meant it. Disk-only like its three neighbours, read fresh at each spawn (a `git
-    /// checkout` flipping it is honoured from the next dispatch), and the way back to prompts is
-    /// `"skipPermissions": false` in this file.
-    pub skip_permissions: bool,
+    /// Nobody answers a prompt in an unattended child. Measured per harness: `opencode run`
+    /// auto-rejects the request and the **turn ends right there**. Two real runs died that way
+    /// on their first out-of-project command with the task never reported, which reads on the
+    /// board as an agent that did nothing. A `claude` run parks in `AwaitingPermission`, holding
+    /// its slot and its role's only worktree, until a human happens to open its pane. Neither is
+    /// a safety property; in both the autonomy fails silently. `"manual"` is therefore a
+    /// coherent choice only for a project that wants to watch every run.
+    ///
+    /// # Why `auto` and not `bypassPermissions`
+    ///
+    /// From M67 to M81 this was the boolean `skipPermissions`, and on meant
+    /// `bypassPermissions`: a child that edits, deletes and runs anything, contained only by its
+    /// worktree. Claude's `auto` mode keeps that autonomy and puts a classifier in front of each
+    /// action. The cost is stated rather than hidden: when the classifier will not approve
+    /// something, the CLI can fall back to asking, and an unattended run that asks parks exactly
+    /// as above. A run is expected to stall occasionally, which is a far smaller hazard than a
+    /// child with no brake at all.
+    ///
+    /// `auto` is Claude's word, and not every harness has a counterpart that keeps a headless
+    /// run working. codex's `--approve-for-me` keeps the `workspace-write` sandbox, which
+    /// re-binds `.git` read-only, so the run cannot `git commit`. opencode and mimo have one
+    /// switch in total. So on those harnesses the project default `auto` keeps the promptless
+    /// flag it always had, and each harness's own `unattended` mapping says so where it happens.
+    /// A *role* that writes `permission-mode: auto` still gets each CLI's literal mapping,
+    /// because the role's author chose that trade.
+    ///
+    /// # Reading the old key
+    ///
+    /// A file with no `permissionMode` falls back to [`Self::skip_permissions`]. `false` means
+    /// `"manual"`, because a project that switched prompts back on said so on purpose and an
+    /// upgrade must not re-arm its children. `true` means `"auto"`, **not** bypass: every file
+    /// cide wrote before M82 carries `"skipPermissions": true` whether anybody chose it or not,
+    /// so the key cannot be read as a choice of bypass. A project that wants bypass writes
+    /// `"permissionMode": "bypassPermissions"`.
+    ///
+    /// Absent on disk while `None`. If the default were written out, the panel's first save would
+    /// put `"permissionMode": "auto"` next to a hand-written `"skipPermissions": false` and
+    /// silently outrank it. For the same reason, [`write`] never adds the key on its own.
+    ///
+    /// Disk-only like its neighbours, and read fresh at each spawn, so a `git checkout` that
+    /// changes it takes effect from the next dispatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// The key [`Self::permission_mode`] replaced. Read for its migration and nothing else, and
+    /// never written unless the file already had it — a key the merge in [`write`] would
+    /// preserve anyway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_permissions: Option<bool>,
     /// How long a stopped run is given to wind itself down before cide ends it. Seconds.
     ///
     /// # Why a stop waits at all, and why the number lives here
@@ -229,6 +330,96 @@ pub struct AgentsConfig {
     /// committed, so a teammate's commit or a `git checkout` can change it under a running app,
     /// and a deadline computed at dispatch would honour a number nobody now has.
     pub stop_grace_secs: u16,
+    /// Whether a subagent's turn ending opens a **new Claude tab** to review it, instead of
+    /// typing one line into the product owner's conversation. (M79)
+    ///
+    /// # What this is actually fixing
+    ///
+    /// [`Self::nudge_orchestrator`]'s line lands in the conversation that *dispatched* the work,
+    /// which by the time a long run ends may be a hundred turns deep in something else. The line
+    /// then has to compete for that context's attention against everything already in it, and
+    /// what it is asking for — go and check somebody else's work — is exactly the kind of task a
+    /// loaded context does worst.
+    ///
+    /// So the note goes to a `claude` that has nothing else in its head: a fresh `ClaudeFull`
+    /// tab, opened by cide, carrying a prompt that names the task, the run and the branch and
+    /// asks for a verdict on the task. The tab stays until somebody closes it, which is what
+    /// makes the review a thing on screen rather than a line that scrolled past.
+    ///
+    /// **It replaces the console line rather than joining it.** Two announcements of one fact
+    /// would cost two turns and give two readers the same job, and the reader with the empty
+    /// context is the better one.
+    ///
+    /// On by default, for [`Self::auto_dispatch`]'s reason: the loop this closes is the feature,
+    /// and a loop whose last step is *and then somebody notices* is not a loop. It is
+    /// nevertheless **under** `nudge_orchestrator`, not beside it — a project that said *do not
+    /// announce my subagents to anybody* has not asked for a tab either, so that key still
+    /// silences both roads.
+    pub finish_in_new_tab: bool,
+    /// Whether cide wakes a quiet project up by itself. (M79)
+    ///
+    /// # The most autonomous thing in this file, and it ships off
+    ///
+    /// Every other switch here reacts to something a person or an agent *did*: a task was
+    /// assigned, a run ended, a stop was asked for. This one reacts to **nothing happening** —
+    /// after [`Self::auto_spin_after_secs`] of a project with open tasks, no live run and no
+    /// working Claude pane, cide spawns a `claude` and hands it [`Self::auto_spin_prompt`].
+    ///
+    /// That is a billed process started by a timer, on a machine whose owner may not be at it,
+    /// and it is the one key in this struct that is **off by default** on the same reasoning as
+    /// [`Self::enabled`]: a default that spends money while nobody is watching is a default
+    /// nobody forgives. The way in is deliberate and the way out is the same switch.
+    ///
+    /// It is also gated by everything else: `enabled` must be on, the queue must not be paused
+    /// (`AgentRegistry::dispatching`), and the whole of `cide_app::spinner::should_spin` has to
+    /// agree. See that function — it is pure, and it is where the rules live.
+    pub auto_spin: bool,
+    /// How long a project must be quiet before [`Self::auto_spin`] fires. Seconds.
+    ///
+    /// A **dwell**, not an interval: the clock restarts every time the project looks busy, so
+    /// this is "nothing has happened for this long" rather than "fire every this often". A bare
+    /// interval would land in the middle of a settling burst.
+    ///
+    /// Clamped on read through [`Self::spin_after`], which is the only reader, so the floor and
+    /// the ceiling cannot be forgotten at a second call site. The floor is not cosmetic — see
+    /// [`MIN_SPIN_AFTER_SECS`].
+    pub auto_spin_after_secs: u32,
+    /// What the spun `claude` is told. One line; see [`DEFAULT_SPIN_PROMPT`].
+    ///
+    /// Per project rather than global because it is about *this* repository's work — what
+    /// "going the right way" means here, which roles exist, what to look at first. A blank or
+    /// whitespace-only value reads as the default rather than as an empty prompt, because a
+    /// `claude` handed a lone Enter starts a turn about nothing and bills for it;
+    /// [`Self::spin_prompt`] is the one reader that decides this.
+    pub auto_spin_prompt: String,
+    /// Whether cide answers the spun run's `ExitPlanMode` with `allow`. (M79)
+    ///
+    /// The spun child is started `--permission-mode plan` so it surveys before it acts, and plan
+    /// mode ends at an approval a person is supposed to give. Nobody is there, so with this on
+    /// cide gives it.
+    ///
+    /// **It does so by reading the prompt and answering it, which is the thing
+    /// `AgentRegistry::stop` refuses to do — and the difference is that this one has read it.**
+    /// What that refusal is about is writing *blind*: a lone `\r` at a selection list is an
+    /// answer, so a graceful stop is never offered to a run in `AwaitingPermission` because it
+    /// would approve the tool call the stop meant to prevent. Here the prompt goes through
+    /// `cide_claude::permission::parse`, whose every rule is a reason to refuse, and then through
+    /// `cide_claude::plan::approval`, which recognises the plan prompt by its options and picks
+    /// the one that proceeds **by its words**. Four gates, and the first is that the session is
+    /// one cide spawned for this timer — never a pane, a run, or the console.
+    ///
+    /// The exact-looking alternative was a `PreToolUse` hook answering `allow` for
+    /// `ExitPlanMode`, and it was built and measured against 2.1.278: the prompt drew anyway,
+    /// because that tool carries its own `checkPermissions` returning `ask` and a
+    /// `requiresUserInteraction()` that answers `true`. `cide-hook`'s guard module carries the
+    /// finding where somebody would go looking for it.
+    ///
+    /// On by default **within** [`Self::auto_spin`], which is off by default. A project that
+    /// turned the spinner on asked for a loop that closes without a keystroke, and a spinner
+    /// that plans and then waits for a human is the loop not closing. Switching this off leaves
+    /// the tab sitting at its plan, the pane dot lit, which is a coherent way to want this
+    /// feature — a proposal per quiet period, approved by hand.
+    pub auto_spin_accept_plan: bool,
 }
 
 impl Default for AgentsConfig {
@@ -244,11 +435,22 @@ impl Default for AgentsConfig {
             nudge_orchestrator: true,
             // Same argument, same default: assignment that does nothing is not assignment.
             auto_dispatch: true,
-            // On, and the field's own doc carries the measurement that decided it: an
-            // unattended child cannot answer a prompt, and both harnesses fail silently on one.
-            skip_permissions: true,
+            // Absent, which reads as `auto`: see `unattended`. Neither key is written, so the
+            // panel's first save cannot outrank a hand-written legacy `skipPermissions: false`.
+            permission_mode: None,
+            skip_permissions: None,
             // A minute: one more turn, including a tool call. The field's doc argues it.
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+            // On: the field's doc argues it, and it is still under `nudge_orchestrator`.
+            finish_in_new_tab: true,
+            // **Off**, and the only key here besides `enabled` that is. A timer that spends
+            // money while nobody is watching is the one default this file may not get wrong.
+            auto_spin: false,
+            auto_spin_after_secs: DEFAULT_SPIN_AFTER_SECS,
+            auto_spin_prompt: DEFAULT_SPIN_PROMPT.to_string(),
+            // On *within* a feature that is off: a spinner that waits for a human is the loop
+            // not closing, which is the thing the spinner exists to do.
+            auto_spin_accept_plan: true,
         }
     }
 }
@@ -264,12 +466,84 @@ impl AgentsConfig {
         std::time::Duration::from_secs(u64::from(self.stop_grace_secs.min(MAX_STOP_GRACE_SECS)))
     }
 
-    /// The three fields the panel draws.
+    /// How long the spinner waits, as a duration, with both bounds applied. (M79)
+    ///
+    /// The one reader of [`Self::auto_spin_after_secs`], on [`Self::stop_grace`]'s rule: a clamp
+    /// with two call sites is a clamp that disagrees with itself. Unlike `stop_grace` there is no
+    /// meaningful zero here — `0` would mean *spin the instant a project goes quiet*, which fires
+    /// inside the nudge coalescer's own settling window and is the one value
+    /// [`MIN_SPIN_AFTER_SECS`] exists to refuse — so this clamps up as well as down.
+    #[must_use]
+    pub fn spin_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(
+            self.auto_spin_after_secs
+                .clamp(MIN_SPIN_AFTER_SECS, MAX_SPIN_AFTER_SECS),
+        ))
+    }
+
+    /// What to type into a spun run, with the blank case decided once. (M79)
+    ///
+    /// The one reader of [`Self::auto_spin_prompt`]. A blank or whitespace-only value is the
+    /// default and never an empty prompt: the alternative is a `claude` handed a lone Enter,
+    /// which starts a turn about nothing, bills for it, and leaves a tab whose only content is
+    /// the model asking what was wanted. Clearing the box in Settings therefore means *use the
+    /// one cide ships*, which is also the only thing a person clearing it could mean.
+    #[must_use]
+    pub fn spin_prompt(&self) -> &str {
+        if self.auto_spin_prompt.trim().is_empty() {
+            DEFAULT_SPIN_PROMPT
+        } else {
+            &self.auto_spin_prompt
+        }
+    }
+
+    /// The stance for an unattended child whose role names no mode. The one reader of
+    /// [`Self::permission_mode`] and [`Self::skip_permissions`], so the migration rule cannot be
+    /// applied at one call site and forgotten at another.
+    ///
+    /// An unrecognised word reads as [`Unattended::Ask`], with a warning that names it. Ask is
+    /// the direction a typo in the switch for unattended processes must fail in, and a
+    /// run that then parks on a prompt is visible where a silently widened one is not.
+    #[must_use]
+    pub fn unattended(&self) -> Unattended {
+        match self.permission_mode.as_deref().map(str::trim) {
+            Some("auto") => Unattended::Auto,
+            Some(crate::defs::BYPASS_PERMISSIONS) => Unattended::Bypass,
+            Some("manual") => Unattended::Ask,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    allowed = UNATTENDED_MODES.join(", "),
+                    "agents.permissionMode in .cide/config.json is not a mode cide knows; \
+                     unattended runs will ask"
+                );
+                Unattended::Ask
+            }
+            None => match self.skip_permissions {
+                Some(false) => Unattended::Ask,
+                Some(true) | None => Unattended::Auto,
+            },
+        }
+    }
+
+    /// The fields the panel draws.
     pub fn to_wire(&self) -> OrchestrationConfig {
         OrchestrationConfig {
             enabled: self.enabled,
             max_concurrent: self.max_concurrent,
             harness: self.harness,
+            finish_in_new_tab: self.finish_in_new_tab,
+            auto_spin: self.auto_spin,
+            // The **stored** number and not `spin_after()`'s clamped one, deliberately. The box
+            // has to show what the file says, or a hand-written value outside the bounds is
+            // silently rewritten the first time somebody opens Settings and tabs past the field
+            // — `NumberField` commits on blur. The clamp belongs at the point of use.
+            auto_spin_after_secs: self.auto_spin_after_secs,
+            // Likewise the stored string, not `spin_prompt()`: drawing the default into a box
+            // the file left empty would make the next blur write it to disk, turning "use
+            // whatever cide ships" into a frozen copy of this build's wording.
+            auto_spin_prompt: self.auto_spin_prompt.clone(),
+            auto_spin_accept_plan: self.auto_spin_accept_plan,
         }
     }
 
@@ -292,6 +566,32 @@ impl AgentsConfig {
         }
         if let Some(harness) = patch.harness {
             self.harness = harness;
+        }
+        if let Some(tab) = patch.finish_in_new_tab {
+            self.finish_in_new_tab = tab;
+        }
+        if let Some(spin) = patch.auto_spin {
+            self.auto_spin = spin;
+        }
+        if let Some(secs) = patch.auto_spin_after_secs {
+            // Clamped here as well as at `spin_after`, and the two are not the same act.
+            // `spin_after` protects the *timer* from whatever the file happens to hold,
+            // including a value some other tool wrote. This protects the **file** from a
+            // webview, so what the panel draws back is what the timer will use — `max_concurrent`
+            // above makes the same trade for the same reason.
+            self.auto_spin_after_secs = secs.clamp(MIN_SPIN_AFTER_SECS, MAX_SPIN_AFTER_SECS);
+        }
+        if let Some(prompt) = patch.auto_spin_prompt {
+            // Flattened on the way in, never at the point of use. This string is typed into a
+            // terminal, where a newline is a second Enter that submits the tail of the prompt as
+            // its own turn — `opening_prompt`'s finding 8. Doing it here means the file can never
+            // hold a prompt that would misbehave, and the box shows exactly what will be sent;
+            // flattening at the spawn instead would leave a config somebody read as two lines
+            // and a run that silently got one.
+            self.auto_spin_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        if let Some(accept) = patch.auto_spin_accept_plan {
+            self.auto_spin_accept_plan = accept;
         }
     }
 }
@@ -732,6 +1032,122 @@ mod tests {
         );
     }
 
+    /// A `.cide/config.json` written before M79 still loads, and the new keys read as their
+    /// defaults — which for `finishInNewTab` means a project upgrades *into* the feature.
+    ///
+    /// That is deliberate and is the same argument `nudgeOrchestrator` and `autoDispatch` make:
+    /// the loop this closes is the point, and the setting is the way out. `autoSpin` is the
+    /// exception in the other direction, and this asserts it: a timer that spends money while
+    /// nobody is watching may not arrive with an upgrade.
+    #[test]
+    fn a_config_written_before_the_spinner_existed_still_loads() {
+        let root = temp("pre-m79");
+        std::fs::create_dir_all(cide_dir(&root)).expect("mkdir");
+        std::fs::write(
+            config_path(&root),
+            r#"{ "version": 1, "agents": { "enabled": true, "maxConcurrent": 4 } }"#,
+        )
+        .expect("write");
+
+        let agents = load(&root).agents;
+        assert!(agents.enabled);
+        assert_eq!(agents.max_concurrent, 4);
+        assert!(
+            agents.finish_in_new_tab,
+            "the review tab is the way out, not the way in"
+        );
+        assert!(
+            !agents.auto_spin,
+            "an upgrade started a billed process on a timer"
+        );
+        assert_eq!(agents.auto_spin_after_secs, DEFAULT_SPIN_AFTER_SECS);
+        assert!(agents.auto_spin_accept_plan);
+        // Blank on disk is the shipped prompt, decided in one place.
+        assert_eq!(agents.spin_prompt(), DEFAULT_SPIN_PROMPT);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The clamp is the reader's, not the field's, so a hand-edited file keeps what it says and
+    /// the timer still refuses to fire inside the nudge coalescer's settling window.
+    #[test]
+    fn the_dwell_is_clamped_where_it_is_read() {
+        let mut config = AgentsConfig {
+            auto_spin_after_secs: 5,
+            ..AgentsConfig::default()
+        };
+        assert_eq!(config.auto_spin_after_secs, 5, "the file was rewritten");
+        assert_eq!(
+            config.spin_after(),
+            std::time::Duration::from_secs(u64::from(MIN_SPIN_AFTER_SECS))
+        );
+
+        config.auto_spin_after_secs = u32::MAX;
+        assert_eq!(
+            config.spin_after(),
+            std::time::Duration::from_secs(u64::from(MAX_SPIN_AFTER_SECS))
+        );
+
+        config.auto_spin_after_secs = 1_800;
+        assert_eq!(config.spin_after(), std::time::Duration::from_secs(1_800));
+    }
+
+    /// **Blank means the default and never an empty prompt.**
+    ///
+    /// A `claude` handed a lone Enter starts a turn about nothing and bills for it. Clearing the
+    /// box in Settings means *use the one cide ships*, which is the only thing clearing it could
+    /// mean — and the decision lives in one place so the Settings screen and the spawn cannot
+    /// disagree about what an empty string is.
+    #[test]
+    fn a_blank_prompt_is_the_shipped_one() {
+        for blank in ["", "   ", "\t", "\n  \n"] {
+            let config = AgentsConfig {
+                auto_spin_prompt: blank.into(),
+                ..AgentsConfig::default()
+            };
+            assert_eq!(config.spin_prompt(), DEFAULT_SPIN_PROMPT, "{blank:?}");
+        }
+        let config = AgentsConfig {
+            auto_spin_prompt: "look at the board".into(),
+            ..AgentsConfig::default()
+        };
+        assert_eq!(config.spin_prompt(), "look at the board");
+    }
+
+    /// **The stored prompt can never hold a newline**, because a newline is a second Enter.
+    ///
+    /// Flattened by `apply`, on the way *in*, so the file cannot hold a prompt that would
+    /// misbehave and the Settings box shows exactly what will be typed. Flattening at the spawn
+    /// instead would leave a config somebody read as two lines and a run that silently got one.
+    #[test]
+    fn a_pasted_prompt_is_flattened_before_it_reaches_the_file() {
+        let mut config = AgentsConfig::default();
+        config.apply(OrchestrationPatch {
+            auto_spin_prompt: Some("read the board\nthen\r\nassign   the   work".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            config.auto_spin_prompt,
+            "read the board then assign the work"
+        );
+    }
+
+    /// The dwell is clamped on the way in as well, so what the panel draws back is what the
+    /// timer will use — `maxConcurrent`'s trade.
+    #[test]
+    fn a_patch_cannot_write_a_dwell_the_timer_would_refuse() {
+        let mut config = AgentsConfig::default();
+        config.apply(OrchestrationPatch {
+            auto_spin_after_secs: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(config.auto_spin_after_secs, MIN_SPIN_AFTER_SECS);
+        assert_eq!(
+            config.spin_after(),
+            std::time::Duration::from_secs(u64::from(MIN_SPIN_AFTER_SECS))
+        );
+    }
+
     /// `None` means "leave this alone", and a nonsense number lands as a sane one rather than as
     /// an error the frontend discards.
     #[test]
@@ -744,8 +1160,14 @@ mod tests {
             allow_dangerous_permissions: true,
             nudge_orchestrator: false,
             auto_dispatch: false,
-            skip_permissions: false,
+            permission_mode: Some("manual".into()),
+            skip_permissions: None,
             stop_grace_secs: 5,
+            finish_in_new_tab: false,
+            auto_spin: true,
+            auto_spin_after_secs: 120,
+            auto_spin_prompt: "have a look".into(),
+            auto_spin_accept_plan: false,
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
         assert_eq!(config.max_concurrent, 5);
@@ -768,11 +1190,74 @@ mod tests {
             !config.auto_dispatch,
             "a round trip through the panel turned assignment-starts-work back on"
         );
-        assert!(
-            !config.skip_permissions,
-            "a round trip through the panel turned prompt-skipping back on — this is the one \
-             switch where a silent reset re-arms unattended children"
+        assert_eq!(
+            config.unattended(),
+            Unattended::Ask,
+            "a round trip through the panel changed how unattended children are permitted — \
+             this is the one switch where a silent reset re-arms them"
         );
+    }
+
+    /// The default is `auto`, and the key that replaced `skipPermissions` reads the old one
+    /// without letting an upgrade widen anything. (M82)
+    #[test]
+    fn the_unattended_mode_defaults_to_auto_and_reads_the_old_key() {
+        assert_eq!(AgentsConfig::default().unattended(), Unattended::Auto);
+
+        let with = |mode: Option<&str>, skip: Option<bool>| AgentsConfig {
+            permission_mode: mode.map(str::to_string),
+            skip_permissions: skip,
+            ..AgentsConfig::default()
+        };
+        // Every file cide wrote before M82 says `true` whether or not anybody chose it, so it
+        // reads as the new default. It is not read as bypass.
+        assert_eq!(with(None, Some(true)).unattended(), Unattended::Auto);
+        // A project that switched prompts back on keeps them.
+        assert_eq!(with(None, Some(false)).unattended(), Unattended::Ask);
+        // The new key outranks the old one in both directions.
+        assert_eq!(
+            with(Some("bypassPermissions"), Some(false)).unattended(),
+            Unattended::Bypass
+        );
+        assert_eq!(
+            with(Some("manual"), Some(true)).unattended(),
+            Unattended::Ask
+        );
+        // A typo fails towards asking.
+        assert_eq!(with(Some("Auto-ish"), None).unattended(), Unattended::Ask);
+    }
+
+    /// Neither key is written unless the file had it, so the panel's first save cannot put
+    /// `"permissionMode": "auto"` beside a hand-written `"skipPermissions": false` and outrank
+    /// it. (M82)
+    #[test]
+    fn a_save_does_not_invent_a_permission_mode() {
+        let root = temp("legacy-skip");
+        put(
+            &root,
+            r#"{ "version": 1, "agents": { "enabled": false, "skipPermissions": false } }"#,
+        );
+        let mut config = load(&root);
+        config.agents.apply(OrchestrationPatch {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        write(&root, &config).expect("write");
+        let text = std::fs::read_to_string(config_path(&root)).expect("read back");
+        assert!(!text.contains("permissionMode"), "{text}");
+        assert_eq!(load(&root).agents.unattended(), Unattended::Ask);
+
+        let fresh = temp("fresh-write");
+        write(&fresh, &CideConfig::default()).expect("write");
+        let text = std::fs::read_to_string(config_path(&fresh)).expect("read back");
+        assert!(
+            !text.contains("permissionMode") && !text.contains("skipPermissions"),
+            "{text}"
+        );
+        assert_eq!(load(&fresh).agents.unattended(), Unattended::Auto);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     #[test]

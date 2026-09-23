@@ -155,8 +155,8 @@
 //! **ended at the rejection** — two real runs died mid-investigation, exit 0, task never
 //! reported, which reads on the board as an agent that did nothing. A refusal that ends the
 //! turn is not a safety property in a headless child; it is the autonomy failing silently. So
-//! `--auto` now rides [`RunPlan::skip_permissions`] — the project-level
-//! `agents.skipPermissions`, on by default, off in one config line — and the containment for an
+//! `--auto` now rides [`RunPlan::unattended`] — the project-level
+//! `agents.permissionMode`, `auto` by default, `manual` in one config line — and the containment for an
 //! unattended child is what it always actually was: worktree isolation.
 //!
 //! # Opening a run into a pane shows the events **rendered**, and the raw line is still the channel
@@ -171,6 +171,7 @@
 //! [`Harness::observe`]. `opencode serve` plus `attach` remains the named upgrade path to a
 //! *live* TUI in the pane; this makes the transcript readable without it.
 
+use crate::config::Unattended;
 use cide_ipc::RunState;
 use cide_pty::{Geometry as PtyGeometry, Rendered, SpawnSpec};
 use serde::Deserialize;
@@ -192,12 +193,201 @@ use super::render::{
 // the path stays so nothing that learned it moves.
 pub use super::render::{RUN_COLS, RUN_ROWS};
 
-/// The document's own contract, so a person reading a dumped configuration can look it up.
-const SCHEMA: &str = "https://opencode.ai/config.json";
+/// Which opencode-shaped CLI a run is on. (M81)
+///
+/// # Two CLIs, one implementation, and every difference named here
+///
+/// MiMo Code (`mimo`) is an **opencode fork**, measured on 0.1.15 against this file rather than
+/// assumed from a name: `mimo run` takes the same flags (`--agent`, `--model`, `--variant`,
+/// `--format json`, `--thinking`, `--dir`, `--session`, `--title`); a real turn printed the same
+/// events in the same envelope — `step_start`, `reasoning`, `tool_use`, `text`, `step_finish`,
+/// `sessionID: "ses_…"` on every line, `tokens: {total, input, output, reasoning, cache}` on the
+/// finish; an inline role handed over in `MIMOCODE_CONFIG_CONTENT` is registered with its prompt
+/// verbatim (`mimo debug agent <id>`); and MCP tools are named `<server>_<tool>` — the model
+/// listed `deepwiki_ask_wiki_question` for a server named `deepwiki`.
+///
+/// So the renderer, the failover classifier, the usage reader, the state machine and the
+/// provider document are **one** each, and a copied `mimo.rs` would have been a second spelling
+/// of every row format `check:json-log` pins and of the document `provider_members`' header
+/// insists has one producer. What *does* differ is a field on this struct, and nothing below it
+/// may say `if mimo`: a difference that is not a field is a difference nobody can find.
+#[derive(Debug)]
+pub struct Flavor {
+    /// The wire variant, which is also the binary's name through `defs::harness_binary`.
+    pub kind: cide_ipc::Harness,
+    /// The prefix every environment variable the CLI reads carries: `OPENCODE_CONFIG_CONTENT`,
+    /// `MIMOCODE_CONFIG_CONTENT`. Measured in the `mimo` binary: all sixty-odd are opencode's
+    /// under this rename, and not one `OPENCODE_*` name is read — so an `OPENCODE_CONFIG_CONTENT`
+    /// on a mimo child would be a whole configuration nobody reads, and the run would silently
+    /// be mimo's *default* agent.
+    env_prefix: &'static str,
+    /// The document's own contract, so a person reading a dumped configuration can look it up.
+    schema: &'static str,
+    /// The flag [`RunPlan::unattended`] becomes, for anything but `Ask`. opencode's `run` spells it `--auto`;
+    /// mimo's has no `--auto` and spells it `--dangerously-skip-permissions`.
+    skip_permissions: &'static str,
+    /// Extra arguments on the TUI a finished run is re-opened in ([`Flavor::continue_spec`]).
+    ///
+    /// mimo's TUI asks whether to trust a workspace the first time it opens one, and a cide
+    /// worktree is a directory it has never seen. `--trust` answers it: the run this pane
+    /// continues already worked in that directory headless (`run` asks nothing), so the trust
+    /// was extended when the role was dispatched and a prompt here would be a question about a
+    /// decision already made.
+    continue_args: &'static [&'static str],
+    /// Whether a fatal provider error exits 0 — see [`Harness::failure_exits_zero`]. Also the
+    /// flag that says this CLI's own retry policy must be **bounded** under a pool
+    /// ([`pool_retry`]): the two are one fact about mimo, which retries silently until it gives
+    /// up and then says so with a clean exit.
+    failure_exits_zero: bool,
+    /// Whether `models` annotates each id. mimo prints `xiaomi/mimo-v2.5 — window 1.05M,
+    /// compacts at 944K`; opencode prints the bare id. Only the exact ` — ` separator is cut,
+    /// and only for the flavour that prints it, so opencode's filter goes on refusing every
+    /// line with whitespace in it — see [`is_model_id`].
+    annotated_models: bool,
+}
+
+/// opencode itself.
+pub static OPENCODE_CLI: Flavor = Flavor {
+    kind: cide_ipc::Harness::Opencode,
+    env_prefix: "OPENCODE",
+    schema: "https://opencode.ai/config.json",
+    skip_permissions: "--auto",
+    continue_args: &[],
+    failure_exits_zero: false,
+    annotated_models: false,
+};
+
+/// MiMo Code, the opencode fork. (M81)
+pub static MIMO_CLI: Flavor = Flavor {
+    kind: cide_ipc::Harness::Mimo,
+    env_prefix: "MIMOCODE",
+    schema: "https://mimo.xiaomi.com/mimocode/config.json",
+    skip_permissions: "--dangerously-skip-permissions",
+    continue_args: &["--trust"],
+    failure_exits_zero: true,
+    annotated_models: true,
+};
+
+impl Flavor {
+    /// The flavour for a harness, or `None` for one that is not opencode-shaped.
+    #[must_use]
+    pub fn of(harness: cide_ipc::Harness) -> Option<&'static Flavor> {
+        match harness {
+            cide_ipc::Harness::Opencode => Some(&OPENCODE_CLI),
+            cide_ipc::Harness::Mimo => Some(&MIMO_CLI),
+            cide_ipc::Harness::Claude | cide_ipc::Harness::Qwen | cide_ipc::Harness::Codex => None,
+        }
+    }
+
+    /// The flavour a probe that is not about one role should run under: opencode when it is
+    /// installed, else mimo when *that* is, else opencode — so the not-found sentence names the
+    /// original. (M81)
+    ///
+    /// For `llm_test_model`, which tests a *provider*, not a harness: the document is the same
+    /// for both CLIs, and a machine with only mimo on it must still be able to press Test.
+    #[must_use]
+    pub fn first_installed() -> &'static Flavor {
+        [&OPENCODE_CLI, &MIMO_CLI]
+            .into_iter()
+            .find(|flavor| cide_core::toolchain::which(flavor.program()).is_some())
+            .unwrap_or(&OPENCODE_CLI)
+    }
+
+    /// The binary's bare name, which is also what every sentence below calls it.
+    #[must_use]
+    pub fn program(&self) -> &'static str {
+        crate::defs::harness_binary(self.kind)
+    }
+
+    /// The variable the whole configuration document travels in.
+    fn config_env(&self) -> String {
+        format!("{}_CONFIG_CONTENT", self.env_prefix)
+    }
+
+    /// The `Harness` this flavour is, for the helpers that spell tool names through one.
+    fn harness(&self) -> &'static dyn Harness {
+        match self.kind {
+            cide_ipc::Harness::Mimo => &MimoHarness,
+            _ => &OpencodeHarness,
+        }
+    }
+
+    /// The installed binary, by the *same* search `defs::installed` uses, and the same sentence
+    /// when it misses: a role this build would grey as uninstalled must not also grow a second,
+    /// differently worded complaint about the same absence.
+    fn binary(&self) -> Result<std::path::PathBuf, String> {
+        cide_core::toolchain::which(self.program()).ok_or_else(|| {
+            crate::defs::installed(self.kind)
+                .unwrap_or_else(|| format!("`{}` could not be found", self.program()))
+        })
+    }
+}
 
 /// The opencode CLI as a harness. A unit struct: it holds nothing, and must not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpencodeHarness;
+
+/// MiMo Code as a harness — [`OpencodeHarness`] over [`MIMO_CLI`]. (M81)
+///
+/// Every method is the opencode one, reached through the same shared functions with the other
+/// [`Flavor`]; the argument for one implementation and not two is on that struct.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MimoHarness;
+
+impl Harness for MimoHarness {
+    fn kind(&self) -> cide_ipc::Harness {
+        cide_ipc::Harness::Mimo
+    }
+
+    /// `<server>_<tool>`, opencode's spelling — measured, see [`Flavor`].
+    fn tool_name(&self, tool: &str) -> String {
+        OpencodeHarness.tool_name(tool)
+    }
+
+    fn spawn_spec(&self, plan: &RunPlan<'_>) -> Result<HarnessSpawn, HarnessError> {
+        child(&MIMO_CLI, plan, None)
+    }
+
+    fn respawn_spec(
+        &self,
+        plan: &RunPlan<'_>,
+        session: &str,
+    ) -> Result<HarnessSpawn, HarnessError> {
+        child(&MIMO_CLI, plan, Some(session))
+    }
+
+    fn deliver(&self, text: &str) -> Delivery {
+        OpencodeHarness.deliver(text)
+    }
+
+    fn continue_spec(&self, conversation: &HarnessSession) -> Result<ContinueSpec, HarnessError> {
+        MIMO_CLI.continue_spec(conversation)
+    }
+
+    fn observe(&self, current: RunState, ob: Observation<'_>) -> Option<RunState> {
+        OpencodeHarness.observe(current, ob)
+    }
+
+    fn diagnose(&self, line: &str) -> Option<FailoverReason> {
+        failover(line)
+    }
+
+    fn failure_exits_zero(&self) -> bool {
+        MIMO_CLI.failure_exits_zero
+    }
+
+    fn usage(&self, line: &str) -> Option<cide_ipc::TokenUsage> {
+        usage(line)
+    }
+
+    fn models(
+        &self,
+        cwd: Option<&std::path::Path>,
+        llm: &cide_ipc::LlmSettings,
+    ) -> Result<Vec<String>, String> {
+        MIMO_CLI.models(cwd, llm)
+    }
+}
 
 impl Harness for OpencodeHarness {
     fn kind(&self) -> cide_ipc::Harness {
@@ -215,7 +405,7 @@ impl Harness for OpencodeHarness {
     }
 
     fn spawn_spec(&self, plan: &RunPlan<'_>) -> Result<HarnessSpawn, HarnessError> {
-        child(plan, None)
+        child(&OPENCODE_CLI, plan, None)
     }
 
     fn respawn_spec(
@@ -223,7 +413,7 @@ impl Harness for OpencodeHarness {
         plan: &RunPlan<'_>,
         session: &str,
     ) -> Result<HarnessSpawn, HarnessError> {
-        child(plan, Some(session))
+        child(&OPENCODE_CLI, plan, Some(session))
     }
 
     /// Always [`Delivery::Respawn`]. See the module header: `run` is one turn per process, and
@@ -249,24 +439,7 @@ impl Harness for OpencodeHarness {
     /// person continues under opencode's own configuration — recorded as a limitation in the
     /// journal rather than papered over with a config the run did not carry.
     fn continue_spec(&self, conversation: &HarnessSession) -> Result<ContinueSpec, HarnessError> {
-        if conversation.harness != cide_ipc::Harness::Opencode {
-            return Err(HarnessError::WrongHarness {
-                plan: conversation.harness,
-                harness: cide_ipc::Harness::Opencode,
-            });
-        }
-        let id = conversation.id.trim();
-        if id.is_empty() {
-            return Err(HarnessError::NotAConversation {
-                harness: cide_ipc::Harness::Opencode,
-                id: conversation.id.clone(),
-            });
-        }
-        Ok(ContinueSpec {
-            program: crate::defs::harness_binary(cide_ipc::Harness::Opencode).to_string(),
-            args: vec!["--session".into(), id.to_string()],
-            resume: None,
-        })
+        OPENCODE_CLI.continue_spec(conversation)
     }
 
     /// The whole state machine for this harness, because the output stream is the whole channel.
@@ -359,6 +532,50 @@ impl Harness for OpencodeHarness {
         failover(line)
     }
 
+    fn usage(&self, line: &str) -> Option<cide_ipc::TokenUsage> {
+        usage(line)
+    }
+
+    /// `opencode models`, run for real — see [`Flavor::models`].
+    fn models(
+        &self,
+        cwd: Option<&std::path::Path>,
+        llm: &cide_ipc::LlmSettings,
+    ) -> Result<Vec<String>, String> {
+        OPENCODE_CLI.models(cwd, llm)
+    }
+}
+
+impl Flavor {
+    pub fn continue_spec(
+        &self,
+        conversation: &HarnessSession,
+    ) -> Result<ContinueSpec, HarnessError> {
+        if conversation.harness != self.kind {
+            return Err(HarnessError::WrongHarness {
+                plan: conversation.harness,
+                harness: self.kind,
+            });
+        }
+        let id = conversation.id.trim();
+        if id.is_empty() {
+            return Err(HarnessError::NotAConversation {
+                harness: self.kind,
+                id: conversation.id.clone(),
+            });
+        }
+        Ok(ContinueSpec {
+            program: self.program().to_string(),
+            args: self
+                .continue_args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .chain(["--session".to_string(), id.to_string()])
+                .collect(),
+            resume: None,
+        })
+    }
+
     /// `opencode models`, run for real.
     ///
     /// A probe and not a table, because the answer is a property of *this machine*: the list is
@@ -371,20 +588,12 @@ impl Harness for OpencodeHarness {
     /// the form's box was placeholdered `sonnet` for Claude. Nobody types
     /// `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` from memory, so before this the field was
     /// unfillable in practice and every opencode role ran the provider default.
-    fn models(
+    pub fn models(
         &self,
         cwd: Option<&std::path::Path>,
         llm: &cide_ipc::LlmSettings,
     ) -> Result<Vec<String>, String> {
-        let binary =
-            cide_core::toolchain::which(crate::defs::harness_binary(cide_ipc::Harness::Opencode))
-                // The *same* search `defs::installed` uses, and the same sentence when it misses: a role
-                // this build would grey as uninstalled must not also grow a second, differently worded
-                // complaint about the same absence.
-                .ok_or_else(|| {
-                    crate::defs::installed(cide_ipc::Harness::Opencode)
-                        .unwrap_or_else(|| "`opencode` could not be found".to_string())
-                })?;
+        let binary = self.binary()?;
 
         let mut command = std::process::Command::new(&binary);
         command.arg("models");
@@ -395,8 +604,8 @@ impl Harness for OpencodeHarness {
         // The same document a run gets, so the menu describes the runs that can happen. Without
         // it the probe sees only what the user configured by hand, and cide's own providers are
         // invisible in the very dialog where they are chosen.
-        if let Some(document) = provider_config_content(llm) {
-            command.env("OPENCODE_CONFIG_CONTENT", document);
+        if let Some(document) = provider_config_content(self, llm) {
+            command.env(self.config_env(), document);
         }
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -414,7 +623,7 @@ impl Harness for OpencodeHarness {
             .unwrap_or_default();
         let filtered =
             cide_core::child_env::run_filter_with(command, None, MODELS_DEADLINE, &bin_dir)
-                .map_err(|error| describe(&error))?;
+                .map_err(|error| describe(self, &error))?;
 
         if !filtered.ok {
             // The first non-empty line of stderr, which is where a CLI puts the sentence worth
@@ -425,12 +634,12 @@ impl Harness for OpencodeHarness {
                 .map(str::trim)
                 .find(|line| !line.is_empty());
             return Err(match detail {
-                Some(line) => format!("`opencode models` failed: {line}"),
-                None => "`opencode models` failed and said nothing".to_string(),
+                Some(line) => format!("`{} models` failed: {line}", self.program()),
+                None => format!("`{} models` failed and said nothing", self.program()),
             });
         }
 
-        Ok(model_ids(&String::from_utf8_lossy(&filtered.stdout)))
+        Ok(model_ids(self, &String::from_utf8_lossy(&filtered.stdout)))
     }
 }
 
@@ -571,14 +780,27 @@ fn provider_members(llm: &cide_ipc::LlmSettings) -> serde_json::Map<String, Valu
 ///
 /// `None` when cide has nothing to say, which is the ordinary state of an installation that has
 /// never opened the Models screen: the probe then runs exactly as it did before this existed.
-fn provider_config_content(llm: &cide_ipc::LlmSettings) -> Option<String> {
+fn provider_config_content(flavor: &Flavor, llm: &cide_ipc::LlmSettings) -> Option<String> {
     let members = provider_members(llm);
     if members.is_empty() {
         return None;
     }
     let mut doc = serde_json::Map::new();
-    doc.insert("$schema".into(), json!(SCHEMA));
+    doc.insert("$schema".into(), json!(flavor.schema));
     doc.extend(members);
+    serde_json::to_string(&Value::Object(doc)).ok()
+}
+
+/// [`provider_config_content`] plus [`pool_retry`], for [`test_model`]. The provider members are
+/// the same producer's, so the test still describes the document a run gets.
+fn test_config_content(flavor: &Flavor, llm: &cide_ipc::LlmSettings) -> Option<String> {
+    let Some(retry) = pool_retry(flavor) else {
+        return provider_config_content(flavor, llm);
+    };
+    let mut doc = serde_json::Map::new();
+    doc.insert("$schema".into(), json!(flavor.schema));
+    doc.extend(provider_members(llm));
+    doc.insert("retry".into(), retry);
     serde_json::to_string(&Value::Object(doc)).ok()
 }
 
@@ -673,6 +895,44 @@ pub fn failover(line: &str) -> Option<FailoverReason> {
     }
 }
 
+/// What a `step_finish` line says was spent on the step it ends. (M80)
+///
+/// The part carries `tokens: {total, input, output, reasoning, cache: {read, write}}`, and the
+/// shape is worth reading carefully because its own `total` is the proof: `5725 = 5696 + 4 + 25`
+/// on the measured line below — input plus output plus reasoning, with **cache reads counted
+/// nowhere in it**. So opencode's `input` already excludes what came from the cache, which is
+/// the normalisation [`cide_ipc::TokenUsage`] asks for and means nothing has to be subtracted
+/// here. codex is the harness that needs the arithmetic.
+///
+/// `total` itself is deliberately not carried: it is one CLI's definition of a sum, and a field
+/// holding somebody else's arithmetic is a field that disagrees with [`cide_ipc::TokenUsage::context`]
+/// the day either changes.
+///
+/// A line with a `tokens` object full of zeroes still answers `Some`: a step that spent nothing
+/// measurable is a different claim from a run that has never reported, and the card draws them
+/// differently.
+pub fn usage(line: &str) -> Option<cide_ipc::TokenUsage> {
+    let line = line.trim();
+    // Cheap first — `failover`'s rule, and its reason: this runs on the coalescer thread, the
+    // thread every byte of every session flows through.
+    if !line.starts_with('{') || !line.contains("\"type\":\"step_finish\"") {
+        return None;
+    }
+    let event: Value = serde_json::from_str(line).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("step_finish") {
+        return None;
+    }
+    let tokens = event.get("part")?.get("tokens")?;
+    let at = |pointer: &str| tokens.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    Some(cide_ipc::TokenUsage {
+        input: at("/input"),
+        output: at("/output"),
+        reasoning: at("/reasoning"),
+        cache_read: at("/cache/read"),
+        cache_write: at("/cache/write"),
+    })
+}
+
 /// How long a [`test_model`] turn is given before it is killed.
 ///
 /// Generously longer than [`MODELS_DEADLINE`], because this one waits on a *model*: a cold local
@@ -700,6 +960,7 @@ const TEST_PROMPT: &str = "Reply with the single word: ok";
 /// is a failure a run would have had. Testing against an independently built document would be a
 /// button that reports on a configuration nothing else uses.
 pub fn test_model(
+    flavor: &Flavor,
     cwd: Option<&std::path::Path>,
     llm: &cide_ipc::LlmSettings,
     model: &str,
@@ -709,12 +970,7 @@ pub fn test_model(
         return Err("Name a model first — there is nothing to test.".to_string());
     }
 
-    let binary =
-        cide_core::toolchain::which(crate::defs::harness_binary(cide_ipc::Harness::Opencode))
-            .ok_or_else(|| {
-                crate::defs::installed(cide_ipc::Harness::Opencode)
-                    .unwrap_or_else(|| "`opencode` could not be found".to_string())
-            })?;
+    let binary = flavor.binary()?;
 
     let mut command = std::process::Command::new(&binary);
     command.arg("run");
@@ -726,8 +982,10 @@ pub fn test_model(
     // parser reads a leading `-` as a flag.
     command.arg(TEST_PROMPT);
     command.env("NO_COLOR", "1");
-    if let Some(document) = provider_config_content(llm) {
-        command.env("OPENCODE_CONFIG_CONTENT", document);
+    // Bounded retries on a flavour that would otherwise retry a dead endpoint for fifteen minutes
+    // in silence: a test asks whether the model answers *now*. See `pool_retry`.
+    if let Some(document) = test_config_content(flavor, llm) {
+        command.env(flavor.config_env(), document);
     }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -738,10 +996,10 @@ pub fn test_model(
         .map(|d| vec![d.to_path_buf()])
         .unwrap_or_default();
     let filtered = cide_core::child_env::run_filter_with(command, None, TEST_DEADLINE, &bin_dir)
-        .map_err(|error| describe_test(&error))?;
+        .map_err(|error| describe_test(flavor, &error))?;
 
     let stdout = String::from_utf8_lossy(&filtered.stdout);
-    verdict(&stdout, filtered.ok, &filtered.stderr)
+    verdict(flavor, &stdout, filtered.ok, &filtered.stderr)
 }
 
 /// Read a finished `opencode run --format json` stream as a pass or a sentence.
@@ -756,7 +1014,7 @@ pub fn test_model(
 /// afterwards proved the model answered. Reading the exit code alone would call the first case a
 /// success on any CLI that exits 0 after recovering, and reading the first error alone would call
 /// the second a failure.
-fn verdict(stdout: &str, ok: bool, stderr: &str) -> Result<String, String> {
+fn verdict(flavor: &Flavor, stdout: &str, ok: bool, stderr: &str) -> Result<String, String> {
     let mut answered = false;
     let mut error: Option<String> = None;
     for line in stdout.lines() {
@@ -768,7 +1026,7 @@ fn verdict(stdout: &str, ok: bool, stderr: &str) -> Result<String, String> {
             // mid-step still finishes its step.
             "text" | "tool_use" | "reasoning" => answered = true,
             "error" => {
-                error = Some(error_sentence(line));
+                error = Some(error_sentence(flavor, line));
                 answered = false;
             }
             _ => {}
@@ -784,12 +1042,15 @@ fn verdict(stdout: &str, ok: bool, stderr: &str) -> Result<String, String> {
     if ok {
         // Exit 0 and not one usable event. Rare, and worth its own sentence rather than a
         // cheerful one: something ran and said nothing, which is not a working model.
-        return Err("opencode exited cleanly but the model produced nothing.".to_string());
+        return Err(format!(
+            "{} exited cleanly but the model produced nothing.",
+            flavor.program()
+        ));
     }
     let detail = stderr.lines().map(str::trim).find(|line| !line.is_empty());
     Err(match detail {
-        Some(line) => format!("opencode failed: {line}"),
-        None => "opencode failed and said nothing.".to_string(),
+        Some(line) => format!("{} failed: {line}", flavor.program()),
+        None => format!("{} failed and said nothing.", flavor.program()),
     })
 }
 
@@ -798,9 +1059,12 @@ fn verdict(stdout: &str, ok: bool, stderr: &str) -> Result<String, String> {
 /// Parsed defensively through `Value` and never into a closed struct: the live object carries
 /// fields the published SDK type does not declare (`metadata` was on a probed `APIError`), and a
 /// release that adds one must not turn this into "an unreadable error".
-fn error_sentence(line: &str) -> String {
+fn error_sentence(flavor: &Flavor, line: &str) -> String {
     let Ok(event) = serde_json::from_str::<Value>(line) else {
-        return "opencode reported an error it did not describe.".to_string();
+        return format!(
+            "{} reported an error it did not describe.",
+            flavor.program()
+        );
     };
     let error = event.get("error").unwrap_or(&Value::Null);
     let name = error.get("name").and_then(Value::as_str).unwrap_or("error");
@@ -820,19 +1084,18 @@ fn error_sentence(line: &str) -> String {
 /// Its own wording rather than [`describe`]'s, because that one names `opencode models` in every
 /// arm and this is a different command with a different remedy — a timeout here means the *model*
 /// did not answer, not that a provider is unreachable.
-fn describe_test(error: &cide_core::child_env::FilterError) -> String {
+fn describe_test(flavor: &Flavor, error: &cide_core::child_env::FilterError) -> String {
     use cide_core::child_env::FilterError;
+    let program = flavor.program();
     match error {
-        FilterError::Spawn(io) => format!("`opencode run` could not be started: {io}"),
+        FilterError::Spawn(io) => format!("`{program} run` could not be started: {io}"),
         FilterError::Timeout => format!(
             "The model did not answer within {}s and the attempt was stopped. A local endpoint \
              may still be loading its weights.",
             TEST_DEADLINE.as_secs()
         ),
-        FilterError::Unreadable => {
-            "`opencode run` ran and its output could not be read".to_string()
-        }
-        FilterError::Wait(io) => format!("`opencode run` ran and could not be reaped: {io}"),
+        FilterError::Unreadable => format!("`{program} run` ran and its output could not be read"),
+        FilterError::Wait(io) => format!("`{program} run` ran and could not be reaped: {io}"),
     }
 }
 
@@ -841,16 +1104,21 @@ fn describe_test(error: &cide_core::child_env::FilterError) -> String {
 /// The error is tagged and not prose deliberately — its own doc says every caller phrases its
 /// own sentence — and this one is read in a settings dialog by somebody choosing a model, so it
 /// names the command rather than the machinery.
-fn describe(error: &cide_core::child_env::FilterError) -> String {
+fn describe(flavor: &Flavor, error: &cide_core::child_env::FilterError) -> String {
     use cide_core::child_env::FilterError;
+    let program = flavor.program();
     match error {
-        FilterError::Spawn(io) => format!("`opencode models` could not be started: {io}"),
-        FilterError::Timeout => {
-            "`opencode models` did not answer in time and was stopped. A configured provider may              be unreachable — the model can still be typed in below."
-                .to_string()
+        FilterError::Spawn(io) => format!("`{program} models` could not be started: {io}"),
+        // One sentence: this literal used to run fourteen spaces of indentation into the middle
+        // of it, a line continuation that had lost its backslash.
+        FilterError::Timeout => format!(
+            "`{program} models` did not answer in time and was stopped. A configured provider \
+             may be unreachable — the model can still be typed in below."
+        ),
+        FilterError::Unreadable => {
+            format!("`{program} models` ran and its output could not be read")
         }
-        FilterError::Unreadable => "`opencode models` ran and its output could not be read".to_string(),
-        FilterError::Wait(io) => format!("`opencode models` ran and could not be reaped: {io}"),
+        FilterError::Wait(io) => format!("`{program} models` ran and could not be reaped: {io}"),
     }
 }
 
@@ -932,13 +1200,8 @@ impl std::fmt::Debug for UserConfig {
 /// project's file, and a cide worktree is its own root, so from inside one only the checkout's
 /// committed copy would be seen — the project root sees the same file plus any uncommitted edit
 /// to it, which is the reading a person editing that file expects.
-pub fn user_config(cwd: &std::path::Path) -> Result<UserConfig, String> {
-    let binary =
-        cide_core::toolchain::which(crate::defs::harness_binary(cide_ipc::Harness::Opencode))
-            .ok_or_else(|| {
-                crate::defs::installed(cide_ipc::Harness::Opencode)
-                    .unwrap_or_else(|| "`opencode` could not be found".to_string())
-            })?;
+pub fn user_config(flavor: &Flavor, cwd: &std::path::Path) -> Result<UserConfig, String> {
+    let binary = flavor.binary()?;
     let mut command = std::process::Command::new(&binary);
     command.args(["debug", "config"]);
     command.env("NO_COLOR", "1");
@@ -950,7 +1213,7 @@ pub fn user_config(cwd: &std::path::Path) -> Result<UserConfig, String> {
         .map(|d| vec![d.to_path_buf()])
         .unwrap_or_default();
     let filtered = cide_core::child_env::run_filter_with(command, None, CONFIG_DEADLINE, &bin_dir)
-        .map_err(|error| describe(&error))?;
+        .map_err(|error| describe(flavor, &error))?;
     if !filtered.ok {
         let detail = filtered
             .stderr
@@ -958,8 +1221,11 @@ pub fn user_config(cwd: &std::path::Path) -> Result<UserConfig, String> {
             .map(str::trim)
             .find(|line| !line.is_empty());
         return Err(match detail {
-            Some(line) => format!("`opencode debug config` failed: {line}"),
-            None => "`opencode debug config` failed and said nothing".to_string(),
+            Some(line) => format!("`{} debug config` failed: {line}", flavor.program()),
+            None => format!(
+                "`{} debug config` failed and said nothing",
+                flavor.program()
+            ),
         });
     }
     parse_user_config(&String::from_utf8_lossy(&filtered.stdout))
@@ -1011,11 +1277,17 @@ const CONFIG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 ///
 /// A `/` is required because that is opencode's whole spelling — an id without one is not a
 /// model, it is prose.
-fn model_ids(stdout: &str) -> Vec<String> {
+fn model_ids(flavor: &Flavor, stdout: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     stdout
         .lines()
         .map(str::trim)
+        // mimo's annotation, cut at its exact separator and only for the flavour that prints
+        // one — see `Flavor::annotated_models`.
+        .map(|line| match flavor.annotated_models {
+            true => line.split_once(" — ").map_or(line, |(id, _)| id.trim_end()),
+            false => line,
+        })
         .filter(|line| is_model_id(line))
         // Order is the CLI's, which groups by provider. Sorting would scatter a provider's
         // models through the menu and put whichever id happens to start with `a` on the row a
@@ -1277,13 +1549,18 @@ fn duration_ms(value: &Value) -> Option<u64> {
 ///
 /// One function for both, so the two children differ in exactly the tokens the difference is
 /// about and cannot drift in the environment, the cwd or the configuration.
-fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, HarnessError> {
+fn child(
+    flavor: &Flavor,
+    plan: &RunPlan<'_>,
+    resume: Option<&str>,
+) -> Result<HarnessSpawn, HarnessError> {
     // `plan.harness`, the *resolved* one, not the definition's: a role a local override moved onto
-    // this CLI must not be refused by it. See `RunPlan::harness`.
-    if plan.harness != cide_ipc::Harness::Opencode {
+    // this CLI must not be refused by it. See `RunPlan::harness`. Against the *flavour's* kind, so
+    // an opencode plan handed to mimo is refused as surely as a claude one. (M81)
+    if plan.harness != flavor.kind {
         return Err(HarnessError::WrongHarness {
             plan: plan.harness,
-            harness: cide_ipc::Harness::Opencode,
+            harness: flavor.kind,
         });
     }
     // Refused before anything is built. `run` with an empty message is a process that starts, has
@@ -1295,12 +1572,12 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
     // document there is no role — `--agent <id>` would name an agent that does not exist, the CLI
     // would warn once and fall back to its own default agent, and the run would look like it
     // worked while carrying somebody else's system prompt.
-    let config = config_json(plan).ok_or(HarnessError::NoConfig)?;
+    let config = config_json(flavor, plan).ok_or(HarnessError::NoConfig)?;
 
     // A bare name, resolved by the OS at this spawn rather than pinned at load: opencode updates
     // itself underneath a running app. `defs::harness_binary` is the one place that name lives,
     // and it is the same one `defs::installed` probed for the roster.
-    let program = crate::defs::harness_binary(cide_ipc::Harness::Opencode);
+    let program = flavor.program();
 
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -1343,12 +1620,16 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
         args.push(variant);
     }
 
-    // The project's default for unattended children (`agents.skipPermissions`, on unless
-    // switched off). For this harness the alternative is not a prompt — `run` auto-rejects and,
-    // measured, the **turn ends at the rejection** — so the module header's old argument for
-    // never passing `--auto` is rewritten there, beside the measurement that lost it.
-    if plan.skip_permissions {
-        args.push("--auto".into());
+    // The project's default for unattended children (`agents.permissionMode`). For this harness
+    // the alternative is not a prompt: `run` auto-rejects and, measured, the **turn ends at the
+    // rejection**. So the module header's old argument for never passing `--auto` is rewritten
+    // there, beside the measurement that disproved it. `auto` takes the flag as well, because this
+    // CLI has one switch and no classifier, and the project chose "the run keeps working".
+    //
+    // Unlike the three other harnesses, this ignores the role's `permission-mode`. That was true
+    // before M82 and is left alone: opencode has no counterpart to map a mode onto.
+    if plan.unattended != Unattended::Ask {
+        args.push(flavor.skip_permissions.into());
     }
 
     // Not a display preference. This is the channel — see the module header.
@@ -1409,7 +1690,7 @@ fn child(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Harne
         Vec::new(),
     ));
     spec = spec.apply(plan.proxy.changes().to_vec());
-    spec = spec.env("OPENCODE_CONFIG_CONTENT", config);
+    spec = spec.env(flavor.config_env(), config);
     // What scopes this child's MCP connection to this run's task tools, and nothing else — the
     // app resolves the header's `run` against the registry rather than trusting anything the
     // child says about itself.
@@ -1445,6 +1726,37 @@ fn session_name(plan: &RunPlan<'_>) -> String {
     }
 }
 
+/// mimo's `retry` block, bounding the classes it would otherwise retry for a very long time —
+/// or `None` for a flavour that gives up by itself. (M81)
+///
+/// # Measured, because the failure is a run that hangs rather than one that fails
+///
+/// mimo 0.1.15 carries a retry policy per error class (`request`, `stream`, `network`, `server`,
+/// `rateLimit`, `unknown`), read from a top-level `retry` key. `network`, `server` and `rateLimit`
+/// are `persistent` — retried for ever — and `unknown` allows eight tries over fifteen minutes.
+/// A provider on a closed port lands in `unknown`: probed, it printed **nothing** for two
+/// minutes, and bounding `network` alone changed nothing, while bounding `unknown` ended it in
+/// eighteen seconds with the same `APIError { isRetryable: true }` line opencode prints — which
+/// [`failover`] already classifies as `Unreachable`.
+///
+/// So under a pool all four are bounded: a pool exists to *move on*, and a candidate that the
+/// CLI retries silently for a quarter of an hour is a pool that never fails over. Without one,
+/// nothing is written and mimo's own patience stands, since there is nowhere else to go. The
+/// keys are spelled as mimo's `debug config` echoes them back: `maxElapsedMs` is dropped by its
+/// schema, and `deadlineMs` is the key it keeps.
+fn pool_retry(flavor: &Flavor) -> Option<Value> {
+    if !flavor.failure_exits_zero {
+        return None;
+    }
+    let bounded = json!({ "mode": "bounded", "maxRetries": 2, "deadlineMs": 30_000 });
+    Some(json!({
+        "network": bounded,
+        "server": bounded,
+        "rateLimit": bounded,
+        "unknown": bounded,
+    }))
+}
+
 /// The whole `OPENCODE_CONFIG_CONTENT` document: this role, and cide's MCP server.
 ///
 /// # Built with serde, never `format!`
@@ -1472,7 +1784,7 @@ fn session_name(plan: &RunPlan<'_>) -> String {
 /// `None` is unreachable — `serde_json::to_string` of a `Value` whose keys are all strings cannot
 /// fail — and is still an `Option` rather than an `unwrap`, because the caller turns it into a
 /// refusal and a refused run is always better than a panicking one.
-fn config_json(plan: &RunPlan<'_>) -> Option<String> {
+fn config_json(flavor: &Flavor, plan: &RunPlan<'_>) -> Option<String> {
     let def = &plan.agent.def;
 
     let mut role = serde_json::Map::new();
@@ -1500,7 +1812,7 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
                 let mut prompt = format!(
                     "{}\n\n{}",
                     def.system_prompt,
-                    tracker_preamble(&OpencodeHarness)
+                    tracker_preamble(flavor.harness())
                 );
                 if let Some(change) = plan.change.as_deref() {
                     prompt.push_str("\n\n");
@@ -1508,7 +1820,7 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
                         change,
                         plan.spec_cli.as_deref(),
                         plan.spec_apply.as_deref(),
-                        &OpencodeHarness,
+                        flavor.harness(),
                     ));
                 }
                 // And, for a run with no task, the correction to the tracker paragraph — last,
@@ -1541,11 +1853,17 @@ fn config_json(plan: &RunPlan<'_>) -> Option<String> {
     agents.insert(def.id.to_string(), Value::Object(role));
 
     let mut config = serde_json::Map::new();
-    config.insert("$schema".into(), json!(SCHEMA));
+    config.insert("$schema".into(), json!(flavor.schema));
     config.insert("agent".into(), Value::Object(agents));
     // The user's providers, from global settings. Merged into this document rather than built
     // beside it, so a run and the model probe cannot disagree — see `provider_members`.
     config.extend(provider_members(&plan.llm));
+    // Only on a pool: see `pool_retry`.
+    if plan.choice.is_some()
+        && let Some(retry) = pool_retry(flavor)
+    {
+        config.insert("retry".into(), retry);
+    }
 
     if let Some(hook) = &plan.hook_bin {
         let mut servers = serde_json::Map::new();
@@ -1649,7 +1967,7 @@ mod tests {
             harness: agent.def.harness,
             // Off in the fixture, so every argv assertion below is about what the role
             // and the plan actually said; the skip default has tests of its own.
-            skip_permissions: false,
+            unattended: Unattended::Ask,
         }
     }
 
@@ -1893,7 +2211,7 @@ mod tests {
         assert!(!keep_event(STEP_START) && !keep_event("! permission requested: bash (*)"));
     }
 
-    /// `--auto` rides the project default (`agents.skipPermissions`) — and the message stays the
+    /// `--auto` rides the project default (`agents.permissionMode`) — and the message stays the
     /// last token either way, because a flag written after the positional would be read as
     /// another word of the message. The module header carries the measurement that reversed the
     /// old never-pass-`--auto` stance: a headless auto-reject does not refuse one tool, it ends
@@ -1902,7 +2220,7 @@ mod tests {
     fn the_skip_default_passes_auto_and_the_message_stays_last() {
         let agent = role();
         let mut plan = plan_for(&agent);
-        plan.skip_permissions = true;
+        plan.unattended = Unattended::Auto;
         let args = spawn(&plan).spec.args;
         assert!(args.iter().any(|a| a == "--auto"), "{args:?}");
         assert_eq!(
@@ -1968,7 +2286,7 @@ mod tests {
         // Load-bearing rather than decorative: the CLI refuses to select a `subagent`-mode agent
         // from `--agent` and silently falls back to its own default one.
         assert_eq!(config["agent"]["developer"]["mode"], json!("primary"));
-        assert_eq!(config["$schema"], json!(SCHEMA));
+        assert_eq!(config["$schema"], json!(OPENCODE_CLI.schema));
 
         // The key is the role's id, because that is what `--agent` names.
         assert_eq!(
@@ -2194,6 +2512,56 @@ mod tests {
         );
     }
 
+    /// A step's figures, and the arithmetic that says they were read the right way round. (M80)
+    ///
+    /// The fixture is a measured line, and its own `total` is the oracle: `5725` is
+    /// `5696 + 4 + 25`, so opencode's `input` is the *uncached* prompt and its cache reads are
+    /// counted beside it, not inside it. That is exactly the shape `TokenUsage` asks for, which
+    /// is why nothing is subtracted here and everything is in `codex::usage`.
+    #[test]
+    fn a_step_finish_reports_what_it_spent() {
+        let spent = usage(STEP_FINISH).expect("a step_finish carries its tokens");
+        assert_eq!(spent.input, 5_696);
+        assert_eq!(spent.output, 4);
+        assert_eq!(spent.reasoning, 25);
+        assert_eq!(spent.cache_read, 0);
+        assert_eq!(spent.cache_write, 0);
+        // The CLI's own `total` and cide's `context` agree while no cache is in play — which is
+        // the claim that the two arithmetics are the same arithmetic.
+        assert_eq!(spent.context(), 5_725);
+
+        let tools = usage(STEP_FINISH_TOOLS).expect("a tool-calling step spends too");
+        assert_eq!(tools.context(), 812);
+
+        // A cached prompt is context the model read, so it counts — and it is still reported
+        // apart, because it is the part that was cheap.
+        let cached = STEP_FINISH.replace(
+            r#""cache":{"read":0,"write":0}"#,
+            r#""cache":{"read":4096,"write":128}"#,
+        );
+        let cached = usage(&cached).expect("still a step_finish");
+        assert_eq!(cached.cache_read, 4_096);
+        assert_eq!(cached.cache_write, 128);
+        assert_eq!(
+            cached.context(),
+            5_725 + 4_096,
+            "a cache write went to the provider, not into this conversation"
+        );
+
+        // Every other line the stream carries says nothing about a spend — including the
+        // neighbouring step marker, and a `tool_use` whose own `state` has a `tokens`-shaped
+        // nothing in it.
+        for quiet in [STEP_START, TEXT, "not json at all", "{}"] {
+            assert_eq!(usage(quiet), None, "{quiet}");
+        }
+        // The substring gate is a gate and not the answer: a line that merely mentions the
+        // words is still parsed and still refused.
+        assert_eq!(
+            usage(r#"{"type":"text","part":{"text":"\"type\":\"step_finish\""}}"#),
+            None
+        );
+    }
+
     /// The id is on the first line, which is what makes the capture a scan rather than a ladder.
     #[test]
     fn the_session_id_is_read_off_the_first_line_and_a_warning_is_survived() {
@@ -2343,7 +2711,7 @@ unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 notamodel
 ";
         assert_eq!(
-            model_ids(stdout),
+            model_ids(&OPENCODE_CLI, stdout),
             vec![
                 "opencode/big-pickle".to_string(),
                 // A second slash and a colon are both real: these two ids are measured off a
@@ -2362,7 +2730,7 @@ notamodel
         // reading.
         let stdout = "zed/one\nanthropic/two\nzed/one\nzed/three\n";
         assert_eq!(
-            model_ids(stdout),
+            model_ids(&OPENCODE_CLI, stdout),
             vec![
                 "zed/one".to_string(),
                 "anthropic/two".to_string(),
@@ -2479,7 +2847,8 @@ notamodel
     #[test]
     #[ignore = "runs the real opencode"]
     fn a_real_debug_config_is_readable() {
-        let config = user_config(&std::env::temp_dir()).expect("opencode is installed");
+        let config =
+            user_config(&OPENCODE_CLI, &std::env::temp_dir()).expect("opencode is installed");
         // `{:?}` and not the fields: the provider block carries keys, and the redaction is the
         // thing worth seeing here.
         eprintln!("{config:?}");
@@ -2613,9 +2982,10 @@ notamodel
         plan.llm = llm.clone();
 
         let run = config_of(&spawn(&plan).spec);
-        let probe: Value =
-            serde_json::from_str(&provider_config_content(&llm).expect("something to say"))
-                .expect("valid JSON");
+        let probe: Value = serde_json::from_str(
+            &provider_config_content(&OPENCODE_CLI, &llm).expect("something to say"),
+        )
+        .expect("valid JSON");
 
         assert_eq!(run["provider"], probe["provider"]);
         assert!(run["provider"].is_object(), "{run}");
@@ -2661,7 +3031,8 @@ notamodel
             "an external-only settings says nothing"
         );
 
-        let document = provider_config_content(&providers()).expect("something to say");
+        let document =
+            provider_config_content(&OPENCODE_CLI, &providers()).expect("something to say");
         assert!(!document.contains("plugin"), "{document}");
     }
 
@@ -2985,7 +3356,8 @@ notamodel
             Some(FailoverReason::Unreachable)
         );
         for harness in crate::harness::registry() {
-            if harness.kind() != cide_ipc::Harness::Opencode {
+            // mimo is the same stream, so it reads it too. (M81)
+            if !harness.kind().reads_provider_document() {
                 assert_eq!(
                     harness.diagnose(DEAD_ENDPOINT),
                     None,
@@ -3001,14 +3373,23 @@ notamodel
 
     #[test]
     fn a_turn_that_produced_text_is_a_working_model() {
-        assert!(verdict(&format!("{STEP_START}\n{TEXT}\n{STEP_FINISH}"), true, "").is_ok());
+        assert!(
+            verdict(
+                &OPENCODE_CLI,
+                &format!("{STEP_START}\n{TEXT}\n{STEP_FINISH}"),
+                true,
+                ""
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn a_provider_error_is_reported_with_its_own_words() {
         // The probed shape: a dead local endpoint, exit 1, one error line.
         let line = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"APIError","data":{"message":"Cannot connect to API: Unable to connect.","isRetryable":true,"metadata":{"url":"http://127.0.0.1:1234/v1"}}}}"#;
-        let answer = verdict(line, false, "").expect_err("a dead endpoint is not a working model");
+        let answer = verdict(&OPENCODE_CLI, line, false, "")
+            .expect_err("a dead endpoint is not a working model");
         assert!(answer.contains("APIError"), "{answer}");
         assert!(answer.contains("Cannot connect"), "{answer}");
     }
@@ -3023,7 +3404,7 @@ notamodel
             r#"{"type":"error","timestamp":1,"error":{"name":"APIError","data":{"message":"flaky","isRetryable":true}}}"#
         );
         assert!(
-            verdict(&recovered, true, "").is_ok(),
+            verdict(&OPENCODE_CLI, &recovered, true, "").is_ok(),
             "text after an error is still an answer"
         );
     }
@@ -3031,14 +3412,16 @@ notamodel
     /// Exit 0 with nothing usable is not a working model, and says so rather than passing.
     #[test]
     fn a_silent_success_is_not_a_pass() {
-        let answer = verdict(STEP_FINISH, true, "").expect_err("no text is no answer");
+        let answer =
+            verdict(&OPENCODE_CLI, STEP_FINISH, true, "").expect_err("no text is no answer");
         assert!(answer.contains("produced nothing"), "{answer}");
     }
 
     /// A child that died before printing JSON falls back to the first useful line of stderr.
     #[test]
     fn a_child_that_printed_nothing_useful_quotes_its_stderr() {
-        let answer = verdict("", false, "\n  boom: no such model\n").expect_err("a failure");
+        let answer =
+            verdict(&OPENCODE_CLI, "", false, "\n  boom: no such model\n").expect_err("a failure");
         assert!(answer.contains("boom: no such model"), "{answer}");
     }
 
@@ -3047,7 +3430,7 @@ notamodel
     #[test]
     fn an_error_carrying_unknown_fields_still_reads() {
         let line = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"nope","ref":"err_1","futureField":{"x":1}}}}"#;
-        let answer = verdict(line, false, "").expect_err("a failure");
+        let answer = verdict(&OPENCODE_CLI, line, false, "").expect_err("a failure");
         assert!(answer.contains("UnknownError: nope"), "{answer}");
     }
 
@@ -3057,6 +3440,210 @@ notamodel
     fn an_empty_settings_says_nothing_at_all() {
         let llm = cide_ipc::LlmSettings::default();
         assert!(provider_members(&llm).is_empty());
-        assert!(provider_config_content(&llm).is_none());
+        assert!(provider_config_content(&OPENCODE_CLI, &llm).is_none());
+    }
+
+    // ==========================================================================================
+    // MiMo Code, the second flavour (M81).
+    // ==========================================================================================
+
+    /// The role fixture, pointed at mimo.
+    fn mimo_role() -> LoadedAgent {
+        let mut agent = role();
+        agent.def.harness = cide_ipc::Harness::Mimo;
+        agent
+    }
+
+    /// The same invocation under mimo's name, with mimo's two differences and nothing of
+    /// opencode's left in it. Every `OPENCODE_*` name is one the fork never reads, so a leaked
+    /// one is a configuration nobody sees and a run on mimo's *default* agent — the failure the
+    /// whole flavour exists to make impossible.
+    #[test]
+    fn a_mimo_run_is_opencodes_invocation_under_mimos_names() {
+        let mut agent = mimo_role();
+        agent.def.model = Some("xiaomi/mimo-v2.6-flash".into());
+        let mut plan = plan_for(&agent);
+        plan.unattended = Unattended::Auto;
+        let spawned = MimoHarness.spawn_spec(&plan).expect("a spawnable plan");
+        let spec = &spawned.spec;
+        let args = &spec.args;
+
+        assert_eq!(spec.program, "mimo");
+        assert_eq!(args[0], "run", "{args:?}");
+        assert_eq!(value_of(args, "--agent"), "developer");
+        assert_eq!(value_of(args, "--model"), "xiaomi/mimo-v2.6-flash");
+        assert_eq!(value_of(args, "--format"), "json");
+        assert!(args.iter().any(|arg| arg == "--thinking"), "{args:?}");
+        // mimo's `run` has no `--auto`; this is its spelling of the same permission.
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "--auto"), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some(&*plan.prompt));
+
+        let document = env_value(spec, "MIMOCODE_CONFIG_CONTENT").expect("mimo's config");
+        let config: Value = serde_json::from_str(document).expect("json");
+        assert_eq!(config["$schema"], json!(MIMO_CLI.schema));
+        assert_eq!(config["agent"]["developer"]["mode"], json!("primary"));
+        // The tracker is reached under opencode's spelling, which mimo shares (measured).
+        assert!(
+            config["agent"]["developer"]["prompt"]
+                .as_str()
+                .is_some_and(|prompt| prompt.contains("cide_cide_task_get")),
+            "{config}"
+        );
+        assert!(config["mcp"][SERVER].is_object(), "{config}");
+        assert!(
+            !spec.env.iter().any(|(key, _)| key.starts_with("OPENCODE_")),
+            "{:?}",
+            spec.env
+        );
+        assert!(matches!(spawned.binding, SessionBinding::Harness { .. }));
+
+        let resumed = MimoHarness
+            .respawn_spec(&plan, "ses_ffe5f35a09c2bffetJ1TxJm6qO")
+            .expect("a follow-up");
+        assert_eq!(
+            value_of(&resumed.spec.args, "--session"),
+            "ses_ffe5f35a09c2bffetJ1TxJm6qO"
+        );
+    }
+
+    /// A flavour refuses the other flavour's plan, exactly as it refuses a claude one: the
+    /// resolved harness decides the child, and forking opencode for a mimo plan would run a
+    /// role on a CLI the user did not choose, reading it with the right machine by accident.
+    #[test]
+    fn each_flavour_refuses_the_others_plan() {
+        let mimo = mimo_role();
+        let refused = OpencodeHarness
+            .spawn_spec(&plan_for(&mimo))
+            .expect_err("a mimo plan");
+        assert!(
+            matches!(refused, HarnessError::WrongHarness { .. }),
+            "{refused}"
+        );
+
+        let opencode = role();
+        let refused = MimoHarness
+            .spawn_spec(&plan_for(&opencode))
+            .expect_err("an opencode plan");
+        assert!(
+            matches!(refused, HarnessError::WrongHarness { .. }),
+            "{refused}"
+        );
+    }
+
+    /// The TUI a finished mimo run re-opens in: `mimo --trust --session <id>`, and an opencode
+    /// conversation is not one it will open — the ids share a shape and live in two stores.
+    #[test]
+    fn a_mimo_conversation_reopens_in_mimos_tui_and_only_there() {
+        use cide_ipc::{Harness, HarnessSession};
+        let conversation = |harness| HarnessSession {
+            harness,
+            id: "ses_ffe5f35a09c2bffetJ1TxJm6qO".into(),
+            cwd: PathBuf::from("/p/.cide/worktrees/qa-t-2"),
+        };
+
+        let spec = MimoHarness
+            .continue_spec(&conversation(Harness::Mimo))
+            .expect("a captured id");
+        assert_eq!(spec.program, "mimo");
+        assert_eq!(
+            spec.args,
+            vec!["--trust", "--session", "ses_ffe5f35a09c2bffetJ1TxJm6qO"]
+        );
+
+        assert!(matches!(
+            MimoHarness.continue_spec(&conversation(Harness::Opencode)),
+            Err(HarnessError::WrongHarness { .. })
+        ));
+        assert!(matches!(
+            OpencodeHarness.continue_spec(&conversation(Harness::Mimo)),
+            Err(HarnessError::WrongHarness { .. })
+        ));
+    }
+
+    /// `mimo models` annotates each id, and the annotation is cut at its exact separator — for
+    /// mimo only, so opencode's filter keeps refusing prose. Captured from 0.1.15.
+    #[test]
+    fn mimos_annotated_model_list_reads_as_ids() {
+        let stdout = "mimo/mimo-auto — window 1M, compacts at 900K\n\
+                      xiaomi/mimo-v2.5 — window 1.05M, compacts at 944K\n\
+                      xiaomi/mimo-v2.6-flash — window 1.05M, compacts at 944K\n";
+        assert_eq!(
+            model_ids(&MIMO_CLI, stdout),
+            vec![
+                "mimo/mimo-auto".to_string(),
+                "xiaomi/mimo-v2.5".to_string(),
+                "xiaomi/mimo-v2.6-flash".to_string()
+            ]
+        );
+        assert!(
+            model_ids(&OPENCODE_CLI, stdout).is_empty(),
+            "an annotated line is prose to opencode's reader"
+        );
+    }
+
+    /// Captured from a real `mimo run --format json` turn (0.1.15, one tool call): the state
+    /// machine, the session capture and the usage reader are opencode's and read it unchanged.
+    #[test]
+    fn a_real_mimo_stream_reads_like_opencodes() {
+        const START: &str = r#"{"type":"step_start","timestamp":1790101651585,"sessionID":"ses_ffe5f35a09c2bffetJ1TxJm6qO","part":{"id":"prt_g001a0ca5f8080001Yl58gOb5v","messageID":"msg_g001a0ca5f650a001GT4L53JNF","sessionID":"ses_ffe5f35a09c2bffetJ1TxJm6qO","snapshot":"0472df0c57846f06e707d0819422f438f93347c0","type":"step-start"}}"#;
+        const TOOL: &str = r#"{"type":"tool_use","timestamp":1790101656834,"sessionID":"ses_ffe5f35a09c2bffetJ1TxJm6qO","part":{"type":"tool","tool":"bash","callID":"call_3fc8c31ab7a84355bfa9482b","state":{"status":"completed","input":{"command":"echo hi","description":"Runs echo hi once"},"output":"hi\n","metadata":{"output":"hi\n","exit":0,"description":"Runs echo hi once","truncated":false},"title":"Runs echo hi once","time":{"start":1790101656805,"end":1790101656810}},"id":"prt_g001a0ca5f89e0001aoRF39sLw","sessionID":"ses_ffe5f35a09c2bffetJ1TxJm6qO","messageID":"msg_g001a0ca5f650a001GT4L53JNF"}}"#;
+        const FINISH: &str = r#"{"type":"step_finish","timestamp":1790101662111,"sessionID":"ses_ffe5f35a09c2bffetJ1TxJm6qO","part":{"id":"prt_g001a0ca5fa992001AYU5VSe9G","reason":"stop","snapshot":"937c9e99612dd46d60d8e0b13769f67e33669dc2","messageID":"msg_g001a0ca5f9527001yLFIke6ng","sessionID":"ses_ffe5f35a09c2bffetJ1TxJm6qO","type":"step-finish","tokens":{"total":30391,"input":30370,"output":3,"reasoning":18,"cache":{"write":0,"read":0}},"cost":0.00425768}}"#;
+
+        assert_eq!(
+            capture(START).as_deref(),
+            Some("ses_ffe5f35a09c2bffetJ1TxJm6qO")
+        );
+        assert_eq!(
+            MimoHarness.observe(RunState::Starting, Observation::Line(START)),
+            Some(RunState::Running)
+        );
+        assert!(keep_event(TOOL));
+        let usage = MimoHarness.usage(FINISH).expect("a step's spend");
+        assert_eq!(usage.output, 3);
+        assert!(verdict(&MIMO_CLI, &format!("{START}\n{TOOL}\n{FINISH}"), true, "").is_ok());
+    }
+
+    /// Under a pool, a mimo child is told to give up on a dead candidate in seconds rather than
+    /// the fifteen silent minutes its defaults allow; without one nothing is said, and opencode
+    /// is never told anything, since it gives up by itself. See `pool_retry`.
+    #[test]
+    fn only_a_mimo_run_on_a_pool_bounds_its_retries() {
+        let choice = cide_ipc::PoolChoice {
+            pool: "cheap-first".into(),
+            index: 0,
+            entry: cide_ipc::PoolEntry {
+                provider: "xiaomi".into(),
+                model: "mimo-v2.6-flash".into(),
+                variant: String::new(),
+            },
+        };
+        let mimo_config = |choice: Option<cide_ipc::PoolChoice>| {
+            let agent = mimo_role();
+            let mut plan = plan_for(&agent);
+            plan.choice = choice;
+            let spawned = MimoHarness.spawn_spec(&plan).expect("spawnable");
+            serde_json::from_str::<Value>(
+                env_value(&spawned.spec, "MIMOCODE_CONFIG_CONTENT").expect("a config"),
+            )
+            .expect("json")
+        };
+
+        let pooled = mimo_config(Some(choice.clone()));
+        for class in ["network", "server", "rateLimit", "unknown"] {
+            assert_eq!(pooled["retry"][class]["mode"], json!("bounded"), "{pooled}");
+        }
+        assert!(mimo_config(None).get("retry").is_none());
+
+        let agent = role();
+        let mut plan = plan_for(&agent);
+        plan.choice = Some(choice);
+        assert!(config_of(&spawn(&plan).spec).get("retry").is_none());
+        assert!(MimoHarness.failure_exits_zero());
+        assert!(!OpencodeHarness.failure_exits_zero());
     }
 }

@@ -3182,6 +3182,7 @@ mod tests {
             project,
             TabKind::ClaudeFull {
                 title: "review".into(),
+                ephemeral: false,
             },
             claude("cide : claude — review"),
         )

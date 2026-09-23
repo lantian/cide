@@ -45,7 +45,7 @@
  * harness this build does not have is a parse error with a line number in it, which is only
  * possible while the set has a definition.
  */
-export type Harness = 'claude' | 'opencode' | 'qwen' | 'codex'
+export type Harness = 'claude' | 'opencode' | 'qwen' | 'codex' | 'mimo'
 
 /**
  * The harnesses, as data, so membership is a lookup rather than a type assertion.
@@ -53,7 +53,7 @@ export type Harness = 'claude' | 'opencode' | 'qwen' | 'codex'
  * `check-agents.mjs` asserts this equals Rust's variant list as a set, so adding `Codex` there
  * fails the build here rather than rendering an empty harness column nobody notices.
  */
-export const HARNESSES: readonly Harness[] = ['claude', 'opencode', 'qwen', 'codex']
+export const HARNESSES: readonly Harness[] = ['claude', 'opencode', 'qwen', 'codex', 'mimo']
 
 /** Is this one of the harnesses this build knows how to label? */
 export function isHarness(value: string): value is Harness {
@@ -73,6 +73,7 @@ export function harnessLabel(harness: string): string {
   if (harness === 'opencode') return 'opencode'
   if (harness === 'qwen') return 'qwen'
   if (harness === 'codex') return 'codex'
+  if (harness === 'mimo') return 'mimo'
   return harness.trim() === '' ? 'unknown harness' : harness
 }
 

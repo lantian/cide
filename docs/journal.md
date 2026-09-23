@@ -12857,3 +12857,520 @@ byte; choosing Automatic deleted the line rather than blanking it; a hand-writte
 `color: chartreuse` drew the note with the word in it and survived a Cancel untouched. What is
 still unwatched is the light theme — the two-ring treatment is measured against `--panel-2` in
 both and was looked at in one.
+
+## A finished run opens its own reviewer, and an idle project wakes itself (M79)
+
+Two loops in the orchestration story ended in a human noticing, and both are now closed.
+
+`agent_rpc::note_run_over` has typed one line into the product owner's conversation since M18,
+and the line is fine — what is wrong is *where it lands*. It arrives in the same context that
+dispatched the work, which by the time a long run ends may be a hundred turns deep in something
+else, and what it asks for — go and check somebody else's work — is the task a loaded context
+does worst. So with `finishInNewTab` (on by default, under `nudgeOrchestrator` as ever) the note
+goes to a `claude` with nothing else in its head: a fresh `ClaudeFull` tab, opened by cide,
+carrying a prompt that names the task, the run and the branch and asks for a verdict on the task.
+One tab per *coalesced burst*, which is what `NUDGES` already delivered — six agents finishing
+together give one tab, not six.
+
+The second loop is that nothing restarted a stalled project. `autodispatch` starts a role when a
+task is assigned or a role is @mentioned, but a project with open tasks nobody has assigned just
+sits. `spinner.rs` is a dwell: when a project has had no live run, no working Claude pane, an
+open queue and at least one task not `Done` for `autoSpinAfterSecs`, cide opens a Claude in plan
+mode and hands it the project's own prompt — survey what happened, judge whether it is going the
+right way, *then* assign. It is the one key in `AgentsConfig` besides `enabled` that ships
+**off**: a timer that spends money while nobody is watching is a default nobody forgives.
+
+### A pane built in Rust, which M42 says never to do
+
+`cmd::agents` carries a long note on a deleted `agent_open_pane` and what it cost: a pane created
+by a command never passes through `rememberSpawnPlan`, so `PaneHost.mirrored` is never set, and
+closing an agent's pane killed the agent's `claude` mid-turn. That note is about a pane *adopting
+somebody else's* session. These panes' children are forked **for them**, by `claude_tab`, seconds
+earlier — so `mirrored: false` is the correct value and closing the pane ending the child is what
+Ctrl+W is supposed to mean. Session first, tab second, `SplitIntent::Adopt`'s rule, so the id is
+in `Pane::session` before the tree is mutated and nothing has to survive the render gap.
+
+The pid→pane bind is made here too. Writing `Pane::session` directly skips `pane_bind_session`,
+whose second job is the `IdeServers` join that decides which pane an `openDiff` belongs to;
+`resolve_unbound_connections` would recover it by walking ancestry, but both facts are in hand at
+the spawn and reconstructing what you can simply state is how a feature ends up working
+sometimes.
+
+### Closing the tab has to end the child, and it did not
+
+The plan was wrong about this and the code said so. `closePane` kills; **`tab_close` does not** —
+it records the whole tree, session bindings included, into `ClosedTabs` so Ctrl+Shift+T can
+re-adopt the conversation, and the frontend states the rule outright: *"A closed tab's hosts stay
+parked on purpose."* For a tab a person opened that is the feature. For a tab cide opens once per
+finished run it is a `claude` leaked per run, alive and billed-for until the app quits, in a tab
+the user closed precisely to say they were done with it.
+
+So `TabKind::ClaudeFull` grew an `ephemeral` member — a field and not a variant, because a
+variant is four arms and two of them get forgotten — and the mark decides **both** halves:
+`tab_close` kills a marked tab's sessions *and* writes no `ClosedTabs` record, or Ctrl+Shift+T
+would put back a tab naming a session the registry has forgotten. `#[serde(default)]` sits on the
+member rather than only the container, `TerminalSettings::job_notify_after_secs`' rule, and
+`a_claude_tab_saved_before_ephemeral_existed_loads_as_the_users` is the proof: without it every
+`workspace.json` in existence fails to parse its Claude tabs and `load` starts clean.
+
+### The plan approval: what was built, what was measured, and what shipped
+
+The spinner's child runs `--permission-mode plan`, which ends at an approval a person is supposed
+to give, and nobody is there. The user asked for it to be accepted automatically. The obvious
+objection is cide's own: a lone `\r` at a selection list **is an answer**, which is why
+`AgentRegistry::stop` refuses to say anything to a run in `AwaitingPermission` and kills it
+instead.
+
+So the first cut did not type. `ExitPlanMode` is a tool, cide already registers a `PreToolUse`
+hook on every child it spawns, and `cide-hook` already prints a `permissionDecision` for one
+case — so the hook answered `allow` for that one tool, on a child marked `CIDE_AUTO_PLAN=1`.
+Exact: one tool by name, no screen, no timing, no version-fragile labels. It was built, and
+`cide-agents`' `real_plan` test spawned a real `claude` against it. **The prompt drew anyway.**
+
+The reason is in the shipped binary and is structural rather than a race: `ExitPlanMode` carries
+its own `checkPermissions`, returning `behavior: "ask"` unconditionally outside the teammate
+path, and a `requiresUserInteraction()` that answers `true`. A hook decision does not override a
+tool declaring that it needs a human. There is no spelling of that idea that would have worked,
+which is worth knowing before writing it a second time — so the rule was deleted and the finding
+put in `cide-hook`'s guard module where somebody would go looking for it.
+
+What shipped reads the prompt instead, through `cide_claude::permission::parse`, which M72 wrote
+for phones and whose every rule is a reason to refuse. Four gates: only a session cide spawned
+for this timer, only in `AwaitingPermission` (the hook is exact and has already decided), only a
+prompt `cide_claude::plan` recognises, and only an option that says yes — found by its **words**,
+never its position.
+
+Two more things the real CLI settled, each of which had looked like the feature failing:
+
+- **The question is not there.** `permission::parse` hands back an *empty* question for this
+  prompt, because the CLI puts a blank line between the sentence and the options and
+  `question_above` stops at the first blank. Gating on the question never fired. So the gate is
+  the **options** — `auto mode`, `manually approve edits` — which is the better gate anyway: one
+  screen carried two phrasings of the same question (`Ready to code?` above the plan,
+  `…Would you like to proceed?` below it) while the options have to keep saying what they do,
+  because a person reads them to choose.
+- **The digit does nothing.** `permission::answer_bytes` writes one digit and deliberately no
+  Return, and its header flagged the open question: *"Whether the CLI needs the Return at all is
+  the one fact here that has not been measured against a real prompt."* Measured: the run
+  answered `1`, the highlight did not move, and the prompt was still there three minutes later.
+  `plan::keystrokes` moves the highlight to the option and confirms — the gesture the list is
+  built around, and *safer* than digit-then-Return, which would send a Return into whatever the
+  digit opened if a future CLI made the digit act.
+
+The arrow's spelling is read off the mirror (`ScreenInfo::app_cursor`) rather than hardcoded. A
+`ESC [ B` in application-cursor mode is read by nothing and looks exactly like a prompt that
+cannot be answered — which is how one run spent four minutes blaming this feature for the CLI's
+*workspace-trust* list.
+
+### The reviewer finishes the task, and two things it got wrong first
+
+The review tab shipped asking for a *verdict*: read the task, check the work, write a comment.
+Reported immediately, and the objection is the feature's own argument turned around —
+`finishInNewTab` means the console is **not** told, so a verdict written into a comment that
+nothing reads ends the loop exactly where M18 found it. Nobody else was going to pick the task
+up.
+
+So the tab owns the task from the moment it opens, and has exactly two ways to put it down:
+satisfied, comment the verdict, **merge the branch** with `cide_agent_integrate`, and set `done`;
+not satisfied, comment what is left, set the task back to `doing`, and hand it to the role that
+built it with `cide_agent_dispatch` carrying that feedback as the brief.
+
+The merge took a second report to get right. The first version closed the task and said the
+branch *"isn't merged into main yet; I left that to you"* — which is the same defect as the
+verdict-only version wearing a different hat: it had handed the job back to the one person the
+feature exists to keep out of the loop. Accepting work means taking it into the branch.
+`integrate` computes the merge in memory and refuses on conflict without writing a byte, so its
+failure arm folds straight into the hand-back road, and the merge is ordered *before* the close
+— or a task is marked done over work that never landed. It is told not to fix the work itself — the role has the context and still holds a
+checkout of the branch, and a second author on it is how two runs clobber one file.
+
+That makes it a loop rather than a report, and it closes on itself: the re-dispatched run ends,
+opens another review tab, and that one reads the comments this one wrote. Which is also the only
+bound available, and it is the right one — the comments are the record, so a reviewer that can
+see the task has already been sent back for the same reason is told to stop and leave it in
+review for a person. A counter in Rust would have stopped a task that was genuinely converging.
+
+Two defects came out of the same report.
+
+**The branch name was built from the label.** A role labelled `3D Artist` has the id
+`3d-artist`, and a run's checkout is `cide/<role-id>-<slug of the task id>` — so the prompt was
+telling reviewers to diff `cide/3D Artist-t-1060`, a ref with a space and capitals in it that has
+never existed and that `cide_git::worktree`'s own whitelist refuses by construction. Two
+producers of one name, which this repository has a rule about; it calls
+`cide_agents::checkout_name` now, and `Turn` carries the `AgentId` beside the label because they
+are different strings and only one of them is a name anything answers to.
+
+**And it asked the user what to do.** Twice over. In prose — a turn ending in a question is a
+task nobody picks up, so the prompt now says in as many words that there is nobody at the
+keyboard and every question is its to decide; the spinner's default prompt says the same. And
+structurally, which was the part not noticed when it was written: the review tab had **no
+permission stance at all**, so it parked on the first prompt raised by a `git diff` or a test
+run, holding a tab and doing nothing. That is precisely the failure `AgentsConfig::skip_permissions`
+was written for and measured on dispatched runs — and this is one, in every respect that matters:
+cide spawned it, and nobody is watching. It follows the project's own setting now. The difference
+from a dispatched run is stated rather than papered over: this tab stands in the **project root**
+rather than a worktree, because a diff and a test run are what it is for, so its containment is
+the brief rather than the checkout.
+
+### Three more reports, and what each one was really about
+
+**It stole the view.** A reviewer opened in front of whatever the user was reading, which is the
+one thing a feature premised on *nobody was watching the agents* must not do. `open_tab_behind`
+is a sibling of `open_tab` rather than a `bool` on it: twenty-five call sites open a tab because
+somebody asked for one and every one of them should raise it, and a parameter threaded through
+all of them would put the decision where there is no decision to make. The reviewer opens behind;
+the spinner's planner still raises, because a project idle for a quarter of an hour has nothing
+to interrupt. A background tab's panes are laid out at full size behind `visibility: hidden` —
+`paneHosts.ts`' rule — so the session still starts and the review still happens.
+
+**The tab did not think it was an orchestrator.** It was right to doubt: `roster_paragraph` had
+two opening sentences, and the non-console one is hedged — *you may act as one* — deliberately,
+because a conversation pane opened from the Tasks panel has just been handed a task to *work*,
+and two identities in one prompt is a model guessing which to be. That hedge is exactly wrong for
+a tab cide opened with a brief telling it to judge a task, merge its branch and close it or
+dispatch it back. There is no second identity to confuse it with. So there is a third `Voice`,
+`Acting`, which says it *is* acting as the product owner, that cide opened the tab with nobody at
+the keyboard, and that the instructions are the job rather than a report to write. Everything
+after the opening sentence stays byte-identical across all three, so a rule taught to one is
+taught to all.
+
+**Things noticed in passing were being lost.** A run that spots a defect outside its task had two
+bad options: fix it, which makes a branch nobody can review, or mention it in a comment, which is
+read once by whoever reviews that task and never again. Now all three prompts say the same thing
+— open a task for it and carry on. It cost `TRACKER_PREAMBLE` about 160 characters and a
+deliberate raise of the budget that paragraph carries, which is the edit that budget exists to
+force; the sentence earns it, because both failures it names cost a review each time they happen.
+
+### Where a reviewer stands, diagnosed on a real board
+
+Two more reports, and the same afternoon's data on `~/work/selfcraft` settled both — 91 `cide/*`
+branches, 61 Claude sessions in the project's own slug, all from one day.
+
+**"Subagent history shows the review session, not the work."** True, and the cause is that
+`claude` files a transcript under **the directory it started in**. Every reviewer stood in the
+project root, so every one of them landed in that project's Claude history. The project in
+question runs its subagents on `opencode`, so cide's reviewers were the *only* claude sessions in
+it: "the project's Claude history" had become a list of cide's own bookkeeping, sixty-one entries
+deep. A reviewer now stands in the **worktree it is reviewing** — the same composite
+`checkout_name` built for the run — so its transcript files beside the work it is about, and it
+starts in the branch whose diff it was told to read. `cide_agent_integrate` is unaffected, which
+is what makes this safe: it resolves the project root from the workspace and merges into *that*
+checkout's branch, never into whatever the caller is standing in.
+
+**"It often says the worktree is already merged."** The reviewer was telling the truth. `main`
+carries real `Merge cide/ui-dev-t-146 into main` commits — the merge feature working — and of 91
+branches, 87 were genuinely in. `Integrated::UpToDate` is the correct answer for a re-dispatched
+run that added no commits of its own, which happens whenever a hand-back produces a turn that
+changes nothing. What was wrong was the *reading*: the prompt gave the reviewer two outcomes,
+merged and conflicted, so a third answer arrived with nowhere to go and got reported to the user
+as a fault — "the branch isn't merged", which is the first report wearing its opposite face. It
+is now named as the normal answer it is: the branch is already in, check the work is present and
+close the task.
+
+**What this did not fix, and it is a real limit.** `claude_tab` spawns `claude` whatever
+`AgentsConfig::harness` says, so a project whose roles all run on `opencode` still gets a Claude
+reviewer. That is not an oversight: `cmd::session`'s pane road attaches cide's `--mcp-config` only
+when `program_is_claude`, so a reviewer on another CLI would open with **no tracker tools at all**
+— unable to comment, integrate or dispatch, which is the whole job. Equipping a pane of another
+harness is the prerequisite, and it is not this milestone's.
+
+### One reviewer per task, and the road out of an idle run
+
+The same board, two hours later and running the fixed build, answered the next question: does the
+loop actually close? It does — of twenty-nine reviewer sessions, ten merged the branch and closed
+the task, four sent it back with instructions, and ten correctly did nothing because an earlier
+reviewer had already closed it. None of them ended by asking the user anything, which was the
+point of the *nobody will answer you* paragraph. Reviewer placement held: fifty-eight sessions
+filed under worktree slugs against two under the project root, both from the restart itself.
+
+The ten that did nothing are the finding. **Every hand-back opened a tab, and a claude run hands
+back once per turn**, so a task sent back once and reworked twice collected three reviewers —
+each of them told, by `review_prompt`, that *nobody else is reviewing it*. That sentence was
+simply false, and on `t-132` it cost something: four reviewers were live at once and two of them
+acted. One dispatched the role afresh; the other, reviewing the same task from the same worktree,
+posted a contradicting verdict, **stopped a live child**, and then had its own dispatch refused
+three times. Neither was wrong about anything it could see, which is what makes two owners of one
+task unrecoverable from inside a brief.
+
+So a task has one reviewer while its tab is open (`REVIEWERS`), and a later burst for that task is
+**typed into that conversation** instead — `nudge_line`, the console road's own line, because the
+tab already has the brief and is very likely holding the thread the new turn continues. The two
+gates the tab road deliberately omits come back on this arm, and their original argument is what
+says so: they exist because the console road writes into a conversation somebody else is using,
+and this road now has one. Mid-turn it holds, and the reviewer's own next `Idle` edge re-arms the
+flusher. The table is pruned against the session registry on every read, so closing a tab
+un-suppresses that task immediately; it is keyed on the task, and a burst whose last turn had no
+task is never deduplicated, because a task-less run stands in the project root (M40) and two of
+them share nothing to collide over.
+
+The other half is `run_state_detail`'s **`Idle`** arm. An idle run's child is parked at its
+prompt and will sit there until something ends it, so the duplicate refusal's general advice —
+*stop it, or wait for it to end* — was, for the one state a hand-back always lands a caller in,
+advice to wait for ever. The row now names the road out: stop it with `cide_agent_stop` and
+dispatch again. Written there rather than in `review_prompt` because the refusal is read by
+whoever hits it, which is every caller and not only cide's own tab — `push::preview`'s
+one-producer rule applied to a sentence.
+
+Two things this did **not** change, both noticed on the same board. Forty-seven reviewer children
+were alive at once, 14.7 GB resident, because a tab stays until somebody closes it — which is
+what was asked for, and the deduplication is what bounds it. And `cide_agent_dispatch` still
+refuses an idle run rather than resuming it; typing the brief into the live child would be the
+better answer and keeps the run's context, but it is a change to the dispatch funnel and not a
+sentence.
+
+### The prompt box, and a constraint kept in the wrong place
+
+The prompt field shipped as a single-line `TextField`, and the argument was that the string is
+typed at a terminal where a newline is a second Enter — so a control that could not hold one was
+the constraint expressed in the form. Reported immediately, and correctly: the default prompt is
+about five hundred characters, and a 26px box is the wrong shape to read it in, let alone rewrite
+it.
+
+The reasoning was sound about the file and wrong about the person, and the fix cost nothing
+because the constraint was never that control's to keep. `AgentsConfig::apply` already flattens
+the string on the way *in* — which is why the flattening went there rather than at the spawn, so
+the file can never hold a prompt that would misbehave and the box always shows what will be sent.
+So `TextArea` holds whatever somebody types, the file holds one line, and the box shows that line
+back after the round trip; the hint says line breaks become spaces, which is a statement about
+what just happened rather than a warning nobody can act on.
+
+It is a separate control from `TextField` rather than a `multiline` prop, because the two differ
+in exactly one thing that is not styling: **what Enter means.** A field holding an id commits on
+it; a box holding prose cannot. A flag would have put that branch on the one keystroke the two
+disagree about, in the place a reader would not look.
+
+### What is not verified
+
+`cargo test -p cide-agents --test real_plan -- --ignored` passes end to end against 2.1.278: the
+model plans, cide reads the grid, navigates, confirms, plan mode ends and the file is written.
+`should_spin`'s seven refusals, `plan::approval`'s negative corpus, `review_prompt`'s one-line
+guard, the `ephemeral` round trip and the config clamps are all pinned in the workspace suite.
+
+**Not yet seen on a display.** Nothing in CI can watch a review tab appear when a real subagent
+hands back, confirm that closing it ends that `claude` and no other, or watch a spun tab plan and
+proceed with nobody at the keyboard. The tab's geometry self-corrects in theory —
+`session_attach` resizes before it attaches — and in theory is where that claim currently sits.
+
+## Who ran this line, on what, and how full the context is (M80)
+
+> *"Can we show in harness read only log info about what harness is used and what model, inside
+> modal that i can open when clicking bash or thoughts? And info about used context length"*
+
+A run's pane is a rendered stream: `● bash  cargo test  1.2s #7`, `∴ thought  4.1s #8`. The `#7`
+resolves to the whole event in a card (M42, M62), and until now that card said everything about
+the *line* and nothing about the *run*. On this machine a role may be an opencode pool that has
+failed over twice, a codex a project override redirected it to (M78), or the claude its file
+names — and all three are read back from the same pane, in the same colours, days later. Two
+facts answer "why did it do that", and neither was on screen once the run left the panel's live
+rows.
+
+The card grows a footer: **Run by** (harness · model · pool position) and **Context** (the
+window, with the last step's breakdown). `session_log_detail` fills it from `AgentRegistry` in
+the same round trip that fetched the line, so the card still opens on one command and either has
+the block or knows there is none — a shell pane's structured log line, which is the case this
+card was built for, has no run and draws no footer at all.
+
+### The two CLIs count differently, and raw it would have been invisible
+
+opencode's `step_finish` carries `tokens: {total, input, output, reasoning, cache:{read,write}}`,
+and its own `total` is the proof of the shape: `5725 = 5696 + 4 + 25`, with the cache counted
+nowhere in it. codex's `turn.completed` carries `usage: {input_tokens, cached_input_tokens,
+output_tokens}` where the cached figure is a **part of** the input, not a figure beside it. Drawn
+raw, the same conversation reads 72% larger under one harness than the other, both numbers look
+like measurements, and nothing anywhere says why. So `Harness::usage` — a third reading of the
+stream beside `observe` and `diagnose`, and separate for their reason: it moves nothing and
+latches nothing — answers a **normalised** `cide_ipc::TokenUsage` with the cached half taken out
+of `input`, and the subtraction lives in `codex::usage` alone.
+
+Three smaller decisions around the same number:
+
+- It is the **last step's**, never a running sum. Each step's prompt contains the previous one's,
+  so adding them counts the same tokens once per turn and grows quadratically with a conversation
+  that is merely long. The last step is the honest one, and the card says *(last step)* in as
+  many words rather than leaving the reader to assume a total.
+- The **percentage appears only with a stated window**. `LogRunInfo::context_limit` is filled
+  from `LlmModel::context` — a number the user typed for a custom provider, in the document this
+  very child was forked with — matched on the provider and the model as two separate keys, never
+  by splitting a joined `provider/model` (`PoolEntry`'s header refuses to own that parser). A
+  catalogued model's window is opencode's catalog's business and cide keeps no copy of it, so
+  usually there is no limit and the card prints the count alone. A percentage of a guessed window
+  is the one shape here worse than no percentage: it reads as a measurement.
+- `cache_write` is named in the breakdown and is **not** in the window. Those tokens went to the
+  provider's cache, not into this conversation.
+
+### Read off the run, never off the role's file
+
+`LogRunInfo::harness` is `LiveRun::harness`, which M78 made true against a local override, and
+the model is the run's own pool candidate (`PoolEntry::model_flag`, the same join the argv uses)
+falling back to what the child was forked with. Reading `agent.def` here would have reproduced
+M78's bug in the one surface built to explain a run after the fact — a card captioning an
+opencode conversation `claude`. The pool **position** is carried beside the model for the same
+reason the failover log line carries it: without `2 of 3`, the card names a model nobody chose
+and says nothing about the two that refused before it.
+
+A finished run still answers. Its row has left the live list and its child is gone, which is
+exactly the occasion this card exists for.
+
+### What is not there
+
+`claude` and `qwen` runs report nothing: cide never parses their output, `Harness::usage`
+defaults to `None`, and the footer says so in a sentence rather than drawing four zeroes. The
+harness and the model are still named for them, which is most of what was asked for. A
+conversation-wide total, a cost in currency, and a window for catalogued models are all absent
+for the same reason — cide would have to invent the number.
+
+**Not yet seen on a display.** The formatters, the normalisation and the registry lookup are
+pinned by `cargo test -p cide-agents`, `cargo test -p cide-app -- a_log_line_names
+a_run_with_no_pool` and `check:json-log`, which also pins the sum against the Rust it restates;
+what no check can see is the footer's two rows under a real card with a real opencode run behind
+them.
+
+## MiMo Code, as a second flavour of opencode (M81)
+
+> *"Need to add support of mimo (mimo code) harness for subagents"*
+
+A role may now say `harness: mimo` and run on Xiaomi's MiMo Code CLI, with everything an
+opencode role gets: the rendered stream, the Open-in-TUI road, the Model menu, pools, failover and
+the folded-in default model.
+
+### It is opencode, and that was measured rather than guessed from a name
+
+`mimo` 0.1.15 is a 135 MB Bun-compiled binary beside a `@mimo-ai/plugin` package, which is
+opencode's installation, renamed. That was the hypothesis. What made it the design is what the
+binary did when asked:
+
+- **`mimo run` takes opencode's flags** (`--agent`, `-m`, `--variant`, `--format json`,
+  `--thinking`, `--dir`, `-s`, `--title`, `--fork`).
+- **A real turn printed opencode's events**, line for line in shape: `step_start`, `reasoning`,
+  `tool_use`, `text`, `step_finish`, with `sessionID: "ses_…"` on every line and opencode's
+  `tokens` object on each finish.
+- **An inline role in `MIMOCODE_CONFIG_CONTENT` is registered** with its prompt verbatim, which
+  `mimo debug agent` shows.
+- **MCP tools are named `<server>_<tool>`.** The model listed `deepwiki_ask_wiki_question` for a
+  server named `deepwiki`, so the tracker preamble's `cide_cide_task_get` is right for both CLIs.
+- **Every environment variable is opencode's under a `MIMOCODE_` prefix**, and the binary reads
+  no `OPENCODE_*` name at all.
+
+So `harness/opencode.rs` is **one implementation with two `Flavor`s**, not a fourth copy of three
+thousand lines. The renderer, the failover classifier, the usage reader, the state machine and
+the provider document each still have one producer. A copied `mimo.rs` would have been a second
+spelling of the row format `check:json-log` pins, and of the document `provider_members` insists
+is made in one place. Every difference is a field on `Flavor`, and nothing in the shared code says
+`if mimo`:
+
+- the variable prefix;
+- the `$schema`;
+- skip-permissions: mimo's `run` has no `--auto` and spells it `--dangerously-skip-permissions`;
+- `--trust` on the re-opened TUI. That TUI asks about a directory the run already worked in
+  headless, so the question is about a decision already made;
+- `mimo models`' annotated lines (`xiaomi/mimo-v2.5 — window 1.05M, …`). These are cut at that
+  exact separator for mimo only, so opencode's filter still refuses prose;
+- the two differences below.
+
+`cide_ipc::Harness::reads_provider_document` replaces four `== Harness::Opencode` tests in
+`overrides.rs` and two arms in the app. One producer answers *does this harness take pools,
+providers and a default model*. `Facts` caches `debug config` per flavour, because the two CLIs
+keep separate configuration files and one project therefore has two defaults. The Test button
+runs under whichever of the two is installed, since it tests a provider and not a harness.
+
+### Two divergences, both of which would have been a pool that never fails over
+
+A pool candidate on a closed port **printed nothing for two minutes** under mimo, where opencode
+errors at once. The binary's retry table explains why:
+- `network`, `server` and `rateLimit` are `persistent`, meaning they are retried for ever;
+- a refused connection lands in `unknown`, which allows eight tries over fifteen minutes;
+- bounding `network` alone changed nothing, and bounding `unknown` ended it in eighteen seconds.
+
+So a mimo run **on a pool** gets a `retry` block bounding all four classes. A pool exists to move
+on, and a candidate the CLI retries silently for a quarter of an hour is a pool that never
+fails over. A run without a pool keeps mimo's own patience, because there is nowhere to go.
+mimo's schema drops `maxElapsedMs` and keeps `deadlineMs`; `debug config` echoes back what
+survived, which is how that was found.
+
+Once it gave up, mimo printed opencode's exact `APIError { isRetryable: true }` line, which
+`failover` already classifies as `Unreachable`, **and exited 0**. A typo'd model does the same.
+The failover gate refuses a clean exit, on opencode's measured contract: a zero exit after an
+error line is a turn it retried and *finished*. mimo's retries are silent, so its error line is
+the verdict, and `Harness::failure_exits_zero` says so. Without it, every candidate's death would
+have read as a clean end. The latch is still the trigger, and a clean mimo exit with nothing
+classified spends nothing.
+
+The free `mimo/mimo-auto` endpoint has been retired. A turn on it prints
+`MiMo free API service has ended` to stderr, exits 0 and emits no event at all. That is
+unclassifiable, and it ends the run as a clean exit with nothing in the pane but the exit.
+
+### What is verified, and what is not
+
+- **Workspace suite:** green, with the unit tests beside opencode's own. They cover:
+  - the argv and environment, with no `OPENCODE_*` leak;
+  - each flavour refusing the other's plan;
+  - the TUI re-open;
+  - the annotated model list;
+  - a captured real stream through the state machine, capture, usage and verdict;
+  - the retry block present only for mimo on a pool;
+  - the failover gate for a clean mimo exit, both with a verdict and without one.
+- **`cargo test -p cide-agents --test real_mimo -- --ignored`** passes against 0.1.15. Three of
+  its tests are quota-free: the inline role registers; a dead pool candidate classifies as
+  `Unreachable` in under twenty seconds; the Test button refuses a dead endpoint. The fourth
+  spends two small turns: a turn streams, its id is captured, its spend is read, and a
+  `--session` follow-up continues the same conversation. `real_opencode` still passes, so the
+  split moved nothing for opencode.
+- **Not yet seen on a display:** a mimo role dispatched from the panel, its pane's rendered
+  stream, Open landing in `mimo --trust --session`, and a failover between two live candidates.
+  `mimo` lives in `~/.mimocode/bin`, which only `~/.bashrc` puts on `PATH`. A desktop-launched
+  cide finds it through `login_path`'s `bash -l -i` probe, and that is also untested on a display.
+- **`../cide-mobile`'s synced `Harness` type** is one variant behind `contract/protocol.ts`. The
+  phone never branches on the name, so `"mimo"` renders as itself there; the sync is its own
+  change.
+
+## Unattended runs on `auto`, and a permission mode an override can set (M82)
+
+Asked for: run Claude subagents with auto mode instead of permission bypass, make that the
+project default, and let a local override set the mode.
+
+### What changed
+
+- **`agents.permissionMode` replaces `agents.skipPermissions`** in `.cide/config.json`. It takes
+  one of three values: `auto` (the default), `bypassPermissions` or `manual`.
+  `AgentsConfig::unattended()` is its only reader, and `RunPlan::unattended` carries the answer
+  to each harness. The role's own `permission-mode:` still wins over it.
+- **The old key is migrated as it is read, and nothing is written.** With no `permissionMode`,
+  `skipPermissions: false` means `manual`, and `true` means `auto`, not bypass. Every file cide
+  wrote before M82 says `true` whether or not anybody chose it, so `true` cannot be read as a
+  choice of bypass. Neither key is serialised while unset. Otherwise the panel's first save
+  would write `"permissionMode": "auto"` beside a hand-written `"skipPermissions": false` and
+  silently outrank it. `a_save_does_not_invent_a_permission_mode` asserts that. An unknown word
+  reads as `manual`, with a warning.
+- **Per harness, `auto` as a project default means:**
+  - claude: `--permission-mode auto`, literally.
+  - codex: keeps `--dangerously-bypass-approvals-and-sandbox`, because `--approve-for-me` keeps
+    the `workspace-write` sandbox and that sandbox makes `.git` read-only.
+  - qwen: keeps `yolo`, because its own `auto` has never been measured headless.
+  - opencode and mimo: keep their single promptless flag.
+  A *role* that writes `auto` still gets each CLI's literal mapping. The review tab the finish
+  nudge opens (`claude_tab::TabMode::Direct`) follows the same three values.
+- **The `bypassPermissions` gate now applies under the default.** `dispatch_refusal`'s
+  exception was "the project already skips every prompt". That now holds only for a project
+  whose own mode is `bypassPermissions`. A role that writes bypass in an `auto` project needs
+  `allowDangerousPermissions`, which is the two-acts rule applying again.
+- **`AgentOverride::permission_mode`** (local, uncommitted) beats the role's own mode and the
+  project default. `overrides::resolve` folds it, and it reaches every harness through
+  `Resolved::apply`, the same way `model` and `effort` do. An unknown word is dropped with a
+  warning, and the role's own mode stands. The value is part of `ChildSettings`, so Resume
+  restarts a paused run whose mode was changed. Claude Code subagents still take no override
+  (`row_for`). The override header's "an override cannot supply a permission mode" is rewritten
+  with the argument for the exception: how far an unattended process is trusted on this machine
+  is decided by whoever owns the machine.
+- **`cide_agent_override` takes `permissionMode` but refuses `bypassPermissions` by name.**
+  Without that refusal, a model could grant unattended runs no brake at all, and the one gate for
+  that exists so that a person decides it. The Settings override card has a Permission mode
+  select that offers every mode, bypass included, because only a person can reach that screen.
+
+### What is verified, and what is not
+
+- `cargo test -p cide-agents`, `-p cide-app`, `-p cide-ipc`, and `check:pools`, whose
+  field count moved from five to six. The workspace suite and every `check:*` also ran.
+- **Not seen live:** a dispatched claude run under `--permission-mode auto`. In particular, what
+  it does when the classifier declines an action is unconfirmed. If it falls back to a prompt,
+  the run parks in `AwaitingPermission` exactly as a `manual` run would. That is the trade this
+  milestone accepts over a child with no brake.

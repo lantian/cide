@@ -362,6 +362,26 @@ mod guard {
         Some(bytes)
     }
 
+    // There is deliberately **no `allow_line` for `ExitPlanMode`**, and this note is the record
+    // of why, because it is the obvious thing to reach for and it cannot work.
+    //
+    // M79 needed a plan approved with nobody at the keyboard, and a `PreToolUse` hook answering
+    // `permissionDecision: "allow"` for that one tool is the exact-looking way to do it: it names
+    // the tool, needs no screen parsing and no timing. It was built, and measured against the
+    // shipped CLI (2.1.278) by `cide-agents`' `real_plan` test: the model planned and the
+    // approval prompt drew anyway.
+    //
+    // The reason is in the binary and is structural rather than a race. `ExitPlanMode` carries
+    // **its own** `checkPermissions`, which returns `behavior: "ask"` unconditionally outside the
+    // teammate path, and a `requiresUserInteraction()` that answers `true`. A hook decision does
+    // not override a tool declaring that it needs a human, so there is no spelling of this that
+    // would have worked — which is worth knowing before writing it a second time.
+    //
+    // cide answers the prompt itself instead: `cide_claude::plan`, read off the rendered grid, on
+    // a session cide spawned and nowhere else. If a later CLI makes plan exit an ordinary
+    // permission, a hook rule becomes possible and would be better than reading a screen; until
+    // somebody measures that again, it is not.
+
     /// Does this tool input name the tracker?
     ///
     /// # Resolve before comparing

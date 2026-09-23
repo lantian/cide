@@ -219,6 +219,13 @@ pub fn versioned_board(store: &TaskStore) -> (u64, TaskBoard) {
 pub fn broadcast(app: &AppHandle, project: ProjectId, store: &TaskStore) {
     let (rev, board) = versioned_board(store);
     crate::emit::tasks_changed(app, project, rev, &board);
+    // Every board change passes here or through `cmd::tasks::answer`, so this is where an idle
+    // run whose task just closed is ended. See `AgentRegistry::retire_done`.
+    if let Some(registry) =
+        tauri::Manager::try_state::<std::sync::Arc<crate::agents::AgentRegistry>>(app)
+    {
+        registry.retire_done(app, project, &board);
+    }
 }
 
 /// The directory a project's tracker lives under, or [`CoreError::NoSuchProject`].

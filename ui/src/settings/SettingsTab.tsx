@@ -139,6 +139,17 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     let live = true
     void agentDefs
       .models(project, 'opencode')
+      // A machine with mimo and no opencode: the fork reads the same provider document, so its
+      // list is the honest one for a pool. Asked only when opencode could not answer at all —
+      // a *failing* opencode's sentence is still the one to show. (M81)
+      .then((answer) =>
+        answer !== null && answer.problem !== null && answer.models.length === 0
+          ? agentDefs
+              .models(project, 'mimo')
+              .then((mimo) => (mimo !== null && mimo.problem === null ? mimo : answer))
+              .catch(() => answer)
+          : answer,
+      )
       .then((answer) => {
         if (live) setOpencodeModels(answer)
       })

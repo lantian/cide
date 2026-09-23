@@ -31,6 +31,13 @@ const eq = (actual, expected, what) => {
 }
 const ok = (cond, what) => eq(cond === true, true, what)
 
+// Rust source with its comments taken out, for every assertion below that reads one. Mandatory
+// rather than tidy in this file: the house style is to name the failure a rule prevents, so
+// `render.rs`'s prose spells the thought row, the tail and the budget that went away, and
+// `TokenUsage`'s doc spells the sum its arithmetic is pinned against — every one of those
+// assertions would otherwise pass by matching the documentation of the thing it is checking.
+const stripRust = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+
 const out = mkdtempSync(join(tmpdir(), 'cide-json-log-'))
 try {
   execFileSync(
@@ -227,6 +234,67 @@ try {
     'and the arrival is converted from the wire’s bigint before any arithmetic can throw '
       + 'inside the render')
 
+  /*
+   * Who ran the line, on what, and how full the context is. (M80)
+   *
+   * Three numbers and a join, every one of which is wrong in a way nobody can see from the
+   * screen: the two CLIs count a cached prompt differently, a percentage needs a window cide
+   * usually does not have, and a figure grouped one way here and another way elsewhere is two
+   * numbers on one card. So the formatters are pure and driven here, and the arithmetic is
+   * pinned against the Rust it restates.
+   */
+  eq(model.groupDigits(5_725), '5,725', 'grouped in threes from the right')
+  eq(model.groupDigits(812), '812', 'and not before there is a group to make')
+  eq(model.groupDigits(1_000_000), '1,000,000', 'every three, not only the first')
+  eq(model.groupDigits(0), '0', 'zero is a number and renders as one')
+  ok(!model.groupDigits(Number.NaN).includes('NaN'),
+    'a broken value is a placeholder — `stamp`’s rule, for the same reason')
+
+  const spend = { input: 4_000, output: 300, reasoning: 200, cacheRead: 1_000, cacheWrite: 64 }
+  eq(model.contextTokens(spend), 5_500,
+    'the window is the prompt (cached or not) plus what the model produced — and never the '
+      + 'cache *write*, which went to the provider and not into this conversation')
+  eq(model.contextLine(spend, null), '5,500 tokens',
+    'with no stated window there is no percentage: a percentage of a guessed limit reads as a '
+      + 'measurement, which is worse than no number at all')
+  eq(model.contextLine(spend, 32_768), '5,500 of 32,768 tokens · 17%',
+    'and with one, the share, rounded to whole percent')
+  eq(model.contextLine(spend, 0), '5,500 tokens',
+    '`0` is opencode’s “write no limit”, so it is an absence here too and not a division by it')
+  eq(model.spendLine(spend), '4,000 prompt · 1,000 cached · 300 written · 200 thinking · 64 cache write',
+    'the breakdown names each part it has')
+  eq(model.spendLine({ input: 1_600, output: 412, reasoning: 0, cacheRead: 4_096, cacheWrite: 0 }),
+    '1,600 prompt · 4,096 cached · 412 written',
+    'codex reports no reasoning and no cache writes, so it draws three parts rather than five — '
+      + 'two of them zeroes claiming to be measurements')
+  eq(model.spendLine({ input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }),
+    'nothing measurable',
+    'a step that spent nothing still answers a sentence: it is a different claim from a run '
+      + 'that has never reported one, and the card draws them differently')
+
+  // The same arithmetic in the other language. `TokenUsage::context` is what every consumer in
+  // Rust reads and `contextTokens` is what the card draws; they cannot import one another, and
+  // a term added on one side only would be a figure that disagrees with itself between the
+  // panel and the card.
+  const usageRust = stripRust(readFileSync(
+    resolve(UI, '..', 'crates', 'cide-ipc', 'src', 'agents.rs'), 'utf8'))
+  ok(/self\.input \+ self\.cache_read \+ self\.output \+ self\.reasoning/.test(usageRust),
+    'Rust’s `TokenUsage::context` sums the same four fields this module’s `contextTokens` does')
+  ok(!/self\.cache_write/.test(usageRust),
+    'and neither side counts the cache write, which is not in the window')
+
+  ok(/Number\(run\.usage\.cacheRead\)/.test(card),
+    'the card converts every token count off the wire’s bigint before the formatters see it — '
+      + '`recordedUnixMs`’s rule, and its reason: arithmetic against a number throws in render')
+  ok(/data-audit="logRunFooter"/.test(card),
+    'the footer is findable by a render check, on a wrapper element rather than on a component '
+      + 'whose props a hyphenated attribute would silently pass through and drop')
+  ok(/the CLI's own default/.test(card),
+    'a run cide named no model for says so in words: a blank beside a label reads as a dialog '
+      + 'that half failed — `TaskDetailPending`’s rule')
+  ok(/has not reported a spend/.test(card),
+    'and so does a run with no figures yet, for the same reason')
+
   // --- the cross-language and cross-module wiring -------------------------------------------
 
   const rust = readFileSync(resolve(UI, '..', 'crates', 'cide-app', 'src', 'lifecycle.rs'), 'utf8')
@@ -242,11 +310,6 @@ try {
    * how a click quietly stops doing anything. So the row Rust builds is read out of its source
    * and driven through the parser above — `LOG_LINK_SCHEME`'s rule, one row over.
    */
-  // Comments stripped first, and in this file that is mandatory rather than tidy: the house
-  // style is to name the failure a rule prevents, so `render.rs`'s own prose spells the row, the
-  // tail and the budget that went away — every assertion below would pass by matching the
-  // documentation of the thing it is checking for.
-  const stripRust = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
   const render = stripRust(readFileSync(
     resolve(UI, '..', 'crates', 'cide-agents', 'src', 'harness', 'render.rs'), 'utf8'))
   const row = /format!\("\{DIM\}(.+?)\{RESET\}\{\}", tail\(ms, handle\)\)/.exec(render)?.[1] ?? null

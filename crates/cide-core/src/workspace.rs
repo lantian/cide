@@ -316,6 +316,48 @@ pub fn open_tab(
     kind: TabKind,
     first_pane: Pane,
 ) -> Result<TabId> {
+    insert_tab(ws, project, kind, first_pane, true)
+}
+
+/// [`open_tab`], but the strip's selection does not move. (M79)
+///
+/// # Why this is a sibling and not a `bool` on `open_tab`
+///
+/// [`reinsert_tab`]'s argument, one door along: twenty-five call sites open a tab because
+/// somebody asked for it, and every one of them should raise it — a file the user clicked, a
+/// diff an agent is blocked on, a settings page. Threading a parameter through all of them to
+/// serve one caller would put the decision at twenty-five sites that have no decision to make,
+/// and the name at the call site would be `true`, which says nothing.
+///
+/// There is exactly one caller, and it is the one place where raising the tab is *wrong*:
+/// `cide_app::claude_tab` opening a reviewer because a subagent finished. That happens while
+/// the user is reading something else — it is the whole premise of the feature that nobody was
+/// watching — and a tab that steals the view mid-sentence is worse than no notification at all.
+/// It was reported as exactly that. The spinner's tab still raises, because a project that has
+/// been idle for a quarter of an hour has nothing to interrupt.
+///
+/// **The pane still mounts and its child still starts.** A background tab's panes are laid out
+/// at full size behind `visibility: hidden` — `layout/paneHosts.ts`' rule, which exists so
+/// measurements never read zero — so the session is adopted, the prompt is typed and the review
+/// happens; the only thing that does not happen is the strip moving. Were that not true this
+/// would be a feature that silently did nothing.
+pub fn open_tab_behind(
+    ws: &mut Workspace,
+    project: ProjectId,
+    kind: TabKind,
+    first_pane: Pane,
+) -> Result<TabId> {
+    insert_tab(ws, project, kind, first_pane, false)
+}
+
+/// The body both of them share. `activate` is the only difference.
+fn insert_tab(
+    ws: &mut Workspace,
+    project: ProjectId,
+    kind: TabKind,
+    first_pane: Pane,
+    activate: bool,
+) -> Result<TabId> {
     // A pane id is the address every later command uses — focus, close, detach, attach a
     // session. Two panes sharing one would make both unaddressable, and `validate` rejects
     // the resulting workspace, so refuse before building a state we would then call corrupt.
@@ -343,7 +385,12 @@ pub fn open_tab(
             tree: layout::new_tree(first_pane),
         },
     );
-    set_active(p, id);
+    if activate {
+        set_active(p, id);
+    }
+    // `bump` either way: the tab is in the tree whether or not it is the one on screen, and a
+    // window that never heard about it would draw a strip missing a tab and a pane that never
+    // mounts — which is the same as the feature not existing.
     bump(ws);
     Ok(id)
 }
@@ -2384,6 +2431,7 @@ fn build_demo() -> Result<Workspace> {
         cide,
         TabKind::ClaudeFull {
             title: "refactor pty".into(),
+            ephemeral: false,
         },
         demo_pane(PaneKind::Claude, "cide : claude — refactor", true),
     )?;
@@ -2984,6 +3032,7 @@ mod tests {
             id,
             TabKind::ClaudeFull {
                 title: "one".into(),
+                ephemeral: false,
             },
             aux_pane(),
         )
@@ -3192,6 +3241,7 @@ mod tests {
             id,
             TabKind::ClaudeFull {
                 title: "one".into(),
+                ephemeral: false,
             },
             aux_pane(),
         )
@@ -3227,6 +3277,7 @@ mod tests {
             id,
             TabKind::ClaudeFull {
                 title: title.into(),
+                ephemeral: false,
             },
             aux_pane(),
         )
@@ -3556,6 +3607,7 @@ mod tests {
             1,
             TabKind::ClaudeFull {
                 title: "one".into(),
+                ephemeral: false,
             },
             tree,
         );
@@ -3602,6 +3654,7 @@ mod tests {
             99,
             TabKind::ClaudeFull {
                 title: "far".into(),
+                ephemeral: false,
             },
             layout::new_tree(aux_pane()),
         )
@@ -3669,6 +3722,7 @@ mod tests {
             id,
             TabKind::ClaudeFull {
                 title: "one".into(),
+                ephemeral: false,
             },
             aux_pane(),
         )
@@ -4063,6 +4117,7 @@ mod tests {
             id,
             TabKind::ClaudeFull {
                 title: "one".into(),
+                ephemeral: false,
             },
             aux_pane(),
         )
@@ -4119,6 +4174,7 @@ mod tests {
             id,
             TabKind::ClaudeFull {
                 title: "one".into(),
+                ephemeral: false,
             },
             aux_pane(),
         )
@@ -4234,6 +4290,7 @@ mod tests {
             id,
             TabKind::ClaudeFull {
                 title: "one".into(),
+                ephemeral: false,
             },
             aux_pane(),
         )
@@ -4299,14 +4356,20 @@ mod tests {
         let a = open_tab(
             &mut ws,
             id,
-            TabKind::ClaudeFull { title: "a".into() },
+            TabKind::ClaudeFull {
+                title: "a".into(),
+                ephemeral: false,
+            },
             aux_pane(),
         )
         .expect("opens");
         let b = open_tab(
             &mut ws,
             id,
-            TabKind::ClaudeFull { title: "b".into() },
+            TabKind::ClaudeFull {
+                title: "b".into(),
+                ephemeral: false,
+            },
             aux_pane(),
         )
         .expect("opens");
@@ -4722,7 +4785,10 @@ mod tests {
         let full = open_tab(
             &mut ws,
             id,
-            TabKind::ClaudeFull { title: "a".into() },
+            TabKind::ClaudeFull {
+                title: "a".into(),
+                ephemeral: false,
+            },
             aux_pane(),
         )
         .expect("opens");
@@ -4743,7 +4809,10 @@ mod tests {
         let full = open_tab(
             &mut ws,
             id,
-            TabKind::ClaudeFull { title: "a".into() },
+            TabKind::ClaudeFull {
+                title: "a".into(),
+                ephemeral: false,
+            },
             aux_pane(),
         )
         .expect("opens");
@@ -4802,7 +4871,10 @@ mod tests {
         open_tab(
             &mut ws,
             id,
-            TabKind::ClaudeFull { title: "a".into() },
+            TabKind::ClaudeFull {
+                title: "a".into(),
+                ephemeral: false,
+            },
             aux_pane(),
         )
         .expect("opens");
@@ -4869,7 +4941,10 @@ mod tests {
             open_tab(
                 &mut ws,
                 id,
-                TabKind::ClaudeFull { title: "x".into() },
+                TabKind::ClaudeFull {
+                    title: "x".into(),
+                    ephemeral: false
+                },
                 clash
             ),
             Err(CoreError::Invariant(_))
@@ -4916,7 +4991,10 @@ mod tests {
         let full = open_tab(
             &mut ws,
             id,
-            TabKind::ClaudeFull { title: "a".into() },
+            TabKind::ClaudeFull {
+                title: "a".into(),
+                ephemeral: false,
+            },
             aux_pane(),
         )
         .expect("opens");
@@ -5453,6 +5531,76 @@ mod tests {
         );
     }
 
+    /// **A reviewer opens behind what you are reading; a planner opens in front.** (M79)
+    ///
+    /// Reported as a bug in the shipped behaviour: a subagent finishing while the user was in
+    /// the middle of a file took the view away to show a tab announcing it. The premise of that
+    /// feature is that nobody was watching the agents, so interrupting is the one thing it must
+    /// not do.
+    ///
+    /// Both halves in one test, because the value of the sibling is the *difference*: a build
+    /// where `open_tab_behind` were an alias for `open_tab` would pass any test of the second
+    /// half alone, and so would one where every tab opened behind.
+    #[test]
+    fn a_tab_opened_behind_does_not_move_the_strips_selection() {
+        let mut ws = Workspace::default();
+        let id = open_project(&mut ws, vec![PathBuf::from("/p")], None).expect("open");
+
+        // What the user is looking at: something other than the console, so the assertion
+        // cannot pass by the selection merely staying where it started.
+        let reading = open_tab(
+            &mut ws,
+            id,
+            TabKind::File {
+                path: PathBuf::from("/p/src/main.rs"),
+                dirty: false,
+            },
+            demo_pane(PaneKind::Editor, "main.rs", false),
+        )
+        .expect("a file tab");
+        assert_eq!(project(&ws, id).expect("p").active_tab, reading);
+
+        let review = open_tab_behind(
+            &mut ws,
+            id,
+            TabKind::ClaudeFull {
+                title: "Review: developer · t-1".into(),
+                ephemeral: true,
+            },
+            demo_pane(PaneKind::Claude, "p : claude", false),
+        )
+        .expect("the review tab");
+        assert_eq!(
+            project(&ws, id).expect("p").active_tab,
+            reading,
+            "a finished subagent took the view away from what was being read"
+        );
+        // It is nonetheless *there* — in the strip, with its pane — or this would be a feature
+        // that silently did nothing.
+        assert!(
+            project(&ws, id)
+                .expect("p")
+                .tabs
+                .iter()
+                .any(|tab| tab.id == review),
+            "the tab was not opened at all"
+        );
+
+        // And the other half: an ordinary open still raises, which is what every other caller
+        // in the workspace depends on.
+        let planner = open_tab(
+            &mut ws,
+            id,
+            TabKind::ClaudeFull {
+                title: "Plan".into(),
+                ephemeral: true,
+            },
+            demo_pane(PaneKind::Claude, "p : claude", false),
+        )
+        .expect("the spinner's tab");
+        assert_eq!(project(&ws, id).expect("p").active_tab, planner);
+    }
+
     // --- reopening a closed project ------------------------------------------------------
 
     /// Close `id` and hand back the record `persist::closed.json` would have kept.
@@ -5481,6 +5629,7 @@ mod tests {
             a,
             TabKind::ClaudeFull {
                 title: "full".into(),
+                ephemeral: false,
             },
             demo_pane(PaneKind::Claude, "full : claude", true),
         )
@@ -5672,7 +5821,8 @@ mod tests {
     fn the_tabs_that_outlive_a_close_are_the_documents_and_the_queries() {
         assert!(tab_outlives_close(&TabKind::ClaudeHome));
         assert!(tab_outlives_close(&TabKind::ClaudeFull {
-            title: "t".into()
+            title: "t".into(),
+            ephemeral: false
         }));
         assert!(tab_outlives_close(&TabKind::File {
             path: PathBuf::from("/x"),

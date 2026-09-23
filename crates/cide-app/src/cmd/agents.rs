@@ -186,15 +186,17 @@ pub async fn agents_config_set(
         // into whatever is already in the file: the two disk-only keys, and anything a future
         // cide added, survive a round trip through a panel that has never heard of them.
         let mut file: CideConfig = config::load(&root);
+        // Read before `apply` consumes it. `OrchestrationPatch` stopped being `Copy` in M79
+        // (it carries the spinner's prompt), so the enabling gate below cannot read the patch
+        // back off the stack any more; it reads the one field it is about, first.
+        let enabling = patch.enabled == Some(true);
         file.agents.apply(patch);
 
         // Only the *gesture that enables* is gated. A project already switched on by hand keeps
         // working, and a patch that only changes `maxConcurrent` on it is not the moment to
         // refuse: refusing there would wedge the panel shut over a state the user wrote
         // themselves, while fixing nothing.
-        if patch.enabled == Some(true)
-            && let Some(why) = worktree_refusal(&root, &file)
-        {
+        if enabling && let Some(why) = worktree_refusal(&root, &file) {
             // `CoreError::Io` because there is no tagged variant for a policy refusal and adding
             // one is a `cide-core` change outside this slice. Nothing branches on the tag here —
             // the sentence *is* the answer, and it names the two ways out.
@@ -394,8 +396,12 @@ pub async fn llm_test_model(
     // the await. The document handed to the test is the one a run gets.
     let llm = state.with(|ws| Ok::<_, CoreError>(ws.settings.llm.clone()))?;
     blocking(move || {
+        // Whichever opencode-shaped CLI is installed: the provider document is the same for
+        // both, and this tests the provider. (M81)
+        let flavor = cide_agents::harness::opencode::Flavor::first_installed();
         let (ok, detail) =
-            match cide_agents::harness::opencode::test_model(root.as_deref(), &llm, &model) {
+            match cide_agents::harness::opencode::test_model(flavor, root.as_deref(), &llm, &model)
+            {
                 Ok(detail) => (true, detail),
                 Err(detail) => (false, detail),
             };

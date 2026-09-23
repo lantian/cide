@@ -58,6 +58,31 @@ pub enum Harness {
     /// whitelisted environment rather than its own. `codex resume <id>` is the real TUI a
     /// person re-opens a finished run in.
     Codex,
+    /// Xiaomi's MiMo Code (`mimo`). (M81) **An opencode fork**, measured on 0.1.15: `mimo run`
+    /// takes opencode's flags, prints opencode's `--format json` events byte for byte in shape,
+    /// names MCP tools `<server>_<tool>`, and reads every environment variable opencode does
+    /// under a `MIMOCODE_` prefix. So it is not a fifth implementation but a second *flavour* of
+    /// `cide_agents::harness::opencode` — one renderer, one failover classifier, one provider
+    /// document — and it takes everything [`Harness::reads_provider_document`] grants.
+    Mimo,
+}
+
+impl Harness {
+    /// Whether this harness is fed cide's LLM **provider document** — and therefore takes a
+    /// model pool, fails over, folds in its own default model, and is a different child when a
+    /// provider changes. (M81)
+    ///
+    /// One producer for a question that was four `== Harness::Opencode` tests in
+    /// `cide_agents::overrides` and two more in the app, which is four places for a second
+    /// opencode-shaped CLI to be silently left out of: a pool named on a mimo role would have
+    /// been reported *inert* by the roster and ignored by the fork, with nothing logged.
+    #[must_use]
+    pub const fn reads_provider_document(self) -> bool {
+        match self {
+            Harness::Opencode | Harness::Mimo => true,
+            Harness::Claude | Harness::Qwen | Harness::Codex => false,
+        }
+    }
 }
 
 /// The colours a role may be drawn in, in the order a derived colour indexes them. (M75)
@@ -620,7 +645,14 @@ pub enum AgentRoster {
 /// in *this* struct will eventually be drawn too, and when they are they will still be a
 /// per-project file write and still not a [`crate::SettingsPatch`]. The rule the paragraph above
 /// is really stating survives intact: nothing about a project rides `Workspace.settings`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+///
+/// # Why this is `Clone` and no longer `Copy` (M79)
+///
+/// It was `Copy` until [`Self::auto_spin_prompt`] arrived, and a prompt is a `String` a person
+/// wrote. The alternative — keeping `Copy` by leaving the prompt off the wire — would have put
+/// the one field on this screen that a user actually composes behind a hand edit of a JSON file,
+/// which is the state `AgentDraft` exists to get *out* of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct OrchestrationConfig {
@@ -635,14 +667,42 @@ pub struct OrchestrationConfig {
     pub max_concurrent: u16,
     /// The harness a role gets when its definition does not name one.
     pub harness: Harness,
+    /// A finished run's note opens a fresh Claude tab instead of typing into the console. (M79)
+    ///
+    /// `cide_agents::config::AgentsConfig::finish_in_new_tab` carries the argument; this is the
+    /// same key, on the wire because the user asked for it in Settings. Note it is **under**
+    /// `nudgeOrchestrator`, which stays disk-only: that key answers *announce my subagents at
+    /// all*, this one answers *where*.
+    pub finish_in_new_tab: bool,
+    /// cide wakes this project when it goes quiet with work still open. (M79)
+    pub auto_spin: bool,
+    /// How long that quiet must last, in seconds. The **stored** number, not the clamped one —
+    /// `AgentsConfig::to_wire` says why.
+    pub auto_spin_after_secs: u32,
+    /// What the spun run is told. Empty means *use the one cide ships*, decided in
+    /// `AgentsConfig::spin_prompt` and never here.
+    pub auto_spin_prompt: String,
+    /// cide reads the spun run's plan approval off its screen and answers it. (M79)
+    ///
+    /// `cide_agents::config::AgentsConfig::auto_spin_accept_plan` carries the argument, including
+    /// why this is not the blind write the stop code refuses.
+    pub auto_spin_accept_plan: bool,
 }
 
 impl Default for OrchestrationConfig {
     fn default() -> Self {
+        // Mirrors `cide_agents::config::AgentsConfig::default`, which is the real one: this is
+        // what a build with no such handler draws, and the two disagreeing would show a panel
+        // that describes a file it is not reading.
         Self {
             enabled: false,
             max_concurrent: 2,
             harness: Harness::Claude,
+            finish_in_new_tab: true,
+            auto_spin: false,
+            auto_spin_after_secs: 900,
+            auto_spin_prompt: String::new(),
+            auto_spin_accept_plan: true,
         }
     }
 }
@@ -653,7 +713,9 @@ impl Default for OrchestrationConfig {
 /// `#[ts(optional)]`, so a caller flipping one switch need not restate the other two — and it is
 /// allowed to, because none of these three fields is itself nullable. That is the exact test
 /// [`crate::TaskEdit`] fails and explains at length.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+///
+/// `Clone` rather than `Copy` since M79, for [`OrchestrationConfig`]'s reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 #[ts(export)]
 pub struct OrchestrationPatch {
@@ -667,6 +729,19 @@ pub struct OrchestrationPatch {
     pub max_concurrent: Option<u16>,
     #[ts(optional)]
     pub harness: Option<Harness>,
+    #[ts(optional)]
+    pub finish_in_new_tab: Option<bool>,
+    #[ts(optional)]
+    pub auto_spin: Option<bool>,
+    /// Clamped by `AgentsConfig::apply` rather than refused, `max_concurrent`'s trade.
+    #[ts(optional)]
+    pub auto_spin_after_secs: Option<u32>,
+    /// Flattened to one line by `AgentsConfig::apply` before it reaches the file: this string is
+    /// typed into a terminal, where a newline is another Enter.
+    #[ts(optional)]
+    pub auto_spin_prompt: Option<String>,
+    #[ts(optional)]
+    pub auto_spin_accept_plan: Option<bool>,
 }
 
 /// Dispatch one run. Inbound.
@@ -1143,6 +1218,104 @@ pub struct AgentModels {
     /// [`AgentDraftProblem`], because nothing the user typed caused it and nothing they can type
     /// in this form fixes it. The box stays editable either way.
     pub problem: Option<String>,
+}
+
+/// What a harness reported it spent, as of its last completed step. (M80)
+///
+/// # Normalised, because the two CLIs count differently
+///
+/// opencode's `step_finish` carries `tokens: {input, output, reasoning, cache:{read,write}}`
+/// whose own `total` is `input + output + reasoning` — cache reads are counted *beside* the
+/// input, not inside it. codex's `turn.completed` carries `usage: {input_tokens,
+/// cached_input_tokens, output_tokens}` where `cached_input_tokens` is a **subset** of
+/// `input_tokens`. Carried raw, the same conversation would read as a third larger under one
+/// harness than the other, and nothing on the card would say why. So each harness's `usage`
+/// answers this shape with the cached half taken *out* of [`Self::input`], and this struct's
+/// arithmetic is the same arithmetic for both.
+///
+/// It is the **last step's** figures and never a running sum: that is what makes
+/// [`Self::context`] mean what the card says it means, and it is also all either CLI reports —
+/// neither states a conversation total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TokenUsage {
+    /// The prompt the model read, less whatever of it came from the cache.
+    pub input: u64,
+    /// What it wrote.
+    pub output: u64,
+    /// What it thought, where the harness counts that apart from the output. opencode does;
+    /// codex reports no reasoning figure at all, so this is `0` for every codex run rather than
+    /// a number invented from the output.
+    pub reasoning: u64,
+    /// The part of the prompt served from the provider's cache. Still context — it is in the
+    /// window — and still worth seeing apart, because it is the part that was cheap.
+    pub cache_read: u64,
+    /// What was written *into* the cache on this step. Not part of the window.
+    pub cache_write: u64,
+}
+
+impl TokenUsage {
+    /// Roughly what was in the model's context window when this step ended.
+    ///
+    /// The prompt it read (cached or not) plus what it produced, which is what the *next*
+    /// request's prompt will contain. An estimate, and the card says so in as many words: a
+    /// harness that compacts, summarises or drops a turn between steps makes the next prompt
+    /// smaller than this, and neither CLI reports the number directly. Deliberately not
+    /// including [`Self::cache_write`] — those bytes went to the provider's cache, not into
+    /// this conversation.
+    #[must_use]
+    pub fn context(&self) -> u64 {
+        self.input + self.cache_read + self.output + self.reasoning
+    }
+}
+
+/// Which harness and model are behind a log line, for the card that opens one. (M80)
+///
+/// # Why the card asks at all
+///
+/// A run's pane draws `● bash  cargo test  1.2s #7` and nothing about *who ran it*. On one
+/// machine a role may be an `opencode` pool that failed over twice, a `codex` the project's
+/// overrides redirected it to, or the `claude` its file names — and the three are read back
+/// from the same pane, in the same colours, days later. The two facts that answer "why did it
+/// do that" are the harness and the model, and until M80 neither was anywhere on screen once
+/// the run had left the Agents panel's live rows.
+///
+/// `None` on a [`crate::LogLineDetail`] is the ordinary answer, not a failure: a shell pane's
+/// structured log lines are the feature this card was built for and they belong to no run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LogRunInfo {
+    /// The harness the standing child was **forked with**, which is not always the one the
+    /// role's file names — an override redirects it, and M78's whole lesson was that the two
+    /// answers drift silently. `AgentRegistry` reads it off the run, never off the definition.
+    pub harness: Harness,
+    /// The model that child was given, spelled as the harness was told it: a pool candidate's
+    /// `provider/model`, the override's or the role's single model, or opencode's own resolved
+    /// default.
+    ///
+    /// `None` where cide named none and the CLI chose for itself — a `claude` run with no
+    /// `model:` in its definition, which is the common case. Drawn as a sentence saying so,
+    /// never as a blank: a blank beside a label reads as a broken dialog (`TaskDetailPending`'s
+    /// rule).
+    pub model: Option<String>,
+    /// How far down its pool this run has fallen, as `2 of 3`, or `None` for a run with no
+    /// pool. The model above is *this* candidate, so without the position a failover is
+    /// invisible — the card would simply name a model nobody chose.
+    pub pool_position: Option<String>,
+    /// The last step's tokens, or `None` until the run has finished one.
+    pub usage: Option<TokenUsage>,
+    /// The model's context window in tokens, where **this machine's configuration** states one.
+    ///
+    /// Only ever a number a user typed: `LlmModel::context`, looked up in the provider document
+    /// the child was forked with, by the pool candidate's provider **and** model id as two
+    /// separate keys. A catalogued model's window is the provider's business and cide holds no
+    /// table of them, and splitting a `provider/model` string to go looking would be inventing
+    /// the parser [`crate::PoolEntry`]'s header refuses to own. So this is usually `None`, and
+    /// the card then prints the token count with no percentage rather than a percentage of a
+    /// guess.
+    pub context_limit: Option<u32>,
 }
 
 #[cfg(test)]

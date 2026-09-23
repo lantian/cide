@@ -1153,7 +1153,12 @@ pub fn tab_new_claude(
         workspace::open_tab(
             ws,
             project,
-            TabKind::ClaudeFull { title },
+            TabKind::ClaudeFull {
+                title,
+                // A tab the *user* asked for. `ephemeral` is cide's mark for a tab cide opened
+                // by itself, and closing one of those ends its child — see the field's doc.
+                ephemeral: false,
+            },
             Pane {
                 id: PaneId::new(),
                 kind: PaneKind::Claude,
@@ -1217,11 +1222,33 @@ pub fn tab_close(
     // than a second `update`, so the record describes the tab as it stood one instant before it
     // went — the tree included, with its pane ids and session bindings.
     let record = state.with(|ws| closing_record(ws, project, tab));
+    // Read in the same borrow, before the close, for the same reason. One of the two is always
+    // empty: a tab is either remembered or ended, never both.
+    let ending = state.with(|ws| ephemeral_sessions(ws, project, tab));
 
     let out = state.update(|ws| {
         workspace::close_tab(ws, project, tab, force)?;
         Ok(Mutated { rev: ws.rev })
     })?;
+
+    // **After** the close has actually happened, on `record`'s rule exactly: `close_tab` refuses
+    // a pinned console and an unsaved buffer, and a child killed before that refusal would be a
+    // `claude` ended for a tab that is still on screen.
+    //
+    // `kill` and not the graceful ladder: this is a pane close, which is what `closePane` already
+    // does to a session a pane owns, and the ladder is for shutdown, where a `claude` is given
+    // time to finish writing the transcript a resume depends on. Nothing resumes an ephemeral
+    // tab — `closing_record` answered `None` for it — so there is no transcript to protect.
+    if !ending.is_empty()
+        && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
+    {
+        for session in ending {
+            if let Some(pty) = registry.get(session) {
+                tracing::info!(%project, %tab, %session, "ending a tab cide opened by itself");
+                pty.kill();
+            }
+        }
+    }
 
     // Pushed only once the close has actually happened. `close_tab` refuses a pinned console and
     // an unsaved buffer, and a record pushed before the refusal would let Ctrl+Shift+T open a
@@ -1352,6 +1379,13 @@ fn reorder_target(
 /// `None` for a tab or project that is not there, which the caller reads as "nothing to
 /// remember" rather than as an error: `close_tab` is about to fail on the same lookup and its
 /// refusal is the one the user should see.
+///
+/// `None` also for an **ephemeral** tab (M79), and that is a second rule wearing the same return
+/// value. A tab cide opened by itself has a `claude` that `tab_close` is about to kill, so a
+/// record of it would let Ctrl+Shift+T put back a tab naming a session the registry has
+/// forgotten — the hole `closed_tabs.rs`' header is about, arriving by a new door. The two
+/// halves are deliberately decided in one place, here and at [`ephemeral_sessions`], so a tab
+/// cannot be killed and remembered or remembered and spared.
 fn closing_record(
     ws: &cide_ipc::Workspace,
     project: ProjectId,
@@ -1360,6 +1394,15 @@ fn closing_record(
     let p = workspace::project(ws, project).ok()?;
     let index = p.tabs.iter().position(|t| t.id == tab)?;
     let t = &p.tabs[index];
+    if matches!(
+        t.kind,
+        TabKind::ClaudeFull {
+            ephemeral: true,
+            ..
+        }
+    ) {
+        return None;
+    }
     let kind = match &t.kind {
         TabKind::File { path, .. } => TabKind::File {
             path: path.clone(),
@@ -1373,6 +1416,48 @@ fn closing_record(
         index,
         tree: t.tree.clone(),
     })
+}
+
+/// The sessions an **ephemeral** tab's close must end. (M79)
+///
+/// Empty for every tab a person opened, which is the ordinary case and the one that must not
+/// change: closing such a tab parks its hosts on purpose, and Ctrl+Shift+T re-adopts the same
+/// conversation.
+///
+/// `TabKind::ClaudeFull::ephemeral` marks the tabs cide opened by itself — one per finished
+/// subagent turn, one per quiet period — and for those, parking is a `claude` leaked per run,
+/// alive and billed-for until the app quits, in a tab the user closed precisely to say they
+/// were done with it. So those children are ended.
+///
+/// Read from the tree **before** the close, like [`closing_record`] beside it and for the same
+/// reason: afterwards there is nothing left to read.
+fn ephemeral_sessions(
+    ws: &cide_ipc::Workspace,
+    project: ProjectId,
+    tab: TabId,
+) -> Vec<cide_ipc::SessionId> {
+    let Ok(p) = workspace::project(ws, project) else {
+        return Vec::new();
+    };
+    let Some(t) = p.tabs.iter().find(|t| t.id == tab) else {
+        return Vec::new();
+    };
+    if !matches!(
+        t.kind,
+        TabKind::ClaudeFull {
+            ephemeral: true,
+            ..
+        }
+    ) {
+        return Vec::new();
+    }
+    // The tab's own panes only. A pane detached into its own window has left this tree, and a
+    // window the user pulled out and kept is not something a tab close should reach into.
+    t.tree
+        .panes
+        .values()
+        .filter_map(|pane| pane.session)
+        .collect()
 }
 
 /// Put back the last tab this project closed. Ctrl+Shift+T.
@@ -1555,6 +1640,82 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
 mod tests {
     use super::*;
     use cide_ipc::{DiffOrigin, DiffSpec, RepoId, SettingsSection, Workspace, git::DiffSide};
+
+    /// **A tab cide opened by itself is ended and not remembered; a tab a person opened is
+    /// remembered and not ended.** (M79)
+    ///
+    /// Both halves in one test because they are one decision wearing two return values, and the
+    /// two ways of splitting them are both bugs: a tab killed *and* recorded lets Ctrl+Shift+T
+    /// reopen a tab naming a session the registry has forgotten — the hole `closed_tabs.rs`'
+    /// header is about — while a tab recorded *and* spared is the `claude` leaked per finished
+    /// run that `TabKind::ClaudeFull::ephemeral` exists to stop.
+    #[test]
+    fn an_ephemeral_tab_is_ended_and_an_ordinary_one_is_remembered() {
+        let mut ws = Workspace::default();
+        let project =
+            workspace::open_project(&mut ws, vec![PathBuf::from("/p")], None).expect("open");
+
+        let claude_pane = |session: SessionId| Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Claude,
+            role: PaneRole::Auxiliary,
+            session: Some(session),
+            conversation: None,
+            conversation_since: None,
+            continues: None,
+            title: "p : claude".into(),
+            docker: None,
+        };
+
+        let mine = SessionId::new();
+        let review = workspace::open_tab(
+            &mut ws,
+            project,
+            TabKind::ClaudeFull {
+                title: "Review: developer · t-1".into(),
+                ephemeral: true,
+            },
+            claude_pane(mine),
+        )
+        .expect("the review tab");
+
+        let theirs = SessionId::new();
+        let opened_by_hand = workspace::open_tab(
+            &mut ws,
+            project,
+            TabKind::ClaudeFull {
+                title: "scratch".into(),
+                ephemeral: false,
+            },
+            claude_pane(theirs),
+        )
+        .expect("the user's tab");
+
+        assert_eq!(
+            ephemeral_sessions(&ws, project, review),
+            vec![mine],
+            "the review tab's claude would have been left running"
+        );
+        assert!(
+            closing_record(&ws, project, review).is_none(),
+            "Ctrl+Shift+T would reopen a tab whose session is about to be killed"
+        );
+
+        assert!(
+            ephemeral_sessions(&ws, project, opened_by_hand).is_empty(),
+            "closing a tab the user opened killed their conversation"
+        );
+        assert!(
+            closing_record(&ws, project, opened_by_hand).is_some(),
+            "a tab the user opened stopped being reopenable"
+        );
+
+        // And nothing else in the tree is ephemeral, the console above all — it is pinned and
+        // `close_tab` refuses it, but a rule that read the *kind* rather than the mark would
+        // still have listed its session.
+        let console = workspace::console_tab(&ws, project).expect("console");
+        assert!(ephemeral_sessions(&ws, project, console).is_empty());
+    }
 
     /// A closed project's session list is the ladder's input, so a session shown twice — a
     /// mirror, or a torn-out pane beside the docked one it came from — must be listed once,
@@ -2158,6 +2319,7 @@ mod tests {
         // conversations, so matching them would silently drop one of the two records.
         let one = TabKind::ClaudeFull {
             title: "one".into(),
+            ephemeral: false,
         };
         assert!(!same_tab(&one, &one.clone()));
 

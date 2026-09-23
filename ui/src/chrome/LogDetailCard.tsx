@@ -32,7 +32,20 @@ import { OverlayCard } from '@/overlays/ModalShell'
 import { copyText } from '@/sidebar/copyText'
 import { notify } from './notices'
 import { useLogDetail } from './logDetailStore'
-import { stamp, viewOf, type ToolView } from './logDetailModel'
+import {
+  contextLine,
+  spendLine,
+  stamp,
+  viewOf,
+  type TokenSpend,
+  type ToolView,
+} from './logDetailModel'
+// One pure function, out of an import-free module — `check:settings-agents` keeps
+// `agentsDraft.ts` free of imports, so this costs the card nothing but the words themselves.
+// The harness is spelled here exactly as the Settings screen spells it, because a person who
+// set a role to Codex there must find the same word on the card that explains its run.
+import { harnessLabel } from '@/settings/agentsDraft'
+import type { LogRunInfo } from '@/ipc/client'
 import styles from './LogDetailCard.module.css'
 
 interface Token {
@@ -187,8 +200,79 @@ export function LogDetailCard() {
             </pre>
           )}
         </div>
+        {pending.detail?.run != null && <RunFooter run={pending.detail.run} />}
       </div>
     </OverlayCard>
+  )
+}
+
+/**
+ * Who ran this line, on what, and how much of the model's context the conversation is taking.
+ * (M80)
+ *
+ * The three facts a run's pane does not carry. A row reads `● bash  cargo test  1.2s #7`
+ * whatever forked it, and on one machine a role may be an opencode pool that has failed over
+ * twice, a codex the project's overrides redirected it to, or the claude its file names — read
+ * back days later, in the same colours. `LogRunInfo` is filled from the registry by the same
+ * command that fetched the line, so this costs no second round trip and is absent, whole,
+ * for every shell pane's log line.
+ *
+ * Every value renders a **sentence** where it is missing rather than a blank — `TaskDetailPending`'s
+ * rule, and the reason is the same: a blank beside a label reads as a dialog that half failed,
+ * while "the CLI's own default" is a fact somebody can act on.
+ */
+function RunFooter({ run }: { run: LogRunInfo }) {
+  // `u64` on the wire is a `bigint` here, exactly as `recordedUnixMs` above is — the conversion
+  // is the card's, so `logDetailModel` stays import-free and drivable by `check:json-log`.
+  const spend: TokenSpend | null =
+    run.usage === null
+      ? null
+      : {
+          input: Number(run.usage.input),
+          output: Number(run.usage.output),
+          reasoning: Number(run.usage.reasoning),
+          cacheRead: Number(run.usage.cacheRead),
+          cacheWrite: Number(run.usage.cacheWrite),
+        }
+  return (
+    <footer className={styles.foot} data-audit="logRunFooter">
+      <div className={styles.footRow}>
+        <span className={styles.footLabel}>Run by</span>
+        <span className={styles.footValue} title={run.model ?? undefined}>
+          {harnessLabel(run.harness)}
+          {run.model !== null && (
+            <>
+              {' · '}
+              <span className={styles.footModel}>{run.model}</span>
+            </>
+          )}
+          {run.model === null && <span className={styles.footAside}> · the CLI's own default</span>}
+          {/* Only with a pool, and then always: without it the card would name the candidate a
+              failover moved to and say nothing about the ones that refused before it. */}
+          {run.poolPosition !== null && (
+            <span className={styles.footAside}> · pool {run.poolPosition}</span>
+          )}
+        </span>
+      </div>
+      <div className={styles.footRow}>
+        <span className={styles.footLabel}>Context</span>
+        {spend === null ? (
+          <span className={styles.footAside}>
+            This run has not reported a spend — its harness states none, or no step has finished.
+          </span>
+        ) : (
+          <span className={`${styles.footValue} ${styles.footWrap}`}>
+            {contextLine(spend, run.contextLimit)}
+            {/* "last step" is load-bearing and not a caption: the figure is what the model read
+                and wrote on one step, not a total of the conversation — see `TokenUsage`. */}
+            <span className={styles.footAside}>
+              {' · '}
+              {spendLine(spend)} (last step)
+            </span>
+          </span>
+        )}
+      </div>
+    </footer>
   )
 }
 
