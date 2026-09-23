@@ -158,6 +158,7 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     // It cannot degenerate into the constant `repoOpen` became: the value is the length of a
     // stack that mounting, tab activation and a pointer press all move.
     "diffFocused",
+    "gitlabReviewActive",
 ];
 
 /// Every command cide can run, in palette display order.
@@ -1055,6 +1056,9 @@ fn build() -> Vec<Command> {
         // reason: it puts the user in front of the control that asks. The trailing "…" is this
         // table's mark for that.
         Command::new("git.commit", "Commit changes…", GIT).when("shellWindow && projectOpen"),
+        Command::new("gitlab.open", "Open GitLab merge request by URL…", GIT),
+        Command::new("gitlab.nextFile", "Next MR file", GIT).when("gitlabReviewActive"),
+        Command::new("gitlab.previousFile", "Previous MR file", GIT).when("gitlabReviewActive"),
         Command::new("git.push", "Push to remote…", GIT).when("projectOpen"),
         Command::new("git.refresh", "Refresh git status", GIT).when("projectOpen"),
         // Branches. The two that need a name or a choice open the branch popup

@@ -650,7 +650,7 @@ pub fn tab_open_diff(
 
 /// The pane a diff tab opens with. One shape for both gestures, so a preview tab and a kept
 /// one differ in exactly the flag and nothing a renderer could accidentally key off.
-fn diff_pane(title: String) -> Pane {
+pub(super) fn diff_pane(title: String) -> Pane {
     Pane {
         id: PaneId::new(),
         kind: PaneKind::Diff,
@@ -2381,7 +2381,7 @@ mod tests {
                     // preview slot for exactly that reason — see `PreviewSlot` — so counting one
                     // here would make the working-tree assertions below fail whenever a commit's
                     // file list happened to be open beside them.
-                    DiffOrigin::GitRevision { .. } | DiffOrigin::ClaudeMcp { .. } => None,
+                    DiffOrigin::GitRevision { .. } | DiffOrigin::ClaudeMcp { .. } | DiffOrigin::GitLab { .. } => None,
                 },
                 _ => None,
             })

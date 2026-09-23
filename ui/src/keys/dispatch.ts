@@ -1297,6 +1297,20 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       /* --------------------------------------------------------------------------- Git */
 
+      case 'gitlab.nextFile':
+      case 'gitlab.previousFile': {
+        const tab = focusTarget(boot())?.tab
+        if (tab?.kind.kind === 'diff' && tab.kind.spec.origin.kind === 'gitLab') {
+          const doc = tab.kind.spec.origin.document
+          void import('@/gitlab/store').then(m => m.navigateReviewFile(doc, command === 'gitlab.nextFile' ? 1 : -1))
+            .catch(e => notify(String(e), { kind: 'error' }))
+        }
+        return
+      }
+      case 'gitlab.open': {
+        useOverlays.getState().show('gitlabOpen')
+        return
+      }
       case 'git.push': {
         /*
          * Every repository in the project, in root order. A monorepo with submodules has

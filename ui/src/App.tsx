@@ -1,3 +1,8 @@
+import { ReviewPanel } from '@/gitlab/ReviewPanel'
+import { GitLabDialogs } from '@/gitlab/Dialogs'
+import { GitLabInbox } from '@/gitlab/Inbox'
+import { startGitLab, useGitLab } from '@/gitlab/store'
+import { PushMRPrompt } from '@/gitlab/PushMRPrompt'
 /**
  * The shell.
  *
@@ -346,6 +351,19 @@ export function App() {
   // Closed from the first render in a torn-out tab window, which draws no rail: the
   // initialiser runs once, and `SIDEBAR_INITIAL` there would mount a Files panel with no
   // button anywhere that could ever dismiss it.
+  const gitLab = useGitLab()
+  function hideToolWindow() {
+    void toolWindowApi.setLayout(activeProject?.id ?? null, {open:false}).catch(() => {})
+  }
+  useEffect(() => {
+    startGitLab()
+    const show = () => setSidebar(st => showPanel(st, 'gitlab'))
+    const review = (event: Event) => setSidebar(st => showPanel(st, `mr:${(event as CustomEvent<string>).detail}`))
+    window.addEventListener('cide:gitlab-inbox', show)
+    window.addEventListener('cide:gitlab-review', review)
+    return () => { window.removeEventListener('cide:gitlab-inbox', show); window.removeEventListener('cide:gitlab-review', review) }
+  }, [])
+
   const [sidebar, setSidebar] = useState<SidebarState>(
     tabWindow ? { view: null, last: SIDEBAR_INITIAL.last } : SIDEBAR_INITIAL,
   )
@@ -1042,9 +1060,18 @@ export function App() {
     [extPanels, railHidden],
   )
   const railExtras = useMemo(
-    () => sidebarPanels.filter((p) => !p.hidden).map((p) => p.item),
-    [sidebarPanels],
+    () => [...gitLab.board.reviews.map(r => ({ id: `mr:${r.id}` as ActivityView,
+      path: 'M12 22 2 14l2-11 4 8h8l4-8 2 11-10 8ZM2 14h20M8 11l4 11 4-11', label: `!${r.iid} ${r.title}` })),
+      ...sidebarPanels.filter((p) => !p.hidden).map((p) => p.item)],
+    [sidebarPanels, gitLab.board.reviews],
   )
+  useEffect(() => {
+    setSidebar(old => {
+      const alive = (view: string) => !view.startsWith('mr:') || gitLab.board.reviews.some(r => `mr:${r.id}` === view)
+      if (old.view && !alive(old.view)) return { view: 'gitlab', last: 'gitlab' }
+      return alive(old.last) ? old : { ...old, last: 'gitlab' }
+    })
+  }, [gitLab.board.reviews])
   /*
    * The ones the user took off the strip. They still reach the rail — as menu entries under
    * `···` rather than as buttons — because a rail button is the only route into a contributed
@@ -1637,7 +1664,7 @@ export function App() {
              * this state, not a fallback. `?? false` for the frame before bootstrap resolves.
              */
             toolWindowOpen={
-              (activeProject?.toolWindow ?? boot?.workspace.toolWindow)?.open ?? false
+              ((activeProject?.toolWindow ?? boot?.workspace.toolWindow)?.open ?? false)
             }
             onToggleToolWindow={() => {
               // Straight to Rust, with no local mirror: the panel's state lives on
@@ -1841,6 +1868,16 @@ export function App() {
                 <OpenSpecPanel project={activeProjectId} />
               </PanelBoundary>
             )}
+            {sidebar.view?.startsWith('mr:') && (
+              <PanelBoundary name="MR review" onClose={() => setSidebar(st => ({ ...st, view: null }))}>
+                <ReviewPanel key={sidebar.view} review={sidebar.view.slice(3)} theme={theme} />
+              </PanelBoundary>
+            )}
+            {sidebar.view === 'gitlab' && (
+              <PanelBoundary name="GitLab" onClose={() => setSidebar(st => selectView(st, 'gitlab'))}>
+                <GitLabInbox />
+              </PanelBoundary>
+            )}
             {sidebar.view === 'extensions' && (
               <PanelBoundary
                 name="Extensions"
@@ -1887,7 +1924,7 @@ export function App() {
             {isPanelOpen(sidebar) && (
               <SidebarSplitter
                 panel={
-                  sidebar.view === 'git'
+                  sidebar.view === 'git' || sidebar.view?.startsWith('mr:')
                     ? 'git'
                     : sidebar.view === 'agents' ||
                         sidebar.view === 'tasks' ||
@@ -1917,6 +1954,8 @@ export function App() {
                 runCommand={runCommand}
                 openTerminalPath={openTerminalPath}
               />
+              <PushMRPrompt />
+              <GitLabDialogs />
             </div>
             </div>
 
@@ -1960,11 +1999,7 @@ export function App() {
               && (activeProject?.toolWindow ?? boot.workspace.toolWindow).open && (
               <PanelBoundary
                 name="the git tool window"
-                onClose={() => {
-                  void toolWindowApi
-                    .setLayout(activeProject?.id ?? null, { open: false })
-                    .catch(() => {})
-                }}
+                onClose={hideToolWindow}
               >
                 <ToolWindowHost project={activeProject?.id ?? null} />
               </PanelBoundary>

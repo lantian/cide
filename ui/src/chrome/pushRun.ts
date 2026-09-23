@@ -1,3 +1,4 @@
+import { checkAfterPush } from '@/gitlab/PushMRPrompt'
 /**
  * Sending a push, once somebody has said yes. (M31)
  *
@@ -98,6 +99,7 @@ function pushPass(
       const preview = previews[i]
       if (result.status === 'fulfilled' && preview !== undefined) {
         done.push({ name: preview.repo.name, outcome: result.value })
+        checkAfterPush(project, preview.repo.id, result.value.remote, result.value.branch)
       }
     })
     if (done.length === 0) return

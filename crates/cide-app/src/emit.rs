@@ -942,3 +942,9 @@ mod tests {
         clear_remote_tee();
     }
 }
+
+/// Global GitLab connections, preferences and open MR identities; credentials never leave Rust.
+pub const GITLAB_CHANGED: &str = "cide://gitlab-changed";
+pub fn gitlab_changed(app: &AppHandle, board: &cide_ipc::gitlab::GitLabBoard) {
+    let _ = app.emit(GITLAB_CHANGED, board);
+}

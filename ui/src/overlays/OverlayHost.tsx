@@ -185,6 +185,9 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
   // cannot function once it is on screen.
   if (open === 'about') return <AboutCard onDismiss={close} />
 
+  // GitLab dialogs have their own host. Only the explicit commands state owns the palette.
+  if (open !== 'commands') return null
+
   return (
     <CommandPalette
       commands={commands}

@@ -949,7 +949,7 @@ pub fn slot_of(origin: &DiffOrigin) -> Option<PreviewSlot> {
     match origin {
         DiffOrigin::Git { .. } => Some(PreviewSlot::Working),
         DiffOrigin::GitRevision { .. } => Some(PreviewSlot::Revision),
-        DiffOrigin::ClaudeMcp { .. } => None,
+        DiffOrigin::ClaudeMcp { .. } | DiffOrigin::GitLab { .. } => None,
     }
 }
 
