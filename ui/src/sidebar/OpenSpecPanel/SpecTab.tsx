@@ -42,6 +42,7 @@ import { EMPTY_DRAFT } from '../TasksPanel/model'
 import { adaptChange } from './adapt'
 import { RequirementEditor } from './RequirementEditor'
 import styles from './SpecTab.module.css'
+import { isWebUrl, openWebLink } from '@/chrome/webLinks'
 import {
   CHANGE_ICON,
   DESIGN_LABEL,
@@ -1184,10 +1185,10 @@ function ChangeTab({
    * A link inside the proposal.
    *
    * `MarkdownFrame` has the same three arms for the same three reasons, and the external one is
-   * the one worth restating: cide does not navigate to a URL from a webview. The JS opener command
-   * is capability-gated per window and a detached-pane window deliberately has none, so a JS-side
-   * open would work in the shell window and silently do nothing in a detached one — see
-   * `terminal/xterm.ts` for the argument in full. `links.ts` refuses to resolve a scheme at all,
+   * the one worth restating: cide never navigates *this webview* to a URL. An http(s) link goes
+   * to the user's browser through Rust (`chrome/webLinks.ts`), because the JS opener command is
+   * capability-gated per window and a detached-pane window deliberately has none, so a JS-side
+   * open would work in the shell window and silently do nothing in a detached one. `links.ts` refuses to resolve a scheme at all,
    * which is what makes `javascript:` and `data:` unreachable rather than merely unlisted.
    */
   const onNavigate = useCallback(
@@ -1213,7 +1214,8 @@ function ChangeTab({
         void file.open(project, resolved).catch(notifyFailure)
         return
       }
-      notify(`cide does not open external links: ${href}`, { kind: 'warn' })
+      if (isWebUrl(href)) openWebLink(href)
+      else notify(`cide opens only http and https links, not ${href}`, { kind: 'warn' })
     },
     [project, proposalPath],
   )
@@ -1308,7 +1310,8 @@ function CapabilityPage({ project, spec }: { project: ProjectId; spec: string })
         return
       }
       if (kind === 'external') {
-        notify(`cide does not open external links: ${href}`, { kind: 'warn' })
+        if (isWebUrl(href)) openWebLink(href)
+        else notify(`cide opens only http and https links, not ${href}`, { kind: 'warn' })
       }
     },
     [project, path],

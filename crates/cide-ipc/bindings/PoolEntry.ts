@@ -39,4 +39,23 @@ model: string,
  * `effort: xhigh` carried onto the candidate a rate limit fell over to would be refused
  * outright by the CLI — turning a recoverable failure into a hard one at the worst moment.
  */
-variant: string, };
+variant: string, 
+/**
+ * How many runs may be on this entry at once, across every project. `None` is no limit.
+ *
+ * # A pool is a preference *and* a set of slots
+ *
+ * Without this a pool only moved a run down when a provider refused it — so a subscription
+ * that allows four sessions took a fifth, which the provider then rate-limited, which failed
+ * over, which is a round trip and a burnt turn to learn what the user already knew. With it,
+ * admission (`cide_app::agents::admit_a_pass`) puts a run on the first entry that has room,
+ * and a pool whose every entry is full keeps the run *queued* rather than overcommitting one.
+ *
+ * **Counted across projects**, because pools are global settings and the thing the number
+ * describes — a provider account's concurrency — does not know which project asked.
+ *
+ * `0` is not a value: [`LlmSettings::cleaned`] turns it into `None`, since an entry nobody
+ * may run on is an entry to delete, and a stored `0` would be a pool that queues for ever
+ * with no sentence saying why.
+ */
+maxRunning?: number, };

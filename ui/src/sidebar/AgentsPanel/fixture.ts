@@ -154,6 +154,8 @@ function run(over: Partial<RunView> & Pick<RunView, 'run' | 'agent' | 'agentLabe
     // What Rust computes from the session and the conversation: a row with a session is
     // openable, which keeps every story's Open control where it was.
     openable: (over.session ?? null) !== null,
+    model: null,
+    poolPosition: null,
     ...over,
   }
 }
@@ -165,6 +167,28 @@ const RUNNING = run({
   session: 's-0001',
   phase: 'running',
   task: 't-14',
+  // A single model and no pool: the ordinary claude role. (M89)
+  model: 'opus',
+})
+
+/*
+ * A live run a **pool** chose, one failover down. (M89)
+ *
+ * The row this milestone was for: before it, "which model is this on" was answered only by the
+ * log card, and a failover from the pool's first entry to its second changed nothing on screen.
+ * The line under the task must name the harness, the `provider/model` the child was told, and
+ * the pool with its position — all three, because each alone answers a different question.
+ */
+const POOLED = run({
+  run: 'r-0013',
+  agent: 'developer',
+  agentLabel: 'Developer',
+  harness: 'opencode',
+  session: 's-0013',
+  phase: 'running',
+  task: 't-14',
+  model: 'zai/glm-4.6',
+  poolPosition: 'fast entry 2 of 3',
 })
 
 /*
@@ -298,6 +322,7 @@ const FINISHED = run({
   // by another hour every hour the panel stayed open.
   workedMs: 372_000,
   exitCode: 0,
+  model: 'sonnet',
 })
 
 const FAILED = run({
@@ -308,6 +333,8 @@ const FAILED = run({
   phase: 'failed',
   startedMs: NOW_MS - 9_000_000,
   failure: 'opencode exited before its first turn.',
+  model: 'zai/glm-4.6',
+  poolPosition: 'fast entry 1 of 3',
 })
 
 /*
@@ -383,7 +410,7 @@ function queueShut(
  * own arm — and they can only be seen doing their work when the alternative was available.
  */
 const HANDLERS = {
-  onDispatch: () => {},
+  onTab: () => {},
   onOpen: () => {},
   onPause: () => {},
   onResume: () => {},
@@ -395,8 +422,9 @@ const HANDLERS = {
   onRevealConfig: () => {},
   /*
    * Integrate, and its arming half. Handed to every story for the reason the rest of this map
-   * is: the assertion that matters is that an *unarmed* role shows Integrate and not Merge, and
-   * a story given no handler could not have shown either, so it would pass for the wrong reason.
+   * is: the assertion that matters is that only a *finished run with a task* shows Integrate,
+   * and a story given no handler could not have shown it anywhere, so the negative half would
+   * pass for the wrong reason.
    */
   onIntegrateArm: () => {},
   onIntegrate: () => {},
@@ -447,6 +475,9 @@ export type AgentsStoryName =
   | 'project-paused-no-live-run'
   | 'integrate-unarmed'
   | 'integrate-armed'
+  | 'role-pooled'
+  | 'history'
+  | 'history-empty'
 
 export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
   'no-project': story({ project: null, roster: ready([RUNNING]) }),
@@ -620,15 +651,33 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
   'rogue-phase': story({ roster: ready([ADRIFT, ROGUE]) }),
 
   /*
-   * Integrate, unarmed — every role offers it, whatever its runs are doing. A role's branch
-   * outlives its runs, so this is not a run action and is not gated on one; `upToDate` is the
-   * honest answer when the branch holds nothing, and the panel cannot know that without asking.
+   * Integrate, unarmed — offered on the one run that has a branch to merge: `FINISHED` is over
+   * and names t-15, so it is `cide/qa-t-15`. `FAILED` has no task (it stood in the project
+   * root and minted no branch) and `RUNNING` is still writing, so neither may carry it. (M89: it
+   * was on every role row, merging a base branch per-task worktrees had emptied.)
    */
-  'integrate-unarmed': story({ roster: ready([]) }),
+  'integrate-unarmed': story({ roster: ready([RUNNING, FINISHED, FAILED]), tab: 'history' }),
 
   /*
    * Integrate, armed — the confirm-on-second-click state, which changes the user's *own* branch
-   * and so is the one gesture in this panel that earns a second press.
+   * and so is the one gesture in this panel that earns a second press. Armed by **run** id.
    */
-  'integrate-armed': story({ roster: ready([]), integrateArmed: 'developer' }),
+  'integrate-armed': story({
+    roster: ready([FINISHED, FAILED]),
+    tab: 'history',
+    integrateArmed: 'r-0005',
+  }),
+
+  /* A live pooled run beside the ordinary one — see `POOLED`. */
+  'role-pooled': story({ roster: ready([POOLED, QA_RUNNING]) }),
+
+  /*
+   * The History tab chosen. The Agents tab's rows are still in the markup, `hidden` — see
+   * `AgentsPanel.tsx`'s header for why both are always mounted — and the check reads which
+   * panel carries the attribute rather than which is present.
+   */
+  history: story({ roster: ready([RUNNING, FINISHED, FAILED]), tab: 'history' }),
+
+  /* History chosen with nothing ended yet: a sentence, not a blank panel. */
+  'history-empty': story({ roster: ready([RUNNING]), tab: 'history' }),
 }

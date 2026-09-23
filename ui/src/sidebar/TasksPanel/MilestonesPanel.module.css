@@ -1,0 +1,538 @@
+/* The Tasks panel's Milestones tab and its two modals (M83). Tokens only; type from the ladder. */
+
+.tabs {
+  display: inline-flex;
+  gap: var(--sp-1);
+}
+
+.tab {
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--r-3);
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tabOn {
+  border-color: var(--border);
+  color: var(--text-hi);
+}
+
+.tab:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.quiet {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+.note {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+  border-left: 2px solid var(--green);
+  padding-left: var(--sp-2);
+}
+
+.error {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-ui-12);
+  color: var(--red);
+}
+
+.list {
+  list-style: none;
+  margin: 0 0 var(--sp-3);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.row:hover {
+  background: var(--chrome-hi);
+}
+
+.row:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.row[data-state='active'] {
+  border-color: var(--yellow);
+}
+
+.row[data-state='accepted'] {
+  opacity: 0.75;
+}
+
+.rowHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.badge {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.row[data-state='active'] .badge {
+  color: var(--yellow);
+}
+
+.row[data-state='accepted'] .badge {
+  color: var(--green);
+}
+
+.rowId,
+.rowTask {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.rowTask {
+  margin-left: auto;
+}
+
+.rowTitle {
+  font-size: var(--fs-ui-12);
+  color: var(--text-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rowGate {
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.rowGate[data-verdict='passed'] {
+  color: var(--green);
+}
+
+.rowGate[data-verdict='failed'] {
+  color: var(--red);
+}
+
+.section {
+  margin: var(--sp-4) 0 var(--sp-2);
+  font-size: var(--fs-ui-11);
+  font-weight: 500;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+.kv {
+  display: flex;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: var(--fs-ui-12);
+}
+
+.k {
+  flex: none;
+  width: 6.5em;
+  color: var(--dim);
+}
+
+.v {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+}
+
+/* --- the modals --- */
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-5);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.modalTitle {
+  margin: 0;
+  font-size: var(--fs-ui-14);
+  font-weight: 500;
+  color: var(--text-hi);
+}
+
+.modalActions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.result {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--red);
+  border-radius: var(--r-2);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.result:hover {
+  background: var(--chrome-hi);
+}
+
+.result[data-verdict='running'] {
+  border-left-color: var(--yellow);
+}
+
+.result[data-verdict='passed'] {
+  border-left-color: var(--green);
+}
+
+.resultHead {
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+}
+
+.tail {
+  margin: var(--sp-1) 0 0;
+  max-height: 16em;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* --- a milestone's tasks --- */
+
+.rowCount {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.taskList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.taskLink {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  cursor: pointer;
+}
+
+.tasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 18em;
+  overflow-y: auto;
+}
+
+.taskRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 2px var(--sp-1);
+  border: none;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  text-align: left;
+  cursor: pointer;
+}
+
+.taskRow:hover {
+  background: var(--chrome-hi);
+}
+
+.taskRow:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.taskRow[data-status='done'] {
+  color: var(--faint);
+}
+
+.taskStatus {
+  flex: none;
+  width: 4.5em;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.taskRow[data-status='doing'] .taskStatus {
+  color: var(--yellow);
+}
+
+.taskRow[data-status='review'] .taskStatus {
+  color: var(--accent);
+}
+
+.taskId {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.taskTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.taskAgent {
+  flex: none;
+  margin-left: auto;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/* --- what is being checked now --- */
+
+.busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: var(--sp-2);
+  padding: 0 var(--sp-1);
+  border: none;
+  background: transparent;
+  color: var(--yellow);
+  font-family: inherit;
+  font-size: var(--fs-ui-11);
+  font-weight: 400;
+  cursor: pointer;
+}
+
+.spin {
+  display: inline-flex;
+  animation: milestones-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+.rowGate[data-verdict='running'] {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--yellow);
+}
+
+@keyframes milestones-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* --- a check's whole log --- */
+
+/* The job-log viewer's container: its lines are `white-space: pre` and scroll sideways. */
+.log {
+  height: 58vh;
+  overflow: auto;
+  padding: var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  font-size: var(--fs-ui-11);
+  color: var(--text);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.logWrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 0;
+}
+
+.logSearch {
+  align-self: flex-start;
+  width: 18em;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+}
+
+/* --- the wide card and its tabs (the GitLab MR modal's shape) --- */
+
+.wide {
+  width: min(960px, calc(100vw - 64px));
+}
+
+:global([data-audit='overlayCard']):has(.wide) {
+  width: auto;
+  max-width: calc(100vw - 32px);
+}
+
+.modalTabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.modalTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  color: inherit;
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.modalTab:hover {
+  background: var(--chrome-hi);
+}
+
+.modalTab[aria-pressed='true'] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.modalTab:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.taskTab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  max-height: 58vh;
+  overflow-y: auto;
+}
+
+/* --- proposals --- */
+
+.proposalRow[data-kind] {
+  border-color: var(--accent);
+}
+
+.rationale {
+  font-size: var(--fs-ui-12);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.diffBlock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.diff {
+  margin: 0;
+  max-height: 40vh;
+  overflow: auto;
+  padding: var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  white-space: pre;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.diffAdd {
+  color: var(--green);
+}
+
+.diffDel {
+  color: var(--red);
+}
+
+.diffHunk {
+  color: var(--accent);
+}
+
+.tabCount {
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: var(--r-3);
+  background: var(--accent);
+  color: var(--panel);
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
+}

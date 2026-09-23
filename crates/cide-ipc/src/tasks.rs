@@ -76,11 +76,31 @@ use crate::ids::{AgentId, ChangeName, CommentId, ProjectId, SessionId, TaskAttac
 /// existed, in more detail than a tombstone row could. A `Cancelled` group would also compete
 /// with `Done` for the bottom of the panel, where neither is being read.
 ///
+/// # The one that was added: `Inbox` (M83)
+///
+/// `Inbox` is not `Blocked` under another name. It is not a reason attached to work; it is the
+/// statement that something is **not work yet**. Before it existed, "anything noticed in passing
+/// goes on the board" meant every defect a run tripped over became a `Todo` — a task autodispatch
+/// would start, the spinner counted as open work, and the next planning turn read as part of the
+/// plan. Measured on a real board (`~/work/selfcraft`, four months, 232 tasks): of 98 open tasks,
+/// 36 were the plan and the rest were things somebody noticed. The board grew faster than it
+/// closed, and the orchestrator read the growth as progress.
+///
+/// So a thing noticed goes to the inbox, and nothing about the inbox is automatic: autodispatch
+/// does not start it (`autodispatch` starts `Todo | Doing` only), the spinner does not count it as
+/// open work, and a role assigned to it is not woken. It becomes work by being moved to `Todo` —
+/// by the orchestrator when a milestone needs it, or by the user. It never expires: a project left
+/// alone for a month has the same inbox when it is opened again, because time passing says nothing
+/// about whether an observation was right.
+///
+/// It is placed **first** so that the derived `Ord` keeps reading as the life of a task.
+///
 /// `Copy` and `Hash` because the panel groups by this and the group order is a lookup table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum TaskStatus {
+    Inbox,
     Todo,
     Doing,
     Review,
@@ -949,7 +969,16 @@ impl TaskFile {
     ///
     /// **2 since M68**: the index plus one `.cide/tasks/<id>/task.json` per task. 1 was the whole
     /// tracker in this one file; `cide_tasks::read` migrates it, and nothing writes a 1 again.
-    pub const CURRENT_SCHEMA: u32 = 2;
+    ///
+    /// **3 since M83**, and 3 is only ever *written* when it has to be: see
+    /// [`Self::schema_on_disk`]. Schema 3 is schema 2 plus [`TaskStatus::Inbox`] — the one change a
+    /// build that predates it cannot parse. Such a build reads a row with `"status": "inbox"` as an
+    /// unparseable file, and an unparseable tracker is set aside; a newer schema number is instead
+    /// a clean *refusal* that touches nothing. The number exists to turn the first into the second.
+    pub const CURRENT_SCHEMA: u32 = 3;
+
+    /// The schema a tracker is written as when nothing in it needs [`Self::CURRENT_SCHEMA`].
+    pub const SCHEMA_WITHOUT_INBOX: u32 = 2;
 
     /// The first schema this build can still *read*.
     ///
@@ -958,6 +987,22 @@ impl TaskFile {
     /// A tracker is a file in somebody's repository and a build that refused last year's is the
     /// tracker locking a team out of its own history.
     pub const OLDEST_READABLE_SCHEMA: u32 = 1;
+
+    /// The schema number this file must carry on disk. (M83)
+    ///
+    /// 3 while any row is in the inbox, 2 otherwise — so a teammate, or the installed build beside
+    /// a development one, goes on reading every tracker that has not used the inbox, and refuses
+    /// cleanly (rather than setting the file aside as corrupt) the one that has. A tracker whose
+    /// inbox empties again is written back as 2. The schema number is a claim about what the file
+    /// *contains*, and bumping every tracker on first open would lock older builds out of files
+    /// that differ from what they wrote in nothing but that number.
+    pub fn schema_on_disk(&self) -> u32 {
+        if self.tasks.iter().any(|t| t.status == TaskStatus::Inbox) {
+            Self::CURRENT_SCHEMA
+        } else {
+            Self::SCHEMA_WITHOUT_INBOX
+        }
+    }
 }
 
 impl Default for TaskFile {

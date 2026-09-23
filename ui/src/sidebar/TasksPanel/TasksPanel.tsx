@@ -75,6 +75,7 @@ import {
 } from './model'
 import { agentColor, glyphSpins, phaseGlyph, type RunPhase } from '@/sidebar/AgentsPanel/model'
 import { DeleteControl, TONE_CLASS, chipClass, cx } from './TaskDetail'
+import type { ReactNode } from 'react'
 import type { ProjectId } from '@/ipc/client'
 import { Icon, asIcon } from '@/icons/Icon'
 
@@ -122,6 +123,13 @@ export interface TasksPanelViewProps {
   onSelectTask?: ((task: string | null) => void) | undefined
   /** Create a task — and, on an `absent` board, the tracker file with it. */
   onCreateTask?: (() => void) | undefined
+  /**
+   * Open the planning tab the quiet-project timer opens, now. (M88) `undefined` withholds the
+   * button, which the host does unless the project has roles to put work on.
+   */
+  onPlanTasks?: (() => void) | undefined
+  /** A **Plan tasks** press is in flight: the button is dimmed so a second one opens no second tab. */
+  planning?: boolean | undefined
   /** Show `.cide/tasks.json` in the file manager. The only write-free action on a broken file. */
   onReveal?: (() => void) | undefined
   /** Read the file again. The other one. */
@@ -173,9 +181,21 @@ export interface TasksPanelViewProps {
   onDeleteArm?: ((task: string) => void) | undefined
   /** Second click: remove the task from `.cide/tasks.json`. Reachable only from an armed control. */
   onDelete?: ((task: string) => void) | undefined
+  /**
+   * What the header says where it says *Tasks*. (M83) The host puts the Tasks / Milestones tabs
+   * here; absent is the word, so every story that predates the tabs draws what it always drew.
+   */
+  title?: ReactNode | undefined
+  /**
+   * Task id → its verify state (M83): cide checking a run's branch before it may be merged.
+   * Absent draws no mark, so every story that predates it draws what it always drew.
+   */
+  verifies?: Readonly<Record<string, 'running' | 'passed' | 'failed'>> | undefined
 }
 
 export function TasksPanelView({
+  title = 'Tasks',
+  verifies,
   project,
   board = BOARD_UNKNOWN,
   runs = [],
@@ -192,6 +212,8 @@ export function TasksPanelView({
   onDelete,
   onSelectTask,
   onCreateTask,
+  onPlanTasks,
+  planning = false,
   onReveal,
   onRetry,
 }: TasksPanelViewProps) {
@@ -227,6 +249,28 @@ export function TasksPanelView({
         onClick={onCreateTask}
       >
         New task
+      </button>
+    ) : null
+
+  /*
+   * **Plan tasks** (M88): the quiet-project timer's planning tab, on demand — the same prompt,
+   * the same milestone facts, opened in the project's unattended mode. Beside New task because
+   * it is the other way work reaches this board. Only on a `ready` board: the planner's first
+   * instruction is to read the board, and every other arm has none to read. Dimmed while the
+   * press is in flight, which can be minutes when a stale milestone gate runs first.
+   */
+  const planTasks =
+    writable && board.kind === 'ready' && onPlanTasks !== undefined ? (
+      <button
+        type="button"
+        className={styles.action}
+        data-audit="tasksPlan"
+        data-write="true"
+        disabled={planning}
+        title="Open a Claude tab that surveys the board and git, then creates and assigns the next tasks"
+        onClick={onPlanTasks}
+      >
+        {planning ? 'Planning…' : 'Plan tasks'}
       </button>
     ) : null
 
@@ -332,7 +376,7 @@ export function TasksPanelView({
   return (
     <aside className={styles.panel} data-audit="sidebarTasks" aria-label="Tasks">
       <div className={styles.header} data-audit="tasksHeader">
-        <span className={styles.headerTitle}>Tasks</span>
+        <span className={styles.headerTitle}>{title}</span>
         {/* Empty, not `—`, when `metaFigure` withholds it — the model argues that out. What
             matters is that it is never `0`, which would be a count nobody took. Withheld
             outright with no project open: a figure counting tasks in a project that is not on
@@ -371,6 +415,7 @@ export function TasksPanelView({
           </p>
           <div className={styles.actions} data-audit="tasksActions">
             {newTask}
+            {planTasks}
             {onReveal !== undefined && (
               <button
                 type="button"
@@ -443,7 +488,8 @@ export function TasksPanelView({
             A task is a title, a body, a status and the role it is for. Agents read and write
             them through the same file you do.
           </p>
-          <div className={styles.actions} data-audit="tasksActions">{newTask}</div>
+          <div className={styles.actions} data-audit="tasksActions">{newTask}
+            {planTasks}</div>
         </div>
       ) : empty === 'filter' || empty === 'search' ? (
         /*
@@ -461,7 +507,8 @@ export function TasksPanelView({
          * single "show everything" would also take away a narrowing the user still meant.
          */
         <div className={styles.body} data-audit="tasksBody">
-          <div className={styles.actions} data-audit="tasksActions">{newTask}</div>
+          <div className={styles.actions} data-audit="tasksActions">{newTask}
+            {planTasks}</div>
           {searchRow}
           {filterRow}
           <div className={styles.noMatch} data-audit="tasksNoMatch">
@@ -508,7 +555,8 @@ export function TasksPanelView({
         </div>
       ) : (
         <div className={styles.body} data-audit="tasksBody">
-          <div className={styles.actions} data-audit="tasksActions">{newTask}</div>
+          <div className={styles.actions} data-audit="tasksActions">{newTask}
+            {planTasks}</div>
           {searchRow}
           {filterRow}
           <div className={styles.groups} data-audit="tasksGroups">
@@ -522,6 +570,7 @@ export function TasksPanelView({
                       runs={runs}
                       roles={roles}
                       roleColors={roleColors}
+                      verify={verifies?.[task.id]}
                       onSelect={onSelectTask}
                       /* The card is a modal over this list, so the row it came from has to be
                          findable behind the scrim. */
@@ -555,7 +604,9 @@ export function TasksPanelView({
                   className={styles.group}
                   data-audit="tasksGroup"
                   key={group.status}
-                  open={group.status !== 'done'}
+                  // The inbox starts closed like Done (M83): noticed work that is read on
+                  // every glance becomes the plan, which is what the status exists to stop.
+                  open={group.status !== 'done' && group.status !== 'inbox'}
                 >
                   <summary className={styles.groupHead}>
                     {/* One mark, rotated by `[open]`, rather than two names swapped in JS: a
@@ -611,8 +662,10 @@ function TaskLine({
   armed,
   onDeleteArm,
   onDelete,
+  verify,
 }: {
   task: TaskView
+  verify?: 'running' | 'passed' | 'failed' | undefined
   runs: readonly RunRef[]
   roles: Readonly<Record<string, string>>
   roleColors: Readonly<Record<string, string>>
@@ -637,6 +690,34 @@ function TaskLine({
       </span>
       <span className={styles.taskId}>{task.id}</span>
       <span className={styles.taskTitle}>{task.title}</span>
+      {/*
+        * cide checking this task's branch (M83): turning while verify runs, then the verdict. A
+        * run's work being checked is otherwise invisible until a merge does or does not happen.
+        */}
+      {verify !== undefined && (
+        <span
+          className={cx(styles.verifyMark, styles[`verify_${verify}`])}
+          data-audit="tasksVerify"
+          data-verify={verify}
+          title={
+            verify === 'running'
+              ? 'cide is running verify on this branch'
+              : verify === 'passed'
+                ? 'verify passed on this branch'
+                : 'verify failed on this branch — open the task for the output'
+          }
+        >
+          <span className={verify === 'running' ? styles.chipSpin : undefined} aria-hidden="true">
+            <Icon
+              name={asIcon(
+                verify === 'running' ? 'loader-circle' : verify === 'passed' ? 'circle-check' : 'circle-x',
+              )}
+              size={0}
+            />
+          </span>
+          verify
+        </span>
+      )}
       {chip !== null && (
         <span
           className={chipClass(chip)}

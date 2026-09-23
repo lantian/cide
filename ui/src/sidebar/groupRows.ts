@@ -272,3 +272,32 @@ const STEMS: Readonly<Record<string, string>> = {
   [SCRATCHES]: 'folder-temp',
   [PROJECT_NOTES]: 'markdown',
 }
+
+/**
+ * `TreeRow.root` on every row that belongs to no project root — every row of a synthetic group,
+ * header, note, pin and dependency alike. Matches `cide_ipc::fs::NO_ROOT` (`u16::MAX`) exactly.
+ */
+export const NO_ROOT = 0xffff
+
+/**
+ * Whether this row is the first of the rows cide adds under the project — the one that draws the
+ * hairline separating *Project Notes*, *External Libraries* and *Scratches* from the user's files.
+ *
+ * > *"Project Notes looks like a part of project — need somehow to separate or highlight it (but
+ * > not too intrusively)"*
+ *
+ * Keyed on `root`, not on `kind`, and that is the whole design. The obvious rule — "a `pin` or
+ * `group` whose previous row is not synthetic" — fires a second time on *Scratches* whenever
+ * *External Libraries* is expanded, because the row above it is then a crate's source file, of
+ * kind `file`, exactly like a project file. Rust already tells the two apart: a project row
+ * carries its root's index and every synthetic row carries [`NO_ROOT`], and `cide_fs::groups`
+ * draws them as one contiguous block after the walk. So the boundary is the one row where the
+ * previous row has a root and this one does not, whatever is expanded on either side of it.
+ *
+ * `prevRoot === undefined` — the first row, or a previous row not fetched yet — answers `false`:
+ * a tree with no project rows above has nothing to separate from, and a line missing for one
+ * frame is better than one drawn in the wrong place.
+ */
+export function opensSyntheticSection(root: number, prevRoot: number | undefined): boolean {
+  return root === NO_ROOT && prevRoot !== undefined && prevRoot !== NO_ROOT
+}

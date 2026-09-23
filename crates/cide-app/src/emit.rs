@@ -709,6 +709,54 @@ pub fn agents_changed(
     }
 }
 
+// --- milestones (M83) --------------------------------------------------------------------
+
+/// A project's milestones changed: the plan was written, a gate started or finished, one was
+/// accepted.
+///
+/// A signal carrying only the project, and the window re-asks with `milestones_get`. The view is
+/// small, but it is *derived* from three places — the committed config, this machine's gate
+/// results and the board — and a snapshot built at emit time by a gate thread would race the
+/// panel write it is reporting. One producer, `milestones::view`, read when it is wanted.
+pub const MILESTONES_CHANGED: &str = "cide://milestones-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MilestonesChanged {
+    project: cide_ipc::ProjectId,
+}
+
+pub fn milestones_changed(app: &AppHandle, project: cide_ipc::ProjectId) {
+    // A paired device is owed it too (M91): a gate running, and its verdict, is exactly what
+    // somebody away from the desk is waiting to hear. The project only, re-read by the server's
+    // coalescer with the rest of the project's projections.
+    tee(|| cide_remote::RemoteEvent::MilestonesChanged { project });
+    if let Err(error) = app.emit(MILESTONES_CHANGED, MilestonesChanged { project }) {
+        tracing::debug!(%error, "milestones-changed reached no window");
+    }
+}
+
+/// A paired device pressed PgUp/PgDn on a session showing the normal screen. (M91)
+///
+/// The pane host holding `session` scrolls its xterm by `pages` — the desk's view and the
+/// device's move together, which is what the button promises. Every window is told, because
+/// which one holds the pane is the webview's knowledge (a detached pane is in its own window);
+/// the others hold no host for the session and do nothing.
+pub const REMOTE_SCROLL: &str = "cide://remote-scroll";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteScroll {
+    session: cide_ipc::SessionId,
+    pages: i8,
+}
+
+pub fn remote_scroll(app: &AppHandle, session: cide_ipc::SessionId, pages: i8) {
+    if let Err(error) = app.emit(REMOTE_SCROLL, RemoteScroll { session, pages }) {
+        tracing::debug!(%error, "remote-scroll reached no window");
+    }
+}
+
 // --- extensions (M22) ------------------------------------------------------------------
 
 /// The extension registry changed: a marketplace connected or refreshed, something installed,
@@ -841,6 +889,23 @@ pub fn remote_changed(app: &AppHandle) {
     }
 }
 
+/// Global GitLab connections, preferences and open MR identities; credentials never leave Rust.
+pub const GITLAB_CHANGED: &str = "cide://gitlab-changed";
+pub fn gitlab_changed(app: &AppHandle, board: &cide_ipc::gitlab::GitLabBoard) {
+    let _ = app.emit(GITLAB_CHANGED, board);
+}
+
+/// A review's local drafts moved: an agent wrote, edited or discarded one. (M85) Carries the
+/// review id only — the panel re-reads that review's drafts — because a draft list rides no
+/// board and an MR nobody has open needs nothing read at all.
+///
+/// Not folded into [`GITLAB_CHANGED`]: that one's payload is the board, and a board with an
+/// unchanged revision is one the panel is right to treat as nothing new.
+pub const GITLAB_DRAFTS_CHANGED: &str = "cide://gitlab-drafts-changed";
+pub fn gitlab_drafts_changed(app: &AppHandle, review: &str) {
+    let _ = app.emit(GITLAB_DRAFTS_CHANGED, review);
+}
+
 // --- the remote tee ---------------------------------------------------------------------
 //
 // `AppHandle::emit` reaches this process's webviews and nothing else, so a paired device cannot
@@ -941,10 +1006,4 @@ mod tests {
         assert!(rx.try_recv().is_ok());
         clear_remote_tee();
     }
-}
-
-/// Global GitLab connections, preferences and open MR identities; credentials never leave Rust.
-pub const GITLAB_CHANGED: &str = "cide://gitlab-changed";
-pub fn gitlab_changed(app: &AppHandle, board: &cide_ipc::gitlab::GitLabBoard) {
-    let _ = app.emit(GITLAB_CHANGED, board);
 }

@@ -62,8 +62,12 @@ pub mod libraries;
 pub mod lifecycle;
 pub mod logring;
 pub mod lsp;
+pub mod milestones;
+/// Reviewing a GitLab merge request with an agent, and the tools that review is served. (M85)
+pub mod mr_review;
 pub mod notes;
 pub mod positions_state;
+pub mod proposals;
 pub mod remote;
 pub mod scratches;
 // Comment stripping for this crate's structural source assertions. Test-only: a source
@@ -389,6 +393,10 @@ pub fn run() {
     // the call that registered them; Tauri's `State` hands out a reference, which a
     // `thread::spawn` cannot keep.
     builder = builder.manage(std::sync::Arc::new(agents::AgentRegistry::default()));
+    // Milestone gates and branch verification (M83): the last results survive a restart in the
+    // profile's state directory, loaded on first use rather than here.
+    builder = builder.manage(std::sync::Arc::new(milestones::Checks::default()));
+    builder = builder.manage(std::sync::Arc::new(proposals::Proposals::default()));
     // `ide` is deliberately *not* managed here. It is a `PendingIdeServers`, whose one method
     // ensures every restored project's server and registers the state together — so it has to
     // wait for `setup`, where the restored workspace exists to be offered. Registering it here
@@ -431,11 +439,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             cmd::gitlab::gitlab_request,
             cmd::gitlab::gitlab_open_document,
+            cmd::gitlab::gitlab_review_launch,
+            cmd::gitlab::gitlab_review_harnesses,
+            cmd::gitlab::gitlab_review_run,
             cmd::gitlab::gitlab_open_url,
             cmd::gitlab::gitlab_after_push,
             cmd::gitlab::gitlab_local_file,
             cmd::app::app_quit_requested,
             cmd::app::app_ready,
+            cmd::app::app_open_url,
             cmd::app::app_get_bootstrap,
             cmd::app::workspace_rev,
             cmd::app::window_set_viewport,
@@ -537,6 +549,7 @@ pub fn run() {
             cmd::lifecycle::app_restore_plan,
             cmd::pane::pane_split,
             cmd::pane::pane_add_row,
+            cmd::pane::tab_new_run,
             cmd::pane::pane_close,
             cmd::pane::pane_focus,
             cmd::pane::pane_maximize,
@@ -735,9 +748,20 @@ pub fn run() {
             cmd::agents::agents_ack_stale_turn,
             cmd::agents::agents_run_open,
             cmd::agents::agents_integrate,
+            cmd::agents::agents_plan_now,
+            cmd::agents::milestones_get,
+            cmd::agents::milestones_set,
+            cmd::agents::milestones_gate_run,
+            cmd::agents::milestones_accept,
+            cmd::agents::milestones_check_log,
+            cmd::agents::proposal_accept,
+            cmd::agents::proposal_reject,
             cmd::agents::agents_draft,
             cmd::agents::agents_models,
             cmd::agents::llm_test_model,
+            cmd::agents::llm_pool_state,
+            cmd::agents::llm_pool_reset,
+            cmd::agents::llm_probe_limits,
             cmd::agents::agent_overrides_get,
             cmd::agents::agent_overrides_set,
             cmd::agents::agents_save,

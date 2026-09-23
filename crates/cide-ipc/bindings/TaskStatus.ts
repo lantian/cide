@@ -18,6 +18,25 @@
  * existed, in more detail than a tombstone row could. A `Cancelled` group would also compete
  * with `Done` for the bottom of the panel, where neither is being read.
  *
+ * # The one that was added: `Inbox` (M83)
+ *
+ * `Inbox` is not `Blocked` under another name. It is not a reason attached to work; it is the
+ * statement that something is **not work yet**. Before it existed, "anything noticed in passing
+ * goes on the board" meant every defect a run tripped over became a `Todo` — a task autodispatch
+ * would start, the spinner counted as open work, and the next planning turn read as part of the
+ * plan. Measured on a real board (`~/work/selfcraft`, four months, 232 tasks): of 98 open tasks,
+ * 36 were the plan and the rest were things somebody noticed. The board grew faster than it
+ * closed, and the orchestrator read the growth as progress.
+ *
+ * So a thing noticed goes to the inbox, and nothing about the inbox is automatic: autodispatch
+ * does not start it (`autodispatch` starts `Todo | Doing` only), the spinner does not count it as
+ * open work, and a role assigned to it is not woken. It becomes work by being moved to `Todo` —
+ * by the orchestrator when a milestone needs it, or by the user. It never expires: a project left
+ * alone for a month has the same inbox when it is opened again, because time passing says nothing
+ * about whether an observation was right.
+ *
+ * It is placed **first** so that the derived `Ord` keeps reading as the life of a task.
+ *
  * `Copy` and `Hash` because the panel groups by this and the group order is a lookup table.
  */
-export type TaskStatus = "todo" | "doing" | "review" | "done";
+export type TaskStatus = "inbox" | "todo" | "doing" | "review" | "done";

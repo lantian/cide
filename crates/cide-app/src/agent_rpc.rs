@@ -316,6 +316,16 @@ enum Scope {
         /// `cide_task_attach` is read against. From the registry, never from the child. (M39)
         cwd: PathBuf,
     },
+    /// A run started from the GitLab MR panel to review one merge request. (M85) Served the
+    /// `cide_mr_*` tools and **nothing** of the tracker or the orchestration — see
+    /// `cide_agents::review`'s header for why the line is drawn there.
+    Review {
+        run: RunId,
+        review: String,
+        label: String,
+        harness: Harness,
+        cwd: PathBuf,
+    },
     /// The header named nothing this process can place. A valid server with no tools.
     Unscoped,
 }
@@ -326,7 +336,7 @@ enum Scope {
 /// mock app is behind a feature this build does not enable, so anything that takes one is
 /// untestable here. This is the same split `hooks.rs` makes for `live_in`/`forget_in` and for the
 /// same reason, and it is why [`respond`] has tests at all.
-trait ToolAccess: Send + Sync {
+pub(crate) trait ToolAccess: Send + Sync {
     fn names(&self) -> &[&'static str];
     fn call(&self, name: &str, arguments: &Value) -> ToolResult;
 }
@@ -438,12 +448,24 @@ impl ToolAccess for ProjectTools {
         let notify = self
             .session
             .map_or(RunNotify::Primary, |session| RunNotify::Session { session });
-        crate::task_triggers::consider(
-            &self.app,
-            self.project,
-            sink.mutations.into_inner(),
-            notify,
-        );
+        let mutations = sink.mutations.into_inner();
+        // A run that just set its task to review has, by its own account, finished: verify its
+        // branch now, so the reviewer's merge finds the answer ready instead of waiting on it.
+        // (M83) Warming only — the merge is where the result is enforced.
+        for mutation in &mutations {
+            if let TaskAuthor::Agent { agent, .. } = &mutation.author
+                && mutation.after.status == cide_ipc::TaskStatus::Review
+                && mutation.before.as_ref().map(|t| t.status) != Some(cide_ipc::TaskStatus::Review)
+            {
+                crate::milestones::prewarm(
+                    &self.app,
+                    self.project,
+                    agent.clone(),
+                    mutation.after.id.clone(),
+                );
+            }
+        }
+        crate::task_triggers::consider(&self.app, self.project, mutations, notify);
         result
     }
 }
@@ -513,6 +535,7 @@ impl TaskSink for StoreSink {
         change: Option<&ChangeName>,
         links: &[cide_ipc::TaskLinkSpec],
         attachments: &[PathBuf],
+        inbox: bool,
     ) -> Result<Task, String> {
         let req = TaskNew {
             // Carried because the wire shape has it; the store ignores it and knows its own
@@ -523,8 +546,9 @@ impl TaskSink for StoreSink {
             agent: agent.cloned(),
             // Always. `TaskSink::create` has no status parameter and the `cide_task_create` tool
             // advertises none, so a run cannot mint a task that is already `Done` — the
-            // restriction `TaskNew::status` describes, in the one line that enforces it.
-            status: None,
+            // restriction `TaskNew::status` describes, in the one line that enforces it. The
+            // one status it may ask for is the inbox (M83), which is *less* than the default.
+            status: inbox.then_some(cide_ipc::TaskStatus::Inbox),
             // Set at creation rather than by a follow-up edit, for the reason `TaskSink::create`
             // states: the trigger below reads the task this mutation left behind, and a task that
             // did not yet name its change would dispatch a run that is told nothing about the
@@ -606,6 +630,27 @@ impl TaskSink for StoreSink {
 
     fn root(&self) -> &Path {
         self.store.root()
+    }
+
+    fn search(&self, query: &str) -> Result<Vec<TaskId>, String> {
+        Ok(self.store.search(query))
+    }
+
+    // The same composite `RegistrySink::integrate` merges, so "unmerged" here and "merged" there
+    // are answers about one branch. Read-only, on this connection's thread, as integrate is.
+    // (M86)
+    fn unmerged(&self, agent: &AgentId, task: &TaskId) -> Result<Option<usize>, String> {
+        cide_git::worktree::unmerged(
+            self.store.root(),
+            &cide_agents::checkout_name(agent, Some(task)),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    // From the connection's identity, which `app_binder` decided — the same source as the author,
+    // so nothing a call carries can make a run look like the orchestrator.
+    fn by_run(&self) -> bool {
+        matches!(self.author, TaskAuthor::Agent { .. })
     }
 
     fn cwd(&self) -> &Path {
@@ -810,6 +855,14 @@ impl AgentSink for RegistrySink {
             .map_err(|error| error.to_string())
     }
 
+    fn pool_load(&self) -> Result<Vec<(cide_ipc::PoolEntry, u32)>, String> {
+        let registry = self
+            .app
+            .try_state::<Arc<AgentRegistry>>()
+            .ok_or_else(|| gone().to_string())?;
+        Ok(registry.pool_load())
+    }
+
     fn set_llm(&self, llm: LlmSettings) -> Result<(), String> {
         let workspace = self
             .app
@@ -835,6 +888,75 @@ impl AgentSink for RegistrySink {
 
     fn resolutions(&self) -> Result<Vec<(AgentId, cide_agents::overrides::Resolved)>, String> {
         crate::agents::resolutions_for(&self.app, self.project).map_err(|error| error.to_string())
+    }
+
+    fn milestones_view(&self) -> Result<cide_ipc::MilestonesView, String> {
+        crate::milestones::view(&self.app, self.project).ok_or_else(|| gone().to_string())
+    }
+
+    fn milestones_define(
+        &self,
+        mut plan: cide_ipc::MilestonePlan,
+    ) -> Result<cide_ipc::MilestonePlan, String> {
+        let root = self.root()?;
+        // The handler refused a project that has milestones; this is the same rule where the
+        // write happens, because a second caller of this method would otherwise be a road
+        // around it. (M83)
+        if !cide_agents::config::load_milestones(&root).is_empty() {
+            return Err(
+                "this project already has milestones; they are the user's to change".into(),
+            );
+        }
+        // The tasks each milestone needs are made by `set_plan`, the one road both this tool and
+        // the Tasks panel's Milestones tab write through. (M83)
+        crate::milestones::set_plan(&self.app, self.project, &mut plan, TaskAuthor::Orchestrator)?;
+        crate::milestones::run_gate(&self.app, self.project);
+        Ok(plan)
+    }
+
+    fn proposals_create(
+        &self,
+        draft: cide_agents::milestones::ProposalDraft,
+    ) -> Result<cide_ipc::Proposal, String> {
+        crate::proposals::create(&self.app, self.project, draft, TaskAuthor::Orchestrator)
+    }
+
+    fn proposals_list(&self) -> Result<Vec<cide_ipc::Proposal>, String> {
+        let root = self.root()?;
+        Ok(crate::proposals::list(&self.app, &root))
+    }
+
+    fn proposals_withdraw(&self, id: &str) -> Result<(), String> {
+        crate::proposals::withdraw(&self.app, self.project, id)
+    }
+
+    fn milestones_propose(&self, text: &str) -> Result<TaskId, String> {
+        let root = self.root()?;
+        let plan = cide_agents::config::load_milestones(&root);
+        let task = plan
+            .current()
+            .and_then(|m| m.task.clone())
+            .ok_or("this project has no milestone task to put a proposal on; use `define`")?;
+        let stores = self
+            .app
+            .try_state::<Arc<TasksStores>>()
+            .ok_or_else(|| gone().to_string())?;
+        let store = stores.ensure(self.project, &root);
+        store
+            .edit(
+                &task,
+                TaskEdit::Comment {
+                    text: format!(
+                        "**Proposed change to the milestones** — for the user to make in \
+                         the Milestones tab of the Tasks panel, or to decline.\n\n{}",
+                        text.trim()
+                    ),
+                },
+                TaskAuthor::Orchestrator,
+            )
+            .map_err(|error| error.to_string())?;
+        crate::tasks_state::broadcast(&self.app, self.project, &store);
+        Ok(task)
     }
 
     fn definition(&self, scope: AgentScope, name: &AgentId) -> Result<Option<AgentDraft>, String> {
@@ -977,17 +1099,29 @@ impl AgentSink for RegistrySink {
         // it — the caller asked, and the accept loop is untouched. The name is the same
         // composite a dispatch's checkout gets, so the branch merged is by construction the one
         // that run committed to.
-        cide_git::worktree::integrate(&root, &cide_agents::checkout_name(agent, task))
-            .map(|outcome| match outcome {
-                cide_git::worktree::Integration::UpToDate => Integrated::UpToDate,
-                cide_git::worktree::Integration::Merged { commit, files } => {
-                    Integrated::Merged { commit, files }
-                }
-                cide_git::worktree::Integration::Conflicts { paths } => {
-                    Integrated::Conflicts { paths }
-                }
-            })
-            .map_err(|error| error.to_string())
+        //
+        // The milestone checks first (M83): a branch that moves a gate, leaves work uncommitted,
+        // or fails the project's verify command is refused here with the reason — this is the
+        // model's road, and the panel's Integrate (the user's) does not pass through it.
+        crate::milestones::before_integrate(&self.app, self.project, &root, agent, task)?;
+        let outcome =
+            cide_git::worktree::integrate(&root, &cide_agents::checkout_name(agent, task))
+                .map(|outcome| match outcome {
+                    cide_git::worktree::Integration::UpToDate => Integrated::UpToDate,
+                    cide_git::worktree::Integration::Merged { commit, files } => {
+                        Integrated::Merged { commit, files }
+                    }
+                    cide_git::worktree::Integration::Conflicts { paths } => {
+                        Integrated::Conflicts { paths }
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+        // Something landed, so the active milestone's gate is asked again — in the background,
+        // because the answer is for whoever plans next, not for this call.
+        if matches!(outcome, Integrated::Merged { .. }) {
+            crate::milestones::run_gate(&self.app, self.project);
+        }
+        Ok(outcome)
     }
 
     fn now_unix_ms(&self) -> u64 {
@@ -1109,6 +1243,20 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 session: None,
                 cwd: Some(cwd),
             }),
+            Scope::Review {
+                run,
+                review,
+                label,
+                harness,
+                cwd,
+            } => Box::new(crate::mr_review::ReviewTools::new(
+                app.clone(),
+                run,
+                review,
+                label,
+                harness,
+                cwd,
+            )),
             Scope::Unscoped => Box::new(NoTools),
         }
     })
@@ -1249,11 +1397,22 @@ fn resolve_run(app: &AppHandle, hello: &Hello) -> Option<Scope> {
 fn run_scope_of(runs: &[crate::agents::RunScope], run: RunId) -> Option<Scope> {
     runs.iter()
         .find(|live| live.run == run)
-        .map(|live| Scope::Run {
-            project: live.project,
-            agent: live.agent.clone(),
-            label: live.label.clone(),
-            cwd: live.cwd.clone(),
+        .map(|live| match &live.purpose {
+            crate::agents::RunPurpose::Work => Scope::Run {
+                project: live.project,
+                agent: live.agent.clone(),
+                label: live.label.clone(),
+                cwd: live.cwd.clone(),
+            },
+            // Decided by what the registry says the run was started as, never by its role id:
+            // a real role could be called `mr-review` too. See `RunPurpose`.
+            crate::agents::RunPurpose::MrReview { review, .. } => Scope::Review {
+                run: live.run,
+                review: review.clone(),
+                label: live.label.clone(),
+                harness: live.harness,
+                cwd: live.cwd.clone(),
+            },
         })
 }
 
@@ -1428,8 +1587,11 @@ fn respond(inbound: &Inbound, access: &dyn ToolAccess) -> Option<Value> {
 /// `cide_hook::mcp` degrades into on its own when cide is not running at all.
 fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
     let allowed = access.names();
+    // The review vocabulary is a family of its own (M85) and joins the list here, where the
+    // per-connection filter already is — one place deciding what a connection sees.
     tools::descriptors()
         .into_iter()
+        .chain(cide_agents::review::descriptors())
         .filter(|entry| {
             entry["name"]
                 .as_str()
@@ -1976,7 +2138,11 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
         {
             return note_to_reviewer(app, project, session, turns);
         }
-        let prompt = review_prompt(&turns, title_of(app, project, &turns).as_deref());
+        let prompt = review_prompt(
+            config.review_prompt_template(),
+            &turns,
+            title_of(app, project, &turns).as_deref(),
+        );
         match crate::claude_tab::open_with_prompt(
             app,
             project,
@@ -1985,10 +2151,12 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
             // The project's own stance for an unattended child, read from the same file in the
             // same breath as the switch that opened this tab. A reviewer that parks on a
             // permission prompt nobody will answer is the failure `permission_mode` documents,
-            // and its brief tells it not to edit anything — `TabMode::Direct`'s doc carries the
+            // and its brief tells it not to edit anything — `TabMode`'s doc carries the
             // trade, because this one stands in the project root rather than a worktree.
-            crate::claude_tab::TabMode::Direct {
+            crate::claude_tab::TabMode {
                 unattended: config.unattended(),
+                // Behind what the user is reading: see the field.
+                behind: true,
             },
             // The worktree the run under review worked in, so the reviewer starts *in* the
             // branch — and so its transcript files beside that work instead of in the project's
@@ -2434,7 +2602,15 @@ fn review_tab_title(turns: &[Turn]) -> String {
 /// this string is built from an agent label out of a committed markdown file and a task title
 /// out of a tracker any agent may write, and a newline in either is a second Enter that would
 /// submit the first half of the instructions as its own turn.
-fn review_prompt(turns: &[Turn], title: Option<&str>) -> String {
+///
+/// # The template (M84)
+///
+/// The task case is the project's `agents.reviewPrompt`, filled by
+/// [`cide_agents::config::fill_review_prompt`] — editable per project in Settings under the
+/// switch that opens this tab. The text below the switch ships as
+/// [`cide_agents::config::DEFAULT_REVIEW_PROMPT`], and every clause argued above is in it. The
+/// task-less case stays here: it has no task, branch or role to fill a template with.
+fn review_prompt(template: &str, turns: &[Turn], title: Option<&str>) -> String {
     let last = turns.last();
     let who = last
         .map(|turn| turn.agent_label.as_str())
@@ -2466,46 +2642,29 @@ fn review_prompt(turns: &[Turn], title: Option<&str>) -> String {
 
     let line = match turn.task.as_ref() {
         Some(id) => {
-            let named = match title.map(one_line).filter(|title| !title.is_empty()) {
-                Some(title) => format!("task {id} ({})", clip(&title)),
+            let title = title
+                .map(one_line)
+                .filter(|title| !title.is_empty())
+                .map(|t| clip(&t));
+            let named = match &title {
+                Some(title) => format!("task {id} ({title})"),
                 None => format!("task {id}"),
             };
-            let branch = cide_agents::checkout_name(&turn.agent, Some(id));
-            let role = &turn.agent.0;
-            format!(
-                "A subagent just {ended}: {who}, on {named}. You own that task now — nobody \
-                 else is reviewing it and the product owner has not been told, so it is yours \
-                 to finish or to send back. **There is nobody at the keyboard and nobody will \
-                 answer you**: decide every question yourself from what you can read, and never \
-                 end your turn by asking what to do — a turn that ends in a question is a task \
-                 nobody picks up. First find out what actually happened: read the \
-                 task with mcp__cide__cide_task_get and read its comments, which are the only \
-                 place the run reported; then diff the branch cide/{branch} against the base to \
-                 see what changed rather than what was claimed, and run whatever this repository \
-                 uses to check itself. Then take one of exactly two actions. If the work is done \
-                 and correct and did what the task asked rather than something adjacent: \
-                 comment your verdict with mcp__cide__cide_task_comment, then **merge it \
-                 yourself** with mcp__cide__cide_agent_integrate (agent `{role}`, task {id}) — \
-                 accepting work means taking it into this branch, and leaving a merge for \
-                 somebody to do later is the same as not accepting it — and only then set the \
-                 task to done with mcp__cide__cide_task_update. If that merge reports conflicts \
-                 it has changed nothing, and the task is not done: treat it as the other case \
-                 below, naming the conflicting paths. If it says there was nothing to merge, \
-                 that is a normal answer and not a problem to report — the branch is already \
-                 in, usually because an earlier review merged it — so check the work is present \
-                 and close the task. If the work is not right: comment exactly \
-                 what is wrong and \
-                 what is still needed, set the task back to doing with \
-                 mcp__cide__cide_task_update, and hand it back to the same role with \
-                 mcp__cide__cide_agent_dispatch (agent `{role}`, task {id}) passing that same \
-                 feedback as the instructions — do not fix it yourself, the role that built it \
-                 has the context. One exception, and read the comments for it before you \
-                 dispatch: if this task has already been sent back for the same reason, stop, \
-                 say so plainly in a comment, leave it in review and do not dispatch again. \
-                 Anything you notice that is wrong but is *not* this task — something the run \
-                 broke elsewhere, a gap it revealed, work this one turns out to depend on — goes \
-                 on the board as its own task with mcp__cide__cide_task_create, rather than into \
-                 this task's verdict where it is read once and lost.{also}"
+            let branch = format!("cide/{}", cide_agents::checkout_name(&turn.agent, Some(id)));
+            // `who` without its backticks: the template puts them where it wants them.
+            let agent = who.trim_matches('`');
+            cide_agents::config::fill_review_prompt(
+                template,
+                &[
+                    ("task_id", &id.0),
+                    ("task_title", title.as_deref().unwrap_or("")),
+                    ("task", &named),
+                    ("branch", &branch),
+                    ("role", &turn.agent.0),
+                    ("agent", agent),
+                    ("outcome", &ended),
+                    ("others", &also),
+                ],
             )
         }
         None => format!(
@@ -2680,6 +2839,7 @@ impl NudgeCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cide_agents::config::DEFAULT_REVIEW_PROMPT;
     use cide_core::workspace;
     use cide_ipc::TaskStatus;
 
@@ -2922,6 +3082,8 @@ mod tests {
             agent: AgentId(agent.to_string()),
             label: format!("{agent} (label)"),
             cwd: PathBuf::from(format!("/repo/.cide/worktrees/{agent}")),
+            purpose: crate::agents::RunPurpose::Work,
+            harness: cide_ipc::Harness::Claude,
         }
     }
 
@@ -2948,6 +3110,48 @@ mod tests {
         // the call site and therefore no tools at all.
         assert_eq!(run_scope_of(&runs, RunId::new()), None);
         assert_eq!(run_scope_of(&[], runs[0].run), None);
+    }
+
+    #[test]
+    fn a_review_run_is_scoped_to_its_review_and_never_to_the_tracker() {
+        let project = ProjectId::new();
+        let mut review = a_run(project, "mr-review");
+        review.purpose = crate::agents::RunPurpose::MrReview {
+            review: "r1".into(),
+            cwd: PathBuf::from("/cache/review/source"),
+            brief: String::new(),
+            tools: Vec::new(),
+            harness: Harness::Opencode,
+        };
+        review.harness = Harness::Opencode;
+        let runs = vec![a_run(project, "developer"), review.clone()];
+        // Decided by the purpose the registry holds, not the role id: a real role named
+        // `mr-review` is an ordinary run.
+        assert!(matches!(
+            run_scope_of(&runs, runs[0].run),
+            Some(Scope::Run { .. })
+        ));
+        assert_eq!(
+            run_scope_of(&runs, review.run),
+            Some(Scope::Review {
+                run: review.run,
+                review: "r1".into(),
+                label: review.label.clone(),
+                harness: Harness::Opencode,
+                cwd: review.cwd.clone(),
+            })
+        );
+        // And a connection answering the review names lists those six and nothing else.
+        let access = FakeAccess {
+            names: cide_agents::review::tool::REVIEW.to_vec(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let listed: Vec<String> = descriptors_for(&access)
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, cide_agents::review::tool::REVIEW);
+        assert!(!listed.iter().any(|n| n.starts_with("cide_task_")));
     }
 
     /// Records every call, so the JSON-RPC layer can be driven with no app and no store.
@@ -3268,7 +3472,7 @@ mod tests {
     /// through the transport, the header line and the JSON-RPC layer, exactly as `cide-hook mcp`
     /// drives them.
     ///
-    /// Three connections, three answers: twenty tools for the project's primary session, nine for
+    /// Three connections, three answers: twenty-two tools for the project's primary session, nine for
     /// a run, none for anything else. And the enforcement half beside the advertisement: the run
     /// connection asks for `cide_agent_dispatch` by name and is answered `METHOD_NOT_FOUND`
     /// **without the call reaching the sink at all**, which is the assertion that matters — an
@@ -3313,7 +3517,7 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 20, "{names:?}");
+            assert_eq!(names.len(), 22, "{names:?}");
             assert_eq!(names, tools::tool::EVERY);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));
@@ -3451,6 +3655,7 @@ mod tests {
                 None,
                 &[],
                 &[],
+                false,
             )
             .expect("create");
         assert!(sink.changed.load(Ordering::Relaxed));
@@ -3529,7 +3734,7 @@ mod tests {
             cwd: worktree.clone(),
         };
         let made = sink
-            .create("Draw the thing", "", None, None, &[], &[])
+            .create("Draw the thing", "", None, None, &[], &[], false)
             .expect("create");
 
         // A creation whose file is refused leaves no task behind — the id is spent, the row is
@@ -3743,11 +3948,24 @@ mod tests {
         let hostile = "Fix the parser\nand then\r\nrewrite the lexer";
 
         for prompt in [
-            review_prompt(&[turn(project, "developer", Some("t-17"))], Some(hostile)),
-            review_prompt(&[turn(project, "dev\neloper", Some("t-17"))], Some(hostile)),
-            review_prompt(&[turn(project, "developer", None)], Some(hostile)),
-            review_prompt(&[], None),
             review_prompt(
+                DEFAULT_REVIEW_PROMPT,
+                &[turn(project, "developer", Some("t-17"))],
+                Some(hostile),
+            ),
+            review_prompt(
+                DEFAULT_REVIEW_PROMPT,
+                &[turn(project, "dev\neloper", Some("t-17"))],
+                Some(hostile),
+            ),
+            review_prompt(
+                DEFAULT_REVIEW_PROMPT,
+                &[turn(project, "developer", None)],
+                Some(hostile),
+            ),
+            review_prompt(DEFAULT_REVIEW_PROMPT, &[], None),
+            review_prompt(
+                DEFAULT_REVIEW_PROMPT,
                 &[
                     ended_turn(project, "developer", Some("t-1"), TurnOutcome::Failed),
                     ended_turn(
@@ -3775,7 +3993,11 @@ mod tests {
     fn the_review_prompt_names_the_branch_only_when_there_is_one() {
         let project = ProjectId::new();
 
-        let with_task = review_prompt(&[turn(project, "developer", Some("t-9"))], Some("Wire it"));
+        let with_task = review_prompt(
+            DEFAULT_REVIEW_PROMPT,
+            &[turn(project, "developer", Some("t-9"))],
+            Some("Wire it"),
+        );
         assert!(
             with_task.contains("cide/developer-t-9"),
             "the reviewer was not told where to look: {with_task}"
@@ -3783,7 +4005,11 @@ mod tests {
         assert!(with_task.contains("t-9"));
         assert!(with_task.contains("Wire it"));
 
-        let adhoc = review_prompt(&[turn(project, "developer", None)], None);
+        let adhoc = review_prompt(
+            DEFAULT_REVIEW_PROMPT,
+            &[turn(project, "developer", None)],
+            None,
+        );
         assert!(
             !adhoc.contains("cide/"),
             "a branch was invented for a run that has none: {adhoc}"
@@ -3802,6 +4028,7 @@ mod tests {
     fn the_branch_is_the_one_the_worktree_actually_builds() {
         let project = ProjectId::new();
         let prompt = review_prompt(
+            DEFAULT_REVIEW_PROMPT,
             &[turn(project, "3D Artist", Some("T-1060"))],
             Some("Seamless sand"),
         );
@@ -3832,7 +4059,11 @@ mod tests {
     #[test]
     fn the_reviewer_is_told_how_to_finish_or_hand_back() {
         let project = ProjectId::new();
-        let prompt = review_prompt(&[turn(project, "3D Artist", Some("t-1060"))], None);
+        let prompt = review_prompt(
+            DEFAULT_REVIEW_PROMPT,
+            &[turn(project, "3D Artist", Some("t-1060"))],
+            None,
+        );
 
         for handle in [
             "mcp__cide__cide_task_get",
@@ -3887,10 +4118,15 @@ mod tests {
     #[test]
     fn a_lone_turn_mentions_no_others() {
         let project = ProjectId::new();
-        let one = review_prompt(&[turn(project, "developer", Some("t-1"))], None);
+        let one = review_prompt(
+            DEFAULT_REVIEW_PROMPT,
+            &[turn(project, "developer", Some("t-1"))],
+            None,
+        );
         assert!(!one.contains("other subagent"), "{one}");
 
         let three = review_prompt(
+            DEFAULT_REVIEW_PROMPT,
             &[
                 turn(project, "a", Some("t-1")),
                 turn(project, "b", Some("t-2")),

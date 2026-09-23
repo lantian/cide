@@ -2381,7 +2381,9 @@ mod tests {
                     // preview slot for exactly that reason — see `PreviewSlot` — so counting one
                     // here would make the working-tree assertions below fail whenever a commit's
                     // file list happened to be open beside them.
-                    DiffOrigin::GitRevision { .. } | DiffOrigin::ClaudeMcp { .. } | DiffOrigin::GitLab { .. } => None,
+                    DiffOrigin::GitRevision { .. }
+                    | DiffOrigin::ClaudeMcp { .. }
+                    | DiffOrigin::GitLab { .. } => None,
                 },
                 _ => None,
             })

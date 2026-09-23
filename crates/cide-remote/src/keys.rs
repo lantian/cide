@@ -165,6 +165,52 @@ pub fn wheel(lines: i16, modes: &ScreenInfo) -> Vec<u8> {
 /// How many lines one scroll frame may carry. See [`wheel`].
 pub const MAX_WHEEL_LINES: u16 = 32;
 
+/// What a device's PgUp/PgDn (`ClientBody::ScrollView`) turns into. (M91)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Page {
+    /// The normal screen: the history is the **terminal's**, so the desk's pane scrolls its own
+    /// scrollback and the device pages its copy. Nothing is written to the child — to a shell,
+    /// `ESC[5~` is a key readline ignores, which is exactly how PgUp used to do nothing.
+    Desk,
+    /// An alternate screen: the program owns the transcript, so the bytes go to it and both ends
+    /// see its redraw.
+    Program(Vec<u8>),
+}
+
+/// Decide [`Page`] from the child's modes, read off the mirror at the moment of the press.
+///
+/// On an alternate screen that asked for the mouse, a wheel of about a screenful — the rows less
+/// two, so a line of context survives the turn, capped at [`MAX_WHEEL_LINES`]. One that did not
+/// ask gets the PgUp/PgDn **key** instead, which is what a full-screen pager binds and what this
+/// button sent before M91; a wheel there would arrive as typed characters.
+pub fn page(pages: i8, modes: &ScreenInfo) -> Page {
+    use cide_ipc::screen::MouseReporting;
+    if !modes.alt {
+        return Page::Desk;
+    }
+    if pages == 0 {
+        return Page::Program(Vec::new());
+    }
+    if modes.mouse != MouseReporting::Off {
+        let per_page = i16::try_from(modes.rows.saturating_sub(2).max(1)).unwrap_or(i16::MAX);
+        let lines = per_page.saturating_mul(i16::from(pages));
+        let capped = lines.clamp(-(MAX_WHEEL_LINES as i16), MAX_WHEEL_LINES as i16);
+        return Page::Program(wheel(capped, modes));
+    }
+    let key = KeyEvent {
+        key: if pages < 0 {
+            KeyName::PageUp
+        } else {
+            KeyName::PageDown
+        },
+        text: None,
+        ctrl: false,
+        alt: false,
+        shift: false,
+    };
+    Page::Program(encode(&key, modes).repeat(usize::from(pages.unsigned_abs())))
+}
+
 /// xterm's modifier parameter, or `None` when there are no modifiers to report.
 fn modifier(event: &KeyEvent) -> Option<u8> {
     let bits = u8::from(event.shift) | (u8::from(event.alt) << 1) | (u8::from(event.ctrl) << 2);
@@ -291,6 +337,51 @@ mod tests {
             mouse,
             ..modes(false, false)
         }
+    }
+
+    #[test]
+    fn a_page_on_the_normal_screen_scrolls_the_desk_and_writes_nothing() {
+        assert_eq!(page(-1, &modes(false, false)), Page::Desk);
+        assert_eq!(
+            page(1, &tracking(cide_ipc::screen::MouseReporting::Sgr)),
+            Page::Desk
+        );
+    }
+
+    #[test]
+    fn a_page_on_an_alternate_screen_with_the_mouse_is_a_screenful_of_wheel() {
+        let alt = ScreenInfo {
+            alt: true,
+            rows: 12,
+            ..tracking(cide_ipc::screen::MouseReporting::Sgr)
+        };
+        let Page::Program(bytes) = page(-1, &alt) else {
+            panic!("an alternate screen is the program's")
+        };
+        // Ten lines up (twelve rows less two), each one SGR wheel-up at the centre.
+        assert_eq!(bytes, "\x1b[<64;41;7M".repeat(10).into_bytes());
+
+        // A tall screen is capped rather than asking for a hundred redraws.
+        let tall = ScreenInfo { rows: 200, ..alt };
+        let Page::Program(bytes) = page(1, &tall) else {
+            panic!("an alternate screen is the program's")
+        };
+        assert_eq!(
+            bytes,
+            "\x1b[<65;41;101M"
+                .repeat(usize::from(MAX_WHEEL_LINES))
+                .into_bytes()
+        );
+    }
+
+    #[test]
+    fn a_page_on_an_alternate_screen_without_the_mouse_is_the_key() {
+        let alt = ScreenInfo {
+            alt: true,
+            ..modes(false, false)
+        };
+        assert_eq!(page(-2, &alt), Page::Program(b"\x1b[5~\x1b[5~".to_vec()));
+        assert_eq!(page(1, &alt), Page::Program(b"\x1b[6~".to_vec()));
     }
 
     fn key(key: KeyName) -> KeyEvent {

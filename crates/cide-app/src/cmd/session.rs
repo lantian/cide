@@ -416,7 +416,24 @@ fn orchestrator_paragraph(
     }
 
     let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
-    Some(roster_paragraph(&roles, voice.unwrap_or(inferred)))
+    // The same resolution the roster tool reports and a dispatch enforces, so the number this
+    // paragraph states is the number `cide_agents_list` states. A failure drops the figures, not
+    // the paragraph.
+    let limits = crate::agents::resolutions_for(app, project)
+        .ok()
+        .map(|resolved| {
+            let ready = resolved.iter().filter(|(id, _)| {
+                roles
+                    .iter()
+                    .any(|def| def.id == *id && def.unavailable.is_none())
+            });
+            let project_max = agents.config.agents.max_concurrent;
+            Limits {
+                project: project_max,
+                total: cide_agents::overrides::capacity(ready.map(|(_, r)| r), project_max),
+            }
+        });
+    Some(roster_paragraph(&roles, voice.unwrap_or(inferred), limits))
 }
 
 /// Which opening sentence a pane's roster paragraph gets. (M79)
@@ -456,7 +473,7 @@ pub(crate) enum Voice {
 /// as one — without being told it *is*, because a task's conversation pane opened from the Tasks
 /// panel has just been handed a task to work, and two identities in one prompt is a model
 /// guessing which to be.
-fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice) -> String {
+fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<Limits>) -> String {
     let roles = if roles.is_empty() {
         // Said rather than omitted: a session told it is the product owner and handed no roles
         // would call `cide_agents_list`, get an empty answer, and have no idea whether that is a
@@ -509,6 +526,18 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice) -> String {
         }
     };
 
+    // The numbers, when they could be read: a model told only that "caps exist" fans out ten
+    // ways and learns the real figure from nine queued rows. Snapshotted at spawn like the role
+    // list, so it points at the roster for the current figure the same way.
+    let limits = match limits {
+        Some(Limits { project, total }) => format!(
+            " (at most {project} at once here) and, with these roles' `max-concurrent` and their \
+             pools' running limits, at most {total} can actually be live at once — \
+             `mcp__cide__cide_agents_list` gives the current figure"
+        ),
+        None => String::new(),
+    };
+
     format!(
         "{opening} {roles} That list was read when this session \
          started; `mcp__cide__cide_agents_list` is the current one. A role is a markdown file at \
@@ -532,11 +561,16 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice) -> String {
          wins. Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
          write this project's shared task tracker at `.cide/tasks.json`: create the task before \
          you hand it to anybody, because a run is pointed at its task and reads the statement of \
-         the work from there. The board is also where anything you notice in passing goes — a \
-         defect, a gap, a piece of work something else turns out to need: open a task for it \
-         with `mcp__cide__cide_task_create` the moment you see it, rather than folding it into \
-         whatever is in flight or keeping it in this conversation, because a conversation ends \
-         and the board does not. Assigning a todo or doing task to a role — with \
+         the work from there. Anything you notice in passing — a defect, a gap, a piece of work \
+         something else turns out to need — goes on the board too, the moment you see it, \
+         rather than into whatever is in flight or this conversation, because a conversation \
+         ends and the board does not; but it goes to the **inbox** (status `inbox` — pass \
+         `inbox: true` to `mcp__cide__cide_task_create`), where noticed work waits and nothing \
+         starts it, and tasks the roles create land there by themselves. `todo` is for work you have decided the project does now. When the \
+         project has milestones (`mcp__cide__cide_milestones`), that means work towards the \
+         active one: link it `subtaskOf` the milestone's task, pull from the inbox only what \
+         its gate needs, and let the gate — a command cide runs, not your judgement — say when \
+         it is met. Assigning a todo or doing task to a role — with \
          `mcp__cide__cide_task_assign` or `mcp__cide__cide_task_update`, by creating the task \
          with an assignee, or by @mentioning a role in a task's body or a comment — starts that \
          role on it automatically; `mcp__cide__cide_agent_dispatch` (a role and a task id, \
@@ -551,8 +585,11 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice) -> String {
          something, or for a small piece of work not worth a task, never for work whose result \
          you need to read, and keep it clear of files you or another run are editing. A role \
          runs up to its `max-concurrent` tasks at once, each task in its own worktree on branch \
-         `cide/<role>-<task>`, and the project caps concurrent runs — anything past a cap \
-         queues in order, so fan out across tasks and roles freely. A run that starts moves its \
+         `cide/<role>-<task>`, and the project caps concurrent runs{limits} — anything past a \
+         cap queues in order, so fan out across tasks and roles freely. A role on a model pool \
+         is capped by the pool too: each of its models may carry a running limit, counted \
+         across every project on this machine, a run starts on the first model with room, and \
+         it waits in the queue when every one is full. A run that starts moves its \
          task to doing; when the work is done it sets the task to review and comments what it \
          did. A run reports back only through that tracker, so read those comments, take work \
          you accept into this branch with `mcp__cide__cide_agent_integrate` — naming the task, \
@@ -570,6 +607,15 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice) -> String {
          record. When you need the user, end your turn with a direct question: cide marks the \
          pane and the window title while you are awaiting input."
     )
+}
+
+/// The concurrency figures the roster paragraph states. See [`cide_agents::overrides::capacity`].
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// The project's `maxConcurrent`.
+    project: u16,
+    /// Every cap at once: roles, pools and the project.
+    total: u32,
 }
 
 /// Whatever it is handed, on one line, with runs of whitespace collapsed.
@@ -1897,7 +1943,7 @@ mod tests {
     fn the_roster_paragraph_names_the_roles_and_the_namespaced_tools() {
         let developer = role("developer", "Implements one task\n  end to end.");
         let qa = role("qa", "");
-        let paragraph = roster_paragraph(&[&developer, &qa], Voice::ProductOwner);
+        let paragraph = roster_paragraph(&[&developer, &qa], Voice::ProductOwner, None);
         // Printed on purpose: this is prose handed to a language model, and the assertions below
         // check fragments of it. `cargo test -p cide-app roster_paragraph -- --nocapture`.
         eprintln!("{paragraph}");
@@ -1980,10 +2026,20 @@ mod tests {
         // Anything noticed in passing goes on the board. (M79) The orchestrator's half of the
         // rule `TRACKER_PREAMBLE` states for a run: a conversation ends and the board does not,
         // so a defect that lives only in this session's context is a defect nobody sees again.
-        assert!(
-            paragraph.contains("mcp__cide__cide_task_create"),
-            "{paragraph}"
-        );
+        //
+        // Into the **inbox** since M83, and the paragraph says so, or the orchestrator files
+        // every observation as `todo` and its next planning turn plans from them — which is how a
+        // real board reached 98 open tasks of which 36 were the plan. And it is told what `todo`
+        // is for once there are milestones, and that the gate, not its own reading, says when one
+        // is met.
+        for word in [
+            "**inbox**",
+            "status `inbox`",
+            "mcp__cide__cide_milestones",
+            "subtaskOf",
+        ] {
+            assert!(paragraph.contains(word), "{word} is not named: {paragraph}");
+        }
 
         // ...and the way to summon the user is to end the turn asking (`windows::set_awaiting`
         // badges the pane and retitles the window).
@@ -1999,8 +2055,8 @@ mod tests {
     #[test]
     fn a_second_pane_is_told_it_may_orchestrate_and_everything_else_is_the_same() {
         let developer = role("developer", "Implements one task end to end.");
-        let console = roster_paragraph(&[&developer], Voice::ProductOwner);
-        let pane = roster_paragraph(&[&developer], Voice::Pane);
+        let console = roster_paragraph(&[&developer], Voice::ProductOwner, None);
+        let pane = roster_paragraph(&[&developer], Voice::Pane, None);
 
         assert!(
             console.starts_with("You are the product owner"),
@@ -2037,9 +2093,9 @@ mod tests {
     #[test]
     fn a_tab_cide_opened_is_told_it_is_acting_as_the_product_owner() {
         let developer = role("developer", "Implements one task end to end.");
-        let acting = roster_paragraph(&[&developer], Voice::Acting);
-        let pane = roster_paragraph(&[&developer], Voice::Pane);
-        let console = roster_paragraph(&[&developer], Voice::ProductOwner);
+        let acting = roster_paragraph(&[&developer], Voice::Acting, None);
+        let pane = roster_paragraph(&[&developer], Voice::Pane, None);
+        let console = roster_paragraph(&[&developer], Voice::ProductOwner, None);
 
         assert!(
             acting.starts_with("You are acting as the product owner"),
@@ -2070,9 +2126,35 @@ mod tests {
 
     #[test]
     fn a_project_with_no_roles_gets_a_paragraph_that_says_so_and_names_the_file() {
-        let paragraph = roster_paragraph(&[], Voice::ProductOwner);
+        let paragraph = roster_paragraph(&[], Voice::ProductOwner, None);
         assert!(paragraph.contains(".cide/agents/<name>.md"), "{paragraph}");
         assert!(paragraph.contains("nobody to dispatch to"), "{paragraph}");
+    }
+
+    /// The orchestrator is told the numbers, not only that caps exist: the project's own cap
+    /// and the total every cap allows, and that pool models carry running limits.
+    #[test]
+    fn the_paragraph_states_how_many_runs_can_be_live() {
+        let paragraph = roster_paragraph(
+            &[],
+            Voice::ProductOwner,
+            Some(Limits {
+                project: 4,
+                total: 3,
+            }),
+        );
+        assert!(
+            paragraph.contains("(at most 4 at once here)"),
+            "{paragraph}"
+        );
+        assert!(
+            paragraph.contains("at most 3 can actually be live at once"),
+            "{paragraph}"
+        );
+        assert!(paragraph.contains("running limit"), "{paragraph}");
+
+        let unknown = roster_paragraph(&[], Voice::ProductOwner, None);
+        assert!(!unknown.contains("can actually be live"), "{unknown}");
     }
 
     /// The degradation `cide_core::claude_cli::WARNED_ARGS` promises the user, from this side.
@@ -2126,7 +2208,7 @@ mod tests {
     #[test]
     fn the_paragraph_folds_into_the_users_own_append_system_prompt() {
         let developer = role("developer", "Implements one task end to end.");
-        let paragraph = roster_paragraph(&[&developer], Voice::ProductOwner);
+        let paragraph = roster_paragraph(&[&developer], Voice::ProductOwner, None);
 
         let mut args = vec![
             "--append-system-prompt".to_string(),
@@ -2702,7 +2784,7 @@ mod tests {
     /// so a future edit that moves the paragraph out from behind the gate has to answer for it.
     #[test]
     fn the_roster_paragraph_is_only_worth_sending_with_the_tools_that_back_it() {
-        let paragraph = roster_paragraph(&[], Voice::ProductOwner);
+        let paragraph = roster_paragraph(&[], Voice::ProductOwner, None);
         for tool in ["mcp__cide__cide_agents_list", "mcp__cide__cide_task_"] {
             assert!(paragraph.contains(tool), "{paragraph}");
         }

@@ -502,6 +502,50 @@ pub enum ClientBody {
     /// A device holds rows and asks for a body only when somebody opens one — the board carries
     /// no content for the reason `TaskRow` exists at all.
     TaskGet { project: ProjectId, task: TaskId },
+    /// Page the **view** of a session, up (negative) or down: PgUp/PgDn on a phone. (M91)
+    ///
+    /// Not [`Self::Input`]'s `PageUp`, which is `ESC[5~` handed to the program — ignored by a
+    /// shell's readline, since in a real terminal paging is the *terminal's* job, and so a phone's
+    /// PgUp scrolled nothing anywhere unless a full-screen program happened to bind the key. And
+    /// not [`Self::Scroll`], which only ever talks to the program. This asks cide to do what a
+    /// person's Shift+PgUp at the desk would: on the normal screen, scroll the desktop pane's own
+    /// scrollback (the device pages its own copy of the same history, so the two move together);
+    /// on an alternate screen with mouse reports, a wheel of `pages` screenfuls to the program,
+    /// whose redraw both ends then show. Refused — as an `Error`, never silently — on an
+    /// alternate screen that did not ask for the mouse, where there is nothing to scroll.
+    ///
+    /// Offered when [`ServerBody::Welcome`]'s `features` carries `"scrollView"`.
+    ScrollView {
+        session: SessionId,
+        pages: i8,
+        #[ts(type = "number")]
+        seq: u64,
+    },
+    /// A project's milestones, gates and proposals, as the desk's Milestones tab draws them. (M91)
+    ///
+    /// Answered with [`ServerBody::Milestones`]; a subscribed project is also pushed one whenever
+    /// a gate starts or finishes, so a device learns "running" and the verdict without polling.
+    /// Offered when `features` carries `"milestones"`.
+    MilestonesGet { project: ProjectId },
+    /// Run a milestone's gate now, in the background. The verdict arrives as a pushed
+    /// [`ServerBody::Milestones`] — twice, as on the desk: once running, once finished.
+    GateRun {
+        project: ProjectId,
+        milestone: String,
+    },
+    /// The user accepts a milestone whose gate passed: its task is done and the next one is
+    /// active. Answered with the new [`ServerBody::Milestones`].
+    MilestoneAccept {
+        project: ProjectId,
+        milestone: String,
+    },
+    /// The full output of a gate (`kind: "gate"`, `key` a milestone id) or of a verify
+    /// (`"verify"`, `key` a task id) — the last MiB of it. Answered with [`ServerBody::CheckLog`].
+    CheckLog {
+        project: ProjectId,
+        kind: String,
+        key: String,
+    },
     /// Keep the connection honest. RN's `WebSocket` exposes no protocol-level ping, and a NAT
     /// mapping that has gone away is otherwise indistinguishable from a quiet server.
     Ping,
@@ -674,6 +718,24 @@ pub enum ServerBody {
     Board {
         project: ProjectId,
         tasks: Vec<crate::TaskRow>,
+    },
+    /// A project's milestones. (M91) `view` is absent when the project defines none, or is not
+    /// open here. Boxed for [`Self::Task`]'s reason.
+    Milestones {
+        project: ProjectId,
+        #[ts(optional)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        view: Option<Box<crate::MilestonesView>>,
+    },
+    /// A check's log, the answer to [`ClientBody::CheckLog`]. `text` is absent when that check
+    /// has never run here.
+    CheckLog {
+        project: ProjectId,
+        kind: String,
+        key: String,
+        #[ts(optional)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     Desync {
         why: String,

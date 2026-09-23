@@ -3,12 +3,18 @@
  * (M18)
  *
  * ```
- * ● Developer · claude                        2m     ← RunRow, in Recent
- *   t-14 Add the retry bar        Open  ⏸  ⏹
+ * ● Developer · opencode · zai/glm-4.6          6m     ← RunRow, in History
+ *   t-14 Add the retry bar           Open  ⎇
  * ⚠ This turn may have timed out while paused.   Retry turn   Leave it
  *
  *   ◆ t-16 Sweep the phase table   1m   Open ⏸ ⏹    ← ActivityRow, under a role
+ *     claude · opus
  * ```
+ *
+ * Both say **what the run is on** — harness, model, and the pool that chose it — through
+ * `usingLabel`, from fields Rust reads off the run rather than off the role file (M89). With
+ * pools and local overrides the file says what the *next* run would get; the row has to say what
+ * this one got, or a failover is invisible until somebody opens the log card.
  *
  * # Two rows, because there are two questions
  *
@@ -52,9 +58,9 @@
 import {
   agentColor,
   glyphSpins,
-  harnessLabel,
   isDonePhase,
   timeTitle,
+  usingLabel,
   workedFor,
   type RunRow as RunRowData,
   type Tone,
@@ -122,6 +128,12 @@ export interface RunRowProps {
   onRetryTurn?: ((run: string) => void) | undefined
   /** Dismiss the stale-turn bar without re-sending anything. */
   onAckStaleTurn?: ((run: string) => void) | undefined
+  /** Is *this* run the one waiting for a confirming second Integrate click? History only. */
+  armed?: boolean | undefined
+  /** First Integrate click: arm this run. See [`IntegrateControl`]. */
+  onIntegrateArm?: ((run: string) => void) | undefined
+  /** Second click: merge this run's task branch. See [`IntegrateControl`]. */
+  onIntegrate?: ((run: string) => void) | undefined
 }
 
 /**
@@ -188,6 +200,11 @@ export function ActivityRow({
           onStop={onStop}
         />
       </div>
+      {/* What it is on, dim and under the task rather than beside it: the task is what the
+          line is *about*, and at 320px a model name beside it would truncate the title first. */}
+      <p className={styles.using} data-audit="agentsUsing">
+        {usingLabel(run)}
+      </p>
       <RunNotes row={row} />
       <StaleBar row={row} onRetryTurn={onRetryTurn} onAckStaleTurn={onAckStaleTurn} />
     </div>
@@ -210,6 +227,9 @@ export function RunRow({
   onRevealTask,
   onRetryTurn,
   onAckStaleTurn,
+  armed = false,
+  onIntegrateArm,
+  onIntegrate,
 }: RunRowProps) {
   const { run } = row
 
@@ -256,7 +276,11 @@ export function RunRow({
         <span className={styles.sep} aria-hidden="true">
           ·
         </span>
-        <span className={styles.harness}>{harnessLabel(run.harness)}</span>
+        {/* The whole of what it ran on, where this used to print the harness alone: History is
+            where somebody asks "which model did that", and the harness does not answer it. */}
+        <span className={styles.harness} data-audit="agentsUsing" title={usingLabel(run)}>
+          {usingLabel(run)}
+        </span>
         {/* A record, so this figure is **final**: a terminal run has no open interval, and
             `workedFor` therefore answers the same thing however long ago it ended. The old
             `elapsed(nowMs, startedMs)` rose for ever on a row whose doc says "how long it
@@ -278,6 +302,12 @@ export function RunRow({
           onPause={onPause}
           onResume={onResume}
           onStop={onStop}
+        />
+        <IntegrateControl
+          row={row}
+          armed={armed}
+          onIntegrateArm={onIntegrateArm}
+          onIntegrate={onIntegrate}
         />
       </div>
 
@@ -412,7 +442,7 @@ function RunControls({
           className={cx(styles.control, styles.controlGlyph, styles.controlStop)}
           data-audit="agentsStop"
           onClick={() => onStop(run.run)}
-          title="End this run. Its transcript stays readable in Recent."
+          title="End this run. Its transcript stays readable in History."
           aria-label="Stop this run"
         >
           <Icon name="square" size={1} />
@@ -420,6 +450,86 @@ function RunControls({
       )}
     </span>
   )
+}
+
+/**
+ * A finished run's **Integrate**: merge its task branch into the branch the user has checked
+ * out. At most one button, and which one is the whole design. (M89 — it was on the role row.)
+ *
+ * # Why a run, and only a finished one with a task
+ *
+ * It used to sit on every role row and merge `cide/<role>`, the role's *base* branch — which
+ * since per-task worktrees (M40) holds only what an older cide's task-less dispatches left there.
+ * A task's work is on `cide/<role>-<task>`, and the one row that knows both halves of that name
+ * is a run. So the control is drawn where the backend's `integrate(root, agent, task)` has
+ * everything it needs, and nowhere else:
+ *
+ *  * **finished** (`isDonePhase`): a live run is still writing its branch, and merging half a
+ *    turn's commits is not a thing anybody means to do from a sidebar;
+ *  * **with a task**: a task-less run stands in the project root and mints no branch — its edits
+ *    are already in the user's tree, and a merge button there would merge nothing.
+ *
+ * It stays offered whether or not the branch has anything the base lacks, for the reason the
+ * role-level control was: the wire does not carry that, and `upToDate` is a perfectly good answer
+ * the host reports as one. Merging is normally the orchestrator's (`cide_agent_integrate`) —
+ * this is the person's way to take one run's work themselves.
+ *
+ * # Two clicks
+ *
+ * The first press arms; the second merges. It writes files the user may have open and adds a
+ * commit to their branch, from a row in a scrolling list — recoverable (`ORIG_HEAD`, the reflog)
+ * but real, and easy to hit by mistake, which is the confirm-on-second-click case rather than the
+ * dialog case. The arm is per run, and `run` is closed over from the row that drew it, so a merge
+ * is only ever for the run the user armed.
+ *
+ * A mark rather than a word, beside Open, like every other run control; the armed half is a
+ * check mark and its `title` is the sentence that has to be true — the merge is computed in memory
+ * and `Index::has_conflicts` is asked before a byte is written, so a conflict changes nothing.
+ */
+function IntegrateControl({
+  row,
+  armed,
+  onIntegrateArm,
+  onIntegrate,
+}: {
+  row: RunRowData
+  armed: boolean
+  onIntegrateArm?: ((run: string) => void) | undefined
+  onIntegrate?: ((run: string) => void) | undefined
+}) {
+  const { run } = row
+  const task = run.task
+  if (task === null || !isDonePhase(run.phase)) return null
+  const branch = `cide/${run.agent}-${task}`
+  if (armed && onIntegrate !== undefined) {
+    return (
+      <button
+        type="button"
+        className={cx(styles.control, styles.controlGlyph, styles.controlArmed)}
+        data-audit="agentsIntegrateConfirm"
+        title={`Merge ${branch} now. If it conflicts, nothing is changed at all and you get the list of paths.`}
+        aria-label="Confirm merge"
+        onClick={() => onIntegrate(run.run)}
+      >
+        <Icon name="check" size={1} />
+      </button>
+    )
+  }
+  if (onIntegrateArm !== undefined) {
+    return (
+      <button
+        type="button"
+        className={cx(styles.control, styles.controlGlyph)}
+        data-audit="agentsIntegrate"
+        title={`Merge ${branch} into the branch you have checked out. Asks to confirm first.`}
+        aria-label="Integrate"
+        onClick={() => onIntegrateArm(run.run)}
+      >
+        <Icon name="git-merge" size={1} />
+      </button>
+    )
+  }
+  return null
 }
 
 /**

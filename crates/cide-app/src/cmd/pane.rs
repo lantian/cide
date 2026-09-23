@@ -191,6 +191,52 @@ pub fn pane_split(
     })
 }
 
+/// A new closable tab whose one pane shows a run — the MR review's tab. (M85)
+///
+/// The Agents panel opens a run as a row in the project console; a review asked for a tab of
+/// its own. Built here with [`pane_for`] and answered as a [`SplitOutcome`] for the same reason
+/// [`pane_add_row`] is: the frontend records the intent as the pane's spawn plan before the pane
+/// becomes renderable, so it mirrors the run's child rather than spawning a fresh `claude` — the
+/// note on the deleted `agent_open_pane` in `cmd::agents` is why a command never finishes the
+/// pane itself.
+///
+/// Only the two intents that show an existing run. A tab built here around a *new* session
+/// would be `tab_new_claude` with an extra step and a second meaning.
+///
+/// Not `ephemeral`: the pane mirrors a child it does not own, so closing the tab leaves the run
+/// working — stopping it is the Agents panel's — and Ctrl+Shift+T brings the view back.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_new_run(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    title: String,
+    intent: SplitIntent,
+) -> Result<SplitOutcome, CoreError> {
+    if !matches!(
+        intent,
+        SplitIntent::Mirror { .. } | SplitIntent::Continue { .. }
+    ) {
+        return Err(CoreError::Io(
+            "a run's tab shows an existing run: mirror or continue".into(),
+        ));
+    }
+    state.update(|ws| {
+        let name = workspace::project(ws, project)?.name.clone();
+        let fresh = pane_for(&intent, &name);
+        let pane = fresh.id;
+        workspace::open_tab(
+            ws,
+            project,
+            TabKind::ClaudeFull {
+                title,
+                ephemeral: false,
+            },
+            fresh,
+        )?;
+        Ok(SplitOutcome { pane, intent })
+    })
+}
+
 /// A new full-width row holding one pane.
 ///
 /// `after: None` appends at the bottom. `intent: None` asks for the tab's default, which is

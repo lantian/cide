@@ -89,12 +89,21 @@ pub fn spawn(
     let spawned = std::thread::Builder::new()
         .name(format!("cide-events-{run}"))
         .spawn(move || {
+            // The dual mode writes no `result` in a TUI, so the turn's end is recovered from
+            // the stream by a tracker that lives exactly as long as this run's lines — see
+            // `TurnTracker` for the two-hour `Running` it ends. qwen is the only harness that
+            // reports through an event file; one that ever does in another dialect brings its
+            // own tracker here.
+            let mut turns = cide_agents::harness::qwen::TurnTracker::default();
             tap(&app, &registry, run, session, &pty, &path, |line, log| {
-                log.append(line);
-                if let Some((moved, _)) =
-                    registry.observe(Some(&app), session, Observation::Line(line))
-                {
-                    after_transition(&app, &registry, moved);
+                let over = turns.feed(line);
+                for line in std::iter::once(line).chain(over) {
+                    log.append(line);
+                    if let Some((moved, _)) =
+                        registry.observe(Some(&app), session, Observation::Line(line))
+                    {
+                        after_transition(&app, &registry, moved);
+                    }
                 }
             });
             let _ = std::fs::remove_file(&path);

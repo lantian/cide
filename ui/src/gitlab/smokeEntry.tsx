@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { ReviewPanel } from './ReviewPanel'
 import { Discussions } from './Discussions'
+import { Drafts } from './Drafts'
 import { data } from './store'
 import type { Change, MR, Version } from './types'
 const refs = {
@@ -84,10 +85,33 @@ data.set('review', {
   activity: [],
   approval: { approved: false, approved_by: [], approvals_left: 1 },
   approvalError: null,
+  drafts: [
+    {
+      id: 'draft1',
+      review: 'review',
+      severity: 'critical',
+      body: 'This drops the error.',
+      path: change.new_path,
+      oldPath: change.old_path,
+      side: 'new',
+      line: 2,
+      position: {
+        ...refs,
+        position_type: 'text',
+        old_path: change.old_path,
+        new_path: change.new_path,
+        new_line: 2,
+      },
+      headSha: refs.head_sha,
+      author: { label: 'Review !42', harness: 'opencode', run: 'run' },
+      createdUnixMs: 0,
+    },
+  ],
 })
 console.log(
   JSON.stringify({
     panel: renderToStaticMarkup(<ReviewPanel review="review" />),
     discussions: renderToStaticMarkup(<Discussions review="review" />),
+    drafts: renderToStaticMarkup(<Drafts review="review" />),
   }),
 )

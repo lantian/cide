@@ -370,6 +370,73 @@ interface Span {
   readonly end: number
 }
 
+/**
+ * A web link in terminal output, as `pathLinks.ts` draws and opens it.
+ *
+ * `start`/`end` are offsets into the logical line, `end` exclusive — the same coordinates a
+ * [`Candidate`] uses, so one range mapping serves both.
+ */
+export interface UrlCandidate {
+  readonly text: string
+  readonly start: number
+  readonly end: number
+}
+
+/** `http(s)://` and at least one host character. Case-insensitive, like the scheme is. */
+const WEB_URL = /https?:\/\/[^\s'"`<>]+/gi
+
+/**
+ * Every `http(s)://` link in one logical line, trimmed of the prose around it.
+ *
+ * The URL spans [`matchPaths`] skips are exactly the ones this offers, and that is the whole
+ * story of why this exists: until it did, a ctrl+click on `https://host/a/b` in a terminal was
+ * claimed by the click gate, found no path candidate (the URL was skipped), and answered "no
+ * file path under the pointer" — a web link reported as a missing file.
+ *
+ * Only `http`/`https`, unlike `URL_RUN`'s any-scheme shape: that one is about what *not* to
+ * read as a path, this one about what to hand the desktop, and Rust's `app_open_url` refuses
+ * every other scheme anyway.
+ *
+ * Trailing sentence punctuation is dropped (`see https://example.com.`), and so is a closing
+ * bracket with no opener inside the URL, so `(https://example.com)` loses its `)` while
+ * `https://en.wikipedia.org/wiki/Ruby_(gem)` keeps it — the markdown preview's autolink rule.
+ */
+export function matchUrls(logicalLine: string): UrlCandidate[] {
+  const line = logicalLine.length > MAX_LINE ? logicalLine.slice(0, MAX_LINE) : logicalLine
+  const out: UrlCandidate[] = []
+  WEB_URL.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = WEB_URL.exec(line)) !== null) {
+    // Preceded by a scheme character means this is the tail of something longer
+    // (`xhttps://…`, `git+https://…`) — not an http link at all.
+    const before = match.index > 0 ? line.charAt(match.index - 1) : ''
+    if (/[A-Za-z0-9+.-]/.test(before)) continue
+    let text = match[0]
+    for (;;) {
+      const last = text.charAt(text.length - 1)
+      if ('.,;:!?*'.includes(last)) {
+        text = text.slice(0, -1)
+        continue
+      }
+      const open = last === ')' ? '(' : last === ']' ? '[' : last === '}' ? '{' : null
+      if (open !== null && count(text, open) < count(text, last)) {
+        text = text.slice(0, -1)
+        continue
+      }
+      break
+    }
+    if (!/^https?:\/\/[^/]/i.test(text)) continue
+    out.push({ text, start: match.index, end: match.index + text.length })
+  }
+  return out
+}
+
+function count(text: string, ch: string): number {
+  let n = 0
+  for (const c of text) if (c === ch) n++
+  return n
+}
+
 function urlSpans(line: string): Span[] {
   const spans: Span[] = []
   URL_RUN.lastIndex = 0

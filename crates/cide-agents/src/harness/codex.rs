@@ -917,7 +917,8 @@ pub(crate) fn developer_brief(plan: &RunPlan<'_>) -> String {
         }
     };
     say(plan.agent.def.system_prompt.clone());
-    if plan.hook_bin.is_some() {
+    // `&& tracker_paragraphs`: an MR review keeps the bridge and hears none of this (M85).
+    if plan.hook_bin.is_some() && plan.tracker_paragraphs {
         say(tracker_preamble(&CodexHarness));
         if let Some(change) = &plan.change {
             say(spec_preamble(
@@ -1072,6 +1073,7 @@ mod tests {
             choice: None,
             harness: agent.def.harness,
             unattended: Unattended::Ask,
+            tracker_paragraphs: true,
         }
     }
 

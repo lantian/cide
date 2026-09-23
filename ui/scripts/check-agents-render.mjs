@@ -28,6 +28,13 @@
  *    not `disabled` attributes, precisely so a well-meaning "grey it out instead" cannot pass.
  *    `role-queued` is the second way to have none — a run with no session yet — so the absence
  *    is pinned from both of its causes.
+ *  - **Only a finished run with a task offers Integrate, and nothing offers Dispatch.** (M89)
+ *    Integrate moved off the role, where it merged a base branch per-task worktrees had emptied,
+ *    onto the run whose task names the real one; a live run or a task-less one must not carry
+ *    it. Dispatch was removed outright, and a stray one coming back is counted.
+ *  - **Every run says what it is on, and the role spinner turns.** (M89) The harness, model and
+ *    pool line is read off each run row; the role's summary dot is in the spin digest beside the
+ *    run's, because it was drawn still for a milestone with nothing noticing.
  *  - **Every role row carries a Configure, in every story.** The count is compared against the
  *    number of rows rather than asserted positive, because "some rows have one" is the state the
  *    rule exists to make impossible. It is the control offered unconditionally, so the row that
@@ -121,6 +128,11 @@ const ABSENT_SENTENCE = 'No task tracker in this project.'
  */
 const INTEGRATE = 'Integrate'
 const INTEGRATE_CONFIRM = 'Confirm merge'
+/*
+ * Since M89 both Integrate halves and Configure are marks with no text, so the assertions reach
+ * them through their accessible names (`labels` in the digest) — which is where a screen reader
+ * reads them, and so exactly the words that must not drift.
+ */
 
 /*
  * The empty screen's one control, as its rendered text.
@@ -261,7 +273,7 @@ try {
       'with a mark in the dot column — an empty cell reads as a rendering fault',
     )
     ok(
-      d.dispatches > 0,
+      d.configures > 0,
       'the story really was given handlers, so the zeroes above are the gate holding rather ' +
         'than nothing being wired',
     )
@@ -325,11 +337,10 @@ try {
       queued?.opens,
       0,
       'and renders NO Open element: there is no session to attach a pane to, and nothing on ' +
-        'the row could change that. Not a disabled button — the control that changes this is ' +
-        'Dispatch, on the same row',
+        'the row could change that. Not a disabled button — what changes it is the run starting',
     )
     eq(d.opens, 0, 'and none anywhere else in the document either')
-    ok(d.dispatches > 0, 'the story really was given handlers')
+    ok(d.configures > 0, 'the story really was given handlers')
     ok(
       d.rows?.[0]?.includes('t-15'),
       'the queued line still links its task — a run nothing can account for is the state most ' +
@@ -388,7 +399,7 @@ try {
     for (const [name, d] of Object.entries(agents)) {
       for (const role of d.roles ?? []) {
         ok(
-          role.buttons.includes('Configure'),
+          role.configures === 1 && role.labels.some((l) => l.startsWith('Configure ')),
           `${name}/${role.id}: every role row carries Configure — it is the control you reach ` +
             'for when the role itself is what is wrong, so the states it must not be missing ' +
             'in are exactly the broken ones',
@@ -403,10 +414,11 @@ try {
     }
     const un = a('role-unavailable')
     const artist = un.roles?.find((r) => r.id === 'artist')
-    ok(
-      artist?.buttons.includes('Configure') && !artist?.buttons.includes('Dispatch'),
-      'the role whose harness is missing carries Configure and NOT Dispatch: it cannot be run, ' +
-        'and it is the one somebody most wants to open the settings for',
+    eq(
+      artist?.configures,
+      1,
+      'the role whose harness is missing carries Configure: it cannot be run, and it is the one ' +
+        'somebody most wants to open the settings for',
     )
     eq(
       artist?.reason,
@@ -417,21 +429,50 @@ try {
   }
 
   /*
-   * Never both, never neither, per role row.
+   * ===== Dispatch is gone, and its refusal is not. ========================================= (M89)
+   *
+   * The button dispatched against whatever the Tasks board had selected and refused with a toast
+   * otherwise — nearly always. Work reaches a role by assignment now. What survives is
+   * `canDispatch`'s sentence, which is the only place a broken role says why nothing assigned to
+   * it will start: drawn exactly when the model refuses, and never as an empty paragraph.
    */
   {
+    for (const [name, d] of Object.entries(agents)) {
+      ok(
+        !(d.labels ?? []).some((l) => /^Dispatch\b/.test(l)),
+        `${name}: no Dispatch control anywhere — it came back`,
+      )
+    }
     const d = a('role-unavailable')
     eq(d.roles?.length, 3, 'three roles, including the one whose harness is missing')
-    for (const role of d.roles ?? []) {
-      if (role.buttons.includes('Dispatch')) {
-        eq(role.reason, '', `${role.id}: a dispatchable role carries the button and no sentence`)
-      } else {
-        ok(role.reason.length > 0, `${role.id}: a refused role carries the sentence saying why`)
-      }
-    }
     ok(
-      d.roles?.some((r) => r.reason !== '') && d.roles?.some((r) => r.buttons.includes('Dispatch')),
-      'and the fixture really does exercise both halves',
+      d.roles?.some((r) => r.reason !== '') && d.roles?.some((r) => r.reason === ''),
+      'a refused role says why and a sound one draws no sentence at all — both halves exercised',
+    )
+    eq(
+      a('roles-resting').roles?.map((r) => r.reason),
+      ['', ''],
+      'two sound, resting roles carry no refusal paragraph',
+    )
+  }
+
+  /*
+   * ===== The role's description is the name's tooltip. ===================================== (M89)
+   *
+   * It was a paragraph on every row. It is a hover now, led by the id — which is what a task's
+   * assignee spells — so the paragraph must be gone from the text and present in the title.
+   */
+  {
+    const d = a('roles-resting')
+    const dev = d.roles?.find((r) => r.id === 'developer')
+    ok(
+      dev?.nameTitle.startsWith('developer — ') && dev.nameTitle.length > 'developer — '.length,
+      `the name's title leads with the id and carries the description: ${dev?.nameTitle}`,
+    )
+    const desc = dev?.nameTitle.slice('developer — '.length) ?? ''
+    ok(
+      desc !== '' && !d.text?.includes(desc),
+      'and the description is no longer printed on the row',
     )
   }
 
@@ -475,10 +516,7 @@ try {
     // A badged row is an ordinary row in every other respect. If it were not, this is where it
     // would show: the subagents dispatch, take Configure, and refuse nothing.
     for (const role of badged) {
-      ok(
-        role.buttons.includes('Dispatch') && role.buttons.includes('Configure'),
-        `${role.id}: a subagent row is dispatchable and configurable like any other`,
-      )
+      eq(role.configures, 1, `${role.id}: a subagent row is configurable like any other`)
       eq(role.reason, '', `${role.id}: and refuses nothing`)
     }
   }
@@ -583,9 +621,8 @@ try {
     ok(ghost !== undefined, 'a run whose role file was deleted still gets a row, invented from it')
     eq(ghost?.runs, 1, 'with its line on screen')
     eq(ghost?.opens, 1, 'openable, because there is a session and a child behind it')
-    ok(!ghost?.buttons.includes('Dispatch'), 'and not dispatchable — there is no definition')
     ok(ghost?.reason.includes('.cide/agents/'), 'refused with a sentence naming where roles live')
-    ok(ghost?.buttons.includes('Configure'), 'and it carries Configure, like every other row')
+    eq(ghost?.configures, 1, 'and it carries Configure, like every other row')
   }
 
   /*
@@ -754,7 +791,6 @@ try {
       'never both at once: a header offering Pause and Resume side by side asks a user whose ' +
         'console is already frozen to work out which half applies to them',
     )
-    eq(d.dispatches, 0, 'and a shut queue refuses every dispatch, with canDispatch’s sentence')
     ok(
       d.roles?.every((r) => r.reason === 'The dispatch queue is paused.'),
       '...on every role row, in as many words',
@@ -794,7 +830,6 @@ try {
       ['none', 'none'],
       'and every role row is resting, which is exactly why the flag has to be read',
     )
-    eq(d.dispatches, 0, 'the queue is shut, so no role offers a dispatch either')
   }
 
   /*
@@ -844,7 +879,6 @@ try {
         'The `agents.pause` palette row still carries it',
     )
     eq(d.rows, [], 'nothing running')
-    eq(d.dispatches, 2, 'and both roles offer a dispatch')
     eq(d.meta, '0', 'a checked, idle roster may say zero — it looked')
   }
 
@@ -904,33 +938,96 @@ try {
    */
   {
     const un = a('integrate-unarmed')
-    ok(
-      un.buttons?.includes(INTEGRATE),
-      'every role offers Integrate — a role branch outlives its runs, and the panel cannot know ' +
-        'what is on one without asking',
+    eq(
+      un.integrates,
+      ['r-0005'],
+      'Integrate is offered on exactly the finished run with a task — `cide/qa-t-15` — and not on ' +
+        'the live run (still writing its branch) nor the task-less failure (it minted no branch)',
     )
     ok(
-      !un.buttons?.includes(INTEGRATE_CONFIRM),
-      'and an unarmed role does NOT carry the confirming label: one press arms, it does not merge',
+      !un.labels?.includes(INTEGRATE_CONFIRM),
+      'and an unarmed run does NOT carry the confirming label: one press arms, it does not merge',
     )
     ok(
-      un.roles?.every((r) => r.buttons.includes(INTEGRATE)),
-      '...on every row, including the ones that are doing nothing at all',
+      un.roles?.every((r) => !r.labels.includes(INTEGRATE)),
+      'and no role row carries it any more — a role alone names the base branch, which per-task ' +
+        'worktrees left empty',
     )
 
     const armed = a('integrate-armed')
     ok(
-      armed.buttons?.includes(INTEGRATE_CONFIRM),
-      'an armed role asks to confirm, in a word — this is the press that rewrites the branch the ' +
-        'user has checked out, and a bare glyph is not consent',
+      armed.labels?.includes(INTEGRATE_CONFIRM),
+      'an armed run asks to confirm, in its accessible name — this is the press that rewrites the ' +
+        'branch the user has checked out',
     )
     eq(
-      armed.roles?.filter((r) => r.buttons.includes(INTEGRATE_CONFIRM)).length,
-      1,
-      'exactly one row is armed: arming is single-valued, so a second press cannot land on a ' +
-        'role the user never named',
+      armed.integrateConfirms,
+      ['r-0005'],
+      'exactly the armed run is confirming: arming is single-valued and keyed by run, so a second ' +
+        'press cannot land on a run the user never named',
     )
+    eq(armed.integrates, [], 'and it shows the confirming half instead of, not beside, the first')
     eq(armed.unclassed, 0, 'the armed control names only classes its stylesheet defines')
+  }
+
+  /*
+   * ===== What a run is on. ================================================================= (M89)
+   *
+   * Read off the run by Rust (`AgentRun::model`, `pool_position`), never off the role file. The
+   * pooled story is the one that matters: a failover moved it to the pool's second entry, and
+   * before this line nothing on the panel said so.
+   */
+  {
+    const d = a('role-pooled')
+    ok(
+      d.using?.includes('opencode · zai/glm-4.6 · pool fast entry 2 of 3'),
+      `a pooled run names its harness, provider/model and pool position: ${JSON.stringify(d.using)}`,
+    )
+    ok(
+      a('role-running').using?.includes('claude · opus'),
+      'a run with one chosen model names it, and no pool',
+    )
+    const h = a('history')
+    ok(
+      h.using?.includes('opencode · zai/glm-4.6 · pool fast entry 1 of 3') &&
+        h.using?.includes('claude · sonnet'),
+      `History rows say the same for runs that have ended: ${JSON.stringify(h.using)}`,
+    )
+    for (const [name, story] of Object.entries(agents)) {
+      eq(
+        story.using?.length,
+        story.rows?.length,
+        `${name}: every run row — live or ended — carries exactly one "what it is on" line`,
+      )
+    }
+  }
+
+  /*
+   * ===== Agents | History. ================================================================= (M89)
+   *
+   * Both panels are always in the markup and the inactive one carries `hidden` — so every story
+   * above still sees History's rows, and this is where the tab itself is pinned.
+   */
+  {
+    const r = a('role-running')
+    eq(
+      r.tabs,
+      ['agents|true|Agents 2', 'history|false|History 0'],
+      'two tabs, the Agents one pressed by default, each carrying its count',
+    )
+    eq(r.hiddenPanels, ['history'], 'and History is in the markup but hidden')
+
+    const h = a('history')
+    eq(
+      h.tabs,
+      ['agents|false|Agents 2', 'history|true|History 2'],
+      'choosing History presses it, and its count is the ended runs',
+    )
+    eq(h.hiddenPanels, ['agents'], 'and hides the Agents panel instead')
+
+    const e = a('history-empty')
+    ok(e.text?.includes('No run has ended yet.'), 'an empty History says so rather than going blank')
+    eq(a('disabled').tabs, [], 'and a screen with no roster to list draws no tabs')
   }
 
   // =============================================================== the Tasks panel ========
@@ -1479,14 +1576,14 @@ try {
     }
     eq(
       empty.composeStatuses,
-      ['todo|true', 'doing|false', 'review|false', 'done|false'],
-      'the status segment offers all four and starts on `todo` — `EMPTY_DRAFT`’s value, and not ' +
+      ['inbox|false', 'todo|true', 'doing|false', 'review|false', 'done|false'],
+      'the status segment offers all five (the inbox since M83) and starts on `todo` — `EMPTY_DRAFT`’s value, and not ' +
         'the filter the list happens to be on: a status the user did not choose is one they will ' +
         'not notice, in a file their repository tracks',
     )
     eq(
       filled.composeStatuses,
-      ['todo|false', 'doing|true', 'review|false', 'done|false'],
+      ['inbox|false', 'todo|false', 'doing|true', 'review|false', 'done|false'],
       'and a draft that named one is drawn on it. This is the field `TaskNew::status` was added ' +
         'for, so a user starting work now says so in one write instead of two',
     )
@@ -2038,8 +2135,8 @@ try {
     const all = t('list')
     eq(
       all.filters,
-      ['All|true', 'Doing|false', 'Review|false', 'Todo|false', 'Done|false'],
-      'the filter is a row of toggles — All, then the four statuses in GROUP_ORDER so the ' +
+      ['All|true', 'Doing|false', 'Review|false', 'Todo|false', 'Inbox|false', 'Done|false'],
+      'the filter is a row of toggles — All, then the five statuses in GROUP_ORDER so the ' +
         'buttons sit in the order of the headings beneath them — with All on when nothing is ' +
         'filtered, because "all" is the absence of a filter rather than a fifth status',
     )
@@ -2093,7 +2190,7 @@ try {
     ok(none.buttons?.includes('Show all tasks'), 'with a way back out in the sentence’s own row')
     eq(
       none.filters?.length,
-      5,
+      6,
       'and the filter row itself is still drawn — a filter that hid its own control when it ' +
         'matched nothing would leave the user no way back to their tasks',
     )
@@ -2157,7 +2254,7 @@ try {
       'the header figure does not follow the search, for the filter’s reason: it names the ' +
         'tracker, not the slice being read',
     )
-    eq(hit.filters?.length, 5, 'the filter row is still drawn — the two narrowings compose')
+    eq(hit.filters?.length, 6, 'the filter row is still drawn — the two narrowings compose')
     eq(hit.searchValue, 'Retry', 'the box holds what was typed')
     eq(hit.searchClear, true, 'and with text in it, the clear control exists')
 

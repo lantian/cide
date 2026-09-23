@@ -531,6 +531,23 @@ pub struct AgentRun {
     ///
     /// What Open then does is a second question with three answers — see [`RunOpen`].
     pub openable: bool,
+    /// The model this run is on, `provider/model` where the harness spells it that way. (M89)
+    ///
+    /// **The run's, never the role file's.** After a local override or a pool failover the file
+    /// names what the *next* dispatch would get; this names what the child was actually told,
+    /// resolved by the same ladder as [`LogRunInfo::model`] so the panel's row and the log card
+    /// never disagree. `None` where nothing chose one and the harness picked its own default —
+    /// the row then draws the harness alone rather than guessing a name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The pool that chose [`Self::model`] and how far down it the run is — `fast entry 2 of 3`.
+    /// (M89) `None` for a run with no pool, which is every harness but opencode today.
+    ///
+    /// A field rather than the sentence it used to be inside [`Self::note`]: a pool is the
+    /// standing fact of what the run is on, and a note is for events. A row that has to parse
+    /// prose to learn its model is a row that breaks on the next rewording.
+    #[serde(default)]
+    pub pool_position: Option<String>,
 }
 
 /// What pressing **Open** on a run should do, as `agents_run_open` answers it. (M42)
@@ -682,11 +699,9 @@ pub struct OrchestrationConfig {
     /// What the spun run is told. Empty means *use the one cide ships*, decided in
     /// `AgentsConfig::spin_prompt` and never here.
     pub auto_spin_prompt: String,
-    /// cide reads the spun run's plan approval off its screen and answers it. (M79)
-    ///
-    /// `cide_agents::config::AgentsConfig::auto_spin_accept_plan` carries the argument, including
-    /// why this is not the blind write the stop code refuses.
-    pub auto_spin_accept_plan: bool,
+    /// What a reviewer tab is told, as a template with `{placeholders}`. Empty means *use the
+    /// one cide ships*, decided in `AgentsConfig::review_prompt_template`. (M84)
+    pub review_prompt: String,
 }
 
 impl Default for OrchestrationConfig {
@@ -702,7 +717,7 @@ impl Default for OrchestrationConfig {
             auto_spin: false,
             auto_spin_after_secs: 900,
             auto_spin_prompt: String::new(),
-            auto_spin_accept_plan: true,
+            review_prompt: String::new(),
         }
     }
 }
@@ -740,8 +755,9 @@ pub struct OrchestrationPatch {
     /// typed into a terminal, where a newline is another Enter.
     #[ts(optional)]
     pub auto_spin_prompt: Option<String>,
+    /// Flattened to one line by `AgentsConfig::apply`, `auto_spin_prompt`'s reason.
     #[ts(optional)]
-    pub auto_spin_accept_plan: Option<bool>,
+    pub review_prompt: Option<String>,
 }
 
 /// Dispatch one run. Inbound.
@@ -1177,6 +1193,41 @@ pub enum AgentSaveOutcome {
 ///
 /// So the frontend must never treat this as a closed set. `check-settings-agents.mjs` asserts
 /// `model` is not a closed vocabulary and the box stays typable beside the menu; this type only
+/// What a custom provider's server said about one model's limits. (M88)
+///
+/// A verdict, for [`LlmModelTest`]'s reason one type down: the Settings row draws either
+/// outcome as a sentence, and "this server does not say" is an ordinary answer rather than
+/// cide failing.
+///
+/// # Why cide asks at all
+///
+/// opencode reads a custom model's window only from its configuration: it never asks an
+/// OpenAI-compatible server, so a model declared without `limit.context` runs with no
+/// compaction threshold at all. The server very often *knows* — vLLM and SGLang put
+/// `max_model_len` on `/v1/models`, llama.cpp's `/props` states the `n_ctx` it was started
+/// with, LM Studio's `/api/v0/models` the loaded context — so the row can be filled from the
+/// one place that cannot be wrong about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LlmLimitsProbe {
+    /// The provider and model asked about, echoed so a late answer cannot land on a row the user
+    /// has since retyped.
+    pub provider: String,
+    pub model: String,
+    /// The context window in tokens, or `0` when the server did not say.
+    pub context: u32,
+    /// The output ceiling in tokens, or `0` when neither the server said nor a context was found
+    /// to estimate one from.
+    pub output: u32,
+    /// `true` when [`Self::output`] is cide's estimate rather than the server's figure — almost
+    /// always, since few servers state one. opencode refuses a context without an output, so a
+    /// row filled with only the window would be a row it rejects.
+    pub output_estimated: bool,
+    /// One whole sentence: where the numbers came from, or why there are none.
+    pub detail: String,
+}
+
 /// Whether one provider/model actually answered, run for real. (M45)
 ///
 /// A verdict and not a `Result` on the wire, for `AgentModels::problem`'s reason: the frontend
@@ -1195,6 +1246,190 @@ pub struct LlmModelTest {
     /// One whole sentence, either way. The failure half is the provider's own words where there
     /// were any — see `cide_agents::harness::opencode`'s `error_sentence`.
     pub detail: String,
+}
+
+/// Why a provider refused a run, as the pool-state card draws it. (M90)
+///
+/// The wire twin of `cide_agents::FailoverReason`, which is not serialisable and lives in a crate
+/// this one must not depend on. Three cases for the same reason that enum gives: each is a
+/// different something a different candidate plausibly routes around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PoolRefusal {
+    RateLimited,
+    Unreachable,
+    Auth,
+}
+
+/// A pool target every run's admission is currently steering around. (M90)
+///
+/// **Machine-wide and in memory.** One refusal benches the *target* — provider, model and
+/// variant, `PoolEntry::same_target` — for every pool that names it and every project, because
+/// that is what the refusal was about: a local server that is not running is not running for
+/// anyone. Not persisted, because a restart is exactly the moment a user has usually fixed the
+/// thing that refused, and a bench that outlived it would be a claim about a process that is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolBench {
+    pub reason: PoolRefusal,
+    #[ts(type = "number")]
+    pub since_unix_ms: u64,
+    /// When admission stops steering around it by itself. Reset ends it sooner.
+    #[ts(type = "number")]
+    pub until_unix_ms: u64,
+    /// The run whose refusal benched it, and that run's label — so the card can say *who* found
+    /// out, which is usually the question after "why is it skipped".
+    pub run: RunId,
+    pub agent_label: String,
+}
+
+/// Why admission passed over one entry on its way to the one a run started on. (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum PoolSkip {
+    /// At its `maxRunning`, counted across every project.
+    Full { running: u32, max: u16 },
+    /// Benched by an earlier refusal. See [`PoolBench`].
+    Benched {
+        reason: PoolRefusal,
+        #[ts(type = "number")]
+        until_unix_ms: u64,
+    },
+}
+
+/// One entry passed over, and why. (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolSkipped {
+    pub entry: crate::llm::PoolEntry,
+    /// Zero-based position in the run's own list.
+    pub index: u16,
+    pub skip: PoolSkip,
+}
+
+/// Something a pool did, for the card's "recent decisions". (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum PoolEventKind {
+    /// A run was admitted onto `entry`, having passed over `skipped` — empty when it got the
+    /// first entry it was allowed to try. `benchedFallback` is the case where every entry with
+    /// room was benched and admission tried one anyway rather than wait on a timer.
+    Started {
+        entry: crate::llm::PoolEntry,
+        index: u16,
+        of: u16,
+        skipped: Vec<PoolSkipped>,
+        benched_fallback: bool,
+    },
+    /// A provider refused a run on `entry`, which benched it.
+    Refused {
+        entry: crate::llm::PoolEntry,
+        reason: PoolRefusal,
+        #[ts(type = "number")]
+        until_unix_ms: u64,
+    },
+    /// A person reset one target's bench, or every bench (`entry` of `None`), and how many
+    /// waiting runs that moved back up their list.
+    Reset {
+        entry: Option<crate::llm::PoolEntry>,
+        rewound: u32,
+    },
+}
+
+/// One line of the pool log. (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolEvent {
+    #[ts(type = "number")]
+    pub at_unix_ms: u64,
+    /// The pool the run was on, where there was one and it had a name.
+    pub pool: Option<String>,
+    pub run: Option<RunId>,
+    pub agent_label: Option<String>,
+    pub project: Option<ProjectId>,
+    pub kind: PoolEventKind,
+}
+
+/// A run standing on, or waiting for, a pool target. (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolRunRef {
+    pub run: RunId,
+    pub agent_label: String,
+    pub project: ProjectId,
+    pub state: RunState,
+    /// `2 of 6`, as the run's own row says it.
+    pub position: String,
+    /// The row's sentence — why a waiting run is waiting, or what its last failover was.
+    pub note: Option<String>,
+}
+
+/// Whether the provider an entry names can be used at all. (M90)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PoolProviderState {
+    Ready,
+    /// Configured and switched off. Runs never get this entry — `overrides::resolve` drops it.
+    Disabled,
+    /// No provider with this id is configured. **Kept** — it may be one of the CLI's own logins,
+    /// which cide cannot see — but if it is a typo, every run placed on it fails over.
+    Missing,
+}
+
+/// One entry of one configured pool, as it stands right now. (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolEntryState {
+    pub entry: crate::llm::PoolEntry,
+    pub provider: PoolProviderState,
+    /// Slot-holding runs on this target in every project — what `maxRunning` is a ceiling on.
+    pub running: u32,
+    pub runs: Vec<PoolRunRef>,
+    /// `None` when admission is not steering around it.
+    pub bench: Option<PoolBench>,
+}
+
+/// One configured pool. (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolState {
+    pub name: String,
+    pub description: String,
+    pub entries: Vec<PoolEntryState>,
+}
+
+/// Everything the pool-state card draws, read in one lock. (M90)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolStateReport {
+    /// The backend's clock at the read, so a countdown is computed against it rather than a
+    /// webview clock that may disagree by seconds.
+    #[ts(type = "number")]
+    pub now_unix_ms: u64,
+    pub pools: Vec<PoolState>,
+    /// Queued runs with a pool, in dispatch order — the ones a Reset can move.
+    pub waiting: Vec<PoolRunRef>,
+    /// Newest first.
+    pub events: Vec<PoolEvent>,
 }
 
 /// makes the common case one click.
@@ -1300,7 +1535,7 @@ pub struct LogRunInfo {
     /// never as a blank: a blank beside a label reads as a broken dialog (`TaskDetailPending`'s
     /// rule).
     pub model: Option<String>,
-    /// How far down its pool this run has fallen, as `2 of 3`, or `None` for a run with no
+    /// How far down its pool this run has fallen, as `entry 2 of 3`, or `None` for a run with no
     /// pool. The model above is *this* candidate, so without the position a failover is
     /// invisible — the card would simply name a model nobody chose.
     pub pool_position: Option<String>,
@@ -1393,6 +1628,8 @@ mod tests {
             stale_turn: true,
             note: None,
             openable: false,
+            model: None,
+            pool_position: None,
         };
         let json = serde_json::to_string(&run).expect("serialize");
         // snake_case on both sides would round-trip happily and read `undefined` in the webview.

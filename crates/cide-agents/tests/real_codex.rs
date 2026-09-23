@@ -83,6 +83,7 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         harness: agent.def.harness,
         // The project default: a bypassed sandbox, which is what a task run gets.
         unattended: cide_agents::config::Unattended::Bypass,
+        tracker_paragraphs: true,
     }
 }
 

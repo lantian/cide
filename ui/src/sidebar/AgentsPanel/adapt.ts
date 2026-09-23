@@ -180,6 +180,8 @@ function run(from: WireRun): RunView {
     staleTurn: from.staleTurn,
     note: from.note,
     openable: from.openable,
+    model: from.model,
+    poolPosition: from.poolPosition,
   }
 }
 

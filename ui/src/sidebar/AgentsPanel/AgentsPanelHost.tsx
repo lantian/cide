@@ -42,11 +42,9 @@
  * dispatch is actually looking at. The interval only exists while this panel is mounted, and
  * the render it causes is over a list bounded by the concurrency ceiling plus `RECENT_CAP`.
  *
- * # All seven run actions are passed now
+ * # All six run actions are passed now
  *
- * `onDispatch`, `onStop` and `onOpen` were wired first: there is a registry behind them, and
- * `AgentDef.unavailable` is `null` for a sound role, so `canDispatch` returns a green light and
- * the view draws a Dispatch button that has to work.
+ * `onStop` and `onOpen` were wired first: there is a registry behind them.
  *
  * `onPause`, `onResume`, `onRetryTurn` and `onAckStaleTurn` join them, because the four
  * commands behind them exist and are tested. The rule that held them back has not changed and
@@ -86,27 +84,21 @@
  * pane, and it reaches the scope from a window whose sidebar is showing some other panel
  * entirely, or none.
  *
- * # Which task a dispatch is against, and the sentence when there is none
+ * # There is no Dispatch here any more (M89)
  *
- * `DispatchRequest.task` is optional on the wire and this panel fills it anyway: a run with no
- * task draws no chip on any row, leaves no trace once it has exited, and puts a hole in the
- * record of what the agents did that afternoon. The Tasks panel's current selection is the
- * answer — read off `useTasks.getState()` rather than subscribed to, because nothing here
- * *draws* the selection and a subscription would re-render the whole panel every time somebody
- * clicked a row in the other one.
+ * The role row used to carry one, and it dispatched against whatever task was selected on the
+ * Tasks board — refusing with a toast when nothing was, which was nearly always, because the two
+ * panels are rarely on screen together. Work reaches a role by being assigned, and every road to
+ * that (the board's assignee, `cide_task_assign`, an @mention) names its task. `useAgents.dispatch`
+ * stays in the store for the callers that have one.
  *
- * With nothing selected the dispatch is **refused with a sentence naming the Tasks panel**,
- * rather than sent as an ad-hoc run. Those are the two honest options; the third — silently
- * dispatching against nothing — is the one that produces the unaccountable run this design
- * spends a field avoiding.
+ * # Integrate names a run now, and the run names the task
  *
- * The intended gesture is smaller than a refusal: an inline row under the role listing the open
- * tasks, plus a one-line instruction, dismissible with Escape. It is not here because it needs
- * a prop `AgentsPanelViewProps` does not have — this slice does not own `AgentsPanel.tsx`. What
- * that view needs is a `dispatchFor?: string | null` (which role's form is open, `null` for
- * none) plus `onDispatchFormOpen?: (agent: string) => void` and
- * `onDispatchSubmit?: (agent: string, task: string, prompt: string) => void`, with `onDispatch`
- * becoming the form-opening gesture rather than the send. Until then, this.
+ * The control moved from the role row to a finished run in History, because the branch a task's
+ * work lives on is `cide/<role>-<task>` and only the run knows both halves. The view hands back a
+ * run id; this host looks the run up in the roster it already holds and passes its agent and
+ * task to `useAgents.integrate` — never a role alone, which would reach the base branch that
+ * per-task worktrees left empty.
  */
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { fsReveal, type ProjectId } from '@/ipc/client'
@@ -114,21 +106,10 @@ import { notify, notifyFailure } from '@/chrome/notices'
 import { useAgents } from '@/sidebar/agentsStore'
 import { useTasks } from '@/sidebar/tasksStore'
 import { revealTask } from '@/chrome/taskReveal'
-import { AgentsPanelView } from './AgentsPanel'
+import { AgentsPanelView, type AgentsTab } from './AgentsPanel'
 
 /** How often elapsed times are recomputed. See the header for why it is not 30 s. */
 const TICK_MS = 1_000
-
-/**
- * What a Dispatch press says when no task is selected.
- *
- * It names the panel and the gesture, because "select a task first" is only actionable if the
- * reader knows where tasks are selected — and the Tasks panel may not even be the view on
- * screen when this is read.
- */
-const NO_TASK_SELECTED =
-  'Select a task in the Tasks panel first. A run is always dispatched against one, so the ' +
-  'board can account for what the agent did.'
 
 export interface AgentsPanelProps {
   /** The active project, or `null` — in a detached-pane window, and before one is open. */
@@ -147,7 +128,6 @@ export const AgentsPanel = memo(AgentsPanelImpl)
 function AgentsPanelImpl({ project }: AgentsPanelProps) {
   const roster = useAgents((s) => s.roster)
   const enable = useAgents((s) => s.enable)
-  const dispatch = useAgents((s) => s.dispatch)
   const stop = useAgents((s) => s.stop)
   const pause = useAgents((s) => s.pause)
   const resume = useAgents((s) => s.resume)
@@ -199,7 +179,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
   )
 
   /*
-   * Which role's Integrate is armed, or `null`.
+   * Which run's Integrate is armed, or `null`.
    *
    * A merge into the branch the user has checked out is the one gesture in this panel that
    * changes their own working tree rather than an agent's, so it is confirm-on-second-click —
@@ -213,6 +193,14 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
    * showing the same project should not find its Integrate armed because somebody armed one here.
    */
   const [integrateArmed, setIntegrateArmed] = useState<string | null>(null)
+
+  /*
+   * Which tab each project was left on. Per project, because the panel is the same component
+   * across a project switch and a History left open on one project is not a statement about the
+   * next; host state for `integrateArmed`'s reason — it is what this window is looking at.
+   */
+  const [tabs, setTabs] = useState<Readonly<Record<string, AgentsTab>>>({})
+  const tab: AgentsTab = project === null ? 'agents' : (tabs[project] ?? 'agents')
 
   /*
    * Disarm whenever the roster moves. A button armed against a roster that has since changed is
@@ -233,18 +221,21 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
    * one that did not fire.
    */
   const integrate = useCallback(
-    (agent: string) => {
+    (runId: string) => {
       setIntegrateArmed(null)
+      const run = roster.kind === 'ready' ? roster.runs.find((r) => r.run === runId) : undefined
+      // The view only draws the control on a finished run with a task, so both are here; a run
+      // that left the roster between the two clicks is disarmed by the effect above before this
+      // can be reached. Refusing rather than merging the role's base branch is the point.
+      if (run === undefined || run.task === null) return
+      const agent = run.agent
+      const branch = `cide/${agent}-${run.task}`
       void useAgents
         .getState()
-        .integrate(agent)
+        .integrate(agent, run.task)
         .then((done) => {
-          // All three carry the project: an integrate is a merge over a real repository and
-          // takes as long as it takes, so its answer routinely arrives after the user has
-          // moved on — and a merge report shown over a different repository is worse than one
-          // shown late.
           if (done.kind === 'upToDate') {
-            notify(`${agent} has nothing to integrate — its branch holds no new commits.`, {
+            notify(`${branch} has nothing to integrate — it holds no new commits.`, {
               kind: 'warn',
               project,
             })
@@ -252,13 +243,13 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
           }
           if (done.kind === 'merged') {
             const n = done.files === 1 ? '1 file' : `${done.files} files`
-            notify(`Integrated ${agent}: ${n} at ${done.commit.slice(0, 8)}.`, {
+            notify(`Integrated ${branch}: ${n} at ${done.commit.slice(0, 8)}.`, {
               kind: 'ok',
               project,
             })
             return
           }
-          notify(`${agent} conflicts with your branch — nothing was merged.`, {
+          notify(`${branch} conflicts with your branch — nothing was merged.`, {
             kind: 'error',
             project,
             hint: 'Your checkout is untouched. Resolve on the agent’s branch, or open its pane and ask it to.',
@@ -267,7 +258,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
         })
         .catch((reason: unknown) => notifyFailure(reason, { project }))
     },
-    [project],
+    [project, roster],
   )
 
   /*
@@ -309,23 +300,6 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
       {...(project === null
         ? {}
         : {
-            /*
-             * Dispatch: always against a task, never against nothing. See the header.
-             *
-             * The refusal is a `notifyFailure` rather than a disabled button, because the
-             * button is not what is missing — the role really is dispatchable, and the thing
-             * that is absent is a decision the user has not made yet. A control greyed out for
-             * a reason that lives in another panel is precisely the state `canDispatch` exists
-             * to keep off this screen.
-             */
-            onDispatch: (agent: string) => {
-              const task = useTasks.getState().selected
-              if (task === null) {
-                notifyFailure(NO_TASK_SELECTED)
-                return
-              }
-              guarded(dispatch(agent, task))
-            },
             /*
              * Stop and Open both act on a run id the row was drawn from, and both are gated by
              * the view on top of the handler being present — `canStop` is "not a done phase",
@@ -390,15 +364,14 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
             onConfigure: (agent: string) => guarded(configure(agent)),
             onConfigureAll: () => guarded(configure()),
             /*
-             * Integrate is a *role* action, not a run action — it merges a branch, which outlives
-             * every run that wrote to it. It is offered whatever the role's runs are doing, and
-             * `upToDate` is the honest answer when there is nothing on the branch: the panel does
-             * not know what a role's worktree holds, and a button that pretended to would be
-             * predicting from data it does not have.
+             * Integrate is a finished *run's* action since M89 — see the header. The view draws
+             * it only on a run with a task, and `integrate` looks that run up by id.
              */
             integrateArmed,
-            onIntegrateArm: (agent: string) => setIntegrateArmed(agent),
+            onIntegrateArm: (run: string) => setIntegrateArmed(run),
             onIntegrate: integrate,
+            tab,
+            onTab: (next: AgentsTab) => setTabs((all) => ({ ...all, [project]: next })),
           })}
       /*
        * The agent→task link: selecting the task is the whole gesture now. `TaskDetailHost` is

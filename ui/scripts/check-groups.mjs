@@ -334,6 +334,43 @@ try {
       'palette row that scrolls nowhere and says nothing is the defect this file is about',
   )
 
+  // --- where the project ends ---------------------------------------------------------------
+  //
+  // *Project Notes* sat under `rust-toolchain.toml` in the same face and read as a repository
+  // file. The boundary is keyed on `root`, because a kind rule fires twice: with *External
+  // Libraries* expanded, the row above *Scratches* is a crate's `file`, indistinguishable by kind
+  // from a project file.
+
+  const P = 0 // a project row's root index
+  const N = g.NO_ROOT
+  eq(N, 65535, '`NO_ROOT` is `cide_ipc::fs::NO_ROOT` (`u16::MAX`) verbatim')
+  ok(g.opensSyntheticSection(N, P), 'the first synthetic row after a project row opens the section')
+  ok(g.opensSyntheticSection(N, 3), '… after a row of any root, in a multi-root project')
+  ok(!g.opensSyntheticSection(N, N), 'a synthetic row after a synthetic row does not — ' +
+    'including *Scratches* under an expanded *External Libraries*, whose last child is a `file`')
+  ok(!g.opensSyntheticSection(P, P), 'a project row never does')
+  ok(!g.opensSyntheticSection(P, N), 'nor does a project row after a synthetic one')
+  ok(!g.opensSyntheticSection(N, undefined), 'the first row, or an unfetched neighbour, draws no line')
+
+  // Comments stripped: the prose around these calls names the needles.
+  const code = tree.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+  ok(
+    /opensSyntheticSection\(\s*row\.root,\s*useFileTree\.getState\(\)\.rowAt\(toReal\(item\.index\) - 1\)\?\.root/.test(code),
+    '`FileTree` asks `opensSyntheticSection` with the REAL previous row, not the virtual one ' +
+      '(a draft row shifts every index below it by one)',
+  )
+  ok(/section \? styles\.rowSection/.test(code), 'and `Row` draws `rowSection` from it')
+  ok(
+    /row\.kind === 'group' \|\| row\.kind === 'pin' \? styles\.rowGroup/.test(code),
+    'the *Project Notes* pin is drawn in the headers\' quieter shade, not as a project file',
+  )
+  const css = readFileSync('src/sidebar/FileTree.module.css', 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+  ok(
+    /\.rowSection::before\s*\{[^}]*position:\s*absolute/.test(css) && !/\.rowSection\s*\{/.test(css),
+    'the hairline is an absolutely-placed pseudo-element, never a border or margin on the row ' +
+      'itself — every row is exactly `rowHeight` and placed at `index * rowHeight`',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)

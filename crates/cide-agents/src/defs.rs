@@ -613,6 +613,52 @@ impl LoadedAgent {
     pub fn is_available(&self) -> bool {
         self.def.unavailable.is_none()
     }
+
+    /// The role a merge-request review runs as: built here, never read from a file. (M85)
+    ///
+    /// Not a file in `.cide/agents/` because it belongs to no project — the MR under review may
+    /// not even be this project's — and a role a user can edit is a role whose brief can lose
+    /// the one sentence that matters ("nothing is published"). `unavailable` is decided the way
+    /// [`load`] decides it, so an uninstalled harness is refused by `dispatch_refusal` with the
+    /// sentence the roster would show.
+    ///
+    /// `tools` is for `claude` only, where `--allowedTools` is the list run **without asking**,
+    /// not a restriction: the review tools and reading. Every other harness reads a role's
+    /// `tools` as its own vocabulary and would be narrowed by a claude spelling, so it gets none.
+    pub fn synthetic(
+        id: &str,
+        label: &str,
+        harness: Harness,
+        system_prompt: String,
+        tools: Vec<String>,
+    ) -> Self {
+        let unavailable = implemented(harness).or_else(|| installed(harness));
+        LoadedAgent {
+            def: AgentDef {
+                id: AgentId(id.to_string()),
+                label: label.to_string(),
+                scope: AgentScope::Project,
+                harness,
+                description: label.to_string(),
+                system_prompt,
+                model: None,
+                color: None,
+                unavailable,
+                max_concurrent: 4,
+                // It stands in the review checkout it is given, which is already its own.
+                worktree: false,
+            },
+            origin: PathBuf::new(),
+            shadows: None,
+            tools: match harness {
+                Harness::Claude => tools,
+                _ => Vec::new(),
+            },
+            permission_mode: None,
+            effort: None,
+            extras: Vec::new(),
+        }
+    }
 }
 
 /// Every role this project has, and everything wrong with the files they came from.

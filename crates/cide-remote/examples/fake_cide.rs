@@ -277,6 +277,8 @@ impl RemoteHost for Constants {
             stale_turn: false,
             note: None,
             openable: true,
+            model: None,
+            pool_position: None,
         };
         vec![
             base.clone(),
@@ -669,6 +671,11 @@ impl RemoteHost for Constants {
             .lock()
             .expect("not poisoned")
             .insert(session);
+        Ok(())
+    }
+
+    /// A desk with no pane to scroll: accepted, as the real one accepts it. (M91)
+    fn scroll_view(&self, _session: cide_ipc::SessionId, _pages: i8) -> Result<(), String> {
         Ok(())
     }
 

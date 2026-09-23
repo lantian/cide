@@ -7,6 +7,8 @@ export interface TreeFile {
   path: string
   label?: string
   discussions?: { resolved: number; unresolved: number }
+  /** Local, unpublished draft comments on this file. (M85) */
+  drafts?: number
   detail?: string
 }
 interface Node {
@@ -112,6 +114,15 @@ function Entry({
           theme={theme}
         />
         <span>{node.name}</span>
+        {!!node.file?.drafts && (
+          <span
+            className={`${styles.threadCounts} ${styles.draftCount}`}
+            aria-label={`${node.file.drafts} unpublished drafts`}
+            title={`${node.file.drafts} draft ${node.file.drafts === 1 ? 'comment' : 'comments'}, not published`}
+          >
+            <Icon name="pencil" size={1} /> {node.file.drafts}
+          </span>
+        )}
         {node.file?.discussions &&
           node.file.discussions.unresolved + node.file.discussions.resolved >
             0 && (

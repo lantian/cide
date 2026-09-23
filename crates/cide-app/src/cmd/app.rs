@@ -364,6 +364,57 @@ fn live_sessions(
     })
 }
 
+/// Open a web link in the user's default browser.
+///
+/// The one door every surface that shows a URL goes through: a terminal's OSC 8 hyperlink or a
+/// bare `https://…` it printed, a link in a markdown preview, one in an OpenSpec document. Until
+/// this existed each of them refused and told the user to copy the address, on the argument —
+/// still right — that terminal output and a cloned repository's `.md` are untrusted, and that a
+/// click must never navigate *this app's own webview*. That is why the open is here and not
+/// JS-side: `tauri_plugin_opener` hands the URL to `xdg-open`/`open`, which starts a separate
+/// browser, and the JS opener command is capability-gated per window, so a detached pane (which
+/// has no `opener` permission on purpose) would have silently opened nothing.
+///
+/// Only `http:` and `https:` are passed on. `file:`, `javascript:`, `data:` and every custom
+/// scheme a desktop has registered a handler for are refused: `xdg-open` would happily launch
+/// whatever application claims `foo:`, and a scheme allowlist is the whole of the threat model
+/// that remains once the webview is out of the picture.
+#[tauri::command]
+pub fn app_open_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let url = web_url(&url)?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|error| format!("Could not open your browser: {error}"))
+}
+
+/// `url` if it is an `http(s)` address worth handing to the desktop, trimmed; otherwise why not.
+///
+/// Whitespace and control characters are refused rather than stripped: a URL with a newline in
+/// it came out of a terminal line that was not one URL, and quietly repairing it would open an
+/// address nobody wrote. The length cap is `xdg-open`'s argv, not a browser's.
+fn web_url(url: &str) -> Result<&str, String> {
+    let url = url.trim();
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    let rest = if lower.starts_with("https://") {
+        &url[8..]
+    } else if lower.starts_with("http://") {
+        &url[7..]
+    } else {
+        return Err(format!("cide opens only http and https links, not {url}"));
+    };
+    if rest.is_empty() || rest.starts_with('/') {
+        return Err(format!("{url} names no host"));
+    }
+    if url.len() > 8192 {
+        return Err("That link is too long to open".into());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("{url} is not one address"));
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +527,31 @@ mod tests {
             !keymap::resolve(&user).is_empty(),
             "the defaults must still be there"
         );
+    }
+
+    #[test]
+    fn only_http_and_https_reach_the_desktop() {
+        assert_eq!(
+            web_url(" https://example.com/a "),
+            Ok("https://example.com/a")
+        );
+        assert_eq!(
+            web_url("HTTP://localhost:5173/"),
+            Ok("HTTP://localhost:5173/")
+        );
+        for refused in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "ftp://host/x",
+            "https://",
+            "https:///path",
+            "http://a b",
+            "https://a\nb",
+            "//host/x",
+            "src/main.rs",
+        ] {
+            assert!(web_url(refused).is_err(), "{refused} must be refused");
+        }
     }
 }

@@ -2072,6 +2072,17 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      case 'agents.poolState': {
+        // `help.about`'s guard, for its reason: the card lives in `OverlayHost`, which the shell
+        // window mounts only with a project. (M90)
+        const b = boot()
+        if (b?.role.kind !== 'shell' || activeProjectOf(b) === null) {
+          return unmet(command, 'no shell window with a project open')
+        }
+        useOverlays.getState().toggle('pools')
+        return
+      }
+
       case 'theme.toggle':
         // The persisting one from `settings/useSettings`, not `useWorkspace.toggleTheme` —
         // that only sets the local flag, so the choice was lost on the next snapshot and

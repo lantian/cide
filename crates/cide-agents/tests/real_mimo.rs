@@ -80,6 +80,7 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         choice: None,
         harness: agent.def.harness,
         unattended: cide_agents::config::Unattended::Bypass,
+        tracker_paragraphs: true,
     }
 }
 
@@ -197,6 +198,7 @@ fn a_dead_pool_candidate_is_classified_within_seconds() {
             provider: "cide-test-dead".into(),
             model: "nothing-here".into(),
             variant: String::new(),
+            max_running: None,
         },
     });
     let spawned = MimoHarness.spawn_spec(&plan).expect("spawnable");

@@ -177,6 +177,134 @@ pub enum GitLabRequest {
         remote_url: String,
         branch: String,
     },
+    /// This review's local drafts, newest last. Never touches GitLab.
+    Drafts {
+        review: String,
+    },
+    /// The user's edit of a draft. `None` leaves that half as it is.
+    DraftEdit {
+        review: String,
+        draft: String,
+        body: Option<String>,
+        severity: Option<GitLabSeverity>,
+    },
+    DraftDiscard {
+        review: String,
+        drafts: Vec<String>,
+    },
+    /// Post each draft as an ordinary thread, one request per draft; a draft leaves the local
+    /// store only once its own POST succeeded. Answers a [`GitLabPublished`].
+    DraftPublish {
+        review: String,
+        drafts: Vec<String>,
+    },
+}
+
+/// How much a review finding matters. Metadata of the draft, shown as a badge beside it — and
+/// **never** written into the comment body, so a published comment reads as the reviewer wrote
+/// it rather than carrying a label GitLab has no field for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum GitLabSeverity {
+    Critical,
+    Major,
+    Minor,
+    Suggestion,
+}
+
+impl GitLabSeverity {
+    pub const ALL: [GitLabSeverity; 4] = [
+        GitLabSeverity::Critical,
+        GitLabSeverity::Major,
+        GitLabSeverity::Minor,
+        GitLabSeverity::Suggestion,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitLabSeverity::Critical => "critical",
+            GitLabSeverity::Major => "major",
+            GitLabSeverity::Minor => "minor",
+            GitLabSeverity::Suggestion => "suggestion",
+        }
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|s| s.as_str().eq_ignore_ascii_case(text.trim()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum GitLabSide {
+    Old,
+    New,
+}
+
+/// Who wrote a draft: the agent run that proposed it, or the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GitLabDraftAuthor {
+    pub label: String,
+    pub harness: Option<crate::Harness>,
+    /// The run that wrote it, so a run may edit and discard its own drafts and nobody else's.
+    pub run: Option<String>,
+}
+
+/// A review comment that exists **only in cide** until the user publishes it.
+///
+/// The GitLab position is computed when the draft is written, against the MR version that was
+/// latest then — a line outside every hunk is refused at that moment, while the agent that chose
+/// it can still pick another, rather than at publish time when nobody is there to fix it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GitLabDraft {
+    pub id: String,
+    pub review: String,
+    pub severity: GitLabSeverity,
+    pub body: String,
+    /// `None` for a general comment on the MR.
+    pub path: Option<String>,
+    pub old_path: Option<String>,
+    pub side: Option<GitLabSide>,
+    pub line: Option<u32>,
+    /// The GitLab text position, SHAs included, ready to POST.
+    #[ts(type = "unknown")]
+    pub position: Option<serde_json::Value>,
+    /// The MR head the position was computed against; a newer head marks the draft outdated.
+    pub head_sha: String,
+    pub author: GitLabDraftAuthor,
+    #[ts(type = "number")]
+    pub created_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GitLabPublished {
+    pub published: Vec<String>,
+    pub failed: Vec<GitLabPublishFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GitLabPublishFailure {
+    pub draft: String,
+    pub error: String,
+}
+
+/// A harness the MR panel can start a review on, and why not when it cannot.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GitLabReviewHarness {
+    pub harness: crate::Harness,
+    pub unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

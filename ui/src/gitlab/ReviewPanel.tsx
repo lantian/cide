@@ -18,7 +18,14 @@ import {
   useGitLab,
   closeReview,
   showReviewInfo,
+  showLaunchReview,
 } from './store'
+import {
+  agentReviews,
+  HARNESS_LABEL,
+  showAgentReview,
+  stopAgentReview,
+} from './agentReview'
 import {
   changeTotals,
   message,
@@ -145,8 +152,11 @@ export function ReviewPanel({
     })
     await refreshApprovals(review)
   }
+  const agent = agentReviews.get(review)
+  const draftsOf = (path: string, oldPath = path) =>
+    d.drafts.filter((x) => x.path === path || x.path === oldPath).length
   const sections: {
-    section: 'description' | 'discussions' | 'activity' | 'pipelines'
+    section: 'description' | 'discussions' | 'drafts' | 'activity' | 'pipelines'
     label: string
     icon: IconName
   }[] = [
@@ -156,6 +166,7 @@ export function ReviewPanel({
       label: `Discussions (${d.discussions.filter((t) => t.notes.some((n) => n.resolvable && !n.resolved)).length})`,
       icon: 'message-square',
     },
+    { section: 'drafts', label: `Drafts (${d.drafts.length})`, icon: 'pencil' },
     { section: 'activity', label: 'Activity', icon: 'list' },
     { section: 'pipelines', label: 'Pipelines', icon: 'play' },
   ]
@@ -185,6 +196,15 @@ export function ReviewPanel({
               }
             >
               <Icon name="refresh-cw" />
+            </button>
+            <button
+              className={chrome.iconButton}
+              aria-label="Review with an agent"
+              title="Review with an agent — its findings become draft comments you publish"
+              disabled={busy}
+              onClick={() => showLaunchReview(review)}
+            >
+              <Icon name="eye" />
             </button>
             <button
               className={chrome.iconButton}
@@ -253,6 +273,36 @@ export function ReviewPanel({
       {(error || snap.error || d.approvalError) && (
         <div role="alert" className={styles.error}>
           {error || snap.error || d.approvalError}
+        </div>
+      )}
+      {agent && (
+        <div
+          className={styles.notice}
+          role="status"
+          aria-label="Agent review"
+        >
+          <span>
+            <strong>{HARNESS_LABEL[agent.harness]} review</strong> ·{' '}
+            {agent.detail}
+          </span>
+          <span className={styles.row}>
+            {agent.state !== 'queued' && (
+              <button
+                title="Show the review's tab"
+                onClick={() => void run(() => showAgentReview(review))}
+              >
+                <Icon name="square-terminal" size={1} /> Show
+              </button>
+            )}
+            {(agent.state === 'queued' || agent.state === 'running') && (
+              <button
+                title="Stop the agent; drafts it wrote are kept"
+                onClick={() => void run(() => stopAgentReview(review))}
+              >
+                <Icon name="square" size={1} /> Stop
+              </button>
+            )}
+          </span>
         </div>
       )}
       <nav className={chrome.reviewActions} aria-label="MR information">
@@ -335,6 +385,7 @@ export function ReviewPanel({
                   .map((path) => ({
                     path,
                     discussions: fileDiscussions(d.discussions, path),
+                    drafts: draftsOf(path),
                   }))
               : visible
                   .filter((c) =>
@@ -350,6 +401,7 @@ export function ReviewPanel({
                       c.new_path,
                       c.old_path,
                     ),
+                    drafts: draftsOf(c.new_path, c.old_path),
                     detail: `${c.new_file ? 'A' : c.deleted_file ? 'D' : c.renamed_file ? 'R' : 'M'} +${changeTotals([c]).additions} −${changeTotals([c]).deletions}`,
                   }))
           }

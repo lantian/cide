@@ -26,12 +26,14 @@ pub mod ids;
 pub mod image;
 pub mod keymap;
 pub mod llm;
+pub mod milestones;
 pub mod overrides;
 /// Per-file view memory. Its own module, and deliberately not part of [`workspace`] — the
 /// header of `positions.rs` says why at length.
 pub mod positions;
 /// What a path *is* — the properties card's OS stat, text facts and git summary. (M70)
 pub mod properties;
+pub mod proposals;
 pub mod remote;
 pub mod screen;
 pub mod settings;
@@ -45,12 +47,19 @@ pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use image::{ImageDoc, ImageFormat};
 pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
-pub use llm::{LlmModel, LlmProvider, LlmSettings, ModelPool, PoolChoice, PoolEntry};
+pub use llm::{
+    LlmModel, LlmProvider, LlmSettings, ModelPool, PoolChoice, PoolEntry, pool_capacity,
+};
+pub use milestones::{
+    CheckResult, GateState, Milestone, MilestonePlan, MilestoneTask, MilestoneTasks,
+    MilestonesView, VerifyState,
+};
 pub use overrides::{AgentOverride, AgentOverrides, ProjectOverrides};
 pub use positions::{MarkdownView, ViewPosition};
 pub use properties::{
     DirSummary, FileProperties, FilePropertiesGit, LineEnding, Owner, PathKind, TextFacts,
 };
+pub use proposals::{Proposal, ProposalChange, ProposedFile};
 pub use settings::{
     ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
     DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,
@@ -117,8 +126,10 @@ pub mod agents;
 pub mod tasks;
 
 pub use agents::{
-    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, LlmModelTest, LogRunInfo,
-    OrchestrationConfig, OrchestrationPatch, RunNotify, RunOpen, RunState, TokenUsage,
+    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, LlmLimitsProbe, LlmModelTest,
+    LogRunInfo, OrchestrationConfig, OrchestrationPatch, PoolBench, PoolEntryState, PoolEvent,
+    PoolEventKind, PoolProviderState, PoolRefusal, PoolRunRef, PoolSkip, PoolSkipped, PoolState,
+    PoolStateReport, RunNotify, RunOpen, RunState, TokenUsage,
 };
 pub use tasks::{
     ATTACHMENTS_DIR, ATTACHMENTS_LEAF, AttachTarget, AttachmentKind, LinkType, StagedFile,

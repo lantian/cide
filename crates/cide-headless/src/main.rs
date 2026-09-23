@@ -698,6 +698,7 @@ fn render_board(file: &TaskFile) -> String {
 /// The `serde` spelling of a status, which is what the file on disk holds.
 fn status_name(status: TaskStatus) -> &'static str {
     match status {
+        TaskStatus::Inbox => "inbox",
         TaskStatus::Todo => "todo",
         TaskStatus::Doing => "doing",
         TaskStatus::Review => "review",
@@ -847,14 +848,12 @@ fn render_agents_config(root: &Path, present: bool, roster: &ProjectAgents) -> S
                 clamped => format!("{} (clamped to {clamped})", config.auto_spin_after_secs),
             },
         ),
-        (
-            "autoSpinAcceptPlan",
-            config.auto_spin_accept_plan.to_string(),
-        ),
         // The prompt as it will be *sent*, so a blank in the file reads as the shipped default
         // rather than as an empty prompt — `AgentsConfig::spin_prompt`'s decision, shown rather
         // than restated.
         ("autoSpinPrompt", clip_prompt(config.spin_prompt())),
+        // The template as it will be filled, `autoSpinPrompt`'s rule: blank reads as the default.
+        ("reviewPrompt", clip_prompt(config.review_prompt_template())),
     ] {
         rows.push(Row {
             label: format!("  {key}"),

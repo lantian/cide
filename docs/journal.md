@@ -13346,6 +13346,9 @@ project default, and let a local override set the mode.
   - codex: keeps `--dangerously-bypass-approvals-and-sandbox`, because `--approve-for-me` keeps
     the `workspace-write` sandbox and that sandbox makes `.git` read-only.
   - qwen: keeps `yolo`, because its own `auto` has never been measured headless.
+    *Reversed after M83:* a project set to `auto` was getting qwen runs with no brake while the
+    panel said `auto`. qwen 0.24.4 offers `--approval-mode auto`, so the default now maps to it
+    literally. `bypassPermissions` is still `yolo`. Not yet checked on a real headless turn.
   - opencode and mimo: keep their single promptless flag.
   A *role* that writes `auto` still gets each CLI's literal mapping. The review tab the finish
   nudge opens (`claude_tab::TabMode::Direct`) follows the same three values.
@@ -13374,3 +13377,520 @@ project default, and let a local override set the mode.
   it does when the classifier declines an action is unconfirmed. If it falls back to a prompt,
   the run parks in `AwaitingPermission` exactly as a `manual` run would. That is the trade this
   milestone accepts over a child with no brake.
+
+## Milestones with a gate, an inbox, and verify before a merge (M83)
+
+Asked for: technology that lets the agents carry a complex project to a goal on their own, with
+a person checking only milestones — because on `~/work/selfcraft` the current loop "breeds
+tasks rather than moving towards the goal". The board said so in numbers: 232 tasks after four
+months, 193 created by the orchestrator, and of the 98 open only 36 were the plan (P2–P6); the
+rest were things somebody had noticed. Three sentences in cide's own prompts told every run,
+reviewer and planner to file anything noticed as a task, the spinner counted every undone task
+as work to plan from, and nothing a program could check said what the project was for.
+
+### What changed
+
+- **`TaskStatus::Inbox`.** Noticed, not yet work. Autodispatch does not start it, the spinner
+  does not count it, `cide_task_list` leaves it out unless asked (and says how many it left out),
+  and an explicit dispatch of one is refused with the road out. Moving it to `todo` is an
+  assignment edge, so a role a run named on it starts then. It never expires — asked explicitly:
+  a project left alone for a month has the same inbox when it is opened.
+- **Where a new task goes is decided by cide** (`cide_agents::milestones::placement`). A run's is
+  always inbox. The orchestrator's is `todo` only when it is `subtaskOf` the active milestone
+  (directly or through a parent) and the milestone has fewer open tasks than its limit (12 by
+  default); otherwise inbox, with the reason in the answer. `inbox: true` files it there
+  whatever. A title that repeats an open task becomes a *Seen again* comment on that task
+  instead (Jaccard ≥ 0.6 over words; the corpus in the test is selfcraft's own titles).
+- **Milestones** — `.cide/config.json`'s `milestones` key: ordered items, each with a `gate` shell
+  command whose exit 0 means *met*, plus a project `verify` command, `guardPaths` and `maxOpen`.
+  Read and written apart from `agents`, so a broken gate cannot switch subagents off.
+  - cide runs the active gate after every merge an agent makes and before the spinner plans
+    (when `HEAD` moved since the last run). A pass moves the milestone's task to review with the
+    output, and the spinner then does not wake the project: the next step is the user's, in
+    the Tasks panel's **Milestones** tab (*Accept*, which marks it done and activates the next).
+  - That tab is a list — each milestone with its state and last gate verdict, then the project
+    checks — and everything is edited in a modal with a draft sent on Save. It started as a block
+    in Settings → Agents and moved on the user's word: Settings is global, milestones belong to
+    one repository beside its board. A milestone added there gets its task on the board at once
+    (`milestones::set_plan`, the one writer the tool's `define` shares).
+  - **What a milestone contains is shown everywhere it is asked.** Work belongs to a milestone by
+    being `subtaskOf` its task at any depth (`milestones::tree_under`). `cide_milestones get`
+    lists the active one's open tasks as a tree and counts the rest; `cide_task_get` opens with
+    the task's milestone and whether it is active or waits; the spinner's facts name the open
+    tasks, not just their number; the tab's rows carry `open · done` and the milestone modal lists
+    the tasks, each opening its card; and the card's head has an `in milestone: slice · active`
+    chip. `MilestonesView::tasks` is the one producer for the panel and the card
+    (`ui/src/sidebar/milestonesStore.ts`, re-asked on every board change as well as on
+    `milestones-changed`, because linking a task is a board change).
+  - **A check running is visible where the work is.** Verify is recorded per task
+    (`Checks::task_verifies`, memory only) when it starts and when it answers, a dirty-worktree
+    refusal included, and every change emits `milestones-changed`. The task's row carries a
+    turning `verify` mark and then its verdict; the card has a verify line with the command, the
+    time and, on failure, the output open — and a *full log* link; the panel's header shows `gate slice · verify ×2`
+    while anything runs, and the Milestones rows turn while their gate does. Before this a
+    subagent's work was checked for minutes with nothing on screen saying so.
+  - **The whole output is kept.** `cide_core::check::run_logged` writes every line as it arrives
+    to `$XDG_STATE_HOME/cide/check-logs/<project>/{gate,verify}-<key>.log` (latest run per
+    milestone or task; never under `.cide/`, which is committed), ending with how it ended. The
+    panel reads the last MiB through `milestones_check_log` in a log window that re-reads every
+    second while the check runs and follows the end unless the reader scrolled up; agents get
+    the path in `cide_milestones get` and in verify's refusal, and can read the file.
+  - **Proposals: what only the user may change, proposed to them ready to apply.** An agent that
+    saw the slice gate should also run `e2e.sh all` could only leave a comment and write "accept
+    it in the Milestones tab", where there was nothing to accept. `cide_milestone_proposals` (the
+    twenty-second tool, orchestration only) queues one change with a title and a rationale:
+    the whole milestone plan it wants (existing ids keep their tasks), or the whole new content
+    of **guarded** files — anything else goes through a branch like all work, or the queue would
+    be a road around every check that road has — or a note. `cide_milestones propose` now
+    queues into the same place. The queue is per project in the profile's state directory and
+    rides `MilestonesView::proposals`; the Milestones tab lists it first, with a count on the
+    tab's label, and a modal shows the rationale and the diff (`git diff --no-index` for files,
+    before → after for a plan). **Accept applies exactly what was read**: a plan through
+    `set_plan`; files are refused untouched if any no longer says what it said when proposed,
+    otherwise written and committed — those paths only (`accepting_files_applies_exactly_what_was_read_or_nothing`
+    checks both halves in a real repository). Reject drops it. Both are noted on the task it
+    came from, and both re-run the gate after a change.
+  - **One look for a task, and a log you can read.** A milestone's task list is drawn with the
+    card's Links rows (`linkRow`, the status glyph in its tone), so todo and done differ and a task
+    looks the same wherever it is listed. The milestone modal has three tabs — Overview, Tasks,
+    Log — in the GitLab MR modal's shape, because the log ran into the form beneath it. Logs keep
+    the runner's colour codes now (only the tail is cleaned) and are drawn by the GitLab job-log
+    viewer, after `checkLogModel.ts` turns each `=====` banner into a collapsible section and
+    colours uncoloured verdict lines (`check:check-log` drives both through that parser; "0 failed"
+    in a passing summary stays green). The header's `gate slice` opens the running check's log.
+  - A task under a *later* milestone is not started — quietly on assignment, with a sentence on
+    an explicit dispatch.
+  - **Only the user changes them.** `cide_milestones` (the twenty-first tool, orchestration only)
+    can `get`, `define` the first plan on a project that has none (creating a task per
+    milestone), and otherwise only `propose`, which comments on the active milestone's task.
+- **Verify before an agent's merge.** `cide_agent_integrate` refuses a branch that touches a
+  guarded path, a worktree with uncommitted changes (what merges is the branch), or a failing
+  verify, quoting the output — the reviewer's hand-back, already written. Verify is warmed when a
+  run sets its task to review and cached per commit. Harness-agnostic: no hooks involved. The
+  panel's Integrate (the user's) is not gated.
+- **Prompts.** `TRACKER_PREAMBLE`, the roster paragraph and `review_prompt` now say *inbox*; the
+  default spin prompt reads the milestones first and says *close before you open*; and the
+  spinner appends one computed line of facts (active milestone, gate verdict and last lines, open
+  and inbox counts).
+- **The schema number follows the content.** A tracker is written as schema 3 only while
+  something is in the inbox, and a schema 2 file opens without a conversion. Bumping on open
+  would have locked the installed build (beside the dev one) out of every tracker the dev build
+  looked at; not bumping would have had an older build call an `"inbox"` row unparseable and set
+  the file aside. `../cide-mobile` groups and counts the new status.
+
+### How it was checked
+
+- `cargo test --workspace` (3,850), clippy on every touched crate, `codegen --check`,
+  `contract-check`, `tsc`, `pnpm build`, every `check:*` touched, and `npm run check` in
+  `../cide-mobile`. `CIDE_TRACKER=~/work/selfcraft … a_real_tracker -- --ignored` converts a copy
+  of the real board.
+- `cide_core::check`'s own tests run real processes, including a timeout whose background child
+  must die with the group. The first version of the both-streams test was flaky — the stderr
+  line could be queued before the stdout burst and pushed out of the tail — and now pauses first.
+- **Not seen live at the time of writing:** a gate passing and moving a milestone to review, the
+  Milestones tab on a display, and a reviewer receiving a verify refusal. Those are what the
+  selfcraft clean-up below exercises first.
+
+## The reviewer's brief is a per-project template (M84)
+
+- **What changed.** The prompt a reviewer tab is opened with (`finishInNewTab`) was a `format!`
+  in `agent_rpc::review_prompt`. It is now `agents.reviewPrompt` in `.cide/config.json`, edited in
+  Settings → Agents directly under *Review finished runs in a new tab*, and shown only while that
+  switch is on. `cide_agents::config::DEFAULT_REVIEW_PROMPT` is the old text, word for word, as a
+  template; blank means that default, `spin_prompt`'s rule.
+- **Placeholders**: `{task_id}`, `{task_title}`, `{task}`, `{branch}`, `{role}`, `{agent}`,
+  `{outcome}`, `{others}`, filled by `fill_review_prompt` in **one pass**, so a task title that says
+  `{branch}` reaches the reviewer as text. Unknown names are left as written. The result and the
+  stored value are both flattened to one line: it is typed into a terminal.
+- **Not templated**: a task-less run's brief, which has no task, branch or role to fill in. The
+  MCP `cide_agents_config` tool cannot set the new key, for `autoSpinPrompt`'s reason.
+- **Checked**: `cargo test -p cide-agents`, `-p cide-app agent_rpc` (the existing review-prompt
+  tests now run against the default template), `-p cide-ipc`, clippy, `codegen --check`,
+  `contract-check`, `tsc`, `check:settings-agents|agents|pools|ui-scale`. **Not seen on a display**:
+  the Settings field, or a reviewer tab opened from an edited template.
+
+## An agent reviews a GitLab MR into local draft comments (M85)
+
+- **What it does.** The MR panel's header has a new *Review with an agent* button (the eye icon).
+  It opens a dialog with two fields: a harness (every harness in cide's registry; one that is not
+  installed is disabled, with the roster's sentence) and optional instructions. Pressing Start does
+  three things:
+  - makes the MR's disposable checkout at the head commit, and fetches the base commit into it too
+    (`Workspaces::fetch_into`), so `git diff <base> <head>` works there;
+  - enqueues an ordinary run in the active project;
+  - opens that run in a new tab (`tab_new_run`, a mirror pane) once it has a child.
+
+  The agent's findings are **draft comments kept only in cide** (`gitlab-drafts.json` beside
+  `gitlab.json`). Each has a severity: critical, major, minor or suggestion. Drafts appear in two
+  places:
+  - inline in the MR diff tabs, dashed and marked "Draft · not published";
+  - in a new **Drafts** section of the MR dialog, grouped by file.
+
+  The user edits, discards and publishes drafts by hand, one at a time, selected, or all.
+  Publishing posts the body alone, as an ordinary thread at the stored position. The severity is a
+  badge and is never published.
+- **How it is built.** It is a run, not a `claude_tab`, because only the run machinery forks all
+  five harnesses. `RunPurpose::MrReview` carries four things: the review, the checkout, a brief
+  composed for the chosen harness, and the harness itself. Three code paths read it:
+  - `start_child` builds the role in memory (`LoadedAgent::synthetic`). It pins the harness
+    against local overrides (`Facts::resolve_pinned`) and skips the "subagents are off" refusal,
+    because the review is not a project role.
+  - `agent_rpc` serves the connection `Scope::Review`: the six `cide_mr_*` tools and nothing else.
+  - The four harnesses leave cide's tracker paragraphs out (`RunPlan::tracker_paragraphs`).
+
+  There is deliberately no publish tool. A claude reviewer gets `--allowedTools` for its own tools
+  and for reading, so edits still ask. The run's `notify` is `Silent`, so no reviewer tab opens on
+  it and the product owner is not nudged. It is kept out of the run snapshot. Closing the review
+  stops it before the checkout is deleted.
+- **Why local drafts, not GitLab's draft notes.** The user decided this. GitLab's pending review is
+  visible in the web UI, and one press of *Submit review* there would publish a machine's whole
+  batch. GitLab also has no field for a severity.
+- **Checked.** The following all pass:
+  - `cargo test` for `cide-gitlab`, `cide-agents`, `cide-ipc` and `cide-app`, including a new test
+    for publishing over the mock transport and one for the review scope;
+  - clippy on the workspace, `codegen --check`, `contract-check`, `tsc` and `pnpm build`;
+  - every `check:*` script. `check:gitlab-dom` now asserts four things: the file's draft count, the
+    Drafts list with a severity badge that is not in the body, Publish sending one `draftPublish`,
+    and an unavailable harness being disabled in the launch dialog.
+- **Not seen on a display or against a real GitLab:**
+  - the button and dialog on screen;
+  - a real review run on any harness, and the tab opening onto it;
+  - an agent's drafts arriving live;
+  - publishing to a real MR;
+  - the base-commit fetch against a real remote, including a fork MR, where the base comes from
+    the target project.
+
+  The first live run should confirm three things: that `cide_mr_info` is called, that the drafts
+  land on the right lines, and that the published thread carries no severity text.
+
+## `done` is refused while the task's branch is unmerged (M86)
+
+- **What happened.** In terrastrike, the reviewer tab accepted t-1062's work. Its
+  `cide_agent_integrate` call was then denied by Claude Code's auto-mode classifier
+  (`[Merge Without Review]`, 2026-09-22, in the tab's transcript). The reviewer set the task to done
+  anyway, and the last line of its verdict asked "the orchestrator" to merge. Nobody reads a done
+  task, so the branch sat unmerged. An audit then found the same state on t-1032, t-1060 and t-1061
+  (t-22 turned out to be a false positive). The review prompt already said a conflicting merge
+  means not done, but it did not name a denied call.
+- **What changed.**
+  - `cide_git::worktree::unmerged(root, name)` reports how many commits `cide/<name>` has that
+    `HEAD` lacks. It returns `None` when there is no branch, or when merging the branch in memory
+    would leave `HEAD`'s tree unchanged. The second case is t-22: a merge-only branch whose content
+    master took directly.
+  - `cide_task_update` checks `TaskSink::unmerged` on the assignee's `cide/<role>-<task>` before
+    setting a task to done. If the branch is unmerged, it refuses the **whole** call. The refusal
+    says to integrate first, and says that a merge failing for any reason (conflicts, verify, an
+    error, a denied call) means the task stays in review with a comment. Only the model's path is
+    gated. The user can still close a task from the board.
+  - The default review prompt now names the same cases.
+- **Checked.** `cargo test` passes for `cide-git` (`unmerged_counts_only_what_the_base_lacks`),
+  `cide-agents` (`done_is_refused_while_the_tasks_branch_is_not_merged`) and `cide-app`. Clippy
+  passes on the workspace, and fmt passes. The gate's rule was also run against terrastrike's board
+  by hand: t-22 came back clean, and t-1032, t-1060, t-1061 and t-1062 came back unmerged.
+- **Not fixed here.** The classifier denial itself belongs to the user's Claude Code permissions,
+  not to cide. A project that wants a reviewer tab to merge on its own must allow
+  `mcp__cide__cide_agent_integrate` in `.claude/settings.json`. Only the assignee's branch is
+  checked, so a task that changed hands can still close over the first role's unmerged branch.
+
+## A pool entry carries a running limit, and the orchestrator is told the number (M87)
+
+- **What was asked.** A pool entry (provider + model) should also carry a maximum running count.
+  For example, if the first entry allows 4 and a fifth run starts, it goes on the next entry. The
+  most runs that can be live is then the sum of the entries' counts, or the project's cap if that
+  is smaller. Claude must be told that final number.
+- **What changed.**
+  - **Data.** `PoolEntry` gained `max_running: Option<u16>`, sent as `maxRunning` and absent when
+    unset; `cleaned` turns a `0` into `None`. `cide_ipc::pool_capacity` and `ModelPool::capacity`
+    return the sum of a pool's complete entries' limits, or `None` when any complete entry is
+    unlimited.
+  - **Admission picks the entry.** The pool is now stamped on the run at dispatch (`DispatchSpec`
+    gained a `pool` field, and `plan_dispatch` takes the `LlmSettings`) instead of at the first
+    fork, so `admit_a_pass` can see it. Admission places a run on the first entry at or after its
+    `pool_index` that has room. If every such entry is full, the run stays queued and its row says
+    which models are full and how full (`pump` redraws the row).
+    - The count covers slot-holding runs **across every project**, matched on provider, model and
+      variant. An idle run holds no slot, so it takes no room.
+  - **Failover respects the limits.** A provider failure whose remaining candidates are all full
+    no longer forks over a limit. It puts the run back at the front of its queue, releases its
+    slot, unbinds its session and advances `pool_index` (`FailoverPlan::Queued`). `watch_exit`
+    then pumps, and admission forks the run onto the first entry that frees.
+    - `restamp` now takes the current pool instead of clearing it, because admission reads the pool
+      before the fork does.
+  - **What Claude is told.**
+    - `cide_agents_list`:
+      - Each role row states `min(max-concurrent, pool capacity)` and why.
+      - The header states the project total from `cide_agents::overrides::capacity`. It applies all
+        three caps and counts a pool shared by several roles once.
+      - The pools line shows each model's `running/limit`, machine-wide, via the new
+        `AgentSink::pool_load`.
+    - The system prompt's roster paragraph states the project cap and the same total, and explains
+      that a pool's model limits queue runs.
+    - The descriptions of `cide_agent_dispatch`, `cide_agents_config` and `cide_llm_pool` say the
+      same. `cide_llm_pool` takes `maxRunning` per entry and refuses `0`, negative numbers and
+      non-integers.
+  - **Settings.** Each pool entry has a "max running" box; blank means no limit. The readout states
+    what the pool holds at once.
+- **Decided with the user.** All three caps apply: the pool's sum is one more cap, and a role's
+  own `max-concurrent` still binds. Counts are machine-wide, not per project.
+- **Checked.**
+  - `cargo test` passes for `cide-ipc`, `cide-agents` and `cide-app`. The registry tests cover:
+    - a full entry sending a run to the next one;
+    - a full pool queueing a run and a freed entry admitting it;
+    - an idle run leaving room;
+    - the count shared across projects;
+    - a run never climbing above where a failover left it;
+    - a failover into a full entry waiting.
+  - Clippy passes on the three crates, and `codegen --check` and `contract-check` pass. The UI
+    checks pass: `check:pools` (it now covers the limit's wire shape and TS/Rust capacity parity),
+    `check:settings-agents`, `check:selectors`, `check:ui-scale` and `tsc`.
+- **Not seen on a display or against a real provider.** Not yet seen:
+  - the Settings field;
+  - a real opencode fan-out landing on the second entry;
+  - a live failover waiting for room.
+
+  In one early full `cide-app` run, one agents test failed once and passed on every rerun; it was
+  not identified.
+- **Known edge.** A paused run that is restarted on Resume onto an edited pool takes the new list's
+  first entry without checking room. The restart keeps its own slot and does not go through
+  admission, so it can exceed a limit by one run while that child lives.
+
+## A custom model's limits are read off its server (M88)
+
+- **What was asked.** A custom model's context and output limits should fill in by themselves
+  when the model is configured. opencode never asks an OpenAI-compatible server what a model
+  serves, so a model declared without `limit.context` runs with no compaction threshold. The
+  dev profile's `k3s` model was one: its server states `max_model_len: 262144`, and nothing read
+  it.
+- **What changed.**
+  - `cide_agents::limits` adds pure parsers over three server shapes and one blocking probe:
+    - `GET {base}/models`, which gives vLLM and SGLang `max_model_len`, OpenRouter
+      `context_length` and `top_provider.max_completion_tokens`, and LM Studio's
+      `loaded_context_length`;
+    - llama.cpp's `{root}/props`, read for `default_generation_settings.n_ctx`, the per-slot
+      figure;
+    - LM Studio's `{root}/api/v0/models`.
+
+    Trained lengths (`meta.n_ctx_train`, Ollama's `context_length`) are deliberately not read:
+    they overstate the served window. When the server states no output limit, the output is
+    estimated as a quarter of the context, at most 32768, and the answer says it was estimated.
+    The probe uses the proxy path a run takes (`ProxyScope::claude`).
+  - The `llm_probe_limits(provider, model)` command reads the base URL and key from settings and
+    answers an `LlmLimitsProbe` verdict. The probe is free (a `GET`, never a completion).
+  - In Settings → Models, each custom model row:
+    - fills its limits when the model id is committed (on blur), if both boxes are still empty;
+    - has a refresh button that asks again and overwrites the boxes;
+    - shows the answer's sentence under the row.
+
+    An answer that arrives late lands on the current rows, matched by model id, so it neither
+    reverts edits nor overwrites a number typed meanwhile.
+- **Checked.**
+  - `cargo test` passes for `cide-agents` (the parser fixtures), `cide-app` and `cide-ipc`.
+    Clippy, fmt, `codegen --check` and `contract-check` pass (the contract was accepted with
+    `--write`). `check:pools` now asserts the fill rules. `tsc` and the related UI checks pass.
+  - `limits::tests::a_real_server` (`#[ignore]`d) was run against the k3s endpoint with its key.
+    It read 262144 from `max_model_len`.
+- **Not seen on a display.** The row filling itself, the button, and the note under the row.
+  The probe has not been run against llama.cpp or LM Studio servers, only against their
+  documented shapes. `cide_llm_provider` (the MCP tool) does not probe yet, so a model Claude
+  adds still needs its limits typed, or a press of the button.
+
+## The spinner's tab runs in the project's unattended mode, not plan mode (M88)
+
+- **What happened.** In selfcraft, the "Plan" tab the spinner opened stopped on a Claude Code
+  approval for `cide_task_get`, and did so for every cide tool it called. The tab was started
+  with `--permission-mode plan`, which is `default` with edits held back, so every MCP call asks.
+  The survey the prompt asks for is almost all MCP calls. A first fix passed
+  `--allowedTools mcp__cide` beside `plan`. The user's verdict was that running the tab in the
+  ordinary mode would be simpler.
+- **What changed.**
+  - `claude_tab::TabMode` is now a struct, `{ unattended, behind }`, with no `Plan` arm. The
+    spinner's tab gets the project's `agents.permissionMode` (`auto` by default), as the
+    reviewer tab already did. It still raises and the reviewer still opens behind.
+  - Deleted: `watch_for_plan` (the thread that read the plan approval off the screen and typed
+    the answer), `cide_claude::plan`, `cide-agents`' `real_plan` test, and the
+    `autoSpinAcceptPlan` key (config, wire, headless, and the Settings toggle). A
+    `.cide/config.json` that still carries the key reads fine, because `AgentsConfig` does not
+    deny unknown fields. `DEFAULT_SPIN_PROMPT` already says to survey before planning, so it did
+    not change.
+  - `cide-hook` keeps its note on why a `PreToolUse` allow for `ExitPlanMode` cannot work, now
+    dated.
+  - The Tasks panel has a **Plan tasks** button beside New task. It calls the new
+    `agents_plan_now` command, which goes through `spinner::plan_now` and then the timer's own
+    `wake`, so the prompt, the milestone facts and the permission mode are the same as the
+    timer's. The button skips the timer's conditions (`auto_spin`, the dwell, live runs, busy
+    panes), because pressing it is the consent those conditions stand in for. It keeps
+    `enabled`: Rust refuses when subagents are off, and the button is drawn only when the roster
+    has roles. It also restarts the timer's dwell. A milestone whose gate already passes is
+    refused with a sentence instead of logged. The button stays dimmed until the tab is open,
+    which can take minutes when a stale gate runs first.
+- **Checked.** Workspace clippy passes, and fmt passes. `cargo test` passes for `cide-app`
+  (`spinner`, `agent_rpc`, `claude_tab`), `cide-agents config`, `cide-claude`, `cide-core persist`,
+  `cide-hook` and `cide-ipc agents`. `tsc`, `check:settings-agents`, `check:agents` and
+  `check:agents-render` pass. Codegen was regenerated.
+- **Not confirmed.** No spun tab has been watched on a display since the change, and the Plan
+  tasks button has not been pressed in a running build. Under `auto`, the
+  classifier can still deny a cide call such as `cide_agent_integrate` (M86's case). That is the
+  user's Claude Code permissions, not cide's.
+
+## The Agents panel is two tabs and says what each run is on (M89)
+
+- **What happened.** The user reviewed the Agents sidebar:
+  - Its three text buttons per role did not work as a workflow. Dispatch needed a task already
+    selected on the board, so it nearly always refused. Integrate sat on the role and merged
+    `cide/<role>`, which per-task worktrees (M40) left empty. Configure took a line of its own.
+  - The description was a paragraph on every row.
+  - The spinner beside a role's name never turned.
+  - A "Subagents" heading repeated the panel's title.
+  - History was a closed `<details>` at the foot.
+  - Nothing said which harness, provider or model a run was on, or whether a pool chose it.
+  - The Settings form's Description was a one-line input.
+- **What changed.**
+  - `AgentRun` carries `model` (`provider/model`, as the child was told) and `pool_position`
+    (`fast 2 of 3`). Both come from `LiveRun::using`, the ladder `log_run_info` already used,
+    so the log card and the panel cannot disagree. `LiveRun` gained `pool_name` and `last_model`,
+    both persisted in `SavedRun` (`serde(default)`), so a history row still names its model after
+    a restart. The `pool {name}: 1 of 3` sentence left `pool_note`; failover notes stay.
+    `cide_agent_runs` prints `via <harness> <model> (pool …)` per run.
+  - The panel has two tabs, **Agents | History**, under the header. They use the GitLab inbox's
+    `scopeTabs` look, and each label carries a count. Both panels are always rendered and the
+    inactive one is `hidden`, so every story's markup still has History's rows. The host
+    remembers the tab per project.
+  - A role row: the name's `title` is `id — description`. Configure is a `settings` mark at
+    the end of the name line. Dispatch and the role-level Integrate are gone.
+    `canDispatch`'s refusal sentence stays, for a broken role. The summary glyph got
+    `glyphSpin`, which is why it was still.
+  - A run row: a dim `harness · model · pool …` line (`usingLabel`) under a live run, and in
+    place of the bare harness on a History row. A finished run with a task gets a `git-merge`
+    mark (a new vendored icon) that arms and then confirms. It merges `cide/<role>-<task>`
+    through `useAgents.integrate(agent, task)`, and the armed key is the run id.
+  - Settings: Description is a wrapping textarea. It is still one line on disk, because
+    `defs::normalize` folds newlines into spaces.
+- **Checked.** `tsc`, every `check:*` script and `pnpm build` pass. `check:agents-render` has new
+  stories (`role-pooled`, `history`, `history-empty`; the integrate stories are now run-keyed).
+  It asserts:
+  - the using line on every run row;
+  - the tab states and which panel is hidden;
+  - Integrate only on the finished run with a task;
+  - no Dispatch anywhere;
+  - the description in the tooltip and gone from the row;
+  - the role glyph in the spin digest.
+
+  `check:agents` pins `usingLabel`. `cargo test` passes for `cide-app` (`agents`, `agent_rpc`),
+  `cide-agents`, `cide-ipc` and `cide-remote`, and clippy passes on those crates. Codegen and
+  the contract were regenerated.
+- **Not confirmed.** Nothing has been looked at on a display yet, including the tab strip at
+  sidebar width, the Configure mark's baseline on the name line, and the armed merge's yellow.
+  No run has been integrated from History in a running build. A run restored from a snapshot
+  written before this change shows its harness alone until its next fork.
+
+## A pool says why a run started where it did, and a refusal is shared (M90)
+
+Asked for as *"my default pool is always starting from the last element and I have no visual info
+why"*, with, one message later, *"if I forgot to start my local vllm — after starting it — I
+should be able to reset its state"*.
+
+- **What was actually happening.** Each run started at entry 0. Admission silently skipped any
+  entry at its `maxRunning` (counted across every project), and a refusal walked *that one run*
+  down its own list for good: it never climbed back, and neither did its follow-ups. The only trace
+  left was `6 of 6` on the row. Nothing was shared. A local server that was down therefore cost
+  every new run one failed turn, and the pool looked as if it started at the bottom.
+- **The bench** (`agents.rs`, `Inner::benched`). A classified refusal (unreachable, rate limited,
+  auth) benches its *target* — provider, model and variant (`same_target`) — machine-wide, for 3,
+  10 or 30 minutes respectively (`FailoverReason::bench_ms`). The bench is in memory only, so a
+  restart clears it. `choose_entry` replaces `entry_with_room` in both admission and failover. It
+  passes over full or benched entries. When every entry with room is benched it takes the first of
+  them anyway: a bench is a preference and never a wait, so it cannot deadlock a pool.
+- **Every skip is said.** A run that passed over anything gets `started on X (n of m); passed
+  over A benched (unreachable, 2m left), B full 1/1`, and a failover note gains the same suffix.
+  Each admission, refusal and reset also goes into a 100-entry ring, `Inner::pool_events`.
+- **Disabled providers.** `overrides::resolve` now drops entries whose provider is configured and
+  switched off. `provider_members` never wrote a document for them, so a run placed there spent a
+  turn failing over. A provider cide has no row for is still kept, because it may be one of the
+  CLI's own logins.
+- **The card.** Opened from the palette with *Model pools: show state* (`agents.poolState` →
+  overlay `'pools'` → `overlays/PoolStateCard.tsx`). It reads `llm_pool_state` and refreshes on
+  `cide://agents-changed` and whenever a countdown runs out. For each pool entry it shows the load
+  against the limit, whether the provider is usable, the bench with its countdown and the run that
+  caused it, and the runs on the entry. Beside that are **Reset** (`llm_pool_reset`) and **Test**
+  (the Models screen's real-turn probe). It also shows the runs waiting and the recent decisions.
+  Reset clears the bench and moves `Queued`/`Interrupted` runs that hold no slot back onto the
+  entry. A run standing on a child keeps its model, because moving it would miscount `entry_load`.
+- **Checked:**
+  - `cargo test -p cide-app -p cide-agents -p cide-ipc -p cide-core`, including six new registry
+    tests (bench, fallback, expiry, shared target, reset rewinds only waiting runs, snapshot) and
+    one `resolve` test for disabled providers.
+  - Clippy for those crates, `contract-check`, `codegen --check` and `tsc`.
+  - The checks `commands`, `keys`, `picker` (which now asserts the `agents.poolState` → `'pools'` →
+    card chain and its `when`), `pools`, `agents`, `selectors`, `theme`, `ui-scale`, `ui-icons`,
+    `menus`, `motion`, `unlisten`, `casing`, `switcher` and `boundary`, plus `pnpm build`.
+- **Not confirmed.** The card has not been looked at on a display. No real provider refusal has
+  benched anything in a running build yet. Test with a pool whose first entry points at a closed
+  port. The MCP roster does not show benches yet; only `pool_load` reaches an orchestrator.
+
+## The phone: notifications that say what is waiting, PgUp that pages, milestones, and swiping between projects (M91)
+
+Asked for as a list from using the APK: after opening a console, its notification went but the
+row still said *"Waiting for you"*, and so did the list above it; PgUp/PgDn *"sometimes can not
+work"*, and should come first and scroll the desk's view as well; milestones and their gates
+should be on the phone; a sideways swipe should change the project filter. And then: a
+notification sometimes names no console, and tapping one sometimes opens a console stuck on
+*"Waiting for the first frame…"*.
+
+- **"Waiting for you" after looking.** The row read the hook state (`awaitingInput`, which lasts
+  until the next turn starts), not the awaiting set that opening a console clears.
+  `shownState` in `../cide-mobile`'s `src/agents/model.ts` shows *idle* once the session is out
+  of the set. The console screen also re-acknowledges a wait that begins while it is open;
+  before, it acknowledged once, on mount, so a turn that finished while the console was being
+  read came back as waiting after leaving it, on the desk as well.
+- **The first frame that never came.** `Connection.tell` drops anything said before `ready`,
+  and a notification's tap routes before it connects, so `watchScreen` and `acknowledge` went
+  nowhere and nothing said them again. They are now interests on the connection (`watch`,
+  `unwatch`, `acknowledge`), replayed after every `welcome`. The console asks for its history
+  again when the socket comes up, and before the first frame it says what the connection is
+  doing (*Connecting to…*, *Reconnecting…*).
+- **Notifications name all three.** The title is `machine · project` and the body is
+  `<console> is waiting for you.` A wait on a session the phone cannot list yet is held back
+  rather than announced as *"a session"*. That covers the reconnect race and a parked child with
+  no pane, which is what a tap on such a notification opened into.
+- **PgUp/PgDn.** The main cause of *sometimes*: the input counter was a `useRef(1)` in the console
+  screen, while cide's watermark is per socket, so after reopening a console every key was dropped
+  as a duplicate (with no error) until the new count passed the old one. The counter now lives on
+  the connection. PgUp/PgDn lead the bar and send the new `scrollView` frame. cide decides from
+  the mirror (`cide_remote::keys::page`):
+  - **Normal screen:** the desk's pane scrolls its scrollback (`RemoteHost::scroll_view` →
+    `cide://remote-scroll` → `term.scrollPages`) and the phone pages its own copy.
+  - **Alternate screen with the mouse:** a screenful of wheel, so both ends show the program's
+    redraw.
+  - **Alternate screen without the mouse:** the key, as before.
+
+  Refusals, which were already sent, are now shown on the console (`registry.onRefusal`).
+- **Milestones.** New frames `milestonesGet`, `gateRun`, `milestoneAccept` and `checkLog` (client),
+  and `milestones` and `checkLog` (server), behind the `milestones` feature. The view is the
+  desk's own `milestones::view`. It is pushed with the project's other reads and again on every
+  `milestones_changed`, so *running* and the verdict arrive unasked. Running and accepting refuse
+  a milestone that is not the active one. The phone has a Milestones row on the machine screen
+  and a screen with a card per milestone: verdict, the end of the output, *Run gate*, *Accept*,
+  and a full log that follows while the gate runs.
+- **Swipe.** `ProjectSwipe` (gesture-handler's `Pan`: 24 points sideways to start, gives up
+  after 14 vertical) steps through the chips (`nextChoice`: All, then projects, no wrapping) on
+  the machine, Consoles, Agents, Tasks and Milestones screens. The chip rows use
+  gesture-handler's `ScrollView`, so dragging one scrolls it. The console screen is left alone,
+  because there a sideways drag pans.
+- **Checked:**
+  - `cargo test -p cide-remote` (89, including `keys::page` and
+    `a_page_scrolls_the_desk_on_the_normal_screen_and_the_program_on_the_alternate`).
+  - `cargo test -p cide-app -- remote emit windows`, `cargo test -p cide-ipc -- remote screen`
+    and `cargo test -p xtask protocol`.
+  - Clippy for `cide-remote`, `cide-ipc` and `cide-app`, plus `contract-check`,
+    `codegen --check`, `tsc` and every `check:*` (with `check:remote`'s known frames grown by
+    five).
+  - In `../cide-mobile`, `npm run check`: 227 tests, including new ones for the notification
+    wording and the hold-back, watch replay, per-socket `seq`, `paged`, `nextChoice`, the
+    milestone cards, and an end-to-end test against `fake_cide` that watches a console asked for
+    before the connection was up.
+- **Not confirmed.** Nothing here has been seen on a phone or a display:
+  - the swipe gesture, and whether it fights the vertical lists;
+  - the desk pane scrolling in step;
+  - a real gate running from the phone.
+
+  The APK has not been rebuilt (`cd ../cide-mobile/android && ./gradlew assembleRelease`).

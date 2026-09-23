@@ -239,6 +239,9 @@ struct LiveRun {
     /// edge by `agent_rpc::note_run_over`, carried on the wire so the run list can show
     /// `quiet`, and through the snapshot so a resumed run keeps its address.
     notify: RunNotify,
+    /// See [`RunPurpose`]. Never persisted: a review stands in a checkout that dies with the
+    /// process, so the snapshot leaves review runs out entirely.
+    purpose: RunPurpose,
     /// The directory the child was started in — the worktree, or the root under shared
     /// isolation — once it has been. `None` while queued: nothing has forked, so nothing can
     /// have connected to the agent socket and asked. (M39)
@@ -247,7 +250,8 @@ struct LiveRun {
     /// consumer is `agent_rpc`, which resolves a relative path in `cide_task_attach` against
     /// it. [`Self::note`] carries the same fact as a sentence for a person; this is the value.
     cwd: Option<std::path::PathBuf>,
-    /// The ordered candidates this run may fall down, stamped at its **first fork**. (M45)
+    /// The ordered candidates this run may fall down, stamped at **dispatch**. (M45, moved from
+    /// the first fork when entries gained a running limit — admission chooses the entry now.)
     ///
     /// Stamped once and never re-read, for `agent_limit`'s reason one field up: a pool edited
     /// under a live run would mean the candidate a failover advances *to* is not the one the user
@@ -259,8 +263,9 @@ struct LiveRun {
     pool: Vec<cide_ipc::PoolEntry>,
     /// Which element of [`Self::pool`] this run is on.
     ///
-    /// **Monotonic**: `0` at the first fork, `+= 1` on a qualifying provider failure, and never
-    /// decreased by anything. That single property is the whole of "sticky for the run" *and* the
+    /// **Monotonic**: set by admission to the first entry at or after it with room (so `0` for a
+    /// fresh run whose first choice is free), advanced on a qualifying provider failure, and never
+    /// decreased by anything but a person's Resume onto changed settings ([`restamp`]). That single property is the whole of "sticky for the run" *and* the
     /// infinite-loop guard — a run can fail over at most `pool.len() - 1` times for its entire
     /// life, across any number of turns, whatever else goes wrong.
     pool_index: usize,
@@ -283,6 +288,20 @@ struct LiveRun {
     /// child comes up — a failover message written there would live for about a second.
     /// [`Self::wire`] composes the two.
     pool_note: Option<String>,
+    /// The name of the pool [`Self::pool`] was taken from, for the row. (M89)
+    ///
+    /// Stamped at the first fork beside the list itself and cleared by [`restamp`], so a Resume
+    /// onto a renamed pool names the new one. Persisted, so a history row still says which pool
+    /// chose its model after a restart — the question the panel's History tab exists to answer.
+    pool_name: Option<String>,
+    /// The single model the last child was forked with, `provider/model` where the harness
+    /// spells it that way. (M89)
+    ///
+    /// A copy of `forked_with.model` that **survives a restart**: `forked_with` is deliberately
+    /// not persisted (a restored run has no frozen child to compare against), but a finished
+    /// run's row must still say what it ran on. Only the fallback — a pool candidate outranks it,
+    /// exactly as it outranks the single model in the fork's own argv. See [`LiveRun::using`].
+    last_model: Option<String>,
     /// What the child that stands was forked with, as far as a person can change it from
     /// Settings or a role file. `None` until the first fork, and after a restore.
     ///
@@ -641,13 +660,16 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             note: (ahead > 0).then(|| {
                 format!("{ahead} ahead of it in this role's queue; runs start as slots free")
             }),
-            // Stamped at the first fork, not here: resolving needs the settings and the
-            // overrides, which `facts` reads on the forking thread. See `LiveRun::pool`.
-            pool: Vec::new(),
+            // Stamped at dispatch, so admission can place the run on an entry with room. A run
+            // that reaches its first fork with this still empty (a restored snapshot from before
+            // the field existed) is stamped there instead — see `stamp_and_choose`.
+            pool: spec.pool,
             pool_index: 0,
             provider_failure: None,
             spent: Vec::new(),
             pool_note: None,
+            pool_name: None,
+            last_model: None,
             forked_with: None,
             stopping: false,
             stop: None,
@@ -659,6 +681,7 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             project_limit: spec.project_limit.max(1),
             checkout: spec.checkout,
             notify: spec.notify,
+            purpose: spec.purpose,
             cwd: None,
             seq,
             frozen: None,
@@ -787,7 +810,37 @@ impl LiveRun {
         (self.project, self.agent.clone())
     }
 
+    /// What this run is on: the model (`provider/model`) and, where a pool chose it, the pool's
+    /// name and position — `("zai/glm-4.6", "fast 2 of 3")`. (M89)
+    ///
+    /// **Read off the run, never off the role's file**, for the reason [`AgentRegistry::
+    /// log_run_info`] gives at length: the file names what the next dispatch would get, the run
+    /// names what this one got, and after a local override or a failover those differ. One
+    /// ladder, in the order the fork resolves them — the pool's candidate outranks the single
+    /// model — and `model_flag` is the join, so this spells the candidate exactly as the child
+    /// was told it.
+    fn using(&self) -> (Option<String>, Option<String>) {
+        let candidate = self.pool.get(self.pool_index);
+        let model = match candidate {
+            Some(entry) => Some(entry.model_flag()),
+            None => self
+                .forked_with
+                .as_ref()
+                .and_then(|settings| settings.model.clone())
+                .or_else(|| self.last_model.clone()),
+        };
+        let position = candidate.map(|_| {
+            let at = format!("entry {} of {}", self.pool_index + 1, self.pool.len());
+            match &self.pool_name {
+                Some(name) => format!("{name} {at}"),
+                None => at,
+            }
+        });
+        (model, position)
+    }
+
     fn wire(&self) -> AgentRun {
+        let (model, pool_position) = self.using();
         AgentRun {
             run: self.run,
             agent: self.agent.clone(),
@@ -814,6 +867,8 @@ impl LiveRun {
             // clobbered by its own successor with nothing to say it had gone.
             note: compose_note(stop_note(self.stop.as_ref()), &self.pool_note, &self.note),
             openable: self.session.is_some() || self.reopenable,
+            model,
+            pool_position,
         }
     }
 }
@@ -831,6 +886,38 @@ pub struct RunScope {
     pub agent: AgentId,
     pub label: String,
     pub cwd: std::path::PathBuf,
+    /// What the run was started for, which decides the tool set its connection is served.
+    pub purpose: RunPurpose,
+    pub harness: Harness,
+}
+
+/// What a run is for. (M85)
+///
+/// `Work` is every run there was before M85: a project role, standing in the root or its
+/// worktree, served the task tracker. `MrReview` is a GitLab merge-request review started from
+/// the MR panel: a role built in memory (`LoadedAgent::synthetic`) on the harness the user
+/// picked, standing in the MR's disposable checkout, served the `cide_mr_*` tools and nothing
+/// else — `agent_rpc`'s `Scope::Review`.
+///
+/// Carried on the run rather than looked up from its role id, because the id `mr-review` is a
+/// name a user could also give a real role file; a run is a review because it was *started* as
+/// one, and nothing on disk can make it one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RunPurpose {
+    #[default]
+    Work,
+    MrReview {
+        review: String,
+        /// The review checkout the child stands in.
+        cwd: PathBuf,
+        /// The role's whole brief, composed by the launcher for the harness it chose.
+        brief: String,
+        /// `--allowedTools` for a claude reviewer; ignored by the others.
+        tools: Vec<String>,
+        /// The harness the user picked. The brief spells tools this harness's way, so the two
+        /// travel together.
+        harness: Harness,
+    },
 }
 
 /// Everything the command worker resolved before the queue was touched.
@@ -863,6 +950,15 @@ pub struct DispatchSpec {
     pub checkout: Option<String>,
     /// Where the run's turn endings are announced. (M40) See [`cide_ipc::RunNotify`].
     pub notify: RunNotify,
+    /// See [`RunPurpose`]. (M85)
+    pub purpose: RunPurpose,
+    /// The pool this run will fall down, resolved at dispatch — empty when no pool applies.
+    ///
+    /// Stamped here rather than at the first fork since pool entries carry a running limit:
+    /// [`admit_a_pass`] chooses the entry a run starts on by which one has room, and admission
+    /// comes *before* the fork. The limits' reason one field up applies as well — no disk or
+    /// settings read under the lock.
+    pub pool: Vec<cide_ipc::PoolEntry>,
 }
 
 /// A run that a new dispatch of the same role onto the same task would double. (M66)
@@ -890,6 +986,8 @@ struct Admission {
     /// `Some` for a resumed [`RunState::Interrupted`] run: the conversation the new child
     /// continues. `None` is an ordinary first start.
     resume: Option<ResumePoint>,
+    /// See [`RunPurpose`]. Copied off the run at admission, like everything else here.
+    purpose: RunPurpose,
 }
 
 /// How a resumed run's new child finds the old conversation. Built by [`admit_a_pass`] from
@@ -984,6 +1082,34 @@ struct Inner {
     /// find the run through `runs` at all. That is the point of the rebind (nothing the dying
     /// child says can reach the run) and this table is what the rebind costs.
     restarts: HashMap<SessionId, Failover>,
+    /// Pool targets a provider refused recently, which admission steers every run around until
+    /// the bench expires or a person resets it. (M90)
+    ///
+    /// Before this a refusal was a fact about *one run*: it walked that run down its own list and
+    /// told nobody else, so every new run tried the server that had just refused and spent a turn
+    /// learning what the last run already knew — and a pool with a local server nobody had started
+    /// looked, from the outside, like a pool that always began at its last entry. In memory only;
+    /// see [`cide_ipc::PoolBench`] for why a restart clears it.
+    benched: Vec<Bench>,
+    /// What pools did lately, newest last and at most [`POOL_EVENTS`] long — the card's "recent
+    /// decisions", which is the only place an admission that passed over an entry is written
+    /// down. (M90)
+    pool_events: VecDeque<cide_ipc::PoolEvent>,
+}
+
+/// How many pool events [`Inner::pool_events`] keeps. Enough for an afternoon's dispatches to be
+/// read back; a ring, because nothing reads further back than "why did the last few start there".
+const POOL_EVENTS: usize = 100;
+
+/// One benched target. See [`Inner::benched`]. (M90)
+#[derive(Debug, Clone)]
+struct Bench {
+    entry: cide_ipc::PoolEntry,
+    reason: cide_agents::FailoverReason,
+    since_unix_ms: u64,
+    until_unix_ms: u64,
+    run: RunId,
+    agent_label: String,
 }
 
 /// One frozen session, as the registry files it. See [`Inner::frozen_sessions`].
@@ -1053,14 +1179,185 @@ impl AgentRegistry {
         insert_run(&mut self.inner.lock(), spec)
     }
 
+    /// How many slot-holding runs, in every project, stand on each pool target — the figure
+    /// [`cide_ipc::PoolEntry::max_running`] limits, for the roster an orchestrator reads.
+    /// [`entry_load`]'s count, grouped; targets with nothing on them are absent.
+    pub fn pool_load(&self) -> Vec<(cide_ipc::PoolEntry, u32)> {
+        let inner = self.inner.lock();
+        let mut load: Vec<(cide_ipc::PoolEntry, u32)> = Vec::new();
+        for live in inner.runs.values().filter(|live| live.slot) {
+            let Some(on) = live.pool.get(live.pool_index) else {
+                continue;
+            };
+            match load.iter_mut().find(|(entry, _)| entry.same_target(on)) {
+                Some((_, n)) => *n += 1,
+                None => load.push((on.clone(), 1)),
+            }
+        }
+        load
+    }
+
+    /// Every configured pool as admission sees it right now: load, benches, the runs on each
+    /// entry, the runs waiting, and the recent decisions — for the pool-state card. (M90)
+    ///
+    /// Read in one lock so the card cannot show a run on an entry *and* waiting for it. Pools are
+    /// taken from `llm` (the settings as they stand), and runs are matched to entries by target
+    /// rather than by pool name, because that is what a running limit and a bench are both about:
+    /// a run stamped from a pool that has since been renamed is still using that server.
+    pub fn pool_state(&self, llm: &cide_ipc::LlmSettings) -> cide_ipc::PoolStateReport {
+        let inner = self.inner.lock();
+        let now = now_unix_ms();
+        let run_ref = |live: &LiveRun| cide_ipc::PoolRunRef {
+            run: live.run,
+            agent_label: live.agent_label.clone(),
+            project: live.project,
+            state: live.state.clone(),
+            position: live.using().1.unwrap_or_default(),
+            note: compose_note(None, &live.pool_note, &live.note),
+        };
+        let pools = llm
+            .pools
+            .iter()
+            .map(|pool| cide_ipc::PoolState {
+                name: pool.name.clone(),
+                description: pool.description.clone(),
+                entries: pool
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let mut runs: Vec<&LiveRun> = inner
+                            .runs
+                            .values()
+                            .filter(|live| live.slot)
+                            .filter(|live| {
+                                live.pool
+                                    .get(live.pool_index)
+                                    .is_some_and(|on| on.same_target(entry))
+                            })
+                            .collect();
+                        runs.sort_by_key(|live| live.seq);
+                        cide_ipc::PoolEntryState {
+                            entry: entry.clone(),
+                            provider: match llm.provider(&entry.provider) {
+                                None => cide_ipc::PoolProviderState::Missing,
+                                Some(provider) if !provider.enabled() => {
+                                    cide_ipc::PoolProviderState::Disabled
+                                }
+                                Some(_) => cide_ipc::PoolProviderState::Ready,
+                            },
+                            running: u32::try_from(runs.len()).unwrap_or(u32::MAX),
+                            runs: runs.into_iter().map(run_ref).collect(),
+                            bench: bench_on(&inner, entry, now).map(|bench| cide_ipc::PoolBench {
+                                reason: bench.reason.wire(),
+                                since_unix_ms: bench.since_unix_ms,
+                                until_unix_ms: bench.until_unix_ms,
+                                run: bench.run,
+                                agent_label: bench.agent_label.clone(),
+                            }),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut waiting: Vec<&LiveRun> = inner
+            .runs
+            .values()
+            .filter(|live| matches!(live.state, RunState::Queued) && !live.pool.is_empty())
+            .collect();
+        waiting.sort_by_key(|live| live.seq);
+        cide_ipc::PoolStateReport {
+            now_unix_ms: now,
+            pools,
+            waiting: waiting.into_iter().map(run_ref).collect(),
+            events: inner.pool_events.iter().rev().cloned().collect(),
+        }
+    }
+
+    /// Clear the bench on one target, or on every target (`None`), and move the runs that are
+    /// **waiting** back up their lists onto it. Answers the projects whose rows changed, for the
+    /// caller to redraw before it pumps the queue. (M90)
+    ///
+    /// # Which runs move
+    ///
+    /// Only a run that is `Queued` or `Interrupted` and holds no slot — one with no child, whose
+    /// next fork is decided by admission from `pool_index` on. A run standing on a child keeps
+    /// the model that child was forked with: moving its index would make `entry_load` count it
+    /// against a server it is not talking to, and there is no argv to change under a live
+    /// process anyway. Its *next* dispatch picks the reset entry up like any new run's.
+    ///
+    /// This is the one place besides [`restamp`] that lowers `pool_index`, and it is allowed to
+    /// for the same reason: a person said so. The monotonic rule exists so a run cannot loop on
+    /// a refusal by itself, not to overrule the user who has just fixed what refused.
+    pub fn reset_pool_entry(&self, target: Option<&cide_ipc::PoolEntry>) -> Vec<ProjectId> {
+        let mut inner = self.inner.lock();
+        inner
+            .benched
+            .retain(|bench| target.is_some_and(|target| !bench.entry.same_target(target)));
+        let mut touched = Vec::new();
+        let mut rewound = 0u32;
+        for live in inner.runs.values_mut() {
+            if live.slot || !matches!(live.state, RunState::Queued | RunState::Interrupted) {
+                continue;
+            }
+            let back_to = match target {
+                Some(target) => live.pool.iter().position(|entry| entry.same_target(target)),
+                None => (!live.pool.is_empty()).then_some(0),
+            };
+            let Some(back_to) = back_to.filter(|&at| at < live.pool_index) else {
+                continue;
+            };
+            live.pool_index = back_to;
+            match target {
+                Some(target) => live.spent.retain(|(entry, _)| !entry.same_target(target)),
+                None => live.spent.clear(),
+            }
+            live.pool_note = Some(format!(
+                "moved back to {} (entry {} of {}) by a reset",
+                live.pool[back_to].model_flag(),
+                back_to + 1,
+                live.pool.len()
+            ));
+            rewound += 1;
+            if !touched.contains(&live.project) {
+                touched.push(live.project);
+            }
+        }
+        log_pool_event(
+            &mut inner,
+            cide_ipc::PoolEvent {
+                at_unix_ms: now_unix_ms(),
+                pool: None,
+                run: None,
+                agent_label: None,
+                project: None,
+                kind: cide_ipc::PoolEventKind::Reset {
+                    entry: target.cloned(),
+                    rewound,
+                },
+            },
+        );
+        touched
+    }
+
     /// Take every queued run that may start now, marking each `Starting` and holding its slot.
     ///
     /// The admission decision and the slot it takes happen under one lock, which is what makes
     /// two concurrent pumps safe: whichever gets the lock first takes the slot, and the second
-    /// sees a full one.
+    /// sees a full one. Production goes through [`Self::take_admissions_noting`]; this is its
+    /// face for a test that only counts admissions.
+    #[cfg(test)]
     fn take_admissions(&self) -> Vec<Admission> {
+        self.take_admissions_noting().0
+    }
+
+    /// Take every queued run that may start now, under one lock for the reason given on
+    /// `take_admissions` above — plus every project where a queued run's row now says
+    /// something new — a pool that is full — so [`Self::pump`] can redraw it. Without that the
+    /// sentence would be written under the lock and shown at the next unrelated change.
+    fn take_admissions_noting(&self) -> (Vec<Admission>, Vec<ProjectId>) {
         let mut inner = self.inner.lock();
         let mut admitted = Vec::new();
+        let mut noted = Vec::new();
 
         // A pass admits at most one run per agent, because only the *front* of an agent's queue
         // is ever eligible — that is what makes a queue serial. So it repeats until a pass admits
@@ -1069,18 +1366,218 @@ impl AgentRegistry {
         // event to call this again.
         loop {
             let before = admitted.len();
-            admit_a_pass(&mut inner, &mut admitted);
+            admit_a_pass(&mut inner, &mut admitted, &mut noted);
             if admitted.len() == before {
                 break;
             }
         }
 
-        admitted
+        (admitted, noted)
     }
 }
 
+/// How many runs **holding a slot**, in any project, stand on this pool target right now —
+/// the count [`cide_ipc::PoolEntry::max_running`] is a ceiling on.
+///
+/// Counted by scan rather than kept in a map beside `agent_slots`, because the thing counted is
+/// a *derived* fact — which entry a slot-holding run is on — and a counter would need every
+/// writer of `slot` and of `pool_index` to remember it. The registry holds tens of runs.
+///
+/// A slot and not "live", for the project cap's reason: an idle run has handed its turn back and
+/// its child is not talking to the provider, so it is not using the concurrency a provider sells.
+/// `except` leaves one run out — a failover asking where *it* can go next.
+fn entry_load(inner: &Inner, entry: &cide_ipc::PoolEntry, except: Option<RunId>) -> usize {
+    inner
+        .runs
+        .values()
+        .filter(|live| live.slot && Some(live.run) != except)
+        .filter(|live| {
+            live.pool
+                .get(live.pool_index)
+                .is_some_and(|on| on.same_target(entry))
+        })
+        .count()
+}
+
+/// The bench standing on this target at `now`, if any. See [`Inner::benched`]. (M90)
+///
+/// Expiry is read here rather than swept by a timer: an expired bench is simply one this answers
+/// `None` for, so there is no clock thread to own and no moment at which it is half-cleared.
+fn bench_on<'a>(inner: &'a Inner, entry: &cide_ipc::PoolEntry, now: u64) -> Option<&'a Bench> {
+    inner
+        .benched
+        .iter()
+        .find(|bench| bench.until_unix_ms > now && bench.entry.same_target(entry))
+}
+
+/// Which entry a run should stand on, and every entry it passed over on the way. (M90)
+#[derive(Debug, Clone)]
+struct Choice {
+    at: usize,
+    skipped: Vec<cide_ipc::PoolSkipped>,
+    /// Every entry with room was benched, and this is the first of them — tried anyway.
+    benched_fallback: bool,
+}
+
+/// The first entry of `pool` at or after `from` that has room **and is not benched**; failing
+/// that, the first with room at all; `None` only when every one is at its running limit.
+///
+/// `from` is how monotonicity survives the limits: a run a failover moved to entry 2 never
+/// climbs back to entry 0 because entry 0 has since freed up — that entry already refused it.
+///
+/// # The bench is a preference, never a gate (M90)
+///
+/// A benched entry is passed over while anything later has room, and taken anyway when nothing
+/// does. The other reading — wait until a bench expires — would park a whole pool behind a timer
+/// the moment its last entry refused once, which is the deadlock a pool exists to avoid, and it
+/// would make "the server is back" something the user can only express by finding the Reset
+/// button. Trying a benched entry costs at most the turn it would have cost without benches.
+fn choose_entry(
+    inner: &Inner,
+    pool: &[cide_ipc::PoolEntry],
+    from: usize,
+    except: Option<RunId>,
+    now: u64,
+) -> Option<Choice> {
+    let mut skipped = Vec::new();
+    let mut fallback: Option<(usize, usize)> = None;
+    for (at, entry) in pool.iter().enumerate().skip(from) {
+        let index = u16::try_from(at).unwrap_or(u16::MAX);
+        if let Some(max) = entry.max_running {
+            let running = entry_load(inner, entry, except);
+            if running >= usize::from(max) {
+                skipped.push(cide_ipc::PoolSkipped {
+                    entry: entry.clone(),
+                    index,
+                    skip: cide_ipc::PoolSkip::Full {
+                        running: u32::try_from(running).unwrap_or(u32::MAX),
+                        max,
+                    },
+                });
+                continue;
+            }
+        }
+        if let Some(bench) = bench_on(inner, entry, now) {
+            // The skips *before* this one belong to the fallback's story; the ones after it do
+            // not, because a run that falls back to here never looked past it.
+            fallback.get_or_insert((at, skipped.len()));
+            skipped.push(cide_ipc::PoolSkipped {
+                entry: entry.clone(),
+                index,
+                skip: cide_ipc::PoolSkip::Benched {
+                    reason: bench.reason.wire(),
+                    until_unix_ms: bench.until_unix_ms,
+                },
+            });
+            continue;
+        }
+        return Some(Choice {
+            at,
+            skipped,
+            benched_fallback: false,
+        });
+    }
+    let (at, before) = fallback?;
+    skipped.truncate(before);
+    Some(Choice {
+        at,
+        skipped,
+        benched_fallback: true,
+    })
+}
+
+/// `k3s/qwen benched (unreachable, 2m left), o3/big full 1/1` — the skips as the row says them.
+fn skipped_phrase(skipped: &[cide_ipc::PoolSkipped], now: u64) -> String {
+    skipped
+        .iter()
+        .map(|skip| match &skip.skip {
+            cide_ipc::PoolSkip::Full { running, max } => {
+                format!("{} full {running}/{max}", skip.entry.model_flag())
+            }
+            cide_ipc::PoolSkip::Benched {
+                reason,
+                until_unix_ms,
+            } => format!(
+                "{} benched ({}, {} left)",
+                skip.entry.model_flag(),
+                refusal_phrase(*reason),
+                minutes_left(*until_unix_ms, now)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`cide_agents::FailoverReason::phrase`], from the wire side.
+fn refusal_phrase(reason: cide_ipc::PoolRefusal) -> &'static str {
+    match reason {
+        cide_ipc::PoolRefusal::RateLimited => "rate limited",
+        cide_ipc::PoolRefusal::Unreachable => "unreachable",
+        cide_ipc::PoolRefusal::Auth => "refused the credential",
+    }
+}
+
+/// `2m`, rounded up so a bench with seconds to go never reads `0m left`.
+fn minutes_left(until: u64, now: u64) -> String {
+    let ms = until.saturating_sub(now);
+    format!("{}m", ms.div_ceil(60_000).max(1))
+}
+
+/// Append to the pool log, dropping the oldest past [`POOL_EVENTS`].
+fn log_pool_event(inner: &mut Inner, event: cide_ipc::PoolEvent) {
+    if inner.pool_events.len() >= POOL_EVENTS {
+        inner.pool_events.pop_front();
+    }
+    inner.pool_events.push_back(event);
+}
+
+/// Bench `entry` for its reason's time, or extend a bench already on it. (M90)
+fn bench_entry(
+    inner: &mut Inner,
+    entry: &cide_ipc::PoolEntry,
+    reason: cide_agents::FailoverReason,
+    run: RunId,
+    agent_label: &str,
+    now: u64,
+) -> u64 {
+    let until = now + reason.bench_ms();
+    inner
+        .benched
+        .retain(|bench| !bench.entry.same_target(entry));
+    inner.benched.push(Bench {
+        entry: entry.clone(),
+        reason,
+        since_unix_ms: now,
+        until_unix_ms: until,
+        run,
+        agent_label: agent_label.to_string(),
+    });
+    until
+}
+
+/// The row's sentence for a run waiting on a full pool: each entry it could take, and how full.
+fn pool_full_note(inner: &Inner, pool: &[cide_ipc::PoolEntry], from: usize) -> String {
+    let each = pool
+        .iter()
+        .skip(from)
+        .map(|entry| {
+            format!(
+                "{} {}/{}",
+                entry.model_flag(),
+                entry_load(inner, entry, None),
+                entry
+                    .max_running
+                    .map_or_else(|| "∞".to_string(), |max| max.to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("every model in its pool is at its running limit ({each}); starts when one frees")
+}
+
 /// One pass of the admission scan: at most one run per agent, oldest dispatch first.
-fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
+fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>, noted: &mut Vec<ProjectId>) {
+    let now = now_unix_ms();
     {
         // Dispatch order across the whole registry, so an agent that has been waiting longer
         // wins the project's last slot.
@@ -1112,6 +1609,34 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             if agent_held >= agent_limit || project_held >= project_limit {
                 continue;
             }
+            // The pool gate: which entry this run starts on, by which has room. A run with no
+            // pool has nothing to gate. A pool whose every remaining entry is at its
+            // `max_running` keeps the run queued with a sentence rather than overcommitting one
+            // — the provider would only refuse it, and a refusal costs a turn to learn what the
+            // settings already said. Counted across projects: see `PoolEntry::max_running`.
+            //
+            // It also steers around benched targets (M90) — see `choose_entry` for why a bench
+            // is a preference and never a reason to wait.
+            let chosen = match live.pool.is_empty() {
+                true => None,
+                false => {
+                    let from = live.pool_index.min(live.pool.len() - 1);
+                    match choose_entry(inner, &live.pool, from, None, now) {
+                        Some(choice) => Some(choice),
+                        None => {
+                            let note = pool_full_note(inner, &live.pool, from);
+                            let live = inner.runs.get_mut(&run).expect("just read above");
+                            if live.note.as_deref() != Some(note.as_str()) {
+                                live.note = Some(note);
+                                if !noted.contains(&project) {
+                                    noted.push(project);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
             // The checkout gate — the per-task successor to the worktree clamp that used to
             // pin `agent_limit` at 1. Two children in one checkout is the failure worktree
             // isolation exists to prevent, and with a worktree per task it is no longer a
@@ -1145,6 +1670,50 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
             move_to(live, RunState::Starting, now_unix_ms());
             live.slot = true;
             live.note = None;
+            let mut started = None;
+            if let Some(choice) = chosen {
+                live.pool_index = choice.at;
+                // Said on the row only when something was passed over: a run on the first entry
+                // it may try has nothing to explain, and its pool position already says where it
+                // is. When something was, this is the sentence the user had no way to get before
+                // M90 — why a run began at the bottom of its list.
+                if !choice.skipped.is_empty() || choice.benched_fallback {
+                    let target = &live.pool[choice.at];
+                    let passed_over = match choice.skipped.is_empty() {
+                        true => String::new(),
+                        false => format!("; passed over {}", skipped_phrase(&choice.skipped, now)),
+                    };
+                    live.pool_note = Some(match choice.benched_fallback {
+                        false => format!(
+                            "started on {} (entry {} of {}){passed_over}",
+                            target.model_flag(),
+                            choice.at + 1,
+                            live.pool.len(),
+                        ),
+                        true => format!(
+                            "started on {} (entry {} of {}) although it is benched — nothing after it \
+                             had room{passed_over}",
+                            target.model_flag(),
+                            choice.at + 1,
+                            live.pool.len(),
+                        ),
+                    });
+                }
+                started = Some(cide_ipc::PoolEvent {
+                    at_unix_ms: now,
+                    pool: live.pool_name.clone(),
+                    run: Some(run),
+                    agent_label: Some(live.agent_label.clone()),
+                    project: Some(project),
+                    kind: cide_ipc::PoolEventKind::Started {
+                        entry: live.pool[choice.at].clone(),
+                        index: u16::try_from(choice.at).unwrap_or(u16::MAX),
+                        of: u16::try_from(live.pool.len()).unwrap_or(u16::MAX),
+                        skipped: choice.skipped,
+                        benched_fallback: choice.benched_fallback,
+                    },
+                });
+            }
             // A resumed interrupted run continues its old conversation; one that never had a
             // conversation to continue (it was still queued when cide quit) starts fresh with
             // its original prompt, which is the honest reading of "nothing happened yet".
@@ -1192,7 +1761,11 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>) {
                 change: live.change.clone(),
                 prompt,
                 resume,
+                purpose: live.purpose.clone(),
             });
+            if let Some(event) = started {
+                log_pool_event(inner, event);
+            }
         }
     }
 }
@@ -1279,14 +1852,20 @@ pub(crate) fn resolutions_for(
         .collect())
 }
 
-/// Clear a run's pool stamp so its next fork stamps the pool as configured now. The one place
-/// the stickiness rule on [`LiveRun::pool`] yields, and only to a person's Resume — never to a
-/// failover or a follow-up, which continue on the list the run was arranged on.
-fn restamp(live: &mut LiveRun) {
-    live.pool.clear();
+/// Put a run on the pool as configured now. The one place the stickiness rule on
+/// [`LiveRun::pool`] yields, and only to a person's Resume — never to a failover or a follow-up,
+/// which continue on the list the run was arranged on.
+///
+/// Given the new list rather than clearing the old one for the next fork to restamp, because
+/// admission reads the list *before* the fork: a cleared pool is a run whose running limits
+/// nobody counts.
+fn restamp(live: &mut LiveRun, pool: &[cide_ipc::PoolEntry]) {
+    live.pool = pool.to_vec();
     live.pool_index = 0;
     live.spent.clear();
     live.pool_note = None;
+    // Re-stamped at the next fork, from the settings that fork resolves.
+    live.pool_name = None;
 }
 
 /// What a run says while its settings restart is between the old child and the new.
@@ -1724,6 +2303,24 @@ impl AgentRegistry {
     /// root for it would be answering a question that cannot legitimately be asked yet, and a
     /// connection that *did* name such a run is one nothing this process started — refused,
     /// like an unknown run id.
+    /// Every unfinished run reviewing `review`, in any project. (M85) Closing a review deletes
+    /// the checkout these stand in, so the close stops them first.
+    pub fn review_runs(&self, review: &str) -> Vec<(ProjectId, RunId)> {
+        self.inner
+            .lock()
+            .runs
+            .values()
+            .filter(|run| {
+                matches!(&run.purpose, RunPurpose::MrReview { review: r, .. } if r == review)
+                    && !matches!(
+                        run.state,
+                        RunState::Finished { .. } | RunState::Failed { .. }
+                    )
+            })
+            .map(|run| (run.project, run.run))
+            .collect()
+    }
+
     pub fn run_scopes_for(&self, project: ProjectId) -> Vec<RunScope> {
         let inner = self.inner.lock();
         inner
@@ -1737,6 +2334,8 @@ impl AgentRegistry {
                     agent: run.agent.clone(),
                     label: run.agent_label.clone(),
                     cwd: run.cwd.clone()?,
+                    purpose: run.purpose.clone(),
+                    harness: run.harness,
                 })
             })
             .collect()
@@ -2892,7 +3491,12 @@ impl AgentRegistry {
             live.stale_turn = false;
             move_to(live, RunState::Starting, now_unix_ms());
             if pool_changed {
-                restamp(live);
+                // Onto the new list's first entry without asking whether it has room: this is a
+                // run that already holds its slot swapping its own child, not a new one taking a
+                // slot, and it reaches the fork without passing admission. The overshoot is at
+                // most one run for as long as this child lives, and only after a person edited
+                // the pool under a paused run — cheaper than a restart that could refuse itself.
+                restamp(live, &now.pool);
             }
             if resume.is_some() && !never_began {
                 // A continuation line is a prompt into a conversation that carries real work,
@@ -2919,6 +3523,7 @@ impl AgentRegistry {
                 session: Some(next),
                 previous: Some(old),
                 why: Carried::Settings,
+                purpose: live.purpose.clone(),
             };
             inner.frozen_sessions.remove(&old);
             inner.restarts.insert(old, failover);
@@ -3053,10 +3658,11 @@ impl AgentRegistry {
             // two lines and `admit_a_pass`'s are what will name it; the guard comes after the
             // trace, not before it.
             tracing::info!(%run, agent = %live.agent, "resume: requeued an interrupted run to continue its conversation");
-            if !live.pool.is_empty()
-                && settings_now(&live.agent).is_some_and(|now| now.pool != live.pool)
+            if let Some(now) = settings_now(&live.agent)
+                && now.pool != live.pool
+                && !live.pool.is_empty()
             {
-                restamp(live);
+                restamp(live, &now.pool);
             }
             let key = live.key();
             inner.queues.entry(key).or_default().push_back(run);
@@ -3291,6 +3897,7 @@ impl AgentRegistry {
                 // this admission never goes through the queue, so there is no later point at
                 // which a `ResumePoint` would be read.
                 resume: None,
+                purpose: live.purpose.clone(),
             },
             previous: live.session,
             harness_session,
@@ -3447,6 +4054,7 @@ impl AgentRegistry {
                 rebind: None,
                 conversation,
             }),
+            purpose: failover.purpose,
         };
         let resume = admission
             .resume
@@ -3485,12 +4093,30 @@ impl AgentRegistry {
     /// the sequence reversed.
     ///
     /// `None` is the ordinary answer and leaves the exit to end the run exactly as it always has.
+    ///
+    /// Production calls [`Self::plan_failover_or_wait`]; this is its face for the tests that
+    /// only ask whether a fork was planned.
+    #[cfg(test)]
     fn plan_failover(&self, session: SessionId, code: i32) -> Option<Failover> {
+        match self.plan_failover_or_wait(session, code)? {
+            FailoverPlan::Fork(failover) => Some(*failover),
+            FailoverPlan::Queued(_) => None,
+        }
+    }
+
+    /// [`Self::plan_failover`], with the third answer running limits added: the next candidates
+    /// exist but are all at their `max_running`, so the run goes back to the **front** of its
+    /// role's queue — slot released, session unbound, the candidate position advanced — and
+    /// admission forks it onto the first of them that frees. Forking over the limit instead
+    /// would be spending the very concurrency the user capped.
+    fn plan_failover_or_wait(&self, session: SessionId, code: i32) -> Option<FailoverPlan> {
         let mut inner = self.inner.lock();
-        let live = inner
+        let at = inner
             .runs
-            .values_mut()
-            .find(|live| live.session == Some(session))?;
+            .values()
+            .find(|live| live.session == Some(session))?
+            .run;
+        let live = inner.runs.get_mut(&at).expect("found above");
 
         // **Taken, never read.** A candidate's verdict belongs to the child that reported it; a
         // latch left behind would fail the *next* candidate over on its own clean exit.
@@ -3524,7 +4150,51 @@ impl AgentRegistry {
         }
 
         let spent = live.pool.get(live.pool_index).cloned();
-        let next = live.pool_index + 1;
+        let (pool, from) = (live.pool.clone(), live.pool_index + 1);
+        let (agent_label, pool_name, project) = (
+            live.agent_label.clone(),
+            live.pool_name.clone(),
+            live.project,
+        );
+
+        // Bench what refused, for every run and not only this one (M90) — **before** choosing
+        // where this run goes next, so a target named twice in one list is not chosen again a
+        // line later. Benched even on exhaustion: the next run to dispatch should not have to
+        // spend a turn learning it too.
+        let now = now_unix_ms();
+        if let Some(entry) = spent.as_ref() {
+            let until = bench_entry(&mut inner, entry, reason, at, &agent_label, now);
+            log_pool_event(
+                &mut inner,
+                cide_ipc::PoolEvent {
+                    at_unix_ms: now,
+                    pool: pool_name.clone(),
+                    run: Some(at),
+                    agent_label: Some(agent_label.clone()),
+                    project: Some(project),
+                    kind: cide_ipc::PoolEventKind::Refused {
+                        entry: entry.clone(),
+                        reason: reason.wire(),
+                        until_unix_ms: until,
+                    },
+                },
+            );
+        }
+        // Where this run could go next: the count needs every other run, and leaves this one out
+        // because it is leaving its current entry.
+        let choice = choose_entry(&inner, &pool, from, Some(at), now);
+        let wait_note = choice
+            .is_none()
+            .then(|| pool_full_note(&inner, &pool, from));
+        let passed_over = choice
+            .as_ref()
+            .filter(|choice| !choice.skipped.is_empty())
+            .map(|choice| format!("; passed over {}", skipped_phrase(&choice.skipped, now)))
+            .unwrap_or_default();
+        let room = choice.as_ref().map(|choice| choice.at);
+        let live = inner.runs.get_mut(&at).expect("found above");
+
+        let next = room.unwrap_or(from);
         let Some(candidate) = live.pool.get(next).cloned() else {
             // Exhausted. The run ends as any run ends — the exit is real and so is its code — and
             // the row says what happened to it, which is the whole of what exhaustion owes a user.
@@ -3549,12 +4219,59 @@ impl AgentRegistry {
         if let Some(entry) = spent.clone() {
             live.spent.push((entry, reason));
         }
+        // The fresh-or-continue decision, `Failover::resume`'s below — made here too because the
+        // wait needs it as much as the fork.
+        let fresh = live.turns <= 1;
+        if room.is_none() {
+            // Every remaining candidate is at its running limit. Wait for one rather than fork
+            // over it; `admit_a_pass` searches from `next` on, so the order is kept and nothing
+            // already refused is retried.
+            live.pool_index = next;
+            let resume = match fresh {
+                true => {
+                    live.harness_session = None;
+                    None
+                }
+                false => live
+                    .harness_session
+                    .clone()
+                    .map(|conversation| ResumePoint {
+                        // A pool is opencode-shaped, whose child is a new cide session either way.
+                        rebind: None,
+                        conversation,
+                    }),
+            };
+            live.pool_note = Some(format!(
+                "{} {} — waiting for room on {} (entry {} of {})",
+                spent.as_ref().map_or_else(String::new, PoolEntryExt::flag),
+                reason.phrase(),
+                candidate.model_flag(),
+                next + 1,
+                live.pool.len()
+            ));
+            // `requeue_unsubmitted`'s shape: unbind first, so the exit that follows belongs to
+            // nobody and cannot end the run it has just been taken from.
+            live.session = None;
+            move_to(live, RunState::Queued, now_unix_ms());
+            live.requeued = Some(Requeued {
+                resume,
+                prompt: live.prompt.clone(),
+            });
+            live.note = wait_note;
+            let held = std::mem::replace(&mut live.slot, false);
+            let (key, project) = (live.key(), live.project);
+            if held {
+                release(&mut inner, &key, project);
+            }
+            inner.queues.entry(key).or_default().push_front(at);
+            return Some(FailoverPlan::Queued(project));
+        }
         // **Monotonic**, and that is both the stickiness and the loop guard: a run fails over at
         // most `pool.len() - 1` times for its entire life.
         live.pool_index = next;
         debug_assert!(live.pool_index < live.pool.len());
         live.pool_note = Some(format!(
-            "{} {} — now on {} ({} of {})",
+            "{} {} — now on {} (entry {} of {}){passed_over}",
             spent.as_ref().map_or_else(String::new, PoolEntryExt::flag),
             reason.phrase(),
             candidate.model_flag(),
@@ -3588,7 +4305,6 @@ impl AgentRegistry {
         // This clear is a decision taken **with the lock held, before the next child exists**,
         // which is categorically different from the line-driven overwrite that method refuses. Do
         // not "restore" the invariant here.
-        let fresh = live.turns <= 1;
         let resume = match fresh {
             true => {
                 live.harness_session = None;
@@ -3597,7 +4313,7 @@ impl AgentRegistry {
             false => live.harness_session.clone(),
         };
 
-        Some(Failover {
+        let failover = Failover {
             // **The same `RunId`**, which is what makes this a continuation of one run rather than
             // a second run of the same work. `plan_respawn`'s four rules apply unchanged.
             run: live.run,
@@ -3611,7 +4327,30 @@ impl AgentRegistry {
             session: None,
             previous: live.session,
             why: Carried::Failover,
-        })
+            purpose: live.purpose.clone(),
+        };
+        // A failover's fork never passes through admission, so its start is logged here — or
+        // the card's history would show a refusal and then nothing about where the run went.
+        if let Some(choice) = choice {
+            log_pool_event(
+                &mut inner,
+                cide_ipc::PoolEvent {
+                    at_unix_ms: now,
+                    pool: pool_name,
+                    run: Some(at),
+                    agent_label: Some(agent_label),
+                    project: Some(project),
+                    kind: cide_ipc::PoolEventKind::Started {
+                        entry: candidate,
+                        index: u16::try_from(next).unwrap_or(u16::MAX),
+                        of: u16::try_from(pool.len()).unwrap_or(u16::MAX),
+                        skipped: choice.skipped,
+                        benched_fallback: choice.benched_fallback,
+                    },
+                },
+            );
+        }
+        Some(FailoverPlan::Fork(Box::new(failover)))
     }
 
     /// Stamp this run's pool if it has none yet, and answer the candidate it is on. (M45)
@@ -3635,18 +4374,16 @@ impl AgentRegistry {
     ) -> Option<cide_ipc::PoolChoice> {
         let mut inner = self.inner.lock();
         let live = inner.runs.get_mut(&run)?;
+        live.last_model.clone_from(&settings.model);
         live.forked_with = Some(settings);
         if live.pool.is_empty() && live.pool_index == 0 {
             live.pool.clone_from(&resolved.pool);
-            if let Some(name) = &resolved.pool_name
-                && !resolved.pool.is_empty()
-            {
-                live.pool_note = Some(format!(
-                    "pool {name}: {} of {}",
-                    live.pool_index + 1,
-                    resolved.pool.len()
-                ));
-            }
+        }
+        // The pool's name and position are fields on the wire row now (`LiveRun::using`), not a
+        // sentence in `pool_note` — which is kept for the events a pool has (a failover, an
+        // exhaustion) rather than for the standing fact of which candidate a run is on. (M89)
+        if live.pool_name.is_none() && !live.pool.is_empty() {
+            live.pool_name.clone_from(&resolved.pool_name);
         }
         let entry = live.pool.get(live.pool_index)?.clone();
         Some(cide_ipc::PoolChoice {
@@ -3704,25 +4441,17 @@ impl AgentRegistry {
             .values()
             .find(|run| run.session == Some(session))?;
         let candidate = live.pool.get(live.pool_index);
+        // `LiveRun::using` is the one ladder — the row on the panel and this card must never
+        // name two different models for one run. The card keeps its bare `1 of 3`; the pool's
+        // name is the row's addition.
+        let (model, _) = live.using();
         Some(cide_ipc::LogRunInfo {
             harness: live.harness,
-            // One ladder, in the order the fork resolves them: the pool's candidate outranks the
-            // single model (`harness::opencode`'s argv says so in as many words), and the single
-            // model is already the override's-then-the-role's with opencode's own default folded
-            // in — `Resolved::with_default_model`. `model_flag` is the join, so this spells the
-            // candidate exactly as the child was told it and invents no `provider/model` of its
-            // own (`PoolEntry`'s header: cide only ever joins).
-            model: match candidate {
-                Some(entry) => Some(entry.model_flag()),
-                None => live
-                    .forked_with
-                    .as_ref()
-                    .and_then(|settings| settings.model.clone()),
-            },
+            model,
             // `1 of 3`, and only where there is a pool. Without it the card would name a model
             // nobody chose and say nothing about the two that refused before it.
             pool_position: candidate
-                .map(|_| format!("{} of {}", live.pool_index + 1, live.pool.len())),
+                .map(|_| format!("entry {} of {}", live.pool_index + 1, live.pool.len())),
             usage: live.usage,
             context_limit: candidate.and_then(|entry| {
                 live.forked_with
@@ -3864,6 +4593,20 @@ struct Failover {
     previous: Option<SessionId>,
     /// Which sentence separates the carried screen from the successor's output.
     why: Carried,
+    /// See [`RunPurpose`]: a review's successor is still a review.
+    purpose: RunPurpose,
+}
+
+/// What a provider failure with pool candidates left comes to. See
+/// [`AgentRegistry::plan_failover_or_wait`].
+#[derive(Debug)]
+enum FailoverPlan {
+    /// Fork the next candidate now, in the slot this run already holds. Boxed because the
+    /// other arm is one id, and this is the rare path.
+    Fork(Box<Failover>),
+    /// Every remaining candidate is at its running limit: the run is back at the front of its
+    /// queue, its slot released. The project is whose queue to pump and whose rows to redraw.
+    Queued(ProjectId),
 }
 
 /// Why a run's successor is carrying its predecessor's screen — what the separator between
@@ -3979,6 +4722,13 @@ struct SavedRun {
     pool: Vec<cide_ipc::PoolEntry>,
     #[serde(default)]
     pool_index: usize,
+    /// [`LiveRun::pool_name`] and [`LiveRun::last_model`], so a restored history row still says
+    /// what it ran on. (M89) Absent in an older file, which reads as "not recorded" and draws the
+    /// harness alone.
+    #[serde(default)]
+    pool_name: Option<String>,
+    #[serde(default)]
+    last_model: Option<String>,
     /// The stamped worktree name, kept for the checkout gate's stated reason — the same as the
     /// limits'. `None` reads as "shared isolation" for a file from before this field; the cost
     /// is that such a resumed run skips the gate once, which degrades to the pre-feature
@@ -4334,7 +5084,13 @@ impl AgentRegistry {
             // Terminal runs ride along — the panel's tail is a history, and a history that
             // ends at every restart is a scratchpad. [`Self::forget_old`] has already capped
             // them at [`RECENT_KEPT`] per project, so this is bounded by construction.
-            let mut runs: Vec<&LiveRun> = inner.runs.values().collect();
+            // Not a review (M85): its checkout is deleted when cide quits, so a restored one
+            // could only be resumed into a directory that no longer exists.
+            let mut runs: Vec<&LiveRun> = inner
+                .runs
+                .values()
+                .filter(|live| matches!(live.purpose, RunPurpose::Work))
+                .collect();
             runs.sort_by_key(|live| live.seq);
             RunsFile {
                 version: RUNS_SNAPSHOT_VERSION,
@@ -4370,6 +5126,8 @@ impl AgentRegistry {
                         project_limit: live.project_limit,
                         pool: live.pool.clone(),
                         pool_index: live.pool_index,
+                        pool_name: live.pool_name.clone(),
+                        last_model: live.last_model.clone(),
                         checkout: live.checkout.clone(),
                         notify: live.notify.clone(),
                         state: Some(live.state.clone()),
@@ -4512,6 +5270,8 @@ impl AgentRegistry {
                     provider_failure: None,
                     spent: Vec::new(),
                     pool_note: None,
+                    pool_name: saved.pool_name,
+                    last_model: saved.last_model,
                     // Not persisted. A restored run's next child is a resume that re-reads the
                     // settings and stamps this afresh; there is no frozen child whose argv this
                     // could be compared against.
@@ -4536,6 +5296,8 @@ impl AgentRegistry {
                     project_limit: saved.project_limit.max(1),
                     checkout: saved.checkout,
                     notify: saved.notify,
+                    // Review runs are never saved (see `save_snapshot`), so a restored run was work.
+                    purpose: RunPurpose::Work,
                     // A restored run has no child until it is resumed, and the resume calls
                     // `note_cwd` like a first start does.
                     cwd: None,
@@ -4799,7 +5561,21 @@ impl Facts {
     /// harness that reads the provider document has such a default; `user_config` answers
     /// `None` for every other, and `with_default_model` ignores them anyway.
     fn resolve(&self, agent: &cide_agents::LoadedAgent) -> cide_agents::overrides::Resolved {
-        let resolved = cide_agents::overrides::resolve(agent, &self.overrides, &self.llm);
+        self.resolve_with(agent, &self.overrides)
+    }
+
+    /// [`Self::resolve`] with no local override applied: the role runs exactly the harness it
+    /// names. For an MR review (M85), whose harness is the one the user just picked.
+    fn resolve_pinned(&self, agent: &cide_agents::LoadedAgent) -> cide_agents::overrides::Resolved {
+        self.resolve_with(agent, &cide_ipc::ProjectOverrides::default())
+    }
+
+    fn resolve_with(
+        &self,
+        agent: &cide_agents::LoadedAgent,
+        overrides: &cide_ipc::ProjectOverrides,
+    ) -> cide_agents::overrides::Resolved {
+        let resolved = cide_agents::overrides::resolve(agent, overrides, &self.llm);
         if !resolved.harness.reads_provider_document() {
             return resolved;
         }
@@ -4876,7 +5652,11 @@ struct Started {
 impl AgentRegistry {
     /// Start every run the queue will admit. Returns at once; each start runs on its own task.
     pub fn pump(self: &Arc<Self>, app: &AppHandle) {
-        for admission in self.take_admissions() {
+        let (admitted, noted) = self.take_admissions_noting();
+        for project in noted {
+            self.mark_changed(app, project);
+        }
+        for admission in admitted {
             let registry = Arc::clone(self);
             let app = app.clone();
             tauri::async_runtime::spawn(async move { registry.start(app, admission).await });
@@ -5097,6 +5877,7 @@ impl AgentRegistry {
         let app = app.clone();
         let for_failover = app.clone();
         let for_failover_app = app.clone();
+        let for_wait = app.clone();
         self.watch_exit_with(
             session,
             pty,
@@ -5127,6 +5908,10 @@ impl AgentRegistry {
                     registry.fork_failover(for_failover_app, failover).await;
                 });
             },
+            move |registry, project| {
+                registry.mark_changed(&for_wait, project);
+                registry.pump(&for_wait);
+            },
         );
     }
 
@@ -5146,6 +5931,9 @@ impl AgentRegistry {
         // this method's own stated reason — forking needs an `AppHandle`, this build cannot make
         // one, and a test drives `plan_failover` directly with a closure that does nothing. (M45)
         over_to: impl FnOnce(&Arc<Self>, Failover) + Send + 'static,
+        // The app half of a failover that has to *wait* for a candidate with room: redraw and
+        // pump, because the slot it gave back may start somebody else. (Pool running limits.)
+        wait: impl FnOnce(&Arc<Self>, ProjectId) + Send + 'static,
     ) {
         let registry = Arc::clone(self);
         pty.on_exit(move |exit| {
@@ -5160,9 +5948,18 @@ impl AgentRegistry {
                 over_to(&registry, restart);
                 return;
             }
-            if let Some(failover) = registry.plan_failover(session, exit.code) {
-                over_to(&registry, failover);
-                return;
+            match registry.plan_failover_or_wait(session, exit.code) {
+                Some(FailoverPlan::Fork(failover)) => {
+                    over_to(&registry, *failover);
+                    return;
+                }
+                // Unbound from this session under the lock, so the `observe` below finds nobody
+                // and cannot end it: the run is queued, and its slot came free.
+                Some(FailoverPlan::Queued(project)) => {
+                    wait(&registry, project);
+                    return;
+                }
+                None => {}
             }
             // `Observation::Exit` is the only observation carrying ground truth about the child,
             // so the harness answers it from any state — which is what turns an `Idle` run whose
@@ -5921,15 +6718,43 @@ fn start_child(
     // that time a `git pull` can disable the project or a role's file can be deleted. Spawning on
     // the strength of a check made before the wait is spawning on a fact that has expired.
     let project = cide_agents::load_project(&facts.root);
-    let agent = project.get(&admission.agent).ok_or_else(|| {
-        CoreError::Io(format!(
-            "no role named `{}` in this project",
-            admission.agent
-        ))
-    })?;
-    if let Some(why) =
-        cide_agents::dispatch_refusal(agent, &project.config.agents, facts.hook_bin.as_deref())
-    {
+    // A review's role is built here rather than read, from what its launcher composed (M85) —
+    // see `RunPurpose`. Everything below it is the same fork every run takes.
+    let synthetic = match &admission.purpose {
+        RunPurpose::Work => None,
+        RunPurpose::MrReview {
+            brief,
+            tools,
+            harness,
+            ..
+        } => Some(cide_agents::LoadedAgent::synthetic(
+            &admission.agent.0,
+            "MR review",
+            *harness,
+            brief.clone(),
+            tools.clone(),
+        )),
+    };
+    let agent = match &synthetic {
+        Some(agent) => agent,
+        None => project.get(&admission.agent).ok_or_else(|| {
+            CoreError::Io(format!(
+                "no role named `{}` in this project",
+                admission.agent
+            ))
+        })?,
+    };
+    // A review belongs to no project role, so "subagents are off for this project" is not its
+    // refusal to give: the rest of the gate — the bridge, the harness being installed, a
+    // dangerous mode — is. The queue's pause still holds it, which is the user's own brake.
+    let gate = match &admission.purpose {
+        RunPurpose::Work => project.config.agents.clone(),
+        RunPurpose::MrReview { .. } => cide_agents::AgentsConfig {
+            enabled: true,
+            ..project.config.agents.clone()
+        },
+    };
+    if let Some(why) = cide_agents::dispatch_refusal(agent, &gate, facts.hook_bin.as_deref()) {
         return Err(CoreError::Io(why));
     }
 
@@ -5937,11 +6762,13 @@ fn start_child(
     // so the admission gate and this fork cannot disagree. Read off the same fresh `project.get`
     // as the refusal, so a role's `worktree: false` flipped mid-queue is honoured at the fork —
     // and a run with no task lands in the project root under every isolation (M40).
-    let cwd = match cide_agents::run_checkout(
-        agent,
-        &project.config.agents,
-        admission.task.as_ref(),
-    ) {
+    let checkout = match &admission.purpose {
+        RunPurpose::Work => {
+            cide_agents::run_checkout(agent, &project.config.agents, admission.task.as_ref())
+        }
+        RunPurpose::MrReview { .. } => None,
+    };
+    let cwd = match checkout {
         Some(name) => {
             // One worktree per (role, task), and the name's determinism is load-bearing — a
             // resumed run recomputes this and must land in the directory its transcript lives
@@ -5983,13 +6810,30 @@ fn start_child(
         // with no task — which is what each of those says on its face (and what
         // `agents_config_set` refuses to arrange by accident). Nothing is wound down to reclaim
         // the root either: the user is standing in it.
-        None => facts.root.clone(),
+        None => match &admission.purpose {
+            RunPurpose::Work => facts.root.clone(),
+            // The MR's own checkout, which the launcher made. Gone means the review was closed
+            // while this run queued, and a reviewer standing in the project root would review
+            // the wrong tree without knowing it.
+            RunPurpose::MrReview { cwd, .. } if cwd.is_dir() => cwd.clone(),
+            RunPurpose::MrReview { .. } => {
+                return Err(CoreError::Io(
+                    "the MR's checkout is gone — the review was closed; start it again from the MR panel"
+                        .into(),
+                ));
+            }
+        },
     };
 
     // What this role actually runs as *here*: the committed definition folded with this
     // machine's local override. Pure, and computed before anything is forked or written, so its
     // one refusal costs nothing when it fires. (M45)
-    let resolved = facts.resolve(agent);
+    // A review is pinned to the harness the user picked in the MR panel: a local override that
+    // redirects "every role that names nothing" is about the project's roles, not this one.
+    let resolved = match &admission.purpose {
+        RunPurpose::Work => facts.resolve(agent),
+        RunPurpose::MrReview { .. } => facts.resolve_pinned(agent),
+    };
     // The only refusal this fold produces: an override naming a pool that is not configured
     // here. Refused rather than degraded, because falling back would answer with a model nobody
     // chose and bill for it — and people build a pool to *cap* spend. See `overrides::resolve`.
@@ -6062,6 +6906,9 @@ fn start_child(
         // with is the file as it stood at this fork. A `git checkout` that changes
         // `agents.permissionMode` is honoured from the next dispatch, never cached past it.
         unattended: project.config.agents.unattended(),
+        // A review's connection lists the `cide_mr_*` tools only; its brief is the whole of
+        // what it is told. See `RunPlan::tracker_paragraphs`.
+        tracker_paragraphs: matches!(admission.purpose, RunPurpose::Work),
     };
 
     // `resolved.harness`, not `agent.def.harness`: a local override may have redirected this role
@@ -6602,6 +7449,8 @@ mod tests {
             project_limit,
             checkout: None,
             notify: RunNotify::Primary,
+            purpose: RunPurpose::Work,
+            pool: Vec::new(),
         }
     }
 
@@ -6615,6 +7464,7 @@ mod tests {
             provider: provider.into(),
             model: model.into(),
             variant: String::new(),
+            max_running: None,
         }
     }
 
@@ -6623,7 +7473,7 @@ mod tests {
         let project = ProjectId::new();
         let run = registry.enqueue(spec(project, "developer", 4, 4));
         let mut admitted = Vec::new();
-        admit_a_pass(&mut registry.inner.lock(), &mut admitted);
+        admit_a_pass(&mut registry.inner.lock(), &mut admitted, &mut Vec::new());
         let session = SessionId::new();
         registry.bind_session(run, session);
         {
@@ -6637,6 +7487,389 @@ mod tests {
             live.harness_session = Some("ses_first".into());
         }
         (project, run, session)
+    }
+
+    // ==========================================================================================
+    // Pool entries with a running limit: admission places a run on the first entry with room.
+    // ==========================================================================================
+
+    /// A pool of `limits.len()` entries, `model-0…`, each with the given `max_running`.
+    fn limited_pool(limits: &[Option<u16>]) -> Vec<cide_ipc::PoolEntry> {
+        limits
+            .iter()
+            .enumerate()
+            .map(|(i, &max_running)| cide_ipc::PoolEntry {
+                max_running,
+                ..pool_entry("openrouter", &format!("model-{i}"))
+            })
+            .collect()
+    }
+
+    fn pooled_spec(project: ProjectId, pool: &[cide_ipc::PoolEntry]) -> DispatchSpec {
+        DispatchSpec {
+            harness: Harness::Opencode,
+            pool: pool.to_vec(),
+            ..spec(project, "developer", 8, 8)
+        }
+    }
+
+    fn index_of(registry: &AgentRegistry, run: RunId) -> usize {
+        registry.inner.lock().runs[&run].pool_index
+    }
+
+    /// **The request exactly**: the first entry allows two, so the third run starts on the next.
+    #[test]
+    fn a_full_entry_sends_the_next_run_to_the_next_entry() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[Some(2), Some(1)]);
+        let runs: Vec<RunId> = (0..3)
+            .map(|_| registry.enqueue(pooled_spec(project, &pool)))
+            .collect();
+
+        assert_eq!(registry.take_admissions().len(), 3);
+        assert_eq!(index_of(&registry, runs[0]), 0);
+        assert_eq!(index_of(&registry, runs[1]), 0);
+        assert_eq!(index_of(&registry, runs[2]), 1, "entry 0 was full");
+    }
+
+    /// A pool whose every entry is full keeps the run queued with a sentence, and the slot a
+    /// finished run gives back is what lets it start — on the entry that freed.
+    #[test]
+    fn a_full_pool_queues_and_a_freed_entry_admits() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[Some(1), Some(1)]);
+        let first = registry.enqueue(pooled_spec(project, &pool));
+        let second = registry.enqueue(pooled_spec(project, &pool));
+        let third = registry.enqueue(pooled_spec(project, &pool));
+
+        let (admitted, noted) = registry.take_admissions_noting();
+        assert_eq!(admitted.len(), 2, "the pool holds two");
+        assert_eq!(noted, vec![project], "the waiting row is redrawn");
+        assert_eq!(state_of(&registry, third), RunState::Queued);
+        let note = registry.inner.lock().runs[&third]
+            .note
+            .clone()
+            .unwrap_or_default();
+        assert!(note.contains("running limit"), "{note}");
+        assert!(note.contains("openrouter/model-0 1/1"), "{note}");
+
+        // Asking again changes nothing, and says nothing new.
+        let (admitted, noted) = registry.take_admissions_noting();
+        assert!(admitted.is_empty());
+        assert!(noted.is_empty(), "the same sentence is not a change");
+
+        assert!(registry.set_state(None, second, RunState::Finished { code: 0 }));
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].run, third);
+        assert_eq!(index_of(&registry, third), 1, "the entry that freed");
+        assert_eq!(index_of(&registry, first), 0);
+    }
+
+    /// An idle run holds no slot, so it holds no place on its entry either — the provider is not
+    /// being asked anything while a run waits for its next instruction.
+    #[test]
+    fn an_idle_run_leaves_room_on_its_entry() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[Some(1), Some(1)]);
+        let first = registry.enqueue(pooled_spec(project, &pool));
+        registry.take_admissions();
+        assert!(registry.set_state(None, first, RunState::Running));
+        assert!(registry.set_state(None, first, RunState::Idle));
+
+        let second = registry.enqueue(pooled_spec(project, &pool));
+        registry.take_admissions();
+        assert_eq!(index_of(&registry, second), 0);
+    }
+
+    /// Counted across projects: pools are machine-wide, and so is a provider's concurrency.
+    #[test]
+    fn an_entrys_limit_is_shared_by_every_project() {
+        let registry = AgentRegistry::default();
+        let pool = limited_pool(&[Some(1), None]);
+        let here = registry.enqueue(pooled_spec(ProjectId::new(), &pool));
+        let there = registry.enqueue(pooled_spec(ProjectId::new(), &pool));
+        assert_eq!(registry.take_admissions().len(), 2);
+        assert_eq!(index_of(&registry, here), 0);
+        assert_eq!(
+            index_of(&registry, there),
+            1,
+            "another project's run fills entry 0"
+        );
+    }
+
+    // ==========================================================================================
+    // The bench (M90): one run's refusal steers every later admission, until it expires or a
+    // person resets it.
+    // ==========================================================================================
+
+    /// A pooled run admitted onto its first entry, bound, running — and then refused.
+    fn refuse_a_pooled_run(
+        registry: &AgentRegistry,
+        project: ProjectId,
+        pool: &[cide_ipc::PoolEntry],
+        reason: cide_agents::FailoverReason,
+    ) -> (RunId, Option<FailoverPlan>) {
+        let run = registry.enqueue(pooled_spec(project, pool));
+        registry.take_admissions();
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry.inner.lock().runs.get_mut(&run).unwrap().state = RunState::Running;
+        registry.note_provider_failure(run, reason);
+        (run, registry.plan_failover_or_wait(session, 1))
+    }
+
+    /// **The report**: a local server that is down refuses one run, and the next run starts past
+    /// it without spending a turn — and says why on its row.
+    #[test]
+    fn a_refusal_benches_its_entry_for_the_next_run() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[None, None, None]);
+        let (first, plan) = refuse_a_pooled_run(
+            &registry,
+            project,
+            &pool,
+            cide_agents::FailoverReason::Unreachable,
+        );
+        assert!(matches!(plan, Some(FailoverPlan::Fork(_))));
+        assert_eq!(index_of(&registry, first), 1);
+
+        let second = registry.enqueue(DispatchSpec {
+            agent: AgentId("qa".into()),
+            ..pooled_spec(project, &pool)
+        });
+        registry.take_admissions();
+        assert_eq!(index_of(&registry, second), 1, "entry 0 is benched");
+        let note = registry.inner.lock().runs[&second]
+            .pool_note
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            note.contains("openrouter/model-0 benched (unreachable"),
+            "{note}"
+        );
+
+        let report = registry.pool_state(&cide_ipc::LlmSettings {
+            providers: Vec::new(),
+            pools: vec![cide_ipc::ModelPool {
+                name: "default".into(),
+                description: String::new(),
+                entries: pool.clone(),
+            }],
+        });
+        let entries = &report.pools[0].entries;
+        let bench = entries[0].bench.as_ref().expect("entry 0 benched");
+        assert_eq!(bench.reason, cide_ipc::PoolRefusal::Unreachable);
+        assert_eq!(bench.run, first);
+        assert!(entries[1].bench.is_none());
+        assert_eq!(entries[1].running, 2, "both runs stand on entry 1");
+        assert_eq!(entries[0].provider, cide_ipc::PoolProviderState::Missing);
+        // Newest first: the second run's start, the first run's failover start, its refusal, and
+        // the first run's own start.
+        assert!(matches!(
+            report.events[0].kind,
+            cide_ipc::PoolEventKind::Started { index: 1, .. }
+        ));
+        assert!(report.events.iter().any(|event| matches!(
+            event.kind,
+            cide_ipc::PoolEventKind::Refused {
+                reason: cide_ipc::PoolRefusal::Unreachable,
+                ..
+            }
+        )));
+    }
+
+    /// A bench is a preference: when nothing after a benched entry has room, the run is placed
+    /// on it anyway rather than parked behind a timer.
+    #[test]
+    fn a_benched_entry_is_still_taken_when_nothing_else_has_room() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[None, Some(1)]);
+        let (first, _) = refuse_a_pooled_run(
+            &registry,
+            project,
+            &pool,
+            cide_agents::FailoverReason::RateLimited,
+        );
+        assert_eq!(index_of(&registry, first), 1, "entry 1 is now full");
+
+        let second = registry.enqueue(DispatchSpec {
+            agent: AgentId("qa".into()),
+            ..pooled_spec(project, &pool)
+        });
+        assert_eq!(registry.take_admissions().len(), 1, "admitted, not parked");
+        assert_eq!(index_of(&registry, second), 0);
+        let note = registry.inner.lock().runs[&second]
+            .pool_note
+            .clone()
+            .unwrap_or_default();
+        assert!(note.contains("although it is benched"), "{note}");
+    }
+
+    /// Expiry is read, not swept: a bench past its `until` is simply not there.
+    #[test]
+    fn an_expired_bench_steers_nothing() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[None, None]);
+        refuse_a_pooled_run(
+            &registry,
+            project,
+            &pool,
+            cide_agents::FailoverReason::Unreachable,
+        );
+        registry.inner.lock().benched[0].until_unix_ms = now_unix_ms() - 1;
+
+        let second = registry.enqueue(DispatchSpec {
+            agent: AgentId("qa".into()),
+            ..pooled_spec(project, &pool)
+        });
+        registry.take_admissions();
+        assert_eq!(index_of(&registry, second), 0);
+    }
+
+    /// A bench is on the *target*, so a second pool naming the same server steers around it too.
+    #[test]
+    fn a_bench_is_shared_by_every_pool_naming_the_target() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[None, None]);
+        refuse_a_pooled_run(&registry, project, &pool, cide_agents::FailoverReason::Auth);
+
+        // Another pool, another order, the same refused target in second place.
+        let other = vec![
+            pool_entry("zai", "glm"),
+            pool[0].clone(),
+            pool_entry("deepseek", "flash"),
+        ];
+        let run = registry.enqueue(DispatchSpec {
+            agent: AgentId("qa".into()),
+            ..pooled_spec(project, &other)
+        });
+        // Start it past entry 0, as a failover would have left it.
+        registry.inner.lock().runs.get_mut(&run).unwrap().pool_index = 1;
+        registry.take_admissions();
+        assert_eq!(index_of(&registry, run), 2);
+    }
+
+    /// Reset clears the bench and moves a *waiting* run back onto the entry, but leaves a run
+    /// standing on a child exactly where its child is.
+    #[test]
+    fn a_reset_clears_the_bench_and_rewinds_only_waiting_runs() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[None, None, None]);
+        let (running, _) = refuse_a_pooled_run(
+            &registry,
+            project,
+            &pool,
+            cide_agents::FailoverReason::Unreachable,
+        );
+        // A waiting run that a failover had already walked past entry 0.
+        let waiting = registry.enqueue(DispatchSpec {
+            agent: AgentId("qa".into()),
+            project_limit: 1,
+            ..pooled_spec(project, &pool)
+        });
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&waiting)
+            .unwrap()
+            .pool_index = 2;
+
+        let touched = registry.reset_pool_entry(Some(&pool[0]));
+        assert_eq!(touched, vec![project]);
+        assert!(registry.inner.lock().benched.is_empty());
+        assert_eq!(index_of(&registry, waiting), 0, "moved back up");
+        assert_eq!(
+            index_of(&registry, running),
+            1,
+            "its child stays where it is"
+        );
+        let report = registry.pool_state(&cide_ipc::LlmSettings::default());
+        assert!(matches!(
+            report.events[0].kind,
+            cide_ipc::PoolEventKind::Reset { rewound: 1, .. }
+        ));
+    }
+
+    /// A run a failover moved down never climbs back to an entry that already refused it, even
+    /// when that entry has room.
+    #[test]
+    fn a_run_is_never_placed_above_where_a_failover_left_it() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[Some(4), Some(4), Some(4)]);
+        let run = registry.enqueue(pooled_spec(project, &pool));
+        registry.inner.lock().runs.get_mut(&run).unwrap().pool_index = 2;
+        registry.take_admissions();
+        assert_eq!(index_of(&registry, run), 2);
+    }
+
+    /// A failover whose remaining candidates are all at their limit **waits** rather than forks
+    /// over the limit: back at the front of its queue, slot released, session unbound — and
+    /// admitted onto the next entry once it frees.
+    #[test]
+    fn a_failover_into_a_full_entry_waits_for_room() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[None, Some(1)]);
+        // Something else holds entry 1.
+        let other = registry.enqueue(DispatchSpec {
+            agent: AgentId("other".into()),
+            ..pooled_spec(project, &pool)
+        });
+        registry.take_admissions();
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&other)
+            .unwrap()
+            .pool_index = 1;
+
+        let run = registry.enqueue(pooled_spec(project, &pool));
+        registry.take_admissions();
+        assert_eq!(index_of(&registry, run), 0);
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry.inner.lock().runs.get_mut(&run).unwrap().state = RunState::Running;
+
+        registry.note_provider_failure(run, cide_agents::FailoverReason::RateLimited);
+        match registry.plan_failover_or_wait(session, 1) {
+            Some(FailoverPlan::Queued(queued)) => assert_eq!(queued, project),
+            other => panic!("expected a wait, got {other:?}"),
+        }
+        {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            assert_eq!(live.state, RunState::Queued);
+            assert!(!live.slot, "the slot is given back while it waits");
+            assert_eq!(
+                live.session, None,
+                "the dying child's exit must find nobody"
+            );
+            assert_eq!(live.pool_index, 1, "advanced past the entry that refused");
+            assert!(live.requeued.is_some(), "carrying the fork to make");
+            assert_eq!(inner.queues[&live.key()].front(), Some(&run));
+        }
+        assert!(
+            registry.take_admissions().is_empty(),
+            "entry 1 is still full"
+        );
+
+        assert!(registry.set_state(None, other, RunState::Finished { code: 0 }));
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].run, run);
+        assert_eq!(index_of(&registry, run), 1);
     }
 
     // ==========================================================================================
@@ -6679,7 +7912,7 @@ mod tests {
             Some("openrouter/model-0"),
             "the candidate, joined as the child was told it"
         );
-        assert_eq!(info.pool_position.as_deref(), Some("1 of 3"));
+        assert_eq!(info.pool_position.as_deref(), Some("entry 1 of 3"));
         assert_eq!(info.usage.map(|spent| spent.context()), Some(5_500));
         assert_eq!(
             info.context_limit, None,
@@ -6694,7 +7927,7 @@ mod tests {
             .expect("a candidate is left");
         let info = registry.log_run_info(session).expect("still the same run");
         assert_eq!(info.model.as_deref(), Some("openrouter/model-1"));
-        assert_eq!(info.pool_position.as_deref(), Some("2 of 3"));
+        assert_eq!(info.pool_position.as_deref(), Some("entry 2 of 3"));
 
         // A session no run stands on is the ordinary case — every shell pane in the application.
         assert!(registry.log_run_info(SessionId::new()).is_none());
@@ -7686,7 +8919,7 @@ mod tests {
         spec.harness = Harness::Opencode;
         let run = registry.enqueue(spec);
         let mut admitted = Vec::new();
-        admit_a_pass(&mut registry.inner.lock(), &mut admitted);
+        admit_a_pass(&mut registry.inner.lock(), &mut admitted, &mut Vec::new());
         let session = SessionId::new();
         registry.bind_session(run, session);
         assert_eq!(state_of(&registry, run), RunState::Starting);
@@ -9612,6 +10845,7 @@ mod tests {
             // No pool in this fixture, so no failover can be planned; the closure is here to
             // satisfy the signature and asserts nothing.
             |_, _| {},
+            |_, _| {},
         );
 
         assert_eq!(
@@ -9935,7 +11169,7 @@ mod tests {
         .expect("spawn sh");
         // The reaper's app-free half, exactly as `a_real_childs_exit_finishes_its_run` uses it:
         // the child prints its two lines and exits, and that exit is what ends the turn.
-        registry.watch_exit_with(session, &pty, |_, _| {}, |_, _| {});
+        registry.watch_exit_with(session, &pty, |_, _| {}, |_, _| {}, |_, _| {});
 
         // Two facts, two threads: the exit arrives on the reaper's watch, the capture on the
         // coalescer's, and nothing orders them — so the wait is on both, or the capture assert
@@ -10579,9 +11813,9 @@ mod tests {
         {
             let inner = registry.inner.lock();
             let live = &inner.runs[&run];
-            assert!(
-                live.pool.is_empty(),
-                "cleared, so the fork stamps the current pool"
+            assert_eq!(
+                live.pool, edited,
+                "restamped onto the current pool, which admission and the fork both read"
             );
             assert_eq!(live.pool_index, 0);
             assert_eq!(live.harness_session.as_deref(), Some("ses_first"));
@@ -10766,7 +12000,7 @@ mod tests {
             .requeue_interrupted(project, None, None, &|_| Some(settings(&edited)))
             .expect("requeued");
         assert_eq!(state_of(&registry, run), RunState::Queued);
-        assert!(registry.inner.lock().runs[&run].pool.is_empty());
+        assert_eq!(registry.inner.lock().runs[&run].pool, edited);
         assert_eq!(registry.inner.lock().runs[&run].pool_index, 0);
 
         let registry = AgentRegistry::default();

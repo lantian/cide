@@ -27,4 +27,8 @@ autoSpinAfterSecs?: number,
  * Flattened to one line by `AgentsConfig::apply` before it reaches the file: this string is
  * typed into a terminal, where a newline is another Enter.
  */
-autoSpinPrompt?: string, autoSpinAcceptPlan?: boolean, };
+autoSpinPrompt?: string, 
+/**
+ * Flattened to one line by `AgentsConfig::apply`, `auto_spin_prompt`'s reason.
+ */
+reviewPrompt?: string, };

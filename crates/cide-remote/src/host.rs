@@ -184,4 +184,54 @@ pub trait RemoteHost: Send + Sync + 'static {
     /// is `ui/src/panes/awaiting.ts`'s rule and exists because a surface that has observed
     /// nothing would otherwise report its empty set and clear every marker in the application.
     fn acknowledge(&self, session: cide_ipc::SessionId) -> Result<(), String>;
+
+    /// Scroll the desk's own view of a session by `pages` screenfuls — the terminal's
+    /// scrollback, not the program. (M91)
+    ///
+    /// Only for a session on the **normal** screen; the server sends an alternate screen a wheel
+    /// instead and never asks this. `Ok` when there is no pane showing the session to scroll:
+    /// the device still pages its own copy, and a desk with the tab closed has nothing to keep
+    /// in step with.
+    ///
+    /// Defaulted, like the milestone methods below, to a refusal a person can read: a host that
+    /// predates them says so rather than failing to build — `fake_cide` and the test host are
+    /// hosts too, and neither is about milestones.
+    fn scroll_view(&self, session: cide_ipc::SessionId, pages: i8) -> Result<(), String> {
+        let _ = (session, pages);
+        Err("this cide cannot scroll its view from a device".to_owned())
+    }
+
+    /// A project's milestones, as the desk's Milestones tab draws them; `None` when it has none.
+    /// (M91)
+    fn milestones(&self, project: ProjectId) -> Option<cide_ipc::MilestonesView> {
+        let _ = project;
+        None
+    }
+
+    /// Start a milestone's gate in the background. The answer is the change event, twice.
+    fn gate_run(&self, project: ProjectId, milestone: String) -> Result<(), String> {
+        let _ = (project, milestone);
+        Err("this cide does not run gates for a device".to_owned())
+    }
+
+    /// Accept a milestone whose gate passed.
+    fn milestone_accept(
+        &self,
+        project: ProjectId,
+        milestone: String,
+    ) -> Result<Option<cide_ipc::MilestonesView>, String> {
+        let _ = (project, milestone);
+        Err("this cide does not accept milestones from a device".to_owned())
+    }
+
+    /// The last MiB of a gate's (`kind: "gate"`) or a verify's (`"verify"`) log.
+    fn check_log(
+        &self,
+        project: ProjectId,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<String>, String> {
+        let _ = (project, kind, key);
+        Ok(None)
+    }
 }

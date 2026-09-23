@@ -206,6 +206,14 @@ export const app = {
    */
   quitRequested: (projectId?: ProjectId) =>
     invoke<QuitDecision>('app_quit_requested', { project: projectId ?? null }),
+
+  /**
+   * Open an `http(s)` link in the user's default browser — never in this webview.
+   *
+   * Rust refuses every other scheme and rejects with the sentence to show. The one door for
+   * terminal links, OSC 8 hyperlinks and markdown/OpenSpec links alike; see `ui/src/chrome/webLinks.ts`.
+   */
+  openUrl: (url: string) => invoke<void>('app_open_url', { url }),
 }
 
 export const project = {
@@ -229,6 +237,14 @@ export const tab = {
   /** Open a closable full-screen Claude tab. Splitting it creates new sessions. */
   newClaude: (projectId: ProjectId, title?: string) =>
     invoke<TabId>('tab_new_claude', { project: projectId, title: title ?? null }),
+
+  /**
+   * A closable tab whose one pane shows an existing run — `mirror` or `continue` only. (M85)
+   * Answers a `SplitOutcome` for `addRow`'s reason: the caller records the intent as the pane's
+   * spawn plan before the pane renders. Go through `useWorkspace().newRunTab`, which does.
+   */
+  newRun: (projectId: ProjectId, title: string, intent: SplitIntent) =>
+    invoke<SplitOutcome>('tab_new_run', { project: projectId, title, intent }),
 
   activate: (projectId: ProjectId, id: TabId) =>
     invoke<{ rev: number }>('tab_activate', { project: projectId, tab: id }),
@@ -1449,6 +1465,18 @@ export const events = {
   onSessionStatus: (handler: (session: string, status: unknown) => void) =>
     listen<{ session: string; status: unknown }>('cide://session-status', (e) =>
       handler(e.payload.session, e.payload.status),
+    ),
+
+  /**
+   * A paired device pressed PgUp/PgDn on a session showing the normal screen. (M91)
+   *
+   * The pane holding that session scrolls its own scrollback by `pages` — xterm's scroll
+   * position lives here and nowhere else, so this is the only way a phone's page can move the
+   * desk's view with it. See `emit::REMOTE_SCROLL`.
+   */
+  onRemoteScroll: (handler: (session: string, pages: number) => void) =>
+    listen<{ session: string; pages: number }>('cide://remote-scroll', (e) =>
+      handler(e.payload.session, e.payload.pages),
     ),
 
   /**
@@ -3900,6 +3928,17 @@ export const agentRuns = {
     invoke<void>('agents_ack_stale_turn', { project, run }),
 
   /**
+   * The Tasks panel's **Plan tasks**: open the planning tab the quiet-project timer opens, now.
+   * (M88) **This spends a turn.**
+   *
+   * Not through `pendingCommand`, `integrate`'s reason: a click that silently does nothing is
+   * the failure this feature has paid for most. Rust refuses with a sentence — subagents off, or
+   * the active milestone already met and waiting on the user — for `notifyFailure`. Resolves once
+   * the tab is open, which can be minutes when a stale milestone gate has to run first.
+   */
+  planNow: (project: ProjectId) => invoke<void>('agents_plan_now', { project }),
+
+  /**
    * What pressing **Open** on a run should do — a *question*, never a pane. (M42)
    *
    * Rust answers from the two facts only it has: whether the registry still holds a live child
@@ -4160,6 +4199,7 @@ import type {
   AgentSaveOutcome,
   AgentScope,
   Harness,
+  LlmLimitsProbe,
   LlmModelTest,
   ProjectOverrides,
 } from './generated'
@@ -4228,6 +4268,20 @@ export const agentDefs = {
    * Answers a verdict rather than rejecting, so both outcomes are one sentence beside the row;
    * `null` is only a build with no such handler, exactly as `models` above.
    */
+  /**
+   * Read one custom model's context and output limits off its provider's own server. (M88)
+   *
+   * Free — a `GET` of the server's model list, never a completion — so unlike `testModel` the
+   * screen may call it by itself when a model id is entered. A verdict either way; `null` only on
+   * a build with no such handler.
+   */
+  probeLimits: (provider: string, model: string) =>
+    pendingCommand<LlmLimitsProbe | null>(
+      'llm_probe_limits',
+      () => invoke<LlmLimitsProbe>('llm_probe_limits', { provider, model }),
+      null,
+    ),
+
   /** One real turn against one model. `project` of `null` for `models`' reason above. */
   testModel: (project: ProjectId | null, model: string) =>
     pendingCommand<LlmModelTest | null>(
@@ -5085,4 +5139,79 @@ export const gitlab = {
     invoke<string | null>('gitlab_local_file', { review, project, sourceUrl, path }),
   onChanged: (handler: (board: import('./generated').GitLabBoard) => void) =>
     listen<import('./generated').GitLabBoard>('cide://gitlab-changed', e => handler(e.payload)),
+  /** Which harnesses a review can run on, with the reason for each that cannot. (M85) */
+  reviewHarnesses: () =>
+    invoke<import('./generated').GitLabReviewHarness[]>('gitlab_review_harnesses'),
+  /**
+   * Start an agent reviewing `review`, hosted by `project`'s run queue. Answers the run at once;
+   * it may still be queued. Its findings arrive as local drafts. (M85)
+   */
+  launchReview: (
+    project: ProjectId,
+    review: string,
+    harness: import('./generated').Harness,
+    prompt: string | null,
+  ) => invoke<RunId>('gitlab_review_launch', { project, review, harness, prompt }),
+  /** The review run as the Agents panel would draw it; `null` once forgotten. (M85) */
+  reviewRun: (project: ProjectId, run: RunId) =>
+    invoke<import('./generated').AgentRun | null>('gitlab_review_run', { project, run }),
+  /** A review's drafts moved — an agent wrote one, or another window edited one. (M85) */
+  onDraftsChanged: (handler: (review: string) => void) =>
+    listen<string>('cide://gitlab-drafts-changed', e => handler(e.payload)),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Milestones. (M83)
+ *
+ * A project's ordered goals, each with a gate command cide runs, from `.cide/config.json`'s
+ * `milestones` key. The plan is the user's: Settings writes it whole with `set`, and a model can
+ * only define the first one or propose (`cide_milestones`). `get` answers `null` for a project
+ * that is not open.
+ */
+export const milestones = {
+  get: (project: ProjectId) =>
+    invoke<import('./generated').MilestonesView | null>('milestones_get', { project }),
+  /** Whole-value: the list is ordered and a removed item must go. Awaited, for `setConfig`'s reason. */
+  set: (project: ProjectId, plan: import('./generated').MilestonePlan) =>
+    invoke<import('./generated').MilestonesView | null>('milestones_set', { project, plan }),
+  /** Starts the active gate in the background; the result arrives as `onChanged`. */
+  runGate: (project: ProjectId) => invoke<void>('milestones_gate_run', { project }),
+  accept: (project: ProjectId) =>
+    invoke<import('./generated').MilestonesView | null>('milestones_accept', { project }),
+  /** Apply a proposal exactly (a plan, or files written and committed) and dequeue it. */
+  acceptProposal: (project: ProjectId, id: string) =>
+    invoke<import('./generated').MilestonesView | null>('proposal_accept', { project, id }),
+  /** Dequeue a proposal; nothing is changed. */
+  rejectProposal: (project: ProjectId, id: string) =>
+    invoke<import('./generated').MilestonesView | null>('proposal_reject', { project, id }),
+  /** A check's full log — the last MiB — or `null` when it has not run here. */
+  checkLog: (project: ProjectId, kind: 'gate' | 'verify', key: string) =>
+    invoke<string | null>('milestones_check_log', { project, kind, key }),
+  /** A signal carrying the project; re-ask with `get`. See `emit::MILESTONES_CHANGED`. */
+  onChanged: (handler: (project: ProjectId) => void) =>
+    listen<{ project: ProjectId }>('cide://milestones-changed', (e) => handler(e.payload.project)),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Model-pool state. (M90)
+ *
+ * The pool-state card's read and its one write. Pools are machine-wide settings, so neither
+ * takes a project. `state` is a snapshot — load, benches, who is on what, who is waiting, and
+ * the recent decisions — and the card re-asks on `agentEvents.onChanged`, because every change
+ * that can move it (an admission, a failover, a run ending, a reset) already emits one.
+ *
+ * `state` goes through `pendingCommand` for `agents.roster`'s reason: it is called from a render
+ * effect, and a build without the handler must draw a sentence rather than unmount the tree.
+ * `reset` is awaited and unwrapped — it is a button, and a failure is something to say.
+ * --------------------------------------------------------------------------------------- */
+export const pools = {
+  state: () =>
+    pendingCommand<import('./generated').PoolStateReport | null>(
+      'llm_pool_state',
+      () => invoke<import('./generated').PoolStateReport>('llm_pool_state'),
+      null,
+    ),
+  /** Clear one target's bench, or every bench with `null`, and rewind the runs waiting past it. */
+  reset: (entry: import('./generated').PoolEntry | null) =>
+    invoke<void>('llm_pool_reset', { entry }),
 }

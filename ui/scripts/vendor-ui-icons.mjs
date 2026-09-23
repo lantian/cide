@@ -128,6 +128,8 @@ const ICONS = [
   // Agent and task controls. Deliberately outside the circle family so a status and a button
   // never look alike.
   'pause', 'play', 'eye', 'trash-2', 'pencil',
+  // A finished run's Integrate, in the Agents panel's History (M89).
+  'git-merge',
   // Extension-contributed panel rows.
   'file', 'folder', 'diamond',
   // Explorer header. `asterisk` is a footnote mark: the truncation notice is a footnote, not an

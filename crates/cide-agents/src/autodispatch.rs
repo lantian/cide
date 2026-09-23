@@ -130,8 +130,14 @@ pub fn trigger(
     // fires nothing is a save that merely carries the assignee along (a status flip, a comment
     // — those arrive with `assign_gesture: false`), and an unassign, gesture or not.
     let previously = before.and_then(|task| task.agent.as_ref());
+    // Leaving the inbox is an edge too (M83). A task noticed by a run is often created already
+    // naming the role that should do it, and it sat inert because the inbox is not work; the
+    // move to `Todo` is the decision that it is work now, and it must start that role exactly as
+    // an assignment would. Without this the promotion is a status flip carrying the assignee
+    // along, which fires nothing — and the orchestrator would have to learn to re-assign.
+    let promoted = before.is_some_and(|task| task.status == TaskStatus::Inbox);
     if let Some(agent) = after.agent.as_ref()
-        && (assign_gesture || previously != Some(agent))
+        && (assign_gesture || promoted || previously != Some(agent))
     {
         dispatch.push(agent.clone());
     }
@@ -186,6 +192,66 @@ mod tests {
 
     fn ids(trigger: &Trigger) -> Vec<&str> {
         trigger.dispatch.iter().map(|id| id.0.as_str()).collect()
+    }
+
+    /// The inbox is not work: nothing there starts, whoever assigns it — and leaving it for
+    /// `Todo` starts the role already named on it, because that move is the decision. (M83)
+    #[test]
+    fn an_inbox_task_starts_nothing_until_it_is_promoted() {
+        let inbox = task(TaskStatus::Inbox, Some("qa"));
+        assert!(
+            trigger(
+                None,
+                &inbox,
+                &[],
+                &TaskAuthor::Orchestrator,
+                true,
+                &[],
+                &roles(&["qa"])
+            )
+            .is_none(),
+            "created in the inbox with an assignee: recorded, not started"
+        );
+        assert!(
+            trigger(
+                None,
+                &task(TaskStatus::Inbox, None),
+                &[],
+                &TaskAuthor::User,
+                false,
+                &["@qa look"],
+                &roles(&["qa"])
+            )
+            .is_none(),
+            "a mention on an inbox task does not start it either"
+        );
+
+        let promoted = task(TaskStatus::Todo, Some("qa"));
+        let fired = trigger(
+            Some(&inbox),
+            &promoted,
+            &[],
+            &TaskAuthor::Orchestrator,
+            false,
+            &[],
+            &roles(&["qa"]),
+        )
+        .expect("promotion starts the named role");
+        assert_eq!(ids(&fired), ["qa"]);
+
+        let carried = trigger(
+            Some(&task(TaskStatus::Todo, Some("qa"))),
+            &task(TaskStatus::Doing, Some("qa")),
+            &[],
+            &TaskAuthor::Orchestrator,
+            false,
+            &[],
+            &roles(&["qa"]),
+        );
+        assert!(
+            carried.is_none(),
+            "an ordinary status flip still carries the assignee inertly"
+        );
     }
 
     /// The blocking table: Done is the one status that satisfies, and the empty slice — no

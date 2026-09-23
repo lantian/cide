@@ -107,6 +107,8 @@ try {
     moveUp,
     moveDown,
     removeAt,
+    withMaxRunning,
+    poolCapacity,
   } = pools
 
   const llmRs = repoFile('crates/cide-ipc/src/llm.rs')
@@ -261,6 +263,72 @@ try {
   }
   eq(removeAt(three, 1), ['a', 'c'], 'a remove preserves the order of the rest')
   eq(removeAt(three, 9), three, 'and an out-of-range remove drops nothing')
+
+  // ---------------------------------------------------------------- running limits
+  // A limit is part of the entry, so a reorder carries it — an entry that lost its limit on a
+  // move would silently start overcommitting the model it was protecting.
+  const limited = [
+    { provider: 'a', model: 'x', variant: '', maxRunning: 4 },
+    { provider: 'b', model: 'y', variant: '' },
+  ]
+  eq(moveDown(limited, 0)[1].maxRunning, 4, 'a move keeps the running limit with its entry')
+  // Unset is **absent** on the wire, the rule every optional field here is held to.
+  for (const junk of ['', '0', '-2', '1.5', 'x', '70000']) {
+    const cleared = withMaxRunning(limited[0], junk)
+    ok(!('maxRunning' in cleared), `"${junk}" clears the limit to an absent key, not null or 0`)
+    ok(!JSON.stringify(cleared).includes('maxRunning'), `and "${junk}" serialises without it`)
+  }
+  eq(withMaxRunning(limited[1], ' 3 ').maxRunning, 3, 'a whole number sets the limit')
+  // `cide_ipc::pool_capacity`'s cases, verbatim: see `a_pools_capacity_is_the_sum_of_its_limits_or_none`.
+  eq(poolCapacity([limited[0], { ...limited[1], maxRunning: 2 }]), 6, 'capacity sums the limits')
+  eq(poolCapacity(limited), null, 'one unlimited entry makes the pool unlimited')
+  eq(
+    poolCapacity([limited[0], { provider: 'b', model: '', variant: '' }]),
+    4,
+    'an incomplete entry counts for nothing either way',
+  )
+  eq(poolCapacity([]), null, 'an empty pool has no capacity to state')
+  ok(
+    /pub max_running: Option<u16>/.test(llmRs) &&
+      /skip_serializing_if = "Option::is_none"\)\]\s*#\[ts\(optional\)\]\s*pub max_running/.test(llmRs),
+    'Rust keeps an unset limit off the wire too',
+  )
+  // ---------------------------------------------------------------- limits read off the server
+  // The automatic road (a model id committed) must never overwrite a number the user typed; only
+  // the button, which is asking for the server's figure, may. Comments stripped first, since
+  // they describe exactly this.
+  const sectionCode = section.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  ok(
+    /onBlur=\{\(\) => \{\s*if \(model\.context === 0 && model\.output === 0\) detect\(model, false\)/.test(
+      sectionCode,
+    ),
+    'a row fills itself on blur only while both of its limits are empty',
+  )
+  ok(
+    /if \(!overwrite && \(row\.context !== 0 \|\| row\.output !== 0\)\) return/.test(sectionCode),
+    'and a late answer does not overwrite a limit typed while it was in flight',
+  )
+  ok(
+    /onClick=\{\(\) => detect\(model, true\)\}/.test(sectionCode),
+    'the refresh button is the one road that replaces a typed limit',
+  )
+  ok(
+    /latest\.current/.test(sectionCode),
+    'the answer lands on the current rows, not the ones captured when it was asked',
+  )
+  ok(
+    /\[`llm_probe_limits`\]|'llm_probe_limits'/.test(uiFile('src/ipc/client.ts')),
+    'the probe goes through the one seam, `client.ts`',
+  )
+  ok(
+    /pub struct LlmLimitsProbe/.test(repoFile('crates/cide-ipc/src/agents.rs')),
+    'the probe answers a verdict, not a rejection',
+  )
+
+  ok(
+    /withMaxRunning\(entry, e\.target\.value\)/.test(section),
+    'the screen writes the limit through `withMaxRunning`, never a raw number or null',
+  )
 
   // ---------------------------------------------------------------- verdicts are all drawn
   const providers = [

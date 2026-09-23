@@ -573,6 +573,77 @@ impl RemoteHost for AppRemoteHost {
         );
         Ok(())
     }
+
+    /// PgUp/PgDn from a device, on a normal screen: the pane showing the session scrolls its own
+    /// scrollback, as Shift+PgUp at the desk would. (M91)
+    ///
+    /// An event rather than a write, because the scroll position is **xterm's** — it lives in
+    /// the webview and never touches the vt100 mirror or the child. Every window is told; the
+    /// one whose pane host holds the session acts, and a desk with the tab closed does nothing,
+    /// which is `Ok` — the device still pages its own copy.
+    fn scroll_view(&self, session: cide_ipc::SessionId, pages: i8) -> Result<(), String> {
+        crate::emit::remote_scroll(&self.app, session, pages);
+        Ok(())
+    }
+
+    /// The same one producer the desk's Milestones tab reads. (M91)
+    fn milestones(&self, project: ProjectId) -> Option<cide_ipc::MilestonesView> {
+        crate::milestones::view(&self.app, project)
+    }
+
+    /// Only the **active** milestone's gate runs, as on the desk — and a device naming another
+    /// one is refused rather than silently running the active one: its screen is out of date,
+    /// and the gate it thinks it started is not the one that would run.
+    fn gate_run(&self, project: ProjectId, milestone: String) -> Result<(), String> {
+        self.is_active(project, &milestone)?;
+        crate::milestones::run_gate(&self.app, project);
+        Ok(())
+    }
+
+    fn milestone_accept(
+        &self,
+        project: ProjectId,
+        milestone: String,
+    ) -> Result<Option<cide_ipc::MilestonesView>, String> {
+        self.is_active(project, &milestone)?;
+        crate::milestones::accept(&self.app, project)?;
+        Ok(crate::milestones::view(&self.app, project))
+    }
+
+    fn check_log(
+        &self,
+        project: ProjectId,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<String>, String> {
+        let kind = match kind {
+            "gate" => crate::milestones::LogKind::Gate,
+            "verify" => crate::milestones::LogKind::Verify,
+            other => return Err(format!("no check log of kind `{other}`")),
+        };
+        let Some(state) = self.app.try_state::<WorkspaceState>() else {
+            return Err("this cide is still starting".to_owned());
+        };
+        let root = crate::tasks_state::project_root(&state, project)
+            .map_err(|_| "that project is not open here".to_owned())?;
+        Ok(crate::milestones::read_log(&root, kind, key))
+    }
+}
+
+impl AppRemoteHost {
+    /// Refuse an act aimed at a milestone that is not the active one. See `gate_run`.
+    fn is_active(&self, project: ProjectId, milestone: &str) -> Result<(), String> {
+        let view =
+            crate::milestones::view(&self.app, project).ok_or("that project is not open here")?;
+        match view.plan.current() {
+            Some(current) if current.id == milestone => Ok(()),
+            Some(current) => Err(format!(
+                "`{milestone}` is not the active milestone — `{}` is",
+                current.id
+            )),
+            None => Err("this project has no milestones".to_owned()),
+        }
+    }
 }
 
 // --- the listener's life ------------------------------------------------------------------

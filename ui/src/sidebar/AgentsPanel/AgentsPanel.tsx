@@ -10,9 +10,21 @@
  * with a run appeared twice, and answering "what is `qa` doing" meant reading four lists and
  * joining them by name. `model.ts`'s `SectionKind` carries the whole argument.
  *
- * So a row is a role. It leads with the role's name and a one-word status derived from its runs;
- * under it, one line per run that is actually active, each with its own Open/pause/stop; and at
- * the foot of it the role-scope controls — Dispatch, Integrate, **Configure**.
+ * So a row is a role. It leads with the role's name and a one-word status derived from its runs,
+ * and ends with a **Configure** mark; under it, one line per run that is actually active, each
+ * with its own Open/pause/stop and a dim line saying what it is running on. (M89: the role's
+ * description moved into the name's tooltip, and the row lost its foot of three text buttons —
+ * see "What the row no longer carries" below.)
+ *
+ * # Two tabs, both always mounted
+ *
+ * Agents and History are a segmented pair under the header — `gitlab/Inbox.tsx`'s scope tabs,
+ * the same look — rather than History being a `<details>` at the foot of the list, where it was
+ * one more section to scroll past on the way to nothing. **Both panels are rendered and the
+ * inactive one carries `hidden`**, rather than the inactive one not being rendered: the tab is a
+ * prop like everything else here (see "A pure view"), and a History that did not exist in the
+ * markup of every story would be History the render check could see in only one of them. Twenty
+ * rows at most (`RECENT_CAP`) is nothing to keep in the DOM.
  *
  * # Open is drawn only when there is something to look at, and Configure always
  *
@@ -22,7 +34,7 @@
  * With nothing active a role has no activity lines at all, so there is no Open element anywhere
  * in the row — **withheld, not disabled**, which is this panel's standing rule: a greyed control
  * promises that some reachable condition would make it work, and here there is none. The control
- * that would change it is Dispatch, on the same row.
+ * that would change it is a dispatch — by the orchestrator, or by assigning the task.
  *
  * Configure is on **every** role row including an unavailable one, because a role whose harness
  * is missing is precisely the role somebody wants to open the settings for.
@@ -69,12 +81,20 @@
  * control because it is the second thing anybody wants; it is still drawn because it is the only
  * route from this panel to the files themselves.
  *
- * # Never both, never neither
+ * # What the row no longer carries (M89)
  *
- * A role row carries the Dispatch button **or** the sentence saying why it cannot be
- * dispatched, and both come out of the single `canDispatch` call `sections()` already made.
- * Deriving them from one value is what makes "a greyed control with no explanation" impossible
- * to write here rather than merely discouraged.
+ * **Dispatch** is gone. It started a run of the role against whatever task happened to be
+ * selected on the board, and refused with a toast when none was — which in practice was always,
+ * because the panel and the board are rarely on screen together. Work reaches a role by being
+ * assigned (the board, `cide_task_assign`, an @mention) and every one of those names its task;
+ * a button that named none was the one route in that could not. `canDispatch`'s *refusal*
+ * sentence survives on its own — a role whose harness is missing still says so on its row,
+ * because "why will nothing I assign to this start" is the question that sentence answers.
+ *
+ * **Integrate** moved off the role and onto a finished **run** in History. It merged the role's
+ * base branch `cide/<role>`, which since per-task worktrees (M40) only ever holds what an older
+ * cide left there; a task's work is on `cide/<role>-<task>`, and the one row that knows both the
+ * role and the task is the run. See `RunRow.tsx`'s `IntegrateControl`.
  *
  * # The header carries the project scope, and its resume half is the one to be careful with
  *
@@ -89,22 +109,11 @@
  * including when every run on screen reads `finished` and the only evidence is
  * `dispatching === false`.
  *
- * # A role row can take the role's work back, and it asks twice
- *
- * `Integrate` merges `cide/<role>` into the branch the user has checked out. The whole reason
- * this feature gives every agent a worktree is that the person reviews what the agent did
- * *before* it lands in their branch — and until this control existed only a model could take
- * it, through the `cide_agent_integrate` MCP tool. That was the wrong way round.
- *
- * [`IntegrateControl`] is the second instance of [`ScopeControl`]'s shape — a pair of handlers,
- * at most one button drawn, the conditions argued in one function — and it makes two decisions
- * that are written out there in full: it is offered on **every** role, including ones that
- * cannot be dispatched, because nothing on the wire says whether a role's branch has anything
- * on it; and the merge takes **two clicks**, because it writes the user's working tree.
  */
 import {
   OFF_FOR_THIS_PROJECT,
   RECENT_CAP,
+  glyphSpins,
   ROSTER_UNKNOWN,
   agentColor,
   isDonePhase,
@@ -120,6 +129,9 @@ import type { ProjectId } from '@/ipc/client'
 import { Icon, asIcon } from '@/icons/Icon'
 
 import styles from './AgentsPanel.module.css'
+
+/** Which of the panel's two tabs is showing. See the header. */
+export type AgentsTab = 'agents' | 'history'
 
 /**
  * What a role row's **Configure** says it will do.
@@ -166,29 +178,6 @@ const PAUSE_ALL_TITLE =
 const RESUME_ALL_TITLE =
   'Resume: continue every frozen agent on the current model settings, and reopen the dispatch queue'
 
-/**
- * What the unarmed `Integrate` says. Three clauses, and the third is the one that stops this
- * reading as a destructive button.
- *
- * It names the act (a merge), the destination (*your* branch, not some abstraction), and the
- * fact that the click does not perform it. A control whose first press is harmless has to say
- * so, or a cautious user never presses it and never finds out what it does.
- */
-const INTEGRATE_TITLE =
-  'Merge this role’s branch into the branch you have checked out. Asks to confirm first.'
-
-/**
- * What the armed one says — and it is the sentence that has to be *true*.
- *
- * The promise it makes is `cide_git::worktree::integrate`'s documented behaviour, not a
- * reassurance: the merge is computed in memory and `Index::has_conflicts` is asked before a
- * single byte is written, so a conflict changes nothing whatsoever and answers with the paths
- * instead. Saying so here is what makes the second click a decision rather than a gamble — and
- * it is why nothing in this feature may ever "help" by leaving a half-merged tree behind.
- */
-const INTEGRATE_CONFIRM_TITLE =
-  'Merge it now. If it conflicts, nothing is changed at all and you get the list of paths.'
-
 export interface AgentsPanelViewProps {
   /**
    * The active project, or `null` before one is open.
@@ -215,8 +204,13 @@ export interface AgentsPanelViewProps {
   taskTitles?: Readonly<Record<string, string>> | undefined
   /** The clock, as a prop. See the header. */
   nowMs: number
-  /** Start a run of this role. Only offered when `canDispatch` says yes. */
-  onDispatch?: ((agent: string) => void) | undefined
+  /**
+   * Which tab is showing. Defaults to `agents`. A prop and not state here, for `integrateArmed`'s
+   * reason below: the host holds it, and every story can render either.
+   */
+  tab?: AgentsTab | undefined
+  /** Switch tabs. Without it the tabs are not drawn and the panel shows `tab` alone. */
+  onTab?: ((tab: AgentsTab) => void) | undefined
   onOpen?: ((run: string) => void) | undefined
   onPause?: ((run: string) => void) | undefined
   onResume?: ((run: string) => void) | undefined
@@ -277,8 +271,9 @@ export interface AgentsPanelViewProps {
    */
   onResumeAll?: (() => void) | undefined
   /**
-   * Which role's Integrate is armed — that is, has been clicked once and is waiting for the
-   * confirming second click. `null` for none, which is the resting state.
+   * Which **run**'s Integrate is armed — that is, has been clicked once and is waiting for the
+   * confirming second click. `null` for none, which is the resting state. (A role id until M89,
+   * when the control moved from the role onto the finished run; see the header.)
    *
    * A **prop rather than state in this component**, and that is the file's oldest rule rather
    * than a preference: `AgentsPanel.tsx` is a function of its props so that
@@ -287,28 +282,30 @@ export interface AgentsPanelViewProps {
    * front of a merge — the single state that gate could never see. `AgentsPanelHost` holds it,
    * which is also where it can be cleared when the project changes.
    *
-   * Single-valued, so arming one role disarms any other by construction. Two roles armed at once
+   * Single-valued, so arming one run disarms any other by construction. Two runs armed at once
    * is not a state anybody wants and would be one more thing for a reader to hold.
    */
   integrateArmed?: string | null
   /**
-   * First click: arm this role. Costs nothing, changes nothing, and is reversible by arming
-   * another role or leaving the panel.
+   * First click: arm this run. Costs nothing, changes nothing, and is reversible by arming
+   * another run or leaving the panel.
    *
    * The pair below is [`onPauseAll`]/[`onResumeAll`]'s shape — two handlers, at most one control
    * drawn, the condition in one place ([`IntegrateControl`]) — and for the same reason: the two
    * gestures differ in what they *do*, and one handler taking a boolean would let a caller pass
    * "yes, really merge" from the control that was only meant to ask.
    */
-  onIntegrateArm?: ((agent: string) => void) | undefined
+  onIntegrateArm?: ((run: string) => void) | undefined
   /**
-   * Second click: **merge `cide/<agent>` into the branch the user has checked out.**
+   * Second click: **merge the run's task branch, `cide/<agent>-<task>`, into the branch the user
+   * has checked out.**
    *
    * The one gesture this panel has that rewrites the user's working tree and adds a commit to
    * their history. It is only ever reachable from the armed control, so it cannot be reached by
-   * a single press, and never for a role the user did not name — see [`IntegrateControl`].
+   * a single press, and never for a run the user did not name — see `RunRow.tsx`'s
+   * `IntegrateControl`.
    */
-  onIntegrate?: ((agent: string) => void) | undefined
+  onIntegrate?: ((run: string) => void) | undefined
 }
 
 export function AgentsPanelView({
@@ -316,7 +313,8 @@ export function AgentsPanelView({
   roster = ROSTER_UNKNOWN,
   taskTitles = {},
   nowMs,
-  onDispatch,
+  tab = 'agents',
+  onTab,
   onOpen,
   onPause,
   onResume,
@@ -343,6 +341,8 @@ export function AgentsPanelView({
    */
   const body = sections(roster, taskTitles)
   const meta = metaFigure(roster)
+  const roles = body.find((section) => section.kind === 'agents')
+  const history = body.find((section) => section.kind === 'recent')
 
   return (
     <aside className={styles.panel} data-audit="sidebarAgents" aria-label="Agents">
@@ -501,68 +501,99 @@ export function AgentsPanelView({
         </div>
       ) : (
         <div className={styles.body} data-audit="agentsBody">
-          <div className={styles.sections} data-audit="agentsSections">
-            {body.map((section) =>
-              section.kind === 'recent' ? (
-                /*
-                 * Recent is a real `<details>`: the collapse costs no state, which is what lets
-                 * this component stay a function of its props, and it survives every re-render
-                 * the moving clock causes. Closed by default — the panel answers "what is
-                 * happening", and history is the thing you go and look for.
-                 *
-                 * Its rows are `RunRow`s and not role rows, and that is the section's whole
-                 * point: a finished run has no bearing on what its role is doing now, so it is
-                 * off the role row entirely — and this is the only place its transcript is
-                 * still reachable from. `PtySession` feeds its vt100 mirror whether or not
-                 * anything is attached, so Open here really does bring back the screen.
-                 */
-                <details className={styles.recent} data-audit="agentsSection" key={section.kind}>
-                  <summary className={styles.recentSummary}>
-                    <span className={styles.sectionTitle}>{section.label}</span>
-                    <span className={styles.sectionCount}>{countLabel(section)}</span>
-                  </summary>
-                  <div className={styles.rows} data-audit="agentsRows">
-                    {section.rows.map((row) => (
-                      <RunRow
-                        key={row.run.run}
-                        row={row}
-                        nowMs={nowMs}
-                        onOpen={onOpen}
-                        onStop={onStop}
-                        onRevealTask={onRevealTask}
-                      />
-                    ))}
-                  </div>
-                </details>
-              ) : (
-                <div className={styles.section} data-audit="agentsSection" key={section.kind}>
-                  <div className={styles.sectionHead}>
-                    <span className={styles.sectionTitle}>{section.label}</span>
-                    <span className={styles.sectionCount}>{countLabel(section)}</span>
-                  </div>
-                  <div className={styles.rows} data-audit="agentsRows">
-                    {section.rows.map((role) => (
-                      <RoleLine
-                        key={role.def.id}
-                        role={role}
-                        nowMs={nowMs}
-                        onDispatch={onDispatch}
-                        onConfigure={onConfigure}
-                        onOpen={onOpen}
-                        onPause={onPause}
-                        onResume={onResume}
-                        onStop={onStop}
-                        onRevealTask={onRevealTask}
-                        onRetryTurn={onRetryTurn}
-                        onAckStaleTurn={onAckStaleTurn}
-                        armed={integrateArmed === role.def.id}
-                        onIntegrateArm={onIntegrateArm}
-                        onIntegrate={onIntegrate}
-                      />
-                    ))}
-                  </div>
-                </div>
-              ),
+          {onTab !== undefined && (
+            /*
+             * `gitlab/Inbox.tsx`'s scope tabs — the same `aria-pressed` group and the same look —
+             * so the two sidebar panels that have tabs read as one application. Each label carries
+             * its count, which is where the old section heading's figure went: a heading reading
+             * "Subagents 3" under a header reading "Agents" said the panel's name twice.
+             */
+            <div className={styles.tabs} role="group" aria-label="Agents or history" data-audit="agentsTabs">
+              <button
+                type="button"
+                className={styles.tab}
+                data-audit="agentsTab"
+                data-tab="agents"
+                aria-pressed={tab === 'agents'}
+                title="Every subagent, and what each is doing now"
+                onClick={() => onTab('agents')}
+              >
+                Agents
+                <span className={styles.tabCount}>{roles?.rows.length ?? 0}</span>
+              </button>
+              <button
+                type="button"
+                className={styles.tab}
+                data-audit="agentsTab"
+                data-tab="history"
+                aria-pressed={tab === 'history'}
+                title="Runs that have ended, newest first — what each ran on, and its work to merge"
+                onClick={() => onTab('history')}
+              >
+                History
+                <span className={styles.tabCount}>{historyCount(history)}</span>
+              </button>
+            </div>
+          )}
+          <div
+            className={styles.sections}
+            data-audit="agentsSections"
+            data-tab="agents"
+            hidden={tab !== 'agents'}
+          >
+            {roles !== undefined && roles.kind === 'agents' && (
+              <div className={styles.rows} data-audit="agentsRows">
+                {roles.rows.map((role) => (
+                  <RoleLine
+                    key={role.def.id}
+                    role={role}
+                    nowMs={nowMs}
+                    onConfigure={onConfigure}
+                    onOpen={onOpen}
+                    onPause={onPause}
+                    onResume={onResume}
+                    onStop={onStop}
+                    onRevealTask={onRevealTask}
+                    onRetryTurn={onRetryTurn}
+                    onAckStaleTurn={onAckStaleTurn}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+          {/*
+            * History's rows are `RunRow`s and not role rows, and that is the tab's whole point: a
+            * finished run has no bearing on what its role is doing now, so it is off the role row
+            * entirely — and this is the only place its transcript is still reachable from.
+            * `PtySession` feeds its vt100 mirror whether or not anything is attached, so Open here
+            * really does bring back the screen.
+            */}
+          <div
+            className={styles.sections}
+            data-audit="agentsHistory"
+            data-tab="history"
+            hidden={tab !== 'history'}
+          >
+            {history !== undefined && history.kind === 'recent' ? (
+              <div className={styles.rows} data-audit="agentsRows">
+                {history.rows.map((row) => (
+                  <RunRow
+                    key={row.run.run}
+                    row={row}
+                    nowMs={nowMs}
+                    onOpen={onOpen}
+                    onStop={onStop}
+                    onRevealTask={onRevealTask}
+                    armed={integrateArmed === row.run.run}
+                    onIntegrateArm={onIntegrateArm}
+                    onIntegrate={onIntegrate}
+                  />
+                ))}
+              </div>
+            ) : (
+              <p className={styles.tabEmpty} data-audit="agentsHistoryEmpty">
+                No run has ended yet.
+              </p>
             )}
           </div>
         </div>
@@ -572,16 +603,15 @@ export function AgentsPanelView({
 }
 
 /**
- * The figure beside a section heading — how many subagents, or how many finished runs.
+ * The figure on the History tab — how many finished runs it holds.
  *
- * Recent additionally says when it is showing a prefix rather than the whole history: a
- * counter that reports its own cap as the total is the same quiet lie as an unchecked zero,
- * which is the failure `ProblemsPanel` was written against.
+ * Says when it is showing a prefix rather than the whole history: a counter that reports its own
+ * cap as the total is the same quiet lie as an unchecked zero, which is the failure
+ * `ProblemsPanel` was written against.
  */
-function countLabel(section: Section): string {
-  if (section.kind === 'recent' && section.rows.length >= RECENT_CAP) {
-    return `last ${section.rows.length}`
-  }
+function historyCount(section: Section | undefined): string {
+  if (section === undefined) return '0'
+  if (section.rows.length >= RECENT_CAP) return `last ${section.rows.length}`
   return String(section.rows.length)
 }
 
@@ -719,14 +749,13 @@ function ScopeControl({
 }
 
 /**
- * **One subagent.** The name, what it is doing right now, one line per active run, and the
- * role-scope controls — of which Configure is the only one that is always there.
+ * **One subagent.** The name, what it is doing right now, a Configure mark, and one line per
+ * active run.
  *
  * ```
- * ● Developer · Running                    1/1
- *     ● t-14 Add the retry bar    2m   Open ⏸ ⏹
- *   Implements one task end to end and reports back on it.
- *   Dispatch   Integrate   Configure
+ * ◌ Developer · Running                1/1  ⚙
+ *     ◌ t-14 Add the retry bar    2m   Open ⏸ ⏹
+ *       opencode · zai/glm-4.6 · pool fast 2 of 3
  * ```
  *
  * # The two controls the user asked for
@@ -738,28 +767,27 @@ function ScopeControl({
  * structural rather than conditional. `role.canOpen` is the same fact one level up, for anything
  * that needs to ask.
  *
- * **Configure is always drawn**, whatever the role is doing and whether or not it can be
- * dispatched. It is the one control on the row that leads to where the role can be *changed*,
- * and the row that most needs it is the one whose role is broken.
+ * **Configure is always drawn**, whatever the role is doing. It is the one control on the row
+ * that leads to where the role can be *changed*, and the row that most needs it is the one whose
+ * role is broken. A mark at the end of the name line rather than a word on a line of its own
+ * (M89): it is on every row, so its word was the same word repeated down the whole panel.
  *
- * # Never both, never neither
+ * # The description is the name's tooltip
  *
- * The Dispatch button and the refusal sentence are derived from `role.dispatch`, which
- * `sections()` produced with a single `canDispatch` call — and that call's return type has no
- * third shape: a green light, or a non-empty sentence. Building the two nodes from the one value
- * in two adjacent statements is what makes "a greyed control with nothing explaining it"
- * unwriteable here rather than merely discouraged; `check-agents.mjs` holds the model to the
- * same invariant from the other side.
+ * It used to be a paragraph under the runs, on every row, which made the list as tall as its
+ * prose. It is what a person wants to read *once*, about a role they do not recognise — which is
+ * a hover. The role's id, which the tooltip used to carry, leads it, because the id is what a
+ * task's assignee and `cide_task_assign` spell.
  *
- * The one arrangement that draws neither is a host that passed no `onDispatch` at all. That is
- * not a state the app has — the panel exists to dispatch — and the alternative, drawing the
- * button anyway, is a control that does nothing when pressed, which is the worse half of the
- * trade and the failure this family of panels keeps being rewritten to avoid.
+ * # The refusal survives Dispatch
+ *
+ * `role.dispatch` is still `canDispatch`'s answer, and its sentence is still drawn when it says
+ * no — a role whose harness is missing has to say so somewhere, and "why does nothing I assign
+ * to it start" is the question. The green light simply draws nothing now; see the header.
  */
 function RoleLine({
   role,
   nowMs,
-  onDispatch,
   onConfigure,
   onOpen,
   onPause,
@@ -768,13 +796,9 @@ function RoleLine({
   onRevealTask,
   onRetryTurn,
   onAckStaleTurn,
-  armed,
-  onIntegrateArm,
-  onIntegrate,
 }: {
   role: RoleRow
   nowMs: number
-  onDispatch?: ((agent: string) => void) | undefined
   onConfigure?: ((agent: string) => void) | undefined
   onOpen?: ((run: string) => void) | undefined
   onPause?: ((run: string) => void) | undefined
@@ -783,29 +807,9 @@ function RoleLine({
   onRevealTask?: ((task: string) => void) | undefined
   onRetryTurn?: ((run: string) => void) | undefined
   onAckStaleTurn?: ((run: string) => void) | undefined
-  /** Is *this* role the one waiting for a confirming second click? See `integrateArmed`. */
-  armed: boolean
-  onIntegrateArm?: ((agent: string) => void) | undefined
-  onIntegrate?: ((agent: string) => void) | undefined
 }) {
   const { def, dispatch } = role
-  const button =
-    dispatch.ok && onDispatch !== undefined ? (
-      <button
-        type="button"
-        className={styles.action}
-        data-audit="agentsDispatch"
-        onClick={() => onDispatch(def.id)}
-        title={`Start a ${def.label} run.`}
-      >
-        Dispatch
-      </button>
-    ) : null
-  const reason = dispatch.ok ? null : (
-    <p className={styles.roleReason} data-audit="agentsRoleReason">
-      {dispatch.reason}
-    </p>
-  )
+  const description = def.description.trim()
 
   return (
     <div
@@ -823,9 +827,14 @@ function RoleLine({
           * resting mark when there is none. `model.ts` decided both — a second table here would
           * be a second set of colours for one vocabulary, and `TONE_CLASS` is imported from
           * `RunRow.tsx` for the same reason.
+          *
+          * It **turns** when the mark is the spinner, exactly as the run line's does. Until M89 it
+          * drew the right arc and never moved: this span was written without `glyphSpin`, and the
+          * render check's spin digest read only `agentsGlyph`, so a still spinner a few pixels
+          * above a turning one passed every gate. The digest reads both now.
           */}
         <span
-          className={cx(styles.glyph, TONE_CLASS[role.tone])}
+          className={cx(styles.glyph, TONE_CLASS[role.tone], glyphSpins(role.glyph) && styles.glyphSpin)}
           data-audit="agentsRoleGlyph"
           data-tone={role.tone}
           aria-hidden="true"
@@ -848,7 +857,7 @@ function RoleLine({
           className={styles.roleName}
           style={{ color: agentColor(def.id, def.color) }}
           data-audit="agentsRoleName"
-          title={def.id}
+          title={description === '' ? def.id : `${def.id} — ${description}`}
         >
           {def.label}
         </span>
@@ -895,6 +904,22 @@ function RoleLine({
           {role.live}/{def.maxConcurrent}
           {role.queued > 0 ? ` +${role.queued}` : ''}
         </span>
+        {/*
+          * Last on the line, and on every row — including, and especially, a role that is
+          * unavailable, where nothing else on the row can do anything at all.
+          */}
+        {onConfigure !== undefined && (
+          <button
+            type="button"
+            className={cx(styles.control, styles.controlGlyph)}
+            data-audit="agentsConfigure"
+            onClick={() => onConfigure(def.id)}
+            title={CONFIGURE_TITLE}
+            aria-label={`Configure ${def.label} in Settings`}
+          >
+            <Icon name="settings" size={1} />
+          </button>
+        )}
       </div>
 
       {/*
@@ -920,163 +945,11 @@ function RoleLine({
         />
       ))}
 
-      {def.description.trim() !== '' && (
-        <p className={styles.roleDesc} data-audit="agentsRoleDesc">
-          {def.description}
+      {!dispatch.ok && (
+        <p className={styles.roleReason} data-audit="agentsRoleReason">
+          {dispatch.reason}
         </p>
       )}
-      {reason}
-
-      <div className={styles.roleActions} data-audit="agentsRoleActions">
-        {button}
-        {/*
-          * Beside Dispatch, and independent of it: *start work* and *take the work back* are the
-          * two ends of a role's life and a row that offered only the first would be half a loop.
-          * The independence is the point — see [`IntegrateControl`], which is offered on a role
-          * that cannot be dispatched at all.
-          */}
-        <IntegrateControl
-          agent={def.id}
-          label={def.label}
-          armed={armed}
-          onIntegrateArm={onIntegrateArm}
-          onIntegrate={onIntegrate}
-        />
-        {/*
-          * Last, and on every row. It is last because it is the control you reach for when the
-          * other two are not what you want, and it is on every row because *what this role is*
-          * is always editable — including, and especially, when the role is unavailable and
-          * neither of the others can do anything at all.
-          */}
-        {onConfigure !== undefined && (
-          <button
-            type="button"
-            className={styles.action}
-            data-audit="agentsConfigure"
-            onClick={() => onConfigure(def.id)}
-            title={CONFIGURE_TITLE}
-            aria-label={`Configure ${def.label} in Settings`}
-          >
-            Configure
-          </button>
-        )}
-      </div>
     </div>
   )
-}
-
-/**
- * A role row's **Integrate**: at most one button, and which one is the whole design.
- *
- * # When it is offered: always, and that is an honest answer rather than a lazy one
- *
- * A role with no worktree, or whose branch holds nothing the base lacks, has nothing to
- * integrate — and **the wire does not carry that fact**. `AgentDef` describes a file in
- * `.cide/agents/`: an id, a label, a harness, a description, a prompt, a ceiling and a fault. It
- * says nothing about `cide/<role>`, whether that branch exists, or how far ahead of `HEAD` it
- * is. Nothing in `AgentRoster` does either.
- *
- * So there were two options. Derive a guess from the roster — "this role has a finished run, so
- * it probably has commits" — or offer it always and let the backend answer. The guess is wrong
- * in both directions: a run that finished having written nothing leaves an empty branch, and a
- * role whose runs are long gone from `RECENT_CAP` still has every commit it ever made. A control
- * offered on a guess is a control that is sometimes missing over work that is really there,
- * which is the worse of the two failures by a distance.
- *
- * So: **offered on every role, unconditionally**, and `UpToDate` is a perfectly good answer that
- * the host reports as one. This is not a predictive button and must not be described as one; it
- * is a question the user is allowed to ask, whose answer sometimes is "nothing to do".
- *
- * **What it merges narrowed when worktrees went per-task**: this button names no task, so it
- * targets the role's *base* branch `cide/<role>` — which since M40 only holds work an older
- * cide's task-less dispatches left there, because a run with no task now stands in the project
- * root and mints no branch (`cide_agents::run_checkout`).
- * A task's work lives on `cide/<role>-<task>` now, and the road to it is the orchestrator's
- * `cide_agent_integrate` with the task named; a merge control on the task's own card is the
- * named follow-up for doing it by hand. The backend's "no branch yet" refusal spells the exact
- * branch it looked for, so pressing this over per-task work reads as an explanation rather
- * than a silent no-op.
- *
- * Two consequences worth stating because each looks like an oversight:
- *
- *  * **A role that cannot be dispatched still gets it.** `unavailable` is a fact about the
- *    machine — the harness binary is not on `PATH`, the definition file has no body — and none
- *    of those makes the commits the role already pushed to its branch less real. Withholding the
- *    control there would strand finished work behind an uninstalled CLI.
- *  * **A frozen project still gets it.** A project-scope pause stops children; this merges a
- *    branch in the user's own checkout, which is exactly the thing somebody does *while* the
- *    agents are held.
- *
- * # Two clicks, and why this one earns them
- *
- * The first press arms; the second merges. `ConfirmDestructive` — the house dialog — is for acts
- * that are irreversible or that were triggered by something outside the user's intent, and this
- * is neither: a merge is recoverable (`ORIG_HEAD`, the reflog) and it is only ever reached by
- * pressing a button labelled *Integrate*. But it writes files the user may have open and adds a
- * commit to their branch, from a row in a scrolling list, one row's height from *Dispatch*. That
- * is "recoverable but real, and easy to hit by mistake", which is the confirm-on-second-click
- * case rather than the dialog case.
- *
- * **The arm is per role and the merge is only ever for the role that was armed.** `agent` is
- * closed over from the row that drew the control, so "never merge without the user having asked
- * for this specific role" is structural here rather than a rule somebody has to keep.
- *
- * # Never both, never dead
- *
- * Exactly one of the two buttons exists at a time, and a missing handler withholds its half
- * outright rather than drawing it disabled — the rule every other control in this panel follows,
- * and the reason `check-agents-render.mjs` counts elements rather than `disabled` attributes.
- */
-function IntegrateControl({
-  agent,
-  label,
-  armed,
-  onIntegrateArm,
-  onIntegrate,
-}: {
-  agent: string
-  /** The role's display name, for the confirming button's accessible sentence. */
-  label: string
-  armed: boolean
-  onIntegrateArm?: ((agent: string) => void) | undefined
-  onIntegrate?: ((agent: string) => void) | undefined
-}) {
-  if (armed && onIntegrate !== undefined) {
-    return (
-      <button
-        type="button"
-        className={cx(styles.action, styles.actionArmed)}
-        data-audit="agentsIntegrateConfirm"
-        /* The role is named in the accessible sentence and not only in the row above it: this is
-           the press that merges, and a screen reader on a list of five roles must be able to say
-           *which* branch is about to land without moving off the control. `ScopeControl`'s
-           treatment, same reason. */
-        title={INTEGRATE_CONFIRM_TITLE}
-        aria-label={`Merge ${label}’s branch now. ${INTEGRATE_CONFIRM_TITLE}`}
-        onClick={() => onIntegrate(agent)}
-      >
-        Confirm merge
-      </button>
-    )
-  }
-  if (onIntegrateArm !== undefined) {
-    return (
-      <button
-        type="button"
-        className={styles.action}
-        data-audit="agentsIntegrate"
-        title={INTEGRATE_TITLE}
-        aria-label={`Integrate ${label}’s work. ${INTEGRATE_TITLE}`}
-        onClick={() => onIntegrateArm(agent)}
-      >
-        Integrate
-      </button>
-    )
-  }
-  /*
-   * Armed with no `onIntegrate`, or neither handler at all. Nothing is drawn — not a disabled
-   * *Confirm merge*, which would be a control that has already asked the user for a decision and
-   * then cannot act on it. Not a state the app has: `AgentsPanelHost` passes the pair together.
-   */
-  return null
 }

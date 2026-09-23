@@ -38,9 +38,14 @@
 pub mod autodispatch;
 pub mod config;
 pub mod defs;
+// No `///` here, for `harness`'s reason below: `limits.rs`'s `//!` header is the summary.
+pub mod limits;
 /// `@role` mentions in task prose — the pure scanner; who acts on one is `cide-app`'s question.
 pub mod mentions;
+pub mod milestones;
 pub mod overrides;
+/// The merge-request review vocabulary. (M85)
+pub mod review;
 // No `///` summary here, deliberately: `harness.rs`'s own `//!` header is the summary, and an
 // outer doc comment on the `mod` item merges with it into one fragment that rustdoc then resolves
 // in *this* module's scope — so every `[`RunState`]` and `[`SpawnSpec`]` link inside that header

@@ -27,6 +27,7 @@ import type {
   SettingsPatch,
   SettingsSection,
   AgentModels,
+  LlmLimitsProbe,
   LlmModelTest,
   TerminalRenderer,
   TerminalSettings,
@@ -176,6 +177,11 @@ export interface SectionProps {
    * with no such handler, exactly as `opencodeModels` above.
    */
   testModel: (model: string) => Promise<LlmModelTest | null>
+  /**
+   * A custom model's limits, read off its provider's server. (M88) Free, so the screen calls it
+   * when a model id is entered as well as from its button.
+   */
+  probeLimits: (provider: string, model: string) => Promise<LlmLimitsProbe | null>
 }
 
 const THEMES: readonly { value: Theme; label: string }[] = [
@@ -762,6 +768,7 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
           models={props.opencodeModels}
           recheckModels={props.recheckModels}
           testModel={props.testModel}
+          probeLimits={props.probeLimits}
         />
       )
     case 'agents':

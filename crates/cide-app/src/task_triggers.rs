@@ -177,6 +177,9 @@ fn consider_blocking(
         .map(|store| store.list())
         .unwrap_or_default();
 
+    // Read once per burst, like the board above. (M83)
+    let milestones = cide_agents::config::load_milestones(&root);
+
     for mutation in mutations {
         let fresh: Vec<&str> = mutation.fresh_text.iter().map(String::as_str).collect();
         let blockers = autodispatch::blocker_statuses(&mutation.after, &board);
@@ -193,6 +196,13 @@ fn consider_blocking(
         };
 
         let task = mutation.after.id.clone();
+        // A later milestone's task waits, quietly: the explicit dispatch path refuses the same
+        // case with a sentence (`plan_dispatch`), and an assignment is a record of intent that
+        // starts when its milestone is active. (M83)
+        if let Some(why) = cide_agents::milestones::outside_active(&milestones, &board, &task) {
+            tracing::debug!(%project, %task, %why, "assignment recorded; its milestone is not active");
+            continue;
+        }
         // The adoption write (a mention on an unassigned task becomes the assignee) is applied
         // here, inline, and is structurally incapable of re-triggering: only the two collection
         // sites build `TaskMutation`s, and this write goes through neither.

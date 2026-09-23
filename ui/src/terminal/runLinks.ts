@@ -33,6 +33,8 @@ export interface RunLine {
   readonly tool: string
   /** The ring handle the token names. */
   readonly handle: number
+  /** 0-based: the glyph — past the `[date time] ` stamp when the row has one, 0 when not. */
+  readonly toolStart: number
   /** 0-based, exclusive: the end of the `● tool` prefix. */
   readonly toolEnd: number
   /** 0-based: the `#` of the handle token. */
@@ -58,21 +60,30 @@ export interface RunLine {
  * and the alternative — a marker the model could not accidentally type — is an escape sequence
  * `vt100` drops from every replay, which is the whole reason this token is plain text.
  */
-const RUN_LINE = /^[●✗∴] (\S+)(?: .*)? #(\d+)$/u
+/*
+ * The optional `[2026-09-23 18:01:59] ` in front is `cide_agents::harness::render::stamp` — every
+ * opencode row opens with when it began. It is skipped, not linked: the click targets stay the
+ * glyph-and-tool and the handle, and a row with no stamp (a fixture, an older mirror replayed
+ * after an upgrade, codex) parses exactly as it did. Only this exact shape is skipped, so prose
+ * that happens to open with a bracket is still not a run line.
+ */
+const RUN_LINE = /^((?:\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] )?)[●✗∴] (\S+)(?: .*)? #(\d+)$/u
 
 /** The line's parts, or `null` for a line that is not a tool line with a handle. */
 export function parseRunLine(text: string): RunLine | null {
   const line = text.replace(/\s+$/u, '')
   const match = RUN_LINE.exec(line)
   if (match === null) return null
-  const tool = match[1] ?? ''
-  const digits = match[2] ?? ''
+  const toolStart = (match[1] ?? '').length
+  const tool = match[2] ?? ''
+  const digits = match[3] ?? ''
   const handle = Number(digits)
   if (tool === '' || digits === '' || !Number.isSafeInteger(handle)) return null
   return {
     tool,
     handle,
-    toolEnd: 2 + tool.length,
+    toolStart,
+    toolEnd: toolStart + 2 + tool.length,
     tokenStart: line.length - digits.length - 1,
     end: line.length,
   }

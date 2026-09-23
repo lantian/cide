@@ -810,6 +810,25 @@ fn build() -> Vec<Command> {
             .when("projectOpen")
             .keywords(&["thaw", "unfreeze", "continue", "sigcont", "subagents"]),
         Command::new("task.focusBoard", "Go to tasks", AGENTS).when("shellWindow && projectOpen"),
+        /*
+         * The pool-state card (M90): every model pool's entries with their load, which ones a
+         * refusal has benched and for how long, who is on what, and why recent runs started
+         * where they did — with Reset beside a benched entry and Test beside every one.
+         *
+         * Asked for as *"my default pool is always starting from the last element and I have no
+         * visual info why"*: a run's row said `6 of 6` and nothing about the five before it.
+         *
+         * `shellWindow && projectOpen` for `help.about`'s reason: `OverlayHost` is mounted
+         * there only, and a keymap binding toggling the store anywhere else would leave an
+         * invisible overlay gating every `!overlayOpen` binding. The pools themselves are
+         * global, so any open project will do.
+         */
+        Command::new("agents.poolState", "Model pools: show state", AGENTS)
+            .when("shellWindow && projectOpen")
+            .keywords(&[
+                "llm", "pool", "model", "failover", "penalty", "bench", "reset", "provider",
+                "opencode",
+            ]),
         // Terminal. Splitting one below is offered from any pane — it creates the terminal
         // it splits to — whereas clearing needs a terminal already focused.
         Command::new("terminal.splitBelow", "Split terminal below", TERMINAL).when("paneFocused"),

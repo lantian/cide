@@ -59,6 +59,11 @@ export interface Entry {
   provider: string
   model: string
   variant: string
+  /**
+   * How many runs may be on this entry at once, machine-wide. **Absent** means no limit — never
+   * `null` and never `0`, the rule `check:pools` holds every optional field on this wire to.
+   */
+  maxRunning?: number
 }
 
 /** A pool. Mirrors `cide_ipc::ModelPool`. */
@@ -317,6 +322,40 @@ export function localProblems(provider: Provider): string[] {
     }
   }
   return problems
+}
+
+/**
+ * The entry with its running limit set from what the box holds. Blank, `0`, a fraction or junk
+ * is "no limit", and "no limit" is the key **deleted** rather than set to `undefined` — the
+ * object goes to Rust whole, and an unset field must be absent on the wire.
+ */
+export function withMaxRunning(entry: Entry, text: string): Entry {
+  const next: Entry = { ...entry }
+  const n = Number(text.trim())
+  if (text.trim() !== '' && Number.isInteger(n) && n >= 1 && n <= 65535) {
+    next.maxRunning = n
+  } else {
+    delete next.maxRunning
+  }
+  return next
+}
+
+/**
+ * How many runs a pool can hold at once: the sum of its complete entries' limits, or `null`
+ * when any complete entry is unlimited (or none has a limit). Mirrors
+ * `cide_ipc::pool_capacity`, entry completeness included — `check:pools` holds the two to the
+ * same cases.
+ */
+export function poolCapacity(entries: readonly Entry[]): number | null {
+  let total = 0
+  let any = false
+  for (const entry of entries) {
+    if (entry.provider === '' || entry.model === '') continue
+    if (entry.maxRunning === undefined) return null
+    total += entry.maxRunning
+    any = true
+  }
+  return any ? total : null
 }
 
 /** Every pool name, for the override picker. */

@@ -56,8 +56,15 @@ export type OverlayKind =
    * Reads `Bootstrap.capabilities` off the boot the host was mounted with and asks Rust nothing.
    */
   | 'about'
+  /**
+   * The model-pool state card (`overlays/PoolStateCard.tsx`): every pool's entries, their load
+   * and benches, and why recent runs started where they did. Asks Rust `llm_pool_state`. (M90)
+   */
+  | 'pools'
   | 'gitlabOpen'
   | 'gitlabInfo'
+  /** Start an agent reviewing the MR (`gitlab/Dialogs.tsx`'s `LaunchReviewDialog`). (M85) */
+  | 'gitlabLaunch'
 
 interface OverlayStore {
   open: OverlayKind | null

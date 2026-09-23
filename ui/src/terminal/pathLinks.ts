@@ -91,13 +91,15 @@
  * the exact invalidation the other map enjoys (`cide://fs-changed`) is the project watcher's and
  * does not reach outside the project.
  */
-import type { IBufferLine, ILink, IDisposable } from '@xterm/xterm'
+import type { IBufferLine, ILink, IDisposable, Terminal } from '@xterm/xterm'
 import { notify } from '@/chrome/notices'
+import { isWebUrl, openWebLink } from '@/chrome/webLinks'
 import { events, fs as fsApi, session as sessionApi, type TreeRowKind } from '@/ipc/client'
 import { cellFromPoint, linkAtCell, pressVerdict, type Cell } from './clickGate'
 import {
   candidatePaths,
   matchPaths,
+  matchUrls,
   outsidePaths,
   resolveCandidate,
   resolveDirectory,
@@ -437,25 +439,29 @@ export function attachPathLinks(
   const EMPTY_SCAN: Scan = { links: [], misses: [] }
 
   async function scanLine(y: number): Promise<Scan> {
-    const env = envs.get(ctx.paneId)
-    // No project, no roots, or nowhere to send an open. The first two mean there is nothing to
-    // resolve against — `candidatePaths` would answer `[]` for every candidate anyway — and the
-    // third means a link would be drawn that could not do anything. All three return before the
-    // line is even scanned, which is what makes "no link" the visible state rather than "a link
-    // that swallows clicks".
-    //
-    // `reveal` is deliberately NOT part of this test: a window with no file tree still opens
-    // files perfectly well, it simply offers no directory links. Requiring both would take file
-    // links away from every detached pane.
-    if (env === undefined || env.project === '' || env.roots.length === 0) return EMPTY_SCAN
-    if (env.open === null) return EMPTY_SCAN
-
     const [lines, topIdx] = windowedLineStrings(y - 1, term)
     if (lines.length === 0) return EMPTY_SCAN
     const logical = lines.join('')
 
+    // Web links first, and before any of the project checks below: a URL needs no project, no
+    // roots and no `open` to mean something, so a pane with none of them still opens one.
+    const scan: Scan = { links: webLinks(logical, topIdx), misses: [] }
+
+    const env = envs.get(ctx.paneId)
+    // No project, no roots, or nowhere to send an open. The first two mean there is nothing to
+    // resolve against — `candidatePaths` would answer `[]` for every candidate anyway — and the
+    // third means a link would be drawn that could not do anything. All three return before the
+    // line is scanned for paths, which is what makes "no link" the visible state rather than "a
+    // link that swallows clicks".
+    //
+    // `reveal` is deliberately NOT part of this test: a window with no file tree still opens
+    // files perfectly well, it simply offers no directory links. Requiring both would take file
+    // links away from every detached pane.
+    if (env === undefined || env.project === '' || env.roots.length === 0) return scan
+    if (env.open === null) return scan
+
     const candidates = matchPaths(logical)
-    if (candidates.length === 0) return EMPTY_SCAN
+    if (candidates.length === 0) return scan
 
     // The pane's own cwd first, the spawn cwd second. `candidatePaths` de-duplicates, so a
     // pane that never changed directory pays for one base and not two.
@@ -486,7 +492,6 @@ export function attachPathLinks(
       existence.get(path) === 'file' || outsideKnown(path) === 'file'
     const isDir = (path: string): boolean =>
       existence.get(path) === 'dir' || outsideKnown(path) === 'dir'
-    const scan: Scan = { links: [], misses: [] }
     let cursor: Cursor = { y: topIdx, x: 0, idx: 0 }
     for (const candidate of candidates) {
       /*
@@ -543,6 +548,43 @@ export function attachPathLinks(
     return scan
   }
 
+  /**
+   * The `http(s)://` links in one logical line, each opening in the user's browser.
+   *
+   * Same gesture as a path — ctrl+click, claimed by the gate below — and the same guarded
+   * `activate` for a press that reached xterm some other way. The open goes through Rust
+   * (`chrome/webLinks.ts`), never this webview. Their own cursor, because `matchPaths` skips
+   * exactly these spans, so the two lists interleave and neither can reuse the other's walk;
+   * a line holds few enough URLs that the walk stays short.
+   */
+  function webLinks(logical: string, topIdx: number): Scan['links'] {
+    const out: Scan['links'] = []
+    let cursor: Cursor = { y: topIdx, x: 0, idx: 0 }
+    for (const url of matchUrls(logical)) {
+      const range = rangeOf(url, cursor)
+      if (range === null) continue
+      cursor = { y: range.start.y - 1, x: range.start.x - 1, idx: url.start }
+      const act = (): void => openWebLink(url.text)
+      out.push({
+        act,
+        link: {
+          range,
+          text: url.text,
+          activate: (event: MouseEvent) => {
+            if (event.ctrlKey || event.metaKey) act()
+          },
+          hover: () => {
+            hovered = true
+          },
+          leave: () => {
+            hovered = false
+          },
+        },
+      })
+    }
+    return out
+  }
+
   /** A position in the wrapped block, paired with the string offset it corresponds to. */
   interface Cursor {
     y: number
@@ -561,7 +603,10 @@ export function attachPathLinks(
    * cloned repo decides. Candidates arrive in increasing `start` order, so one cursor carried
    * across them makes the whole line linear.
    */
-  function rangeOf(candidate: Candidate, from: Cursor): ILink['range'] | null {
+  function rangeOf(
+    candidate: Pick<Candidate, 'start' | 'end'>,
+    from: Cursor,
+  ): ILink['range'] | null {
     const [startY, startX] = mapStrIdx(from.y, from.x, candidate.start - from.idx)
     if (startY === -1 || startX === -1) return null
     const [endY, endX] = mapStrIdx(startY, startX, candidate.end - candidate.start)
@@ -669,6 +714,14 @@ export function attachPathLinks(
       // no text.
       return
     }
+    // An OSC 8 hyperlink outranks everything the scan could find, as it does in xterm's own
+    // provider order — and it is read now, synchronously, from the cell the press landed on,
+    // because the gate has just hidden this press from `OscLinkProvider` for good.
+    const osc = oscLinkAt(term, cell)
+    if (osc !== null && isWebUrl(osc)) {
+      openWebLink(osc)
+      return
+    }
     void scanLine(cell.y).then(
       (scan) => actOnCell(scan, cell),
       () => {
@@ -717,9 +770,11 @@ export function attachPathLinks(
       })
       return
     }
-    notify('There is no file path under the pointer.', {
+    notify('There is no file path or web link under the pointer.', {
       kind: 'warn',
-      hint: 'Ctrl+click a path in terminal output to open it, or a folder to show it in the tree.',
+      hint:
+        'Ctrl+click a path in terminal output to open it, a folder to show it in the tree, or ' +
+        'an http(s) link to open it in your browser.',
     })
   }
 
@@ -738,7 +793,7 @@ export function attachPathLinks(
     // A drag that selected the path is not a click that missed; staying silent there is the
     // whole reason this is on `click` and reads the selection.
     if (term.getSelection() !== '') return
-    notify('Ctrl+click a path in a terminal to open it.', { kind: 'warn' })
+    notify('Ctrl+click a path or link in a terminal to open it.', { kind: 'warn' })
   }
 
   el.addEventListener('mousedown', onMouseDown, true)
@@ -811,6 +866,49 @@ function activate(
     resolution.path,
     candidate.line === null ? null : { line: candidate.line, column: candidate.column ?? 1 },
   )
+}
+
+/** The one method of xterm's internal `IOscLinkService` that [`oscLinkAt`] calls. */
+interface OscLinkService {
+  getLinkData?: (id: number) => { uri?: unknown } | undefined
+}
+
+/**
+ * The URI of the OSC 8 hyperlink covering `cell`, or `null`.
+ *
+ * **Reaches into xterm's internals, on purpose and in exactly one place.** OSC 8 links are
+ * web links a program marked up itself (Claude Code's markdown links among them), and their
+ * visible text need not be the URL — `[docs](https://…)` shows `docs`. xterm's
+ * `OscLinkProvider` opens them on whatever click reaches it, which with this gate in place is
+ * only ever a *plain* click; a web link that opens on the click a user makes to focus a pane
+ * is a browser window nobody asked for. So xterm's handler refuses web links (`xterm.ts`) and
+ * the ctrl+press this gate claims opens them — which needs the link under the press, and the
+ * public API has no accessor for it.
+ *
+ * The two internals, both from `@xterm/xterm` 6.0.0 (pinned exactly, and `check:paths` pins
+ * `XTERM_VERSION` to it): a buffer cell loaded through the public `getCell` *is* the internal
+ * `CellData`, whose `extended.urlId` names the link, and `Terminal._core._oscLinkService` maps
+ * that id to its URI — the same two reads `OscLinkProvider.provideLinks` makes. Both names
+ * survive xterm's minified build. Every step is shape-checked, so an upgrade that renames
+ * either degrades to "no OSC link here" and the text-URL path still works; `check:paths`
+ * greps the built bundle for both names so that degradation is a red check, not a quiet one.
+ */
+function oscLinkAt(term: Terminal, cell: { x: number; y: number }): string | null {
+  try {
+    const buffer = term.buffer.active
+    const scratch = buffer.getNullCell() as unknown as { extended?: { urlId?: unknown } }
+    const line = buffer.getLine(cell.y - 1)
+    if (line === undefined) return null
+    line.getCell(cell.x - 1, scratch as unknown as Parameters<IBufferLine['getCell']>[1])
+    const id = scratch.extended?.urlId
+    if (typeof id !== 'number' || id === 0) return null
+    const service = (term as unknown as { _core?: { _oscLinkService?: OscLinkService } })._core
+      ?._oscLinkService
+    const uri = service?.getLinkData?.(id)?.uri
+    return typeof uri === 'string' && uri !== '' ? uri : null
+  } catch {
+    return null
+  }
 }
 
 /** The `none` answer, so `scanLine` can skip the directory probe without an `undefined`. */

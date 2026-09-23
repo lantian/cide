@@ -2319,3 +2319,152 @@ button.linkRowMain {
   outline: 2px dashed var(--accent);
   outline-offset: -2px;
 }
+
+/* The milestone a task serves (M83): one line above the title, the whole of it a button. */
+.milestoneLine {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  width: 100%;
+  min-width: 0;
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  text-align: left;
+  cursor: pointer;
+}
+
+.milestoneLine:hover:not(:disabled) {
+  background: var(--chrome-hi);
+}
+
+.milestoneLine:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.milestoneLine:disabled {
+  cursor: default;
+}
+
+.milestoneLine[data-state='active'] {
+  border-color: var(--yellow);
+}
+
+.milestoneLabel {
+  flex: none;
+  color: var(--faint);
+}
+
+.milestoneId {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.milestoneTitle {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-hi);
+}
+
+.milestoneState {
+  flex: none;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.milestoneLine[data-state='active'] .milestoneState {
+  color: var(--yellow);
+}
+
+/* A task's verify, on its row (M83). */
+.verifyMark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.verify_running {
+  color: var(--yellow);
+}
+
+.verify_passed {
+  color: var(--green);
+}
+
+.verify_failed {
+  color: var(--red);
+}
+
+/* A task's verify, on its card (M83). */
+.verifyLine {
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--red);
+  border-radius: var(--r-2);
+  font-size: var(--fs-ui-12);
+}
+
+.verifyLine[data-verify='running'] {
+  border-left-color: var(--yellow);
+}
+
+.verifyLine[data-verify='passed'] {
+  border-left-color: var(--green);
+}
+
+.verifyHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  color: var(--text);
+}
+
+.verifyMeta {
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+}
+
+.verifyOutput summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+
+.verifyOutput pre {
+  margin: var(--sp-1) 0 0;
+  max-height: 16em;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.verifyLog {
+  margin-left: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: var(--fs-ui-11);
+  cursor: pointer;
+}

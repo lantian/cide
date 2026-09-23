@@ -607,9 +607,44 @@
  *
  * So this rule carries one thing: a slightly quieter colour, because the header is a container
  * and never a file the user is looking for by name. Weight, size and face are the row's.
+ *
+ * The *Project Notes* pin takes it too. Drawn at full strength it sat directly under
+ * `rust-toolchain.toml` in the same face and colour and read as one more file in the repository,
+ * which is the one thing it is not — the notes live outside every root. Same shade as the headers
+ * below it, so the three read as one family: the rows cide adds, not the rows the user owns.
  */
 .rowGroup {
   color: var(--dim);
+}
+
+/*
+ * The hairline above the first of those rows (`groupRows.opensSyntheticSection`).
+ *
+ * The position and the icon that are enough in IDEA were not enough here: with *Project Notes*
+ * pinned first, the boundary fell between two rows with document glyphs, and nothing said where
+ * the project ended. A line is the least that says it — the uppercase header this block's first
+ * version tried was rejected above, and a blank gap is not available at all.
+ *
+ * A **pseudo-element**, not `border-top` or a margin, because every row is exactly `rowHeight`
+ * tall and positioned at `index * rowHeight` by the virtualizer, and the draft row's slot is the
+ * same arithmetic. A border inside the box would shift the row's content by a pixel; a margin
+ * would do nothing to an absolutely-placed box; a taller row would desync every offset below it.
+ * `::before` is drawn *inside* the existing 24px, over its top edge, and moves nothing.
+ *
+ * Inset on both sides by the row's own padding so it reads as a divider inside the list rather
+ * than a panel edge, and `--border` so it is the same rule the panel already draws between its
+ * header and its body — one weight of line in both themes. It sits at the very edge of the row,
+ * so a selection band on *Project Notes* still covers the text and the two never compete.
+ */
+.rowSection::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 6px;
+  right: 8px;
+  height: 1px;
+  background: var(--border);
+  pointer-events: none;
 }
 
 /*

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
+    "check:check-log": "node scripts/check-check-log.mjs",
     "check:agents": "node scripts/check-agents.mjs",
     "check:agents-render": "node scripts/check-agents-render.mjs",
     "check:docker": "node scripts/check-docker.mjs",

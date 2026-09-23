@@ -7,6 +7,7 @@ import {
   type GitLabRequest,
   type GitLabDocument,
 } from '@/ipc/client'
+import type { GitLabDraft } from '@/ipc/generated'
 import type {
   MR,
   Version,
@@ -42,6 +43,8 @@ export interface ReviewData {
   activity: Note[]
   approval: Approval | null
   approvalError: string | null
+  /** Local, unpublished review comments — an agent's findings or the user's edits of them. */
+  drafts: GitLabDraft[]
 }
 export interface Document {
   review: string
@@ -57,10 +60,12 @@ interface Snapshot {
   editor: Document | null
   info: {
     review: string
-    section: 'description' | 'discussions' | 'activity' | 'pipelines'
+    section: 'description' | 'discussions' | 'drafts' | 'activity' | 'pipelines'
   } | null
   error: string | null
   revision: number
+  /** The review the agent-review dialog is for. (M85) */
+  launch: string | null
 }
 let snapshot: Snapshot = {
   board: {
@@ -76,6 +81,7 @@ let snapshot: Snapshot = {
   info: null,
   error: null,
   revision: 0,
+  launch: null,
 }
 const listeners = new Set<() => void>()
 export const data = new Map<string, ReviewData>()
@@ -125,6 +131,9 @@ export function startGitLab() {
   if (started) return
   started = true
   void gitlab.onChanged(boardChanged).catch((e) => set({ error: message(e) }))
+  void gitlab
+    .onDraftsChanged((review) => void refreshDrafts(review))
+    .catch((e) => set({ error: message(e) }))
   void refreshBoard()
 }
 export async function refreshBoard() {
@@ -247,7 +256,7 @@ export async function loadReview(
   const running = pending.get(id)
   if (running) return running
   const promise = (async () => {
-    const [mr, versions, discussions, activity, approval] = await Promise.all([
+    const [mr, versions, discussions, activity, approval, drafts] = await Promise.all([
       api<MR>({ kind: 'detail', review: id }),
       api<Version[]>({ kind: 'versions', review: id }),
       pages<Discussion>((page) => ({ kind: 'discussions', review: id, page })),
@@ -256,6 +265,7 @@ export async function loadReview(
         (value) => ({ value, error: null }),
         (error) => ({ value: null, error: message(error) }),
       ),
+      api<GitLabDraft[]>({ kind: 'drafts', review: id }),
     ])
     const latest = versions[0]
     if (!latest)
@@ -293,6 +303,7 @@ export async function loadReview(
       activity,
       approval: approval.value,
       approvalError: approval.error,
+      drafts,
     }
     if (snapshot.board.reviews.some((r) => r.id === id)) {
       data.set(id, result)
@@ -338,6 +349,16 @@ export async function refreshDiscussions(id: string) {
     touch()
   }
 }
+/** Re-read a review's drafts. Local and cheap: no GitLab request is made. */
+export async function refreshDrafts(id: string) {
+  if (!data.has(id)) return
+  const drafts = await api<GitLabDraft[]>({ kind: 'drafts', review: id })
+  const old = data.get(id)
+  if (old) {
+    data.set(id, { ...old, drafts })
+    touch()
+  }
+}
 export async function prepareSource(
   id: string,
   revision?: string,
@@ -373,6 +394,11 @@ export function showReviewInfo(
 ) {
   set({ info: { review, section } })
   showOverlay('gitlabInfo')
+}
+
+export function showLaunchReview(review: string) {
+  set({ launch: review })
+  showOverlay('gitlabLaunch')
 }
 
 export async function navigateReviewFile(key: GitLabDocument, delta: number) {

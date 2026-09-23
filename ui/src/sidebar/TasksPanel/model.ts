@@ -52,19 +52,21 @@
 /**
  * Where a task is. Restates `TaskStatus` in `crates/cide-ipc/src/tasks.rs`.
  *
- * Four, and the two that were proposed and lost are recorded there: `Blocked` is a *reason*
- * rather than a place, and `Cancelled` belongs to `git log` rather than to a working queue.
+ * Five since M83, and the two that were proposed and lost are recorded there: `Blocked` is a
+ * *reason* rather than a place, and `Cancelled` belongs to `git log` rather than to a working
+ * queue. `inbox` is the one that was added — noticed, not yet work — and the Rust doc says why it
+ * is neither of those.
  */
-export type TaskStatus = 'todo' | 'doing' | 'review' | 'done'
+export type TaskStatus = 'inbox' | 'todo' | 'doing' | 'review' | 'done'
 
 /**
- * The four statuses, in Rust's declaration order.
+ * The five statuses, in Rust's declaration order.
  *
  * This is the *vocabulary*, not the display order — see [`GROUP_ORDER`]. `check-agents.mjs`
  * asserts it equals `pub enum TaskStatus`'s variants as a set, so adding one in Rust fails the
  * build until the tables below know it.
  */
-export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'doing', 'review', 'done']
+export const TASK_STATUSES: readonly TaskStatus[] = ['inbox', 'todo', 'doing', 'review', 'done']
 
 /**
  * Display order, and deliberately **not** [`TASK_STATUSES`]: active first, because the panel
@@ -75,10 +77,16 @@ export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'doing', 'review', 
  * subset of it: a status the panel never groups is a task the user cannot see, which is a task
  * that has silently left the tracker.
  */
-export const GROUP_ORDER: readonly TaskStatus[] = ['doing', 'review', 'todo', 'done']
+/*
+ * The inbox sits between the backlog and Done (M83): below everything that is planned, because
+ * it is not, and above Done because it is still something somebody may act on. It is collapsed
+ * by default like Done — an inbox read top to bottom on every glance is a plan by another name,
+ * which is the failure the status exists to stop.
+ */
+export const GROUP_ORDER: readonly TaskStatus[] = ['doing', 'review', 'todo', 'inbox', 'done']
 
 /**
- * Is this one of the four statuses?
+ * Is this one of the five statuses?
  *
  * Takes `string` rather than `TaskStatus` on purpose: every caller has a value *annotated*
  * `TaskStatus` by a wire type, and the point of the guard is that the annotation is a promise
@@ -118,6 +126,8 @@ export const TONES: readonly Tone[] = ['idle', 'busy', 'attention', 'done']
  * person*, and it should not read as another automatic state in the same family.
  */
 const STATUS_GLYPH: Record<TaskStatus, string> = {
+  // A box and not a circle: every circle is a stage of work, and the inbox is not one yet.
+  inbox: 'archive',
   todo: 'circle',
   doing: 'circle-dot',
   review: 'eye',
@@ -125,6 +135,7 @@ const STATUS_GLYPH: Record<TaskStatus, string> = {
 }
 
 const STATUS_LABEL: Record<TaskStatus, string> = {
+  inbox: 'Inbox',
   todo: 'Todo',
   doing: 'Doing',
   review: 'Review',
@@ -132,6 +143,7 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 }
 
 const STATUS_TONE: Record<TaskStatus, Tone> = {
+  inbox: 'idle',
   todo: 'idle',
   doing: 'busy',
   review: 'attention',
@@ -698,7 +710,7 @@ export interface TaskGroup {
  * Which group a task is drawn in — **the one answer to that question**, shared by [`groups`]
  * and [`matchesFilter`].
  *
- * A status outside the four lands in `todo`, and the reason is [`groups`]'s: a task the panel
+ * A status outside the five lands in `todo`, and the reason is [`groups`]'s: a task the panel
  * cannot place must stay visible rather than fall out of a tracker somebody is relying on. The
  * reason it is a *function* rather than two copies of `isTaskStatus(…) ? … : 'todo'` is the
  * filter: if the list put a rogue-status task under `Todo` and the filter did not match it

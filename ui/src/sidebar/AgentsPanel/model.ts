@@ -546,6 +546,40 @@ export interface RunView {
    * finished opencode run has no session and an openable conversation.
    */
   openable: boolean
+  /**
+   * The model this run is on — `provider/model` where the harness spells it that way — or
+   * `null` when nothing chose one and the harness picked its own default. (M89) `AgentRun::
+   * model`: **the run's, never the role file's**, so a row whose role has since been overridden
+   * or failed over still says what this run was actually told.
+   */
+  model: string | null
+  /** The pool that chose `model` and how far down it — `fast 2 of 3` — or `null`. (M89) */
+  poolPosition: string | null
+}
+
+/**
+ * **What a run is on**, as one dim line: the harness, the model where one was chosen, and the
+ * pool where one chose it. (M89)
+ *
+ * ```
+ * opencode · zai/glm-4.6 · pool fast 2 of 3
+ * claude · opus
+ * codex
+ * ```
+ *
+ * The harness always leads, because it is the one fact every run has and the one that decides
+ * what Open brings up. A missing model draws **nothing** in its place rather than `default` —
+ * the harness chose it and cide was not told what it was, and printing a word for a model
+ * nobody named is the guess this row exists to replace. The pool is last and says `pool`,
+ * because `fast 2 of 3` alone reads like a quota rather than a position in a list.
+ */
+export function usingLabel(run: Pick<RunView, 'harness' | 'model' | 'poolPosition'>): string {
+  const parts = [harnessLabel(run.harness)]
+  const model = run.model?.trim() ?? ''
+  if (model !== '') parts.push(model)
+  const pool = run.poolPosition?.trim() ?? ''
+  if (pool !== '') parts.push(`pool ${pool}`)
+  return parts.join(' · ')
 }
 
 /**

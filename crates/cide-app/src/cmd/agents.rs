@@ -410,6 +410,123 @@ pub async fn llm_test_model(
     .await
 }
 
+/// Every configured pool as admission sees it right now — load, benches, who is on what, who is
+/// waiting, and what the pools decided lately. The pool-state card's one read. (M90)
+///
+/// Synchronous and cheap: one registry lock and a clone of the global settings, no disk. The
+/// card calls it on open and on every `agents_changed`, which is when any of it can move.
+#[tauri::command(rename_all = "camelCase")]
+pub fn llm_pool_state(
+    state: State<'_, WorkspaceState>,
+    agents: State<'_, Arc<AgentRegistry>>,
+) -> Result<cide_ipc::PoolStateReport> {
+    let llm = state.with(|ws| ws.settings.llm.clone());
+    Ok(agents.pool_state(&llm))
+}
+
+/// Clear one pool target's bench — or every bench, with `entry` of `None` — and put the runs
+/// waiting past it back onto it. (M90)
+///
+/// The button a person presses after starting the local server a run found down. Redraws the
+/// projects whose rows moved, then pumps: a reset can be exactly what a queued run was waiting
+/// for, and leaving it to the next unrelated event would make the button look as if it did
+/// nothing.
+#[tauri::command(rename_all = "camelCase")]
+pub fn llm_pool_reset(
+    app: AppHandle,
+    agents: State<'_, Arc<AgentRegistry>>,
+    entry: Option<cide_ipc::PoolEntry>,
+) -> Result<()> {
+    let registry = Arc::clone(&agents);
+    for project in registry.reset_pool_entry(entry.as_ref()) {
+        registry.mark_changed(&app, project);
+    }
+    registry.pump(&app);
+    Ok(())
+}
+
+/// Ask a custom provider's own server for one model's limits, to fill its Settings row. (M88)
+///
+/// Reads the provider's base URL and key from settings rather than taking them as arguments,
+/// so the key never travels back over the bridge it arrived on and the probe asks exactly the
+/// endpoint a run would. Costs nothing — a `GET` of a model list, never a completion — which is
+/// why the screen may call it on its own when a model id is entered, unlike
+/// [`llm_test_model`] above. `cide_agents::limits` carries which servers say what.
+///
+/// A verdict, not a rejection: see [`cide_ipc::LlmLimitsProbe`].
+#[tauri::command(rename_all = "camelCase")]
+pub async fn llm_probe_limits(
+    state: State<'_, WorkspaceState>,
+    provider: String,
+    model: String,
+) -> Result<cide_ipc::LlmLimitsProbe> {
+    let (llm, proxy) = state
+        .with(|ws| Ok::<_, CoreError>((ws.settings.llm.clone(), ws.settings.proxy.clone())))?;
+    blocking(move || {
+        let answer = |context: u32, output: u32, output_estimated: bool, detail: String| {
+            cide_ipc::LlmLimitsProbe {
+                provider: provider.clone(),
+                model: model.clone(),
+                context,
+                output,
+                output_estimated,
+                detail,
+            }
+        };
+        let Some(cide_ipc::LlmProvider::Custom {
+            base_url, api_key, ..
+        }) = llm.provider(&provider)
+        else {
+            return Ok(answer(
+                0,
+                0,
+                false,
+                format!(
+                    "`{provider}` is not a custom provider, so opencode's catalog already knows \
+                     its models' limits."
+                ),
+            ));
+        };
+        let probed = cide_agents::limits::client(&proxy).and_then(|client| {
+            cide_agents::limits::probe(&client, base_url, api_key, model.trim())
+        });
+        Ok(match probed {
+            Ok(Some((found, endpoint))) => {
+                let (output, estimated) = match found.output {
+                    Some(output) => (output, false),
+                    None => (cide_agents::limits::estimate_output(found.context), true),
+                };
+                answer(
+                    found.context,
+                    output,
+                    estimated,
+                    format!(
+                        "{} tokens from the server's `{}` ({endpoint}){}",
+                        found.context,
+                        found.field,
+                        match estimated {
+                            true => format!(
+                                "; it states no output limit, so {output} is cide's estimate"
+                            ),
+                            false => String::new(),
+                        }
+                    ),
+                )
+            }
+            Ok(None) => answer(
+                0,
+                0,
+                false,
+                "The server answered but states no context length for this model — fill it in \
+                 from the value it was started with."
+                    .to_string(),
+            ),
+            Err(why) => answer(0, 0, false, format!("Could not read the limits: {why}.")),
+        })
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn agents_models(
     state: State<'_, WorkspaceState>,
@@ -642,6 +759,9 @@ pub(crate) async fn dispatch_or_duplicate(
     // the registry is behind an `Arc` for exactly this — see `lib.rs`.
     let registry = Arc::clone(&agents);
     let lookup = Arc::clone(&agents);
+    // The pools, for the entry limits admission places this run by. Global settings, so read
+    // off the workspace here rather than off the project's disk on the worker.
+    let llm = state.with(|ws| ws.settings.llm.clone());
 
     let spec = blocking(move || {
         // Read on the worker rather than here, for this module's standing reason: the registry's
@@ -660,7 +780,7 @@ pub(crate) async fn dispatch_or_duplicate(
         let overrides =
             cide_core::persist::load_agent_overrides(&cide_core::persist::agent_overrides_path())
                 .project(&root.to_string_lossy());
-        plan_dispatch(&root, &store, held.as_ref(), &overrides, &request)
+        plan_dispatch(&root, &store, held.as_ref(), &overrides, &llm, &request)
     })
     .await?;
 
@@ -892,6 +1012,33 @@ pub async fn agents_run_open(
         Ok::<_, CoreError>((root, ws.settings.claude.cli.inject.resume.enabled))
     })?;
     agents.open_plan(project, run, &sessions, &root, resume_enabled)
+}
+
+/// The Tasks panel's **Plan tasks** button: open the spinner's planning tab now. (M88)
+///
+/// `crate::spinner::plan_now` is the decision and carries the argument for which of the timer's
+/// conditions a button keeps. Answers once the tab is open, or with the sentence for why none
+/// was — subagents off, or the active milestone already met and waiting on the user.
+///
+/// **On a thread of its own, reached from the blocking pool, and never on a runtime worker**:
+/// `claude_tab::open_with_prompt` enters the runtime with `block_on` to fork the child, which is
+/// the rule `crate::agent_rpc`'s header states, and a stale milestone gate is run first, which
+/// can take minutes. The pool thread only waits on the channel.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn agents_plan_now(app: AppHandle, project: ProjectId) -> Result<()> {
+    blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("cide-plan-now".into())
+            .spawn(move || {
+                let _ = tx.send(crate::spinner::plan_now(&app, project));
+            })
+            .map_err(|error| CoreError::Io(format!("could not start the planner: {error}")))?;
+        rx.recv()
+            .map_err(|_| CoreError::Io("the planner stopped before answering".into()))?
+            .map_err(CoreError::Io)
+    })
+    .await
 }
 
 /// Take the stale-turn offer and re-send the run's last dispatched prompt.
@@ -1138,6 +1285,7 @@ fn plan_dispatch(
     store: &TaskStore,
     held: Option<&HeldPair>,
     overrides: &cide_ipc::ProjectOverrides,
+    llm: &cide_ipc::LlmSettings,
     request: &DispatchRequest,
 ) -> Result<DispatchSpec> {
     let project = cide_agents::load_project(root);
@@ -1202,6 +1350,39 @@ fn plan_dispatch(
         .transpose()?;
 
     /*
+     * An inbox task is not work yet, so nothing dispatches it. (M83)
+     *
+     * The quiet half is `autodispatch`, which starts `Todo | Doing` only; this is the named one,
+     * for the same reason the blocking rule below has one — an explicit gesture's refusal must
+     * say why and what to do instead. Moving a task out of the inbox is the decision that it is
+     * worth doing now, and a dispatch that skipped it would make the inbox a place tasks run from.
+     */
+    if let Some(task) = task.as_ref()
+        && task.status == cide_ipc::TaskStatus::Inbox
+    {
+        return Err(CoreError::Io(format!(
+            "{} is in the inbox, which is where noticed work waits until something needs it: \
+             move it to todo first (cide_task_update with status todo), then dispatch it.",
+            task.id
+        )));
+    }
+
+    /*
+     * Work on a later milestone waits for the current one. (M83)
+     *
+     * A task under milestone P3 started while the slice is still red is effort spent on a goal the
+     * project has not reached, and it competes for the same concurrency the current goal needs.
+     * A task under no milestone is not caught: that is the orchestrator's call, and the placement
+     * rule already sends new loose work to the inbox.
+     */
+    if let Some(task) = task.as_ref() {
+        let plan = cide_agents::config::load_milestones(root);
+        if let Some(why) = cide_agents::milestones::outside_active(&plan, &store.list(), &task.id) {
+            return Err(CoreError::Io(why));
+        }
+    }
+
+    /*
      * The named refusal half of the blocking rule. (M30)
      *
      * The quiet half is `autodispatch::trigger`'s early return — an assignment on a blocked task
@@ -1225,6 +1406,7 @@ fn plan_dispatch(
             .filter(|t| t.status != cide_ipc::TaskStatus::Done)
             .map(|t| {
                 let status = match t.status {
+                    cide_ipc::TaskStatus::Inbox => "inbox",
                     cide_ipc::TaskStatus::Todo => "todo",
                     cide_ipc::TaskStatus::Doing => "doing",
                     cide_ipc::TaskStatus::Review => "review",
@@ -1302,6 +1484,17 @@ fn plan_dispatch(
         // `None` on the wire means the caller had no session to name — the panel, the Tasks
         // panel's assignment — and the primary pane is the honest address for that.
         notify: request.notify.clone().unwrap_or_default(),
+        purpose: crate::agents::RunPurpose::Work,
+        // The pool this run falls down, resolved now so admission can place it on an entry
+        // with room (`PoolEntry::max_running`). Empty on a refusal: the fork resolves again
+        // and refuses with its sentence, which is where that refusal has always been said.
+        pool: {
+            let resolved = cide_agents::overrides::resolve(agent, overrides, llm);
+            match resolved.refusal {
+                Some(_) => Vec::new(),
+                None => resolved.pool,
+            }
+        },
     })
 }
 
@@ -1912,6 +2105,7 @@ mod tests {
             &store,
             Some(&live),
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &request(project, &task),
         )
         .expect_err("the role is already on this task")
@@ -1945,6 +2139,7 @@ mod tests {
             &store,
             Some(&held(RunState::Running)),
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -1959,6 +2154,7 @@ mod tests {
             &store,
             Some(&held(RunState::Running)),
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &ghost,
         )
         .expect_err("refused")
@@ -1981,6 +2177,7 @@ mod tests {
             &store,
             Some(&held(RunState::Running)),
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -2013,6 +2210,7 @@ mod tests {
             &store,
             Some(&held(RunState::Idle)),
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -2025,6 +2223,7 @@ mod tests {
             &store,
             Some(&held(RunState::Paused { since_unix_ms: 1 })),
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -2038,6 +2237,7 @@ mod tests {
             &store,
             Some(&held(RunState::Queued)),
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &request(project, &task),
         )
         .expect_err("refused")
@@ -2067,6 +2267,7 @@ mod tests {
             &store,
             None,
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &DispatchRequest {
                 project: ProjectId::new(),
                 agent: AgentId("game-designer".into()),
@@ -2104,6 +2305,7 @@ mod tests {
             &store,
             None,
             &no_overrides(),
+            &cide_ipc::LlmSettings::default(),
             &DispatchRequest {
                 project: ProjectId::new(),
                 agent: cide_ipc::AgentId("developer".into()),
@@ -2368,4 +2570,102 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+// --- milestones (M83) ------------------------------------------------------------------------
+
+/// What the Milestones tab draws about a project's milestones: the plan, each gate's last result, and
+/// which are accepted. `None` is a project that is not open.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn milestones_get(
+    app: tauri::AppHandle,
+    project: ProjectId,
+) -> Result<Option<cide_ipc::MilestonesView>> {
+    blocking(move || Ok(crate::milestones::view(&app, project))).await
+}
+
+/// Replace the plan. The user's write, whole-value: the Milestones tab holds the list and sends
+/// it back. A milestone without a task gets one (`milestones::set_plan`).
+#[tauri::command(rename_all = "camelCase")]
+pub async fn milestones_set(
+    app: tauri::AppHandle,
+    project: ProjectId,
+    plan: cide_ipc::MilestonePlan,
+) -> Result<Option<cide_ipc::MilestonesView>> {
+    blocking(move || {
+        let mut plan = plan;
+        crate::milestones::set_plan(&app, project, &mut plan, cide_ipc::TaskAuthor::User)
+            .map_err(CoreError::Io)?;
+        Ok(crate::milestones::view(&app, project))
+    })
+    .await
+}
+
+/// Run the active milestone's gate now, in the background. The answer arrives as
+/// `cide://milestones-changed`, twice: once when it starts and once when it ends.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn milestones_gate_run(app: tauri::AppHandle, project: ProjectId) -> Result<()> {
+    crate::milestones::run_gate(&app, project);
+    Ok(())
+}
+
+/// Accept the active milestone: its task is done, and the next milestone becomes active.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn milestones_accept(
+    app: tauri::AppHandle,
+    project: ProjectId,
+) -> Result<Option<cide_ipc::MilestonesView>> {
+    blocking(move || {
+        crate::milestones::accept(&app, project).map_err(CoreError::Io)?;
+        Ok(crate::milestones::view(&app, project))
+    })
+    .await
+}
+
+/// The full log of a check, for the panel's log window: `kind` is `gate` (keyed by milestone id)
+/// or `verify` (keyed by task id). `None` when it has not run on this machine. The last MiB only,
+/// with a line saying so — see `milestones::read_log`.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn milestones_check_log(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    kind: String,
+    key: String,
+) -> Result<Option<String>> {
+    let root = project_root(&state, project)?;
+    let kind = match kind.as_str() {
+        "gate" => crate::milestones::LogKind::Gate,
+        "verify" => crate::milestones::LogKind::Verify,
+        other => return Err(CoreError::Io(format!("no check log of kind `{other}`"))),
+    };
+    blocking(move || Ok(crate::milestones::read_log(&root, kind, &key))).await
+}
+
+/// The user accepts a proposal: cide applies it exactly (a plan, or files written and committed)
+/// and takes it out of the queue. Refused, untouched, when a file it changes has moved since.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn proposal_accept(
+    app: tauri::AppHandle,
+    project: ProjectId,
+    id: String,
+) -> Result<Option<cide_ipc::MilestonesView>> {
+    blocking(move || {
+        crate::proposals::accept(&app, project, &id).map_err(CoreError::Io)?;
+        Ok(crate::milestones::view(&app, project))
+    })
+    .await
+}
+
+/// The user rejects a proposal: it leaves the queue and nothing is changed.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn proposal_reject(
+    app: tauri::AppHandle,
+    project: ProjectId,
+    id: String,
+) -> Result<Option<cide_ipc::MilestonesView>> {
+    blocking(move || {
+        crate::proposals::reject(&app, project, &id).map_err(CoreError::Io)?;
+        Ok(crate::milestones::view(&app, project))
+    })
+    .await
 }

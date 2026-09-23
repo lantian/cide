@@ -60,10 +60,19 @@ export interface AgentsDigest {
   times: { drawn: string; title: string }[]
   /** How many Open controls exist **as elements**. A resting role must contribute zero. */
   opens: number
-  /** How many Dispatch buttons exist. */
-  dispatches: number
   /** How many Configure buttons exist. Must equal the number of role rows, in every story. */
   configures: number
+  /** Every button's accessible name — its `aria-label`, else its text. Icon-only controls
+      (Configure, Integrate) have no text, so `buttons` alone cannot see them. (M89) */
+  labels: string[]
+  /** The text of every `agentsUsing` line — what each run is on. (M89) */
+  using: string[]
+  /** The tabs as `tab|pressed|text`, and which tab panels carry `hidden`. (M89) */
+  tabs: string[]
+  hiddenPanels: string[]
+  /** Integrate's two halves, as the `data-run` of the row each sits in. (M89) */
+  integrates: string[]
+  integrateConfirms: string[]
   /** One entry per role row. See the header for why these are objects. */
   roles: AgentsRoleDigest[]
   /** Is the empty screen's centred block on screen, and what is inside it? */
@@ -114,7 +123,13 @@ export interface AgentsRoleDigest {
   opens: number
   /** Every button text inside this row, in document order. */
   buttons: string[]
-  /** The refusal sentence, or `''` when the row carries a Dispatch button instead. */
+  /** Every button's accessible name inside this row. See the top-level `labels`. */
+  labels: string[]
+  /** How many Configure controls are inside **this row**. Exactly one. */
+  configures: number
+  /** The role name's `title` — its id, and the description when there is one. (M89) */
+  nameTitle: string
+  /** The refusal sentence, or `''` when `canDispatch` says yes. */
   reason: string
   /**
    * The source chip's text, or `''` when the row draws none. (M30)
@@ -175,6 +190,9 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
     buttons: [...role.matchAll(/<button\b[^>]*>([\s\S]*?)<\/button>/g)].map((m) =>
       text(m[1] ?? ''),
     ),
+    labels: labels(role),
+    configures: count(role, 'data-audit="agentsConfigure"'),
+    nameTitle: attr(/<[a-z]+\b[^>]*data-audit="agentsRoleName"[^>]*>/.exec(role)?.[0] ?? '', 'title'),
     reason: text(/data-audit="agentsRoleReason"[^>]*>([^<]*)</.exec(role)?.[1] ?? ''),
     badge: text(/data-audit="agentsRoleBadge"[^>]*>([^<]*)</.exec(role)?.[1] ?? ''),
     badgeScope:
@@ -196,7 +214,16 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
     rows,
     times,
     opens: count(html, 'data-audit="agentsOpen"'),
-    dispatches: count(html, 'data-audit="agentsDispatch"'),
+    labels: labels(html),
+    using: all(html, 'agentsUsing').map((line) => text(line)),
+    tabs: all(html, 'agentsTab').map(
+      (tab) => `${attr(tab, 'data-tab')}|${attr(tab, 'aria-pressed')}|${text(tab)}`,
+    ),
+    hiddenPanels: [...html.matchAll(/<div\b[^>]*data-tab="([^"]*)"[^>]*>/g)]
+      .filter((m) => /\shidden(=""|\s|>|$)/.test(m[0]))
+      .map((m) => m[1] ?? ''),
+    integrates: rowsHolding(html, 'agentsIntegrate'),
+    integrateConfirms: rowsHolding(html, 'agentsIntegrateConfirm'),
     configures: count(html, 'data-audit="agentsConfigure"'),
     roles,
     empty: empty !== '',
@@ -219,7 +246,9 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
      * nowhere, so `glyphs` above — which reads names — passed a static spinner for a milestone
      * and a half. See `model.ts::SPINNING_GLYPH`.
      */
-    glyphSpins: [...html.matchAll(/<span[^>]*data-audit="agentsGlyph"[\s\S]*?<\/span>/g)].map(
+    /* The role's summary dot is read too (M89). It drew the spinner and never turned, and
+       nothing noticed, because this regex once matched `agentsGlyph` alone. */
+    glyphSpins: [...html.matchAll(/<span[^>]*data-audit="agents(?:Role)?Glyph"[\s\S]*?<\/span>/g)].map(
       (m) =>
         `${/data-icon="([^"]*)"/.exec(m[0])?.[1] ?? ''}|${/Spin/.test(m[0]) ? 'spin' : 'still'}`,
     ),
@@ -228,6 +257,20 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
 }
 
 /* -------------------------------------------------------------------- markup scratching */
+
+/** Each button's accessible name: `aria-label` when it has one, else its text. */
+function labels(html: string): string[] {
+  return [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].map(
+    (m) => /aria-label="([^"]*)"/.exec(m[1] ?? '')?.[1] ?? text(m[2] ?? ''),
+  )
+}
+
+/** The `data-run` of every run row that holds a control with this audit hook. */
+function rowsHolding(html: string, hook: string): string[] {
+  return all(html, 'agentsRow')
+    .filter((row) => row.includes(`data-audit="${hook}"`))
+    .map((row) => attr(row, 'data-run'))
+}
 
 /**
  * Every element carrying `data-audit="<hook>"`, as its own outer HTML.

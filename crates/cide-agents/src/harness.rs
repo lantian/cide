@@ -163,10 +163,9 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
      Before you start, comment your plan on the task, and commit each coherent step of \
      the work as you finish it: a run can die mid-turn, and the plan comment plus your branch's \
      commits are the only record of how far you got. If you notice something wrong that is \
-     not this task, do not fix it and do not let it go: open a task for it with \
-     {cide_task_create} saying what you saw and where, then carry on with yours — widening \
-     your own task makes a branch nobody can review, and a comment about it is read once and \
-     lost. \
+     not this task, do not fix it and do not let it go: file it with {cide_task_create} \
+     saying what you saw and where — it lands in the inbox, where whoever plans the work picks \
+     it up if it is needed — then carry on with yours. \
      When the work is done, set the task's status to review and comment what you did \
      and where; done is the reviewer's call, not yours.";
 
@@ -686,6 +685,16 @@ pub struct RunPlan<'a> {
     /// `claude` takes `auto` literally, and the CLIs with no classifier keep their promptless
     /// flag for it.
     pub unattended: crate::config::Unattended,
+    /// Whether cide's own paragraphs about the task tracker — [`TRACKER_PREAMBLE`], the
+    /// OpenSpec one and [`ADHOC_PREAMBLE`] — are told to this run. (M85)
+    ///
+    /// `false` for a run whose connection is served a *different* tool set: a merge-request
+    /// review is served the `cide_mr_*` tools and nothing of the tracker, so a paragraph
+    /// telling it to comment on its task names tools it cannot call — the failure
+    /// `TRACKER_PREAMBLE`'s header describes, reached by another road. The bridge itself stays
+    /// attached (it is `hook_bin`'s question, not this one); such a run's whole brief is its
+    /// role's own system prompt.
+    pub tracker_paragraphs: bool,
 }
 
 /// How the real harness is put back on a conversation, as `session_spawn` wants it. (M42)
@@ -895,6 +904,33 @@ impl FailoverReason {
             Self::RateLimited => "rate limited",
             Self::Unreachable => "unreachable",
             Self::Auth => "refused the credential",
+        }
+    }
+
+    /// The wire twin, for the pool-state card. (M90)
+    #[must_use]
+    pub fn wire(self) -> cide_ipc::PoolRefusal {
+        match self {
+            Self::RateLimited => cide_ipc::PoolRefusal::RateLimited,
+            Self::Unreachable => cide_ipc::PoolRefusal::Unreachable,
+            Self::Auth => cide_ipc::PoolRefusal::Auth,
+        }
+    }
+
+    /// How long one refusal benches its target for every run's admission. (M90)
+    ///
+    /// Short for an unreachable endpoint, because the commonest cause by far is a local server
+    /// nobody has started yet — once it is up, a long bench would keep steering work away from
+    /// the model the user put first. Longer for a rate limit, whose window is minutes by design,
+    /// and longest for a refused credential, which does not fix itself: somebody has to go and
+    /// renew it. The pool-state card's Reset ends any of them the moment the user knows better,
+    /// so these only have to be right when nobody is looking.
+    #[must_use]
+    pub fn bench_ms(self) -> u64 {
+        match self {
+            Self::Unreachable => 3 * 60 * 1000,
+            Self::RateLimited => 10 * 60 * 1000,
+            Self::Auth => 30 * 60 * 1000,
         }
     }
 }
@@ -1303,10 +1339,16 @@ mod tests {
         // branch nobody can review) or mentioning it in passing (a comment read once by the
         // reviewer and never again). Asserted because it is one sentence in a paragraph that
         // has a budget, and the budget is the pressure that would quietly delete it. (M79)
+        //
+        // And it is told the filing lands in the **inbox** (M83), because that is what makes it
+        // honest: before, "open a task" meant a `todo` the spinner then planned from, and a
+        // board of observations grew faster than it closed. The reason the M79 sentence gave for
+        // itself (widening your task makes a branch nobody can review) went to pay for this one.
         assert!(
             TRACKER_PREAMBLE.contains("not this task"),
             "{TRACKER_PREAMBLE}"
         );
+        assert!(TRACKER_PREAMBLE.contains("inbox"), "{TRACKER_PREAMBLE}");
 
         // Prepended to every turn of every run for ever. A budget rather than a measurement, so
         // that growing it is a deliberate edit to this line rather than a paragraph that crept.
@@ -1394,6 +1436,7 @@ mod tests {
                 // Off in the fixture, so every argv assertion below is about what the role
                 // and the plan actually said; the skip default has tests of its own.
                 unattended: crate::config::Unattended::Ask,
+                tracker_paragraphs: true,
             }
         }
 

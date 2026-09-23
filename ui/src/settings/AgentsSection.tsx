@@ -966,12 +966,35 @@ function AgentsEditor({ project }: { project: ProjectId }) {
               onChange={(next) => patchConfig({ finishInNewTab: next })}
             />
           )}
+          {config !== null && config.finishInNewTab && (
+            /*
+             * The reviewer's brief, per project (M84). A template rather than a sentence: the
+             * facts of the run being reviewed are filled in by `fill_review_prompt` in Rust, one
+             * pass, so a task title that happens to say `{branch}` stays text. `TextArea` for the
+             * spin prompt's reason below, and flattened by `AgentsConfig::apply` for its reason.
+             */
+            <TextArea
+              label="What to tell the reviewer"
+              hint={
+                'The first prompt for the review tab when a run on a task ends. Placeholders ' +
+                'are filled with the run\u2019s facts: {task_id}, {task_title}, {task} (id and ' +
+                'title), {branch}, {role} (the id dispatch and merge answer to), {agent} (its ' +
+                'label), {outcome} (how the turn ended) and {others} (other runs that ended at ' +
+                'the same moment). Leave it empty to use the one cide ships. A run with no task ' +
+                'still gets cide\u2019s own brief, since it has no task or branch to name. Line ' +
+                'breaks become spaces when it is saved.'
+              }
+              value={config.reviewPrompt}
+              placeholder="Use cide's own prompt"
+              onCommit={(next) => patchConfig({ reviewPrompt: next })}
+            />
+          )}
           {config !== null && (
             <ToggleRow
               label="Wake this project when it goes quiet"
               hint={
                 'With subagents on and tasks still open, if nothing has been running for the ' +
-                'period below, open a Claude in plan mode and ask it to check what was done ' +
+                'period below, open a Claude and ask it to check what was done ' +
                 'and put the next tasks on the roles. It never fires while a run is live, ' +
                 'while a Claude pane is working, or while agents are paused.'
               }
@@ -1035,18 +1058,6 @@ function AgentsEditor({ project }: { project: ProjectId }) {
                 value={config.autoSpinPrompt}
                 placeholder="Use cide's own prompt"
                 onCommit={(next) => patchConfig({ autoSpinPrompt: next })}
-              />
-              <ToggleRow
-                label="Accept its plan automatically"
-                hint={
-                  'Plan mode ends at an approval that a person would normally give, and there ' +
-                  'is nobody there. cide reads that prompt and answers it \u2014 for this one ' +
-                  'session, only when it recognises the plan question, and only the option that ' +
-                  'says yes. Any other prompt is left alone. Off, the tab waits at its plan ' +
-                  'with the pane marked and you approve it yourself.'
-                }
-                checked={config.autoSpinAcceptPlan}
-                onChange={(next) => patchConfig({ autoSpinAcceptPlan: next })}
               />
             </>
           )}
@@ -1758,12 +1769,17 @@ function RoleForm({
 
         <Field
           label="Description"
-          hint="One line, and it is prompt text as much as UI text: the orchestrator is handed it verbatim when it asks what agents it has. Empty is legal and warned about, never refused."
+          hint="Prompt text as much as UI text: the orchestrator is handed it verbatim when it asks what agents it has, and the Agents panel shows it when you hover the role. Saved as one line — line breaks become spaces. Empty is legal and warned about, never refused."
           errors={errorsFor('description')}
           control={
-            <input
-              className={styles.input}
-              type="text"
+            /* A textarea that wraps, not a one-line input (M89): a useful description is a
+               sentence or two, and an input scrolls it sideways so the author never sees the
+               whole of what the orchestrator will be told. It is still **one line on disk** —
+               `cide_agents::defs::normalize` folds a newline into a space, so Enter here is
+               harmless rather than refused. */
+            <textarea
+              className={styles.descArea}
+              rows={3}
               aria-label="Role description"
               placeholder="Implements one task end to end and reports back on it."
               value={draft.description}

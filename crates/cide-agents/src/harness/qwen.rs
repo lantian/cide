@@ -35,6 +35,10 @@
 //!
 //! # What ends a turn
 //!
+//! **Superseded (M86):** the TUI's dual mode never writes `result` — see [`TurnTracker`], which
+//! recovers the turn's end from `message_stop` and hands the tap [`TURN_OVER`] in its place. The
+//! paragraph below is what M43 expected, kept because the mapping it describes still reads it.
+//!
 //! A `result` event. Its emitter in the bundle carries `subtype`, `is_error`, `duration_ms`,
 //! `num_turns` and `usage` — claude's `-p` envelope — and the `session_start` event's
 //! `supported_events` lists it for the dual mode. **Unmeasured** on a completed turn (the
@@ -231,6 +235,117 @@ impl Event {
     }
 }
 
+/// The line [`TurnTracker`] hands the tap when a turn is over, for [`QwenHarness::observe`] to
+/// read exactly as it would read the CLI's own `result`. Marked `synthetic` so the post-mortem
+/// log, which gets it too, does not pass it off as something the child said.
+pub const TURN_OVER: &str = r#"{"type":"result","subtype":"turn_over","synthetic":true}"#;
+
+/// Where a turn ends, recovered from the stream the dual mode actually writes. (M86)
+///
+/// # Why this exists: the `result` the module header waited for never comes
+///
+/// Read out of the 0.24.4 bundle rather than remembered: the interactive UI's `DualOutputBridge`
+/// has `processEvent`, `startAssistantMessage`, `finalizeAssistantMessage`, `emitUserMessage`,
+/// `emitToolResult`, the permission pair and `emitSystemMessage` — and **no `emitResult`**. The
+/// `supported_events` list on `session_start` names `result` because the list is shared with
+/// `-p`'s adapter, not because the TUI emits one. So a qwen run went `Running` on its first
+/// line and stayed there for the life of the child: selfcraft's qa-tester on t-239 set its task
+/// to review, sat at its prompt, and held its slot and its worktree for over two hours with the
+/// board saying `Running`.
+///
+/// # What ends a turn instead
+///
+/// The adapter splits one API response into an `assistant` line per block type (thinking, then
+/// text, then the tool calls) and closes the response with a main-agent `stream_event` of
+/// `message_stop`. The tool-call line carries `stop_reason: "tool_use"`, the only value that
+/// field ever takes besides `null`. So a response is the last of its turn when its
+/// `message_stop` arrives and **no `tool_use` block was seen since its `message_start`**: a
+/// response that called tools is followed by those tools running and another response, one
+/// that did not is the model handing the turn back.
+///
+/// Why state, on a harness whose struct "holds nothing, and must not": the fact is spread over
+/// two lines, and at `message_stop` alone the two cases are byte-identical. The option that lost
+/// was mapping every `message_stop` to `Idle` and letting the next `user` tool-result line flip
+/// it back — which reads `Idle` for as long as every tool runs (a bot session is minutes), and
+/// `Idle` is the moment the orchestrator is nudged and the slot released. So the memory lives
+/// here, one per run, owned by the event tap that reads that run's lines in order, and
+/// [`QwenHarness`] stays a pure map.
+///
+/// A subagent's lines (`parent_tool_use_id` set) never end the parent's turn and never mark it
+/// as having called tools; the `task` call that started the subagent already did.
+///
+/// If a later CLI starts writing its own `result`, both arrive and the second is `Idle → Idle`,
+/// which `observe` answers with `None`.
+///
+/// What this cannot see: a turn the API fails mid-response, which the TUI reports and which
+/// writes no `message_stop`. That run stays `Running` as before, until a person types into it
+/// or it is stopped.
+#[derive(Debug, Default)]
+pub struct TurnTracker {
+    called_tools: bool,
+}
+
+impl TurnTracker {
+    /// Feed one line off the FIFO, in order. `Some(TURN_OVER)` when this line closed the turn.
+    pub fn feed(&mut self, line: &str) -> Option<&'static str> {
+        let event: TurnEvent = serde_json::from_str(line.trim()).ok()?;
+        if event.parent_tool_use_id.is_some() {
+            return None;
+        }
+        match (
+            event.kind.as_str(),
+            event.event.as_ref(),
+            event.message.as_ref(),
+        ) {
+            ("stream_event", Some(inner), _) if inner.kind == "message_start" => {
+                self.called_tools = false;
+                None
+            }
+            ("stream_event", Some(inner), _) if inner.kind == "message_stop" => {
+                let over = !self.called_tools;
+                self.called_tools = false;
+                over.then_some(TURN_OVER)
+            }
+            ("assistant", _, Some(message)) => {
+                if message.stop_reason.as_deref() == Some("tool_use")
+                    || message.content.iter().any(|block| block.kind == "tool_use")
+                {
+                    self.called_tools = true;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The fields of a line [`TurnTracker`] reads, and only those.
+#[derive(Debug, Deserialize)]
+struct TurnEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    parent_tool_use_id: Option<String>,
+    #[serde(default)]
+    event: Option<Kind>,
+    #[serde(default)]
+    message: Option<TurnMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Kind {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnMessage {
+    #[serde(default)]
+    content: Vec<Kind>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
 /// Build the child, fresh (`resume: false`) or continuing. One function so the two differ in
 /// exactly the identity tokens — `claude.rs::assemble`'s shape.
 fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessError> {
@@ -288,7 +403,9 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     // only when the tracker is attached, then the OpenSpec paragraph, then the ad-hoc one — the
     // same order and the same gate as `claude.rs`.
     cide_core::claude_cli::fold_append_system_prompt(&mut args, &plan.agent.def.system_prompt);
-    if tracker.is_some() {
+    // `plan.tracker_paragraphs` is off for a run served another tool set (M85): an MR review
+    // keeps its bridge but must not be told to use tools its connection does not list.
+    if tracker.is_some() && plan.tracker_paragraphs {
         cide_core::claude_cli::fold_append_system_prompt(
             &mut args,
             &tracker_preamble(&QwenHarness),
@@ -399,12 +516,14 @@ fn approval_mode(
         Some(other) => {
             return Err(refuse(format!("`permission-mode: {other}`")));
         }
-        // The project default. `auto` keeps `yolo`, which this default always gave a qwen
-        // run. qwen's own `auto` mode was never measured in a headless child, and an
-        // unmeasured mode is not something to switch every unattended run onto at once. A
-        // *role* that writes `auto` gets the literal mapping above.
+        // The project default, mapped literally like claude's. From M82 `auto` here kept
+        // `yolo`, on the grounds that qwen's own `auto` (its LLM classifier) had never been
+        // measured in a headless child — which meant a project that chose `auto` got a qwen
+        // run with no brake at all while the panel said otherwise. The CLI lists `auto` among
+        // `--approval-mode`'s choices (0.24.4); a project that wants no brake says `bypass`.
         None => match unattended {
-            Unattended::Auto | Unattended::Bypass => Some("yolo"),
+            Unattended::Auto => Some("auto"),
+            Unattended::Bypass => Some("yolo"),
             Unattended::Ask => None,
         },
     })
@@ -492,6 +611,7 @@ mod tests {
             choice: None,
             harness: agent.def.harness,
             unattended: Unattended::Ask,
+            tracker_paragraphs: true,
         }
     }
 
@@ -616,6 +736,11 @@ mod tests {
         let args = QwenHarness.spawn_spec(&plan).expect("spawnable").spec.args;
         assert_eq!(args[at(&args, "--approval-mode") + 1], "yolo");
 
+        // The project's `auto` is qwen's `auto`, not a quiet `yolo`.
+        plan.unattended = Unattended::Auto;
+        let args = QwenHarness.spawn_spec(&plan).expect("spawnable").spec.args;
+        assert_eq!(args[at(&args, "--approval-mode") + 1], "auto");
+
         let mut accepting = role();
         accepting.permission_mode = Some("acceptEdits".into());
         let plan = plan_for(&accepting, session);
@@ -712,6 +837,60 @@ mod tests {
         assert_eq!(
             h.observe(RunState::Finished { code: 0 }, Observation::Exit(0)),
             None
+        );
+    }
+
+    // A real 0.24.4 stream (selfcraft run 2ef83c0b, text and inputs blanked): one response
+    // per `message_start … message_stop`, an `assistant` line per block type inside it.
+    const MSG_START: &str = r#"{"type":"stream_event","uuid":"ad1e7773-bcc4-4e25-83e2-a5fb9de6a6b5","session_id":"9b56ae96-14d7-4843-b485-0ed44aa2efcb","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"a79cea68-2cf3-4f74-9628-5b5774d50478","role":"assistant","model":"qwen-36-27b-fp8","content":[]}}}"#;
+    const THINKING: &str = r#"{"type":"assistant","uuid":"a79cea68-2cf3-4f74-9628-5b5774d50478","session_id":"9b56ae96-14d7-4843-b485-0ed44aa2efcb","parent_tool_use_id":null,"message":{"id":"a79cea68-2cf3-4f74-9628-5b5774d50478","type":"message","role":"assistant","model":"qwen-36-27b-fp8","content":[{"type":"thinking","thinking":"x","signature":"x"}],"stop_reason":null,"usage":{"input_tokens":0,"output_tokens":0}}}"#;
+    const TEXT: &str = r#"{"type":"assistant","uuid":"0c41195f-871e-49ef-a357-8dd630c90970","session_id":"9b56ae96-14d7-4843-b485-0ed44aa2efcb","parent_tool_use_id":null,"message":{"id":"0c41195f-871e-49ef-a357-8dd630c90970","type":"message","role":"assistant","model":"qwen-36-27b-fp8","content":[{"type":"text","text":"x"}],"stop_reason":null,"usage":{"input_tokens":0,"output_tokens":0}}}"#;
+    const TOOL_USE: &str = r#"{"type":"assistant","uuid":"dfe3e9fb-e42a-4192-9cb7-5184b4607755","session_id":"9b56ae96-14d7-4843-b485-0ed44aa2efcb","parent_tool_use_id":null,"message":{"id":"dfe3e9fb-e42a-4192-9cb7-5184b4607755","type":"message","role":"assistant","model":"qwen-36-27b-fp8","content":[{"type":"tool_use","id":"call_d9aa212679744f77b6138611","name":"tool_search","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":24553,"output_tokens":114,"cache_read_input_tokens":0,"total_tokens":24667}}}"#;
+    const MSG_STOP: &str = r#"{"type":"stream_event","uuid":"e6cb30f9-31bc-42c5-9282-c55680b55c87","session_id":"9b56ae96-14d7-4843-b485-0ed44aa2efcb","parent_tool_use_id":null,"event":{"type":"message_stop"}}"#;
+
+    /// A response that called tools is not the end of the turn; the next one, which did not,
+    /// is — and the line handed back is one `observe` reads as `Idle`. A subagent's responses
+    /// say nothing about the parent's turn.
+    #[test]
+    fn a_turn_ends_at_the_first_response_that_called_no_tools() {
+        let mut t = TurnTracker::default();
+        for line in [SESSION_START, USER, MSG_START, THINKING, TEXT, TOOL_USE] {
+            assert_eq!(t.feed(line), None, "{line}");
+        }
+        assert_eq!(t.feed(MSG_STOP), None, "tools are about to run");
+        assert_eq!(t.feed(USER), None);
+
+        let sub = |line: &str| {
+            line.replace(
+                r#""parent_tool_use_id":null"#,
+                r#""parent_tool_use_id":"call-9""#,
+            )
+        };
+        assert_eq!(t.feed(MSG_START), None);
+        assert_eq!(t.feed(&sub(TOOL_USE)), None);
+        assert_eq!(
+            t.feed(&sub(MSG_STOP)),
+            None,
+            "a subagent's response ends nothing"
+        );
+        assert_eq!(t.feed(THINKING), None);
+        assert_eq!(t.feed(TEXT), None);
+        assert_eq!(
+            t.feed(MSG_STOP),
+            Some(TURN_OVER),
+            "the subagent's tool call did not taint the parent"
+        );
+
+        // A follow-up turn (a typed line, or a background job's notification) ends the same way.
+        assert_eq!(t.feed(USER), None);
+        assert_eq!(t.feed(MSG_START), None);
+        assert_eq!(t.feed(TEXT), None);
+        assert_eq!(t.feed(MSG_STOP), Some(TURN_OVER));
+        assert_eq!(t.feed("not json"), None);
+
+        assert_eq!(
+            QwenHarness.observe(RunState::Running, Observation::Line(TURN_OVER)),
+            Some(RunState::Idle)
         );
     }
 

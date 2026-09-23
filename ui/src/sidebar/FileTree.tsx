@@ -64,7 +64,7 @@ import { useTreeDrag, type TreeDragState } from './useTreeDrag'
 import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
 import { copyText } from './copyText'
 import { creationRefusal, isRootPath, mutationRefusal, relativeTo, rootOf } from './rowPaths'
-import { groupIcon, groupIdOf, isSyntheticPath, rowVerbs } from './groupRows'
+import { groupIcon, groupIdOf, isSyntheticPath, opensSyntheticSection, rowVerbs } from './groupRows'
 import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
 import { SCRATCH_TYPES } from '@/editor/languages'
 import { DEFAULT_DRAWING_SUFFIX } from '@/panes/excalidrawKinds'
@@ -2412,6 +2412,15 @@ export function FileTree({
                 selected={selection.paths.has(row.path)}
                 current={row.path === selected}
                 cut={isCutPending(clip, row.path)}
+                /*
+                 * The previous row off the same resident chunks the map already reads. When it
+                 * is not fetched the answer is `false` for that frame and the line is missing,
+                 * never misplaced; the chunk that brings it re-renders this map anyway.
+                 */
+                section={opensSyntheticSection(
+                  row.root,
+                  useFileTree.getState().rowAt(toReal(item.index) - 1)?.root,
+                )}
                 dragging={inFlight !== null && inDrag(inFlight, row.path)}
                 drop={mark === row.path && flight !== null ? flight.outcome.kind : undefined}
                 dropBand={
@@ -2819,6 +2828,11 @@ interface RowProps {
   /** On the clipboard for a **cut**: drawn faded, because it is about to move. */
   cut: boolean
   /**
+   * The first row cide adds under the project: drawn with a hairline above it, so *Project
+   * Notes* stops reading as a file in the repository. See `groupRows.opensSyntheticSection`.
+   */
+  section: boolean
+  /**
    * In flight: this row, or a folder above it, is being dragged. Drawn dimmed.
    *
    * The single most important signal in the gesture — without it a drag of four files looks
@@ -2862,6 +2876,7 @@ function Row({
   selected,
   current,
   cut,
+  section,
   dragging,
   drop,
   dropBand,
@@ -2912,13 +2927,15 @@ function Row({
   // a cut all at once, which is the ordinary case — Ctrl+X acts on the selection.
   const rowClass = [
     styles.row,
-    // A group header is a heading and reads like one; a note is a sentence and reads dim and
-    // italic, so neither can be mistaken for a file whose name happens to be a sentence.
-    row.kind === 'group' ? styles.rowGroup : null,
+    // A group header and a pin are cide's own rows and read one shade quieter than the user's
+    // files; a note is a sentence and reads dim and italic, so it cannot be mistaken for a file
+    // whose name happens to be a sentence.
+    row.kind === 'group' || row.kind === 'pin' ? styles.rowGroup : null,
     row.kind === 'note' ? styles.rowNote : null,
     selected ? styles.rowSelected : null,
     current ? styles.rowCurrent : null,
     cut ? styles.rowCut : null,
+    section ? styles.rowSection : null,
   ]
     .filter((name) => name !== undefined && name !== null)
     .join(' ')

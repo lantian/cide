@@ -691,12 +691,14 @@ dependencies = [
 name = "cide-agents"
 version = "0.9.1-dev"
 dependencies = [
+ "chrono",
  "cide-claude",
  "cide-core",
  "cide-ipc",
  "cide-pty",
  "libc",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "tracing",

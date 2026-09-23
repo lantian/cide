@@ -125,17 +125,144 @@ pub const MAX_SPIN_AFTER_SECS: u32 = 86_400;
 /// is how a project drifts confidently in the wrong direction. So it is told to read what
 /// happened first, say plainly whether it is going the right way, and only then decide what
 /// happens next.
+///
+/// **Close before you open** since M83. On a real board (`~/work/selfcraft`) the prompt's
+/// *create or re-scope* was read as *create*: 193 of 232 tasks were the planner's, and the board
+/// grew faster than it closed. So a step sits between the judgement and the plan — finish what
+/// is in review, send to the inbox what does not serve the active milestone — and the plan itself
+/// is aimed at the milestone's gate, drawing on the inbox before inventing work. The facts about
+/// the gate are appended by `cide_app::spinner::wake`, computed rather than asked for.
 pub const DEFAULT_SPIN_PROMPT: &str = "Nothing is running in this project and there is open \
      work on the board, and there is nobody at the keyboard — decide every question yourself \
      from what you can read, and do not end your turn by asking what to do. Before planning \
      anything, survey what has actually happened: read the \
      board with mcp__cide__cide_task_list, read the comments on the tasks in review or doing, \
-     and check git log and git status to see what landed. Then judge it — say plainly whether \
+     check git log and git status to see what landed, and if the project has milestones read \
+     them and their gate with mcp__cide__cide_milestones. Then judge it — say plainly whether \
      the work so far is going the way this project needs, and say so even if the answer is no. \
-     Only then plan what happens next: create or re-scope tasks with \
-     mcp__cide__cide_task_create and mcp__cide__cide_task_update, and put them on the roles \
-     mcp__cide__cide_agents_list knows about with mcp__cide__cide_task_assign, which is what \
-     starts them working.";
+     Then close before you open: merge or hand back what is in review, and move to the inbox \
+     (mcp__cide__cide_task_update, status inbox) any todo that does not move the active \
+     milestone. Only then plan what happens next — with milestones, only work that makes the \
+     active milestone's gate pass, as subtasks of its task, pulling from the inbox \
+     (mcp__cide__cide_task_list with status inbox and a query) before writing anything new; \
+     create or re-scope tasks with mcp__cide__cide_task_create and \
+     mcp__cide__cide_task_update, and put them on the roles mcp__cide__cide_agents_list knows \
+     about with mcp__cide__cide_task_assign, which is what starts them working.";
+
+/// What a reviewer tab is told when a subagent's turn on a task ends, when the project has not
+/// written its own. A **template**: `{name}` placeholders are filled by [`fill_review_prompt`]
+/// with the facts of the run being reviewed, and [`REVIEW_PLACEHOLDERS`] is every name it knows.
+///
+/// Per project because what "done and correct" means is the repository's — which checks to run,
+/// what the base branch is, how strict to be — and the user asked to edit it beside the switch
+/// that opens the tab. It lived in `cide_app::agent_rpc::review_prompt` as a `format!` until then;
+/// that function still carries the argument for every clause, and still owns the task-less case,
+/// which has no task, branch or role to fill a template with.
+///
+/// One line for [`DEFAULT_SPIN_PROMPT`]'s reason: it is typed into a terminal.
+pub const DEFAULT_REVIEW_PROMPT: &str = "A subagent just {outcome}: `{agent}`, on {task}. You \
+     own that task now — nobody else is reviewing it and the product owner has not been told, so \
+     it is yours to finish or to send back. **There is nobody at the keyboard and nobody will \
+     answer you**: decide every question yourself from what you can read, and never end your \
+     turn by asking what to do — a turn that ends in a question is a task nobody picks up. First \
+     find out what actually happened: read the task with mcp__cide__cide_task_get and read its \
+     comments, which are the only place the run reported; then diff the branch {branch} against \
+     the base to see what changed rather than what was claimed, and run whatever this repository \
+     uses to check itself. Then take one of exactly two actions. If the work is done and correct \
+     and did what the task asked rather than something adjacent: comment your verdict with \
+     mcp__cide__cide_task_comment, then **merge it yourself** with \
+     mcp__cide__cide_agent_integrate (agent `{role}`, task {task_id}) — accepting work means \
+     taking it into this branch, and leaving a merge for somebody to do later is the same as not \
+     accepting it — and only then set the task to done with mcp__cide__cide_task_update. If that \
+     merge reports conflicts it has changed nothing, and the task is not done: treat it as the \
+     other case below, naming the conflicting paths. If the merge does not happen for any other \
+     reason — an error, or the call itself denied by a permission check — the task is not done \
+     either: leave it in review, comment exactly what stopped the merge, and do not set it to \
+     done (cide refuses done while the branch is unmerged); review is where the user looks, and \
+     done is where nobody does. If it says there was nothing to merge, that \
+     is a normal answer and not a problem to report — the branch is already in, usually because \
+     an earlier review merged it — so check the work is present and close the task. If the work \
+     is not right: comment exactly what is wrong and what is still needed, set the task back to \
+     doing with mcp__cide__cide_task_update, and hand it back to the same role with \
+     mcp__cide__cide_agent_dispatch (agent `{role}`, task {task_id}) passing that same feedback \
+     as the instructions — do not fix it yourself, the role that built it has the context. One \
+     exception, and read the comments for it before you dispatch: if this task has already been \
+     sent back for the same reason, stop, say so plainly in a comment, leave it in review and do \
+     not dispatch again. When the project configures a verify command, \
+     mcp__cide__cide_agent_integrate runs it on the branch first and refuses a failing one, \
+     quoting the output: that refusal is the not-right case, with its feedback already written. \
+     Anything you notice that is wrong but is *not* this task — something the run broke \
+     elsewhere, a gap it revealed, work this one turns out to depend on — goes on the board as \
+     its own task with mcp__cide__cide_task_create and `inbox: true`, rather than into this \
+     task's verdict where it is read once and lost; the inbox is where noticed work waits until \
+     whoever plans decides it is needed.{others}";
+
+/// Every placeholder [`fill_review_prompt`] fills, with what it becomes. The Settings hint lists
+/// the same names; `every_placeholder_is_filled` holds the two ends of this table together.
+pub const REVIEW_PLACEHOLDERS: &[(&str, &str)] = &[
+    ("task_id", "the task's id, e.g. t-17"),
+    (
+        "task_title",
+        "the task's title, clipped; empty when it could not be read",
+    ),
+    (
+        "task",
+        "`task t-17 (its title)`, or `task t-17` without one",
+    ),
+    ("branch", "the run's branch, e.g. cide/developer-t-17"),
+    (
+        "role",
+        "the role's id, which is what dispatch and integrate answer to",
+    ),
+    ("agent", "the role's label, which is what a person reads"),
+    (
+        "outcome",
+        "how the turn ended: handed its turn back, finished (exit 0), failed",
+    ),
+    (
+        "others",
+        "a sentence about other turns that ended in the same moment, or nothing",
+    ),
+];
+
+/// Fill a review template. (M84)
+///
+/// **One pass, left to right, and a filled value is never scanned again.** The values are a task
+/// title any agent may write and a label out of a committed markdown file; a `str::replace` per
+/// placeholder would expand a title that says `{branch}` on the next replace, so text nobody in
+/// the project wrote would be choosing what the reviewer is told. An unknown `{name}` — a typo,
+/// or a brace that was never a placeholder — is left exactly as written, which is what somebody
+/// reading their own prompt back would expect and costs nothing.
+///
+/// The result is flattened to one line, for the terminal's reason, whatever the values held.
+#[must_use]
+pub fn fill_review_prompt(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len() + 128);
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let filled = after.find('}').and_then(|close| {
+            let name = &after[..close];
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value, close))
+        });
+        match filled {
+            Some((value, close)) => {
+                out.push_str(value);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// What [`AgentsConfig::permission_mode`] may say. Checked in order by nothing; listed for the
 /// sentence a bad value produces.
@@ -392,34 +519,10 @@ pub struct AgentsConfig {
     /// `claude` handed a lone Enter starts a turn about nothing and bills for it;
     /// [`Self::spin_prompt`] is the one reader that decides this.
     pub auto_spin_prompt: String,
-    /// Whether cide answers the spun run's `ExitPlanMode` with `allow`. (M79)
-    ///
-    /// The spun child is started `--permission-mode plan` so it surveys before it acts, and plan
-    /// mode ends at an approval a person is supposed to give. Nobody is there, so with this on
-    /// cide gives it.
-    ///
-    /// **It does so by reading the prompt and answering it, which is the thing
-    /// `AgentRegistry::stop` refuses to do — and the difference is that this one has read it.**
-    /// What that refusal is about is writing *blind*: a lone `\r` at a selection list is an
-    /// answer, so a graceful stop is never offered to a run in `AwaitingPermission` because it
-    /// would approve the tool call the stop meant to prevent. Here the prompt goes through
-    /// `cide_claude::permission::parse`, whose every rule is a reason to refuse, and then through
-    /// `cide_claude::plan::approval`, which recognises the plan prompt by its options and picks
-    /// the one that proceeds **by its words**. Four gates, and the first is that the session is
-    /// one cide spawned for this timer — never a pane, a run, or the console.
-    ///
-    /// The exact-looking alternative was a `PreToolUse` hook answering `allow` for
-    /// `ExitPlanMode`, and it was built and measured against 2.1.278: the prompt drew anyway,
-    /// because that tool carries its own `checkPermissions` returning `ask` and a
-    /// `requiresUserInteraction()` that answers `true`. `cide-hook`'s guard module carries the
-    /// finding where somebody would go looking for it.
-    ///
-    /// On by default **within** [`Self::auto_spin`], which is off by default. A project that
-    /// turned the spinner on asked for a loop that closes without a keystroke, and a spinner
-    /// that plans and then waits for a human is the loop not closing. Switching this off leaves
-    /// the tab sitting at its plan, the pane dot lit, which is a coherent way to want this
-    /// feature — a proposal per quiet period, approved by hand.
-    pub auto_spin_accept_plan: bool,
+    /// What a reviewer tab opened by [`Self::finish_in_new_tab`] is told. A template; see
+    /// [`DEFAULT_REVIEW_PROMPT`] and [`fill_review_prompt`]. Blank reads as the default, on
+    /// [`Self::auto_spin_prompt`]'s argument — [`Self::review_prompt_template`] decides it.
+    pub review_prompt: String,
 }
 
 impl Default for AgentsConfig {
@@ -448,9 +551,7 @@ impl Default for AgentsConfig {
             auto_spin: false,
             auto_spin_after_secs: DEFAULT_SPIN_AFTER_SECS,
             auto_spin_prompt: DEFAULT_SPIN_PROMPT.to_string(),
-            // On *within* a feature that is off: a spinner that waits for a human is the loop
-            // not closing, which is the thing the spinner exists to do.
-            auto_spin_accept_plan: true,
+            review_prompt: DEFAULT_REVIEW_PROMPT.to_string(),
         }
     }
 }
@@ -494,6 +595,17 @@ impl AgentsConfig {
             DEFAULT_SPIN_PROMPT
         } else {
             &self.auto_spin_prompt
+        }
+    }
+
+    /// The review template to fill, with the blank case decided once — [`Self::spin_prompt`]'s
+    /// rule, for its reason: an empty prompt is a billed turn about nothing.
+    #[must_use]
+    pub fn review_prompt_template(&self) -> &str {
+        if self.review_prompt.trim().is_empty() {
+            DEFAULT_REVIEW_PROMPT
+        } else {
+            &self.review_prompt
         }
     }
 
@@ -543,7 +655,8 @@ impl AgentsConfig {
             // the file left empty would make the next blur write it to disk, turning "use
             // whatever cide ships" into a frozen copy of this build's wording.
             auto_spin_prompt: self.auto_spin_prompt.clone(),
-            auto_spin_accept_plan: self.auto_spin_accept_plan,
+            // The stored string, for `auto_spin_prompt`'s reason above.
+            review_prompt: self.review_prompt.clone(),
         }
     }
 
@@ -590,8 +703,9 @@ impl AgentsConfig {
             // and a run that silently got one.
             self.auto_spin_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
         }
-        if let Some(accept) = patch.auto_spin_accept_plan {
-            self.auto_spin_accept_plan = accept;
+        if let Some(prompt) = patch.review_prompt {
+            // Flattened on the way in, `auto_spin_prompt`'s rule and reason.
+            self.review_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
         }
     }
 }
@@ -666,6 +780,66 @@ pub fn load_file(path: &Path) -> CideConfig {
             CideConfig::default()
         }
     }
+}
+
+/// A project's milestones: the `milestones` key of `.cide/config.json`. (M83)
+///
+/// Read **separately** from [`load`], and that is the point of it being its own function. `load`
+/// parses the whole file into [`CideConfig`] and discards all of it on any error — right for
+/// `agents`, where a half-understood config is worse than none, and wrong here: a typo in one
+/// milestone's gate would otherwise switch subagents off for the whole project with nothing but a
+/// log line to say why. [`CideConfig`] does not carry this key at all, so [`write`] (which merges
+/// into the existing document) leaves it exactly as it found it and [`write_milestones`] is its
+/// one writer.
+pub fn load_milestones(project_root: &Path) -> cide_ipc::MilestonePlan {
+    let path = config_path(project_root);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return cide_ipc::MilestonePlan::default();
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return cide_ipc::MilestonePlan::default();
+    };
+    match doc.get("milestones") {
+        None | Some(Value::Null) => cide_ipc::MilestonePlan::default(),
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(plan) => plan,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %err,
+                    "the milestones in .cide/config.json could not be read; this project has none \
+                     until they are fixed"
+                );
+                cide_ipc::MilestonePlan::default()
+            }
+        },
+    }
+}
+
+/// Replace the `milestones` key, leaving every other key as it was. (M83)
+///
+/// Whole-value, not a merge: the list is ordered and an item removed in Settings must go, which
+/// is the decision [`merge_object`]'s doc defers to whoever first puts an array in this file.
+/// An empty plan removes the key rather than writing `{"items": []}` into a committed file.
+pub fn write_milestones(project_root: &Path, plan: &cide_ipc::MilestonePlan) -> io::Result<()> {
+    let path = config_path(project_root);
+    let mut doc = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({ "version": SCHEMA_VERSION }));
+    let map = doc.as_object_mut().expect("filtered to an object above");
+    if plan.is_empty() && plan.verify.trim().is_empty() && plan.guard_paths.is_empty() {
+        map.remove("milestones");
+    } else {
+        map.insert(
+            "milestones".to_string(),
+            serde_json::to_value(plan).map_err(io::Error::other)?,
+        );
+    }
+    let mut body = serde_json::to_vec_pretty(&doc).map_err(io::Error::other)?;
+    body.push(b'\n');
+    write_0644(&path, &body)
 }
 
 /// Write a project's config, creating `.cide/` if it is not there.
@@ -958,6 +1132,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Milestones are their own key with their own reader and writer. (M83) A broken milestone
+    /// costs the milestones and nothing else; a save of `agents` leaves them alone; and an empty
+    /// plan takes the key out of the committed file rather than leaving `{"items": []}` behind.
+    #[test]
+    fn milestones_are_read_and_written_beside_agents_without_touching_them() {
+        let root = temp("milestones");
+        put(
+            &root,
+            r#"{ "version": 1, "agents": { "enabled": true },
+                "milestones": { "items": [ { "id": "slice", "gate": 42 } ] } }"#,
+        );
+        assert!(
+            load(&root).agents.enabled,
+            "a bad gate does not switch subagents off"
+        );
+        assert!(
+            load_milestones(&root).is_empty(),
+            "it costs the milestones instead"
+        );
+
+        let plan = cide_ipc::MilestonePlan {
+            items: vec![cide_ipc::Milestone {
+                id: "slice".into(),
+                title: "The slice".into(),
+                gate: "tools/ci/milestone.sh slice".into(),
+                ..Default::default()
+            }],
+            verify: "tools/dev/check.sh".into(),
+            ..Default::default()
+        };
+        write_milestones(&root, &plan).expect("write");
+        assert_eq!(load_milestones(&root), plan);
+
+        let mut config = load(&root);
+        config.agents.apply(cide_ipc::OrchestrationPatch {
+            max_concurrent: Some(4),
+            ..Default::default()
+        });
+        write(&root, &config).expect("write agents");
+        assert_eq!(
+            load_milestones(&root),
+            plan,
+            "saving agents leaves milestones as they were"
+        );
+
+        write_milestones(&root, &cide_ipc::MilestonePlan::default()).expect("clear");
+        // The key, not the word: the spin prompt that `write` stores beside it says "milestones"
+        // itself, and a grep would be matching cide's own prose (CLAUDE.md's self-match trap).
+        let doc: Value = serde_json::from_slice(&std::fs::read(config_path(&root)).expect("read"))
+            .expect("json");
+        assert!(doc.get("milestones").is_none(), "{doc}");
+        assert!(load(&root).agents.enabled);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The file is not cide's to own outright. A key from a newer version, and a hand-edited
     /// field the panel cannot draw, both survive a save.
     #[test]
@@ -1061,7 +1291,6 @@ mod tests {
             "an upgrade started a billed process on a timer"
         );
         assert_eq!(agents.auto_spin_after_secs, DEFAULT_SPIN_AFTER_SECS);
-        assert!(agents.auto_spin_accept_plan);
         // Blank on disk is the shipped prompt, decided in one place.
         assert_eq!(agents.spin_prompt(), DEFAULT_SPIN_PROMPT);
 
@@ -1112,6 +1341,59 @@ mod tests {
             ..AgentsConfig::default()
         };
         assert_eq!(config.spin_prompt(), "look at the board");
+    }
+
+    /// The review template follows the same blank rule, and a patch flattens it on the way in.
+    #[test]
+    fn a_blank_review_prompt_is_the_shipped_one() {
+        for blank in ["", "   ", "\n  \n"] {
+            let config = AgentsConfig {
+                review_prompt: blank.into(),
+                ..AgentsConfig::default()
+            };
+            assert_eq!(config.review_prompt_template(), DEFAULT_REVIEW_PROMPT);
+        }
+        let mut config = AgentsConfig::default();
+        config.apply(OrchestrationPatch {
+            review_prompt: Some("check {task_id}\non\r\n{branch}".into()),
+            ..Default::default()
+        });
+        assert_eq!(config.review_prompt, "check {task_id} on {branch}");
+        assert_eq!(
+            config.to_wire().review_prompt,
+            "check {task_id} on {branch}"
+        );
+    }
+
+    /// **A filled value is never scanned again.** A task title that says `{branch}` is text
+    /// somebody wrote into a tracker, and it must reach the reviewer as that text rather than
+    /// choose what the reviewer is told. Unknown names and stray braces survive as written.
+    #[test]
+    fn a_placeholder_in_a_value_is_not_expanded() {
+        let filled = fill_review_prompt(
+            "on {task} diff {branch} {nope} {unclosed",
+            &[("task", "task t-1 ({branch})"), ("branch", "cide/dev-t-1")],
+        );
+        assert_eq!(
+            filled,
+            "on task t-1 ({branch}) diff cide/dev-t-1 {nope} {unclosed"
+        );
+        assert_eq!(
+            fill_review_prompt("a\n{x}\r\nb", &[("x", "1\n2")]),
+            "a 1 2 b"
+        );
+    }
+
+    /// Every placeholder the default uses is one [`REVIEW_PLACEHOLDERS`] documents, so the
+    /// Settings hint cannot fall behind the prompt cide actually ships.
+    #[test]
+    fn every_placeholder_is_filled() {
+        let values: Vec<(&str, &str)> = REVIEW_PLACEHOLDERS
+            .iter()
+            .map(|(name, _)| (*name, "X"))
+            .collect();
+        let filled = fill_review_prompt(DEFAULT_REVIEW_PROMPT, &values);
+        assert!(!filled.contains('{'), "an unfilled placeholder: {filled}");
     }
 
     /// **The stored prompt can never hold a newline**, because a newline is a second Enter.
@@ -1167,7 +1449,7 @@ mod tests {
             auto_spin: true,
             auto_spin_after_secs: 120,
             auto_spin_prompt: "have a look".into(),
-            auto_spin_accept_plan: false,
+            review_prompt: "review {task_id}".into(),
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
         assert_eq!(config.max_concurrent, 5);

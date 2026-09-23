@@ -655,6 +655,12 @@ interface WorkspaceStore {
    */
   closeProject: (id: ProjectId, force?: boolean) => Promise<void>
   newClaudeTab: (project: ProjectId) => Promise<TabId>
+  /**
+   * A new tab whose one pane shows an existing run (`mirror`/`continue`). (M85) The spawn plan
+   * is recorded before the snapshot that renders the pane — `addRow`'s ordering — so the pane
+   * mirrors the run's child instead of starting a fresh `claude`.
+   */
+  newRunTab: (project: ProjectId, title: string, intent: SplitIntent) => Promise<SplitOutcome>
   activateTab: (project: ProjectId, tab: TabId) => Promise<void>
   /**
    * Close a tab, confirming first if that would lose something.
@@ -969,6 +975,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   },
   newClaudeTab: async (project) => {
     const created = await tabApi.newClaude(project)
+    await synced()
+    return created
+  },
+  newRunTab: async (project, title, intent) => {
+    const created = await tabApi.newRun(project, title, intent)
+    if (created.intent.kind === 'forkPrimary' || created.intent.kind === 'mirror') {
+      rememberSpawnPlan(created.pane, created.intent)
+    }
     await synced()
     return created
   },

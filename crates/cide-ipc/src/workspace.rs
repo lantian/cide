@@ -1009,7 +1009,9 @@ pub enum DiffOrigin {
     /// pending future. See `cide-ide-mcp::diff_broker`.
     ClaudeMcp { request_id: String },
     /// A GitLab review document, hosted by the ordinary workspace tab strip.
-    GitLab { document: crate::gitlab::GitLabDocument },
+    GitLab {
+        document: crate::gitlab::GitLabDocument,
+    },
 }
 
 /// How the user answered a diff that Claude Code is blocked on.

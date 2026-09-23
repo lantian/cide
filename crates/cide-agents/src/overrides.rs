@@ -50,6 +50,19 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// How many runs of this role can be live at once, as far as the role and its pool say:
+    /// its `max-concurrent`, capped by the sum of its pool's running limits when every entry has
+    /// one. The project's `maxConcurrent` is the third cap and is applied by [`capacity`], which
+    /// sees every role at once.
+    #[must_use]
+    pub fn at_once(&self) -> u32 {
+        let own = u32::from(self.max_concurrent.max(1));
+        match cide_ipc::pool_capacity(&self.pool) {
+            Some(pool) => own.min(pool),
+            None => own,
+        }
+    }
+
     /// The candidate a run starts on, or `None` for a run with no pool.
     #[must_use]
     pub fn first_choice(&self) -> Option<PoolChoice> {
@@ -313,18 +326,31 @@ pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSetti
                 // blank half would spell `--model provider/` on the argv. They are *kept* in
                 // settings — see `LlmSettings::cleaned` — and filtered here, where the value
                 // is used.
+                //
+                // So are entries whose provider is configured and **switched off** (M90). The
+                // Models screen strikes those rows through, and `provider_members` leaves a
+                // disabled provider out of the document opencode is given — so a run placed on
+                // one was a run sent to a model with no credentials, which failed over one wasted
+                // turn later and made the pool look as if it started lower down than the user
+                // arranged. A provider cide has no row for at all is *kept*: it may be one of the
+                // CLI's own logins, which cide writes nothing for and cannot see.
                 pool = found
                     .entries
                     .iter()
                     .filter(|entry| !entry.provider.is_empty() && !entry.model.is_empty())
+                    .filter(|entry| {
+                        llm.provider(&entry.provider)
+                            .is_none_or(cide_ipc::LlmProvider::enabled)
+                    })
                     .cloned()
                     .collect();
                 pool_name = Some(found.name.clone());
                 if pool.is_empty() {
                     refusal = Some(format!(
-                        "The pool “{named}” has no complete entry — every row is missing a \
-                             provider or a model. Finish it on the Models screen in \
-                             Settings, or clear this role's pool override."
+                        "The pool “{named}” has no usable entry — every row is missing a \
+                             provider or a model, or names a provider that is switched off. \
+                             Fix it on the Models screen in Settings, or clear this role's \
+                             pool override."
                     ));
                 }
             }
@@ -376,6 +402,44 @@ pub fn inert_pool(agent: &LoadedAgent, overrides: &ProjectOverrides) -> bool {
     over.pool.as_deref().is_some_and(|name| !name.is_empty()) && !harness.reads_provider_document()
 }
 
+/// How many runs this project can have live at once, all three caps applied: each role's
+/// `max-concurrent`, each pool's summed running limits (shared by every role on that pool), and
+/// the project's `maxConcurrent`. The number an orchestrator is told, so that "fan out" means
+/// fanning out to what will actually start rather than to a queue.
+///
+/// A role that cannot run (`refusal`) counts for nothing. A pool's limit is counted once however
+/// many roles share it, since they share its entries. **Machine-wide** runs on the same pool from
+/// another project are not subtracted: this is what the project can hold, not what is free now —
+/// the roster's pool line says what is in use.
+#[must_use]
+pub fn capacity<'a>(roles: impl IntoIterator<Item = &'a Resolved>, project_max: u16) -> u32 {
+    let mut unpooled = 0u32;
+    // Per limited pool: its capacity, and the roles' own caps that draw on it.
+    let mut pools: Vec<(&str, u32, u32)> = Vec::new();
+    for role in roles {
+        if role.refusal.is_some() {
+            continue;
+        }
+        let own = u32::from(role.max_concurrent.max(1));
+        match (
+            role.pool_name.as_deref(),
+            cide_ipc::pool_capacity(&role.pool),
+        ) {
+            (Some(name), Some(limit)) => match pools.iter_mut().find(|(n, _, _)| *n == name) {
+                Some((_, _, drawn)) => *drawn = drawn.saturating_add(own),
+                None => pools.push((name, limit, own)),
+            },
+            _ => unpooled = unpooled.saturating_add(own),
+        }
+    }
+    let pooled = pools.iter().fold(0u32, |sum, (_, limit, drawn)| {
+        sum.saturating_add(*limit.min(drawn))
+    });
+    unpooled
+        .saturating_add(pooled)
+        .min(u32::from(project_max.max(1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +475,7 @@ mod tests {
             provider: provider.into(),
             model: model.into(),
             variant: String::new(),
+            max_running: None,
         }
     }
 
@@ -587,6 +652,44 @@ mod tests {
         );
         assert_eq!(out.pool.len(), 1);
         assert_eq!(out.pool[0].model_flag(), "openrouter/a");
+        assert!(out.refusal.is_none());
+    }
+
+    /// A switched-off provider's entries are not candidates (M90): opencode is given no document
+    /// for it, so a run placed there was a turn spent failing over. A provider cide has no row
+    /// for at all is kept — it may be one of the CLI's own logins.
+    #[test]
+    fn an_entry_on_a_disabled_provider_is_not_a_candidate() {
+        let agent = role(AgentScope::Project, Harness::Opencode);
+        let mut llm = settings(vec![
+            entry("vllm", "local"),
+            entry("cli-login", "m"),
+            entry("openrouter", "a"),
+        ]);
+        llm.providers = vec![
+            cide_ipc::LlmProvider::Catalog {
+                id: "vllm".into(),
+                label: String::new(),
+                enabled: false,
+                api_key: String::new(),
+            },
+            cide_ipc::LlmProvider::Catalog {
+                id: "openrouter".into(),
+                label: String::new(),
+                enabled: true,
+                api_key: String::new(),
+            },
+        ];
+        let out = resolve(
+            &agent,
+            &with(AgentOverride {
+                pool: Some("cheap-first".into()),
+                ..Default::default()
+            }),
+            &llm,
+        );
+        let flags: Vec<String> = out.pool.iter().map(PoolEntry::model_flag).collect();
+        assert_eq!(flags, vec!["cli-login/m", "openrouter/a"]);
         assert!(out.refusal.is_none());
     }
 
@@ -1020,5 +1123,60 @@ mod tests {
                 "{over:?}"
             );
         }
+    }
+
+    fn resolved(max_concurrent: u16, pool: Option<(&str, &[Option<u16>])>) -> Resolved {
+        let (pool_name, pool) = match pool {
+            Some((name, limits)) => (
+                Some(name.to_string()),
+                limits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &max_running)| PoolEntry {
+                        max_running,
+                        ..entry("p", &format!("m{i}"))
+                    })
+                    .collect(),
+            ),
+            None => (None, Vec::new()),
+        };
+        Resolved {
+            harness: Harness::Opencode,
+            pool,
+            pool_name,
+            model: None,
+            effort: None,
+            max_concurrent,
+            permission_mode: None,
+            refusal: None,
+        }
+    }
+
+    #[test]
+    fn a_roles_at_once_is_its_own_cap_under_its_pools() {
+        assert_eq!(resolved(3, None).at_once(), 3);
+        assert_eq!(resolved(8, Some(("p", &[Some(4), Some(2)]))).at_once(), 6);
+        assert_eq!(resolved(1, Some(("p", &[Some(4), Some(2)]))).at_once(), 1);
+        // One unlimited entry: the pool caps nothing.
+        assert_eq!(resolved(8, Some(("p", &[Some(4), None]))).at_once(), 8);
+    }
+
+    /// All three caps, and a pool shared by two roles counted once.
+    #[test]
+    fn the_projects_capacity_applies_every_cap_once() {
+        let pool: &[Option<u16>] = &[Some(4), Some(2)];
+        // Two roles on one pool of 6: they draw 5 + 5 but the pool holds 6; plus 2 unpooled.
+        let roles = [
+            resolved(5, Some(("fast", pool))),
+            resolved(5, Some(("fast", pool))),
+            resolved(2, None),
+        ];
+        assert_eq!(capacity(&roles, 100), 8);
+        assert_eq!(capacity(&roles, 3), 3, "the project's cap is the last word");
+
+        // A role that cannot run holds nothing.
+        let mut refused = resolved(4, None);
+        refused.refusal = Some("no such pool".into());
+        assert_eq!(capacity([&refused, &roles[2]], 100), 2);
     }
 }

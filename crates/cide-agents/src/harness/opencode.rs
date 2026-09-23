@@ -186,7 +186,7 @@ use cide_ipc::HarnessSession;
 use super::RenderState;
 use super::render::{
     BOLD, CYAN, DIM, RED, RESET, TITLE_BUDGET, absorbs, clip, compact_input, compose, measured_ms,
-    one_line_of, prose, tail, thought_line, thousands,
+    one_line_of, prose, stamp, tail, thought_line, thousands,
 };
 
 // Named from here since M42 — `SpawnSpec::fixed_size`'s reason is in `render.rs` now, and
@@ -1416,6 +1416,10 @@ pub fn keep_event(line: &str) -> bool {
 ///   prose (a warning, a rejected permission) and hiding it would hide the failure. Under a live
 ///   marker it is re-emitted beneath the erase instead, so the marker's row accounting holds.
 ///
+/// Every row an event draws opens with a dim `[YYYY-MM-DD HH:MM:SS]` — when the call or the
+/// thought began, in local time (see [`stamp_of`]). The live marker and the CLI's own prose get
+/// none: the marker is not an event, and the prose is kept byte for byte.
+///
 /// Styling is bare SGR (dim/bold/cyan/red), which every theme already maps; no colour is load-
 /// bearing. The handle token is plain text on purpose: an OSC 8 hyperlink is dropped by the
 /// mirror's replay, and a run is mostly read *after* the fact.
@@ -1479,7 +1483,35 @@ pub fn render_event(state: &mut RenderState, line: &str, handle: Option<u64>) ->
         }
         other => Some(format!("{DIM}· {other}{RESET}")),
     };
+    // Every row the event draws opens with when it happened (`render::stamp`) — asked for so a
+    // reader can tell a run that thought for a minute from one that sat for an hour, which the
+    // durations alone cannot say because they measure the call, not the gap before it.
+    let text = text.map(|text| match stamp_of(state, &event, part) {
+        Some(stamp) => format!("{stamp}{text}"),
+        None => text,
+    });
     compose(state, text)
+}
+
+/// The time a row is stamped with: when the call or the thought **began**, where opencode says.
+///
+/// A `tool_use` and a `reasoning` are emitted once, on completion, so the envelope's `timestamp`
+/// is when they *ended* — a two-minute build would be stamped two minutes after it was started,
+/// under a row that reads as its start. The part's own `time.start` is the moment a person means
+/// by "when did it call that". Past that, the envelope's `timestamp` (every line the shipped
+/// emitter prints carries one), and past that the moment the line reached cide, so a release
+/// that stops stamping its events still gets a clock rather than none.
+fn stamp_of(
+    state: &RenderState,
+    event: &serde_json::Map<String, Value>,
+    part: &Value,
+) -> Option<String> {
+    part.pointer("/state/time/start")
+        .or_else(|| part.pointer("/time/start"))
+        .and_then(Value::as_u64)
+        .or_else(|| event.get("timestamp").and_then(Value::as_u64))
+        .or(state.now_unix_ms)
+        .and_then(stamp)
 }
 
 /// A tool call on one line: the glyph, the tool, the CLI's own title, the duration, the handle.
@@ -1804,7 +1836,8 @@ fn config_json(flavor: &Flavor, plan: &RunPlan<'_>) -> Option<String> {
     // tools that were never attached. See `TRACKER_PREAMBLE`'s header.
     role.insert(
         "prompt".into(),
-        json!(match plan.hook_bin.is_some() {
+        // `&& tracker_paragraphs`: an MR review keeps the bridge and hears none of this (M85).
+        json!(match plan.hook_bin.is_some() && plan.tracker_paragraphs {
             true => {
                 // Three paragraphs at most, in the same order and with the same `\n\n` join the
                 // claude side's fold produces — so one role pointed at either CLI reads the same
@@ -1968,6 +2001,7 @@ mod tests {
             // Off in the fixture, so every argv assertion below is about what the role
             // and the plan actually said; the skip default has tests of its own.
             unattended: Unattended::Ask,
+            tracker_paragraphs: true,
         }
     }
 
@@ -2176,6 +2210,27 @@ mod tests {
             rendered.contains("∴ thought") && rendered.contains("#3") && !rendered.contains("ms"),
             "{rendered}"
         );
+
+        // A row opens with when it began: the part's own `time.start`, then the envelope's
+        // `timestamp`. Fixtures stamped `1000` or `1` are not clocks and draw no stamp, which is
+        // what keeps every assertion above about a row's *start* honest.
+        let stamped = r#"{"type":"tool_use","timestamp":1790000060000,"sessionID":"s","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls"},"output":"","title":"ls","time":{"start":1790000000000,"end":1790000060000}}}}"#;
+        let rendered = render_event(&mut RenderState::default(), stamped, Some(4))
+            .text()
+            .expect("rendered")
+            .to_string();
+        let expected = super::super::render::stamp(1_790_000_000_000).expect("a clock");
+        assert!(
+            rendered.starts_with(&format!("{expected}{CYAN}{BOLD}● bash")),
+            "the stamp is the call's start, ahead of the glyph: {rendered:?}"
+        );
+        let envelope = r#"{"type":"text","timestamp":1790000060000,"sessionID":"s","part":{"type":"text","text":"done"}}"#;
+        let rendered = render_event(&mut RenderState::default(), envelope, None)
+            .text()
+            .expect("rendered")
+            .to_string();
+        let expected = super::super::render::stamp(1_790_000_060_000).expect("a clock");
+        assert_eq!(rendered, format!("{expected}done"));
 
         // A failure the CLI reports at the top level — no `part` at all — names itself.
         let error = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"ProviderAuthError"}}"#;
@@ -3145,6 +3200,7 @@ notamodel
                 provider: "openrouter".into(),
                 model: "deepseek/deepseek-chat".into(),
                 variant: String::new(),
+                max_running: None,
             },
         });
         let spawn = spawn(&plan);
@@ -3171,6 +3227,7 @@ notamodel
             provider: "openai".into(),
             model: "gpt-5.1-codex-mini".into(),
             variant: "medium".into(),
+            max_running: None,
         };
         plan.choice = Some(cide_ipc::PoolChoice {
             pool: "p".into(),
@@ -3620,6 +3677,7 @@ notamodel
                 provider: "xiaomi".into(),
                 model: "mimo-v2.6-flash".into(),
                 variant: String::new(),
+                max_running: None,
             },
         };
         let mimo_config = |choice: Option<cide_ipc::PoolChoice>| {

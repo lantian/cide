@@ -1,4 +1,5 @@
 import { CommentBox, Thread } from './Discussions'
+import { DraftCard, draftAnchor, draftOn } from './Drafts'
 import { wholeFileSegments } from '@/panes/diffRows'
 import {
   useEffect,
@@ -67,6 +68,22 @@ export function ReviewDiff({
     }
     return map
   }, [review?.discussions, key])
+  // Local drafts on this exact diff, keyed like `threads`. (M85) A draft written against an
+  // older MR version is not drawn here — its line may mean something else now — and stays in
+  // the Drafts list marked outdated.
+  const pending = useMemo(() => {
+    const map = new Map<string, NonNullable<typeof review>['drafts']>()
+    for (const draft of review?.drafts ?? []) {
+      const anchor = draftAnchor(draft)
+      if (
+        !anchor ||
+        !draftOn(draft, doc.path, doc.refs.base_sha, doc.refs.head_sha)
+      )
+        continue
+      map.set(anchor, [...(map.get(anchor) ?? []), draft])
+    }
+    return map
+  }, [review?.drafts, key])
   useEffect(() => {
     if (!diff) return
     const segments = wholeFileSegments(diff.hunks, diff.newText)
@@ -77,7 +94,9 @@ export function ReviewDiff({
           segment.lines.some(
             (row) =>
               threads.has(`old:${row.oldLineno}`) ||
-              threads.has(`new:${row.newLineno}`),
+              threads.has(`new:${row.newLineno}`) ||
+              pending.has(`old:${row.oldLineno}`) ||
+              pending.has(`new:${row.newLineno}`),
           ),
       ) ?? []
     if (needed.length)
@@ -90,7 +109,7 @@ export function ReviewDiff({
             ),
           ]),
       )
-  }, [diff, threads])
+  }, [diff, threads, pending])
   useEffect(() => {
     let alive = true
     setDiff(null)
@@ -199,11 +218,20 @@ export function ReviewDiff({
             ...(side !== 'old' ? [`new:${newLine}`] : []),
           ]
           const anchored = keys.flatMap((key) => threads.get(key) ?? [])
+          const drafted = keys.flatMap((key) => pending.get(key) ?? [])
           const compose =
             position && line && keys.includes(`${line.side}:${line.line}`)
-          if (!anchored.length && !compose) return null
+          if (!anchored.length && !drafted.length && !compose) return null
           return (
             <div className={styles.inlineThreads}>
+              {drafted.map((draft) => (
+                <DraftCard
+                  key={draft.id}
+                  review={doc.review}
+                  draft={draft}
+                  inline
+                />
+              ))}
               {anchored.map((thread) => (
                 <Thread
                   key={thread.id}

@@ -81,7 +81,7 @@ export function attachRunLinks(
         text: text.slice(start, end),
         activate,
       })
-      callback([link(0, parsed.toolEnd), link(parsed.tokenStart, parsed.end)])
+      callback([link(parsed.toolStart, parsed.toolEnd), link(parsed.tokenStart, parsed.end)])
     },
   }
 

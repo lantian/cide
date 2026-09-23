@@ -38,8 +38,6 @@
 //! for Ctrl+Shift+T, which at one tab per finished run is a `claude` leaked per run. Every tab
 //! this module opens is marked, and `cmd::project::tab_close` ends a marked tab's children.
 
-use std::time::{Duration, Instant};
-
 use cide_core::CoreError;
 use cide_ipc::{Geometry, Pane, PaneId, PaneKind, PaneRole, ProjectId, SessionId, TabId, TabKind};
 use tauri::Manager;
@@ -48,7 +46,7 @@ use crate::workspace_state::WorkspaceState;
 
 /// Which permission mode the new child runs under.
 ///
-/// **Both arms are unattended**, which is the fact that shapes them. These tabs are opened by
+/// **Both tabs are unattended**, which is the fact that shapes this. These tabs are opened by
 /// cide, not by a person reaching for one, and they are opened *because* nobody is watching: one
 /// when a subagent finishes while the product owner is elsewhere, one when the whole project has
 /// been quiet for a quarter of an hour. A prompt either of them raises is a prompt nobody
@@ -56,12 +54,9 @@ use crate::workspace_state::WorkspaceState;
 /// `AgentsConfig::permission_mode` was written for, measured on dispatched runs and no less
 /// true here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TabMode {
-    /// Gets to work immediately.
-    ///
-    /// `unattended` is the project's own `AgentsConfig::unattended`, spelled the way
-    /// `harness::claude` spells it for a dispatched run: one stance for every unattended child
-    /// cide starts, set in one place.
+pub(crate) struct TabMode {
+    /// The project's own `AgentsConfig::unattended`, spelled the way `harness::claude` spells it
+    /// for a dispatched run: one stance for every unattended child cide starts, set in one place.
     ///
     /// # The difference from a dispatched run, stated
     ///
@@ -72,15 +67,26 @@ pub(crate) enum TabMode {
     /// to hand the task back to the role that has the context. That last part is a brief rather
     /// than a mechanism, which is why this follows the project's setting rather than forcing the
     /// stance: a project whose `permissionMode` is `manual` gets a reviewer that asks, and a tab
-    /// that asks is at least visible.
-    Direct { unattended: cide_agents::Unattended },
-    /// `--permission-mode plan`, so the child surveys before it acts.
+    /// that asks is at least visible. The spinner's planner stands in the project root and has
+    /// no containment but its brief, on the same argument.
     ///
-    /// `accept` starts [`watch_for_plan`] on this session, which answers the approval that plan
-    /// mode ends at. Scoped to the session id this function just minted, so no pane, run or
-    /// console can be reached by it — the first of `cide_claude::plan`'s four gates, and the one
-    /// that lives here.
-    Plan { accept: bool },
+    /// # Why there is no plan mode any more (M88)
+    ///
+    /// The spinner's tab was `--permission-mode plan` from M79, so it would survey before it
+    /// acted. Plan mode asks before **every** MCP call — it is the CLI's `default` with edits
+    /// withheld — and the survey is nothing but MCP calls, so an unattended planner parked on a
+    /// `cide_task_get` approval; reported as exactly that. And it ends at an `ExitPlanMode`
+    /// approval no hook can answer (that tool's own `checkPermissions` returns `ask`), so cide
+    /// read the prompt off the rendered grid and typed the answer, `cide_claude::plan`. Two
+    /// workarounds, deleted together, for a mode whose one job here the prompt already states.
+    pub unattended: cide_agents::Unattended,
+    /// Open behind the tab the user is on, rather than raising it.
+    ///
+    /// A reviewer opens *because* a subagent finished while the user was reading something else,
+    /// so raising it takes the view away mid-sentence; the spinner's tab raises, because it fires
+    /// only after the project has been idle, and is about to plan the next round — the thing
+    /// somebody coming back wants in front of them. See the `behind` block in the body.
+    pub behind: bool,
 }
 
 /// Spawn a `claude`, open a tab holding it, and type `prompt` into it.
@@ -120,27 +126,16 @@ pub(crate) fn open_with_prompt(
         Ok::<_, CoreError>((root, project.name.clone()))
     })?;
 
-    // One flag, spelled once. `plan` wins over the project's mode where both could apply,
-    // because the plan road's whole point is that the child surveys before it acts — and what it
-    // is given when the plan is accepted is the CLI's own *auto mode*, which is the same freedom
-    // arriving through the door that was measured to work.
+    // One flag, spelled once. `Ask` passes nothing, which is the CLI's own default.
     let mut args: Vec<String> = Vec::new();
-    match mode {
-        TabMode::Plan { .. } => {
-            args.push("--permission-mode".into());
-            args.push("plan".into());
-        }
-        TabMode::Direct { unattended } => {
-            let mode = match unattended {
-                cide_agents::Unattended::Auto => Some("auto"),
-                cide_agents::Unattended::Bypass => Some(cide_agents::defs::BYPASS_PERMISSIONS),
-                cide_agents::Unattended::Ask => None,
-            };
-            if let Some(mode) = mode {
-                args.push("--permission-mode".into());
-                args.push(mode.into());
-            }
-        }
+    let permission = match mode.unattended {
+        cide_agents::Unattended::Auto => Some("auto"),
+        cide_agents::Unattended::Bypass => Some(cide_agents::defs::BYPASS_PERMISSIONS),
+        cide_agents::Unattended::Ask => None,
+    };
+    if let Some(permission) = permission {
+        args.push("--permission-mode".into());
+        args.push(permission.into());
     }
 
     // `Geometry::default()` is 80×24, byte-identical to the webview's own `FALLBACK`, and it
@@ -168,7 +163,23 @@ pub(crate) fn open_with_prompt(
     //
     // Falls back to the root, which is right for a run dispatched with no task — it worked in
     // the root itself (M40) — and for a worktree that has since been removed.
-    let cwd = cwd.filter(|path| path.is_dir()).unwrap_or(root);
+    let cwd = cwd.filter(|path| path.is_dir()).unwrap_or(root.clone());
+
+    // **The pane has to remember that directory, or the conversation is lost at the first
+    // restart.** Reported as a Resume that worked half the time and otherwise opened a blank
+    // `claude`: the half that failed were exactly the reviewers standing in a worktree.
+    // `lifecycle::entry_for` looks for a pane's transcript under the project root unless
+    // `Pane::continues` names another directory, so a reviewer's — filed under the worktree,
+    // by the paragraph above — answered `Fresh`, and the splash's button started a new session
+    // in the root. `continues` is M42's record of exactly this fact for a run's pane, and every
+    // reader already honours it: the restore plan, the cwd `App.tsx` hands the pane, and
+    // `session_spawn`, which respawns `claude --resume <id>` in that directory.
+    //
+    // Only when the child is *not* in the root. A root-standing tab (the spinner's, a task-less
+    // run's reviewer) was always found, and `continues` would pin its resume to the original id —
+    // `continue_spec` names `conversation.id` — where the ordinary road follows `/clear` to
+    // `Pane::conversation`.
+    let in_worktree = cwd != root;
 
     let request = crate::cmd::session::SpawnRequest {
         program: "claude".into(),
@@ -188,9 +199,7 @@ pub(crate) fn open_with_prompt(
         // system prompt calling it a bystander who could orchestrate left it arguing with itself
         // about whether it was allowed to. Reported as exactly that.
         voice: Some(crate::cmd::session::Voice::Acting),
-        // Nothing here needs a variable of its own: the plan approval is decided in this
-        // process, against a session id, rather than by a child marked for a hook to notice.
-        // See `watch_for_plan`.
+        // Nothing here needs a variable of its own.
         env: Vec::new(),
     };
 
@@ -216,7 +225,7 @@ pub(crate) fn open_with_prompt(
     // project has been idle for a quarter of an hour with nothing running, so there is by
     // construction nothing to interrupt — and it is about to plan the next round of work, which
     // is the thing somebody coming back to the project wants in front of them.
-    let behind = matches!(mode, TabMode::Direct { .. });
+    let behind = mode.behind;
 
     let pane = PaneId::new();
     let opened = state.update(|ws| {
@@ -243,7 +252,12 @@ pub(crate) fn open_with_prompt(
                 session: Some(session),
                 conversation: None,
                 conversation_since: None,
-                continues: None,
+                // The id is the one `--session-id` was handed, which is what `--resume` takes.
+                continues: in_worktree.then(|| cide_ipc::HarnessSession {
+                    harness: cide_ipc::Harness::Claude,
+                    id: session.to_string(),
+                    cwd: cwd.clone(),
+                }),
                 title: format!("{name} : claude"),
                 docker: None,
             },
@@ -289,127 +303,5 @@ pub(crate) fn open_with_prompt(
         crate::agents::type_submitted_line(app, session, &pty, bytes);
     }
 
-    if let TabMode::Plan { accept: true } = mode {
-        watch_for_plan(app, session);
-    }
-
     Ok((session, tab))
-}
-
-/// How long the watcher stays interested in one spun session.
-///
-/// Twenty minutes. A plan-mode turn is a survey of a repository, a plan, and then the work, and
-/// the survey alone can be minutes on a large tree. The bound exists because a watcher is a
-/// thread polling a mirror: it must not outlive the question it was started for, and a run that
-/// has not planned in twenty minutes is not going to be helped by cide typing at it.
-const PLAN_WATCH: Duration = Duration::from_secs(20 * 60);
-
-/// How often the mirror is read while waiting.
-///
-/// A second, which is well inside human reaction time for a prompt nobody is watching, and cheap:
-/// the poll is gated on the hook state first, so the grid walk only happens for the fraction of a
-/// second the session is actually in `AwaitingPermission`.
-const PLAN_POLL: Duration = Duration::from_millis(1_000);
-
-/// The beat between keystrokes when answering a list.
-///
-/// A TUI reads raw and a burst arriving in one `read` is one event to it — the measurement
-/// behind `crate::agents::type_submitted_line`, which is why that helper sends its Enter
-/// separately. Two hundred milliseconds is far above the CLI's own frame time and far below
-/// anything a person waiting would notice.
-const KEY_GAP: Duration = Duration::from_millis(200);
-
-/// Answer the plan approval on **one** session cide spawned. (M79)
-///
-/// # Why cide types here at all, when `AgentRegistry::stop` refuses to
-///
-/// That refusal is blunt and correct: a lone `\r` at a selection list **is an answer**, so a
-/// graceful stop is never offered to a run in `AwaitingPermission` — it would approve the tool
-/// call the stop was meant to prevent. Nothing here weakens it. What it refuses is writing
-/// *blind*, at a prompt nobody has read. This reads the prompt first, through
-/// `cide_claude::permission::parse`, whose own header says every rule in it is a reason to
-/// refuse, and answers only a prompt it recognises with an option it found **by its words**.
-///
-/// The hook road would have been better and was measured not to work — `cide_claude::plan`'s
-/// header carries the evidence and `cide-hook`'s guard module carries the same note.
-///
-/// # Bounded in every direction
-///
-/// One thread per spun session, for at most [`PLAN_WATCH`]; it ends at the first answer, when the
-/// child exits, or at the deadline. It answers **once** and then stops, deliberately: a watcher
-/// that kept going would be a standing agreement to approve whatever that conversation asks next,
-/// which is a different and much larger promise than the one the setting makes.
-fn watch_for_plan(app: &tauri::AppHandle, session: SessionId) {
-    let app = app.clone();
-    let spawned = std::thread::Builder::new()
-        .name("cide-plan-accept".into())
-        .spawn(move || {
-            let deadline = Instant::now() + PLAN_WATCH;
-            while Instant::now() < deadline {
-                std::thread::sleep(PLAN_POLL);
-
-                let Some(registry) = app.try_state::<crate::state::SessionRegistry>() else {
-                    return;
-                };
-                let Some(pty) = registry.get(session) else {
-                    return; // Forgotten: the tab was closed, which ends the child.
-                };
-                if pty.has_exited() {
-                    return;
-                }
-
-                // The hook first, the screen second. `permission::parse` refuses anything whose
-                // session is not `AwaitingPermission` — *"the hook is exact and has already
-                // decided; the screen is never sufficient evidence on its own"* — so asking it
-                // here as well is not a second gate but the same one, read where it is cheap:
-                // a grid walk takes the mirror's lock, and doing that every second for twenty
-                // minutes on a session that is quietly working would be a cost for nothing.
-                let Some(hooks) = app.try_state::<crate::hooks::HookServer>() else {
-                    return;
-                };
-                let state = hooks.state(session);
-                if state != cide_ipc::SessionState::AwaitingPermission {
-                    continue;
-                }
-
-                let screen = pty.capture_screen();
-                let Some(prompt) = cide_claude::permission::parse(&screen, state) else {
-                    // A prompt this cannot read is left for a person, which is the honest
-                    // degradation: the tab is on screen with its pane marked, exactly as it
-                    // would be with `autoSpinAcceptPlan` off.
-                    continue;
-                };
-                let Some(number) = cide_claude::plan::approval(&prompt) else {
-                    // Read, and not the plan question — a file write, a command, a fetch. Left
-                    // alone, and the watcher goes on waiting for the one it was started for.
-                    continue;
-                };
-                tracing::info!(
-                    %session, number,
-                    "answering a spun run's plan approval; nobody is at the keyboard"
-                );
-                // Moved to and confirmed, not addressed by number: the digit alone was measured
-                // to do nothing on this prompt — `cide_claude::plan::keystrokes` carries it —
-                // and the arrow's spelling depends on the cursor mode the program asked for,
-                // which the mirror knows and nothing else does.
-                //
-                // Paced, and **not** through `type_submitted_line`: that helper is for a line of
-                // text owed one Enter, and this is a sequence of keys where each one must be read
-                // before the next arrives. A TUI still painting takes a burst as one chunk.
-                let keys =
-                    cide_claude::plan::keystrokes(prompt.selected, number, screen.info.app_cursor);
-                for key in keys {
-                    pty.write(key);
-                    std::thread::sleep(KEY_GAP);
-                }
-                return;
-            }
-            tracing::debug!(%session, "no plan appeared before the watcher gave up");
-        });
-    if let Err(error) = spawned {
-        // The tab still works and still plans; it simply waits for a person, which is what
-        // `autoSpinAcceptPlan: false` asks for anyway. Said out loud because the difference is
-        // otherwise invisible — a tab sitting at a prompt looks the same either way.
-        tracing::warn!(%error, %session, "no thread to accept this run's plan; it will wait");
-    }
 }

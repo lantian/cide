@@ -17,6 +17,7 @@
 //! Nothing here depends on `tauri`. `cide-headless` links this crate and must never be
 //! able to link a webview — that is the standing check that the rule is being kept.
 
+pub mod check;
 pub mod child_env;
 pub mod claude_cli;
 pub mod commands;

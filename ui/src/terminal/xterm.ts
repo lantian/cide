@@ -19,6 +19,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { notify } from '@/chrome/notices'
+import { isWebUrl } from '@/chrome/webLinks'
 import { showLogDetail } from '@/chrome/logDetailStore'
 import { paneSession } from '@/ipc/client'
 import { parseLogLink } from './logLink'
@@ -224,13 +225,13 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
      * that program chose. Terminal output is untrusted data; that was a click-to-navigate path
      * out of it, and nothing in this repository had ever named it.
      *
-     * The handler refuses, and says so. Refusing *silently* was the tempting version and is the
-     * defect this project keeps finding: a link that underlines, takes a click and does nothing
-     * is indistinguishable from one wired to nothing. Opening it for real is a separate decision
-     * with a separate threat model — it would have to go through Rust and `tauri_plugin_opener`,
-     * because the JS opener command is capability-gated per window and a detached-pane window
-     * deliberately has no `opener` permission, so a JS-side open would work in the shell window
-     * and silently do nothing in a torn-out pane.
+     * The handler used to refuse every web link, and say so. It now opens `http(s)` ones in the
+     * user's *browser*, through Rust and `tauri_plugin_opener` (`cmd::app::app_open_url`) —
+     * never this webview, and not through the JS opener command, which is capability-gated per
+     * window: a detached-pane window deliberately has no `opener` permission, so a JS-side open
+     * would work in the shell window and silently do nothing in a torn-out pane. Everything
+     * else is still refused, out loud: a link that underlines, takes a click and does nothing
+     * is indistinguishable from one wired to nothing.
      *
      * `allowNonHttpProtocols` is left at its default of `false`, which is what makes
      * `OscLinkProvider` drop `file:`, `javascript:` and everything else before it ever gets
@@ -258,9 +259,22 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
           showLogDetail(() => paneSession.logDetail(target.session, target.handle))
           return
         }
-        notify(`cide does not open web links from terminal output: ${oneLine(uri)}`, {
+        /*
+         * An http(s) hyperlink opens on **ctrl+click**, like every other link in a terminal —
+         * and not here. The click that reaches this handler is always a *plain* one, because
+         * `pathLinks.ts`'s gate claims every ctrl+press in capture and so hides it from
+         * `OscLinkProvider`; opening a browser on the click a user makes to focus a pane was
+         * the first version of this, and it was turned down. The gate reads the link under a
+         * ctrl+press itself (`oscLinkAt`) and opens it through `chrome/webLinks.ts`, so all
+         * this arm owes a plain click is the sentence naming the gesture.
+         */
+        if (isWebUrl(uri)) {
+          notify('Ctrl+click a link in a terminal to open it.', { kind: 'warn' })
+          return
+        }
+        notify(`cide does not open web links other than http(s): ${oneLine(uri)}`, {
           kind: 'warn',
-          hint: 'Copy the address and open it in a browser.',
+          hint: 'Copy the address and open it by hand.',
         })
       },
     },

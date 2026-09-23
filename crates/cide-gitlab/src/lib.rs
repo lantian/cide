@@ -1,11 +1,13 @@
 //! GitLab transport and session ownership. This crate never depends on a webview.
+mod drafts;
 mod fetch;
 mod workspaces;
 use cide_ipc::gitlab::*;
+pub use drafts::NewDraft;
 use parking_lot::Mutex;
-use reqwest::{blocking::Client, Method, Url};
+use reqwest::{Method, Url, blocking::Client};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
@@ -34,7 +36,16 @@ pub struct GitLab {
     path: PathBuf,
     workspaces: Workspaces,
     proxy: Mutex<cide_ipc::ProxySettings>,
+    drafts: drafts::Drafts,
+    /// The latest MR version with its diffs, per review, briefly. An agent writes its findings
+    /// one tool call at a time, and each one needs the diff to place its line; thirty drafts
+    /// must not be sixty GitLab requests.
+    versions: Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
 }
+
+/// How long [`GitLab::latest_version`] trusts what it fetched. Short: a push to the MR makes
+/// a new version, and a draft placed on the old one is marked outdated rather than wrong.
+const VERSION_TTL: Duration = Duration::from_secs(60);
 
 pub fn encode(value: &str) -> String {
     value
@@ -137,11 +148,14 @@ impl GitLab {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
             Err(_) => return Err("Cannot read saved GitLab connections".into()),
         };
+        let drafts = drafts::Drafts::load(path.with_file_name("gitlab-drafts.json"));
         Ok(Self {
             saved: Mutex::new(saved),
             path,
             workspaces: Workspaces::new(temporary)?,
             proxy: Mutex::new(cide_ipc::ProxySettings::default()),
+            drafts,
+            versions: Mutex::new(Default::default()),
         })
     }
     pub fn set_proxy(&self, proxy: cide_ipc::ProxySettings) {
@@ -262,9 +276,9 @@ impl GitLab {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let mut result = request.send().map_err(|_| {
-            "GitLab request failed; check your connection, TLS certificate, and proxy"
-        })?;
+        let mut result = request.send().map_err(
+            |_| "GitLab request failed; check your connection, TLS certificate, and proxy",
+        )?;
         // Archived traces can be redirected to signed object-storage URLs. Never forward
         // the private token to a redirect destination; ordinary API calls still refuse redirects.
         if raw && path.ends_with("/trace") {
@@ -332,8 +346,10 @@ impl GitLab {
             if bytes.contains(&0) && !path.ends_with("/trace") {
                 return Err("This file is binary; open it in GitLab".into());
             }
-            json!(String::from_utf8(bytes)
-                .map_err(|_| "This file is binary and cannot be displayed as text")?)
+            json!(
+                String::from_utf8(bytes)
+                    .map_err(|_| "This file is binary and cannot be displayed as text")?
+            )
         } else if bytes.is_empty() {
             Value::Null
         } else {
@@ -358,6 +374,176 @@ impl GitLab {
     }
     pub fn workspace_root(&self, review: &str, sha: &str) -> Option<PathBuf> {
         self.workspaces.root(review, sha)
+    }
+    /// The durable identity of an open review, for a caller outside this crate.
+    pub fn review_of(&self, review: &str) -> Result<GitLabReview> {
+        Ok(self.review(review)?.0)
+    }
+    /// The account an open review is read through: its host, for matching local remotes.
+    pub fn account_of(&self, review: &str) -> Result<GitLabAccount> {
+        Ok(self.review(review)?.1.account)
+    }
+    /// The MR's latest version, diffs included — what a draft's position is computed against.
+    pub fn latest_version(&self, review: &str) -> Result<Value> {
+        if let Some((at, version)) = self.versions.lock().get(review)
+            && at.elapsed() < VERSION_TTL
+        {
+            return Ok(version.clone());
+        }
+        let (r, c) = self.review(review)?;
+        let base = format!("projects/{}/merge_requests/{}", r.project, r.iid);
+        let versions = self.get(&c, &format!("{base}/versions"))?;
+        let latest = versions
+            .as_array()
+            .and_then(|v| v.first())
+            .and_then(|v| v["id"].as_u64())
+            .ok_or("GitLab is preparing the MR diff; try again shortly")?;
+        let version = self.get(&c, &format!("{base}/versions/{latest}"))?;
+        for key in ["base_commit_sha", "start_commit_sha", "head_commit_sha"] {
+            if !version[key]
+                .as_str()
+                .is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err("GitLab is still preparing the MR revisions; try again shortly".into());
+            }
+        }
+        self.versions.lock().insert(
+            review.to_string(),
+            (std::time::Instant::now(), version.clone()),
+        );
+        Ok(version)
+    }
+    /// The MR itself, as `Detail` answers it.
+    pub fn detail(&self, review: &str) -> Result<Value> {
+        Ok(self
+            .execute(GitLabRequest::Detail {
+                review: review.into(),
+            })?
+            .data)
+    }
+    /// Every discussion thread on the MR, all pages.
+    pub fn discussions(&self, review: &str) -> Result<Vec<Value>> {
+        let mut all = Vec::new();
+        let mut page = 1;
+        loop {
+            let response = self.execute(GitLabRequest::Discussions {
+                review: review.into(),
+                page,
+            })?;
+            all.extend(response.data.as_array().cloned().unwrap_or_default());
+            match response.next_page {
+                Some(next) if next > page => page = next,
+                _ => return Ok(all),
+            }
+        }
+    }
+    /// A disposable checkout of the MR head that also holds the base commit, so
+    /// `git diff <base> <head>` answers inside it. The base is best effort: a failure leaves a
+    /// working checkout of the head, and the caller says so instead of refusing the review.
+    pub fn review_checkout(&self, review: &str, head: &str, base: &str) -> Result<(String, bool)> {
+        let root = self
+            .execute(GitLabRequest::Checkout {
+                review: review.into(),
+                sha: head.into(),
+            })?
+            .data["root"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (r, c) = self.review(review)?;
+        let mr = self.get(
+            &c,
+            &format!("projects/{}/merge_requests/{}", r.project, r.iid),
+        )?;
+        // The base lives in the *target* project; a fork's MR fetches it from there.
+        let target = mr["target_project_id"].as_u64().unwrap_or(r.project);
+        let url = string(
+            &self.get(&c, &format!("projects/{target}"))?,
+            "http_url_to_repo",
+        )?;
+        host_url(&url)?;
+        project_from_url(&c.account.host, &url)?;
+        let proxy = self.proxy.lock().clone();
+        let with_base = match self
+            .workspaces
+            .fetch_into(review, head, base, &url, &c.token, &proxy)
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "the MR base could not be fetched into the review checkout");
+                false
+            }
+        };
+        Ok((root, with_base))
+    }
+    pub fn drafts(&self, review: &str) -> Vec<GitLabDraft> {
+        self.drafts.list(review)
+    }
+    /// Write a draft for an agent run. Never reaches GitLab.
+    pub fn draft_create(
+        &self,
+        review: &str,
+        new: NewDraft,
+        author: GitLabDraftAuthor,
+    ) -> Result<GitLabDraft> {
+        self.review(review)?;
+        let version = self.latest_version(review)?;
+        self.drafts
+            .insert(drafts::compose(review, &version, new, author)?)
+    }
+    /// An edit by a run (`Some`) is limited to its own drafts; the user's (`None`) is not.
+    pub fn draft_edit(
+        &self,
+        review: &str,
+        draft: &str,
+        body: Option<String>,
+        severity: Option<GitLabSeverity>,
+        run: Option<&str>,
+    ) -> Result<GitLabDraft> {
+        self.drafts.edit(review, draft, body, severity, run)
+    }
+    pub fn draft_discard(
+        &self,
+        review: &str,
+        drafts: &[String],
+        run: Option<&str>,
+    ) -> Result<usize> {
+        self.drafts.discard(review, drafts, run)
+    }
+    fn publish(&self, review: &str, ids: Vec<String>) -> Result<GitLabPublished> {
+        let mut result = GitLabPublished {
+            published: Vec::new(),
+            failed: Vec::new(),
+        };
+        for id in ids {
+            let outcome = self.drafts.get(review, &id).and_then(|draft| {
+                // The body exactly as written: the severity is the draft's metadata, and
+                // publishing it would put a label into somebody else's review thread.
+                self.execute(GitLabRequest::Comment {
+                    review: review.into(),
+                    body: draft.body,
+                    discussion: None,
+                    position: draft.position,
+                })
+            });
+            match outcome {
+                // Removed one at a time, after its own POST: a batch that fails half-way leaves
+                // exactly the unpublished half behind, never a posted comment still marked draft.
+                Ok(_) => match self.drafts.discard(review, std::slice::from_ref(&id), None) {
+                    Ok(_) => result.published.push(id),
+                    Err(error) => result.failed.push(GitLabPublishFailure {
+                        draft: id,
+                        error: format!(
+                            "Posted to GitLab, but the local draft could not be removed: {error}"
+                        ),
+                    }),
+                },
+                Err(error) => result
+                    .failed
+                    .push(GitLabPublishFailure { draft: id, error }),
+            }
+        }
+        Ok(result)
     }
     fn comparison(&self, doc: &cide_ipc::gitlab::GitLabDocument) -> Result<GitLabResponse> {
         let (r, c) = self.review(&doc.review)?;
@@ -412,6 +598,25 @@ impl GitLab {
             return self.comparison(document);
         }
         match request {
+            Drafts { review } => {
+                self.review(&review)?;
+                Ok(response(json!(self.drafts.list(&review))))
+            }
+            DraftEdit {
+                review,
+                draft,
+                body,
+                severity,
+            } => Ok(response(json!(
+                self.drafts.edit(&review, &draft, body, severity, None)?
+            ))),
+            DraftDiscard { review, drafts } => Ok(response(json!(
+                self.drafts.discard(&review, &drafts, None)?
+            ))),
+            DraftPublish { review, drafts } => {
+                self.review(&review)?;
+                Ok(response(json!(self.publish(&review, drafts)?)))
+            }
             Board => Ok(response(serde_json::to_value(self.board()).unwrap())),
             Connect { host, token } => {
                 let host = host_url(&host)?.as_str().trim_end_matches('/').to_string();
@@ -454,6 +659,8 @@ impl GitLab {
                     .collect();
                 for id in &ids {
                     self.workspaces.close(id)?;
+                    self.drafts.forget(id)?;
+                    self.versions.lock().remove(id);
                 }
                 let mut saved = self.saved.lock();
                 saved.credentials.retain(|c| c.account.id != account);
@@ -550,6 +757,8 @@ impl GitLab {
             }
             Close { review } => {
                 self.workspaces.close(&review)?;
+                self.drafts.forget(&review)?;
+                self.versions.lock().remove(&review);
                 let mut saved = self.saved.lock();
                 saved.reviews.retain(|r| r.id != review);
                 self.save(&mut saved)?;
@@ -639,10 +848,10 @@ impl GitLab {
         match request {
             Detail { .. } => {
                 let mut detail = self.get(&c, &base)?;
-                if let Some(source) = detail["source_project_id"].as_u64() {
-                    if let Ok(project) = self.get(&c, &format!("projects/{source}")) {
-                        detail["source_project"] = project;
-                    }
+                if let Some(source) = detail["source_project_id"].as_u64()
+                    && let Ok(project) = self.get(&c, &format!("projects/{source}"))
+                {
+                    detail["source_project"] = project;
                 }
                 return Ok(response(detail));
             }
@@ -779,7 +988,9 @@ impl GitLab {
                 // Do not hold settings across a network operation: closing a review updates
                 // settings before cancelling its fetch and must be able to reach that cancellation.
                 let proxy = self.proxy.lock().clone();
-                let root = self.workspaces.checkout(&r.id, &sha, &url, &c.token, &proxy)?;
+                let root = self
+                    .workspaces
+                    .checkout(&r.id, &sha, &url, &c.token, &proxy)?;
                 return Ok(response(json!({"root":root,"sha":sha})));
             }
             SourceTree { sha, .. } => {
@@ -822,11 +1033,13 @@ mod tests {
             project_from_url("https://git.example", "git@git.example:group/repo.git").unwrap(),
             "group/repo"
         );
-        assert!(project_from_url(
-            "https://git.example/gitlab",
-            "https://git.example/gitlab-other/repo"
-        )
-        .is_err());
+        assert!(
+            project_from_url(
+                "https://git.example/gitlab",
+                "https://git.example/gitlab-other/repo"
+            )
+            .is_err()
+        );
         assert!(project_from_url("https://git.example", "https://evil.example/a").is_err());
         assert_eq!(
             mr_iid("https://host/g/p/-/merge_requests/42/diffs#note_7").unwrap(),
@@ -1013,9 +1226,10 @@ mod transport_tests {
         let sent = request.recv().unwrap();
         assert!(sent.starts_with("GET /api/v4/projects/group%2Frepo/merge_requests?"));
         assert!(sent.contains("search=a+b%26c"));
-        assert!(sent
-            .to_lowercase()
-            .contains("private-token: private-test-token"));
+        assert!(
+            sent.to_lowercase()
+                .contains("private-token: private-test-token")
+        );
         thread.join().unwrap();
         drop(service);
         fs::remove_dir_all(root).unwrap();
@@ -1056,9 +1270,11 @@ mod transport_tests {
                 .push(account("https://git.example".into()));
             service.save(&mut saved).unwrap();
         }
-        assert!(!serde_json::to_string(&service.board())
-            .unwrap()
-            .contains("private-test-token"));
+        assert!(
+            !serde_json::to_string(&service.board())
+                .unwrap()
+                .contains("private-test-token")
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1146,6 +1362,88 @@ mod transport_tests {
             drop(service);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+    #[test]
+    fn publishing_posts_the_body_alone_and_keeps_only_what_failed() {
+        let (service, root) = service();
+        let (host, sent, thread) =
+            mock_sequence(vec![("201 Created", "", "{}"), ("409 Conflict", "", "{}")]);
+        {
+            let mut saved = service.saved.lock();
+            saved.credentials.push(account(host));
+            saved.reviews.push(GitLabReview {
+                id: "review".into(),
+                account: "test".into(),
+                project: 7,
+                iid: 42,
+                title: "test".into(),
+                url: "https://example.test".into(),
+            });
+        }
+        // Seeded, so the only requests the mock sees are the two posts.
+        service.versions.lock().insert(
+            "review".into(),
+            (
+                std::time::Instant::now(),
+                json!({
+                    "base_commit_sha": "a".repeat(40),
+                    "start_commit_sha": "b".repeat(40),
+                    "head_commit_sha": "c".repeat(40),
+                    "diffs": [{"old_path":"a.go","new_path":"a.go","diff":"@@ -1,1 +1,2 @@\n x\n+y\n"}]
+                }),
+            ),
+        );
+        let author = GitLabDraftAuthor {
+            label: "Review !42".into(),
+            harness: None,
+            run: Some("run".into()),
+        };
+        let draft = |body: &str, line| NewDraft {
+            severity: GitLabSeverity::Critical,
+            body: body.into(),
+            path: Some("a.go".into()),
+            line: Some(line),
+            side: GitLabSide::New,
+        };
+        let first = service
+            .draft_create("review", draft("first", 2), author.clone())
+            .unwrap();
+        let second = service
+            .draft_create("review", draft("second", 1), author)
+            .unwrap();
+        let outcome = service
+            .execute(GitLabRequest::DraftPublish {
+                review: "review".into(),
+                drafts: vec![first.id.clone(), second.id.clone()],
+            })
+            .unwrap();
+        let outcome: GitLabPublished = serde_json::from_value(outcome.data).unwrap();
+        assert_eq!(outcome.published, vec![first.id.clone()]);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].draft, second.id);
+
+        let request = sent.recv().unwrap();
+        assert!(request.starts_with("POST /api/v4/projects/7/merge_requests/42/discussions"));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["body"],
+            json!("first"),
+            "the severity is never published"
+        );
+        assert_eq!(body["position"]["new_line"], json!(2));
+        let _ = sent.recv().unwrap();
+        thread.join().unwrap();
+
+        let left: Vec<_> = service.drafts("review").into_iter().map(|d| d.id).collect();
+        assert_eq!(left, vec![second.id]);
+        service
+            .execute(GitLabRequest::Close {
+                review: "review".into(),
+            })
+            .unwrap();
+        assert!(service.drafts("review").is_empty());
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -1257,9 +1555,11 @@ mod comparison_tests {
         assert!(deleted.new_text.is_none());
         assert_eq!(deleted.hunks[0].lines[0].old_lineno, Some(1));
         doc.deleted_file = false;
-        assert!(comparison_from_text(&doc, "same\n".into(), "same\n".into())
-            .unwrap()
-            .hunks
-            .is_empty());
+        assert!(
+            comparison_from_text(&doc, "same\n".into(), "same\n".into())
+                .unwrap()
+                .hunks
+                .is_empty()
+        );
     }
 }

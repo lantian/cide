@@ -21,7 +21,14 @@ cide-claude = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
+# `limits::probe`: one GET against a custom provider's own server, to read the model's window
+# (M88). Blocking, because the caller is already on the blocking pool and this crate has no
+# runtime; the same client shape `cide-gitlab` builds.
+reqwest = { workspace = true }
 tracing = { workspace = true }
+# `render::stamp`: the wall-clock time a run's rendered row is prefixed with, in the machine's
+# own zone. `cide-core` already links it with `clock`, so this is an edge, not a new crate.
+chrono = { workspace = true }
 
 # `SIGSTOP`/`SIGCONT` for `child_env::signal_group`. The mechanism lives in `cide-core`; only the
 # two signal numbers are needed here, and off unix there is neither. Declared the way

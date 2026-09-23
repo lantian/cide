@@ -206,6 +206,30 @@ pub(super) fn thought_line(ms: Option<u64>, handle: Option<u64>) -> String {
     format!("{DIM}∴ thought{RESET}{}", tail(ms, handle))
 }
 
+/// The `[2026-09-23 18:01:59] ` a rendered row opens with — when the event happened, in the
+/// machine's local zone, dim so the row's own glyph still leads the eye.
+///
+/// Plain text, not an escape the pane interprets, for the reason the `#handle` is: `vt100` drops
+/// OSC 8 from every replay and a run is mostly read after the fact. It therefore sits *in front
+/// of* the glyph `ui/src/terminal/runLinks.ts` anchors on, and that grammar skips exactly this
+/// shape — change the spelling here without changing `STAMP` there and every row of every run
+/// stops being clickable, with nothing on either side able to see it.
+///
+/// `None` for anything before 2001: a `0` or a `1` is a default or a fixture, not a clock, and a
+/// row confidently stamped 1970 is worse than a row with no stamp — the same refusal
+/// [`RenderState::now_unix_ms`] makes about a zero.
+pub(super) fn stamp(unix_ms: u64) -> Option<String> {
+    use chrono::TimeZone;
+    const Y2001_MS: u64 = 978_307_200_000;
+    if unix_ms < Y2001_MS {
+        return None;
+    }
+    let at = chrono::Local
+        .timestamp_millis_opt(i64::try_from(unix_ms).ok()?)
+        .single()?;
+    Some(format!("{DIM}[{}]{RESET} ", at.format("%Y-%m-%d %H:%M:%S")))
+}
+
 /// How long the run said nothing before this line — the duration of a thinking block no harness
 /// states a clock for. (M62)
 ///
@@ -306,6 +330,26 @@ mod tests {
 
     /// The SGR removed, so an assertion is about the characters a person sees — and about the
     /// characters `runLinks.ts` reads, which is the buffer text, never the escapes.
+    /// The stamp is the one spelling `runLinks.ts`'s `STAMP` skips; a zero is no clock at all.
+    #[test]
+    fn a_stamp_is_a_bracketed_local_date_and_time_or_nothing() {
+        let stamped = strip(&stamp(1_790_000_000_000).expect("a real clock is stamped"));
+        let shape = stamped.as_bytes();
+        assert_eq!(stamped.len(), "[2026-09-23 18:01:59] ".len(), "{stamped:?}");
+        assert!(
+            shape[0] == b'['
+                && shape[5] == b'-'
+                && shape[8] == b'-'
+                && shape[11] == b' '
+                && shape[14] == b':'
+                && shape[17] == b':'
+                && stamped.ends_with("] "),
+            "{stamped:?}"
+        );
+        assert_eq!(stamp(0), None);
+        assert_eq!(stamp(1), None, "a fixture's `timestamp: 1` is not 1970");
+    }
+
     fn strip(text: &str) -> String {
         let mut out = String::new();
         let mut chars = text.chars();

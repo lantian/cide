@@ -115,6 +115,10 @@ pub const FEATURES: &[&str] = &[
     "dispatch",
     "tasks",
     "prompt",
+    // PgUp/PgDn page the desk's view as well as the device's. (M91)
+    "scrollView",
+    // Milestones, their gates' state and logs, running a gate and accepting one. (M91)
+    "milestones",
 ];
 
 /// Something that happened in cide, on its way to whichever devices care.
@@ -146,6 +150,10 @@ pub enum RemoteEvent {
     AgentsChanged { project: cide_ipc::ProjectId },
     /// A project's task board moved. (M75)
     TasksChanged { project: cide_ipc::ProjectId },
+    /// A project's milestones moved: a gate started or finished, one was accepted, a plan or a
+    /// proposal changed. (M91) Marked dirty with the other per-project reads — the milestone view
+    /// counts the board's tasks too, so it is stale whenever they are.
+    MilestonesChanged { project: cide_ipc::ProjectId },
     /// The tree changed. **The revision and nothing else** — see `cide-ipc`'s `remote` header for
     /// why a `Workspace` may not cross this wire. Each device re-asks for its projections, on a
     /// timer, and gets a projection back.
@@ -512,7 +520,9 @@ impl RemoteServer {
                 self.inner
                     .fan_out(|_| Some(ServerBody::SessionState { session, state }));
             }
-            RemoteEvent::AgentsChanged { project } | RemoteEvent::TasksChanged { project } => {
+            RemoteEvent::AgentsChanged { project }
+            | RemoteEvent::TasksChanged { project }
+            | RemoteEvent::MilestonesChanged { project } => {
                 // Marked, not sent: these are three host reads and one of them walks a tracker,
                 // and an agent mid-turn emits this many times a second. The coalescer decides.
                 self.inner.projects_dirty.lock().insert(project);
@@ -610,6 +620,9 @@ async fn coalesce_workspace(inner: Arc<Inner>) {
             let runs = ask(&inner, move |host| host.runs(project)).await;
             let roster = ask(&inner, move |host| host.roster(project)).await;
             let tasks = ask(&inner, move |host| host.board(project)).await;
+            let milestones = ask(&inner, move |host| host.milestones(project))
+                .await
+                .map(Box::new);
             for conn in watching {
                 for body in [
                     ServerBody::Runs {
@@ -624,6 +637,10 @@ async fn coalesce_workspace(inner: Arc<Inner>) {
                     ServerBody::Board {
                         project,
                         tasks: tasks.clone(),
+                    },
+                    ServerBody::Milestones {
+                        project,
+                        view: milestones.clone(),
                     },
                 ] {
                     if conn.out.try_send(ServerFrame { id: None, body }).is_err() {
@@ -1377,6 +1394,113 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
 
             (
                 true,
+                ClientBody::ScrollView {
+                    session,
+                    pages,
+                    seq,
+                },
+            ) => {
+                // Decided from the mirror at the moment of the press, like `Scroll`: whether a
+                // page is the terminal's or the program's is the child's mode, not the phone's.
+                let Some(modes) =
+                    ask(&inner, move |host| host.screen(session).map(|s| s.info)).await
+                else {
+                    let _ = say(
+                        &out_tx,
+                        id_of,
+                        ServerBody::Error {
+                            kind: error_kind::NO_SUCH.to_owned(),
+                            detail: "that session is not running here".to_owned(),
+                        },
+                    )
+                    .await;
+                    continue;
+                };
+                let done = match crate::keys::page(pages, &modes) {
+                    crate::keys::Page::Desk => {
+                        ask(&inner, move |host| host.scroll_view(session, pages)).await
+                    }
+                    crate::keys::Page::Program(bytes) if bytes.is_empty() => Ok(()),
+                    crate::keys::Page::Program(bytes) => {
+                        write_into(&inner, session, bytes, &writer_tag, id, seq).await
+                    }
+                };
+                if refused(&out_tx, id_of, done).await.is_err() {
+                    break;
+                }
+            }
+
+            (true, ClientBody::MilestonesGet { project }) => {
+                let view = ask(&inner, move |host| host.milestones(project))
+                    .await
+                    .map(Box::new);
+                if say(&out_tx, id_of, ServerBody::Milestones { project, view })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            (true, ClientBody::GateRun { project, milestone }) => {
+                // Nothing to answer on success: the gate runs in the background and its two
+                // change events (running, then the verdict) reach the device as pushed
+                // `Milestones` frames, which is also how every other device and window hears.
+                let done = ask(&inner, move |host| host.gate_run(project, milestone)).await;
+                if refused(&out_tx, id_of, done).await.is_err() {
+                    break;
+                }
+            }
+
+            (true, ClientBody::MilestoneAccept { project, milestone }) => {
+                let done = ask(&inner, move |host| {
+                    host.milestone_accept(project, milestone)
+                })
+                .await;
+                let sent = match done {
+                    Ok(view) => {
+                        say(
+                            &out_tx,
+                            id_of,
+                            ServerBody::Milestones {
+                                project,
+                                view: view.map(Box::new),
+                            },
+                        )
+                        .await
+                    }
+                    Err(why) => refused(&out_tx, id_of, Err(why)).await,
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+
+            (true, ClientBody::CheckLog { project, kind, key }) => {
+                let (k, c) = (kind.clone(), key.clone());
+                let sent = match ask(&inner, move |host| host.check_log(project, &k, &c)).await {
+                    Ok(text) => {
+                        say(
+                            &out_tx,
+                            id_of,
+                            ServerBody::CheckLog {
+                                project,
+                                kind,
+                                key,
+                                text,
+                            },
+                        )
+                        .await
+                    }
+                    Err(why) => refused(&out_tx, id_of, Err(why)).await,
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+
+            (
+                true,
                 ClientBody::AnswerPrompt {
                     session,
                     option,
@@ -1799,7 +1923,11 @@ async fn send_project(
     )
     .await?;
     let tasks = ask(inner, move |host| host.board(project)).await;
-    say(out, None, ServerBody::Board { project, tasks }).await
+    say(out, None, ServerBody::Board { project, tasks }).await?;
+    let view = ask(inner, move |host| host.milestones(project))
+        .await
+        .map(Box::new);
+    say(out, None, ServerBody::Milestones { project, view }).await
 }
 
 /// Ask the host something, off the runtime.
@@ -1892,6 +2020,8 @@ mod tests {
         /// Holds the next `sessions` read open: it says so on the first channel and waits on the
         /// second. The race `Ordered` closes needs an event to land *during* a read.
         gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+        /// Every `scroll_view` the server asked of the desk.
+        paged: Mutex<Vec<(SessionId, i8)>>,
     }
 
     impl FakeHost {
@@ -1923,6 +2053,7 @@ mod tests {
                 dispatching: Mutex::new(true),
                 details: Mutex::new(std::collections::HashMap::new()),
                 gate: Mutex::new(None),
+                paged: Mutex::new(Vec::new()),
             });
             (host, first, second)
         }
@@ -2043,6 +2174,11 @@ mod tests {
 
         fn acknowledge(&self, session: SessionId) -> Result<(), String> {
             self.acknowledged.lock().push(session);
+            Ok(())
+        }
+
+        fn scroll_view(&self, session: SessionId, pages: i8) -> Result<(), String> {
+            self.paged.lock().push((session, pages));
             Ok(())
         }
 
@@ -2379,6 +2515,8 @@ mod tests {
             stale_turn: false,
             note: None,
             openable: false,
+            model: None,
+            pool_position: None,
         });
         h.host.agents.lock().push(cide_ipc::remote::RemoteAgent {
             id: "reviewer".to_owned().into(),
@@ -2510,7 +2648,10 @@ mod tests {
         )
         .await;
         let mut narrowed = false;
-        for _ in 0..12 {
+        // Bounded by a clock, for the reason the loop above gives: a frame count is a guess about
+        // traffic, and it went stale the moment a project's snapshot grew a fourth frame (M91).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             match heard_any(&mut ws).await {
                 // The *new* project's answer, not whichever frame was still in flight from the
                 // previous subscription.
@@ -2592,7 +2733,7 @@ mod tests {
     /// device it does not know. Parsed rather than ignored, so the test for it can read it.
     /// The next frame a test is *about*.
     ///
-    /// The three per-project reads are skipped, because they are unsolicited pushes — like a
+    /// The per-project reads (runs, roster, board and — since M91 — milestones) are skipped, because they are unsolicited pushes — like a
     /// `SessionState` that happens to land mid-test — and almost every test here reads frames
     /// positionally after a snapshot. A test that is about them uses [`heard_any`].
     ///
@@ -2602,7 +2743,10 @@ mod tests {
     async fn heard(client: &mut Client) -> Option<ServerBody> {
         loop {
             match heard_any(client).await? {
-                ServerBody::Runs { .. } | ServerBody::Roster { .. } | ServerBody::Board { .. } => {
+                ServerBody::Runs { .. }
+                | ServerBody::Roster { .. }
+                | ServerBody::Board { .. }
+                | ServerBody::Milestones { .. } => {
                     continue;
                 }
                 body => return Some(body),
@@ -2883,7 +3027,10 @@ mod tests {
             let frame = heard_frame(&mut ws).await.expect("an answer");
             if !matches!(
                 frame.body,
-                ServerBody::Runs { .. } | ServerBody::Roster { .. } | ServerBody::Board { .. }
+                ServerBody::Runs { .. }
+                    | ServerBody::Roster { .. }
+                    | ServerBody::Board { .. }
+                    | ServerBody::Milestones { .. }
             ) {
                 break frame;
             }
@@ -3478,6 +3625,68 @@ mod tests {
             String::from_utf8_lossy(&written[0].bytes),
             "\x1b[<64;11;1M\x1b[<64;11;1M"
         );
+    }
+
+    /// PgUp on a phone scrolls the desk's pane where the history is the terminal's, and asks the
+    /// program where it is the program's — never `ESC[5~` into a shell. (M91)
+    #[tokio::test]
+    async fn a_page_scrolls_the_desk_on_the_normal_screen_and_the_program_on_the_alternate() {
+        let (h, _first, _second) = harness().await;
+        let session = SessionId::new();
+        h.host.screens.lock().insert(session, grid(&["prompt"]));
+
+        let (device, key) = pair(&h).await;
+        let mut ws = resumed(&h, &device, &key).await;
+        hello(&mut ws).await;
+        for _ in 0..3 {
+            heard(&mut ws).await.expect("the snapshot");
+        }
+
+        say(
+            &mut ws,
+            None,
+            ClientBody::ScrollView {
+                session,
+                pages: -1,
+                seq: 1,
+            },
+        )
+        .await;
+        say(&mut ws, Some(8), ClientBody::Ping).await;
+        while !matches!(heard(&mut ws).await.expect("an answer"), ServerBody::Pong) {}
+        assert_eq!(*h.host.paged.lock(), vec![(session, -1)]);
+        assert!(
+            h.host.written.lock().is_empty(),
+            "a page of the normal screen wrote to the child"
+        );
+
+        // `claude`'s state: the alternate screen, with the mouse.
+        {
+            let mut screens = h.host.screens.lock();
+            let screen = screens.get_mut(&session).expect("the screen");
+            screen.info.alt = true;
+            screen.info.mouse = cide_ipc::screen::MouseReporting::Sgr;
+        }
+        say(
+            &mut ws,
+            None,
+            ClientBody::ScrollView {
+                session,
+                pages: 1,
+                seq: 2,
+            },
+        )
+        .await;
+        say(&mut ws, Some(9), ClientBody::Ping).await;
+        while !matches!(heard(&mut ws).await.expect("an answer"), ServerBody::Pong) {}
+        assert_eq!(
+            h.host.paged.lock().len(),
+            1,
+            "the desk was asked for the program's page"
+        );
+        let written = h.host.written.lock();
+        assert_eq!(written.len(), 1, "one write for one page");
+        assert!(String::from_utf8_lossy(&written[0].bytes).starts_with("\x1b[<65;"));
     }
 
     /// A device sends *up*; what reaches the child depends on a mode only the mirror knows.

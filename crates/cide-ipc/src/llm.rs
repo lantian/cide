@@ -133,6 +133,8 @@ impl LlmSettings {
                 entry.provider = entry.provider.trim().to_string();
                 entry.model = entry.model.trim().to_string();
                 entry.variant = entry.variant.trim().to_string();
+                // See `PoolEntry::max_running`: a `0` is an entry to delete, not a limit.
+                entry.max_running = entry.max_running.filter(|&n| n > 0);
             }
         }
         self
@@ -685,6 +687,25 @@ pub struct PoolEntry {
     /// `effort: xhigh` carried onto the candidate a rate limit fell over to would be refused
     /// outright by the CLI — turning a recoverable failure into a hard one at the worst moment.
     pub variant: String,
+    /// How many runs may be on this entry at once, across every project. `None` is no limit.
+    ///
+    /// # A pool is a preference *and* a set of slots
+    ///
+    /// Without this a pool only moved a run down when a provider refused it — so a subscription
+    /// that allows four sessions took a fifth, which the provider then rate-limited, which failed
+    /// over, which is a round trip and a burnt turn to learn what the user already knew. With it,
+    /// admission (`cide_app::agents::admit_a_pass`) puts a run on the first entry that has room,
+    /// and a pool whose every entry is full keeps the run *queued* rather than overcommitting one.
+    ///
+    /// **Counted across projects**, because pools are global settings and the thing the number
+    /// describes — a provider account's concurrency — does not know which project asked.
+    ///
+    /// `0` is not a value: [`LlmSettings::cleaned`] turns it into `None`, since an entry nobody
+    /// may run on is an entry to delete, and a stored `0` would be a pool that queues for ever
+    /// with no sentence saying why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_running: Option<u16>,
 }
 
 impl PoolEntry {
@@ -696,6 +717,50 @@ impl PoolEntry {
     pub fn model_flag(&self) -> String {
         format!("{}/{}", self.provider, self.model)
     }
+
+    /// Is this entry filled in enough to run? The rule `cide_agents::overrides::resolve` filters a
+    /// pool by, stated once so [`ModelPool::capacity`] counts exactly the entries a run can reach.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.provider.is_empty() && !self.model.is_empty()
+    }
+
+    /// Is `other` the same target — the key a [`Self::max_running`] is counted against.
+    ///
+    /// Provider, model and variant, and not the limit: a run holds a *copy* of its pool taken at
+    /// dispatch, and a user who raises a limit mid-flight must not split one entry's live runs
+    /// into two uncounted halves.
+    #[must_use]
+    pub fn same_target(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.model == other.model
+            && self.variant == other.variant
+    }
+}
+
+impl ModelPool {
+    /// How many runs this pool can hold at once: the sum of its complete entries' limits, or
+    /// `None` when any complete entry is unlimited (or there are no limits at all).
+    ///
+    /// The figure an orchestrator is told, and one of the three caps on a role that runs on this
+    /// pool — with the role's own `max-concurrent` and the project's `maxConcurrent`.
+    #[must_use]
+    pub fn capacity(&self) -> Option<u32> {
+        pool_capacity(&self.entries)
+    }
+}
+
+/// [`ModelPool::capacity`] over a bare list — what a run holds, since it keeps a copy of its
+/// pool's entries rather than the pool (`cide_agents::overrides::Resolved::pool`).
+#[must_use]
+pub fn pool_capacity(entries: &[PoolEntry]) -> Option<u32> {
+    let mut total = 0u32;
+    let mut any = false;
+    for entry in entries.iter().filter(|entry| entry.is_complete()) {
+        total = total.saturating_add(u32::from(entry.max_running?));
+        any = true;
+    }
+    any.then_some(total)
 }
 
 /// The entry a run has settled on, held on the run and reused for every turn. (M45)
@@ -845,12 +910,14 @@ mod tests {
             provider: "lmstudio".into(),
             model: "openai/gpt-oss-20b".into(),
             variant: String::new(),
+            max_running: None,
         };
         assert_eq!(awkward.model_flag(), "lmstudio/openai/gpt-oss-20b");
         let colon = PoolEntry {
             provider: "unsloth".into(),
             model: "Qwen3.8-27B-GGUF:UD-Q4_K_M".into(),
             variant: "high".into(),
+            max_running: None,
         };
         assert_eq!(colon.model_flag(), "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M");
     }
@@ -881,6 +948,7 @@ mod tests {
                             provider: " openrouter ".into(),
                             model: " deepseek/deepseek-chat ".into(),
                             variant: String::new(),
+                            max_running: None,
                         },
                         PoolEntry::default(),
                     ],
@@ -919,6 +987,7 @@ mod tests {
                     provider: "not-configured-yet".into(),
                     model: "m".into(),
                     variant: String::new(),
+                    max_running: None,
                 }],
             }],
         }
@@ -1049,5 +1118,64 @@ mod tests {
             expect: Vec::new(),
         };
         assert!(external.problems().is_empty());
+    }
+
+    fn entry(provider: &str, model: &str, max_running: Option<u16>) -> PoolEntry {
+        PoolEntry {
+            provider: provider.into(),
+            model: model.into(),
+            variant: String::new(),
+            max_running,
+        }
+    }
+
+    #[test]
+    fn a_pools_capacity_is_the_sum_of_its_limits_or_none() {
+        let pool = |entries| ModelPool {
+            name: "p".into(),
+            description: String::new(),
+            entries,
+        };
+        assert_eq!(
+            pool(vec![entry("a", "x", Some(4)), entry("b", "y", Some(2))]).capacity(),
+            Some(6)
+        );
+        // One unlimited entry makes the whole pool unlimited: a run can always land there.
+        assert_eq!(
+            pool(vec![entry("a", "x", Some(4)), entry("b", "y", None)]).capacity(),
+            None
+        );
+        // An incomplete entry is one no run reaches, so its number counts for nothing — and
+        // neither does its missing number make the pool unlimited.
+        assert_eq!(
+            pool(vec![entry("a", "x", Some(4)), entry("b", "", None)]).capacity(),
+            Some(4)
+        );
+        assert_eq!(pool(Vec::new()).capacity(), None);
+    }
+
+    #[test]
+    fn a_zero_limit_is_cleaned_away_and_an_unset_one_is_absent_on_the_wire() {
+        let settings = LlmSettings {
+            providers: Vec::new(),
+            pools: vec![ModelPool {
+                name: "p".into(),
+                description: String::new(),
+                entries: vec![entry("a", "x", Some(0)), entry("b", "y", Some(3))],
+            }],
+        }
+        .cleaned();
+        assert_eq!(settings.pools[0].entries[0].max_running, None);
+        assert_eq!(settings.pools[0].entries[1].max_running, Some(3));
+
+        let json = serde_json::to_value(&settings.pools[0].entries[0]).unwrap();
+        assert!(json.get("maxRunning").is_none(), "{json}");
+        let json = serde_json::to_value(&settings.pools[0].entries[1]).unwrap();
+        assert_eq!(json["maxRunning"], 3);
+
+        // A pool written before the field existed still reads.
+        let old: PoolEntry =
+            serde_json::from_str(r#"{"provider":"a","model":"x","variant":""}"#).unwrap();
+        assert_eq!(old.max_running, None);
     }
 }

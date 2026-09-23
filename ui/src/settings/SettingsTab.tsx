@@ -173,6 +173,11 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     (model: string) => agentDefs.testModel(project, model),
     [project],
   )
+  /** A custom model's limits from its server, for the Models screen's auto-fill. (M88) */
+  const probeLimits = useCallback(
+    (provider: string, model: string) => agentDefs.probeLimits(provider, model),
+    [],
+  )
 
   /**
    * The log directory, resolved by opening it.
@@ -262,6 +267,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
               opencodeModels,
               recheckModels,
               testModel,
+              probeLimits,
             })
           )}
         </div>

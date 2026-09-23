@@ -67,6 +67,8 @@ import { useAgents } from '@/sidebar/agentsStore'
 import { rosterColors, rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TaskDetailModal, TaskDetailPendingModal } from './TaskDetail'
 import { useSpec } from '../specStore'
+import { followMilestones, milestoneOfTask, useMilestones } from '../milestonesStore'
+import { CheckLogModal } from './CheckLogModal'
 import {
   attachments as attachmentsApi,
   spec as specApi,
@@ -640,6 +642,29 @@ function TaskDetailHostImpl() {
     [project, select, open],
   )
 
+  /*
+   * Which milestone the open task serves (M83), from the store the Milestones tab reads too. The
+   * selector returns the store's own `view` object and the chip is derived in a memo — a selector
+   * that built the chip would hand back a fresh object every render (`check:selectors`).
+   */
+  useEffect(() => followMilestones(), [])
+  const milestonesView = useMilestones((state) => state.view)
+  const [verifyLog, setVerifyLog] = useState(false)
+  // A log opened for one task must not greet the next card that opens.
+  const openId = open === null ? null : String(open.id)
+  useEffect(() => setVerifyLog(false), [openId])
+  const verify = useMemo(
+    () =>
+      open === null
+        ? null
+        : (milestonesView?.verifies.find((v) => String(v.task) === String(open.id)) ?? null),
+    [milestonesView, open],
+  )
+  const milestone = useMemo(
+    () => (open === null ? null : milestoneOfTask(milestonesView, String(open.id))),
+    [milestonesView, open],
+  )
+
   if (open === null) return null
   /*
    * The row is in hand and the content is not. Draw the row's own facts and say so — see
@@ -659,6 +684,15 @@ function TaskDetailHostImpl() {
        */
       key={open.id}
       task={detail}
+      milestone={milestone}
+      verify={verify}
+      onOpenVerifyLog={() => setVerifyLog(true)}
+      onOpenMilestone={(id) => {
+        // The card closes first: it is a modal over everything, and the milestone's own modal
+        // opens in the Tasks panel beneath it.
+        select(null)
+        useMilestones.getState().reveal(id)
+      }}
       runs={runs}
       roles={roles}
       roleColors={roleColors}
@@ -976,6 +1010,15 @@ function TaskDetailHostImpl() {
         onOpen={(attachment) => {
           if (project !== null) guarded(attachmentsApi.open(project, open.id as never, attachment))
         }}
+      />
+    )}
+    {/* Verify's whole log for this task, over the card (M83). */}
+    {verifyLog && project !== null && (
+      <CheckLogModal
+        project={project}
+        target={{ kind: 'verify', key: String(open.id), title: `Verify of ${String(open.id)}` }}
+        running={verify?.running === true}
+        onClose={() => setVerifyLog(false)}
       />
     )}
     </>

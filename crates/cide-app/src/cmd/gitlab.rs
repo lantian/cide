@@ -1,8 +1,8 @@
 //! GitLab IPC: blocking transport off the UI thread and review-scoped language services.
 use crate::{lsp::DiagnosticsRegistry, workspace_state::WorkspaceState};
 use cide_ipc::{
-    ProjectId, RepoId,
-    gitlab::{GitLabRequest, GitLabResponse},
+    ProjectId, RepoId, RunId,
+    gitlab::{GitLabRequest, GitLabResponse, GitLabReviewHarness},
 };
 use std::{
     path::PathBuf,
@@ -20,6 +20,13 @@ pub struct GitLabState {
     stopping: Arc<AtomicBool>,
 }
 impl GitLabState {
+    /// The service, for a caller outside the commands — `agent_rpc`'s review tools. (M85)
+    pub(crate) fn service(&self) -> Result<Arc<cide_gitlab::GitLab>, String> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("Cide is closing".into());
+        }
+        self.get()
+    }
     fn get(&self) -> Result<Arc<cide_gitlab::GitLab>, String> {
         self.service
             .get_or_init(|| {
@@ -105,6 +112,13 @@ pub async fn gitlab_request(
             | GitLabRequest::Open { .. }
             | GitLabRequest::Close { .. }
     );
+    // The user's own draft changes reach every window the way an agent's do. (M85)
+    let drafts_of = match &request {
+        GitLabRequest::DraftEdit { review, .. }
+        | GitLabRequest::DraftDiscard { review, .. }
+        | GitLabRequest::DraftPublish { review, .. } => Some(review.clone()),
+        _ => None,
+    };
     let needs_gate = !closing.is_empty()
         || matches!(
             &request,
@@ -115,6 +129,24 @@ pub async fn gitlab_request(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _gate = needs_gate.then(|| operations.lock());
         let app = worker_app;
+        // A review's agent runs stand in the checkout this close deletes (M85): stopped first,
+        // so none is left working in a directory that is no longer there.
+        if let Some(registry) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+            for id in &closing {
+                for (project, run) in registry.review_runs(id) {
+                    if let Err(error) = crate::cmd::agents::agents_stop_blocking(
+                        &app,
+                        project,
+                        run,
+                        crate::agents::StopBy::User,
+                        Some("the MR review was closed".into()),
+                        true,
+                    ) {
+                        tracing::warn!(%error, %run, "a review run did not stop with its review");
+                    }
+                }
+            }
+        }
         if !closing.is_empty() {
             app.state::<WorkspaceState>()
                 .update(|workspace| close_review_tabs(workspace, &closing))
@@ -131,16 +163,13 @@ pub async fn gitlab_request(
             }
         }
         let result = worker.execute(request)?;
-        if let Some((id, sha)) = checkout {
-            if !stopping.load(Ordering::Acquire) && worker.review_open(&id) {
-                if let Some(root) = worker.workspace_root(&id, &sha) {
-                    app.state::<DiagnosticsRegistry>().ensure(
-                        &app,
-                        review_project(&id, &sha)?,
-                        vec![root],
-                    );
-                }
-            }
+        if let Some((id, sha)) = checkout
+            && !stopping.load(Ordering::Acquire)
+            && worker.review_open(&id)
+            && let Some(root) = worker.workspace_root(&id, &sha)
+        {
+            app.state::<DiagnosticsRegistry>()
+                .ensure(&app, review_project(&id, &sha)?, vec![root]);
         }
         Ok::<_, String>(result)
     })
@@ -148,6 +177,9 @@ pub async fn gitlab_request(
     .map_err(|_| "GitLab worker did not finish")??;
     if changed {
         crate::emit::gitlab_changed(&app, &service.board());
+    }
+    if let Some(review) = drafts_of {
+        crate::emit::gitlab_drafts_changed(&app, &review);
     }
     Ok(result)
 }
@@ -464,4 +496,165 @@ mod review_tab_tests {
         assert_eq!(workspace.projects[&project].tabs.len(), 2);
         assert_eq!(workspace.projects[&second_project].tabs.len(), 1);
     }
+}
+
+/// Every harness cide can run a review on, and why not where it cannot. (M85)
+///
+/// `defs::implemented` then `defs::installed`, the order `defs::load` asks them in, so the
+/// dialog greys a harness out with the sentence the Agents panel would show for a role on it.
+/// On a worker: `installed` probes `PATH`.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gitlab_review_harnesses() -> Result<Vec<GitLabReviewHarness>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        cide_agents::harness::registry()
+            .iter()
+            .map(|harness| {
+                let harness = harness.kind();
+                GitLabReviewHarness {
+                    harness,
+                    unavailable: cide_agents::defs::implemented(harness)
+                        .or_else(|| cide_agents::defs::installed(harness)),
+                }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|_| "GitLab worker did not finish".to_string())
+}
+
+/// Start an agent reviewing a merge request. (M85) Answers the run at once; the run's own
+/// queue decides when it starts, and the panel opens its tab once it has a child.
+///
+/// The checkout is made **here**, before the run is enqueued, and not at the fork: it is a
+/// network fetch that can fail for reasons the user must see (a token without `read_repository`,
+/// a deleted source branch), and a failure inside a queued run surfaces as a failed row nobody
+/// was looking at. Made under the operations gate, like the `Checkout` request's, so a Close
+/// racing it cannot delete the directory half-way through.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gitlab_review_launch(
+    app: AppHandle,
+    state: State<'_, GitLabState>,
+    workspace: State<'_, WorkspaceState>,
+    project: ProjectId,
+    review: String,
+    harness: cide_ipc::Harness,
+    prompt: Option<String>,
+) -> Result<RunId, String> {
+    let service = state.service()?;
+    let snapshot = workspace.snapshot();
+    service.set_proxy(snapshot.settings.proxy.clone());
+    let roots: Vec<PathBuf> = snapshot
+        .projects
+        .get(&project)
+        .ok_or("Open a project to host the review: its run lives in that project's Agents panel")?
+        .roots
+        .iter()
+        .map(|r| r.path.clone())
+        .collect();
+    let root = roots
+        .first()
+        .cloned()
+        .ok_or("The project hosting the review has no folder")?;
+    let registry = app
+        .try_state::<Arc<crate::agents::AgentRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or("This window has no agent registry")?;
+    let operations = state.operations.clone();
+    let worker = service.clone();
+    let spec = tauri::async_runtime::spawn_blocking(move || {
+        let brief_for = cide_agents::harness::for_kind(harness)
+            .ok_or_else(|| format!("This build cannot run {harness:?}"))?;
+        let mr = worker.detail(&review)?;
+        let version = worker.latest_version(&review)?;
+        let head = version["head_commit_sha"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let base = version["base_commit_sha"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (checkout, with_base) = {
+            let _gate = operations.lock();
+            worker.review_checkout(&review, &head, &base)?
+        };
+        let host = worker.account_of(&review)?.host;
+        let projects: Vec<String> = [
+            mr["web_url"]
+                .as_str()
+                .and_then(|url| cide_gitlab::project_from_url(&host, url).ok()),
+            mr["source_project"]["path_with_namespace"]
+                .as_str()
+                .map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let local = crate::mr_review::local_repo_for(&roots, &host, &projects);
+        let checkout = PathBuf::from(checkout);
+        let prompt = crate::mr_review::opening_line(
+            &mr,
+            &version,
+            &checkout,
+            with_base,
+            local.as_deref(),
+            prompt.as_deref(),
+        );
+        let config = cide_agents::load_project(&root).config.agents;
+        Ok::<_, String>(crate::agents::DispatchSpec {
+            project,
+            agent: cide_ipc::AgentId(crate::mr_review::REVIEW_AGENT.into()),
+            agent_label: format!("Review !{}", mr["iid"]),
+            harness,
+            task: None,
+            task_title: None,
+            change: None,
+            prompt,
+            // Several MRs may be reviewed at once; the project's own cap still holds them all.
+            agent_limit: 4,
+            project_limit: config.max_concurrent,
+            checkout: None,
+            // Resolved at its fork, like every run before pools were stamped at dispatch: a
+            // review names no pool override of its own. `stamp_and_choose` stamps an empty one.
+            pool: Vec::new(),
+            // A review reports to nobody's conversation: its findings are drafts, its tab is
+            // where it is watched, and the product owner has no verdict to give on it.
+            notify: cide_ipc::RunNotify::Silent,
+            purpose: crate::agents::RunPurpose::MrReview {
+                review: review.clone(),
+                cwd: checkout,
+                brief: cide_agents::review::review_brief(brief_for),
+                tools: crate::mr_review::claude_allowed_tools(),
+                harness,
+            },
+        })
+    })
+    .await
+    .map_err(|_| "GitLab worker did not finish")??;
+    let run = registry
+        .enqueue_unique(spec)
+        .map_err(|_| "A review of this MR is already queued".to_string())?;
+    registry.mark_changed(&app, project);
+    registry.pump(&app);
+    Ok(run)
+}
+
+/// One review run as the Agents panel would draw it, or `None` once the registry has forgotten
+/// it. (M85) The MR panel follows its own review through this rather than the roster: a
+/// project whose subagents are switched off answers a roster with no runs in it at all, and a
+/// review is allowed to run there.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gitlab_review_run(
+    app: AppHandle,
+    project: ProjectId,
+    run: RunId,
+) -> Result<Option<cide_ipc::AgentRun>, String> {
+    let registry = app
+        .try_state::<Arc<crate::agents::AgentRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or("This window has no agent registry")?;
+    Ok(registry
+        .runs_for(project)
+        .into_iter()
+        .find(|live| live.run == run))
 }

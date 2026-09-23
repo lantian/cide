@@ -1,5 +1,5 @@
 //! Disposable review checkouts. A held OS lock is the authority for ownership, not a PID.
-use crate::{validate_relative, Result};
+use crate::{Result, validate_relative};
 use git2::{Oid, Repository};
 use parking_lot::Mutex;
 use std::{
@@ -7,8 +7,8 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -69,12 +69,10 @@ impl Workspaces {
                 .read(true)
                 .write(true)
                 .open(path.join("owner.lock"))
+                && owner.try_lock().is_ok()
+                && let Err(error) = remove_owned(&path)
             {
-                if owner.try_lock().is_ok() {
-                    if let Err(error) = remove_owned(&path) {
-                        tracing::warn!(%error,"Abandoned review workspace cleanup will be retried");
-                    }
-                }
+                tracing::warn!(%error,"Abandoned review workspace cleanup will be retried");
             }
         }
         let parent = base.join(uuid::Uuid::new_v4().to_string());
@@ -127,10 +125,10 @@ impl Workspaces {
         if self.stopped.load(Ordering::Acquire) {
             return Err("Cide is closing".into());
         }
-        if let Some(old) = entries.get(&key) {
-            if old.sha == sha {
-                return Ok(old.root.to_string_lossy().into());
-            }
+        if let Some(old) = entries.get(&key)
+            && old.sha == sha
+        {
+            return Ok(old.root.to_string_lossy().into());
         }
         let parent = self.parent.join(uuid::Uuid::new_v4().to_string());
         io(fs::create_dir(&parent))?;
@@ -176,6 +174,54 @@ impl Workspaces {
                 Err(e)
             }
         }
+    }
+    /// Fetch one more commit into the repository behind an existing checkout of `head` — the
+    /// MR base, so an agent standing in the checkout can `git diff <base> <head>`. A worktree
+    /// shares its repository's objects, so nothing else has to move.
+    ///
+    /// The entries lock is **not** held across the fetch, unlike `checkout`'s: that one guards
+    /// a directory being created, and this only adds objects to one that already exists, so a
+    /// slow network must not stall every other review's source view behind it.
+    pub fn fetch_into(
+        &self,
+        id: &str,
+        head: &str,
+        extra: &str,
+        url: &str,
+        token: &str,
+        proxy: &cide_ipc::ProxySettings,
+    ) -> Result<()> {
+        let oid = git(Oid::from_str(extra))?;
+        if extra.len() != 40 {
+            return Err("Review fetch requires an exact commit SHA".into());
+        }
+        let repository = self
+            .entries
+            .lock()
+            .get(&format!("{id}:{head}"))
+            .map(|e| e.parent.join("repository"))
+            .ok_or("Prepare the review source workspace first")?;
+        if git(Repository::open_bare(&repository))?
+            .find_commit(oid)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let cancelled = self
+            .cancelled
+            .lock()
+            .entry(id.into())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+        crate::fetch::fetch(
+            &repository,
+            extra,
+            url,
+            token,
+            proxy,
+            &self.stopped,
+            &cancelled,
+        )
     }
     pub fn versions(&self, id: &str) -> Vec<String> {
         let prefix = format!("{id}:");
@@ -380,25 +426,29 @@ mod tests {
         assert!(!Path::new(&root).exists());
         assert!(!Path::new(&revised_root).exists());
         assert!(base.join("origin/main.go").exists());
-        assert!(workspaces
-            .checkout(
-                "review",
-                &sha,
-                &url,
-                "",
-                &cide_ipc::ProxySettings::default()
-            )
-            .is_err());
+        assert!(
+            workspaces
+                .checkout(
+                    "review",
+                    &sha,
+                    &url,
+                    "",
+                    &cide_ipc::ProxySettings::default()
+                )
+                .is_err()
+        );
         workspaces.reopen("review");
-        assert!(workspaces
-            .checkout(
-                "review",
-                &sha,
-                &url,
-                "",
-                &cide_ipc::ProxySettings::default()
-            )
-            .is_ok());
+        assert!(
+            workspaces
+                .checkout(
+                    "review",
+                    &sha,
+                    &url,
+                    "",
+                    &cide_ipc::ProxySettings::default()
+                )
+                .is_ok()
+        );
         workspaces.shutdown();
         drop(workspaces);
         drop(tree);

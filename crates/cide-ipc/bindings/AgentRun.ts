@@ -128,4 +128,23 @@ note: string | null,
  *
  * What Open then does is a second question with three answers — see [`RunOpen`].
  */
-openable: boolean, };
+openable: boolean, 
+/**
+ * The model this run is on, `provider/model` where the harness spells it that way. (M89)
+ *
+ * **The run's, never the role file's.** After a local override or a pool failover the file
+ * names what the *next* dispatch would get; this names what the child was actually told,
+ * resolved by the same ladder as [`LogRunInfo::model`] so the panel's row and the log card
+ * never disagree. `None` where nothing chose one and the harness picked its own default —
+ * the row then draws the harness alone rather than guessing a name.
+ */
+model: string | null, 
+/**
+ * The pool that chose [`Self::model`] and how far down it the run is — `fast entry 2 of 3`.
+ * (M89) `None` for a run with no pool, which is every harness but opencode today.
+ *
+ * A field rather than the sentence it used to be inside [`Self::note`]: a pool is the
+ * standing fact of what the run is on, and a note is for events. A row that has to parse
+ * prose to learn its model is a row that breaks on the next rewording.
+ */
+poolPosition: string | null, };

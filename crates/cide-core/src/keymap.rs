@@ -365,8 +365,16 @@ pub fn defaults() -> Vec<Binding> {
     // `addCursorAbove`/`addCursorBelow`. Two breakages against this one.
     .chain(
         [
-            ("alt+pagedown", "gitlab.nextFile", "gitlabReviewActive && !overlayOpen"),
-            ("alt+pageup", "gitlab.previousFile", "gitlabReviewActive && !overlayOpen"),
+            (
+                "alt+pagedown",
+                "gitlab.nextFile",
+                "gitlabReviewActive && !overlayOpen",
+            ),
+            (
+                "alt+pageup",
+                "gitlab.previousFile",
+                "gitlabReviewActive && !overlayOpen",
+            ),
             ("alt+down", "navigate.nextMember", "editorFocused"),
             ("alt+up", "navigate.prevMember", "editorFocused"),
             /*

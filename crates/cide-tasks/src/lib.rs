@@ -1619,6 +1619,9 @@ pub fn read(path: &Path) -> ReadOutcome {
     };
     match parsed {
         Ok(mut file) => {
+            // In memory a tracker is always the current schema; the number on disk is decided at
+            // write time by `TaskFile::schema_on_disk`. (M83)
+            file.schema_version = TaskFile::CURRENT_SCHEMA;
             repair(&mut file);
             ReadOutcome::Ready {
                 file,
@@ -1646,14 +1649,17 @@ pub fn read(path: &Path) -> ReadOutcome {
 type Migrated = Option<HashMap<TaskId, TaskContent>>;
 
 fn migrate(value: Value, version: u64) -> std::result::Result<(Value, Migrated), String> {
-    let current = u64::from(TaskFile::CURRENT_SCHEMA);
-    if version == current {
+    // 2 and 3 are one shape: 3 only adds a status value (M83), so a 2 needs no conversion and
+    // — importantly — no flush. Counting it as migrated would rewrite every schema 2 tracker on
+    // open, which is exactly what `TaskFile::schema_on_disk` exists to avoid.
+    if version >= u64::from(TaskFile::SCHEMA_WITHOUT_INBOX) {
         return Ok((value, None));
     }
     let mut value = value;
     let mut version = version;
     let mut content: HashMap<TaskId, TaskContent> = HashMap::new();
-    while version < current {
+    // The ladder ends at 2, not at `CURRENT_SCHEMA`: 2 → 3 is not a conversion (see above).
+    while version < u64::from(TaskFile::SCHEMA_WITHOUT_INBOX) {
         let (next, lifted) = match version {
             1 => v1_to_v2(value)?,
             other => return Err(format!("no migration from schema {other}")),
@@ -3125,7 +3131,14 @@ impl TaskStore {
             return merged;
         }
 
-        let mut bytes = match serde_json::to_vec_pretty(&*guard) {
+        // Written as the schema the content needs, not the one this build knows (M83): a tracker
+        // with nothing in the inbox stays readable by a build that predates it. The field is put
+        // back straight after, under the same lock, because `validate` and every reader in this
+        // process hold the in-memory file to `CURRENT_SCHEMA`.
+        guard.schema_version = guard.schema_on_disk();
+        let encoded = serde_json::to_vec_pretty(&*guard);
+        guard.schema_version = TaskFile::CURRENT_SCHEMA;
+        let mut bytes = match encoded {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::error!(%error, "could not encode the task file");
@@ -4483,6 +4496,70 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.tasks()).expect("read"), newer);
     }
 
+    /// The schema number on disk follows the content, not the build. (M83)
+    ///
+    /// A build that predates `Inbox` reads `"status": "inbox"` as an unparseable file and sets it
+    /// aside; a newer schema number is a clean refusal instead. So a tracker is written as 3 only
+    /// while something is in the inbox — and a schema 2 file is opened *without* being rewritten,
+    /// or the installed cide beside a development one would be locked out of every tracker the
+    /// development one had merely looked at.
+    #[test]
+    fn the_schema_on_disk_is_three_only_while_something_is_in_the_inbox() {
+        let dir = TempDir::new("inbox-schema");
+        let schema = |dir: &TempDir| -> u64 {
+            let raw = fs::read_to_string(dir.tasks()).expect("written");
+            let value: Value = serde_json::from_str(&raw).expect("json");
+            value["schemaVersion"].as_u64().expect("a number")
+        };
+
+        let store = TaskStore::open(dir.root());
+        let plain = store
+            .create(&new_task("plain"), TaskAuthor::User)
+            .expect("created");
+        store.write_now();
+        assert_eq!(
+            schema(&dir),
+            2,
+            "no inbox row: an older build can still read it"
+        );
+
+        let mut noticed = new_task("noticed in passing");
+        noticed.status = Some(TaskStatus::Inbox);
+        let noticed = store.create(&noticed, TaskAuthor::User).expect("created");
+        store.write_now();
+        assert_eq!(
+            schema(&dir),
+            3,
+            "an inbox row: an older build must refuse, not quarantine"
+        );
+
+        store
+            .edit(
+                &noticed.id,
+                TaskEdit::SetStatus {
+                    status: TaskStatus::Todo,
+                },
+                TaskAuthor::User,
+            )
+            .expect("promoted");
+        store.write_now();
+        assert_eq!(
+            schema(&dir),
+            2,
+            "the inbox emptied, so the file is readable again"
+        );
+        drop(store);
+
+        let before = fs::read_to_string(dir.tasks()).expect("read");
+        let reopened = TaskStore::open(dir.root());
+        assert!(reopened.get(&plain.id).is_some());
+        assert_eq!(
+            fs::read_to_string(dir.tasks()).expect("read"),
+            before,
+            "opening a schema 2 tracker is not a conversion and writes nothing"
+        );
+    }
+
     #[test]
     fn a_duplicate_id_keeps_the_first_and_the_file_still_validates() {
         let dir = TempDir::new("dupe");
@@ -4635,7 +4712,8 @@ mod tests {
         let value: Value = serde_json::from_str(json).expect("valid JSON");
         let (migrated, content) = migrate(value, 1).expect("an older file still migrates");
         let file: TaskFile = serde_json::from_value(migrated).expect("and parses");
-        assert_eq!(file.schema_version, TaskFile::CURRENT_SCHEMA);
+        // The ladder stops at 2; `read` lifts the in-memory number to `CURRENT_SCHEMA` (M83).
+        assert_eq!(file.schema_version, TaskFile::SCHEMA_WITHOUT_INBOX);
         assert_eq!(file.tasks[0].change, None);
         assert!(
             file.tasks[0].links.is_empty(),

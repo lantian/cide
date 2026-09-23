@@ -185,6 +185,7 @@ try {
     workedFor,
     timeTitle,
     staleTurnLine,
+    usingLabel,
   } = agents
 
   const {
@@ -303,7 +304,7 @@ try {
   const rustPhases = variants(agentsRs, 'pub enum RunState {', 'RunState')
   const rustHarnesses = variants(agentsRs, 'pub enum Harness {', 'Harness')
 
-  ok(rustStatuses.length === 4, `read ${rustStatuses.length} TaskStatus variants — the scan still matches`)
+  ok(rustStatuses.length === 5, `read ${rustStatuses.length} TaskStatus variants — the scan still matches`)
   ok(rustPhases.length === 9, `read ${rustPhases.length} RunState variants — the scan still matches`)
   ok(rustHarnesses.length === 5, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
 
@@ -460,6 +461,19 @@ try {
     eq(phaseGlyph('running'), SPINNING_GLYPH, 'and the table and the rule name the same mark')
     ok(!glyphSpins(phaseGlyph('idle')), 'idle sits still — the contrast the arc was chosen for')
     ok(!glyphSpins(''), 'and an unknown phase\u2019s fallback mark does not spin')
+  }
+
+  /*
+   * What a run is on. (M89) The harness always leads; a model nobody chose draws nothing rather
+   * than a guessed word; the pool says `pool` so `fast 2 of 3` does not read as a quota.
+   */
+  {
+    const on = (harness, model, poolPosition) => usingLabel({ harness, model, poolPosition })
+    eq(on('opencode', 'zai/glm-4.6', 'fast entry 2 of 3'), 'opencode · zai/glm-4.6 · pool fast entry 2 of 3', 'all three')
+    eq(on('claude', 'opus', null), 'claude · opus', 'a single model, no pool')
+    eq(on('codex', null, null), 'codex', 'nothing chosen: the harness alone, never "default"')
+    eq(on('claude', '  ', ''), 'claude', 'blank is nothing, not an empty segment')
+    eq(on('', null, null), 'unknown harness', 'and an empty harness still gets harnessLabel\u2019s word')
   }
 
   /*

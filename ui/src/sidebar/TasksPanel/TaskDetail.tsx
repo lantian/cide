@@ -528,6 +528,8 @@ function asRun(chip: Chip): RunView {
     staleTurn: false,
     note: null,
     openable: chip.openable,
+    model: null,
+    poolPosition: null,
   }
 }
 
@@ -559,7 +561,32 @@ export interface LinkAdd {
   kind: LinkKind
 }
 
+/**
+ * The milestone a task serves, for the chip in the card's head. (M83) `goal` is the milestone's
+ * own task; `state` is the milestone's, not the task's.
+ */
+export interface TaskMilestone {
+  id: string
+  title: string
+  state: 'active' | 'later' | 'accepted'
+  goal: boolean
+}
+
 export interface TaskDetailProps {
+  /**
+   * Which milestone this task belongs to, or absent for none. (M83) Optional, so every story
+   * that predates milestones draws the head it always drew.
+   */
+  milestone?: TaskMilestone | null | undefined
+  /**
+   * cide's verify on this task's branch (M83): running, or its last verdict with the output.
+   * Absent draws nothing.
+   */
+  verify?: import('@/ipc/client').VerifyState | null | undefined
+  /** Open verify's whole log for this task. Absent draws no button. */
+  onOpenVerifyLog?: (() => void) | undefined
+  /** Open that milestone in the Tasks panel's Milestones tab. Absent draws the line inert. */
+  onOpenMilestone?: ((milestone: string) => void) | undefined
   /**
    * The task, **with its content**. (M68)
    *
@@ -1152,6 +1179,104 @@ export function TaskDetail(props: TaskDetailProps) {
       </div>
 
       <div className={styles.cardBody} data-audit="taskCardBody">
+        {/*
+          * The milestone this task serves (M83), as its own line above the title rather than a
+          * chip in the head: the head is the id, the creator, a spec chip and the close button,
+          * and a milestone squeezed in beside them was cut to `in milestone: sl…`. Its title is
+          * the point — which goal this work is for — so it gets the width, and it is a button
+          * because the next thing anybody wants is the milestone itself: its gate and its other
+          * tasks, in the Milestones tab.
+          */}
+        {props.milestone != null && (
+          <button
+            type="button"
+            className={styles.milestoneLine}
+            data-audit="taskMilestone"
+            data-milestone={props.milestone.id}
+            data-state={props.milestone.state}
+            disabled={props.onOpenMilestone === undefined}
+            title="Open this milestone"
+            onClick={() => props.onOpenMilestone?.(props.milestone?.id ?? '')}
+          >
+            <span className={styles.milestoneLabel}>Milestone</span>
+            <span className={styles.milestoneId}>{props.milestone.id}</span>
+            <span className={styles.milestoneTitle}>{props.milestone.title}</span>
+            <span className={styles.milestoneState}>
+              {props.milestone.goal
+                ? 'this task is the milestone'
+                : props.milestone.state === 'active'
+                  ? 'active'
+                  : props.milestone.state === 'accepted'
+                    ? 'accepted'
+                    : 'waits for its turn'}
+            </span>
+          </button>
+        )}
+        {/*
+          * Verify on this task's branch (M83) — the check cide runs before a model may merge the
+          * work. Running is drawn turning; a verdict names the command and when, and a failure
+          * opens onto its output, which is exactly the feedback the reviewer hands back.
+          */}
+        {props.verify != null && (
+          <div
+            className={styles.verifyLine}
+            data-audit="taskVerify"
+            data-verify={
+              props.verify.running ? 'running' : props.verify.last?.passed === true ? 'passed' : 'failed'
+            }
+          >
+            <div className={styles.verifyHead}>
+              <span
+                className={props.verify.running ? styles.chipSpin : undefined}
+                aria-hidden="true"
+              >
+                <Icon
+                  name={asIcon(
+                    props.verify.running
+                      ? 'loader-circle'
+                      : props.verify.last?.passed === true
+                        ? 'circle-check'
+                        : 'circle-x',
+                  )}
+                  size={0}
+                />
+              </span>
+              <span>
+                {props.verify.running
+                  ? 'Verify is running on this branch'
+                  : props.verify.last?.passed === true
+                    ? 'Verify passed'
+                    : 'Verify failed'}
+              </span>
+              {props.verify.last !== undefined && (
+                <span className={styles.verifyMeta}>
+                  {props.verify.running ? 'previous: ' : ''}
+                  <code>{props.verify.last.command}</code> ·{' '}
+                  {new Date(props.verify.last.startedUnixMs).toLocaleString()}
+                  {props.verify.last.durationMs > 0
+                    ? ` · ${Math.round(props.verify.last.durationMs / 1000)}s`
+                    : ''}
+                </span>
+              )}
+              {props.onOpenVerifyLog !== undefined && (
+                <button
+                  type="button"
+                  className={styles.verifyLog}
+                  data-audit="taskVerifyLog"
+                  onClick={props.onOpenVerifyLog}
+                >
+                  {props.verify.running ? 'watch the log' : 'full log'}
+                </button>
+              )}
+            </div>
+            {props.verify.last !== undefined && props.verify.last.tail !== '' && (
+              <details className={styles.verifyOutput} open={!props.verify.running && !props.verify.last.passed}>
+                <summary>Output</summary>
+                <pre>{props.verify.last.tail.split('\n').slice(-30).join('\n')}</pre>
+              </details>
+            )}
+          </div>
+        )}
         <FieldRow field="title" task={task} roles={roles} editing={editing} run={run} props={props} />
 
         {/*

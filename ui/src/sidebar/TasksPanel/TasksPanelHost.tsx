@@ -75,6 +75,7 @@
  */
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  agentRuns,
   attachments as attachmentsApi,
   tasks as tasksApi,
   fsReveal,
@@ -88,6 +89,8 @@ import { useSpec } from '../specStore'
 import { useAgents } from '@/sidebar/agentsStore'
 import { rosterColors, rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TasksPanelView } from './TasksPanel'
+import { MilestonesPanel, TasksTabs } from './MilestonesPanel'
+import { followMilestones, runningGates, useMilestones, verifyMarks } from '../milestonesStore'
 import { TaskComposeModal } from './TaskCompose'
 import { assigneeHint, filterAfterCreate, linkableTargets, queryAfterCreate } from './model'
 import type { ArmedDelete, RunRef, StatusFilter } from './model'
@@ -219,6 +222,18 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    * two states and the filtered-to-nothing screen names the filter, counts the tasks that exist
    * and offers Show all — and the filter row itself stays on screen, lit on the one that is on.
    */
+  /*
+   * Tasks or Milestones (M83). In the milestones store rather than here, so a task card can ask
+   * for the Milestones tab (its milestone chip); remembered for the life of the window, so the
+   * rail's Files and back does not throw the user off the tab they were on.
+   */
+  const tab = useMilestones((state) => state.tab)
+  const setTab = useMilestones((state) => state.setTab)
+  // The view object itself, and the marks derived in a memo (`check:selectors`). (M83)
+  useEffect(() => followMilestones(), [])
+  const milestonesView = useMilestones((state) => state.view)
+  const verifies = useMemo(() => verifyMarks(milestonesView), [milestonesView])
+  const gatesRunning = useMemo(() => runningGates(milestonesView), [milestonesView])
   const [filter, setFilter] = useState<StatusFilter>(null)
 
   /**
@@ -325,6 +340,11 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
    * deliberately does not import that, so the surfacing stays at the gesture, where a reader
    * looking at the click can find it.
    */
+  /*
+   * A **Plan tasks** press in flight. (M88) Local state and not the store's: it guards one
+   * button against a second press, and a sidebar shut mid-press loses nothing but the dimming.
+   */
+  const [planning, setPlanning] = useState(false)
   const guarded = useCallback(
     (done: Promise<void>) => {
       // Stamped with this panel's project, so a write that fails after the user has moved on
@@ -334,9 +354,28 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
     [project],
   )
 
+  const verifyingTasks = Object.keys(verifies).filter((t) => verifies[t] === 'running')
+  const verifying = verifyingTasks.length
+  const tabs = (
+    <TasksTabs
+      tab={tab}
+      onTab={setTab}
+      gatesRunning={gatesRunning}
+      verifying={verifying}
+      verifyingTasks={verifyingTasks}
+      project={project}
+      proposals={milestonesView?.proposals.length ?? 0}
+    />
+  )
+  if (tab === 'milestones') {
+    return <MilestonesPanel project={project} title={tabs} />
+  }
+
   return (
     <>
       <TasksPanelView
+        title={tabs}
+        verifies={verifies}
         project={project}
         board={board}
         runs={runs}
@@ -372,6 +411,20 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
          * `tasksStore.create`, which is where a palette `task.new` would arrive too.
          */
         onCreateTask={beginCompose}
+        /*
+         * Only when the project has roles: the planner's whole output is work put on them, and
+         * Rust refuses a project with subagents off anyway. The press resolves once the tab is
+         * open; a refusal (a met milestone, subagents off) is a sentence for `notifyFailure`.
+         */
+        {...(project !== null && roster.kind === 'ready'
+          ? {
+              onPlanTasks: () => {
+                setPlanning(true)
+                guarded(agentRuns.planNow(project).finally(() => setPlanning(false)))
+              },
+            }
+          : {})}
+        planning={planning}
         {...(project !== null && path !== null
           ? {
               onReveal: () => {

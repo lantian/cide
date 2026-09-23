@@ -28,10 +28,16 @@
  * overwrite the real key. What survives is `ClaudeCliSection`'s rule — a value you cannot see is a
  * value you cannot correct — and a `Note` saying plainly where the bytes end up.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 
 import { Icon } from '@/icons'
-import type { AgentModels, LlmModelTest, LlmSettings, SettingsPatch } from '@/ipc/generated'
+import type {
+  AgentModels,
+  LlmLimitsProbe,
+  LlmModelTest,
+  LlmSettings,
+  SettingsPatch,
+} from '@/ipc/generated'
 
 import { ActionButton, Group, Note, Row, TextField, ToggleRow } from './controls'
 import controls from './controls.module.css'
@@ -50,8 +56,10 @@ import {
   modelsFor,
   moveDown,
   moveUp,
+  poolCapacity,
   removeAt,
   splitModelId,
+  withMaxRunning,
   type Entry,
   type Model,
   type Pool,
@@ -76,6 +84,8 @@ export interface ModelsSectionProps {
    * wired to a button — never to a keystroke or a mount.
    */
   testModel: (model: string) => Promise<LlmModelTest | null>
+  /** A custom model's limits from its server. Free; see `ModelRows`. (M88) */
+  probeLimits: (provider: string, model: string) => Promise<LlmLimitsProbe | null>
 }
 
 export function ModelsSection({
@@ -84,6 +94,7 @@ export function ModelsSection({
   models,
   recheckModels,
   testModel,
+  probeLimits,
 }: ModelsSectionProps) {
   const write = (next: LlmSettings) => patch({ llm: next })
   const providers = settings.providers as Provider[]
@@ -161,6 +172,7 @@ export function ModelsSection({
             onChange={(next) => setProvider(index, next)}
             onRemove={() => write({ ...settings, providers: removeAt(providers, index) })}
             testModel={testModel}
+            probeLimits={probeLimits}
           />
         ))}
         <div className={styles.actions}>
@@ -287,6 +299,7 @@ function ProviderCard({
   onChange,
   onRemove,
   testModel,
+  probeLimits,
 }: {
   provider: Provider
   offered: readonly string[] | null
@@ -296,6 +309,7 @@ function ProviderCard({
   onChange: (next: Provider) => void
   onRemove: () => void
   testModel: (model: string) => Promise<LlmModelTest | null>
+  probeLimits: (provider: string, model: string) => Promise<LlmLimitsProbe | null>
 }) {
   const problems = localProblems(provider)
   return (
@@ -364,7 +378,7 @@ function ProviderCard({
         onCommit={(label) => onChange({ ...provider, label })}
       />
 
-      {providerBody(provider, onChange)}
+      {providerBody(provider, onChange, probeLimits)}
 
       {problems.map((problem) => (
         <p key={problem} className={styles.problem}>
@@ -457,7 +471,11 @@ function TestableModels({
 }
 
 /** The fields that differ per kind. Exhaustive, with a `never` on the end. */
-function providerBody(provider: Provider, onChange: (next: Provider) => void) {
+function providerBody(
+  provider: Provider,
+  onChange: (next: Provider) => void,
+  probeLimits: (provider: string, model: string) => Promise<LlmLimitsProbe | null>,
+) {
   switch (provider.kind) {
     case 'catalog':
       return (
@@ -506,8 +524,10 @@ function providerBody(provider: Provider, onChange: (next: Provider) => void) {
             onCommit={(apiKey) => onChange({ ...provider, apiKey })}
           />
           <ModelRows
+            provider={provider.id}
             models={provider.models as Model[]}
             onChange={(models) => onChange({ ...provider, models })}
+            probeLimits={probeLimits}
           />
         </>
       )
@@ -565,16 +585,67 @@ function verdictMiss(provider: Provider): string {
   }
 }
 
-/** The model list a custom endpoint must declare. */
+/**
+ * The model list a custom endpoint must declare.
+ *
+ * # Limits fill themselves (M88)
+ *
+ * opencode never asks a custom server for a model's window, and a model declared without one runs
+ * with no compaction threshold. The server usually says — `llm_probe_limits` reads it — so a row
+ * whose two number boxes are still empty is filled when its model id is committed (on blur), and
+ * the refresh button asks again on demand. The automatic road **never overwrites** a number the
+ * user typed; the button does, because pressing it is asking for the server's figure.
+ *
+ * The answer lands through `latest`, not the `models` the request was made from: the probe takes
+ * a second over a network, and a row list captured at the request would revert whatever was typed
+ * meanwhile. It is matched by model id, which the answer echoes, so a row retyped in the meantime
+ * is left alone.
+ */
 function ModelRows({
+  provider,
   models,
   onChange,
+  probeLimits,
 }: {
+  provider: string
   models: Model[]
   onChange: (next: Model[]) => void
+  probeLimits: (provider: string, model: string) => Promise<LlmLimitsProbe | null>
 }) {
   const set = (index: number, next: Model) =>
     onChange(models.map((m, i) => (i === index ? next : m)))
+  const latest = useRef({ models, onChange })
+  latest.current = { models, onChange }
+  const [probes, setProbes] = useState<Record<string, LlmLimitsProbe | 'running'>>({})
+  const detect = (model: Model, overwrite: boolean) => {
+    const id = model.id.trim()
+    if (id === '' || provider === '') return
+    setProbes((was) => ({ ...was, [id]: 'running' }))
+    void probeLimits(provider, id).then((answer) => {
+      setProbes((was) => ({
+        ...was,
+        [id]: answer ?? {
+          provider,
+          model: id,
+          context: 0,
+          output: 0,
+          outputEstimated: false,
+          detail: 'This build cannot read limits from a server.',
+        },
+      }))
+      if (answer === null || answer.context === 0) return
+      const now = latest.current
+      const at = now.models.findIndex((m) => m.id.trim() === answer.model)
+      const row = now.models[at]
+      if (row === undefined) return
+      if (!overwrite && (row.context !== 0 || row.output !== 0)) return
+      now.onChange(
+        now.models.map((m, i) =>
+          i === at ? { ...m, context: answer.context, output: answer.output } : m,
+        ),
+      )
+    })
+  }
   return (
     <div>
       <span className={controls.label}>Models</span>
@@ -590,45 +661,61 @@ function ModelRows({
         <span className={styles.modelHeadNumber}>Output</span>
       </div>
       {models.map((model, index) => (
-        <div key={index} className={styles.modelRow}>
-          <input
-            className={styles.entryField}
-            aria-label="Model id"
-            placeholder="qwen3:8b"
-            value={model.id}
-            onChange={(e) => set(index, { ...model, id: e.target.value })}
-          />
-          <input
-            className={styles.entryField}
-            aria-label="Model label"
-            placeholder="shown in menus"
-            value={model.label}
-            onChange={(e) => set(index, { ...model, label: e.target.value })}
-          />
-          <input
-            className={`${styles.entryField} ${styles.modelNumber}`}
-            aria-label="Context limit"
-            placeholder="tokens"
-            inputMode="numeric"
-            value={model.context === 0 ? '' : String(model.context)}
-            onChange={(e) => set(index, { ...model, context: numberOf(e.target.value) })}
-          />
-          <input
-            className={`${styles.entryField} ${styles.modelNumber}`}
-            aria-label="Output limit"
-            placeholder="tokens"
-            inputMode="numeric"
-            value={model.output === 0 ? '' : String(model.output)}
-            onChange={(e) => set(index, { ...model, output: numberOf(e.target.value) })}
-          />
-          <button
-            type="button"
-            className={styles.iconButton}
-            aria-label="Remove model"
-            onClick={() => onChange(removeAt(models, index))}
-          >
-            <Icon name="x" size={1} />
-          </button>
+        <div key={index}>
+          <div className={styles.modelRow}>
+            <input
+              className={styles.entryField}
+              aria-label="Model id"
+              placeholder="qwen3:8b"
+              value={model.id}
+              onChange={(e) => set(index, { ...model, id: e.target.value })}
+              onBlur={() => {
+                if (model.context === 0 && model.output === 0) detect(model, false)
+              }}
+            />
+            <input
+              className={styles.entryField}
+              aria-label="Model label"
+              placeholder="shown in menus"
+              value={model.label}
+              onChange={(e) => set(index, { ...model, label: e.target.value })}
+            />
+            <input
+              className={`${styles.entryField} ${styles.modelNumber}`}
+              aria-label="Context limit"
+              placeholder="tokens"
+              inputMode="numeric"
+              value={model.context === 0 ? '' : String(model.context)}
+              onChange={(e) => set(index, { ...model, context: numberOf(e.target.value) })}
+            />
+            <input
+              className={`${styles.entryField} ${styles.modelNumber}`}
+              aria-label="Output limit"
+              placeholder="tokens"
+              inputMode="numeric"
+              value={model.output === 0 ? '' : String(model.output)}
+              onChange={(e) => set(index, { ...model, output: numberOf(e.target.value) })}
+            />
+            <button
+              type="button"
+              className={styles.iconButton}
+              aria-label="Read limits from the server"
+              title="Read this model's context and output limits from the server"
+              disabled={model.id.trim() === '' || probes[model.id.trim()] === 'running'}
+              onClick={() => detect(model, true)}
+            >
+              <Icon name="refresh-cw" size={1} />
+            </button>
+            <button
+              type="button"
+              className={styles.iconButton}
+              aria-label="Remove model"
+              onClick={() => onChange(removeAt(models, index))}
+            >
+              <Icon name="x" size={1} />
+            </button>
+          </div>
+          <LimitsNote probe={probes[model.id.trim()]} />
         </div>
       ))}
       <div className={styles.actions}>
@@ -638,6 +725,17 @@ function ModelRows({
         />
       </div>
     </div>
+  )
+}
+
+/** What the server said about one row's limits, under it — or nothing before it was asked. */
+function LimitsNote({ probe }: { probe: LlmLimitsProbe | 'running' | undefined }) {
+  if (probe === undefined) return null
+  if (probe === 'running') return <span className={styles.limitsNote}>Asking the server…</span>
+  return (
+    <span className={probe.context > 0 ? styles.limitsNote : styles.testResultBad}>
+      {probe.detail}
+    </span>
   )
 }
 
@@ -753,6 +851,22 @@ function PoolCard({
               value={entry.variant}
               onChange={(e) => set(index, { ...entry, variant: e.target.value })}
             />
+            {/*
+             * The entry's running limit. Blank is no limit. A run starts on the first entry
+             * with room, and waits in the queue when every one is full — so this is how a
+             * subscription that allows four sessions is kept from being asked for a fifth.
+             */}
+            <input
+              className={`${styles.entryField} ${styles.entryLimit}`}
+              aria-label="Entry max running"
+              title="How many runs may use this model at once, across every project. Blank is no limit."
+              type="number"
+              min={1}
+              step={1}
+              placeholder="no limit"
+              value={entry.maxRunning ?? ''}
+              onChange={(e) => set(index, withMaxRunning(entry, e.target.value))}
+            />
             {/* Buttons rather than drag: keyboard-reachable, and the move logic is a pure
                 function `check:pools` drives. `check:ui-icons` forbids a Unicode arrow. */}
             <button
@@ -813,9 +927,17 @@ function PoolCard({
                   : entryFlags(entry).join(' ')}
                 {verdict === 'unknownProvider' && '   ← no such provider'}
                 {verdict === 'disabledProvider' && '   ← provider switched off'}
+                {verdict !== 'incomplete' &&
+                  entry.maxRunning !== undefined &&
+                  `   (up to ${entry.maxRunning} at once)`}
               </span>
             )
           })}
+          {poolCapacity(entries) !== null && (
+            <span className={styles.readoutLine}>
+              holds {poolCapacity(entries)} run(s) at once; the next waits for a model to free
+            </span>
+          )}
         </div>
       )}
     </div>

@@ -77,7 +77,7 @@ try {
   const tool = '● bash  cargo test --workspace  1.2s #7'
   eq(
     run.parseRunLine(tool),
-    { tool: 'bash', handle: 7, toolEnd: 6, tokenStart: tool.length - 2, end: tool.length },
+    { tool: 'bash', handle: 7, toolStart: 0, toolEnd: 6, tokenStart: tool.length - 2, end: tool.length },
     'a completed call: the prefix ends after the tool, the token is the last two characters',
   )
   eq(run.parseRunLine(tool + '   ').handle, 7, 'trailing cells are trimmed before the token is read')
@@ -89,6 +89,19 @@ try {
   eq(run.parseRunLine('● bash  echo #7 #x'), null, 'and the token must be digits')
 
   /*
+   * The stamp `render::stamp` opens every opencode row with. Skipped rather than linked: the
+   * glyph-and-tool span moves right by exactly its width, and nothing else about the row changes.
+   */
+  const stamped = '[2026-09-23 18:01:59] ● bash  cargo test --workspace  1.2s #7'
+  eq(
+    run.parseRunLine(stamped),
+    { tool: 'bash', handle: 7, toolStart: 22, toolEnd: 28, tokenStart: stamped.length - 2, end: stamped.length },
+    'a stamped call: the prefix span starts at the glyph, past the stamp',
+  )
+  eq(run.parseRunLine('[2026-09-23 18:01:59] ∴ thought  4.1s #8').tool, 'thought', 'a stamped thought row links too')
+  eq(run.parseRunLine('[soon] ● bash  cargo test #7'), null, 'only the stamp\'s own shape is skipped')
+
+  /*
    * The thought row (M62). A block of the model's reasoning is one collapsed row whose whole
    * text lives behind the handle, so the row *must* parse: a `∴` line that this grammar refuses
    * shows a `#8` nobody can click, and nothing in Rust or in the pane can see that. Its `tool`
@@ -97,7 +110,7 @@ try {
   const thought = '∴ thought  4.1s #8'
   eq(
     run.parseRunLine(thought),
-    { tool: 'thought', handle: 8, toolEnd: 9, tokenStart: thought.length - 2, end: thought.length },
+    { tool: 'thought', handle: 8, toolStart: 0, toolEnd: 9, tokenStart: thought.length - 2, end: thought.length },
     'a thought row parses as a run line, prefix and token alike',
   )
   eq(run.parseRunLine('∴ thought  #8').handle, 8, 'and with no duration, which is the unknown case')
@@ -316,6 +329,10 @@ try {
   ok(row !== null, 'render.rs still builds the thought row from one format string')
   ok(run.parseRunLine(`${row}  4.1s #8`) !== null && run.parseRunLine(`${row}  #8`) !== null,
     `the row Rust spells (${row}) is a row this parser reads, with and without a duration`)
+  // The row stamp, likewise: Rust spells it with a chrono format, this parser skips it with a
+  // regex, and a drift between them unlinks every row of every opencode run.
+  ok(render.includes('format!("{DIM}[{}]{RESET} ", at.format("%Y-%m-%d %H:%M:%S"))'),
+    'render.rs still stamps a row `[%Y-%m-%d %H:%M:%S] `, the one shape `runLinks.ts` skips')
   ok(/pub\(super\) fn tail\(ms: Option<u64>, handle: Option<u64>\)/.test(render),
     'and one function spells the `#handle` tail for both harnesses, so a tool line and a '
       + 'thought row cannot drift out of that grammar separately')
@@ -333,9 +350,9 @@ try {
       + 'provider drops `cide-log:` before any handler is asked and the click does nothing')
   ok(xterm.includes('parseLogLink(uri)') && xterm.includes('showLogDetail('),
     'and it routes a parsed log link to the card rather than to the web-link refusal')
-  ok(/notify\(`cide does not open web links/.test(xterm),
-    'while every other URI still meets the refusal: allowing non-http protocols through to '
-      + 'this handler must not become allowing cide to open them')
+  ok(/if \(isWebUrl\(uri\)\)/.test(xterm) && /notify\(`cide does not open web links/.test(xterm),
+    'only an http(s) URI is opened, and every other one still meets the refusal: allowing '
+      + 'non-http protocols through to this handler must not become allowing cide to open them')
 
   const app = readFileSync(join(UI, 'src', 'App.tsx'), 'utf8')
   eq((app.match(/<LogDetailCard \/>/g) ?? []).length, 2,

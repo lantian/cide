@@ -399,6 +399,58 @@ pub fn integrate(root: &Path, agent: &str) -> Result<Integration> {
     })
 }
 
+/// How many commits `cide/<agent>` has that the project's `HEAD` does not, or `None` when there
+/// is no such branch or everything on it is already in.
+///
+/// The question behind "may this task be set to done": accepting a run's work means taking it
+/// into this branch, and a task closed over a branch that never landed is work the board says is
+/// finished and the product does not have. That happened (terrastrike's t-1062): the reviewer's
+/// `cide_agent_integrate` was denied by the tab's own permission check — not a conflict, so the
+/// review prompt's "a conflict means not done" did not obviously cover it — the reviewer set the
+/// task to done anyway with "somebody should merge this" in its last comment, and nothing on the
+/// board ever looked at that task again. A prompt rule had already failed once, so the answer is
+/// a fact the tracker checks rather than a sentence it asks for.
+///
+/// Read-only and cheap — one revwalk bounded by the merge base — so it can sit in front of every
+/// status change. A missing branch is `None` rather than an error: a task-less run, a role with
+/// `worktree: false`, or a branch somebody deleted after merging all mean "nothing is waiting".
+pub fn unmerged(root: &Path, agent: &str) -> Result<Option<usize>> {
+    validate_agent(agent)?;
+    let repo = repo_mod::open(&repo_mod::canonical(root))?;
+    let Ok(branch) = repo.find_branch(&branch_name(agent), BranchType::Local) else {
+        return Ok(None);
+    };
+    let theirs = branch.into_reference().peel_to_commit().wrap()?.id();
+    let ours = repo
+        .head()
+        .map_err(|_| GitError::Unborn)?
+        .peel_to_commit()
+        .wrap()?
+        .id();
+    let mut walk = repo.revwalk().wrap()?;
+    walk.push(theirs).wrap()?;
+    walk.hide(ours).wrap()?;
+    let ahead = walk.count();
+    if ahead == 0 {
+        return Ok(None);
+    }
+    // Commits ahead whose *content* is already in: terrastrike's `cide/qa-t-22` is one merge
+    // commit of `cide/developer-t-22`, which master took directly. Counting commits alone calls
+    // that unmerged for ever, and a gate that fires on work that is plainly in teaches whoever
+    // meets it to route around it. So the merge is computed in memory, as `integrate` does,
+    // and a clean result equal to `HEAD`'s tree means there is nothing waiting. A conflict is
+    // by definition content that is not in.
+    let ours_commit = repo.find_commit(ours).wrap()?;
+    let theirs_commit = repo.find_commit(theirs).wrap()?;
+    let mut index = repo
+        .merge_commits(&ours_commit, &theirs_commit, None)
+        .wrap()?;
+    if !index.has_conflicts() && index.write_tree_to(&repo).wrap()? == ours_commit.tree_id() {
+        return Ok(None);
+    }
+    Ok(Some(ahead))
+}
+
 // --- internals ------------------------------------------------------------------------------
 
 /// `cide/<agent>`.
@@ -747,6 +799,40 @@ mod tests {
             Integration::UpToDate
         );
         assert_eq!(head_of(&root), before, "and nothing moved");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The gate `cide_task_update` puts in front of `done`: nothing on a missing or fully merged
+    /// branch, a count on one that is ahead — including after the base moved on, which is the
+    /// case a plain `HEAD == branch` comparison would get wrong in both directions.
+    #[test]
+    fn unmerged_counts_only_what_the_base_lacks() {
+        let root = project("unmerged");
+        assert_eq!(unmerged(&root, "developer-t-1").expect("no branch"), None);
+
+        let made = ensure(&root, "developer-t-1").expect("ensure");
+        assert_eq!(unmerged(&root, "developer-t-1").expect("fresh"), None);
+
+        commit(&made.path, "a.txt", "a\n", "one");
+        commit(&made.path, "b.txt", "b\n", "two");
+        commit(&root, "base2.txt", "moved\n", "the base moves on");
+        assert_eq!(unmerged(&root, "developer-t-1").expect("ahead"), Some(2));
+
+        assert!(matches!(
+            integrate(&root, "developer-t-1").expect("integrate"),
+            Integration::Merged { .. }
+        ));
+        assert_eq!(unmerged(&root, "developer-t-1").expect("merged"), None);
+
+        // Commits ahead whose content the base already has — a branch that only merged
+        // another one master took directly — is nothing waiting, not one commit unmerged.
+        let qa = ensure(&root, "qa-t-1").expect("ensure qa");
+        git(
+            &qa.path,
+            &["commit", "-q", "--allow-empty", "-m", "nothing new"],
+        );
+        assert_eq!(unmerged(&root, "qa-t-1").expect("empty commit"), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }

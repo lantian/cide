@@ -180,9 +180,14 @@ for (const arm of ['off', 'refused']) {
 const KNOWN_CLIENT_FRAMES = [
   'acknowledge',
   'answerPrompt',
+  // M91: the Milestones screen reads a check's log, runs the active gate, accepts it.
+  'checkLog',
   'dispatch',
+  'gateRun',
   'hello',
   'input',
+  'milestoneAccept',
+  'milestonesGet',
   'pair',
   'paste',
   'ping',
@@ -190,6 +195,8 @@ const KNOWN_CLIENT_FRAMES = [
   'runResume',
   'runStop',
   'scroll',
+  // M91: PgUp/PgDn page the desk's view as well as the phone's.
+  'scrollView',
   'scrollbackPage',
   'subscribe',
   'taskEdit',

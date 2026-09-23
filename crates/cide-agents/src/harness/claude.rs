@@ -428,7 +428,9 @@ fn assemble(
     //
     // Gated, so a run with no bridge is never told to call tools it does not have. See
     // `tracker` above and `TRACKER_PREAMBLE`'s own header.
-    if tracker.is_some() {
+    // `plan.tracker_paragraphs` is off for a run served another tool set (M85): an MR review
+    // keeps its bridge but must not be told to use tools its connection does not list.
+    if tracker.is_some() && plan.tracker_paragraphs {
         cide_core::claude_cli::fold_append_system_prompt(
             &mut args,
             &tracker_preamble(&ClaudeHarness),
@@ -880,6 +882,7 @@ mod tests {
             // Off in the fixture, so every argv assertion below is about what the role
             // and the plan actually said; the skip default has tests of its own.
             unattended: Unattended::Ask,
+            tracker_paragraphs: true,
         }
     }
 

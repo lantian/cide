@@ -36,7 +36,7 @@ harness: Harness,
  */
 model: string | null, 
 /**
- * How far down its pool this run has fallen, as `2 of 3`, or `None` for a run with no
+ * How far down its pool this run has fallen, as `entry 2 of 3`, or `None` for a run with no
  * pool. The model above is *this* candidate, so without the position a failover is
  * invisible — the card would simply name a model nobody chose.
  */

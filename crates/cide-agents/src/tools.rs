@@ -1,4 +1,4 @@
-//! The twenty MCP tools cide serves a `claude`: their names, their schemas, and handlers that
+//! The twenty-two MCP tools cide serves a `claude`: their names, their schemas, and handlers that
 //! touch nothing. (M18)
 //!
 //! Two families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
@@ -256,6 +256,14 @@ pub mod tool {
     pub const AGENT_STOP: &str = "cide_agent_stop";
     /// Merge a role's worktree branch back into the checked-out branch.
     pub const AGENT_INTEGRATE: &str = "cide_agent_integrate";
+    /// The project's milestones and how each one's gate stands; defining them on a project that
+    /// has none; proposing a change to them otherwise. (M83) **Never changing them** once they
+    /// exist — see `cide_ipc::milestones`' header: a goal the agent working towards it can
+    /// rewrite is not a goal.
+    pub const MILESTONES: &str = "cide_milestones";
+    /// Propose a change to what only the user may change — the milestones, or a guarded file —
+    /// ready to apply, into a queue the user accepts or rejects from the Tasks panel. (M83)
+    pub const MILESTONE_PROPOSALS: &str = "cide_milestone_proposals";
 
     /// The task vocabulary, in the order `tools/list` advertises it.
     ///
@@ -299,13 +307,15 @@ pub mod tool {
         AGENT_RUNS,
         AGENT_STOP,
         AGENT_INTEGRATE,
+        MILESTONES,
+        MILESTONE_PROPOSALS,
     ];
 
     /// Both families, in advertised order: [`ALL`] then [`ORCHESTRATION`].
     ///
     /// Spelled out rather than concatenated, because a `const fn` concatenation of two slices is
     /// not expressible and a `Vec` would give up the `&'static [&'static str]` that lets a
-    /// connection's allow-list be a borrowed slice. `the_sixteen_are_the_only_sixteen` is what
+    /// connection's allow-list be a borrowed slice. `the_twenty_two_are_the_only_twenty_two` is what
     /// keeps the three lists from drifting — a name added to either family and forgotten here is
     /// a test failure, not a tool nobody is served.
     pub const EVERY: &[&str] = &[
@@ -329,6 +339,8 @@ pub mod tool {
         AGENT_RUNS,
         AGENT_STOP,
         AGENT_INTEGRATE,
+        MILESTONES,
+        MILESTONE_PROPOSALS,
     ];
 }
 
@@ -340,12 +352,13 @@ pub mod tool {
 /// more says so, and the answer always reports the total so a truncation is never silent.
 pub const DEFAULT_LIST_LIMIT: usize = 50;
 
-/// The four statuses, as a slice, so the schema's `enum` and the parser cannot disagree.
+/// The five statuses, as a slice, so the schema's `enum` and the parser cannot disagree.
 ///
 /// The wire spellings themselves come from serde ([`status_wire`]), never from literals here:
 /// [`TaskStatus`] is `rename_all = "camelCase"`, and a hand-written `"in_progress"` in a schema
 /// is a value the model would send and `cide-ipc` would refuse.
 const STATUSES: &[TaskStatus] = &[
+    TaskStatus::Inbox,
     TaskStatus::Todo,
     TaskStatus::Doing,
     TaskStatus::Review,
@@ -534,6 +547,12 @@ pub trait TaskSink: Send + Sync {
     /// new task before it is answered — `TaskNew::attachments`' reason: one task, broadcast once
     /// with its files. A refused file takes the creation with it, so a retry does not mint a
     /// second task beside a first that has none. (M39)
+    ///
+    /// `inbox` puts the task in [`TaskStatus::Inbox`] rather than `Todo` (M83). A bool and not a
+    /// status, for the reason `TaskNew::status` gives: a caller of this trait must not be able to
+    /// mint a task that is already doing, in review or done. [`crate::milestones::placement`]
+    /// decides it, in the handler, where it is a pure function of the board.
+    #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
         title: &str,
@@ -542,7 +561,34 @@ pub trait TaskSink: Send + Sync {
         change: Option<&ChangeName>,
         links: &[TaskLinkSpec],
         attachments: &[PathBuf],
+        inbox: bool,
     ) -> Result<Task, String>;
+
+    /// Whether the caller is a dispatched run rather than a Claude pane. (M83)
+    ///
+    /// A run's new task goes to the inbox (see `milestones`' header). Decided by the app from the
+    /// connection, as the author is — never from anything in a call's arguments.
+    fn by_run(&self) -> bool;
+
+    /// Ids of the tasks whose id, title or body contain `query`, ignoring case — the store's own
+    /// `cide_tasks::search`, which reads bodies a row does not carry. (M83)
+    fn search(&self, query: &str) -> Result<Vec<TaskId>, String>;
+
+    /// The project's milestones, read from `.cide/config.json` under [`Self::root`]. A method so
+    /// a test can answer without a disk; nothing but a test should override it.
+    fn milestones(&self) -> cide_ipc::MilestonePlan {
+        crate::config::load_milestones(self.root())
+    }
+
+    /// How many commits `agent`'s checkout branch for `task` — `cide/<agent>-<task>` — has that
+    /// the project's checked-out branch lacks, or `None` when there is no such branch or all of
+    /// it is in. The fact [`task_update`] checks before it lets a task become `done`. (M86)
+    ///
+    /// Defaulted to "nothing waiting" so a test sink with no repository behind it keeps the
+    /// behaviour it had; the app's sink answers from `cide_git::worktree::unmerged`.
+    fn unmerged(&self, _agent: &AgentId, _task: &TaskId) -> Result<Option<usize>, String> {
+        Ok(None)
+    }
 
     /// Apply one change. The author of a [`TaskEdit::Comment`] is **not** a parameter — it is
     /// decided by the app from the connection this call arrived on, for the `spawned_as` reason
@@ -833,6 +879,16 @@ pub trait AgentSink: Send + Sync {
     /// Store providers and pools. See [`Self::set_overrides`] for why this takes the whole value.
     fn set_llm(&self, llm: LlmSettings) -> Result<(), String>;
 
+    /// How many slot-holding runs, **machine-wide**, stand on each pool target right now — the
+    /// count a [`PoolEntry::max_running`] limits. Entries with nothing running may be absent.
+    ///
+    /// Defaulted to "nothing known" so a sink that cannot see the registry (every test double)
+    /// renders the roster without the usage figures rather than failing to compile; the app's
+    /// sink answers from the registry.
+    fn pool_load(&self) -> Result<Vec<(PoolEntry, u32)>, String> {
+        Ok(Vec::new())
+    }
+
     /// What each role would actually run as, here, right now. (M71)
     ///
     /// Built by `crate::overrides::resolve` — the same function a dispatch resolves with, rather
@@ -844,6 +900,50 @@ pub trait AgentSink: Send + Sync {
     /// Ordered as [`Self::agents`] orders them, and a role missing from the answer is one whose
     /// definition could not be loaded — the roster says so rather than inventing a resolution.
     fn resolutions(&self) -> Result<Vec<(AgentId, crate::overrides::Resolved)>, String>;
+
+    // --- milestones (M83) ------------------------------------------------------------------
+    //
+    // Default bodies so a sink that predates milestones answers with a sentence rather than
+    // failing to compile; the app's `RegistrySink` is the one that implements them.
+
+    /// The project's milestones and each gate's last result.
+    fn milestones_view(&self) -> Result<cide_ipc::MilestonesView, String> {
+        Err("milestones are not available here".into())
+    }
+
+    /// Write a first plan: create a task for each milestone that names none, then the config.
+    /// Refused when the project already has milestones — that is the handler's rule and the
+    /// implementation's too.
+    fn milestones_define(
+        &self,
+        _plan: cide_ipc::MilestonePlan,
+    ) -> Result<cide_ipc::MilestonePlan, String> {
+        Err("milestones are not available here".into())
+    }
+
+    /// Record a proposed change as a comment on the active milestone's task, and answer its id.
+    fn milestones_propose(&self, _text: &str) -> Result<TaskId, String> {
+        Err("milestones are not available here".into())
+    }
+
+    /// Queue a proposal for the user. The implementation reads each file's current content and
+    /// diffs it; the draft carries only what the agent asked for.
+    fn proposals_create(
+        &self,
+        _draft: crate::milestones::ProposalDraft,
+    ) -> Result<cide_ipc::Proposal, String> {
+        Err("proposals are not available here".into())
+    }
+
+    /// The queue, oldest first.
+    fn proposals_list(&self) -> Result<Vec<cide_ipc::Proposal>, String> {
+        Err("proposals are not available here".into())
+    }
+
+    /// Take one of this caller's proposals back out of the queue.
+    fn proposals_withdraw(&self, _id: &str) -> Result<(), String> {
+        Err("proposals are not available here".into())
+    }
 }
 
 // --- what `tools/list` says --------------------------------------------------------------------
@@ -855,7 +955,7 @@ pub trait AgentSink: Send + Sync {
 /// `cide_ide_mcp::tools`'s rule, and its `every_advertised_tool_has_a_schema_and_a_description`
 /// has a twin below.
 ///
-/// **All sixteen, always.** The per-connection filtering is `cide_app::agent_rpc`'s
+/// **All twenty-two, always.** The per-connection filtering is `cide_app::agent_rpc`'s
 /// `descriptors_for`, which keeps this order and drops what the connection may not call: one
 /// definition of each tool, and the scope decided in exactly one place.
 pub fn descriptors() -> Vec<Value> {
@@ -878,10 +978,36 @@ pub fn descriptors() -> Vec<Value> {
 /// that leaves the choice between `cide_task_update` and `cide_task_assign` to chance.
 pub fn description(name: &str) -> &'static str {
     match name {
+        tool::MILESTONE_PROPOSALS => {
+            "Propose a change to this project's milestones — what only the user may change — \
+             ready to apply: the milestone plan \
+             (give the whole plan you want — `milestones` as [{id, title, gate}], plus `verify`, \
+             `guardPaths`, `maxOpen` — as for cide_milestones define) or the files a gate reads \
+             (the guarded paths, such as a gate script) (`files` as [{path, content}], the whole new content; `content: null` \
+             deletes). One proposal is one change with a `title` and a `rationale` saying why. \
+             It is queued in the Tasks panel for the user, who accepts it — cide applies it \
+             exactly, committing file changes — or rejects it. `action: list` shows the queue, \
+             `action: withdraw` with `id` takes one of yours back. Nothing here changes \
+             anything by itself."
+        }
+        tool::MILESTONES => {
+            "This project's milestones: the ordered goals it is working towards, each with a \
+             gate — a shell command cide runs whose exit 0 means the milestone is met — and \
+             which one is active. `action: get` reads them with each gate's last result. \
+             `action: define` writes the first plan, and only on a project that has none: give \
+             `milestones` as [{id, title, gate}], plus `verify` (a command cide runs on a \
+             branch before it may be merged) and `guardPaths` (files a gate reads, which no \
+             branch may change). Once milestones exist they are the user's: `action: propose` \
+             with `text` (why) and, optionally, the plan fields as for define (the change) \
+             queues a proposal the user accepts or rejects in the Tasks panel; nothing here \
+             changes them. A guarded file's new content is proposed with cide_milestone_proposals."
+        }
         tool::TASK_LIST => {
-            "List this project's tasks, newest last. Optionally filter by status or by the role a \
-             task is assigned to. Returns a summary per task — call cide_task_get for a task's \
-             body and comments."
+            "List this project's tasks, newest last. Optionally filter by status, by the role a \
+             task is assigned to, or by `query` — words matched against the id, title and body. \
+             Tasks in the `inbox` (noticed, not yet planned) are left out unless `status` names \
+             it; the answer says how many there are. Returns a summary per task — call \
+             cide_task_get for a task's body and comments."
         }
         tool::TASK_GET => {
             "Read one task in full: its body, its attachments, and its whole comment log with \
@@ -890,7 +1016,12 @@ pub fn description(name: &str) -> &'static str {
              can be read from there."
         }
         tool::TASK_CREATE => {
-            "Add a task to this project's tracker. It starts in the `todo` status. Give it a \
+            "Add a task to this project's tracker. A task a dispatched run creates goes to the \
+             `inbox`, where noticed work waits until it is planned; the orchestrator's goes to \
+             `todo`, unless the project has milestones and the task is not `subtaskOf` the \
+             active one (or that milestone is full) — the answer says where it went and why. A \
+             task that repeats an open one is added to it as a comment instead. Pass `inbox: \
+             true` to file something noticed rather than planned. Give it a \
              title a person can act on, and put the statement of the work in the body. If the \
              work is an OpenSpec change, name it in `change` — a run started on that task is \
              pointed at its proposal, design and task checklist. `links` records edges to \
@@ -977,7 +1108,9 @@ pub fn description(name: &str) -> &'static str {
         }
         tool::AGENTS_CONFIG => {
             "Change this project's subagent settings: `maxConcurrent`, how many runs may be live \
-             across the whole project whatever a role's own limit says, and `harness`, the CLI a \
+             across the whole project whatever a role's own limit says (a role on a model pool is \
+             capped by its models' running limits as well; cide_agents_list states the resulting \
+             total), and `harness`, the CLI a \
              role that names none of its own gets. It writes `.cide/config.json`, which is \
              **committed** \u{2014} your next commit carries it, and a teammate pulling it runs what it \
              says \u{2014} so change it for a reason you would write in a commit message. \
@@ -1026,7 +1159,12 @@ pub fn description(name: &str) -> &'static str {
              the order is the whole point, and `entries` is stored exactly as you send it. Each \
              entry is a provider id and a model id **as two fields**, never one `provider/model` \
              string, because a model id may itself contain slashes. `variant` on an entry is that \
-             candidate's own effort setting and beats the role's. Sending `entries` replaces the \
+             candidate's own effort setting and beats the role's. `maxRunning` on an entry is how \
+             many runs may be on that model at once, counted across every project: a run starts \
+             on the first entry with room, so four runs on an entry limited to 4 send the fifth \
+             to the next one, and a pool whose every entry is full keeps the run queued. The \
+             pool can then hold at most the sum of its limits (unlimited if any entry has none), \
+             and cide_agents_list reports that figure. Sending `entries` replaces the \
              pool's whole list (that is what ordering means); everything else about the pool is \
              left alone. `remove: true` deletes the pool by name \u{2014} a role overridden onto a pool \
              that no longer exists is **refused at dispatch**, not silently given a default, and \
@@ -1052,7 +1190,8 @@ pub fn description(name: &str) -> &'static str {
              in its pane; if you need to *read* the outcome, make a task instead, and keep it \
              clear of files you or another run are editing. Either way this returns a run id \
              **immediately** and does not wait — carry on, and watch with cide_agent_runs. A \
-             dispatch past a role's concurrency is queued rather than refused. `instructions` \
+             dispatch past a cap \u{2014} the role's concurrency, the project's, or every model of the \
+             role's pool at its running limit \u{2014} is queued rather than refused. `instructions` \
              is a single line by design (it is typed into a terminal): anything longer — \
              context, constraints, acceptance criteria — belongs in a task's body. `notify` says \
              where cide announces the run's turn endings: `here` (this pane, the default), \
@@ -1118,17 +1257,102 @@ pub fn input_schema(name: &str) -> Value {
     });
 
     match name {
+        tool::MILESTONE_PROPOSALS => json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["create", "list", "withdraw"] },
+                "title": { "type": "string", "description": "For `create`: one line naming the change." },
+                "rationale": { "type": "string", "description": "For `create`: why, in markdown — what is wrong now and what this fixes." },
+                "task": { "type": "string", "description": "For `create`: the task this came out of, if any, e.g. `t-233`." },
+                "milestones": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "title": { "type": "string" },
+                            "gate": { "type": "string" },
+                            "timeoutSecs": { "type": "integer", "minimum": 1 },
+                        },
+                        "required": ["id", "title", "gate"],
+                    },
+                    "description": "For `create`: the whole milestone list you propose, in order. Existing ids keep their tasks.",
+                },
+                "verify": { "type": "string" },
+                "guardPaths": { "type": "array", "items": { "type": "string" } },
+                "maxOpen": { "type": "integer", "minimum": 1 },
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative to the project root; must be a guarded path." },
+                            "content": { "type": ["string", "null"], "description": "The whole new content; null deletes the file." },
+                        },
+                        "required": ["path", "content"],
+                    },
+                    "description": "For `create`: new contents of guarded files.",
+                },
+                "id": { "type": "string", "description": "For `withdraw`: the proposal, e.g. `p-3`." },
+            },
+            "required": ["action"],
+        }),
+        tool::MILESTONES => json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["get", "define", "propose"] },
+                "milestones": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "A short handle, e.g. `slice`." },
+                            "title": { "type": "string" },
+                            "gate": {
+                                "type": "string",
+                                "description": "Shell command run in the project root; exit 0 means met.",
+                            },
+                            "timeoutSecs": { "type": "integer", "minimum": 1 },
+                        },
+                        "required": ["id", "title", "gate"],
+                    },
+                    "description": "For `define`: the milestones, in order.",
+                },
+                "verify": {
+                    "type": "string",
+                    "description": "For `define`: the command run in a run's checkout before its branch may be merged.",
+                },
+                "guardPaths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "For `define`: paths a gate reads (a directory ends in `/`); a branch that changes one is not merged.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "For `propose`: the change you suggest and why, in markdown.",
+                },
+            },
+            "required": ["action"],
+        }),
         tool::TASK_LIST => json!({
             "type": "object",
             "properties": {
                 "status": {
                     "type": "array",
                     "items": { "type": "string", "enum": status_enum },
-                    "description": "Keep only tasks in these statuses. Absent means all four.",
+                    "description":
+                        "Keep only tasks in these statuses. Absent means every status but \
+                         `inbox`.",
                 },
                 "assignee": {
                     "type": "string",
                     "description": "Keep only tasks assigned to this role, e.g. `developer`.",
+                },
+                "query": {
+                    "type": "string",
+                    "description":
+                        "Keep only tasks whose id, title or body contains this text, ignoring \
+                         case. Comments are not searched.",
                 },
                 "limit": {
                     "type": "integer",
@@ -1189,6 +1413,12 @@ pub fn input_schema(name: &str) -> Value {
                         "Edges to existing tasks, recorded with the creation. Name a blockedBy \
                          link here rather than in a follow-up cide_task_link, so the task is \
                          never dispatchable before its blocker is known.",
+                },
+                "inbox": {
+                    "type": "boolean",
+                    "description":
+                        "File it in the inbox — noticed, not yet planned — whatever else would \
+                         place it. A task a dispatched run creates goes there anyway.",
                 },
                 "attachments": {
                     "type": "array",
@@ -1637,6 +1867,14 @@ pub fn input_schema(name: &str) -> Value {
                                      one carried onto a failover candidate can be refused \
                                      outright by the CLI.",
                             },
+                            "maxRunning": {
+                                "type": ["integer", "null"],
+                                "minimum": 1,
+                                "description":
+                                    "How many runs may be on this model at once, across every \
+                                     project. Absent or null is no limit. A run takes the first \
+                                     entry with room, and waits in the queue when none has any.",
+                            },
                         },
                         "required": ["provider", "model"],
                     },
@@ -1914,18 +2152,31 @@ fn task_list(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_LIST)),
     };
 
+    let query = match optional_string(arguments, "query") {
+        Ok(value) => value.filter(|q| !q.trim().is_empty()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_LIST)),
+    };
+
     let all = match sink.list() {
         Ok(tasks) => tasks,
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_LIST)),
     };
+    let found = match query.as_deref().map(|q| sink.search(q)).transpose() {
+        Ok(found) => found,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_LIST)),
+    };
 
+    // The inbox is left out of an unfiltered list (M83): it is where noticed work waits, and a
+    // planning turn that reads it as part of the board plans from it — the growth this status
+    // exists to stop. Named in the header, so it is never a silent omission.
+    let hidden_inbox = statuses.is_none();
     let matched: Vec<&TaskRow> = all
         .iter()
-        .filter(|task| {
-            statuses
-                .as_ref()
-                .is_none_or(|set| set.contains(&task.status))
+        .filter(|task| match statuses.as_ref() {
+            Some(set) => set.contains(&task.status),
+            None => task.status != TaskStatus::Inbox,
         })
+        .filter(|task| found.as_ref().is_none_or(|ids| ids.contains(&task.id)))
         .filter(|task| {
             assignee
                 .as_deref()
@@ -1948,6 +2199,20 @@ fn task_list(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
              by `status` to see the rest.",
             shown.len()
         )
+    };
+
+    let inbox = if hidden_inbox {
+        all.iter()
+            .filter(|task| task.status == TaskStatus::Inbox)
+            .filter(|task| found.as_ref().is_none_or(|ids| ids.contains(&task.id)))
+            .count()
+    } else {
+        0
+    };
+    let header = if inbox > 0 {
+        format!("{header} {inbox} more wait in the inbox; list them with `status: [\"inbox\"]`.")
+    } else {
+        header
     };
 
     let mut body = String::new();
@@ -1974,7 +2239,18 @@ fn task_get(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
     // an incoming link — "blocks t-7" — is on the *other* task and a link line resolves its target's
     // status and title, both of which a row carries.
     match sink.get(&id) {
-        Ok(Some(task)) => ToolResult::text(fenced(&render_full(&task, &all, sink.root()))),
+        // Which milestone it serves, outside the fence because it is cide's reading of the board
+        // rather than a field of the task (M83): a task whose milestone is not the active one
+        // waits, and a model that did not know that would dispatch it and be refused.
+        Ok(Some(task)) => {
+            let milestone = crate::milestones::milestone_line(&sink.milestones(), &all, &id)
+                .map(|line| format!("{line}\n"))
+                .unwrap_or_default();
+            ToolResult::text(format!(
+                "{milestone}{}",
+                fenced(&render_full(&task, &all, sink.root()))
+            ))
+        }
         Ok(None) => ToolResult::error(no_such(&id)),
         Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_GET)),
     }
@@ -2030,6 +2306,71 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
     };
 
+    /*
+     * Where it goes, before it exists. (M83)
+     *
+     * `milestones::placement` decides inbox or todo from the board as it stands and the caller's
+     * identity; a duplicate of an open task becomes a comment on that task instead of a second
+     * row. Both are decided here rather than in the sink because they are pure functions of what
+     * the sink already answers, and a rule in the app's sink would be one no test in this crate
+     * could see.
+     */
+    let rows = match sink.list() {
+        Ok(rows) => rows,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+    };
+    let plan = sink.milestones();
+    let parent = links
+        .iter()
+        .find(|l| l.link == LinkType::SubtaskOf)
+        .map(|l| l.target.clone());
+    let asked_inbox = match arguments.get("inbox") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            return ToolResult::error(format!(
+                "{}: `inbox` must be true or false.",
+                tool::TASK_CREATE
+            ));
+        }
+    };
+    let placed = crate::milestones::placement(sink.by_run(), &plan, &rows, parent.as_ref());
+    // Asking for the inbox always wins: it is *less* than any placement, so it needs no rule.
+    // Asking for todo is not a parameter at all — that is `placement`'s decision.
+    let inbox = asked_inbox || placed.status == TaskStatus::Inbox;
+    let placed = if asked_inbox {
+        crate::milestones::Placement {
+            status: TaskStatus::Inbox,
+            reason: None,
+        }
+    } else {
+        placed
+    };
+    if inbox && let Some(existing) = crate::milestones::duplicate_of(&rows, &title) {
+        let note = if body.trim().is_empty() {
+            format!("Seen again: {}", title.trim())
+        } else {
+            format!("Seen again: {}\n\n{}", title.trim(), body.trim())
+        };
+        let noted = if attachments.is_empty() {
+            sink.edit(&existing, TaskEdit::Comment { text: note })
+        } else {
+            sink.attach(
+                &existing,
+                AttachTarget::NewComment { text: note },
+                &attachments,
+            )
+        };
+        return match noted {
+            Ok(_) => ToolResult::text(format!(
+                "Not created: {existing} already says this, so what you wrote was added to it as \
+                 a comment instead of a second task. Read it with {} if you need to.",
+                tool::TASK_GET
+            )),
+            Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+        };
+    }
+
     match sink.create(
         &title,
         &body,
@@ -2037,19 +2378,33 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         change.as_ref(),
         &links,
         &attachments,
+        inbox,
     ) {
         Ok(task) => {
             let all = match board_for_render(tool::TASK_CREATE, sink) {
                 Ok(all) => all,
                 Err(result) => return result,
             };
+            let why = placed
+                .reason
+                .map(|reason| format!(" {}", capitalise(&reason)))
+                .unwrap_or_default();
             ToolResult::text(format!(
-                "Created {}.\n{}",
+                "Created {}.{why}\n{}",
                 task.id,
                 fenced(&render_full(&task, &all, sink.root()))
             ))
         }
         Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+    }
+}
+
+/// `it went…` → `It went…`, for a reason that starts a sentence of its own.
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -2135,10 +2490,64 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
 
     // Existence first, so a typo'd id costs nothing and reads as a refusal rather than as a
     // half-applied update.
-    match sink.get(&id) {
-        Ok(Some(_)) => {}
+    let current = match sink.get(&id) {
+        Ok(Some(task)) => task,
         Ok(None) => return ToolResult::error(no_such(&id)),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+    };
+
+    // **`done` over a branch that never landed is refused.** (M86) Accepting a run's work means
+    // taking it into this branch; the review prompt has said so since M79, and said that a merge
+    // reporting conflicts leaves the task not done. In terrastrike's t-1062 the reviewer's
+    // integrate was denied by its own tab's permission check instead — a refusal the prompt did
+    // not name — and it set the task to done with "the orchestrator needs to merge this" as the
+    // last line of its verdict. Nobody reads a done task's comments, so the work sat unmerged
+    // for a day while the board said it had shipped, and an audit then found four more like it.
+    // A rule the model already broke once is a fact to check, not a sentence to sharpen, so it
+    // is checked here, on the model's road only: the user closing a task from the board does
+    // not come through this function and stays free to drop work on purpose.
+    //
+    // Checked against the assignee's branch, which is the one `cide_agent_integrate` merges for
+    // that task. The whole call is refused rather than applied without its status: a caller
+    // told "updated" would read the rest as having gone through and not look again.
+    let to_done = edits.iter().any(|edit| {
+        matches!(
+            edit,
+            TaskEdit::SetStatus {
+                status: TaskStatus::Done
+            }
+        )
+    });
+    if to_done
+        && current.status != TaskStatus::Done
+        && let Some(agent) = &current.agent
+    {
+        match sink.unmerged(agent, &id) {
+            Ok(None) => {}
+            Ok(Some(ahead)) => {
+                let branch = crate::checkout_name(agent, Some(&id));
+                return ToolResult::error(format!(
+                    "{}: {id} was not set to done, and nothing else in this call was applied \
+                     either. `cide/{branch}` has {ahead} commit(s) this project's branch does not \
+                     — the work was never integrated, and a task whose work is not in is not \
+                     done. Merge it with {} (agent `{}`, task {id}) and then set done. **If that \
+                     merge does not happen for any reason** — conflicts, a failing verify \
+                     command, an error, or the call itself being denied by a permission check — \
+                     leave the task in review and comment exactly what stopped it: review is \
+                     where the user looks, and done is where nobody does. The same if you \
+                     decided this work should be dropped rather than merged — say so in a \
+                     comment and leave it in review; closing a task over unmerged work is the \
+                     user's call, made from the board.",
+                    tool::TASK_UPDATE,
+                    tool::AGENT_INTEGRATE,
+                    agent.0,
+                ));
+            }
+            // Not a repository, an unborn HEAD, a branch that will not resolve: nothing this
+            // gate can speak to, and refusing `done` in a project without git would be a
+            // tracker that can never close anything.
+            Err(_) => {}
+        }
     }
 
     let mut last = None;
@@ -2430,8 +2839,334 @@ pub fn dispatch_orchestration(
         tool::AGENT_RUNS => Some(agent_runs(arguments, sink)),
         tool::AGENT_STOP => Some(agent_stop(arguments, sink)),
         tool::AGENT_INTEGRATE => Some(agent_integrate(arguments, sink)),
+        tool::MILESTONES => Some(milestones(arguments, sink)),
+        tool::MILESTONE_PROPOSALS => Some(proposals(arguments, sink)),
         _ => None,
     }
+}
+
+/// `cide_milestones`: read, define once, or propose. (M83)
+fn milestones(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let action = match required_string(arguments, "action") {
+        Ok(action) => action,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+    };
+    let view = match sink.milestones_view() {
+        Ok(view) => view,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+    };
+    match action.as_str() {
+        "get" => ToolResult::text(render_milestones(&view)),
+        "define" => {
+            if !view.plan.is_empty() {
+                return ToolResult::error(format!(
+                    "{}: this project already has milestones, and they are the user's to change \
+                     — in the Milestones tab of the Tasks panel, or by editing .cide/config.json. Use \
+                     `action: propose` with `text` to put your suggestion in front of them.",
+                    tool::MILESTONES
+                ));
+            }
+            let plan = match milestone_plan_from(arguments) {
+                Ok(plan) => plan,
+                Err(why) => return ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+            };
+            match sink.milestones_define(plan) {
+                Ok(_) => match sink.milestones_view() {
+                    Ok(view) => ToolResult::text(format!(
+                        "Defined. From now on these are the user's to change; you may propose.\n{}",
+                        render_milestones(&view)
+                    )),
+                    Err(why) => ToolResult::error(format!(
+                        "{}: defined, but could not be re-read: {why}",
+                        tool::MILESTONES
+                    )),
+                },
+                Err(why) => ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+            }
+        }
+        "propose" => {
+            // The same queue as `cide_milestone_proposals create` (M83): `text` is the rationale, and the
+            // plan fields, when given, are the change. A proposal the user can apply rather than
+            // a comment they have to act on by hand.
+            let text = match required_string(arguments, "text") {
+                Ok(text) if !text.trim().is_empty() => text,
+                Ok(_) => {
+                    return ToolResult::error(format!(
+                        "{}: `text` is blank — say what should change and why.",
+                        tool::MILESTONES
+                    ));
+                }
+                Err(why) => return ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+            };
+            let mut args = arguments.clone();
+            if let Some(map) = args.as_object_mut() {
+                map.insert("rationale".into(), Value::String(text));
+                map.entry("title")
+                    .or_insert_with(|| Value::String("A change to the milestones".into()));
+                if let Some(task) = view.plan.current().and_then(|m| m.task.clone()) {
+                    map.entry("task").or_insert(Value::String(task.0));
+                }
+            }
+            let draft = match crate::milestones::proposal_draft(&args, &view.plan) {
+                Ok(draft) => draft,
+                Err(why) => return ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+            };
+            match sink.proposals_create(draft) {
+                Ok(p) => ToolResult::text(format!(
+                    "Queued {} for the user. Nothing changed: they accept it (cide applies it) or \
+                     reject it in the Milestones tab of the Tasks panel. Carry on towards the \
+                     active milestone as it stands. To propose a guarded file's new content, use \
+                     {}.",
+                    p.id,
+                    tool::MILESTONE_PROPOSALS
+                )),
+                Err(why) => ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+            }
+        }
+        other => ToolResult::error(format!(
+            "{}: no action `{other}` — it is `get`, `define` or `propose`.",
+            tool::MILESTONES
+        )),
+    }
+}
+
+/// `cide_milestone_proposals`: create, list, withdraw. (M83)
+fn proposals(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let action = match required_string(arguments, "action") {
+        Ok(action) => action,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::MILESTONE_PROPOSALS)),
+    };
+    match action.as_str() {
+        "list" => match sink.proposals_list() {
+            Ok(list) if list.is_empty() => ToolResult::text("No proposals are waiting."),
+            Ok(list) => ToolResult::text(
+                list.iter()
+                    .map(|p| {
+                        format!(
+                            "- {} — {} ({}; by {})",
+                            p.id,
+                            p.title,
+                            match &p.change {
+                                cide_ipc::ProposalChange::Plan { .. } =>
+                                    "the milestones".to_string(),
+                                cide_ipc::ProposalChange::Files { files } => files
+                                    .iter()
+                                    .map(|f| f.path.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                cide_ipc::ProposalChange::Note => "a note".to_string(),
+                            },
+                            match &p.by {
+                                TaskAuthor::User => "the user".to_string(),
+                                TaskAuthor::Orchestrator => "the orchestrator".to_string(),
+                                TaskAuthor::Agent { agent, .. } => agent.to_string(),
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Err(why) => ToolResult::error(format!("{}: {why}", tool::MILESTONE_PROPOSALS)),
+        },
+        "withdraw" => {
+            let id = match required_string(arguments, "id") {
+                Ok(id) => id,
+                Err(why) => {
+                    return ToolResult::error(format!("{}: {why}", tool::MILESTONE_PROPOSALS));
+                }
+            };
+            match sink.proposals_withdraw(&id) {
+                Ok(()) => ToolResult::text(format!("Withdrew {id}.")),
+                Err(why) => ToolResult::error(format!("{}: {why}", tool::MILESTONE_PROPOSALS)),
+            }
+        }
+        "create" => {
+            let view = match sink.milestones_view() {
+                Ok(view) => view,
+                Err(why) => {
+                    return ToolResult::error(format!("{}: {why}", tool::MILESTONE_PROPOSALS));
+                }
+            };
+            let draft = match crate::milestones::proposal_draft(arguments, &view.plan) {
+                Ok(draft) => draft,
+                Err(why) => {
+                    return ToolResult::error(format!("{}: {why}", tool::MILESTONE_PROPOSALS));
+                }
+            };
+            match sink.proposals_create(draft) {
+                Ok(p) => ToolResult::text(format!(
+                    "Queued {} for the user — it waits in the Milestones tab of the Tasks panel, \
+                     where they accept it (cide applies it) or reject it. Nothing has changed \
+                     yet; carry on with the milestones as they stand.",
+                    p.id
+                )),
+                Err(why) => ToolResult::error(format!("{}: {why}", tool::MILESTONE_PROPOSALS)),
+            }
+        }
+        other => ToolResult::error(format!(
+            "{}: no action `{other}` — it is `create`, `list` or `withdraw`.",
+            tool::MILESTONE_PROPOSALS
+        )),
+    }
+}
+
+/// `define`'s arguments as a plan, refusing what would make a milestone that cannot be checked.
+pub(crate) fn milestone_plan_from(arguments: &Value) -> Result<cide_ipc::MilestonePlan, String> {
+    let items = arguments
+        .get("milestones")
+        .and_then(Value::as_array)
+        .ok_or("`milestones` is required for `define`, as [{id, title, gate}]")?;
+    if items.is_empty() {
+        return Err("`milestones` is empty".into());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let text = |key: &str| {
+            item.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let id = text("id").ok_or("every milestone needs an `id`")?;
+        if out.iter().any(|m: &cide_ipc::Milestone| m.id == id) {
+            return Err(format!("two milestones are called `{id}`"));
+        }
+        let gate = text("gate").ok_or_else(|| {
+            format!("milestone `{id}` has no `gate`: a milestone nothing can check is a wish")
+        })?;
+        out.push(cide_ipc::Milestone {
+            title: text("title").unwrap_or_else(|| id.clone()),
+            id,
+            task: None,
+            gate,
+            timeout_secs: item.get("timeoutSecs").and_then(Value::as_u64),
+        });
+    }
+    let verify = arguments
+        .get("verify")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let guard_paths = arguments
+        .get("guardPaths")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(cide_ipc::MilestonePlan {
+        active: out.first().map(|m| m.id.clone()),
+        items: out,
+        verify,
+        max_open: None,
+        guard_paths,
+    })
+}
+
+/// The plan as a model reads it.
+fn render_milestones(view: &cide_ipc::MilestonesView) -> String {
+    let plan = &view.plan;
+    if plan.is_empty() {
+        return "This project has no milestones. Define the first plan with `action: define` — \
+                ordered goals, each with a gate command whose exit 0 means it is met."
+            .to_string();
+    }
+    let active = plan.current().map(|m| m.id.clone());
+    let mut out = String::new();
+    for m in &plan.items {
+        let marker = if view.accepted.contains(&m.id) {
+            "accepted"
+        } else if active.as_deref() == Some(m.id.as_str()) {
+            "ACTIVE"
+        } else {
+            "later"
+        };
+        out.push_str(&format!(
+            "- [{marker}] `{}` {}{} — gate: `{}`\n",
+            m.id,
+            m.title,
+            m.task
+                .as_ref()
+                .map(|t| format!(" ({t})"))
+                .unwrap_or_default(),
+            m.gate
+        ));
+        if let Some(list) = view.tasks.iter().find(|t| t.milestone == m.id) {
+            let done = list
+                .tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Done)
+                .count();
+            let open: Vec<&cide_ipc::MilestoneTask> = list
+                .tasks
+                .iter()
+                .filter(|t| t.status != TaskStatus::Done)
+                .collect();
+            out.push_str(&format!("  tasks: {} open, {done} done\n", open.len()));
+            // Every open one for the active milestone — that is the work — and a count for the
+            // rest, whose lists are read when they become active, not before.
+            if active.as_deref() == Some(m.id.as_str()) && !view.accepted.contains(&m.id) {
+                for t in open {
+                    out.push_str(&format!(
+                        "  {}- {} [{}] {}{}\n",
+                        "  ".repeat(t.depth as usize),
+                        t.id,
+                        status_wire(t.status),
+                        t.title,
+                        t.agent
+                            .as_ref()
+                            .map(|a| format!(" — {a}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        if let Some(state) = view.gates.iter().find(|g| g.milestone == m.id) {
+            if state.running {
+                out.push_str("  gate: running now\n");
+            }
+            if let Some(last) = &state.last {
+                let verdict = if last.passed {
+                    "PASSED".to_string()
+                } else if last.timed_out {
+                    "FAILED (timed out)".to_string()
+                } else {
+                    format!(
+                        "FAILED (exit {})",
+                        last.exit_code.map_or("?".into(), |c| c.to_string())
+                    )
+                };
+                let tail: Vec<&str> = last.tail.lines().collect();
+                let tail = tail[tail.len().saturating_sub(12)..].join("\n");
+                out.push_str(&format!("  last gate: {verdict}\n{}", fenced(&tail)));
+                if let Some(log) = &state.log {
+                    out.push_str(&format!("  the whole output: {log}\n"));
+                }
+            }
+        }
+    }
+    if !plan.verify.trim().is_empty() {
+        out.push_str(&format!(
+            "Verify (run on a branch before it is merged): `{}`\n",
+            plan.verify
+        ));
+    }
+    if !plan.guard_paths.is_empty() {
+        out.push_str(&format!(
+            "Guarded (a branch changing these is not merged): {}\n",
+            plan.guard_paths.join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "Open-task limit for the active milestone: {}.",
+        plan.max_open()
+    ));
+    out
 }
 
 /// The roles, with each one's live run count.
@@ -2494,20 +3229,42 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
     // The project's own two settings, said once at the top beside the queue's state and for its
     // reason: they are facts about the project, not properties of a role. A read failure drops
     // the clause rather than the roster — `dispatching`'s rule, one line up. (M71)
+    // What each role would actually run as, from the function a dispatch resolves with. An empty
+    // answer is a roster that says only what the definitions say, which is what it said before
+    // M71 — degraded, never wrong.
+    let resolutions = sink.resolutions().unwrap_or_default();
+    let overrides = sink.overrides().unwrap_or_default();
+
     let settings = match sink.config() {
-        Ok(config) => format!(" {} ({})", config_sentence(&config), tool::AGENTS_CONFIG),
+        Ok(config) => {
+            // The number an orchestrator plans a fan-out against: every cap at once, over the
+            // roles that can run. Only stated when the roster resolved — without resolutions it
+            // would be the project cap restated, which the sentence before it already says.
+            let ready = resolutions.iter().filter(|(id, _)| {
+                agents
+                    .iter()
+                    .any(|def| def.id == *id && def.unavailable.is_none())
+            });
+            let total = crate::overrides::capacity(ready.map(|(_, r)| r), config.max_concurrent);
+            let most = match resolutions.is_empty() {
+                true => String::new(),
+                false => format!(
+                    " With these roles' max-concurrent and their pools' running limits, at most \
+                     {total} run(s) can be live at once here; anything past that queues."
+                ),
+            };
+            format!(
+                " {} ({}){most}",
+                config_sentence(&config),
+                tool::AGENTS_CONFIG
+            )
+        }
         Err(_) => String::new(),
     };
     let header = format!(
         "{} role(s) defined, {live} run(s) live.{ground}{queue}{settings}",
         agents.len()
     );
-
-    // What each role would actually run as, from the function a dispatch resolves with. An empty
-    // answer is a roster that says only what the definitions say, which is what it said before
-    // M71 — degraded, never wrong.
-    let resolutions = sink.resolutions().unwrap_or_default();
-    let overrides = sink.overrides().unwrap_or_default();
 
     let mut body = String::new();
     for def in &agents {
@@ -2528,9 +3285,21 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         // The **resolved** number, not the declared one: a local override may raise or lower a
         // role's concurrency, and a roster that printed the definition's answer would be telling
         // an orchestrator it may fan out three ways while the admission gate allows one. (M71)
-        let at_once = resolved
-            .map_or(def.max_concurrent, |resolved| resolved.max_concurrent)
-            .max(1);
+        //
+        // And capped by the role's pool when every entry of it has a running limit: a role
+        // allowed 8 on a pool that holds 4 + 2 starts 6, and the seventh waits for a model.
+        let at_once = match resolved {
+            Some(resolved) => {
+                let own = resolved.max_concurrent.max(1);
+                match cide_ipc::pool_capacity(&resolved.pool) {
+                    Some(pool) if pool < u32::from(own) => format!(
+                        "{pool} at once (max-concurrent {own}, but its pool's models allow {pool})"
+                    ),
+                    _ => format!("{own} at once"),
+                }
+            }
+            None => format!("{} at once", def.max_concurrent.max(1)),
+        };
         // A role that opted out of the checkout is the exception to the header's ground
         // sentence, and it changes what the orchestrator does next: no worktree, no
         // `cide/<role>-<task>` branch, nothing to integrate — the run's edits land directly
@@ -2576,7 +3345,7 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
         };
         body.push_str(&format!(
             "{} ({}) | {runs_as}{overridden} | {standing} | {mine} live run(s), runs up to \
-             {at_once} at once{ground}{source}\n",
+             {at_once}{ground}{source}\n",
             one_line(def.id.as_str()),
             one_line(&def.label),
         ));
@@ -2651,6 +3420,9 @@ fn llm_footer(sink: &dyn AgentSink) -> String {
         out.push_str(&format!("\nproviders: {}", listed.join("; ")));
     }
     if !llm.pools.is_empty() {
+        // Machine-wide, like the limits it is read against. A read failure draws the limits
+        // without the usage — the ceilings are still true.
+        let load = sink.pool_load().unwrap_or_default();
         let listed: Vec<String> = llm
             .pools
             .iter()
@@ -2658,9 +3430,24 @@ fn llm_footer(sink: &dyn AgentSink) -> String {
                 let entries: Vec<String> = pool
                     .entries
                     .iter()
-                    .map(|entry| one_line(&entry.model_flag()))
+                    .map(|entry| {
+                        let flag = one_line(&entry.model_flag());
+                        let running = load
+                            .iter()
+                            .find(|(on, _)| on.same_target(entry))
+                            .map_or(0, |(_, n)| *n);
+                        match entry.max_running {
+                            Some(max) => format!("{flag} {running}/{max} running"),
+                            None if running > 0 => format!("{flag} {running} running"),
+                            None => flag,
+                        }
+                    })
                     .collect();
-                format!("{} [{}]", one_line(&pool.name), entries.join(", "))
+                let holds = match pool.capacity() {
+                    Some(n) => format!(", holds {n} at once"),
+                    None => String::new(),
+                };
+                format!("{} [{}{holds}]", one_line(&pool.name), entries.join(", "))
             })
             .collect();
         out.push_str(&format!("\npools: {}", listed.join("; ")));
@@ -3027,8 +3814,8 @@ fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
     //
     // `enabled` is refused by name above, loudly. The five M79 keys are refused by silence, and
     // they are the stronger case of the two: `autoSpin` starts a billed `claude` off a *timer*,
-    // `autoSpinPrompt` decides what that process is told, and `finishInNewTab` puts a tab on the
-    // user's screen. A model that could set any of them could arrange to be woken up, and write
+    // `autoSpinPrompt` decides what that process is told, `reviewPrompt` what every reviewer is
+    // told, and `finishInNewTab` puts a tab on the user's screen. A model that could set any of them could arrange to be woken up, and write
     // its own wake-up call. They are the user's, through Settings, and a `..Default::default()`
     // that quietly widened would hand them over — so if a key is ever added here it must be
     // added with an argument for why a model may hold it.
@@ -3720,7 +4507,8 @@ fn llm_pool(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         return ToolResult::error(format!("{}: {why}", tool::LLM_POOL));
     }
     ToolResult::text(format!(
-        "{} {said} A run falls down that list in order as candidates refuse it.",
+        "{} {said} A run starts on the first entry with room and falls down that list in order \
+         as candidates refuse it.",
         match at.is_some() {
             true => "Changed.",
             false => "Added.",
@@ -3747,7 +4535,10 @@ fn pool_sentence(pool: &ModelPool) -> String {
     let listed: Vec<String> = pool
         .entries
         .iter()
-        .map(|entry| one_line(&entry.model_flag()))
+        .map(|entry| match entry.max_running {
+            Some(n) => format!("{} (up to {n} at once)", one_line(&entry.model_flag())),
+            None => one_line(&entry.model_flag()),
+        })
         .collect();
     format!(
         "`{}` is {}.",
@@ -3799,6 +4590,19 @@ fn optional_entries(arguments: &Value) -> Result<Option<Vec<PoolEntry>>, String>
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
+            max_running: match item.get("maxRunning") {
+                None | Some(Value::Null) => None,
+                Some(value) => match value.as_u64().and_then(|n| u16::try_from(n).ok()) {
+                    Some(0) | None => {
+                        return Err(format!(
+                            "`maxRunning` must be a whole number from 1 to {} (or null for no \
+                             limit), not {value}",
+                            u16::MAX
+                        ));
+                    }
+                    Some(n) => Some(n),
+                },
+            },
         });
     }
     Ok(Some(entries))
@@ -3895,7 +4699,8 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(run) => match task {
             Some(task) => ToolResult::text(format!(
                 "Dispatched `{agent}` on {task}. Run {run}.\nNothing waits on it: it may be \
-                 queued behind the role's other runs. Call {} to see how it is getting on, and \
+                 queued behind the role's other runs, the project's cap or its pool's running \
+                 limits. Call {} to see how it is getting on, and \
                  read what it did in the task's comments. {announced}{paused}",
                 tool::AGENT_RUNS
             )),
@@ -4154,6 +4959,18 @@ fn render_run(run: &AgentRun, now: u64) -> String {
     if let Some(note) = run.note.as_deref().map(one_line).filter(|n| !n.is_empty()) {
         line.push_str(&format!(" | {note}"));
     }
+    // What it is on — the harness, and the model and pool where one was chosen. Until M89 the
+    // pool reached this list only as a sentence inside `note`; it is a field now, so it is
+    // printed from the field, and a run with no chosen model says its harness alone rather than
+    // a model nobody named.
+    let mut on = harness_wire(run.harness).to_string();
+    if let Some(model) = run.model.as_deref().map(one_line) {
+        on.push_str(&format!(" {model}"));
+    }
+    if let Some(pool) = run.pool_position.as_deref().map(one_line) {
+        on.push_str(&format!(" (pool {pool})"));
+    }
+    line.push_str(&format!(" | via {on}"));
     // A run that will never announce itself says so on its row, because the caller that chose
     // `notify: none` is the one reading this list to find out — and a row that looked like every
     // other would have it waiting for a knock that is not coming. (M40)
@@ -4772,6 +5589,7 @@ fn kind_of(value: &Value) -> &'static str {
 /// to a name rather than panicking inside a tool call.
 fn status_wire(status: TaskStatus) -> &'static str {
     match status {
+        TaskStatus::Inbox => "inbox",
         TaskStatus::Todo => "todo",
         TaskStatus::Doing => "doing",
         TaskStatus::Review => "review",
@@ -5150,6 +5968,12 @@ mod tests {
         tasks: Mutex<Vec<Task>>,
         /// When set, every call fails with this sentence — the "the tracker is unreadable" path.
         broken: Option<String>,
+        /// Answers [`TaskSink::by_run`]: false is a Claude pane, which is what most tests are.
+        run: bool,
+        /// What [`TaskSink::milestones`] answers; none unless a test sets some.
+        plan: cide_ipc::MilestonePlan,
+        /// What [`TaskSink::unmerged`] answers for every task: `None` is a branch that is in.
+        unmerged: Option<usize>,
     }
 
     impl FakeSink {
@@ -5157,6 +5981,9 @@ mod tests {
             Self {
                 tasks: Mutex::new(tasks),
                 broken: None,
+                run: false,
+                plan: cide_ipc::MilestonePlan::default(),
+                unmerged: None,
             }
         }
 
@@ -5164,6 +5991,9 @@ mod tests {
             Self {
                 tasks: Mutex::new(Vec::new()),
                 broken: Some(why.to_string()),
+                run: false,
+                plan: cide_ipc::MilestonePlan::default(),
+                unmerged: None,
             }
         }
     }
@@ -5219,6 +6049,7 @@ mod tests {
             change: Option<&ChangeName>,
             links: &[TaskLinkSpec],
             attachments: &[PathBuf],
+            inbox: bool,
         ) -> Result<Task, String> {
             if let Some(why) = &self.broken {
                 return Err(why.clone());
@@ -5228,7 +6059,11 @@ mod tests {
                 id: TaskId(format!("t-{}", tasks.len() + 1)),
                 title: title.trim().to_string(),
                 body: body.to_string(),
-                status: TaskStatus::Todo,
+                status: if inbox {
+                    TaskStatus::Inbox
+                } else {
+                    TaskStatus::Todo
+                },
                 agent: agent.cloned(),
                 comments: Vec::new(),
                 change: change.cloned(),
@@ -5253,6 +6088,33 @@ mod tests {
             };
             tasks.push(task.clone());
             Ok(task)
+        }
+
+        fn by_run(&self) -> bool {
+            self.run
+        }
+
+        fn unmerged(&self, _agent: &AgentId, _task: &TaskId) -> Result<Option<usize>, String> {
+            Ok(self.unmerged)
+        }
+
+        fn milestones(&self) -> cide_ipc::MilestonePlan {
+            self.plan.clone()
+        }
+
+        fn search(&self, query: &str) -> Result<Vec<TaskId>, String> {
+            let q = query.to_lowercase();
+            Ok(self
+                .tasks
+                .lock()
+                .iter()
+                .filter(|t| {
+                    t.id.as_str().to_lowercase().contains(&q)
+                        || t.title.to_lowercase().contains(&q)
+                        || t.body.to_lowercase().contains(&q)
+                })
+                .map(|t| t.id.clone())
+                .collect())
         }
 
         fn edit(&self, id: &TaskId, edit: TaskEdit) -> Result<Task, String> {
@@ -5775,6 +6637,7 @@ mod tests {
                     provider: "lmstudio".into(),
                     model: "openai/gpt-oss-20b".into(),
                     variant: String::new(),
+                    max_running: None,
                 }],
             }],
         }
@@ -6205,6 +7068,123 @@ mod tests {
         assert_eq!(llm.pools.len(), 2, "the pool that was already there went");
     }
 
+    /// A running limit rides an entry as `maxRunning`, is shown back, and a zero is refused —
+    /// an entry nobody may run on is an entry to delete.
+    #[test]
+    fn a_pool_entry_takes_a_running_limit() {
+        let sink = FakeAgents {
+            llm: Mutex::new(configured()),
+            ..roster()
+        };
+        let answer = ask(
+            tool::LLM_POOL,
+            json!({
+                "name": "limited",
+                "entries": [
+                    { "provider": "openrouter", "model": "a", "maxRunning": 4 },
+                    { "provider": "openrouter", "model": "b", "maxRunning": null },
+                ],
+            }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(
+            text_of(&answer).contains("openrouter/a (up to 4 at once)"),
+            "{}",
+            text_of(&answer)
+        );
+        {
+            let llm = sink.llm.lock();
+            let pool = llm.pool("limited").expect("stored");
+            assert_eq!(pool.entries[0].max_running, Some(4));
+            assert_eq!(pool.entries[1].max_running, None);
+        }
+
+        for bad in [json!(0), json!(-1), json!("4"), json!(70_000)] {
+            let answer = ask(
+                tool::LLM_POOL,
+                json!({
+                    "name": "limited",
+                    "entries": [{ "provider": "openrouter", "model": "a", "maxRunning": bad }],
+                }),
+                &sink,
+            );
+            assert!(answer.is_error, "{bad} was accepted");
+            assert!(
+                text_of(&answer).contains("maxRunning"),
+                "{}",
+                text_of(&answer)
+            );
+        }
+    }
+
+    /// **The number an orchestrator plans against.** A role allowed 8 on a pool whose models
+    /// allow 4 + 2 says 6 on its row, the pool line says how full each model is, and the header
+    /// states the total with every cap applied — the project's included.
+    #[test]
+    fn the_roster_states_how_many_runs_can_actually_be_live() {
+        let entries = vec![
+            PoolEntry {
+                max_running: Some(4),
+                ..PoolEntry {
+                    provider: "openrouter".into(),
+                    model: "a".into(),
+                    ..PoolEntry::default()
+                }
+            },
+            PoolEntry {
+                max_running: Some(2),
+                ..PoolEntry {
+                    provider: "openrouter".into(),
+                    model: "b".into(),
+                    ..PoolEntry::default()
+                }
+            },
+        ];
+        let mut llm = configured();
+        llm.pools = vec![ModelPool {
+            name: "fast".into(),
+            description: String::new(),
+            entries: entries.clone(),
+        }];
+        let sink = FakeAgents {
+            llm: Mutex::new(llm),
+            resolutions: vec![(
+                AgentId("developer".into()),
+                crate::overrides::Resolved {
+                    pool: entries,
+                    max_concurrent: 8,
+                    ..resolved(Harness::Opencode, None, Some("fast"))
+                },
+            )],
+            ..roster()
+        };
+        sink.config.lock().max_concurrent = 10;
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &sink));
+        assert!(
+            text.contains("runs up to 6 at once (max-concurrent 8, but its pool's models allow 6)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("at most 6 run(s) can be live at once here"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "fast [openrouter/a 0/4 running, openrouter/b 0/2 running, holds 6 at once]"
+            ),
+            "{text}"
+        );
+
+        // The project's cap is the last word.
+        sink.config.lock().max_concurrent = 3;
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &sink));
+        assert!(
+            text.contains("at most 3 run(s) can be live at once here"),
+            "{text}"
+        );
+    }
+
     /// A pool with nothing in it refuses every dispatch overridden onto it, and a tool call has no
     /// next gesture to fill it — so creating one would be creating a trap.
     #[test]
@@ -6580,7 +7560,7 @@ mod tests {
     }
 
     #[test]
-    fn the_twenty_are_the_only_twenty() {
+    fn the_twenty_two_are_the_only_twenty_two() {
         assert_eq!(
             tool::ORCHESTRATION,
             [
@@ -6597,6 +7577,11 @@ mod tests {
                 "cide_agent_runs",
                 "cide_agent_stop",
                 "cide_agent_integrate",
+                // Last, because it is the loop's frame rather than a step in it: what the work is
+                // for, and whether it is there yet. (M83)
+                "cide_milestones",
+                // The loop's frame's other half: what only the user may change, proposed to them.
+                "cide_milestone_proposals",
             ]
         );
         // `EVERY` is spelled out rather than concatenated (see its own doc), so this is what
@@ -6655,14 +7640,18 @@ mod tests {
             // Exhaustive, so adding a variant to `TaskStatus` fails to compile here rather than
             // quietly leaving it out of every schema.
             match status {
-                TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Review | TaskStatus::Done => {}
+                TaskStatus::Inbox
+                | TaskStatus::Todo
+                | TaskStatus::Doing
+                | TaskStatus::Review
+                | TaskStatus::Done => {}
             }
             assert_eq!(status_from_wire(status_wire(status)), Some(status));
         }
         assert_eq!(status_from_wire("in-progress"), None);
 
         let listed = input_schema(tool::TASK_UPDATE)["properties"]["status"]["enum"].clone();
-        assert_eq!(listed, json!(["todo", "doing", "review", "done"]));
+        assert_eq!(listed, json!(["inbox", "todo", "doing", "review", "done"]));
     }
 
     #[test]
@@ -7030,6 +8019,222 @@ mod tests {
         assert_eq!(sink.tasks.lock().len(), 1);
     }
 
+    /// A run's new task is inbox, and says so in the answer the run reads; a second report of
+    /// an open task is a comment on it, not a second row. (M83)
+    #[test]
+    fn a_runs_new_task_goes_to_the_inbox_and_a_duplicate_becomes_a_comment() {
+        let mut sink = FakeSink::new(vec![task(
+            "t-1",
+            "ScTilePainter leaves one-tile-wide wall bands empty (grey holes)",
+            TaskStatus::Todo,
+            None,
+        )]);
+        sink.run = true;
+
+        let made = call(
+            tool::TASK_CREATE,
+            json!({ "title": "Damage numbers drift left on wide crits", "assignee": "ui-dev" }),
+            &sink,
+        );
+        let text = text_of(&made);
+        assert!(!made.is_error, "{text}");
+        assert!(
+            text.contains("inbox"),
+            "the run is told where it went: {text}"
+        );
+        assert_eq!(sink.tasks.lock()[1].status, TaskStatus::Inbox);
+
+        let again = call(
+            tool::TASK_CREATE,
+            json!({ "title": "ScTilePainter leaves one-tile-wide wall bands empty", "body": "seen on seed 7" }),
+            &sink,
+        );
+        let text = text_of(&again);
+        assert!(!again.is_error, "{text}");
+        assert!(text.starts_with("Not created: t-1"), "{text}");
+        let tasks = sink.tasks.lock();
+        assert_eq!(tasks.len(), 2, "no third row");
+        let noted = &tasks[0].comments.last().expect("a comment").text;
+        assert!(
+            noted.contains("Seen again") && noted.contains("seed 7"),
+            "{noted}"
+        );
+    }
+
+    /// An unfiltered list leaves the inbox out and says how much it left out; naming the status
+    /// shows it; `query` narrows either. (M83)
+    #[test]
+    fn the_list_leaves_the_inbox_out_unless_asked_and_searches_bodies() {
+        let mut noticed = task("t-2", "Stale comment in painter", TaskStatus::Inbox, None);
+        noticed.body = "mentions the retry ladder".into();
+        let sink = FakeSink::new(vec![
+            task("t-1", "Bot reaches level five", TaskStatus::Todo, None),
+            noticed,
+        ]);
+        let plain = text_of(&call(tool::TASK_LIST, json!({}), &sink));
+        assert!(
+            plain.starts_with("1 task(s) match. 1 more wait in the inbox"),
+            "{plain}"
+        );
+        assert!(!plain.contains("t-2"), "{plain}");
+
+        let inbox = text_of(&call(
+            tool::TASK_LIST,
+            json!({ "status": ["inbox"] }),
+            &sink,
+        ));
+        assert!(
+            inbox.contains("t-2") && !inbox.contains("more wait"),
+            "{inbox}"
+        );
+
+        let found = text_of(&call(
+            tool::TASK_LIST,
+            json!({ "status": ["inbox", "todo"], "query": "RETRY" }),
+            &sink,
+        ));
+        assert!(found.contains("t-2") && !found.contains("t-1"), "{found}");
+    }
+
+    /// A task says which milestone it serves, and whether that one is active. (M83)
+    #[test]
+    fn a_task_names_its_milestone() {
+        let mut goal = task("t-1", "Milestone: the slice", TaskStatus::Todo, None);
+        goal.links = Vec::new();
+        let mut child = task("t-2", "Bot reaches level five", TaskStatus::Todo, None);
+        child.links = vec![TaskLink {
+            link: LinkType::SubtaskOf,
+            target: TaskId("t-1".into()),
+            deleted: false,
+            at_unix_ms: 1,
+        }];
+        let mut sink = FakeSink::new(vec![
+            goal,
+            child,
+            task("t-3", "Loose", TaskStatus::Todo, None),
+        ]);
+        sink.plan = cide_ipc::MilestonePlan {
+            items: vec![cide_ipc::Milestone {
+                id: "slice".into(),
+                title: "The slice".into(),
+                task: Some(TaskId("t-1".into())),
+                gate: "true".into(),
+                timeout_secs: None,
+            }],
+            ..Default::default()
+        };
+        let text = text_of(&call(tool::TASK_GET, json!({ "id": "t-2" }), &sink));
+        assert!(
+            text.starts_with(
+                "Milestone: `slice` — The slice (held by t-1) — the active milestone."
+            ),
+            "{text}"
+        );
+        let loose = text_of(&call(tool::TASK_GET, json!({ "id": "t-3" }), &sink));
+        assert!(!loose.contains("Milestone:"), "{loose}");
+    }
+
+    /// `get` lists the active milestone's open work as a tree, and counts the rest. (M83)
+    #[test]
+    fn the_milestones_answer_lists_the_active_ones_open_tasks() {
+        let task_of = |id: &str, status, depth| cide_ipc::MilestoneTask {
+            id: TaskId(id.into()),
+            title: format!("work {id}"),
+            status,
+            agent: None,
+            depth,
+        };
+        let m = |id: &str, t: &str| cide_ipc::Milestone {
+            id: id.into(),
+            title: id.into(),
+            task: Some(TaskId(t.into())),
+            gate: "true".into(),
+            timeout_secs: None,
+        };
+        let view = cide_ipc::MilestonesView {
+            project: cide_ipc::ProjectId::new(),
+            plan: cide_ipc::MilestonePlan {
+                items: vec![m("slice", "t-1"), m("p2", "t-9")],
+                ..Default::default()
+            },
+            gates: Vec::new(),
+            verifies: Vec::new(),
+            accepted: Vec::new(),
+            tasks: vec![
+                cide_ipc::MilestoneTasks {
+                    milestone: "slice".into(),
+                    tasks: vec![
+                        task_of("t-2", TaskStatus::Doing, 0),
+                        task_of("t-3", TaskStatus::Todo, 1),
+                        task_of("t-4", TaskStatus::Done, 0),
+                    ],
+                },
+                cide_ipc::MilestoneTasks {
+                    milestone: "p2".into(),
+                    tasks: vec![task_of("t-10", TaskStatus::Todo, 0)],
+                },
+            ],
+            proposals: Vec::new(),
+        };
+        let text = render_milestones(&view);
+        assert!(
+            text.contains(
+                "  tasks: 2 open, 1 done\n  - t-2 [doing] work t-2\n    - t-3 [todo] work t-3\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("t-4"),
+            "done work is counted, not listed: {text}"
+        );
+        assert!(
+            text.contains("  tasks: 1 open, 0 done\n") && !text.contains("t-10"),
+            "{text}"
+        );
+    }
+
+    /// With milestones, the orchestrator's task is todo only under the active one. (M83)
+    #[test]
+    fn the_orchestrators_task_outside_the_active_milestone_goes_to_the_inbox() {
+        let mut sink = FakeSink::new(vec![task(
+            "t-1",
+            "Milestone: the slice",
+            TaskStatus::Todo,
+            None,
+        )]);
+        sink.plan = cide_ipc::MilestonePlan {
+            items: vec![cide_ipc::Milestone {
+                id: "slice".into(),
+                title: "The slice".into(),
+                task: Some(TaskId("t-1".into())),
+                gate: "true".into(),
+                timeout_secs: None,
+            }],
+            ..Default::default()
+        };
+
+        let loose = call(
+            tool::TASK_CREATE,
+            json!({ "title": "Rename the theme file" }),
+            &sink,
+        );
+        let text = text_of(&loose);
+        assert!(
+            text.contains("not part of the active milestone `slice`"),
+            "{text}"
+        );
+        assert_eq!(sink.tasks.lock()[1].status, TaskStatus::Inbox);
+
+        let serving = call(
+            tool::TASK_CREATE,
+            json!({ "title": "Bot reaches level five",
+                    "links": [{ "link": "subtaskOf", "target": "t-1" }] }),
+            &sink,
+        );
+        assert!(!serving.is_error, "{}", text_of(&serving));
+        assert_eq!(sink.tasks.lock()[2].status, TaskStatus::Todo);
+    }
+
     #[test]
     fn update_applies_every_field_it_was_given() {
         let sink = board();
@@ -7072,6 +8277,49 @@ mod tests {
             sink.get(&TaskId("t-1".into())).unwrap().unwrap().agent,
             None
         );
+    }
+
+    /// terrastrike's t-1062: integrate was denied, the reviewer set done anyway, and the branch
+    /// sat unmerged under a closed task. `done` over an unmerged branch is refused whole — and
+    /// the refusal names the denied-merge case, so the model knows to stop in review. (M86)
+    #[test]
+    fn done_is_refused_while_the_tasks_branch_is_not_merged() {
+        let mut sink = board();
+        sink.unmerged = Some(3);
+        let refused = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-1", "status": "done", "title": "Shipped" }),
+            &sink,
+        );
+        assert!(refused.is_error, "{}", text_of(&refused));
+        let text = text_of(&refused);
+        assert!(text.contains("cide/developer-t-1"), "{text}");
+        assert!(text.contains("3 commit(s)"), "{text}");
+        assert!(text.contains("denied by a permission check"), "{text}");
+        assert!(text.contains("leave the task in review"), "{text}");
+        {
+            let tasks = sink.tasks.lock();
+            let t1 = tasks.iter().find(|t| t.id.0 == "t-1").unwrap();
+            assert_eq!(t1.status, TaskStatus::Doing, "not set to done");
+            assert_eq!(t1.title, "Add the retry bar", "and nothing else applied");
+        }
+
+        // Every other status still moves freely: review is exactly where it should go.
+        let review = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-1", "status": "review" }),
+            &sink,
+        );
+        assert!(!review.is_error, "{}", text_of(&review));
+
+        // Once the branch is in, done goes through.
+        sink.unmerged = None;
+        let done = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-1", "status": "done" }),
+            &sink,
+        );
+        assert!(!done.is_error, "{}", text_of(&done));
     }
 
     #[test]
@@ -7515,6 +8763,8 @@ mod tests {
             stale_turn: false,
             note: None,
             openable: false,
+            model: None,
+            pool_position: None,
         }
     }
 

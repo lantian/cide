@@ -162,7 +162,26 @@ note: string | null,
  *
  * What Open then does is a second question with three answers — see [`RunOpen`].
  */
-openable: boolean, };
+openable: boolean, 
+/**
+ * The model this run is on, `provider/model` where the harness spells it that way. (M89)
+ *
+ * **The run's, never the role file's.** After a local override or a pool failover the file
+ * names what the *next* dispatch would get; this names what the child was actually told,
+ * resolved by the same ladder as [`LogRunInfo::model`] so the panel's row and the log card
+ * never disagree. `None` where nothing chose one and the harness picked its own default —
+ * the row then draws the harness alone rather than guessing a name.
+ */
+model: string | null, 
+/**
+ * The pool that chose [`Self::model`] and how far down it the run is — `fast entry 2 of 3`.
+ * (M89) `None` for a run with no pool, which is every harness but opencode today.
+ *
+ * A field rather than the sentence it used to be inside [`Self::note`]: a pool is the
+ * standing fact of what the run is on, and a note is for events. A row that has to parse
+ * prose to learn its model is a row that breaks on the next rewording.
+ */
+poolPosition: string | null, };
 
 /**
  * Which of the two directories a definition lives in.
@@ -247,6 +266,31 @@ sinceUnixMs: number, };
 export type ChangeName = string;
 
 /**
+ * What one run of a gate or a verify command answered.
+ */
+export type CheckResult = { 
+/**
+ * The command, as run.
+ */
+command: string, 
+/**
+ * Exit 0 within the timeout.
+ */
+passed: boolean, 
+/**
+ * `None` when the process was killed (a timeout, a signal) rather than exiting.
+ */
+exitCode?: number, timedOut: boolean, 
+/**
+ * The last lines of combined output, which is where every test runner prints its verdict.
+ */
+tail: string, startedUnixMs: number, durationMs: number, 
+/**
+ * The commit that was checked, when the directory is a git checkout.
+ */
+head?: string, };
+
+/**
  * What a device may say.
  */
 export type ClientBody = { "t": "pair", code: string, client: ClientInfo, } | { "t": "hello", protocol: number, client: ClientInfo, } | { "t": "subscribe", projects: Array<ProjectId>, } | { "t": "answerPrompt", session: SessionId, option: number, expectScreen: string, } | { "t": "input", session: SessionId, key: KeyEvent, seq: number, 
@@ -263,7 +307,7 @@ expectScreen?: string, } | { "t": "paste", session: SessionId, text: string, seq
 /**
  * See [`Self::Input`]'s field of the same name.
  */
-expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "ping" };
+expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "ping" };
 
 /**
  * One frame from a device.
@@ -358,6 +402,24 @@ prompt?: string,
 notify?: RunNotify, };
 
 /**
+ * A milestone's gate, as last seen. Outbound.
+ */
+export type GateState = { milestone: string, 
+/**
+ * `None` when it has never run on this machine.
+ */
+last?: CheckResult, 
+/**
+ * A run is in progress now.
+ */
+running: boolean, 
+/**
+ * The full output of the last (or current) run, as a path — for a model that can read a
+ * file; the panel asks `milestones_check_log`. Absent until it has run here.
+ */
+log?: string, };
+
+/**
  * Which CLI actually runs a role.
  *
  * An enum and not a string because it selects an implementation — `cide_agents::harness`
@@ -439,6 +501,110 @@ export type KeyName = { "k": "char" } | { "k": "enter" } | { "k": "escape" } | {
 export type LinkType = "related" | "blockedBy" | "subtaskOf";
 
 /**
+ * One goal.
+ */
+export type Milestone = { 
+/**
+ * A short handle — `slice`, `p2` — that the gate command and the prompts name it by.
+ */
+id: string, title: string, 
+/**
+ * The task that holds this goal on the board. Work towards it is `subtaskOf` it.
+ */
+task?: TaskId, 
+/**
+ * Shell command, run with `sh -c` in the project root. Exit 0 is met.
+ */
+gate: string, 
+/**
+ * Seconds. `number` on the wire, not ts-rs's `bigint`: a day is 86,400 and a JavaScript
+ * number holds that exactly, while a `bigint` would make every reader cast.
+ */
+timeoutSecs?: number, };
+
+/**
+ * A project's milestones, as `.cide/config.json` holds them and the Milestones tab edits them.
+ *
+ * Every field defaults, so a hand-written `{"milestones": {"items": [...]}}` is a complete file —
+ * and, more importantly, so a shape this build does not recognise costs only this key: the loader
+ * reads `milestones` separately from `agents`, because a parse failure in `agents` disables
+ * subagents for the whole project, and a typo in a gate command must not do that.
+ */
+export type MilestonePlan = { 
+/**
+ * In order. The first one not yet accepted is where the project is, unless [`Self::active`]
+ * says otherwise.
+ */
+items: Array<Milestone>, 
+/**
+ * The milestone being worked on, by id. `None` with items present means the first one.
+ */
+active?: string, 
+/**
+ * Run in a run's worktree before its work is integrated; exit 0 is *done*. Empty is none.
+ *
+ * A role saying it ran the checks is a report; this is the checks. It is what makes *review*
+ * mean the work passes, for every harness alike — no harness hook is involved, because codex
+ * and opencode have none cide may write.
+ */
+verify: string, 
+/**
+ * How many open tasks (todo, doing, review) the active milestone may hold before a new one
+ * the orchestrator creates goes to the inbox instead. `None` is [`DEFAULT_MAX_OPEN`].
+ */
+maxOpen?: number, 
+/**
+ * Paths (a file, or a directory with a trailing `/`) relative to the project root that a
+ * gate reads. A branch that touches one is refused at integration: the work may not move the
+ * goal it is measured against.
+ */
+guardPaths: Array<string>, };
+
+/**
+ * One task under a milestone: enough to draw a row and open the card. Outbound.
+ */
+export type MilestoneTask = { id: TaskId, title: string, status: TaskStatus, agent?: AgentId, 
+/**
+ * 0 for a direct subtask of the milestone's task, 1 for its subtasks, and so on.
+ */
+depth: number, };
+
+/**
+ * One milestone's tasks, as a tree flattened in board order. Outbound.
+ */
+export type MilestoneTasks = { milestone: string, tasks: Array<MilestoneTask>, };
+
+/**
+ * Everything the Milestones tab of the Tasks panel draws about a project's milestones. Outbound.
+ */
+export type MilestonesView = { project: ProjectId, plan: MilestonePlan, 
+/**
+ * One per milestone that has ever been run here, in [`MilestonePlan::items`] order.
+ */
+gates: Array<GateState>, 
+/**
+ * Ids of milestones the user accepted — their task is done.
+ */
+accepted: Array<string>, 
+/**
+ * The work under each milestone, one entry per milestone in [`MilestonePlan::items`] order —
+ * every task that is `subtaskOf` its task at any depth, done ones included so the tab can
+ * count them. (M83)
+ */
+tasks: Array<MilestoneTasks>, 
+/**
+ * Verify on each task's branch that this cide has run or is running, newest first. (M83) The
+ * board and the card draw it on the task, so a run's work being checked is visible where the
+ * work is rather than only as a merge that has not happened yet.
+ */
+verifies: Array<VerifyState>, 
+/**
+ * Changes agents have proposed to the milestones or to guarded files, oldest first, waiting
+ * for the user to accept or reject them. (M83)
+ */
+proposals: Array<Proposal>, };
+
+/**
  * What a program has asked for by way of mouse reports. Mirrors `vt100`'s two modes, flattened
  * to what a sender of a **wheel** needs: whether to send anything, and in which encoding.
  */
@@ -498,6 +664,50 @@ export type ProjectId = string;
  * One numbered choice.
  */
 export type PromptOption = { number: number, label: string, };
+
+/**
+ * One proposed change, waiting for the user. Outbound.
+ */
+export type Proposal = { 
+/**
+ * `p-1`, `p-2`, … — per project, never reused.
+ */
+id: string, title: string, 
+/**
+ * Why, in markdown, as the agent wrote it.
+ */
+rationale: string, by: TaskAuthor, createdUnixMs: number, 
+/**
+ * The task it came out of, if any; accepting or rejecting it is noted there.
+ */
+task?: TaskId, change: ProposalChange, };
+
+/**
+ * What accepting a proposal does.
+ */
+export type ProposalChange = { "kind": "plan", plan: MilestonePlan, before: MilestonePlan, } | { "kind": "files", files: Array<ProposedFile>, } | { "kind": "note" };
+
+/**
+ * One file in a [`ProposalChange::Files`].
+ */
+export type ProposedFile = { 
+/**
+ * Relative to the project root, `/`-separated.
+ */
+path: string, 
+/**
+ * The new content; `None` deletes the file.
+ */
+content?: string, 
+/**
+ * The content when it was proposed (`None`: the file did not exist). Accepting refuses if
+ * the file no longer says this — the proposal was written against something else.
+ */
+before?: string, 
+/**
+ * A unified diff of `before` → `content`, for reading.
+ */
+diff: string, };
 
 /**
  * A role, as a device lists it. (M75)
@@ -832,7 +1042,7 @@ dispatching: boolean, } | { "t": "task", project: ProjectId, id: TaskId,
  * much stack. Serde and ts-rs both see straight through a `Box`, so the wire and the
  * TypeScript are unchanged.
  */
-task?: TaskDetail, } | { "t": "board", project: ProjectId, tasks: Array<TaskRow>, } | { "t": "desync", why: string, } | { "t": "pong" } | { "t": "goingAway", why: string, };
+task?: TaskDetail, } | { "t": "board", project: ProjectId, tasks: Array<TaskRow>, } | { "t": "milestones", project: ProjectId, view?: MilestonesView, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, text?: string, } | { "t": "desync", why: string, } | { "t": "pong" } | { "t": "goingAway", why: string, };
 
 /**
  * One frame to a device.
@@ -1335,9 +1545,28 @@ attachmentCount: number, };
  * existed, in more detail than a tombstone row could. A `Cancelled` group would also compete
  * with `Done` for the bottom of the panel, where neither is being read.
  *
+ * # The one that was added: `Inbox` (M83)
+ *
+ * `Inbox` is not `Blocked` under another name. It is not a reason attached to work; it is the
+ * statement that something is **not work yet**. Before it existed, "anything noticed in passing
+ * goes on the board" meant every defect a run tripped over became a `Todo` — a task autodispatch
+ * would start, the spinner counted as open work, and the next planning turn read as part of the
+ * plan. Measured on a real board (`~/work/selfcraft`, four months, 232 tasks): of 98 open tasks,
+ * 36 were the plan and the rest were things somebody noticed. The board grew faster than it
+ * closed, and the orchestrator read the growth as progress.
+ *
+ * So a thing noticed goes to the inbox, and nothing about the inbox is automatic: autodispatch
+ * does not start it (`autodispatch` starts `Todo | Doing` only), the spinner does not count it as
+ * open work, and a role assigned to it is not woken. It becomes work by being moved to `Todo` —
+ * by the orchestrator when a milestone needs it, or by the user. It never expires: a project left
+ * alone for a month has the same inbox when it is opened again, because time passing says nothing
+ * about whether an observation was right.
+ *
+ * It is placed **first** so that the derived `Ord` keeps reading as the life of a task.
+ *
  * `Copy` and `Hash` because the panel groups by this and the group order is a lookup table.
  */
-export type TaskStatus = "todo" | "doing" | "review" | "done";
+export type TaskStatus = "inbox" | "todo" | "doing" | "review" | "done";
 
 /**
  * One status transition, recorded where the mutation is applied. (M27)
@@ -1362,3 +1591,16 @@ export type TaskStatusChange = { from: TaskStatus, to: TaskStatus, by: TaskAutho
  * Stamped by Rust when the change lands, for [`TaskComment::at_unix_ms`]'s reason.
  */
 atUnixMs: bigint, };
+
+/**
+ * Verify on one task's branch. Outbound.
+ */
+export type VerifyState = { task: TaskId, agent: AgentId, 
+/**
+ * It is running now; `last` is then the previous result, if any.
+ */
+running: boolean, last?: CheckResult, 
+/**
+ * The full output, as [`GateState::log`].
+ */
+log?: string, };

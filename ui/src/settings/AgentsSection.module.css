@@ -276,6 +276,39 @@
 }
 
 /*
+ * The role's description: `.input`'s box, unpinned from one row. (M89)
+ *
+ * A short paragraph rather than a document, so it starts at three lines and not at `.prompt`'s
+ * 320px, and wraps rather than scrolling sideways. Both `user-select` spellings for `.prompt`'s
+ * reason below — WebKitGTK drops the unprefixed one, and the app root disables selection.
+ */
+.descArea {
+  display: block;
+  width: 100%;
+  min-height: calc(56px * var(--ui-scale));
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  resize: vertical;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.descArea::placeholder {
+  color: var(--faint);
+}
+
+.descArea:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+/*
  * The system prompt.
  *
  * The one control on this screen that is a document rather than a value, and it is given the room

@@ -69,11 +69,43 @@ const jobs = [
     web_url: 'https://git.example/jobs/2',
   },
 ]
+// One local draft (M85): critical, on the changed line of api/main.go. Its severity is
+// metadata — the assertions below hold it out of the body and out of what is published.
+let drafts = [
+  {
+    id: 'd1',
+    review: 'review',
+    severity: 'critical',
+    body: 'This drops the error.',
+    path: 'api/main.go',
+    oldPath: 'api/main.go',
+    side: 'new',
+    line: 1,
+    position: {
+      position_type: 'text',
+      base_sha: 'a'.repeat(40),
+      start_sha: 'b'.repeat(40),
+      head_sha: 'c'.repeat(40),
+      old_path: 'api/main.go',
+      new_path: 'api/main.go',
+      new_line: 1,
+    },
+    headSha: 'c'.repeat(40),
+    author: { label: 'Review !42', harness: 'claude', run: 'run' },
+    createdUnixMs: 0,
+  },
+]
 window.__TAURI_INTERNALS__ = {
   transformCallback: () => 1,
   invoke: async (command, args) => {
     calls.push({ command, args })
     if (command === 'gitlab_open_url') return
+    // The agent review's harness list (M85): one runnable, one not installed.
+    if (command === 'gitlab_review_harnesses')
+      return [
+        { harness: 'claude', unavailable: null },
+        { harness: 'opencode', unavailable: '`opencode` is not on PATH' },
+      ]
     if (command === 'gitlab_request') {
       const q = args.request
       const review = {
@@ -117,6 +149,14 @@ window.__TAURI_INTERNALS__ = {
         return { data: {}, nextPage: null }
       }
       if (q.kind === 'comparison') return { data: comparison, nextPage: null }
+      if (q.kind === 'drafts') return { data: drafts, nextPage: null }
+      if (q.kind === 'draftPublish') {
+        drafts = drafts.filter((d) => !q.drafts.includes(d.id))
+        return {
+          data: { published: q.drafts, failed: [] },
+          nextPage: null,
+        }
+      }
       if (q.kind === 'open') return { data: review, nextPage: null }
       const data =
         q.kind === 'pipelines'
@@ -456,6 +496,7 @@ try {
     },
     versions: [],
     discussions: [],
+    drafts,
     approval: approvalReply,
     approvalError: null,
     activity: [
@@ -566,6 +607,67 @@ try {
       '',
     /pb\.go/,
   )
+
+  // Drafts (M85): counted on the file, listed with a severity badge that is not the body, and
+  // published as the body alone.
+  const changedApi = container.querySelector(
+    '[aria-label="MR changed files"] [title="api"]',
+  )
+  if (changedApi?.getAttribute('aria-expanded') === 'false')
+    await click(changedApi)
+  assert.ok(
+    container.querySelector('[aria-label="1 unpublished drafts"]'),
+    'the changed file shows its draft count',
+  )
+  // Folded again: the source tree below starts from the folders as the user left them.
+  if (changedApi?.getAttribute('aria-expanded') === 'true')
+    await click(changedApi)
+  await click(
+    [
+      ...container.querySelectorAll('[aria-label="MR information"] button'),
+    ].find((b) => b.textContent === 'Drafts (1)'),
+  )
+  const card = document.querySelector(
+    '[aria-label="Critical draft comment, not published"]',
+  )
+  assert.ok(card, 'the draft is listed and marked unpublished')
+  assert.equal(card.querySelector('[data-severity]')?.textContent, 'Critical')
+  assert.doesNotMatch(
+    card.querySelector('div')?.textContent ?? '',
+    /Critical/,
+    'the severity is not part of the comment body',
+  )
+  await click(
+    [...card.querySelectorAll('button')].find((b) => b.textContent === 'Publish'),
+  )
+  const published = calls.filter(
+    (c) => c.args?.request?.kind === 'draftPublish',
+  )
+  assert.deepEqual(published.at(-1)?.args.request.drafts, ['d1'])
+  assert.equal(
+    calls.filter((c) => c.args?.request?.kind === 'comment').length,
+    0,
+    'publishing is one request to Rust, which posts the body; the UI posts nothing itself',
+  )
+  await click(document.querySelector('[aria-label="Close MR information"]'))
+
+  // The launch dialog: a harness that is not installed cannot be chosen.
+  await click(container.querySelector('[aria-label="Review with an agent"]'))
+  const harness = document.querySelector('#gitlab-review-harness')
+  assert.ok(harness, 'the agent review dialog opens')
+  await act(async () => new Promise((r) => setTimeout(r, 0)))
+  assert.equal(harness.value, 'claude', 'the first runnable harness is chosen')
+  assert.equal(
+    harness.querySelector('option[value="opencode"]')?.disabled,
+    true,
+    'an unavailable harness is disabled',
+  )
+  assert.match(
+    document.querySelector('[role="dialog"]')?.textContent ?? '',
+    /Nothing is posted to GitLab until you publish/,
+  )
+  await act(async () => showOverlay('commands'))
+
   await click(
     [...container.querySelectorAll('button')].find(
       (b) => b.textContent === 'Browse MR source',

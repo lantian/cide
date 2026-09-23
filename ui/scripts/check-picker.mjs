@@ -857,6 +857,24 @@ try {
       'the card and one pasted from a terminal must never disagree in a bug thread',
   )
 
+  /*
+   * The pool-state card (`agents.poolState` → `'pools'` → `PoolStateCard`), for the About box's
+   * reason one block up: three files have to agree and `check:commands` sees two. (M90)
+   */
+  ok(
+    /\| 'pools'/.test(store) &&
+      /case 'agents\.poolState':[\s\S]{0,400}toggle\('pools'\)/.test(dispatch) &&
+      /open === 'pools'\) return <PoolStateCard/.test(host),
+    "'pools' is an OverlayKind, `agents.poolState` toggles it, and the host draws the card",
+  )
+  ok(
+    /Command::new\("agents\.poolState"[^)]*\)\s*\.when\("shellWindow && projectOpen"\)/.test(
+      uiFile('../crates/cide-core/src/commands.rs'),
+    ),
+    "`agents.poolState` asks for the host's own clause — a keymap binding firing it anywhere " +
+      'else would leave an invisible overlay gating every `!overlayOpen` binding',
+  )
+
   if (failed > 0) {
     console.error(`\ncheck-picker: ${failed} failure(s)`)
     process.exit(1)

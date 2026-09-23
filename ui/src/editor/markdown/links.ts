@@ -3,13 +3,12 @@
  *
  * Three kinds, and the whole feature's behaviour follows from which one a target is:
  *
- * * **External** — `https://…`, `mailto:`, anything with a scheme. cide does not navigate to
- *   these, and the refusal is the same one `terminal/xterm.ts` makes for OSC 8 hyperlinks, whose
- *   comment is worth reading: opening a URL "would have to go through Rust and
- *   `tauri_plugin_opener`, because the JS opener command is capability-gated per window and a
+ * * **External** — `https://…`, `mailto:`, anything with a scheme. This webview never navigates
+ *   to one. An `http(s)` link opens in the user's browser through Rust (`chrome/webLinks.ts`,
+ *   `cmd::app::app_open_url`) — the JS opener command is capability-gated per window and a
  *   detached-pane window deliberately has no `opener` permission, so a JS-side open would work in
- *   the shell window and silently do nothing in a torn-out pane". A `.md` in a cloned repository
- *   is exactly as untrusted as terminal output.
+ *   the shell window and silently do nothing in a torn-out pane. Every other scheme is refused: a
+ *   `.md` in a cloned repository is exactly as untrusted as terminal output.
  * * **A fragment** — `#some-heading`, which scrolls this preview and touches nothing else.
  * * **Local** — a relative or absolute path, resolved against the document's own directory and
  *   opened as a tab, which is what a reader clicking `[the ADR](../adr/0009.md)` wants.

@@ -38,7 +38,7 @@
   flex: none;
 }
 .panelHeader h2 {
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   font-weight: 600;
   margin: 0;
   flex: 1;
@@ -85,7 +85,7 @@
   border-radius: 4px;
   background: transparent;
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 .scopeTabs button:hover {
   color: var(--text);
@@ -140,7 +140,7 @@
   justify-content: space-between;
   padding: 9px 12px;
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   gap: 8px;
   flex: none;
 }
@@ -192,7 +192,7 @@
 .openedLabel {
   margin-left: auto;
   color: var(--accent);
-  font-size: 10px;
+  font-size: var(--fs-ui-11);
   font-weight: 500;
 }
 .state {
@@ -202,7 +202,7 @@
   flex: none;
   border-radius: 4px;
   padding: 2px 5px;
-  font-size: 10px;
+  font-size: var(--fs-ui-11);
   font-weight: 600;
   line-height: 1.4;
   color: var(--dim);
@@ -217,7 +217,7 @@
   background: color-mix(in srgb, var(--purple) 10%, transparent);
 }
 .mrTitle {
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   font-weight: 600;
   line-height: 1.4;
   color: var(--text-hi);
@@ -229,7 +229,7 @@
 }
 .projectName {
   max-width: 100%;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -255,7 +255,7 @@
   align-items: center;
   gap: 8px;
   margin-top: 9px;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   min-width: 0;
 }
 .itemFooter > a {
@@ -274,7 +274,7 @@
   margin-left: auto;
   color: var(--faint);
   white-space: nowrap;
-  font-size: 10px;
+  font-size: var(--fs-ui-11);
 }
 .itemSignals > span {
   display: inline-flex;
@@ -282,14 +282,14 @@
   gap: 3px;
 }
 .accountLabel {
-  font-size: 10px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   margin-top: 5px;
   overflow-wrap: anywhere;
 }
 .opening {
   color: var(--accent);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 .inboxError {
   padding: 8px 12px;
@@ -310,7 +310,7 @@
 }
 .empty p {
   margin: 0;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   max-width: 240px;
 }
 .inbox .loadMore {
@@ -331,7 +331,7 @@
   border-top: 1px solid var(--border);
   padding: 7px 10px;
   color: var(--faint);
-  font-size: 10px;
+  font-size: var(--fs-ui-11);
   flex: none;
 }
 .inboxFooter button {
@@ -342,7 +342,7 @@
   border: 0;
   color: var(--accent);
   padding: 0;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 
 .reviewPanel.reviewPanel {
@@ -371,7 +371,7 @@
   margin-left: auto;
 }
 .reviewTitle {
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
   font-weight: 600;
   color: var(--text-hi);
   line-height: 1.4;
@@ -401,7 +401,7 @@
   align-items: baseline;
   gap: 4px;
   flex-wrap: wrap;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 .approval {
   display: flex;
@@ -423,11 +423,11 @@
   gap: 2px;
 }
 .approval strong {
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   font-weight: 600;
 }
 .approval span {
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--dim);
 }
 .approval[data-status='approved'] {
@@ -498,7 +498,7 @@
   gap: 5px;
   flex-wrap: wrap;
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 .excludedToggle input {
   margin: 0;

@@ -9,6 +9,10 @@ import {
 import { OverlayCard } from '@/overlays/ModalShell'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { data, openReview, showInbox, showReviewInfo, useGitLab } from './store'
+import { gitlab } from '@/ipc/client'
+import type { GitLabReviewHarness, Harness } from '@/ipc/generated'
+import { Drafts } from './Drafts'
+import { HARNESS_LABEL, startAgentReview } from './agentReview'
 import { message } from './model'
 import { Markdown } from './Markdown'
 import { UserLink, Users } from './UserLink'
@@ -172,6 +176,7 @@ export function ReviewInfoDialog() {
   const { review, section } = info
   let body: ReactNode
   if (section === 'discussions') body = <Discussions review={review} />
+  else if (section === 'drafts') body = <Drafts review={review} />
   else if (section === 'activity')
     body = (
       <div className={styles.discussions}>
@@ -237,7 +242,13 @@ export function ReviewInfoDialog() {
         </header>
         <nav className={styles.bar} aria-label="MR information sections">
           {(
-            ['description', 'discussions', 'activity', 'pipelines'] as const
+            [
+              'description',
+              'discussions',
+              'drafts',
+              'activity',
+              'pipelines',
+            ] as const
           ).map((s) => (
             <button
               key={s}
@@ -256,11 +267,125 @@ export function ReviewInfoDialog() {
   )
 }
 
+/**
+ * Start an agent reviewing the MR: pick a harness, optionally say what to focus on. (M85)
+ *
+ * The agent's findings arrive as local drafts; this dialog says so, because "review" next to a
+ * GitLab MR otherwise reads as something that posts.
+ */
+export function LaunchReviewDialog() {
+  const { launch } = useGitLab()
+  const d = launch ? data.get(launch) : undefined
+  const [harnesses, setHarnesses] = useState<GitLabReviewHarness[] | null>(
+    null,
+  )
+  const [harness, setHarness] = useState<Harness | ''>('')
+  const [prompt, setPrompt] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let alive = true
+    gitlab.reviewHarnesses().then(
+      (list) => {
+        if (!alive) return
+        setHarnesses(list)
+        setHarness((old) => old || (list.find((h) => !h.unavailable)?.harness ?? ''))
+      },
+      (e) => alive && setError(message(e)),
+    )
+    return () => {
+      alive = false
+    }
+  }, [])
+  if (!launch || !d) return null
+  const chosen = harnesses?.find((h) => h.harness === harness)
+  async function submit() {
+    if (busy || !harness || !launch) return
+    setBusy(true)
+    setError('')
+    try {
+      await startAgentReview(launch, harness, prompt)
+      closeOverlay()
+    } catch (e) {
+      setError(message(e))
+      setBusy(false)
+    }
+  }
+  return (
+    <OverlayCard label="Review with an agent" onDismiss={closeOverlay}>
+      <form
+        className={`${styles.openDialog} ${styles.launch}`}
+        onKeyDown={modalKeys}
+        onSubmit={(event) => {
+          event.preventDefault()
+          void submit()
+        }}
+      >
+        <h2>
+          Review !{d.mr.iid} with an agent
+        </h2>
+        <p className={styles.muted}>
+          The agent reads the MR and the project at the MR&apos;s head, and
+          writes its findings as <strong>draft</strong> comments with a
+          severity. Nothing is posted to GitLab until you publish a draft.
+        </p>
+        <label htmlFor="gitlab-review-harness">Harness</label>
+        <select
+          id="gitlab-review-harness"
+          value={harness}
+          disabled={!harnesses}
+          onChange={(e) => setHarness(e.target.value as Harness)}
+        >
+          {!harnesses && <option value="">Checking installed harnesses…</option>}
+          {harnesses?.map((h) => (
+            <option key={h.harness} value={h.harness} disabled={!!h.unavailable}>
+              {HARNESS_LABEL[h.harness]}
+              {h.unavailable ? ' — unavailable' : ''}
+            </option>
+          ))}
+        </select>
+        {chosen?.unavailable && (
+          <span className={styles.muted}>{chosen.unavailable}</span>
+        )}
+        <label htmlFor="gitlab-review-prompt">
+          Instructions <span className={styles.muted}>(optional)</span>
+        </label>
+        <textarea
+          id="gitlab-review-prompt"
+          className={styles.comment}
+          placeholder="What to focus on — e.g. concurrency in the new cache, or the migration's rollback."
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+        />
+        {error && (
+          <div role="alert" className={styles.error}>
+            {error}
+          </div>
+        )}
+        <div className={styles.dialogFooter}>
+          <button type="button" onClick={closeOverlay}>
+            Cancel
+          </button>
+          <button
+            className={styles.primary}
+            type="submit"
+            disabled={busy || !harness || !!chosen?.unavailable}
+          >
+            {busy ? 'Preparing checkout…' : 'Start review'}
+          </button>
+        </div>
+      </form>
+    </OverlayCard>
+  )
+}
+
 export function GitLabDialogs() {
   const open = useOverlayOpen()
   return open === 'gitlabOpen' ? (
     <OpenReviewDialog />
   ) : open === 'gitlabInfo' ? (
     <ReviewInfoDialog />
+  ) : open === 'gitlabLaunch' ? (
+    <LaunchReviewDialog />
   ) : null
 }

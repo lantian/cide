@@ -2,6 +2,7 @@
 import type { AgentRun } from "./AgentRun";
 import type { AwaitingEntry } from "./AwaitingEntry";
 import type { InstanceInfo } from "./InstanceInfo";
+import type { MilestonesView } from "./MilestonesView";
 import type { PermissionPrompt } from "./PermissionPrompt";
 import type { ProjectId } from "./ProjectId";
 import type { RemoteAgent } from "./RemoteAgent";
@@ -53,4 +54,4 @@ dispatching: boolean, } | { "t": "task", project: ProjectId, id: TaskId,
  * much stack. Serde and ts-rs both see straight through a `Box`, so the wire and the
  * TypeScript are unchanged.
  */
-task?: TaskDetail, } | { "t": "board", project: ProjectId, tasks: Array<TaskRow>, } | { "t": "desync", why: string, } | { "t": "pong" } | { "t": "goingAway", why: string, };
+task?: TaskDetail, } | { "t": "board", project: ProjectId, tasks: Array<TaskRow>, } | { "t": "milestones", project: ProjectId, view?: MilestonesView, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, text?: string, } | { "t": "desync", why: string, } | { "t": "pong" } | { "t": "goingAway", why: string, };

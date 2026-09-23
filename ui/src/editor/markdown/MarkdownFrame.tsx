@@ -42,6 +42,7 @@ import {
   whenResizeSettles,
 } from '@/layout/resizeGesture'
 import { notify } from '@/chrome/notices'
+import { isWebUrl, openWebLink } from '@/chrome/webLinks'
 import { writeClipboard } from '../clipboard'
 import { utf8ByteLength } from '../byteSize'
 import { parseMarkdown } from './blocks'
@@ -339,23 +340,24 @@ export function MarkdownFrame({
         return
       }
       /*
-       * An external URL. cide does not navigate to one, and `terminal/xterm.ts` has the
-       * argument at length for the identical case in terminal output: opening it for real
-       * "would have to go through Rust and `tauri_plugin_opener`, because the JS opener command
-       * is capability-gated per window and a detached-pane window deliberately has no `opener`
-       * permission, so a JS-side open would work in the shell window and silently do nothing in
-       * a torn-out pane".
+       * An external URL. An http(s) one opens in the user's browser — through Rust, never by
+       * navigating this webview; `chrome/webLinks.ts` and `cmd::app::app_open_url` say why
+       * (a `.md` in a cloned repository is as untrusted as terminal output, and the JS opener
+       * is capability-gated per window so it would do nothing in a detached pane).
        *
-       * Refusing *silently* is the defect this project keeps finding — "a link that underlines,
-       * takes a click and does nothing is indistinguishable from one wired to nothing" — and the
-       * terminal's answer is a notice telling the user to copy the address. Here the address can
-       * simply be copied for them, which is that hint carried out rather than recited.
+       * Any other scheme — `mailto:`, `javascript:`, a protocol-relative `//host` — is still not
+       * followed, and refusing *silently* is the defect this project keeps finding, so it is
+       * copied instead: the old "copy the address" hint carried out rather than recited.
        */
+      if (isWebUrl(href)) {
+        openWebLink(href)
+        return
+      }
       void writeClipboard(href).then((copied) => {
         notify(
           copied
-            ? `Copied ${href} — cide does not open web links from a document`
-            : `cide does not open web links from a document: ${href}`,
+            ? `Copied ${href} — cide opens only http and https links`
+            : `cide opens only http and https links, not ${href}`,
           { kind: copied ? 'ok' : 'warn', hint: copied ? undefined : 'Copy the address by hand.' },
         )
       })

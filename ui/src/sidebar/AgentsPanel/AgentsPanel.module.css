@@ -258,33 +258,6 @@
 }
 
 /*
- * The armed half of a role's Integrate — the press that actually merges.
- *
- * It has to look **different from the button that was there a moment ago**, or the second click
- * is the first click landing twice: the word changes from *Integrate* to *Confirm merge*, and a
- * user who was already moving reads the shape before the word. So this is the one control in the
- * panel that is filled rather than outlined, in the warning colour rather than the accent —
- * accent is what `.actionPrimary` uses for *Enable subagents*, and the two must not read as the
- * same class of act. `--yellow` and not `--red`: a merge into your own branch is a real change,
- * not a failure, and training a user that red means "something broke" is worth more than the
- * extra half-second of alarm here.
- *
- * `color-mix` with a fallback declaration above it, the pattern `.action:hover` already uses: a
- * WebKit that does not know the function drops the second declaration and keeps a legible first.
- */
-.actionArmed {
-  border-color: var(--yellow);
-  background: var(--yellow);
-  background: color-mix(in srgb, var(--yellow) 22%, transparent);
-  color: var(--yellow);
-}
-
-.actionArmed:hover {
-  background: var(--yellow);
-  background: color-mix(in srgb, var(--yellow) 34%, transparent);
-}
-
-/*
  * The `empty` screen: a claim, a sentence, and one button, centred in the body.
  *
  * Centred vertically as well as horizontally, which is the whole of the design. A lone button
@@ -347,58 +320,73 @@
   gap: 14px;
 }
 
-.section {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+/* The inactive tab's panel. Needed, not redundant: `display: flex` above is an author rule and
+   beats the user agent's `[hidden] { display: none }`, so without this both tabs draw at once. */
+.sections[hidden] {
+  display: none;
 }
 
-.sectionHead {
+/*
+ * Agents | History, under the header. `gitlab/ReviewChrome.module.css`'s `.scopeTabs`, restated
+ * rather than imported — a CSS module is private to its component, and a shared one for two
+ * rules would be a third file to keep in step — so the two sidebar panels with tabs read as one
+ * application. `aria-pressed` is the selected state, as it is there.
+ */
+.tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  padding: 2px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.tab {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  font-size: var(--fs-ui-12);
-  letter-spacing: 0;
-  text-transform: none;
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 2px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
   color: var(--dim);
-}
-
-.sectionTitle {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.sectionCount {
-  flex: none;
-  font-family: var(--font-mono);
+  font-family: inherit;
   font-size: var(--fs-ui-11);
-  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.tab[aria-pressed='true'] {
+  color: var(--accent-hi);
+  background: var(--panel);
+  border-color: var(--border);
+  box-shadow: 0 1px 2px #0000000a;
+  font-weight: 600;
+}
+
+/* The count on each tab — where the old section heading's figure went. */
+.tabCount {
+  font-family: var(--font-mono);
+  font-weight: 400;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
 
-/* Recent is a real `<details>` so the collapse costs no state and survives a re-render with
-   no store behind it. Closed by default: it answers "what happened", not "what is happening". */
-.recent {
-  display: block;
-}
-
-.recentSummary {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  cursor: pointer;
+.tabEmpty {
+  margin: 0;
   font-size: var(--fs-ui-12);
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--dim);
-  list-style: none;
-}
-
-.recentSummary::-webkit-details-marker {
-  display: none;
+  color: var(--faint);
 }
 
 .rows {
@@ -605,6 +593,25 @@
   font-family: var(--font-mono);
 }
 
+/*
+ * Integrate's armed half: the one control on a run row that is waiting on the user, so it wears
+ * yellow until pressed — the second press rewrites the branch they have checked out.
+ *
+ * `color-mix` with a fallback declaration above it: a WebKit that does not know the function
+ * drops the second declaration and keeps a legible first.
+ */
+.controlArmed {
+  background: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 22%, transparent);
+  color: var(--yellow);
+}
+
+.controlArmed:hover {
+  background: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 34%, transparent);
+  color: var(--yellow);
+}
+
 /* Stop is the one irreversible control on the row, so it is the one that takes a colour. */
 .controlStop:hover {
   color: var(--red);
@@ -619,6 +626,20 @@
   line-height: 1.4;
   color: var(--faint);
   overflow-wrap: anywhere;
+}
+
+/* What an active run is on — harness · model · pool. Dim and mono under the task line, indented
+   to the task's column, because it is read when asked for and not on every glance. */
+.using {
+  margin: 0;
+  padding-left: 18px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1.4;
+  color: var(--faint);
 }
 
 .rowFailure {
@@ -816,21 +837,10 @@
   font-variant-numeric: tabular-nums;
 }
 
-.roleDesc {
-  margin: 0;
-  font-size: var(--fs-ui-12);
-  line-height: 1.45;
-  color: var(--faint);
-  overflow-wrap: anywhere;
-}
-
 /*
- * Why this role cannot be dispatched — and it is drawn **instead of** the Dispatch button,
- * never beside it.
- *
- * `canDispatch` returns a green light or a sentence and has no third shape; the markup here
- * derives both from that one call so it cannot render a greyed control with no explanation,
- * which is a dead control wearing grey.
+ * Why this role cannot be dispatched — `canDispatch`'s sentence, drawn when it says no. The
+ * Dispatch button it used to stand in for is gone (M89); the sentence is still the only place a
+ * role whose harness is missing says so.
  */
 .roleReason {
   margin: 0;
@@ -839,23 +849,6 @@
   color: var(--dim);
   font-style: italic;
   overflow-wrap: anywhere;
-}
-
-/*
- * The role-scope controls, on a row of their own at the foot of the role row.
- *
- * A row rather than a trailing cluster on the name line, because there are three of them and
- * the name line already carries a status and a figure; at 320px they would each be squeezed to
- * a few pixels and the role's name would be the thing that truncated. `wrap` because a long
- * role label and three controls do not always fit, and a control pushed off the right edge is
- * a control that does not exist.
- */
-.roleActions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-top: 2px;
 }
 
 /* --- Tones. -------------------------------------------------------------------------- */

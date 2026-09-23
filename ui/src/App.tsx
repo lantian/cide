@@ -486,6 +486,23 @@ export function App() {
     return () => unlisten?.()
   }, [])
 
+  // PgUp/PgDn from a paired phone (M91): the pane showing that session pages its scrollback,
+  // so the desk and the device move together. Every window hears it; only the one whose host
+  // holds the session has anything to scroll.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    void events
+      .onRemoteScroll((session, pages) => {
+        for (const host of liveHosts()) {
+          if (host.sessionId === session) host.terminal?.term.scrollPages(pages)
+        }
+      })
+      .then((fn) => {
+        unlisten = fn
+      })
+    return () => unlisten?.()
+  }, [])
+
   // A window-manager close the Rust side refused. It raises the same dialog the command
   // paths raise; discarding re-issues `window_close` with `force: true`, which does have a
   // command behind it.

@@ -104,6 +104,7 @@ try {
 
   const {
     matchPaths,
+    matchUrls,
     candidatePaths,
     outsidePaths,
     resolveCandidate,
@@ -123,6 +124,26 @@ try {
 
   /** The candidate texts a line yields, in order. */
   const texts = (line) => matchPaths(line).map((c) => c.text)
+
+  /*
+   * Web links. Until `matchUrls` existed a ctrl+click on a printed URL found no path candidate
+   * (the URL span is skipped) and was reported as a file that is not in the project.
+   */
+  const urls = (line) => matchUrls(line).map((c) => c.text)
+  eq(urls('see https://example.com/a/b for more'), ['https://example.com/a/b'], 'a bare https link')
+  eq(urls('dev server at http://localhost:5173/'), ['http://localhost:5173/'], 'an http one, trailing slash kept')
+  eq(urls('see https://example.com.'), ['https://example.com'], 'sentence punctuation is not the URL')
+  eq(urls('(https://example.com/x)'), ['https://example.com/x'], 'an unmatched closing paren is dropped')
+  eq(urls('https://en.wikipedia.org/wiki/Ruby_(gem)'), ['https://en.wikipedia.org/wiki/Ruby_(gem)'],
+    'a balanced one is kept')
+  eq(urls('git+https://host/x file:///etc/passwd ftp://h/x https://'), [],
+    'only http(s), not the tail of another scheme, and not a scheme with no host')
+  {
+    const line = 'x https://a.b/c y'
+    const [only] = matchUrls(line)
+    eq(line.slice(only.start, only.end), 'https://a.b/c', 'offsets index the logical line')
+    eq(texts('open https://host/src/main.rs now'), [], 'and the same span still yields no path')
+  }
   /** The first candidate, or `null` — most samples are meant to yield exactly one. */
   const only = (line) => {
     const all = matchPaths(line)
@@ -799,6 +820,21 @@ try {
   )
 
   const pkgJson = JSON.parse(read('package.json'))
+  /*
+   * `pathLinks.ts`'s `oscLinkAt` reads the OSC 8 link under a ctrl+press through two xterm
+   * internals, and degrades to "no link" if either is renamed — so a ctrl+click on a markdown
+   * link in a Claude pane would silently stop opening. The built bundle is the thing that has to
+   * still carry both names.
+   */
+  {
+    const bundle = readFileSync(join(UI, 'node_modules', '@xterm', 'xterm', 'lib', 'xterm.mjs'), 'utf8')
+    ok(bundle.includes('_oscLinkService') && bundle.includes('getLinkData'),
+      'xterm still exposes _core._oscLinkService.getLinkData, which oscLinkAt reads')
+    ok(bundle.includes('urlId'), 'and a cell still carries extended.urlId')
+    const links = code('src/terminal/pathLinks.ts')
+    ok(/const osc = oscLinkAt\(term, cell\)/.test(links) && /openWebLink\(osc\)/.test(links),
+      'the gate opens the OSC 8 web link under a ctrl+press')
+  }
   const declared = /XTERM_VERSION = '([^']+)'/.exec(read('src/terminal/xterm.ts'))
   ok(declared !== null, 'xterm.ts declares XTERM_VERSION as a literal this can read')
   eq(

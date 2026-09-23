@@ -290,7 +290,7 @@ interface AgentsStore {
    * filesystem watcher, which sees the checkout. A refresh here would be a round trip asking a
    * question whose answer cannot have changed.
    */
-  integrate: (agent: AgentId) => Promise<AgentIntegration>
+  integrate: (agent: AgentId, task?: string) => Promise<AgentIntegration>
 }
 
 /**
@@ -593,7 +593,7 @@ export const useAgents = create<AgentsStore>((set, get) => ({
     await get().refresh()
   },
 
-  integrate: async (agent) => {
+  integrate: async (agent, task) => {
     const project = get().project
     if (project === null) {
       /*
@@ -612,6 +612,8 @@ export const useAgents = create<AgentsStore>((set, get) => ({
      * word means something stronger than elsewhere in this file — a store that guessed at this
      * outcome would be guessing about the contents of the user's working tree.
      */
-    return await agentWorktreeApi.integrate(project, agent)
+    // `task` names the run's branch, `cide/<agent>-<task>` — which is where a task's work is.
+    // Without it this reaches the role's base branch, which only an older cide wrote to.
+    return await agentWorktreeApi.integrate(project, agent, task)
   },
 }))

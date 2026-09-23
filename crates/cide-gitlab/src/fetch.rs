@@ -1,7 +1,7 @@
 //! Use the same installed Git and proxy environment as Cide's ordinary network operations.
 //! Keep account credentials in this child's environment, never arguments or repository config.
 use crate::Result;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use cide_core::{child_env, proxy::ProxyEnv};
 use cide_ipc::ProxySettings;
 use std::{
@@ -251,14 +251,40 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 302 Found\r\nLocation: https://other.invalid/repo.git\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ] {
-            let (url, thread) = server(move |stream| stream.write_all(response.as_bytes()).unwrap());
+            let (url, thread) =
+                server(move |stream| stream.write_all(response.as_bytes()).unwrap());
             let token = "test-review-token";
-            let error = fetch(&root.0, &"a".repeat(40), &url, token, &settings(), &AtomicBool::new(false), &AtomicBool::new(false)).unwrap_err();
+            let error = fetch(
+                &root.0,
+                &"a".repeat(40),
+                &url,
+                token,
+                &settings(),
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
             let request = thread.join().unwrap();
-            assert!(request.contains(&format!("Authorization: Basic {}", STANDARD.encode(format!("oauth2:{token}")))), "request must carry the account credential");
-            assert!(error.contains(if response.contains("403") { "403" } else { "302" }), "{error}");
+            assert!(
+                request.contains(&format!(
+                    "Authorization: Basic {}",
+                    STANDARD.encode(format!("oauth2:{token}"))
+                )),
+                "request must carry the account credential"
+            );
+            assert!(
+                error.contains(if response.contains("403") {
+                    "403"
+                } else {
+                    "302"
+                }),
+                "{error}"
+            );
             assert!(!error.contains(token));
-            assert!(!error.contains("Could not resolve host: other.invalid"), "must not follow the redirect");
+            assert!(
+                !error.contains("Could not resolve host: other.invalid"),
+                "must not follow the redirect"
+            );
         }
         // Fetch authentication is transient, including after a failure.
         let config = fs::read_to_string(root.0.join("config")).unwrap();

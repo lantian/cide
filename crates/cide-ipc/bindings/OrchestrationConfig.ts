@@ -81,9 +81,7 @@ autoSpinAfterSecs: number,
  */
 autoSpinPrompt: string, 
 /**
- * cide reads the spun run's plan approval off its screen and answers it. (M79)
- *
- * `cide_agents::config::AgentsConfig::auto_spin_accept_plan` carries the argument, including
- * why this is not the blind write the stop code refuses.
+ * What a reviewer tab is told, as a template with `{placeholders}`. Empty means *use the
+ * one cide ships*, decided in `AgentsConfig::review_prompt_template`. (M84)
  */
-autoSpinAcceptPlan: boolean, };
+reviewPrompt: string, };

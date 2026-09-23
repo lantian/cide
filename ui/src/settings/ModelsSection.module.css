@@ -88,6 +88,10 @@
   font-size: var(--fs-ui-11);
 }
 
+.entryLimit {
+  flex: 0 0 calc(72px * var(--ui-scale));
+}
+
 .entryField:focus {
   outline: 0;
   border-color: var(--accent);
@@ -162,6 +166,14 @@
   align-items: center;
   gap: 6px;
   padding: 3px 0;
+}
+
+/* What the server said about a row's limits, under it. (M88) */
+.limitsNote {
+  display: block;
+  padding: 0 0 3px 2px;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
 }
 
 .modelNumber {
