@@ -965,18 +965,28 @@ pub(crate) fn close_project_here(
             blocked,
             cide_ide_mcp::CancelReason::ProjectClosed,
         );
-        servers.stop(project);
+        // Off this thread, and the children with it. `project_close` is a synchronous command,
+        // so this runs on the GTK main loop, and `stop` blocked it for the IDE server's drain —
+        // up to two seconds of every window frozen on each close. The entry still leaves the
+        // map here; the drain, and then the session ladder below, run on the stop's thread, so
+        // the order the doc above names (IDE server first, children after) is unchanged.
+        let app_for_sessions = app.clone();
+        servers.stop_in_background(app, project, move || {
+            stop_closed_sessions(&app_for_sessions, sessions)
+        });
+    } else {
+        // After the IDE server, before anything slow: the ladder runs on its own thread and
+        // only its start is ordered here.
+        stop_closed_sessions(app, sessions);
     }
-
-    // After the IDE server, before anything slow: the ladder runs on its own thread and only
-    // its start is ordered here.
-    stop_closed_sessions(app, sessions);
 
     // And its language servers. Dropping the entry runs each one's shutdown ladder, which is
     // where a `gopls` writes the cache that keeps the *next* open fast — so a project closed and
-    // reopened does not re-index from nothing.
+    // reopened does not re-index from nothing. On a thread of its own: the ladders are seconds
+    // per server, run one after another, and were paid on the main loop. A reopen of the same
+    // roots waits for them — see `DiagnosticsRegistry::ensure`.
     if let Some(diagnostics) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
-        diagnostics.close(project);
+        diagnostics.close_in_background(project);
     }
 
     // And its task tracker, which is written on the way out rather than merely dropped: a task
@@ -1648,12 +1658,21 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
 /// every input; `crate::running::last` holds what was *sent*, which is a different question. The
 /// `at` on the answer is what protects the caller from a broadcast that overtook this reply —
 /// see `ProjectRunningSet`.
+///
+/// On the blocking pool: `compute` reads each project's board, and the tracker holds its locks
+/// across the fsync of a write, so on the main thread a slow disk was a frozen window. The reply
+/// carries `at`, so arriving a moment later than it used to is exactly the case the counter is
+/// already there for. `Err` only when the pool lost the task.
 #[tauri::command(rename_all = "camelCase")]
-pub fn project_running_counts(
+pub async fn project_running_counts(
     app: tauri::AppHandle,
-    state: State<'_, WorkspaceState>,
-) -> cide_ipc::ProjectRunningSet {
-    crate::running::compute(&app, &state.snapshot())
+) -> Result<cide_ipc::ProjectRunningSet, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = app.state::<WorkspaceState>().snapshot();
+        crate::running::compute(&app, &snapshot)
+    })
+    .await
+    .map_err(|error| format!("the running counts could not be read: {error}"))
 }
 
 #[cfg(test)]

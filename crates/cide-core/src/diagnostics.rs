@@ -270,7 +270,12 @@ impl DiagnosticStore {
         // staleness mark is keyed by both and this is the one place it can be stamped: the store
         // is the truth, a `Diagnostic` is a copy handed to a view, and rewriting the flag anywhere
         // downstream would be a second implementation of the rule in another language.
-        let mut items: Vec<Diagnostic> = enabled
+        //
+        // Borrowed until the cap has been applied, and only the survivors cloned. This runs under
+        // the store's mutex — which the pump needs to fold the next publish in — once per window
+        // after every coalesced `cide://diagnostics`, continuously while a server is checking; it
+        // used to clone every item of every source and then throw all but `cap` of them away.
+        let mut found: Vec<(bool, &Diagnostic)> = enabled
             .iter()
             .flat_map(|(id, state)| {
                 state
@@ -282,16 +287,12 @@ impl DiagnosticStore {
             .filter(|(_, d)| {
                 settings.shows_severity(d.severity) && settings.shows_source(&d.source)
             })
-            .map(|(stale, d)| {
-                let mut d = d.clone();
-                d.stale = stale;
-                d
-            })
             .collect();
         // A total order, so the prefix a cap keeps is the *worst* problems rather than whichever
         // path sorted first. `sort_by` on (severity, path, line, column) mirrors the panel's own
         // comparator — the frontend re-sorts within a file, and this decides what survives the cap.
-        items.sort_by(|a, b| {
+        // Stable over the same input order as before, so ties land exactly where they did.
+        found.sort_by(|(_, a), (_, b)| {
             a.severity
                 .cmp(&b.severity)
                 .then_with(|| a.path.cmp(&b.path))
@@ -300,8 +301,16 @@ impl DiagnosticStore {
                 .then_with(|| a.message.cmp(&b.message))
         });
 
-        let truncated = items.len().saturating_sub(cap) as u32;
-        items.truncate(cap);
+        let truncated = found.len().saturating_sub(cap) as u32;
+        found.truncate(cap);
+        let items: Vec<Diagnostic> = found
+            .into_iter()
+            .map(|(stale, d)| {
+                let mut d = d.clone();
+                d.stale = stale;
+                d
+            })
+            .collect();
         let reports = self.reports(settings, cap);
 
         // A source that is `Unavailable` is not waiting for anything — it is *not running*, which

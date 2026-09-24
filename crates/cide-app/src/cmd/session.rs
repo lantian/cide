@@ -2151,8 +2151,21 @@ pub fn session_list(registry: State<'_, SessionRegistry>) -> Vec<SessionId> {
 /// A `State` parameter does not drift `contract/commands.json`: that file is a list of command
 /// *names*, and Tauri injects state rather than taking it off the wire, so `ui/src/ipc/
 /// client.ts` is untouched.
+///
+/// # On the blocking pool
+///
+/// For a codex console the answer is a walk of `$CODEX_HOME/sessions/Y/M/D`, the whole of it
+/// when the thread is missing, and it grows with the machine's history; each restored pane asks
+/// once. Nothing is ordered against it — the pane only reads the answer — so it leaves the main
+/// thread, and a lost task is `false`, the answer this doc already gives for not being able to tell.
 #[tauri::command(rename_all = "camelCase")]
-pub fn session_resumable(app: tauri::AppHandle, cwd: String, session: SessionId) -> bool {
+pub async fn session_resumable(app: tauri::AppHandle, cwd: String, session: SessionId) -> bool {
+    tauri::async_runtime::spawn_blocking(move || resumable_now(&app, &cwd, session))
+        .await
+        .unwrap_or(false)
+}
+
+fn resumable_now(app: &tauri::AppHandle, cwd: &str, session: SessionId) -> bool {
     // A codex console (M93) answers by the thread its hooks named, found by id under
     // `$CODEX_HOME/sessions`; `session` is cide's routing id and names no codex conversation.
     let (resume_enabled, codex) = app
@@ -2175,7 +2188,7 @@ pub fn session_resumable(app: tauri::AppHandle, cwd: String, session: SessionId)
         return thread
             .is_some_and(|thread| cide_core::codex_cli::resumable(&thread.to_string(), enabled));
     }
-    crate::lifecycle::resumable(std::path::Path::new(&cwd), session, resume_enabled)
+    crate::lifecycle::resumable(std::path::Path::new(cwd), session, resume_enabled)
 }
 
 /// Kill a session — **unless it is a subagent run's**, in which case closing the pane closes

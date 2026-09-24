@@ -380,6 +380,43 @@ impl IdeServers {
         tracing::info!(%project, "IDE server stopped");
     }
 
+    /// [`Self::stop`] for `project_close`, which runs on the GTK main thread: the entry leaves
+    /// the map here, so the project is gone for every caller the moment this returns, and the
+    /// shutdown — up to `DRAIN_TIMEOUT`, two seconds, of waiting for connections to drain — runs
+    /// on its own thread. Blocking there froze every window for the whole drain on each close.
+    ///
+    /// Safe to overlap a reopen: a new `ensure` binds a fresh port and lockfile, and the old
+    /// server's shutdown only ever touches its own. The quit path keeps the synchronous `stop`,
+    /// because there returning *is* the proof the lockfiles are gone.
+    ///
+    /// `then` runs on the same thread once the shutdown has returned — or at once, with no
+    /// server to stop. It is how the close keeps `lifecycle::run_teardown`'s order while leaving
+    /// the main thread: the children are stopped only after the drain, so a `claude` blocked on
+    /// `openDiff` still hears its rejection over a live socket.
+    pub fn stop_in_background(
+        &self,
+        app: &tauri::AppHandle,
+        project: ProjectId,
+        then: impl FnOnce() + Send + 'static,
+    ) {
+        let entry = self.servers.remove(&project).map(|(_, entry)| entry);
+        let app = app.clone();
+        let spawned = std::thread::Builder::new()
+            .name("cide-ide-stop".into())
+            .spawn(move || {
+                if let Some(entry) = entry
+                    && let Some(servers) = app.try_state::<IdeServers>()
+                {
+                    servers.rt.block_on(entry.server.shutdown());
+                    tracing::info!(%project, "IDE server stopped");
+                }
+                then();
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, %project, "no thread to stop the IDE server; dropped without its drain, and the closed project's children outlive it until quit");
+        }
+    }
+
     /// Stop every server. The quit path.
     pub fn stop_all(&self) {
         let projects: Vec<ProjectId> = self.servers.iter().map(|e| *e.key()).collect();

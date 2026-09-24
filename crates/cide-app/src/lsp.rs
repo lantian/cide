@@ -84,6 +84,9 @@ const KICK_CEILING: Duration = Duration::from_secs(5);
 #[derive(Default)]
 pub struct DiagnosticsRegistry {
     projects: DashMap<ProjectId, Arc<ProjectDiagnostics>>,
+    /// Teardowns [`Self::close_in_background`] started and that may still be running, with the
+    /// roots their servers were indexing. See [`Self::ensure`] for why they are kept.
+    closing: Mutex<Vec<(Vec<PathBuf>, std::thread::JoinHandle<()>)>>,
 }
 
 impl DiagnosticsRegistry {
@@ -119,6 +122,26 @@ impl DiagnosticsRegistry {
     ) -> Arc<ProjectDiagnostics> {
         if let Some(existing) = self.get(project) {
             return existing;
+        }
+        // A project reopened while its previous life is still shutting down waits for that
+        // teardown first. `respawn`'s rule, across a close: two rust-analyzers indexing one
+        // workspace is 2–8 GB, and the dying one saves its index on the way out. Only an
+        // overlapping root waits, so opening an unrelated project never pays for this — and a
+        // reopen within the ladder's seconds pays what every close used to pay on the main thread.
+        let overlapping: Vec<std::thread::JoinHandle<()>> = {
+            let mut closing = self.closing.lock();
+            closing.retain(|(_, handle)| !handle.is_finished());
+            let (hit, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *closing)
+                .into_iter()
+                .partition(|(old, _)| {
+                    old.iter()
+                        .any(|a| roots.iter().any(|b| a.starts_with(b) || b.starts_with(a)))
+                });
+            *closing = keep;
+            hit.into_iter().map(|(_, handle)| handle).collect()
+        };
+        for handle in overlapping {
+            let _ = handle.join();
         }
         let diagnostics = Arc::new(ProjectDiagnostics::start(app.clone(), project, roots));
         self.projects.insert(project, Arc::clone(&diagnostics));
@@ -186,9 +209,47 @@ impl DiagnosticsRegistry {
         self.projects.remove(&project);
     }
 
+    /// [`Self::close`] for `project_close`, which runs on the GTK main thread.
+    ///
+    /// The entry leaves the map here, so nothing can reach the project after this returns; the
+    /// *drop* — the pump's join and every server's shutdown ladder, seconds per server, one
+    /// after another — runs on its own thread. Done inline, it froze every window for all of it
+    /// on each close. The GitLab review paths keep the synchronous `close`: they delete the
+    /// checkout next, and a server still alive would write into what is being removed.
+    ///
+    /// The handle is kept so a reopen of the same roots can wait for it — see [`Self::ensure`].
+    /// Dropped on this thread only when the process has none to spare, which is a close that
+    /// costs what it always did.
+    pub fn close_in_background(&self, project: ProjectId) {
+        let Some((_, diagnostics)) = self.projects.remove(&project) else {
+            return;
+        };
+        let roots = diagnostics.roots.clone();
+        let slot = Arc::new(Mutex::new(Some(diagnostics)));
+        let spawned = std::thread::Builder::new()
+            .name(format!("cide-diag-close-{project}"))
+            .spawn({
+                let slot = Arc::clone(&slot);
+                move || drop(slot.lock().take())
+            });
+        match spawned {
+            Ok(handle) => self.closing.lock().push((roots, handle)),
+            Err(error) => {
+                tracing::warn!(%error, %project, "no thread for the language-server teardown; stopping inline");
+                drop(slot.lock().take());
+            }
+        }
+    }
+
     /// Stop every server, for the shutdown ladder.
     pub fn close_all(&self) {
         self.projects.clear();
+        // The quit path: a teardown `close_in_background` started must finish before the
+        // process does, or a server is killed mid-save of the index its ladder exists to keep.
+        let closing = std::mem::take(&mut *self.closing.lock());
+        for (_, handle) in closing {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1857,7 +1918,21 @@ fn respawn(
     server: Server,
 ) {
     let source = server.source();
-    handles.lock().retain(|h| h.server() != server);
+    // Taken out in one short lock and dropped after it, `stop_servers`' shape. `retain` used to
+    // drop the old handle *inside* the guard, and that drop joins the shutdown ladder — up to
+    // `GRACE` + `KILL_AFTER`, three seconds — while `notify_document` waits on this same lock
+    // from the synchronous `diagnostics_did_change`. A keystroke during a restart froze every
+    // window for the whole ladder. The order the doc above insists on is unchanged: the drop
+    // still completes before the spawn below.
+    let old: Vec<LspHandle> = {
+        let mut held = handles.lock();
+        let (old, keep): (Vec<LspHandle>, Vec<LspHandle>) = std::mem::take(&mut *held)
+            .into_iter()
+            .partition(|h| h.server() == server);
+        *held = keep;
+        old
+    };
+    drop(old);
     store.lock().clear_source(source.clone());
     let roots = roots.to_vec();
     let choice = binary_choices(app)
@@ -1924,8 +1999,10 @@ impl Drop for ProjectDiagnostics {
         if let Some(pump) = self.pump.lock().take() {
             let _ = pump.join();
         }
-        // Each handle's own `Drop` runs its shutdown ladder.
-        self.handles.lock().clear();
+        // Each handle's own `Drop` runs its shutdown ladder — outside the lock, `stop_servers`'
+        // shape, because a spawn thread still finishing `sync_servers` pushes onto this `Vec`.
+        let dropped: Vec<LspHandle> = std::mem::take(&mut *self.handles.lock());
+        drop(dropped);
     }
 }
 
@@ -2119,14 +2196,20 @@ fn sync_servers(
 
     // Gone first, so a server whose extension was just disabled has released its child before a
     // replacement for the same binary is spawned.
-    let dropped: Vec<Server> = {
+    //
+    // `gone` leaves the block and is dropped after the guard, not inside it: locals drop in
+    // reverse order, so a `gone` declared after `held` used to run every shutdown ladder with the
+    // handles lock still taken — the freeze `respawn` documents.
+    let gone: Vec<LspHandle> = {
         let mut held = handles.lock();
         let (keep, gone): (Vec<LspHandle>, Vec<LspHandle>) = std::mem::take(&mut *held)
             .into_iter()
             .partition(|handle| wanted.contains(&handle.server()));
         *held = keep;
-        gone.iter().map(LspHandle::server).collect()
+        gone
     };
+    let dropped: Vec<Server> = gone.iter().map(LspHandle::server).collect();
+    drop(gone);
     for server in dropped {
         tracing::info!(binary = %server.binary(), "sync: dropped a server no longer wanted");
         store.lock().clear_source(server.source());

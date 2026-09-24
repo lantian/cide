@@ -22,14 +22,15 @@
 //! [`diagnostics_definition`], [`diagnostics_probe`], [`diagnostics_usages`] and
 //! [`diagnostics_implementations`] each block on a reply from one, and [`diagnostics_refresh`]
 //! stats every path it is about to name. All six go to the blocking pool, because a command
-//! polled on the main thread holds the GTK loop and freezes every window in the app.
+//! polled on the main thread holds the GTK loop and freezes every window in the app — and so
+//! does [`diagnostics_get`], which waits on the store the pump is writing (see its doc).
 //!
 //! [`diagnostics_usages_cancel`] is deliberately *not* among them: it takes a mutex and pushes one
 //! notification, and making it wait would defeat its whole purpose, since the thing it races is a
 //! twenty-second wait.
 
 use cide_ipc::{DiagnosticSourceId, DiagnosticsSnapshot, ProjectId};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::lsp::DiagnosticsRegistry;
 use crate::workspace_state::WorkspaceState;
@@ -42,22 +43,35 @@ use crate::workspace_state::WorkspaceState;
 ///
 /// Never `Err`. A project with no entry is `unavailable` with a sentence, because "this project
 /// has no language server" is an answer and a rejected promise is not.
+///
+/// # On the blocking pool, unlike its neighbours
+///
+/// It takes the store's mutex, which the pump also takes to fold each publish in, and builds a
+/// snapshot of up to `EMIT_CAP` items — once per window after every coalesced `cide://diagnostics`,
+/// so continuously while a server is checking. On the main thread that was the GTK loop waiting
+/// on the pump. `AppHandle` rather than `State`, so the body can move to the pool.
 #[tauri::command(rename_all = "camelCase")]
-pub fn diagnostics_get(
-    registry: State<'_, DiagnosticsRegistry>,
-    state: State<'_, WorkspaceState>,
-    project: ProjectId,
-) -> DiagnosticsSnapshot {
-    let settings = state.with(|ws| ws.settings.inspections.clone());
-    match registry.get(project) {
-        Some(diagnostics) => diagnostics.snapshot(&settings),
-        None => DiagnosticsSnapshot::Unavailable {
-            reason: "No language server is running for this project. Rust needs rust-analyzer \
-                     and Go needs gopls on PATH."
-                .to_string(),
-            sources: Vec::new(),
-        },
-    }
+pub async fn diagnostics_get(app: tauri::AppHandle, project: ProjectId) -> DiagnosticsSnapshot {
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let settings = app
+            .state::<WorkspaceState>()
+            .with(|ws| ws.settings.inspections.clone());
+        match app.state::<DiagnosticsRegistry>().get(project) {
+            Some(diagnostics) => diagnostics.snapshot(&settings),
+            None => DiagnosticsSnapshot::Unavailable {
+                reason: "No language server is running for this project. Rust needs \
+                         rust-analyzer and Go needs gopls on PATH."
+                    .to_string(),
+                sources: Vec::new(),
+            },
+        }
+    })
+    .await;
+    // Never `Err`, as the doc above promises: a pool that lost the task is an answer too.
+    snapshot.unwrap_or_else(|error| DiagnosticsSnapshot::Unavailable {
+        reason: format!("The problems could not be read: {error}"),
+        sources: Vec::new(),
+    })
 }
 
 /// The editor opened a file. Tells whichever server owns that language.
