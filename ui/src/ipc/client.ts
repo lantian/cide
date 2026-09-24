@@ -5160,6 +5160,14 @@ export const gitlab = {
     harness: import('./generated').Harness,
     prompt: string | null,
   ) => invoke<RunId>('gitlab_review_launch', { project, review, harness, prompt }),
+  /**
+   * Discuss an agent's draft (M101): the message is saved under the draft, then reaches the
+   * reviewer that wrote it — typed into its live conversation, or by reviving that conversation
+   * as a new run, whose id this answers (`null` when the run was still there). A rejection after
+   * the save says why no answer is coming; the message itself is kept either way.
+   */
+  discussDraft: (project: ProjectId, review: string, draft: string, body: string) =>
+    invoke<RunId | null>('gitlab_draft_discuss', { project, review, draft, body }),
   /** The review run as the Agents panel would draw it; `null` once forgotten. (M85) */
   reviewRun: (project: ProjectId, run: RunId) =>
     invoke<import('./generated').AgentRun | null>('gitlab_review_run', { project, run }),

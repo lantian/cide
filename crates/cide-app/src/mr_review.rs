@@ -110,6 +110,21 @@ impl Sink<'_> {
     fn run(&self) -> String {
         self.tools.run.to_string()
     }
+
+    /// This run as a draft's author, with the conversation it is in — which is what a later
+    /// Discuss resumes if this run is gone by then (M101).
+    fn author(&self) -> GitLabDraftAuthor {
+        GitLabDraftAuthor {
+            label: self.tools.label.clone(),
+            harness: Some(self.tools.harness),
+            run: Some(self.run()),
+            conversation: self
+                .tools
+                .app
+                .try_state::<std::sync::Arc<crate::agents::AgentRegistry>>()
+                .and_then(|registry| registry.conversation_id(self.tools.run)),
+        }
+    }
 }
 
 impl ReviewSink for Sink<'_> {
@@ -136,11 +151,7 @@ impl ReviewSink for Sink<'_> {
                 line: request.line,
                 side: request.side,
             },
-            GitLabDraftAuthor {
-                label: self.tools.label.clone(),
-                harness: Some(self.tools.harness),
-                run: Some(self.run()),
-            },
+            self.author(),
         )?;
         self.changed.store(true, Ordering::Relaxed);
         Ok(draft)
@@ -162,6 +173,15 @@ impl ReviewSink for Sink<'_> {
                 .draft_edit(&self.tools.review, draft, body, severity, Some(&run))?;
         self.changed.store(true, Ordering::Relaxed);
         Ok(edited)
+    }
+
+    fn reply(&self, draft: &str, body: String) -> Result<GitLabDraft, String> {
+        let run = self.run();
+        let replied =
+            self.service
+                .draft_reply(&self.tools.review, draft, self.author(), body, Some(&run))?;
+        self.changed.store(true, Ordering::Relaxed);
+        Ok(replied)
     }
 
     fn discard(&self, draft: &str) -> Result<(), String> {

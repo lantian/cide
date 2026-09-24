@@ -273,6 +273,8 @@ try {
     { key: 'alt+up', command: 'navigate.prevMember', when: 'editorFocused' },
     { key: 'alt+pagedown', command: 'gitlab.nextFile', when: 'gitlabReviewActive && !overlayOpen' },
     { key: 'alt+pageup', command: 'gitlab.previousFile', when: 'gitlabReviewActive && !overlayOpen' },
+    { key: 'alt+shift+down', command: 'gitlab.nextComment', when: 'gitlabReviewActive && !overlayOpen && !editorFocused' },
+    { key: 'alt+shift+up', command: 'gitlab.previousComment', when: 'gitlabReviewActive && !overlayOpen && !editorFocused' },
     // The complement: the same two keys are the pane moves everywhere a buffer is not
     // focused, and Alt+Enter is the maximize toggle under the same clause — inside a buffer
     // that chord is CodeMirror's *send lines to Claude*, which the capture gate would kill
@@ -1975,8 +1977,22 @@ try {
         'the state where the re-homing has been deleted and its paragraph left behind',
     )
 
+    /*
+     * A binding whose `when` requires `!editorFocused` cannot eat an editor's stroke: the gate
+     * evaluates the clause before it swallows anything (the compound-clause sweep above proves
+     * that on both entry points), and with a buffer focused this clause is false. The GitLab
+     * review's comment walk (Alt+Shift+Down/Up) is the one such binding; without the exemption
+     * the only way to give a diff surface these chords would be to take them from every editor.
+     * Matched as a whole conjunct, so `!editorFocusedX` or `!editorFocused || x` does not pass.
+     */
+    const editorSafe = (when) =>
+      typeof when === 'string' &&
+      !when.includes('||') &&
+      when.split('&&').some((part) => part.trim() === '!editorFocused')
     const boundIn = (bindings, stroke) => {
-      const hit = bindings.find((b) => normalizeSequence(b.key) === stroke)
+      const hit = bindings.find(
+        (b) => normalizeSequence(b.key) === stroke && !editorSafe(b.when),
+      )
       return hit === undefined ? null : hit.command
     }
     const defaults = rustDefaults()

@@ -187,6 +187,7 @@
   "git_unshelve",
   "git_unstage",
   "gitlab_after_push",
+  "gitlab_draft_discuss",
   "gitlab_local_file",
   "gitlab_open_document",
   "gitlab_open_url",

@@ -84,6 +84,15 @@ export interface Approval {
   user_has_approved?: boolean
   user_can_approve?: boolean
 }
+/** `GET /merge_requests/:iid/commits`, the fields the Commits section draws. */
+export interface Commit {
+  id: string
+  short_id: string
+  title: string
+  author_name: string
+  authored_date: string
+  web_url: string
+}
 export interface Pipeline {
   id: number
   project_id: number

@@ -208,8 +208,17 @@ export function presentSegments(
   segments: readonly FileSegment[],
   totalLines: number,
   expanded: ReadonlySet<number>,
+  /**
+   * Fold every long gap whatever the file's size. The GitLab review opts in: a reviewer reads
+   * what the MR changed, and a 900-line file drawn whole buries a 4-line change in scrolling
+   * (the user's complaint that the MR diff "shows the full file"). The working-tree diff keeps
+   * the whole file below `WHOLE_FILE_COLLAPSE_ABOVE`, because there the surrounding code is
+   * what you are about to stage against. No margin is kept around a fold: libgit2's hunks
+   * already carry three lines of context, so a gap starts where the context ends.
+   */
+  foldAlways = false,
 ): DisplaySegment[] {
-  if (totalLines <= WHOLE_FILE_COLLAPSE_ABOVE) return [...segments]
+  if (!foldAlways && totalLines <= WHOLE_FILE_COLLAPSE_ABOVE) return [...segments]
   return segments.map((segment): DisplaySegment => {
     if (segment.kind !== 'gap') return segment
     if (segment.lines.length <= GAP_COLLAPSE_MIN) return segment

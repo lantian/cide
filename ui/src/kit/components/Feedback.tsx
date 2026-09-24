@@ -35,9 +35,16 @@ export type NoteProps = {
   children: ReactNode
   /** A single button at the right edge, for the one thing the note lets you do about it. */
   action?: ReactNode
+  /**
+   * A row of small buttons **under** the text. For a note with more than one thing to do — an
+   * agent run's Show / Stop / Open drafts — or one in a sidebar-wide column, where a button at
+   * the right edge squeezes the sentence into a word per line. Use `action` or `actions`, not
+   * both: two places for buttons on one note is a note that does not know what it is for.
+   */
+  actions?: ReactNode
 }
 
-export function Note({ tone = 'info', title, children, action }: NoteProps): ReactElement {
+export function Note({ tone = 'info', title, children, action, actions }: NoteProps): ReactElement {
   return (
     <div className={styles.note} data-tone={tone} role={tone === 'bad' ? 'alert' : 'status'}>
       <span className={styles.noteMark}>
@@ -46,6 +53,7 @@ export function Note({ tone = 'info', title, children, action }: NoteProps): Rea
       <div className={styles.noteBody}>
         {title !== undefined && <strong className={styles.noteTitle}>{title}</strong>}
         {children}
+        {actions !== undefined && <div className={styles.noteActions}>{actions}</div>}
       </div>
       {action !== undefined && <div className={styles.noteAction}>{action}</div>}
     </div>

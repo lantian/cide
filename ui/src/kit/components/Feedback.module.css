@@ -65,6 +65,13 @@
   color: var(--text-hi);
 }
 
+.noteActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+}
+
 .noteAction {
   flex: none;
   align-self: center;

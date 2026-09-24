@@ -253,7 +253,9 @@ you" (an awaiting-input counter, an unsaved dot).
   `bad`.
   The tone shows as a 3px gradient bar down the left, a round gradient mark holding the icon, a
   hairline border and a wash that fades left to right. The words stay `--text`, so every tone
-  reads the same. It takes at most one action.
+  reads the same. It takes at most one action at the right edge (`action`). A note with more than
+  one thing to do, or one in a sidebar-wide column, puts a row of `sm` buttons under the text
+  instead (`actions`); the MR panel's agent-review note is the first user. Never both.
 - **`Banner`**: flush across the top of a panel or pane, about the whole of it.
 - **`Toast`**: something that happened elsewhere. A failure toast stays until dismissed.
 - **`EmptyState`**: a mark, a claim, a sentence and one button, centred both ways.

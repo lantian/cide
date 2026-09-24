@@ -1,5 +1,7 @@
 import { Icon, type IconName } from '@/icons/Icon'
-import { IconButton } from '@/kit/components/Button'
+import { Button, IconButton } from '@/kit/components/Button'
+import { Banner, Note, Spinner } from '@/kit/components/Feedback'
+import { Counter } from '@/kit/components/Status'
 import { ApprovalStatus, MRState } from './ReviewStatus'
 import chrome from './ReviewChrome.module.css'
 import { Users } from './UserLink'
@@ -19,6 +21,7 @@ import {
   useGitLab,
   closeReview,
   showReviewInfo,
+  type ReviewSection,
   showLaunchReview,
 } from './store'
 import {
@@ -156,20 +159,33 @@ export function ReviewPanel({
   const agent = agentReviews.get(review)
   const draftsOf = (path: string, oldPath = path) =>
     d.drafts.filter((x) => x.path === path || x.path === oldPath).length
+  // Counts are a kit `Counter` beside the label rather than "(3)" in it, so the three counted
+  // sections read as one system. Commits sits after Pipelines, which in the two-column grid puts
+  // it beside Pipelines and under Activity. A count GitLab could not give is left off, not "0".
   const sections: {
-    section: 'description' | 'discussions' | 'drafts' | 'activity' | 'pipelines'
+    section: ReviewSection
     label: string
     icon: IconName
+    count?: number | undefined
   }[] = [
     { section: 'description', label: 'Overview', icon: 'file-text' },
     {
       section: 'discussions',
-      label: `Discussions (${d.discussions.filter((t) => t.notes.some((n) => n.resolvable && !n.resolved)).length})`,
+      label: 'Discussions',
       icon: 'message-square',
+      count: d.discussions.filter((t) =>
+        t.notes.some((n) => n.resolvable && !n.resolved),
+      ).length,
     },
-    { section: 'drafts', label: `Drafts (${d.drafts.length})`, icon: 'pencil' },
+    { section: 'drafts', label: 'Drafts', icon: 'pencil', count: d.drafts.length },
     { section: 'activity', label: 'Activity', icon: 'list' },
     { section: 'pipelines', label: 'Pipelines', icon: 'play' },
+    {
+      section: 'commits',
+      label: 'Commits',
+      icon: 'git-commit-horizontal',
+      count: d.commits?.length,
+    },
   ]
 
   return (
@@ -255,9 +271,27 @@ export function ReviewPanel({
         </button>
       </div>
       {updated && (
-        <p className={styles.notice}>
-          New commits available. Refresh to review them.
-        </p>
+        <Banner
+          action={
+            <Button
+              size="sm"
+              variant="link"
+              disabled={busy}
+              onClick={() =>
+                void run(async () => {
+                  await loadReview(review, true)
+                  setUpdated(false)
+                  setSource(false)
+                  setFiles([])
+                })
+              }
+            >
+              Refresh
+            </Button>
+          }
+        >
+          New commits available.
+        </Banner>
       )}
       {(error || snap.error || d.approvalError) && (
         <div role="alert" className={styles.error}>
@@ -265,40 +299,73 @@ export function ReviewPanel({
         </div>
       )}
       {agent && (
-        <div
-          className={styles.notice}
-          role="status"
-          aria-label="Agent review"
-        >
-          <span>
-            <strong>{HARNESS_LABEL[agent.harness]} review</strong> ·{' '}
-            {agent.detail}
-          </span>
-          <span className={styles.row}>
-            {agent.state !== 'queued' && (
-              <button
-                title="Show the review's tab"
-                onClick={() => void run(() => showAgentReview(review))}
-              >
-                <Icon name="square-terminal" size={1} /> Show
-              </button>
-            )}
-            {(agent.state === 'queued' || agent.state === 'running') && (
-              <button
-                title="Stop the agent; drafts it wrote are kept"
-                onClick={() => void run(() => stopAgentReview(review))}
-              >
-                <Icon name="square" size={1} /> Stop
-              </button>
-            )}
-          </span>
+        <div className={chrome.agentNote}>
+          <Note
+            tone={
+              agent.state === 'failed'
+                ? 'bad'
+                : agent.state === 'waiting'
+                  ? 'warn'
+                  : agent.state === 'idle' || agent.state === 'finished'
+                    ? 'ok'
+                    : 'info'
+            }
+            title={`${HARNESS_LABEL[agent.harness]} review`}
+            actions={
+              <>
+                {(agent.state === 'idle' || agent.state === 'finished') && (
+                  <Button
+                    size="sm"
+                    icon="pencil"
+                    onClick={() => showReviewInfo(review, 'drafts')}
+                  >
+                    Open drafts
+                  </Button>
+                )}
+                {agent.state !== 'queued' && (
+                  <Button
+                    size="sm"
+                    variant="quiet"
+                    icon="square-terminal"
+                    title="Show the review's tab"
+                    onClick={() => void run(() => showAgentReview(review))}
+                  >
+                    Show
+                  </Button>
+                )}
+                {agent.state !== 'finished' && agent.state !== 'failed' && (
+                  <Button
+                    size="sm"
+                    variant="quiet"
+                    icon="square"
+                    title="Stop the agent; drafts it wrote are kept"
+                    onClick={() => void run(() => stopAgentReview(review))}
+                  >
+                    Stop
+                  </Button>
+                )}
+              </>
+            }
+          >
+            <span className={chrome.agentDetail}>
+              {(agent.state === 'queued' || agent.state === 'running') && (
+                <Spinner />
+              )}
+              {agent.detail}
+            </span>
+          </Note>
         </div>
       )}
       <nav className={chrome.reviewActions} aria-label="MR information">
-        {sections.map(({ section, label, icon }) => (
+        {sections.map(({ section, label, icon, count }) => (
           <button key={section} onClick={() => showReviewInfo(review, section)}>
             <Icon name={icon} size={1} />
             {label}
+            {count !== undefined && (
+              <span className={chrome.sectionCount}>
+                <Counter value={count} />
+              </span>
+            )}
           </button>
         ))}
       </nav>

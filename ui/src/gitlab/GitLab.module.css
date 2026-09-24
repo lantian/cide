@@ -603,11 +603,6 @@
 .deletions {
   color: var(--red);
 }
-.notice {
-  padding: var(--sp-4);
-  margin: 0;
-  font-size: var(--fs-ui-12);
-}
 .openDialog {
   padding: 20px;
   display: flex;
@@ -716,6 +711,13 @@
 }
 .inlineThreads {
   min-width: 0;
+}
+/* Where Alt+Shift+Down/Up landed (`commentNav.ts`): focus moves into the block, and the ring
+   is the only mark of it, so a keyboard walk is visible without scanning for the scrolled row. */
+.inlineThreads:focus {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--r-2);
 }
 .inlineThreads .thread {
   margin: 4px 0 10px;

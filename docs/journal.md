@@ -14616,3 +14616,63 @@ rule 7) — went onto it too.
   The user reviewed phases 1–3 with `./run.sh`; the panes phase, the chrome phase and the
   close-out were done without a stop at the user's request and are unreviewed.
 
+
+## The GitLab MR diff shows hunks, a Commits section, a comment walk, and Discuss on a draft (M101)
+
+The user asked for six changes to the MR review surface, all built on the UI kit.
+
+- **Hunks, not whole files.** The MR diff drew the whole file: `diffRows.presentSegments`
+  folded unchanged stretches only above 5,000 lines. It now takes `foldAlways`. `GitDiffView`
+  passes it through as `foldUnchanged`, and only `ReviewDiff` sets it, so the working-tree and
+  log diffs are unchanged. The existing fold row ("⋯ N unchanged lines") loads the rest. A gap
+  holding a thread or draft still opens by itself. Jumping to a line used to open *every* gap;
+  it now opens only the one that holds the line, since opening all of them undoes the hunks-only
+  view. `check:diff-render` pins `foldAlways`.
+- **Commits.** A new `GitLabRequest::Commits` (`/merge_requests/:iid/commits`, 100 a page) is
+  loaded with the review. A failure there never blocks the MR: the list becomes `null` and the
+  panel draws no count. There is a new `gitlab/Commits.tsx` built from kit `List`/`ListItem`,
+  `Code` and `Person`; a row opens the commit on GitLab. The section buttons' counts moved out
+  of the label text into a kit `Counter`, for Discussions, Drafts and Commits alike. Commits
+  sits after Pipelines, which puts it under Activity in the two-column grid. It uses one new
+  icon, `git-commit-horizontal`.
+- **No Discussions button in the diff header.** The panel's button already opens the dialog.
+  Its place went to the comment walk.
+- **Next/Previous comment, Alt+Shift+Down/Up** (`gitlab.nextComment`/`previousComment`). It walks
+  the threads and drafts of the file in front, in reading order. It stays in the file and clamps
+  at the ends (the user's call; Alt+PgDn moves files). Landing opens the gap if needed, centres
+  the row and moves focus into the comment block, marked by the focus ring.
+  - `gitlab/commentNav.ts` keys walkers by document, because dispatch already knows which tab is
+    in front. It is import-free.
+  - `CommentWalk.tsx` in the header shows "2 / 5" with two kit icon buttons.
+  - The chords are also the editor's move-line (re-homed there). `check:keys` refused any app
+    binding on them, even with a `when` that excludes editors. So the bindings carry
+    `!editorFocused`, and the check now exempts exactly a binding whose clause has that
+    conjunct: the capture gate evaluates the clause before it swallows a stroke.
+- **The agent-review note.** It had been an unstyled `div` with raw buttons. It is now a kit
+  `Note`: info with a spinner while running, ok when done, warn while waiting for a permission,
+  bad on failure. Its actions are Open drafts, Show and Stop. The kit's `Note` gained `actions`,
+  a row of small buttons under the text, for a note in a narrow column with more than one thing
+  to do; its specimen and entry are updated. "New commits available" became the kit `Banner`
+  with a Refresh link. A bug under it was fixed: a claude reviewer that finished its summary is
+  `Idle`, not exited, and the panel showed it as "Reviewing…" with Stop forever. `idle` is now
+  its own state.
+- **Discuss on an agent's draft.** A draft now has a local thread (`GitLabDraft::replies`,
+  `#[serde(default)]` so old files load). Discuss opens a kit textarea under the card. Sending
+  (`gitlab_draft_discuss`) saves the message under the draft first, then reaches the reviewer
+  that wrote it:
+  - If that run is alive, the message is typed into its conversation. A run mid-turn holds it
+    (`LiveRun::follow_ups`) until `set_state` sees the hand-back.
+  - If the run is gone, its conversation is revived. Each draft now records it in
+    `GitLabDraftAuthor::conversation`. The revival is a new run through the admission's
+    `requeued` road, as a fork, standing in the checkout of the draft's own head, since
+    `claude --resume` finds a transcript by directory. The run inherits the old run's drafts
+    (`Drafts::reassign`), because ownership compares run ids.
+  - The reviewer answers with the new `cide_mr_draft_reply`, and may edit or discard the draft
+    as asked. `cide_mr_drafts` shows each draft's discussion, and the brief says how to answer.
+    The discussion is never published: `DraftPublish` still posts the body alone.
+  - The draft card's Publish/Edit/Discard and the edit form's Save/Cancel moved to kit buttons,
+    so the row is one system.
+- **Not confirmed on a display.** Everything was checked by the Rust tests, every `check:*`
+  script, `tsc`, clippy and the build. Nobody has seen it in a running cide yet: the fold rows
+  on a real MR, the walk's focus ring, the note's three tones, a real reviewer answering a
+  Discuss (live, stopped and revived), and opencode's respawn delivery.

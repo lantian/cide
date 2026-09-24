@@ -446,6 +446,7 @@ pub fn run() {
             cmd::gitlab::gitlab_request,
             cmd::gitlab::gitlab_open_document,
             cmd::gitlab::gitlab_review_launch,
+            cmd::gitlab::gitlab_draft_discuss,
             cmd::gitlab::gitlab_review_harnesses,
             cmd::gitlab::gitlab_review_run,
             cmd::gitlab::gitlab_open_url,

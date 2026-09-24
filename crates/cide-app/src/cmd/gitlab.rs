@@ -540,6 +540,53 @@ pub async fn gitlab_review_launch(
     harness: cide_ipc::Harness,
     prompt: Option<String>,
 ) -> Result<RunId, String> {
+    let (registry, spec) = plan_review(
+        &app,
+        &state,
+        &workspace,
+        project,
+        review,
+        harness,
+        Opening::Fresh(prompt),
+    )
+    .await?;
+    let run = registry
+        .enqueue_unique(spec)
+        .map_err(|_| "A review of this MR is already queued".to_string())?;
+    registry.mark_changed(&app, project);
+    registry.pump(&app);
+    Ok(run)
+}
+
+/// What a review run reads first.
+enum Opening {
+    /// A new review: `opening_line`, with the user's extra instructions if any.
+    Fresh(Option<String>),
+    /// A reviewer revived to answer on one of its drafts (M101): this line, typed into the
+    /// conversation it resumes, standing in the checkout of the head it reviewed — `claude
+    /// --resume` finds a transcript by the directory it was written in, so the revival must
+    /// stand where the original did, not in a newer head's checkout.
+    Discuss { line: String, head: String },
+}
+
+/// Everything a review run needs before it is queued: the checkout made, the brief composed.
+/// The launch and a Discuss revival share it, so a revived reviewer has the same brief, tools
+/// and directory as the one that wrote the draft.
+async fn plan_review(
+    app: &AppHandle,
+    state: &GitLabState,
+    workspace: &WorkspaceState,
+    project: ProjectId,
+    review: String,
+    harness: cide_ipc::Harness,
+    opening: Opening,
+) -> Result<
+    (
+        Arc<crate::agents::AgentRegistry>,
+        crate::agents::DispatchSpec,
+    ),
+    String,
+> {
     let service = state.service()?;
     let snapshot = workspace.snapshot();
     service.set_proxy(snapshot.settings.proxy.clone());
@@ -566,10 +613,13 @@ pub async fn gitlab_review_launch(
             .ok_or_else(|| format!("This build cannot run {harness:?}"))?;
         let mr = worker.detail(&review)?;
         let version = worker.latest_version(&review)?;
-        let head = version["head_commit_sha"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let head = match &opening {
+            Opening::Discuss { head, .. } => head.clone(),
+            Opening::Fresh(_) => version["head_commit_sha"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        };
         let base = version["base_commit_sha"]
             .as_str()
             .unwrap_or_default()
@@ -578,28 +628,33 @@ pub async fn gitlab_review_launch(
             let _gate = operations.lock();
             worker.review_checkout(&review, &head, &base)?
         };
-        let host = worker.account_of(&review)?.host;
-        let projects: Vec<String> = [
-            mr["web_url"]
-                .as_str()
-                .and_then(|url| cide_gitlab::project_from_url(&host, url).ok()),
-            mr["source_project"]["path_with_namespace"]
-                .as_str()
-                .map(str::to_string),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let local = crate::mr_review::local_repo_for(&roots, &host, &projects);
         let checkout = PathBuf::from(checkout);
-        let prompt = crate::mr_review::opening_line(
-            &mr,
-            &version,
-            &checkout,
-            with_base,
-            local.as_deref(),
-            prompt.as_deref(),
-        );
+        let prompt = match opening {
+            Opening::Discuss { line, .. } => line,
+            Opening::Fresh(extra) => {
+                let host = worker.account_of(&review)?.host;
+                let projects: Vec<String> = [
+                    mr["web_url"]
+                        .as_str()
+                        .and_then(|url| cide_gitlab::project_from_url(&host, url).ok()),
+                    mr["source_project"]["path_with_namespace"]
+                        .as_str()
+                        .map(str::to_string),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let local = crate::mr_review::local_repo_for(&roots, &host, &projects);
+                crate::mr_review::opening_line(
+                    &mr,
+                    &version,
+                    &checkout,
+                    with_base,
+                    local.as_deref(),
+                    extra.as_deref(),
+                )
+            }
+        };
         let config = cide_agents::load_project(&root).config.agents;
         Ok::<_, String>(crate::agents::DispatchSpec {
             project,
@@ -631,13 +686,154 @@ pub async fn gitlab_review_launch(
     })
     .await
     .map_err(|_| "GitLab worker did not finish")??;
+    Ok((registry, spec))
+}
+
+/// The user discussing an agent's draft (M101): the message is saved under the draft, then
+/// reaches the reviewer that wrote it — typed into its conversation when that run is alive
+/// (held until its turn is over), or by reviving that conversation as a new run when it is gone.
+/// The reviewer answers with `cide_mr_draft_reply`, which lands under the same draft.
+///
+/// Answers the revived run's id, so the panel can follow it as it follows a launched review;
+/// `None` when the message went to a run that was still there.
+///
+/// **The reply is saved before anything is delivered**, and a delivery that fails does not undo
+/// it: the user's words are theirs whatever the reviewer's state, and the error says why no
+/// answer is coming rather than making the text vanish from under the composer.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gitlab_draft_discuss(
+    app: AppHandle,
+    state: State<'_, GitLabState>,
+    workspace: State<'_, WorkspaceState>,
+    project: ProjectId,
+    review: String,
+    draft: String,
+    body: String,
+) -> Result<Option<RunId>, String> {
+    let service = state.service()?;
+    let registry = app
+        .try_state::<Arc<crate::agents::AgentRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or("This window has no agent registry")?;
+    let found = service.draft(&review, &draft)?;
+    let old_run = found
+        .author
+        .run
+        .clone()
+        .ok_or("Only a draft an agent wrote can be discussed: nobody would answer this one")?;
+    let harness = found
+        .author
+        .harness
+        .ok_or("This draft does not say which agent wrote it")?;
+    service.draft_reply(
+        &review,
+        &draft,
+        cide_ipc::gitlab::GitLabDraftAuthor {
+            label: "You".into(),
+            harness: None,
+            run: None,
+            conversation: None,
+        },
+        body.clone(),
+        None,
+    )?;
+    crate::emit::gitlab_drafts_changed(&app, &review);
+
+    let line = discuss_line(&found, &body, harness);
+    // The run that wrote it, if the registry still has it alive — in whichever project hosts it,
+    // which need not be the one in front now.
+    let live = old_run.parse::<RunId>().ok().and_then(|run| {
+        registry
+            .review_runs(&review)
+            .into_iter()
+            .find(|(project, r)| *r == run && registry.follow_up_reachable(*project, run))
+    });
+    if let Some((host, run)) = live {
+        registry
+            .follow_up(&app, host, run, &line)
+            .map_err(|error| {
+                format!(
+                    "Your message is saved on the draft, but the reviewer was not told: {error}"
+                )
+            })?;
+        return Ok(None);
+    }
+
+    let conversation = found.author.conversation.clone().ok_or(
+        "Your message is saved on the draft, but the reviewer that wrote it is gone and cide \
+         did not record its conversation (drafts from before this version). Start a new review \
+         to have it looked at again.",
+    )?;
+    let (registry, spec) = plan_review(
+        &app,
+        &state,
+        &workspace,
+        project,
+        review.clone(),
+        harness,
+        Opening::Discuss {
+            line,
+            head: found.head_sha.clone(),
+        },
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Your message is saved on the draft, but the reviewer could not be revived: {error}"
+        )
+    })?;
     let run = registry
-        .enqueue_unique(spec)
+        .enqueue_continuing(spec, conversation)
         .map_err(|_| "A review of this MR is already queued".to_string())?;
+    // Its drafts become the revived run's, or it could not answer on the draft it was asked
+    // about: a run answers and edits only what it wrote.
+    if let Err(error) = service.draft_reassign(&review, &old_run, &run.to_string()) {
+        tracing::warn!(%error, %run, "a revived reviewer did not inherit its drafts");
+    }
+    crate::emit::gitlab_drafts_changed(&app, &review);
     registry.mark_changed(&app, project);
     registry.pump(&app);
-    Ok(run)
+    Ok(Some(run))
 }
+
+/// What the reviewer is told when the user discusses one of its drafts. **One line** — typed
+/// into a TUI, where every newline is an Enter — so the user's text is flattened and clipped
+/// here, and the whole of it is in `cide_mr_drafts`, which the line points at.
+fn discuss_line(
+    draft: &cide_ipc::gitlab::GitLabDraft,
+    body: &str,
+    harness: cide_ipc::Harness,
+) -> String {
+    let tool = |name: &str| {
+        cide_agents::harness::for_kind(harness)
+            .map_or_else(|| name.to_string(), |h| h.tool_name(name))
+    };
+    let at = match (&draft.path, draft.line) {
+        (Some(path), Some(line)) => format!(" on {path}:{line}"),
+        _ => " (general comment)".into(),
+    };
+    let message = crate::agent_rpc::one_line(body);
+    let message = match message.char_indices().nth(DISCUSS_QUOTE) {
+        Some((at, _)) => format!(
+            "{}… (the whole message is in {})",
+            &message[..at],
+            tool(cide_agents::review::tool::MR_DRAFTS)
+        ),
+        None => message,
+    };
+    format!(
+        "The user is discussing your draft {id}{at}. They wrote: \"{message}\". Answer them with \
+         {reply} on draft {id} — they read the answer under the draft, not here. If they ask for \
+         a change, make it with {edit} (or {discard}) and say in your answer what you changed.",
+        id = draft.id,
+        reply = tool(cide_agents::review::tool::MR_DRAFT_REPLY),
+        edit = tool(cide_agents::review::tool::MR_DRAFT_EDIT),
+        discard = tool(cide_agents::review::tool::MR_DRAFT_DISCARD),
+    )
+}
+
+/// How much of the user's message the typed line quotes; the rest is one tool call away.
+const DISCUSS_QUOTE: usize = 600;
 
 /// One review run as the Agents panel would draw it, or `None` once the registry has forgotten
 /// it. (M85) The MR panel follows its own review through this rather than the roster: a
@@ -657,4 +853,65 @@ pub async fn gitlab_review_run(
         .runs_for(project)
         .into_iter()
         .find(|live| live.run == run))
+}
+
+#[cfg(test)]
+mod discuss_tests {
+    use super::*;
+    use cide_ipc::gitlab::{GitLabDraft, GitLabDraftAuthor, GitLabSeverity, GitLabSide};
+
+    fn draft() -> GitLabDraft {
+        GitLabDraft {
+            id: "d1".into(),
+            review: "r".into(),
+            severity: GitLabSeverity::Major,
+            body: "b".into(),
+            path: Some("src/a.rs".into()),
+            old_path: None,
+            side: Some(GitLabSide::New),
+            line: Some(12),
+            position: None,
+            head_sha: "h".into(),
+            author: GitLabDraftAuthor {
+                label: "Review !1".into(),
+                harness: Some(cide_ipc::Harness::Claude),
+                run: Some("run".into()),
+                conversation: Some("conv".into()),
+            },
+            created_unix_ms: 0,
+            replies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_discuss_line_is_one_line_that_names_the_draft_and_the_reply_tool() {
+        let line = discuss_line(
+            &draft(),
+            "Why major?\n\nIt looks\tminor to me.",
+            cide_ipc::Harness::Claude,
+        );
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "a newline is an Enter: {line}"
+        );
+        assert!(line.contains("draft d1 on src/a.rs:12"), "{line}");
+        assert!(
+            line.contains("\"Why major? It looks minor to me.\""),
+            "{line}"
+        );
+        assert!(line.contains("mcp__cide__cide_mr_draft_reply"), "{line}");
+        let opencode = discuss_line(&draft(), "q", cide_ipc::Harness::Opencode);
+        assert!(
+            !opencode.contains("mcp__cide__"),
+            "each harness spells its tools: {opencode}"
+        );
+    }
+
+    #[test]
+    fn a_long_message_is_clipped_and_points_at_the_whole_of_it() {
+        let long = "word ".repeat(400);
+        let line = discuss_line(&draft(), &long, cide_ipc::Harness::Claude);
+        assert!(line.len() < long.len() + 600, "{}", line.len());
+        assert!(line.contains("mcp__cide__cide_mr_drafts"), "{line}");
+    }
 }

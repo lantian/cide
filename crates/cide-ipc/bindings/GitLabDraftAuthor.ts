@@ -8,4 +8,12 @@ export type GitLabDraftAuthor = { label: string, harness: Harness | null,
 /**
  * The run that wrote it, so a run may edit and discard its own drafts and nobody else's.
  */
-run: string | null, };
+run: string | null, 
+/**
+ * The harness conversation the run was in when it wrote this — claude's `--session-id`,
+ * opencode/codex/mimo's own session id. What a draft's Discuss resumes when the run that
+ * wrote it is gone (stopped, the review closed, cide restarted: review runs are not
+ * persisted), so the answer comes from the reviewer that made the point rather than from a
+ * stranger re-reading it. `None` on drafts written before M101 and on the user's replies.
+ */
+conversation: string | null, };

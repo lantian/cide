@@ -18,7 +18,7 @@ const ROWS: ReadonlyArray<readonly [string, string, string]> = [
   ['Traffic lights', 'kit tone gradients', 'their 11px size is the layout audit\'s; not WindowControls'],
   ['TriCheckbox', 'kept', 'a tri-state box in a tree; the kit Checkbox has no partial row state of its own'],
   ['Tooltip', 'native title', 'about 200 uses; the kit Tooltip is drawn but not wired to anything yet'],
-  ['Avatar / Person', 'not used', 'people are still plain text in the task log and the GitLab panel'],
+  ['Avatar / Person', 'partly used', 'the GitLab panel\'s commit authors and draft discussions use Person; the task log and GitLab threads are still plain text'],
   ['File-type badges', 'own', 'the picker\'s `TS`/`RS` column is a coloured mono label, not a status'],
   ['Renderers', 'tokens only', 'diff, merge, commit graph, terminal, the editor surface and splitter drag geometry'],
 ]

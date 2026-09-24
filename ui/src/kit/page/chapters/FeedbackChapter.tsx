@@ -36,7 +36,8 @@ export function FeedbackChapter(): ReactElement {
             Inline, inside a form or a card, about the thing next to it.{' '}
             <strong>info</strong> neutral context, <strong>ok</strong> a check passed,{' '}
             <strong>warn</strong> it will work but mind this, <strong>bad</strong> it will not
-            work. At most one action, at the right.
+            work. At most one action, at the right; or, with more than one thing to do or in a
+            narrow column, a row of small buttons under the text (<code>actions</code>).
           </>
         }
         ground="chrome"
@@ -56,6 +57,25 @@ export function FeedbackChapter(): ReactElement {
             You do not have permission to write to /opt/projects.
           </Note>
           <Note tone="info">Roles take tasks from the board and work in their own worktree.</Note>
+          <Note
+            tone="ok"
+            title="Claude Code review"
+            actions={
+              <>
+                <Button size="sm" icon="pencil">
+                  Open drafts
+                </Button>
+                <Button size="sm" variant="quiet" icon="square-terminal">
+                  Show
+                </Button>
+                <Button size="sm" variant="quiet" icon="square">
+                  Stop
+                </Button>
+              </>
+            }
+          >
+            Done. Its findings are in Drafts; Discuss a draft to ask about it.
+          </Note>
         </Stack>
       </Specimen>
 

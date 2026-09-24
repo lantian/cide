@@ -40,6 +40,8 @@ pub mod tool {
     pub const MR_DRAFT_EDIT: &str = "cide_mr_draft_edit";
     /// Drop a draft this run wrote.
     pub const MR_DRAFT_DISCARD: &str = "cide_mr_draft_discard";
+    /// Answer the user in a draft's local discussion (M101). Still nothing leaves the machine.
+    pub const MR_DRAFT_REPLY: &str = "cide_mr_draft_reply";
 
     /// Read → write, the order a model skims — `tools.rs`' rule for [`crate::tools::tool::ALL`].
     pub const REVIEW: &[&str] = &[
@@ -49,6 +51,7 @@ pub mod tool {
         MR_DRAFTS,
         MR_DRAFT_EDIT,
         MR_DRAFT_DISCARD,
+        MR_DRAFT_REPLY,
     ];
 }
 
@@ -78,6 +81,8 @@ pub trait ReviewSink {
         severity: Option<GitLabSeverity>,
     ) -> Result<GitLabDraft, String>;
     fn discard(&self, draft: &str) -> Result<(), String>;
+    /// Answer in a draft's discussion. Limited to this run's own drafts, like `edit`.
+    fn reply(&self, draft: &str, body: String) -> Result<GitLabDraft, String>;
 }
 
 pub fn descriptors() -> Vec<Value> {
@@ -130,6 +135,13 @@ pub fn description(name: &str) -> &'static str {
         tool::MR_DRAFT_DISCARD => {
             "Delete a draft you wrote, by `draft` id — for a finding that turned out to be wrong."
         }
+        tool::MR_DRAFT_REPLY => {
+            "Answer the user in the discussion under one of your drafts, by `draft` id. The user \
+             discusses a draft with you to ask about it or to ask for a change; answer the \
+             question directly and briefly. If they ask you to change the draft, change it with \
+             cide_mr_draft_edit (or drop it with cide_mr_draft_discard) and say here what you \
+             changed. The discussion stays in cide: it is never published to GitLab."
+        }
         _ => "",
     }
 }
@@ -175,6 +187,15 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["draft"],
             "additionalProperties": false
         }),
+        tool::MR_DRAFT_REPLY => json!({
+            "type": "object",
+            "properties": {
+                "draft": { "type": "string" },
+                "body": { "type": "string", "description": "Your answer, in Markdown." }
+            },
+            "required": ["draft", "body"],
+            "additionalProperties": false
+        }),
         _ => json!({ "type": "object" }),
     }
 }
@@ -212,6 +233,12 @@ pub fn dispatch(name: &str, args: &Value, sink: &dyn ReviewSink) -> Option<ToolR
                         "side": d.side,
                         "author": d.author.label,
                         "body": d.body,
+                        // The discussion, so a reviewer asked about a draft reads what was
+                        // already said instead of answering the first question again.
+                        "discussion": d.replies.iter().map(|r| json!({
+                            "from": if r.author.run.is_none() { "user" } else { r.author.label.as_str() },
+                            "body": r.body,
+                        })).collect::<Vec<_>>(),
                     }))
                     .collect::<Vec<_>>()
             ))
@@ -230,6 +257,11 @@ pub fn dispatch(name: &str, args: &Value, sink: &dyn ReviewSink) -> Option<ToolR
         tool::MR_DRAFT_DISCARD => required_str(args, "draft").and_then(|draft| {
             sink.discard(&draft)
                 .map(|()| format!("Draft {draft} discarded."))
+        }),
+        tool::MR_DRAFT_REPLY => required_str(args, "draft").and_then(|draft| {
+            let body = required_str(args, "body")?;
+            sink.reply(&draft, body)
+                .map(|d| format!("Answered on draft {}. The user sees it under the draft.", d.id))
         }),
         _ => return None,
     };
@@ -321,7 +353,14 @@ drafts with {cide_mr_drafts} and correct or drop your own with {cide_mr_draft_ed
 
 Your drafts are private: the user reads them in cide and publishes the ones they agree with. \
 When you have finished, end with a short summary: overall assessment, and the count of drafts \
-per severity.";
+per severity.
+
+Afterwards the user may discuss a draft with you: a message says which draft and what they \
+wrote. Read the draft ({cide_mr_drafts} shows it with its discussion so far), check the code again \
+if the question needs it, and answer with {cide_mr_draft_reply} on that draft — the user reads \
+the answer there, not in this conversation. If they ask for the draft to change, change it with \
+{cide_mr_draft_edit} (or drop it with {cide_mr_draft_discard}) and say in your answer what you \
+changed. Stay on that draft; do not start a new review.";
 
 #[cfg(test)]
 mod tests {
@@ -357,8 +396,10 @@ mod tests {
                     label: "x".into(),
                     harness: None,
                     run: None,
+                    conversation: None,
                 },
                 created_unix_ms: 0,
+                replies: Vec::new(),
             })
         }
         fn drafts(&self) -> Result<Vec<GitLabDraft>, String> {
@@ -375,6 +416,56 @@ mod tests {
         fn discard(&self, _: &str) -> Result<(), String> {
             Ok(())
         }
+        fn reply(&self, draft: &str, body: String) -> Result<GitLabDraft, String> {
+            let mut d = self.draft(DraftRequest {
+                severity: GitLabSeverity::Minor,
+                body,
+                path: None,
+                line: None,
+                side: GitLabSide::New,
+            })?;
+            d.id = draft.to_string();
+            Ok(d)
+        }
+    }
+
+    #[test]
+    fn a_reply_needs_a_draft_and_a_body() {
+        let sink = Fake::default();
+        let ok = dispatch(
+            tool::MR_DRAFT_REPLY,
+            &json!({"draft": "d7", "body": "Because."}),
+            &sink,
+        )
+        .unwrap();
+        assert!(!ok.is_error, "{ok:?}");
+        let crate::tools::Content::Text { text } = &ok.content[0];
+        assert!(text.contains("d7"), "{text}");
+        for bad in [
+            json!({"draft": "d7"}),
+            json!({"body": "b"}),
+            json!({"draft": 1, "body": "b"}),
+        ] {
+            assert!(
+                dispatch(tool::MR_DRAFT_REPLY, &bad, &sink)
+                    .unwrap()
+                    .is_error,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_brief_names_the_reply_tool_so_a_discussed_draft_is_answered_there() {
+        let brief = review_brief(&ClaudeHarness);
+        assert!(
+            brief.contains(&ClaudeHarness.tool_name(tool::MR_DRAFT_REPLY)),
+            "{brief}"
+        );
+        assert!(
+            !brief.contains("{cide_"),
+            "every placeholder is spelled out"
+        );
     }
 
     #[test]

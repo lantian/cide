@@ -9,7 +9,9 @@
 //! account change; drafts are not secret, grow with every review, and must not make a corrupted
 //! write of one lose the other.
 use crate::Result;
-use cide_ipc::gitlab::{GitLabDraft, GitLabDraftAuthor, GitLabSeverity, GitLabSide};
+use cide_ipc::gitlab::{
+    GitLabDraft, GitLabDraftAuthor, GitLabDraftReply, GitLabSeverity, GitLabSide,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -163,6 +165,76 @@ impl Drafts {
         Ok(removed)
     }
 
+    /// Append one message to a draft's local discussion. `run` is the reviewer's run when an
+    /// agent answers: a run answers only on drafts it wrote, for `edit`'s reason — two reviews of
+    /// one MR must not talk over each other's findings. The user (`None`) may ask on any draft.
+    pub(crate) fn reply(
+        &self,
+        review: &str,
+        id: &str,
+        author: GitLabDraftAuthor,
+        body: String,
+        run: Option<&str>,
+    ) -> Result<GitLabDraft> {
+        if body.trim().is_empty() {
+            return Err("A reply needs some text".into());
+        }
+        if body.len() > MAX_BODY {
+            return Err(format!("A reply is limited to {} KiB", MAX_BODY / 1024));
+        }
+        let mut saved = self.saved.lock();
+        let before = saved.drafts.clone();
+        let draft = saved
+            .drafts
+            .iter_mut()
+            .find(|d| d.review == review && d.id == id)
+            .ok_or_else(|| format!("No draft `{id}` on this review"))?;
+        owned_by(draft, run)?;
+        // The reviewer answering from a revived conversation is now in a newer one (a revival
+        // forks it); the next revival must resume *that*, or it would not know it had answered.
+        if run.is_some() && author.conversation.is_some() {
+            draft.author.conversation = author.conversation.clone();
+        }
+        draft.replies.push(GitLabDraftReply {
+            id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
+            author,
+            body,
+            created_unix_ms: now_ms(),
+        });
+        let replied = draft.clone();
+        if let Err(error) = self.save(&saved) {
+            saved.drafts = before;
+            return Err(error);
+        }
+        Ok(replied)
+    }
+
+    /// Hand every draft `from` wrote to the run `to` — the run a Discuss revived in the same
+    /// conversation. Without it the revived reviewer could not answer on, edit or discard the
+    /// very findings it is being asked about: `owned_by` compares run ids, and a revival is a
+    /// new run. Answers how many drafts moved.
+    pub(crate) fn reassign(&self, review: &str, from: &str, to: &str) -> Result<usize> {
+        let mut saved = self.saved.lock();
+        let before = saved.drafts.clone();
+        let mut moved = 0;
+        for draft in saved
+            .drafts
+            .iter_mut()
+            .filter(|d| d.review == review && d.author.run.as_deref() == Some(from))
+        {
+            draft.author.run = Some(to.to_string());
+            moved += 1;
+        }
+        if moved == 0 {
+            return Ok(0);
+        }
+        if let Err(error) = self.save(&saved) {
+            saved.drafts = before;
+            return Err(error);
+        }
+        Ok(moved)
+    }
+
     /// Every draft of a closed review goes with it: the review's positions name an MR the user
     /// said they are done with, and a reopened review starts from what GitLab holds.
     pub(crate) fn forget(&self, review: &str) -> Result<()> {
@@ -261,10 +333,15 @@ pub(crate) fn compose(
         position,
         head_sha: head,
         author,
-        created_unix_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64),
+        created_unix_ms: now_ms(),
+        replies: Vec::new(),
     })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// `ui/src/gitlab/model.ts`'s `linePosition`, line for line — the panel's click and an agent's
@@ -352,7 +429,89 @@ mod tests {
             label: "Review !1".into(),
             harness: None,
             run: Some(run.into()),
+            conversation: None,
         }
+    }
+    fn you() -> GitLabDraftAuthor {
+        GitLabDraftAuthor {
+            label: "You".into(),
+            harness: None,
+            run: None,
+            conversation: None,
+        }
+    }
+
+    #[test]
+    fn a_discussion_is_the_users_on_any_draft_and_a_runs_only_on_its_own() {
+        let dir = std::env::temp_dir().join(format!("cide-drafts-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("gitlab-drafts.json");
+        let store = Drafts::load(path.clone());
+        let v = version();
+        let draft = store
+            .insert(compose("r", &v, new(None, None, GitLabSide::New), author("one")).unwrap())
+            .unwrap();
+        store
+            .reply("r", &draft.id, you(), "Why is this major?".into(), None)
+            .unwrap();
+        let refused = store
+            .reply(
+                "r",
+                &draft.id,
+                author("two"),
+                "Not mine".into(),
+                Some("two"),
+            )
+            .unwrap_err();
+        assert!(refused.contains("not by this run"), "{refused}");
+        assert!(
+            store
+                .reply("r", &draft.id, you(), "  ".into(), None)
+                .is_err()
+        );
+
+        // A revival is a new run: until the drafts move to it, it could not answer at all.
+        assert_eq!(store.reassign("r", "one", "three").unwrap(), 1);
+        store
+            .reply(
+                "r",
+                &draft.id,
+                author("three"),
+                "Because it drops data.".into(),
+                Some("three"),
+            )
+            .unwrap();
+
+        let reloaded = Drafts::load(path);
+        let replies = &reloaded.get("r", &draft.id).unwrap().replies;
+        assert_eq!(
+            replies.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            ["Why is this major?", "Because it drops data."],
+            "the discussion survives a restart, in order"
+        );
+        assert_eq!(replies[0].author.run, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_drafts_file_from_before_discussions_still_loads() {
+        let dir = std::env::temp_dir().join(format!("cide-drafts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gitlab-drafts.json");
+        std::fs::write(
+            &path,
+            r#"{"drafts":[{"id":"d","review":"r","severity":"minor","body":"b","path":null,
+                "oldPath":null,"side":null,"line":null,"position":null,"headSha":"h",
+                "author":{"label":"Review !1","harness":null,"run":"one"},"createdUnixMs":1}]}"#,
+        )
+        .unwrap();
+        let store = Drafts::load(path.clone());
+        let draft = store
+            .get("r", "d")
+            .expect("an old file is read, not set aside");
+        assert!(draft.replies.is_empty());
+        assert_eq!(draft.author.conversation, None);
+        assert!(!path.with_extension("json.unreadable").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
     fn new(path: Option<&str>, line: Option<u32>, side: GitLabSide) -> NewDraft {
         NewDraft {

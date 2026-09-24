@@ -444,3 +444,99 @@
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/*
+ * The MR diff header's comment walk (`CommentWalk.tsx`): two kit icon buttons around a counter.
+ * `margin-left: auto` puts it at the bar's far end, away from the file buttons it is not part of.
+ */
+.commentWalk {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  margin-left: auto;
+}
+.commentWalkCount {
+  min-width: 7ch;
+  text-align: center;
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The Commits section in the MR information dialog: the kit list, scrolling inside the dialog. */
+.commits {
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-3);
+}
+
+/* A section button's kit `Counter`, pushed to the button's right edge. */
+.sectionCount {
+  margin-left: auto;
+  display: inline-flex;
+}
+
+/* The agent-review kit `Note`, inset from the panel edges like the section grid below it. */
+.agentNote {
+  padding: var(--sp-4) 12px 0;
+  flex: none;
+}
+.agentDetail {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+/*
+ * A draft's local discussion (`DraftDiscussion.tsx`, M101): replies as a quiet thread under the
+ * draft's body, the reviewer's marked by a left rule in its role colour so the two voices read
+ * apart without a bubble each; and the Discuss composer, the kit textarea and buttons.
+ */
+.draftReplies {
+  list-style: none;
+  margin: var(--sp-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.draftReply {
+  padding: var(--sp-2) 0 var(--sp-2) var(--sp-4);
+  border-left: 2px solid var(--border);
+  min-width: 0;
+}
+.draftReply[data-from='reviewer'] {
+  border-left-color: var(--purple);
+}
+.draftReplyHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+.draftReplyWaiting {
+  padding-left: var(--sp-4);
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+.discussBox {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+}
+.discussActions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+.discussHint {
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+.discussError {
+  color: var(--red);
+  font-size: var(--fs-ui-11);
+}

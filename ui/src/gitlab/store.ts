@@ -13,6 +13,7 @@ import type {
   Version,
   Discussion,
   Approval,
+  Commit,
   Change,
   Refs,
   Note,
@@ -45,6 +46,11 @@ export interface ReviewData {
   approvalError: string | null
   /** Local, unpublished review comments — an agent's findings or the user's edits of them. */
   drafts: GitLabDraft[]
+  /**
+   * The MR's commits, newest first. `null` when GitLab refused the list: the panel then
+   * draws no count rather than a "0" that would read as an empty MR.
+   */
+  commits: Commit[] | null
 }
 export interface Document {
   review: string
@@ -55,12 +61,19 @@ export interface Document {
   oldPath?: string
   at?: { line: number; column: number; side?: 'old' | 'new' }
 }
+export type ReviewSection =
+  | 'description'
+  | 'discussions'
+  | 'drafts'
+  | 'activity'
+  | 'pipelines'
+  | 'commits'
 interface Snapshot {
   board: GitLabBoard
   editor: Document | null
   info: {
     review: string
-    section: 'description' | 'discussions' | 'drafts' | 'activity' | 'pipelines'
+    section: ReviewSection
   } | null
   error: string | null
   revision: number
@@ -258,7 +271,7 @@ export async function loadReview(
   const running = pending.get(id)
   if (running) return running
   const promise = (async () => {
-    const [mr, versions, discussions, activity, approval, drafts] = await Promise.all([
+    const [mr, versions, discussions, activity, approval, drafts, commits] = await Promise.all([
       api<MR>({ kind: 'detail', review: id }),
       api<Version[]>({ kind: 'versions', review: id }),
       pages<Discussion>((page) => ({ kind: 'discussions', review: id, page })),
@@ -268,6 +281,9 @@ export async function loadReview(
         (error) => ({ value: null, error: message(error) }),
       ),
       api<GitLabDraft[]>({ kind: 'drafts', review: id }),
+      // Never fails the review: the commit list is a side section, and an old GitLab or a
+      // token without the scope would otherwise keep the whole MR from opening.
+      pages<Commit>((page) => ({ kind: 'commits', review: id, page })).catch(() => null),
     ])
     const latest = versions[0]
     if (!latest)
@@ -306,6 +322,7 @@ export async function loadReview(
       approval: approval.value,
       approvalError: approval.error,
       drafts,
+      commits,
     }
     if (snapshot.board.reviews.some((r) => r.id === id)) {
       data.set(id, result)

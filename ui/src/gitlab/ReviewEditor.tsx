@@ -30,11 +30,11 @@ import {
   roots,
   revealed,
   useGitLab,
-  showReviewInfo,
   type Document,
 } from './store'
 import { message, reviewProject, visibleChanges, versionRefs } from './model'
 import { ReviewDiff } from './ReviewDiff'
+import { CommentWalk } from './CommentWalk'
 import styles from './GitLab.module.css'
 
 export function ReviewEditor({
@@ -327,15 +327,6 @@ export function ReviewEditor({
       setBusy(false)
     }
   }
-  const threads =
-    d?.discussions.filter((t) =>
-      t.notes.some(
-        (n) =>
-          n.position &&
-          (n.position.new_path === doc.path ||
-            n.position.old_path === doc.path),
-      ),
-    ) ?? []
   const visibleFiles = d
     ? visibleChanges(
         d.version.diffs ?? [],
@@ -430,9 +421,9 @@ export function ReviewEditor({
             Open local working-tree file
           </button>
         )}
-        <button onClick={() => showReviewInfo(doc.review, 'discussions')}>
-          Discussions ({threads.length})
-        </button>
+        {/* The panel's section buttons already open Discussions; the diff header carries
+            the walk through this file's comments instead (Alt+Shift+Down/Up). */}
+        {doc.mode === 'diff' && <CommentWalk document={doc} />}
         {navigation.length > 0 && (
           <button
             onClick={() => {

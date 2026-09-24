@@ -403,6 +403,11 @@ interface GitDiffViewCommon {
   expandedGaps?: ReadonlySet<number> | undefined
   /** Absent ⇒ fold rows draw disabled. The wiring owns the set; this is one gap opening. */
   onExpandGap?: ((gap: number) => void) | undefined
+  /**
+   * Fold unchanged stretches at any file size (`diffRows.presentSegments`' `foldAlways`).
+   * Only the GitLab review sets it; absent keeps the working tree's whole-file rule.
+   */
+  foldUnchanged?: boolean | undefined
 }
 
 /**
@@ -499,6 +504,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     onCollapse,
     expandedGaps = NO_GAPS,
     onExpandGap,
+    foldUnchanged = false,
   } = props
   /**
    * The staging half of the union, or `null` on a revision diff.
@@ -647,8 +653,9 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
     [diff],
   )
   const segments: DisplaySegment[] | null = useMemo(
-    () => (whole === null ? null : presentSegments(whole, totalLines, expandedGaps)),
-    [whole, totalLines, expandedGaps],
+    () =>
+      whole === null ? null : presentSegments(whole, totalLines, expandedGaps, foldUnchanged),
+    [whole, totalLines, expandedGaps, foldUnchanged],
   )
 
   /*

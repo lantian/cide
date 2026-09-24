@@ -1113,6 +1113,15 @@ fn build() -> Vec<Command> {
         Command::new("gitlab.open", "Open GitLab merge request by URL…", GIT),
         Command::new("gitlab.nextFile", "Next MR file", GIT).when("gitlabReviewActive"),
         Command::new("gitlab.previousFile", "Previous MR file", GIT).when("gitlabReviewActive"),
+        // Walk the threads and agent drafts of the MR file in front, in reading order. Stays in
+        // the file and clamps at the ends (`ui/src/gitlab/commentNav.ts`): Alt+PgDn/PgUp above
+        // already move between files.
+        Command::new("gitlab.nextComment", "Next MR comment", GIT)
+            .when("gitlabReviewActive")
+            .keywords(&["discussion", "draft", "thread", "review"]),
+        Command::new("gitlab.previousComment", "Previous MR comment", GIT)
+            .when("gitlabReviewActive")
+            .keywords(&["discussion", "draft", "thread", "review"]),
         Command::new("git.push", "Push to remote…", GIT).when("projectOpen"),
         Command::new("git.refresh", "Refresh git status", GIT).when("projectOpen"),
         // Branches. The two that need a name or a choice open the branch popup

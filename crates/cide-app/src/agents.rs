@@ -387,6 +387,13 @@ struct LiveRun {
     /// the run went back to the queue for it. See [`AgentRegistry::abandon_unsubmitted`].
     /// Taken at admission and read nowhere else; never persisted, for `continuing`'s reason.
     requeued: Option<Requeued>,
+    /// Lines for this run's conversation that arrived mid-turn — a person discussing one of an
+    /// MR reviewer's drafts (M101) — typed in order at its next hand-back. Held rather than
+    /// typed at once because a line written into a TUI mid-turn lands in whatever the model is
+    /// composing, and an opencode child is one process per turn with nobody to read it. Never
+    /// persisted: the reply itself is saved with the draft, and a run that dies holding these
+    /// is revived from the draft's conversation by the next Discuss.
+    follow_ups: Vec<String>,
     /// How many times this run has been put back on the queue for an opening that never took.
     /// Bounded by [`OPENING_REQUEUES`], because a child that cannot be given a prompt twice
     /// running is failing for a reason a third fork will not change.
@@ -689,6 +696,7 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             harness_session: None,
             continuing: false,
             requeued: None,
+            follow_ups: Vec::new(),
             opening_requeues: 0,
             death_noted: false,
             reopenable: false,
@@ -2323,6 +2331,132 @@ impl AgentRegistry {
     /// like an unknown run id.
     /// Every unfinished run reviewing `review`, in any project. (M85) Closing a review deletes
     /// the checkout these stand in, so the close stops them first.
+    /// The conversation `run` is in, as its harness would resume it: claude's session uuid,
+    /// opencode's `ses_…`. `None` for a run that has not named one yet. Recorded on each draft
+    /// a reviewer writes, so a draft's Discuss can revive the conversation that made it. (M101)
+    pub fn conversation_id(&self, run: RunId) -> Option<String> {
+        let inner = self.inner.lock();
+        let live = inner.runs.get(&run)?;
+        match live.harness {
+            Harness::Claude | Harness::Qwen => live.session.map(|session| session.to_string()),
+            Harness::Opencode | Harness::Codex | Harness::Mimo => live.harness_session.clone(),
+        }
+    }
+
+    /// Whether `run` still has a conversation cide can type into — alive, not over, not
+    /// stopping. A Discuss on a draft whose run fails this revives the conversation instead.
+    pub fn follow_up_reachable(&self, project: ProjectId, run: RunId) -> bool {
+        let inner = self.inner.lock();
+        inner.runs.get(&run).is_some_and(|live| {
+            live.project == project
+                && live.stop.is_none()
+                && matches!(
+                    live.state,
+                    RunState::Queued
+                        | RunState::Starting
+                        | RunState::Running
+                        | RunState::AwaitingPermission
+                        | RunState::Idle
+                )
+        })
+    }
+
+    /// Say one more thing to a live run's conversation: now if its turn is over, else at its
+    /// next hand-back (`LiveRun::follow_ups`). (M101)
+    ///
+    /// The delivery is the harness's (`send_prompt`): typed into claude/qwen/codex's TUI, a
+    /// `--session` respawn for opencode — the path `retry_turn` already takes. `line` must be one
+    /// line; every newline in a TUI is an Enter.
+    pub fn follow_up(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        run: RunId,
+        line: &str,
+    ) -> Result<()> {
+        let Some((session, kind, line)) = self.plan_follow_up(project, run, line)? else {
+            return Ok(());
+        };
+        self.send_prompt(app, project, run, session, &line, kind)?;
+        self.mark_changed(app, project);
+        Ok(())
+    }
+
+    /// The half of [`Self::follow_up`] under the lock, for `plan_respawn`'s reason: a test can
+    /// drive it without an `AppHandle`. `Some` is "type this now, into this session" — the line,
+    /// after anything still held, joined, since two typed lines would be two turns; `None` is
+    /// "held for the next hand-back"; an error is a run nothing can be said to.
+    fn plan_follow_up(
+        &self,
+        project: ProjectId,
+        run: RunId,
+        line: &str,
+    ) -> Result<Option<(SessionId, Harness, String)>> {
+        let mut inner = self.inner.lock();
+        let live = inner
+            .runs
+            .get_mut(&run)
+            .filter(|live| live.project == project)
+            .ok_or_else(|| CoreError::Io(format!("no such run in this project: {run}")))?;
+        if live.stop.is_some() {
+            return Err(CoreError::Io("this run is being stopped".into()));
+        }
+        match (&live.state, live.session) {
+            // Idle and not paused: its turn is over, so type now — and anything held for it too,
+            // which would otherwise wait for a hand-back an idle run is not going to make.
+            (RunState::Idle, Some(session)) if live.frozen.is_none() => {
+                let mut lines = std::mem::take(&mut live.follow_ups);
+                lines.push(line.to_string());
+                Ok(Some((session, live.harness, lines.join(" — then: "))))
+            }
+            (
+                RunState::Queued
+                | RunState::Starting
+                | RunState::Running
+                | RunState::AwaitingPermission
+                | RunState::Idle,
+                _,
+            ) => {
+                live.follow_ups.push(line.to_string());
+                Ok(None)
+            }
+            (state, _) => Err(CoreError::Io(format!(
+                "this run cannot be spoken to ({state:?})"
+            ))),
+        }
+    }
+
+    /// Enqueue a review run that **continues** `conversation` rather than starting a fresh one,
+    /// with the spec's prompt as the first thing it reads — a draft's Discuss reviving a
+    /// reviewer that is gone. (M101) The admission's `requeued` road, which already forks a
+    /// child onto an existing conversation with a prompt of its own: as a **fork**
+    /// (`rebind: None`), so a predecessor still filed under the old id cannot have its exit end
+    /// this run.
+    pub fn enqueue_continuing(
+        &self,
+        spec: DispatchSpec,
+        conversation: String,
+    ) -> std::result::Result<RunId, HeldPair> {
+        let prompt = spec.prompt.clone();
+        let mut inner = self.inner.lock();
+        if let Some(task) = spec.task.as_ref()
+            && let Some(held) = holder_in(&inner, spec.project, &spec.agent, task)
+        {
+            return Err(held);
+        }
+        let run = insert_run(&mut inner, spec);
+        if let Some(live) = inner.runs.get_mut(&run) {
+            live.requeued = Some(Requeued {
+                resume: Some(ResumePoint {
+                    rebind: None,
+                    conversation,
+                }),
+                prompt,
+            });
+        }
+        Ok(run)
+    }
+
     pub fn review_runs(&self, review: &str) -> Vec<(ProjectId, RunId)> {
         self.inner
             .lock()
@@ -2451,6 +2585,13 @@ impl AgentRegistry {
                 WindDownStep::Completed => stop.how = StopHow::WoundDown,
             }
         }
+        // A hand-back is when a held Discuss line may be typed (see `LiveRun::follow_ups`). Taken
+        // under the lock so two edges cannot both deliver it; typed after it, like the nudge.
+        let follow_ups = match handed_back && live.stop.is_none() {
+            true => std::mem::take(&mut live.follow_ups),
+            false => Vec::new(),
+        };
+        let follow_project = live.project;
         if handed_back || over {
             let key = live.key();
             let project = live.project;
@@ -2466,6 +2607,23 @@ impl AgentRegistry {
         }
         drop(inner);
         self.forget_old();
+        if let Some(app) = app
+            && !follow_ups.is_empty()
+            && let Some(registry) = app.try_state::<Arc<AgentRegistry>>()
+        {
+            let registry = Arc::clone(&registry);
+            let app = app.clone();
+            // Off the hook applier thread: delivery reaches the session registry and may fork
+            // an opencode child, and this method runs on the thread whose ordering is a
+            // correctness requirement. Joined into one line: two typed lines are two turns, and
+            // the second would land while the first is being answered.
+            let line = follow_ups.join(" — then: ");
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = registry.follow_up(&app, follow_project, run, &line) {
+                    tracing::warn!(%run, %error, "a held follow-up could not be delivered");
+                }
+            });
+        }
         // Before the nudge, because this is what *makes* the run over: the child is still alive
         // at this point — it handed its turn back and is sitting at its prompt — and the run's
         // end is the exit that follows.
@@ -5343,6 +5501,7 @@ impl AgentRegistry {
                     harness_session: saved.harness_session,
                     continuing: false,
                     requeued: None,
+                    follow_ups: Vec::new(),
                     opening_requeues: 0,
                     death_noted: false,
                     reopenable,
@@ -7771,6 +7930,85 @@ mod tests {
     /// integrates right after a run hands its turn back, and the child is still sitting in the
     /// directory. Removing it then would leave a live `claude` with no cwd. The run's end is what
     /// frees it, and `ended_checkout` is what offers it for retirement at that edge.
+    #[test]
+    fn a_follow_up_is_typed_to_an_idle_run_and_held_for_a_busy_one() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "mr-review", 4, 4));
+        let session = SessionId::new();
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&run).expect("run");
+            live.session = Some(session);
+            live.state = RunState::Running;
+        }
+        // Mid-turn: a line typed now would land in whatever the model is composing.
+        assert!(
+            registry
+                .plan_follow_up(project, run, "first")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .plan_follow_up(project, run, "second")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            registry.inner.lock().runs[&run].follow_ups,
+            ["first", "second"]
+        );
+
+        // Idle: typed now, with what was held, as one line — two lines would be two turns.
+        registry.inner.lock().runs.get_mut(&run).expect("run").state = RunState::Idle;
+        let (to, _, line) = registry
+            .plan_follow_up(project, run, "third")
+            .unwrap()
+            .expect("an idle run is typed into");
+        assert_eq!(to, session);
+        assert_eq!(line, "first — then: second — then: third");
+        assert!(registry.inner.lock().runs[&run].follow_ups.is_empty());
+
+        // Over: nothing to say it to, and the caller revives the conversation instead.
+        assert!(registry.set_state(None, run, RunState::Finished { code: 0 }));
+        assert!(registry.plan_follow_up(project, run, "late").is_err());
+        assert!(!registry.follow_up_reachable(project, run));
+        assert!(
+            registry
+                .plan_follow_up(ProjectId::new(), run, "elsewhere")
+                .is_err(),
+            "a run is spoken to only in its own project"
+        );
+    }
+
+    #[test]
+    fn a_revived_reviewer_is_admitted_onto_its_old_conversation_with_the_discussion() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry
+            .enqueue_continuing(
+                DispatchSpec {
+                    prompt: "The user is discussing your draft d1.".into(),
+                    ..spec(project, "mr-review", 4, 4)
+                },
+                "conv-1".into(),
+            )
+            .expect("no task, nothing to duplicate");
+        let (admitted, _) = registry.take_admissions_noting();
+        let admission = admitted
+            .into_iter()
+            .find(|a| a.run == run)
+            .expect("admitted");
+        assert_eq!(admission.prompt, "The user is discussing your draft d1.");
+        let resume = admission.resume.expect("continues a conversation");
+        assert_eq!(resume.conversation, "conv-1");
+        assert!(
+            resume.rebind.is_none(),
+            "a fork, so a predecessor still filed under the old id cannot end this run"
+        );
+    }
+
     #[test]
     fn a_checkout_is_held_until_the_run_standing_in_it_is_over() {
         let registry = AgentRegistry::default();

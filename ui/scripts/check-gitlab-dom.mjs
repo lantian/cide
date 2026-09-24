@@ -91,8 +91,22 @@ let drafts = [
       new_line: 1,
     },
     headSha: 'c'.repeat(40),
-    author: { label: 'Review !42', harness: 'claude', run: 'run' },
+    author: { label: 'Review !42', harness: 'claude', run: 'run', conversation: 'conv' },
     createdUnixMs: 0,
+    replies: [
+      {
+        id: 'r1',
+        author: { label: 'You', harness: null, run: null, conversation: null },
+        body: 'Why critical?',
+        createdUnixMs: 1,
+      },
+      {
+        id: 'r2',
+        author: { label: 'Review !42', harness: 'claude', run: 'run', conversation: 'conv' },
+        body: 'It drops the error the caller retries on.',
+        createdUnixMs: 2,
+      },
+    ],
   },
 ]
 window.__TAURI_INTERNALS__ = {
@@ -546,6 +560,16 @@ try {
     versions: [],
     discussions: [],
     drafts,
+    commits: [
+      {
+        id: 'c'.repeat(40),
+        short_id: 'cccccccc',
+        title: 'Regenerate the bindings',
+        author_name: 'Reviewer',
+        authored_date: '2026-01-01T00:00:00Z',
+        web_url: 'https://gitlab.example/g/p/-/commit/cccccccc',
+      },
+    ],
     approval: approvalReply,
     approvalError: null,
     activity: [
@@ -634,12 +658,24 @@ try {
     'Review comment',
   )
   await click(document.querySelector('[aria-label="Close MR information"]'))
-  for (const label of ['Overview', 'Discussions (0)', 'Pipelines']) {
-    await click(
-      [
-        ...container.querySelectorAll('[aria-label="MR information"] button'),
-      ].find((b) => b.textContent === label),
-    )
+  // The counts are a kit `Counter` after the label, so a button's text is label + count
+  // ("Discussions0"); the count is pinned separately below. Commits sits beside Pipelines.
+  const sectionButton = (label) =>
+    [
+      ...container.querySelectorAll('[aria-label="MR information"] button'),
+    ].find((b) => b.firstChild?.nextSibling?.textContent === label || b.textContent === label)
+  assert.equal(
+    sectionButton('Discussions')?.textContent,
+    'Discussions0',
+    'the unresolved count is drawn as a Counter beside the label',
+  )
+  assert.equal(
+    sectionButton('Commits')?.textContent,
+    'Commits1',
+    'the Commits section is counted from the fixture',
+  )
+  for (const label of ['Overview', 'Discussions', 'Pipelines', 'Commits']) {
+    await click(sectionButton(label))
     assert.equal(
       document.querySelectorAll('[role="dialog"]').length,
       1,
@@ -668,11 +704,8 @@ try {
     container.querySelector('[aria-label="1 unpublished drafts"]'),
     'the changed file shows its draft count',
   )
-  await click(
-    [
-      ...container.querySelectorAll('[aria-label="MR information"] button'),
-    ].find((b) => b.textContent === 'Drafts (1)'),
-  )
+  assert.equal(sectionButton('Drafts')?.textContent, 'Drafts1')
+  await click(sectionButton('Drafts'))
   const card = document.querySelector(
     '[aria-label="Critical draft comment, not published"]',
   )
@@ -682,6 +715,47 @@ try {
     card.querySelector('div')?.textContent ?? '',
     /Critical/,
     'the severity is not part of the comment body',
+  )
+  // Discuss (M101): the local thread under the draft, the user's and the reviewer's lines told
+  // apart, and a composer that opens under the card. Sending needs a host project, which this
+  // fixture has none of: the refusal must be said, and nothing may reach Rust.
+  const draftThread = card.querySelector('[aria-label="Discussion about this draft"]')
+  assert.ok(draftThread, 'the draft shows its discussion')
+  assert.deepEqual(
+    [...draftThread.querySelectorAll('li')].map((li) => li.dataset.from),
+    ['user', 'reviewer'],
+  )
+  const discuss = [...card.querySelectorAll('button')].find(
+    (b) => b.textContent === 'Discuss',
+  )
+  assert.ok(discuss, "an agent's draft offers Discuss")
+  await click(discuss)
+  const box = card.querySelector(
+    '[aria-label="Message to the reviewer about this draft"]',
+  )
+  assert.ok(box, 'Discuss opens a composer under the draft')
+  await act(async () => {
+    const set = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      'value',
+    ).set
+    set.call(box, 'Please make it a minor.')
+    box.dispatchEvent(new window.Event('input', { bubbles: true }))
+  })
+  await click(
+    [...card.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Send to reviewer',
+    ),
+  )
+  await act(async () => new Promise((r) => setTimeout(r, 0)))
+  assert.match(
+    card.querySelector('[role="alert"]')?.textContent ?? '',
+    /Open a workspace project/,
+    'a Discuss with no host project says why it went nowhere',
+  )
+  assert.equal(
+    calls.filter((c) => c.command === 'gitlab_draft_discuss').length,
+    0,
   )
   await click(
     [...card.querySelectorAll('button')].find((b) => b.textContent === 'Publish'),

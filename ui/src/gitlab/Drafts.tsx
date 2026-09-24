@@ -10,6 +10,8 @@ import { useMemo, useState } from 'react'
 import { closeOverlay } from '@/overlays/store'
 import type { GitLabDraft, GitLabPublished, GitLabSeverity } from '@/ipc/generated'
 import { Markdown } from './Markdown'
+import { Button } from '@/kit/components/Button'
+import { DiscussBox, DraftReplies } from './DraftDiscussion'
 import {
   api,
   data,
@@ -100,6 +102,9 @@ export function DraftCard({
   onSelect?: (selected: boolean) => void
 }) {
   const [editing, setEditing] = useState(false)
+  const [discussing, setDiscussing] = useState(false)
+  // Only an agent's draft has somebody to answer: `author.run` is the run that wrote it.
+  const discussable = draft.author.run !== null
   const [body, setBody] = useState(draft.body)
   const [severity, setSeverity] = useState<GitLabSeverity>(draft.severity)
   const [busy, setBusy] = useState(false)
@@ -215,9 +220,12 @@ export function DraftCard({
             autoFocus
           />
           <div className={styles.row}>
-            <button disabled={busy || !body.trim()}>Save draft</button>
-            <button
-              type="button"
+            <Button type="submit" size="sm" variant="primary" disabled={busy || !body.trim()}>
+              Save draft
+            </Button>
+            <Button
+              size="sm"
+              variant="quiet"
               onClick={() => {
                 setEditing(false)
                 setBody(draft.body)
@@ -225,7 +233,7 @@ export function DraftCard({
               }}
             >
               Cancel
-            </button>
+            </Button>
           </div>
         </form>
       ) : (
@@ -233,16 +241,22 @@ export function DraftCard({
           <Markdown review={review} text={draft.body} baseUrl={current?.mr.web_url} />
         </div>
       )}
+      <DraftReplies review={review} draft={draft} />
       {!editing && (
         <div className={styles.row}>
-          <button
-            disabled={busy}
+          <Button
+            size="sm"
+            icon="arrow-up-right"
+            busy={busy}
             title="Post this comment to GitLab, exactly as written"
             onClick={() => void act(() => publish(review, [draft.id]))}
           >
-            {busy ? 'Working…' : 'Publish'}
-          </button>
-          <button
+            Publish
+          </Button>
+          <Button
+            size="sm"
+            variant="quiet"
+            icon="pencil"
             disabled={busy}
             onClick={() => {
               // From the draft as it is now: an agent may have edited it since this rendered.
@@ -252,8 +266,24 @@ export function DraftCard({
             }}
           >
             Edit
-          </button>
-          <button
+          </Button>
+          {discussable && (
+            <Button
+              size="sm"
+              variant="quiet"
+              icon="message-square"
+              disabled={busy}
+              aria-expanded={discussing}
+              title="Ask the reviewer that wrote this draft about it; it answers here"
+              onClick={() => setDiscussing((open) => !open)}
+            >
+              Discuss
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="quiet"
+            icon="trash-2"
             disabled={busy}
             onClick={() =>
               void act(async () => {
@@ -263,8 +293,11 @@ export function DraftCard({
             }
           >
             Discard
-          </button>
+          </Button>
         </div>
+      )}
+      {discussing && !editing && (
+        <DiscussBox review={review} draft={draft} onDone={() => setDiscussing(false)} />
       )}
       {error && (
         <div role="alert" className={styles.error}>

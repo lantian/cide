@@ -1336,6 +1336,22 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         }
         return
       }
+      case 'gitlab.nextComment':
+      case 'gitlab.previousComment': {
+        // The `when` only filters the palette; the key path re-checks that an MR diff is in front.
+        const tab = focusTarget(boot())?.tab
+        if (tab?.kind.kind !== 'diff' || tab.kind.spec.origin.kind !== 'gitLab')
+          return unmet(command, 'no GitLab MR diff in front')
+        const doc = tab.kind.spec.origin.document
+        const next = command === 'gitlab.nextComment'
+        void import('@/gitlab/commentNav').then((m) => {
+          const nav = m.commentNavFor(doc)
+          if (nav === null) return unmet(command, 'the MR diff is not showing its changes')
+          if (!nav.step(next ? 1 : -1))
+            unmet(command, next ? 'no next comment in this file' : 'no previous comment in this file')
+        })
+        return
+      }
       case 'gitlab.open': {
         useOverlays.getState().show('gitlabOpen')
         return

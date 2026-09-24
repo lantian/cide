@@ -60,6 +60,7 @@ export const ICON_PATHS = {
   'file-text': 'M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2zM14 2v5a1 1 0 0 0 1 1h5M10 9H8M16 13H8M16 17H8',
   'folder': 'M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z',
   'git-branch': 'M15 6a9 9 0 0 0-9 9V3M15 6a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM3 18a3 3 0 1 0 6 0a3 3 0 1 0 -6 0Z',  // from path + circle
+  'git-commit-horizontal': 'M9 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM3 12L9 12M15 12L21 12',  // from circle + line
   'git-merge': 'M15 18a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM3 6a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM6 21V9a9 9 0 0 0 9 9',  // from circle + path
   'heading': 'M6 12h12M6 20V4M18 20V4',
   'hexagon': 'M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z',

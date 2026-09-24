@@ -1,6 +1,13 @@
 import { CommentBox, Thread } from './Discussions'
 import { DraftCard, draftAnchor, draftOn } from './Drafts'
-import { wholeFileSegments } from '@/panes/diffRows'
+import { wholeFileSegments, type FileSegment } from '@/panes/diffRows'
+import {
+  claimCommentNav,
+  orderStops,
+  publishCommentCursor,
+  stepStop,
+  type CommentStop,
+} from './commentNav'
 import {
   useEffect,
   useMemo,
@@ -84,6 +91,71 @@ export function ReviewDiff({
     }
     return map
   }, [review?.drafts, key])
+  const navKey = useMemo(
+    () => ({
+      review: doc.review,
+      path: doc.path,
+      baseSha: doc.refs.base_sha,
+      headSha: doc.refs.head_sha,
+    }),
+    [key],
+  )
+  const stops = useMemo(
+    () => orderStops(new Set([...threads.keys(), ...pending.keys()])),
+    [threads, pending],
+  )
+  const stopsRef = useRef(stops)
+  stopsRef.current = stops
+  const cursor = useRef(-1)
+  const [focusStop, setFocusStop] = useState<CommentStop | null>(null)
+  // Stops move when a draft lands or a thread is resolved elsewhere; keep the cursor on the
+  // same line if it still carries a comment, else restart the walk rather than point past the end.
+  useEffect(() => {
+    const at = focusStop
+      ? stops.findIndex((s) => s.side === focusStop.side && s.line === focusStop.line)
+      : -1
+    cursor.current = at
+    publishCommentCursor(navKey, at, stops.length)
+  }, [stops, navKey])
+  useEffect(
+    () =>
+      claimCommentNav(navKey, {
+        step(delta) {
+          const all = stopsRef.current
+          const next = stepStop(all.length, cursor.current, delta)
+          if (next === null) return false
+          const stop = all[next]!
+          cursor.current = next
+          publishCommentCursor(navKey, next, all.length)
+          setLine({ side: stop.side, line: stop.line })
+          setFocusStop({ ...stop })
+          return true
+        },
+      }),
+    [navKey],
+  )
+  // After the stop's gap is open and the row painted: centre it and move focus into the
+  // comment block, so Tab reaches its Reply/Discuss buttons without the mouse.
+  useEffect(() => {
+    if (!focusStop || !diff || !visible) return
+    const segments = wholeFileSegments(diff.hunks, diff.newText)
+    const gap = gapHolding(segments, focusStop.side, focusStop.line)
+    if (gap !== null && !gaps.has(gap)) {
+      setGaps((old) => new Set([...old, gap]))
+      return // re-runs with the gap open
+    }
+    const frame = requestAnimationFrame(() => {
+      const block = host.current?.querySelector<HTMLElement>(
+        `[data-comment-anchor="${focusStop.side}:${focusStop.line}"]`,
+      )
+      const row = host.current?.querySelector(
+        `[data-review-side="${focusStop.side}"][data-review-line="${focusStop.line}"]`,
+      )
+      ;(row ?? block)?.scrollIntoView({ block: 'center' })
+      block?.focus({ preventScroll: true })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [focusStop, diff, visible, gaps])
   useEffect(() => {
     if (!diff) return
     const segments = wholeFileSegments(diff.hunks, diff.newText)
@@ -137,10 +209,15 @@ export function ReviewDiff({
     if (!at || !diff || !visible) return
     const side = at.side ?? 'new'
     setLine({ side, line: at.line })
-    // A discussion may be attached to context hidden inside a collapsed gap.
-    setGaps(
-      new Set(Array.from({ length: diff.hunks.length * 2 + 2 }, (_, i) => i)),
+    // A discussion may be attached to context hidden inside a folded gap. Open that one gap
+    // only: opening every gap (as this did while the review drew whole files anyway) would
+    // undo the hunks-only view the moment anything jumped to a line.
+    const gap = gapHolding(
+      wholeFileSegments(diff.hunks, diff.newText),
+      side,
+      at.line,
     )
+    if (gap !== null) setGaps((old) => new Set([...old, gap]))
     const frame = requestAnimationFrame(() => {
       host.current
         ?.querySelector(
@@ -208,6 +285,7 @@ export function ReviewDiff({
             return next
           })
         }
+        foldUnchanged
         expandedGaps={gaps}
         onExpandGap={(gap) => setGaps((old) => new Set([...old, gap]))}
         onReviewLine={select}
@@ -222,8 +300,14 @@ export function ReviewDiff({
           const compose =
             position && line && keys.includes(`${line.side}:${line.line}`)
           if (!anchored.length && !drafted.length && !compose) return null
+          // The comment walk's landing: the first anchor of this row that holds a comment.
+          const anchor = keys.find((k) => threads.has(k) || pending.has(k))
           return (
-            <div className={styles.inlineThreads}>
+            <div
+              className={styles.inlineThreads}
+              data-comment-anchor={anchor}
+              tabIndex={anchor === undefined ? undefined : -1}
+            >
               {drafted.map((draft) => (
                 <DraftCard
                   key={draft.id}
@@ -268,4 +352,22 @@ export function ReviewDiff({
       />
     </div>
   )
+}
+
+/** The index of the unchanged gap that holds this line, or `null` when it is in a hunk. */
+function gapHolding(
+  segments: readonly FileSegment[] | null,
+  side: 'old' | 'new',
+  line: number,
+): number | null {
+  for (const segment of segments ?? []) {
+    if (segment.kind !== 'gap') continue
+    if (
+      segment.lines.some(
+        (row) => (side === 'old' ? row.oldLineno : row.newLineno) === line,
+      )
+    )
+      return segment.index
+  }
+  return null
 }

@@ -375,6 +375,23 @@ pub fn defaults() -> Vec<Binding> {
                 "gitlab.previousFile",
                 "gitlabReviewActive && !overlayOpen",
             ),
+            // Next/previous comment in the same MR file. Shift on the file walk's Alt, with the
+            // arrows because a comment is a smaller step than a file. Alt+Up/Down alone are the
+            // pane moves in a diff (`!editorFocused` below). Alt+Shift+Arrow is also the
+            // editor's move-line (`editor/editorKeys.ts` re-homed it there), and this is a
+            // window capture listener, so `!editorFocused` is load-bearing: it is what keeps a
+            // buffer's move-line alive, and `check-key-gate.mjs` only lets these chords be
+            // bound at all because the clause carries it.
+            (
+                "alt+shift+down",
+                "gitlab.nextComment",
+                "gitlabReviewActive && !overlayOpen && !editorFocused",
+            ),
+            (
+                "alt+shift+up",
+                "gitlab.previousComment",
+                "gitlabReviewActive && !overlayOpen && !editorFocused",
+            ),
             ("alt+down", "navigate.nextMember", "editorFocused"),
             ("alt+up", "navigate.prevMember", "editorFocused"),
             /*
@@ -2637,6 +2654,27 @@ mod tests {
     /// would swallow ⌥F7 in every terminal pane in every window for a command that needs a caret
     /// to mean anything. The escape hatch is asserted here for the same reason ⌃G's is: so the
     /// `docs/journal.md` cannot print a line that matches nothing.
+    #[test]
+    fn alt_shift_arrows_walk_mr_comments_only_in_a_review() {
+        let shipped = resolve(&[]);
+        assert_eq!(
+            command_for(&shipped, "alt+shift+down"),
+            ["gitlab.nextComment"]
+        );
+        assert_eq!(
+            command_for(&shipped, "alt+shift+up"),
+            ["gitlab.previousComment"]
+        );
+        assert!(
+            shipped
+                .iter()
+                .filter(|r| r.command.starts_with("gitlab.") && r.command.ends_with("Comment"))
+                .all(|r| r.when.as_deref()
+                    == Some("gitlabReviewActive && !overlayOpen && !editorFocused")),
+            "without `!editorFocused`, Alt+Shift+Arrow is taken from every editor's move-line"
+        );
+    }
+
     #[test]
     fn alt_f7_finds_usages_and_only_where_a_caret_is() {
         let shipped = resolve(&[]);

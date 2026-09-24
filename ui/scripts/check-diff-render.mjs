@@ -852,6 +852,23 @@ try {
     ['gap'],
     'and an expanded index opens it again',
   )
+  // The GitLab review's hunks-only view: `foldAlways` folds under the threshold too, keeps the
+  // minimum, and still honours an opened gap — the fold row is how the reader loads the rest.
+  eq(
+    presentSegments([gapOf(500)], 4_000, new Set(), true).map((s) => s.kind),
+    ['fold'],
+    'foldAlways folds a long gap in a small file',
+  )
+  eq(
+    presentSegments([gapOf(GAP_COLLAPSE_MIN)], 40, new Set(), true).map((s) => s.kind),
+    ['gap'],
+    'foldAlways keeps the minimum: a fold that hides ten lines buys nothing here either',
+  )
+  eq(
+    presentSegments([gapOf(500)], 4_000, new Set([0]), true).map((s) => s.kind),
+    ['gap'],
+    'foldAlways still opens an expanded gap',
+  )
 
   // The split columns and their run table.
   const cols = columnRows(segments, { bars: false })

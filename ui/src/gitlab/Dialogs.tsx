@@ -19,6 +19,7 @@ import { UserLink, Users } from './UserLink'
 import { Discussions } from './Discussions'
 import { Activity } from './Activity'
 import { Pipelines } from './Pipelines'
+import { Commits } from './Commits'
 import styles from './GitLab.module.css'
 
 function modalKeys(event: KeyboardEvent<HTMLElement>) {
@@ -184,6 +185,7 @@ export function ReviewInfoDialog() {
       </div>
     )
   else if (section === 'pipelines') body = <Pipelines review={review} />
+  else if (section === 'commits') body = <Commits review={review} />
   else
     body = (
       <div className={styles.details}>
@@ -248,6 +250,7 @@ export function ReviewInfoDialog() {
               'drafts',
               'activity',
               'pipelines',
+              'commits',
             ] as const
           ).map((s) => (
             <button

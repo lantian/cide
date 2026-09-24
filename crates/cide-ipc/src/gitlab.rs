@@ -158,6 +158,11 @@ pub enum GitLabRequest {
         review: String,
         page: u32,
     },
+    /// The MR's commits, newest first, 100 a page — the panel's Commits section and its count.
+    Commits {
+        review: String,
+        page: u32,
+    },
     Jobs {
         review: String,
         #[ts(type = "number")]
@@ -274,6 +279,27 @@ pub struct GitLabDraftAuthor {
     pub harness: Option<crate::Harness>,
     /// The run that wrote it, so a run may edit and discard its own drafts and nobody else's.
     pub run: Option<String>,
+    /// The harness conversation the run was in when it wrote this — claude's `--session-id`,
+    /// opencode/codex/mimo's own session id. What a draft's Discuss resumes when the run that
+    /// wrote it is gone (stopped, the review closed, cide restarted: review runs are not
+    /// persisted), so the answer comes from the reviewer that made the point rather than from a
+    /// stranger re-reading it. `None` on drafts written before M101 and on the user's replies.
+    #[serde(default)]
+    pub conversation: Option<String>,
+}
+
+/// One message in a draft's local discussion: the user asking about a finding, or the reviewer
+/// answering. Never published — `DraftPublish` posts the draft's body alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GitLabDraftReply {
+    pub id: String,
+    /// `run: None` is the user.
+    pub author: GitLabDraftAuthor,
+    pub body: String,
+    #[ts(type = "number")]
+    pub created_unix_ms: u64,
 }
 
 /// A review comment that exists **only in cide** until the user publishes it.
@@ -302,6 +328,11 @@ pub struct GitLabDraft {
     pub author: GitLabDraftAuthor,
     #[ts(type = "number")]
     pub created_unix_ms: u64,
+    /// The local discussion about this draft, oldest first (M101). `default` so a drafts file
+    /// written before it still loads — `Drafts::load` sets an unreadable file aside, and losing
+    /// every unpublished finding to a new field would be that path taken for no reason.
+    #[serde(default)]
+    pub replies: Vec<GitLabDraftReply>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

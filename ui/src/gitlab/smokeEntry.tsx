@@ -85,6 +85,16 @@ data.set('review', {
   activity: [],
   approval: { approved: false, approved_by: [], approvals_left: 1 },
   approvalError: null,
+  commits: [
+    {
+      id: '0123456789abcdef0123456789abcdef01234567',
+      short_id: '01234567',
+      title: 'Regenerate the protobuf bindings',
+      author_name: 'Reviewer',
+      authored_date: '2026-09-20T10:00:00Z',
+      web_url: 'https://gitlab.example/group/project/-/commit/0123456789abcdef',
+    },
+  ],
   drafts: [
     {
       id: 'draft1',
@@ -103,8 +113,32 @@ data.set('review', {
         new_line: 2,
       },
       headSha: refs.head_sha,
-      author: { label: 'Review !42', harness: 'opencode', run: 'run' },
+      author: {
+        label: 'Review !42',
+        harness: 'opencode',
+        run: 'run',
+        conversation: 'ses_smoke',
+      },
       createdUnixMs: 0,
+      replies: [
+        {
+          id: 'reply1',
+          author: { label: 'You', harness: null, run: null, conversation: null },
+          body: 'Is this really critical?',
+          createdUnixMs: 1,
+        },
+        {
+          id: 'reply2',
+          author: {
+            label: 'Review !42',
+            harness: 'opencode',
+            run: 'run',
+            conversation: 'ses_smoke',
+          },
+          body: 'Yes: the caller retries on this error.',
+          createdUnixMs: 2,
+        },
+      ],
     },
   ],
 })

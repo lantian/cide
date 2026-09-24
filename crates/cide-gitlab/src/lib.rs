@@ -502,6 +502,25 @@ impl GitLab {
     ) -> Result<GitLabDraft> {
         self.drafts.edit(review, draft, body, severity, run)
     }
+    /// One message in a draft's local discussion. An agent's (`run: Some`) is limited to its
+    /// own drafts; the user's is not.
+    pub fn draft_reply(
+        &self,
+        review: &str,
+        draft: &str,
+        author: GitLabDraftAuthor,
+        body: String,
+        run: Option<&str>,
+    ) -> Result<GitLabDraft> {
+        self.drafts.reply(review, draft, author, body, run)
+    }
+    pub fn draft(&self, review: &str, draft: &str) -> Result<GitLabDraft> {
+        self.drafts.get(review, draft)
+    }
+    /// Move `from`'s drafts to `to`, the run that resumed its conversation.
+    pub fn draft_reassign(&self, review: &str, from: &str, to: &str) -> Result<usize> {
+        self.drafts.reassign(review, from, to)
+    }
     pub fn draft_discard(
         &self,
         review: &str,
@@ -834,6 +853,7 @@ impl GitLab {
             | Approve { review, .. }
             | Approvals { review }
             | Pipelines { review, .. }
+            | Commits { review, .. }
             | Jobs { review, .. }
             | Trace { review, .. }
             | File { review, .. }
@@ -919,6 +939,13 @@ impl GitLab {
             Pipelines { page, .. } => {
                 path.push_str("/pipelines");
                 params.extend([("page", page.max(1).to_string()), ("per_page", "50".into())]);
+            }
+            Commits { page, .. } => {
+                path.push_str("/commits");
+                params.extend([
+                    ("page", page.max(1).to_string()),
+                    ("per_page", "100".into()),
+                ]);
             }
             Jobs {
                 project,
@@ -1470,6 +1497,7 @@ mod transport_tests {
             label: "Review !42".into(),
             harness: None,
             run: Some("run".into()),
+            conversation: None,
         };
         let draft = |body: &str, line| NewDraft {
             severity: GitLabSeverity::Critical,

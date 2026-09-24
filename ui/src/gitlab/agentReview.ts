@@ -22,7 +22,13 @@ export interface AgentReview {
   project: ProjectId
   run: RunId
   harness: Harness
-  state: 'queued' | 'running' | 'finished' | 'failed'
+  /**
+   * `idle` is a reviewer whose turn is over but whose conversation is still alive — a claude
+   * reviewer does not exit after its summary. It used to fall through to `running`, so a review
+   * that had long finished read "Reviewing…" with a Stop button; and it is the state in which a
+   * draft's Discuss reaches the reviewer by typing rather than by reviving it.
+   */
+  state: 'queued' | 'running' | 'idle' | 'waiting' | 'finished' | 'failed'
   detail: string
   tabOpened: boolean
 }
@@ -60,6 +66,20 @@ export async function startAgentReview(
     harness,
     prompt.trim() || null,
   )
+  adoptAgentReview(review, project, run, harness)
+}
+
+/**
+ * Follow a review run this window did not launch from the dialog: the one a draft's Discuss
+ * revived (`gitlab.draftReply` answers its run id). Replaces any entry for the MR, which ends
+ * that entry's `follow` loop.
+ */
+export function adoptAgentReview(
+  review: string,
+  project: ProjectId,
+  run: RunId,
+  harness: Harness,
+): void {
   const entry: AgentReview = {
     project,
     run,
@@ -126,6 +146,18 @@ async function follow(review: string, entry: AgentReview) {
           state: 'queued',
           detail: row.note ?? 'Waiting for a run slot…',
         })
+      } else if (state.state === 'idle') {
+        // Keep following: a Discuss message starts another turn in this same run.
+        update(entry, {
+          state: 'idle',
+          detail: 'Done. Its findings are in Drafts; Discuss a draft to ask about it.',
+        })
+      } else if (state.state === 'awaitingPermission') {
+        update(entry, {
+          state: 'waiting',
+          detail: 'Waiting for a permission answer in its tab.',
+        })
+        if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
       } else {
         update(entry, { state: 'running', detail: 'Reviewing…' })
         if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
