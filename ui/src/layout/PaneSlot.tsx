@@ -51,8 +51,18 @@ export function PaneSlot({ paneId, onResize, className }: PaneSlotProps) {
        *
        * Keyed by pane id, so a pane that reports two hundred times refits once.
        */
-      whenResizeSettles(paneId, () =>
-        onResizeRef.current?.(lastBox.current.width, lastBox.current.height),
+      whenResizeSettles(paneId,
+        () => onResizeRef.current?.(lastBox.current.width, lastBox.current.height),
+        /*
+         * Whether this pane can be seen, asked when the gesture settles: a pane in a background
+         * tab (`visibility: hidden` on an ancestor, which `visibilityProperty` follows) or parked
+         * off the document refits after the visible ones, one per task, instead of in the same
+         * frame — see `resizeGesture`'s `Deferred`. Where `checkVisibility` is missing the pane
+         * counts as visible, which is the old all-at-once behaviour and never a stale fit.
+         */
+        () =>
+          typeof slot.checkVisibility !== 'function' ||
+          slot.checkVisibility({ visibilityProperty: true }),
       )
     })
     ro.observe(slot)

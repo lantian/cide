@@ -189,6 +189,76 @@ try {
       + 'next real gesture flush on its own first frame',
   )
 
+  /* ------------------------------------------------ off screen: after, one per task --- */
+
+  {
+    const done = []
+    let bVisible = false
+    beginResizeGesture()
+    whenResizeSettles('shown', () => done.push('shown'), () => true)
+    whenResizeSettles('hidden-a', () => done.push('hidden-a'), () => false)
+    whenResizeSettles('hidden-b', () => done.push('hidden-b'), () => bVisible)
+    whenResizeSettles('no-probe', () => done.push('no-probe'))
+    endResizeGesture()
+    eq(
+      done,
+      ['shown', 'no-probe'],
+      'on settle only the work that is ON SCREEN runs in the same task — a probe saying yes, or no '
+        + 'probe at all (the old behaviour). A background tab\'s terminals used to refit in that '
+        + 'same frame too, which with a dozen panes was the freeze on releasing a splitter',
+    )
+    // A tab switched to mid-trickle: its pane is on screen now and must jump the queue.
+    bVisible = true
+    // Polled rather than one fixed sleep: a loaded CI box can run a `setTimeout(0)` late, and a
+    // check that flakes teaches people to ignore it.
+    for (let i = 0; i < 100 && done.length < 3; i++) await sleep(2)
+    eq(
+      done.slice(2, 3),
+      ['hidden-b'],
+      'the trickle runs whatever is on screen NOW first — a tab switched to after the release '
+        + 'refits its panes on the next step, not behind every hidden one',
+    )
+    for (let i = 0; i < 100 && done.length < 4; i++) await sleep(2)
+    eq(done.length, 4, 'and every off-screen piece still runs, one per task')
+  }
+
+  {
+    const done = []
+    beginResizeGesture()
+    whenResizeSettles('x', () => done.push('x'), () => false)
+    whenResizeSettles('y', () => done.push('y'), () => false)
+    endResizeGesture()
+    cancelResizeSettle('x')
+    whenResizeSettles('y', () => done.push('y-fresh'), () => false)
+    await sleep(20)
+    eq(
+      done,
+      ['y-fresh'],
+      'a cancel reaches work already in the trickle (the unmount rule: a flushed `syncSize` '
+        + 'after the slot is gone resurrects a host), and a fresh offer outside a gesture runs '
+        + 'at once and REPLACES the trickled one rather than letting the stale closure run after it',
+    )
+  }
+
+  {
+    const done = []
+    beginResizeGesture()
+    whenResizeSettles('p', () => done.push('p'), () => false)
+    whenResizeSettles('q', () => done.push('q'), () => false)
+    endResizeGesture()
+    beginResizeGesture()
+    await sleep(20)
+    eq(
+      done,
+      [],
+      'a gesture that begins while off-screen work is trickling holds it — refitting under the '
+        + "user's next drag is the per-frame reflow this module exists to prevent",
+    )
+    endResizeGesture()
+    await sleep(20)
+    eq(done.sort(), ['p', 'q'], 'and it settles with that gesture instead of being dropped')
+  }
+
   /* ------------------------------------------------------------------- cancelling ----- */
 
   ran = 0

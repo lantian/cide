@@ -36,6 +36,11 @@
  * cannot be made smooth, because every intermediate refit costs the child a full TUI repaint
  * and that repaint arrives as a screenful of bytes to render.
  *
+ * **Nor does it all happen in one frame on release.** Work whose owner says it is off screen —
+ * a background tab's terminal — is refitted after the visible panes, one piece per task, so
+ * letting go costs a frame for what can be seen rather than a stall for every pane in every tab.
+ * See `Deferred` and `trickleStep`.
+ *
  * Import-free on purpose: `ui/scripts/check-resize.mjs` compiles this one file standalone with
  * the TypeScript in `node_modules` and executes it, the same arrangement `chrome/sidebarWidth.ts`
  * and `toolwindow/toolWindowHeight.ts` have. Everything below is therefore reachable from a test
@@ -61,7 +66,34 @@ let depth = 0
  * because a pane defers on every observer callback — two hundred times in one drag — and must
  * run once.
  */
-const pending = new Map<unknown, () => void>()
+const pending = new Map<unknown, Deferred>()
+
+/**
+ * One piece of deferred work, and — optionally — how to tell whether what it refits is on screen.
+ *
+ * `onScreen` is what lets a settle stop being one long task. `TabContent` lays every tab's panes
+ * out at full size, so letting go of a splitter queued a refit for every terminal in every tab,
+ * and `flush` ran them back to back in one frame: a DOM-renderer reflow over 5000 lines of
+ * scrollback plus a synchronous `session_resize` each, which with a dozen panes is a visible
+ * freeze exactly when the user lets go. Work whose `onScreen` says no is moved to
+ * [`trickle`] and run one piece per task, so the frame after the gesture pays only for what
+ * the user can see. Work with no `onScreen` is treated as on screen, which is the old behaviour.
+ */
+interface Deferred {
+  run: () => void
+  onScreen?: (() => boolean) | undefined
+}
+
+/**
+ * Settled work for things not on screen, drained one entry per macrotask by [`trickleStep`].
+ *
+ * Keyed like `pending`, so a re-deferral or a cancel reaches an entry here too — the unmount
+ * rule on [`cancelResizeSettle`] applies to both queues.
+ */
+const trickle = new Map<unknown, Deferred>()
+
+/** The scheduled trickle step. */
+let trickleTimer: ReturnType<typeof setTimeout> | null = null
 
 /** The scheduled flush, so a second `endResizeGesture` does not queue a second one. */
 let flushFrame: number | null = null
@@ -137,12 +169,19 @@ export function endResizeGesture(): void {
  * the caller is re-deferring the same work with a fresher closure, and running the stale one too
  * would be the duplicate refit this exists to remove.
  */
-export function whenResizeSettles(key: unknown, run: () => void): void {
+export function whenResizeSettles(
+  key: unknown,
+  run: () => void,
+  onScreen?: () => boolean,
+): void {
+  // Whatever this key had waiting in the trickle is stale now: this call carries the fresher
+  // closure, and running both would be the duplicate refit the keying exists to prevent.
+  trickle.delete(key)
   if (depth === 0) {
     run()
     return
   }
-  pending.set(key, run)
+  pending.set(key, { run, onScreen })
 }
 
 /**
@@ -155,6 +194,7 @@ export function whenResizeSettles(key: unknown, run: () => void): void {
  */
 export function cancelResizeSettle(key: unknown): void {
   pending.delete(key)
+  trickle.delete(key)
 }
 
 /**
@@ -199,19 +239,77 @@ function flush(): void {
   // Drained before the first callback runs, not after the last: a callback that defers again —
   // a refit that changes a box and re-enters the observer it came from — must queue for the
   // *next* gesture rather than be dropped by the drain that is already in progress.
-  const work = Array.from(pending.values())
+  const work = Array.from(pending.entries())
   pending.clear()
-  for (const run of work) {
-    try {
-      run()
-    } catch (error) {
-      // One pane's refit failing must not strand the other eleven. Reported and not rethrown for
-      // the reason `TerminalPane` reports a failed resize: the pane is left at a size it is not,
-      // which is visible, and taking the flush down with it would leave every other pane there
-      // too.
-      console.error('[cide] deferred resize work failed', error)
+  for (const [key, deferred] of work) {
+    // Off screen: after this frame, one at a time. See `Deferred`.
+    if (!isOnScreen(deferred)) {
+      trickle.set(key, deferred)
+      continue
     }
+    runSafely(deferred.run)
   }
+  scheduleTrickle()
+}
+
+function runSafely(run: () => void): void {
+  try {
+    run()
+  } catch (error) {
+    // One pane's refit failing must not strand the other eleven. Reported and not rethrown for
+    // the reason `TerminalPane` reports a failed resize: the pane is left at a size it is not,
+    // which is visible, and taking the flush down with it would leave every other pane there
+    // too.
+    console.error('[cide] deferred resize work failed', error)
+  }
+}
+
+/** `true` unless the entry has a probe and the probe says no. A probe that throws is "yes". */
+function isOnScreen(deferred: Deferred): boolean {
+  if (deferred.onScreen === undefined) return true
+  try {
+    return deferred.onScreen()
+  } catch {
+    return true
+  }
+}
+
+function scheduleTrickle(): void {
+  if (trickle.size === 0 || trickleTimer !== null) return
+  // A macrotask, not a frame: the point is to let input and paint in between refits, and a
+  // `setTimeout(0)` yields to both where a rAF chain would pile the work back into frames.
+  trickleTimer = setTimeout(trickleStep, 0)
+}
+
+/**
+ * Run one piece of trickled work — something on screen first, if anything is.
+ *
+ * Visibility is asked again at every step rather than once at the flush, which is what covers a
+ * tab switched to mid-trickle: its panes are on screen now, so they jump the queue and refit on
+ * the next step instead of waiting behind every hidden one.
+ *
+ * A gesture that begins mid-trickle hands the rest back to `pending`, so they settle with it
+ * rather than reflowing under the user's drag — the per-frame refit this module exists to stop.
+ */
+function trickleStep(): void {
+  trickleTimer = null
+  if (depth > 0) {
+    for (const [key, deferred] of trickle) if (!pending.has(key)) pending.set(key, deferred)
+    trickle.clear()
+    return
+  }
+  let chosen: [unknown, Deferred] | undefined
+  for (const entry of trickle) {
+    if (isOnScreen(entry[1])) {
+      chosen = entry
+      break
+    }
+    chosen ??= entry
+  }
+  if (chosen === undefined) return
+  trickle.delete(chosen[0])
+  runSafely(chosen[1].run)
+  scheduleTrickle()
 }
 
 /*

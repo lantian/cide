@@ -72,13 +72,46 @@ export async function diffTokens(
   // `tokenizeFence`'s output feeds `tokenLines` directly, and that assignment is what pins
   // `DiffToken` to `fenceTokens.Token`: a field added on that side and not restated here is a
   // compile error rather than a drift nobody sees.
-  const newLines =
-    newText === null || newGrammar === null ? [] : tokenLines(tokenizeFence(newGrammar, newText))
-  const oldLines =
-    oldText === null || oldGrammar === null ? [] : tokenLines(tokenizeFence(oldGrammar, oldText))
+  const newLines = newText === null || newGrammar === null ? [] : sideTokens(newGrammar, newText)
+  const oldLines = oldText === null || oldGrammar === null ? [] : sideTokens(oldGrammar, oldText)
 
   // Both empty is spelled `null` rather than a pair of empty arrays, so the pane's prop is either
   // usable or absent and `lineTokens` never walks two empty sides once per drawn row.
   if (newLines.length === 0 && oldLines.length === 0) return null
   return { oldLines, newLines }
+}
+
+type Grammar = NonNullable<Awaited<ReturnType<typeof grammarFor>>>
+type SideLines = DiffTokens['newLines']
+
+/**
+ * The last few sides tokenized, by grammar and text.
+ *
+ * `diffTokens` is keyed on both texts, so an agent rewriting a file — a refetch several times a
+ * second, each with a new `newText` — re-tokenized the **old** side too, every time, though it had
+ * not changed. That is a synchronous stream-grammar pass over up to `DIFF_HIGHLIGHT_LIMIT_BYTES`
+ * on the main thread, per side, per refetch. Kept here, the unchanged side is a lookup.
+ *
+ * Four entries: both sides of the diff in front and of one more, which covers the tab switch back
+ * and forth without holding a long tail of large token arrays. Compared by grammar identity
+ * (`grammarFor` hands back one object per language) and string equality — a memcmp at worst,
+ * against a tokenize. The arrays are read-only (`DiffTokens`), so sharing one between two
+ * callers is safe.
+ */
+const SIDE_CACHE_SIZE = 4
+const sideCache: { grammar: Grammar; text: string; lines: SideLines }[] = []
+
+function sideTokens(grammar: Grammar, text: string): SideLines {
+  const at = sideCache.findIndex((entry) => entry.grammar === grammar && entry.text === text)
+  if (at >= 0) {
+    const [hit] = sideCache.splice(at, 1)
+    if (hit !== undefined) {
+      sideCache.unshift(hit)
+      return hit.lines
+    }
+  }
+  const lines = tokenLines(tokenizeFence(grammar, text))
+  sideCache.unshift({ grammar, text, lines })
+  if (sideCache.length > SIDE_CACHE_SIZE) sideCache.length = SIDE_CACHE_SIZE
+  return lines
 }
