@@ -66,6 +66,12 @@ pub struct SettingsPatch {
     pub graphics: Option<GraphicsSettings>,
     #[ts(optional)]
     pub claude: Option<ClaudeSettings>,
+    /// Which CLI a new console runs. (M93) See [`crate::settings::Settings::console_harness`].
+    #[ts(optional)]
+    pub console_harness: Option<crate::settings::ConsoleHarness>,
+    /// How `codex` is launched. (M93)
+    #[ts(optional)]
+    pub codex: Option<crate::settings::CodexSettings>,
     /// Proxy configuration. Sent whole like every other group, which for this one also means
     /// the URLs — credentials included — cross the IPC boundary on every keystroke-debounced
     /// save. That is the same trip `settings.get` already makes in the other direction, and

@@ -45,9 +45,11 @@ export function rangeOf(text: string, firstLine: number, lastLine: number): Send
  * how a user learns not to trust the label.
  */
 export function sendLabel(range: SendRange | null): string {
-  if (range === null) return 'Send this file to Claude'
-  if (range.lineStart === range.lineEnd) return `Send line ${range.lineStart} to Claude`
-  return `Send lines ${range.lineStart}–${range.lineEnd} to Claude`
+  // "Harness", not "Claude" (M93): the console the mention lands in may be Claude Code or
+  // Codex, whichever Settings → Harness started it with, and the menu is the same for both.
+  if (range === null) return 'Send this file to Harness'
+  if (range.lineStart === range.lineEnd) return `Send line ${range.lineStart} to Harness`
+  return `Send lines ${range.lineStart}–${range.lineEnd} to Harness`
 }
 
 /**

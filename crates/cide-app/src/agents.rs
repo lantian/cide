@@ -1791,6 +1791,11 @@ fn resume_point(live: &LiveRun) -> Option<ResumePoint> {
             rebind: Some(session),
             conversation: session.to_string(),
         }),
+        // Codex is caller-bound for routing and harness-bound for its conversation (M93), and
+        // the conversation is the half a resume needs: the successor gets a fresh routing id —
+        // so a dying predecessor's last frames and its exit belong to nobody — and
+        // `codex resume` is handed the thread, which is the same conversation whatever id cide
+        // files the child under.
         Harness::Opencode | Harness::Codex | Harness::Mimo => {
             live.harness_session
                 .clone()
@@ -2502,6 +2507,14 @@ impl AgentRegistry {
             (live.run, live.harness, live.state.clone())
         };
         let harness = cide_agents::for_kind(kind)?;
+        // A caller-bound harness whose *conversation* the CLI still mints announces it in a hook
+        // (codex's `SessionStart`, M93). Recorded before the state moves, so a run that ends on
+        // this very frame is already reopenable. `note_harness_session` never overwrites.
+        if let Observation::Hook(frame) = ob
+            && let Some(conversation) = harness.capture_hook(frame)
+        {
+            self.note_harness_session(run, conversation);
+        }
         let next = harness.observe(current, ob)?;
         self.set_state(app, run, next.clone())
             .then_some((run, next))
@@ -2608,6 +2621,16 @@ impl AgentRegistry {
     /// refusal here would leak it until the app quit. The registry's own continuation of that
     /// run moves it `Queued → Starting` before any child of *its* exists, so a registry child
     /// is never behind an `Interrupted` row and nothing is lost by the answer.
+    /// Which harness the run filed under `session` runs, whatever its state. (M93)
+    pub(crate) fn harness_of_session(&self, session: SessionId) -> Option<Harness> {
+        self.inner
+            .lock()
+            .runs
+            .values()
+            .find(|run| run.session == Some(session))
+            .map(|run| run.harness)
+    }
+
     pub fn owns_session(&self, session: SessionId) -> bool {
         self.inner.lock().runs.values().any(|run| {
             run.session == Some(session)
@@ -5445,6 +5468,8 @@ struct Facts {
     theme: Theme,
     proxy: ProxySettings,
     claude: ClaudeSettings,
+    /// Settings → Harness → Codex, for a role whose harness is codex. (M93)
+    codex: cide_ipc::CodexSettings,
     /// The providers and pools this fork's child is configured with. (M45)
     ///
     /// Read here with everything else, on the thread that already holds the lock, because a
@@ -5493,7 +5518,7 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
     let state = app
         .try_state::<crate::workspace_state::WorkspaceState>()
         .ok_or_else(|| CoreError::Io("the workspace is not available".into()))?;
-    let (root, theme, proxy, claude, llm) = state.with(|ws| {
+    let (root, theme, proxy, claude, codex, llm) = state.with(|ws| {
         let root = cide_core::workspace::project(ws, project)?
             .roots
             .first()
@@ -5504,6 +5529,7 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
             ws.settings.theme,
             ws.settings.proxy.clone(),
             ws.settings.claude.clone(),
+            ws.settings.codex.clone(),
             ws.settings.llm.clone(),
         ))
     })?;
@@ -5518,6 +5544,7 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
         theme,
         proxy,
         claude,
+        codex,
         // Read after the workspace lock is released — it is a file, and `facts` holds that lock
         // for as short a time as it can.
         overrides: cide_core::persist::load_agent_overrides(
@@ -6684,6 +6711,12 @@ impl AgentRegistry {
 
     /// Note that this project's roster changed. Coalesced; see the module header.
     pub fn mark_changed(self: &Arc<Self>, app: &AppHandle, project: ProjectId) {
+        // **Before** the early return below, not after it. A burst is one thread claiming the
+        // roster flush and every later change bailing out here, so a `mark` placed after the
+        // return would only ever see the first change of a burst — and the counts that matter
+        // to the header (a run finishing, the queue emptying) are usually the *last* one.
+        // The two coalescers are independent by design; each drops what it has already said.
+        crate::running::mark(app);
         if !self.emit.mark(project) {
             return;
         }
@@ -6936,6 +6969,7 @@ fn start_child(
         // later opened into a pane is resized then, through the path a re-docked pane uses.
         geometry: Geometry::default(),
         claude: facts.claude.clone(),
+        codex: facts.codex.clone(),
         // From the same `facts` read as everything else above, so the providers a child is
         // configured with are the ones that stood at this fork. See `Facts::llm`.
         llm: facts.llm.clone(),
@@ -7502,6 +7536,44 @@ fn opening_settled(state: Option<SessionState>) -> bool {
     )
 }
 
+/// How long a codex TUI is given to come up before a line is typed into it. (M93)
+///
+/// Codex announces nothing at startup — its `SessionStart` hook fires with the *first prompt*
+/// (measured on 0.155.1), so the "wait until the TUI has left `Spawning`" rule below would wait
+/// out its whole deadline on every fresh codex pane. A paste written before the TUI reads its
+/// input was measured lost (the first probe's paste at eight seconds, while the model was
+/// still loading, never reached the composer). So a codex session that has never reported
+/// anything is treated as up once it has been alive this long.
+const CODEX_BOOT: Duration = Duration::from_secs(6);
+
+/// Which CLI a session runs, when it is a codex one: a console the registry recorded, or an
+/// agent run the run registry holds. (M93)
+fn session_is_codex(app: &AppHandle, session: SessionId) -> bool {
+    let console = app
+        .try_state::<crate::state::SessionRegistry>()
+        .and_then(|registry| registry.harness_of(session));
+    let run = || {
+        app.try_state::<Arc<AgentRegistry>>()
+            .and_then(|registry| registry.harness_of_session(session))
+    };
+    console.or_else(run) == Some(Harness::Codex)
+}
+
+/// `text` as a bracketed paste: how a codex TUI takes a line whole, newlines and all.
+///
+/// Idempotent: a codex run's follow-up already arrives wrapped (`CodexHarness::deliver`), and a
+/// second wrapping would paste the markers themselves as text.
+fn as_paste(text: Vec<u8>) -> Vec<u8> {
+    if text.starts_with(b"\x1b[200~") {
+        return text;
+    }
+    let mut out = Vec::with_capacity(text.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(&text);
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 fn type_line(
     app: &AppHandle,
     session: SessionId,
@@ -7512,8 +7584,16 @@ fn type_line(
     on_stuck: Option<Box<dyn FnOnce() + Send>>,
 ) {
     let (text, enter) = strip_enter(bytes);
-    pty.write(text);
-    if !enter {
+    // A codex TUI (M93) takes the line as a paste, and only once it is up: its text is held for
+    // the thread below rather than written now. See `CODEX_BOOT`.
+    let codex = session_is_codex(app, session);
+    let held = if codex {
+        Some(as_paste(text))
+    } else {
+        pty.write(text);
+        None
+    };
+    if !enter && held.is_none() {
         return;
     }
 
@@ -7526,12 +7606,26 @@ fn type_line(
                 app.try_state::<crate::hooks::HookServer>()
                     .map(|hooks| hooks.state(session))
             };
+            let booted = || {
+                codex
+                    && app
+                        .try_state::<crate::state::SessionRegistry>()
+                        .and_then(|registry| registry.started(session))
+                        .and_then(|at| at.elapsed().ok())
+                        .is_some_and(|alive| alive >= CODEX_BOOT)
+            };
             let deadline = Instant::now() + ENTER_BOOT_DEADLINE;
             while Instant::now() < deadline {
-                if state_of() != Some(SessionState::Spawning) {
+                if state_of() != Some(SessionState::Spawning) || booted() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
+            }
+            if let Some(text) = held {
+                for_thread.write(text);
+                if !enter {
+                    return;
+                }
             }
             std::thread::sleep(ENTER_GAP);
             for_thread.write(b"\r".to_vec());
@@ -9191,12 +9285,25 @@ mod tests {
     ///
     /// Both halves are asserted, because only the pair says where the fault was: the same line,
     /// against the same run, answers nothing before the stamp and `Running` after it.
+    /// A line typed into a codex TUI is one paste, wrapped once. (M93)
+    #[test]
+    fn a_codex_line_is_pasted_once() {
+        assert_eq!(
+            as_paste(b"a\nb".to_vec()),
+            b"\x1b[200~a\nb\x1b[201~".to_vec()
+        );
+        let wrapped = as_paste(b"x".to_vec());
+        assert_eq!(as_paste(wrapped.clone()), wrapped);
+    }
+
     #[test]
     fn a_redirected_run_is_read_by_the_harness_it_was_forked_with() {
-        // Lifted verbatim from a run log written by the CLI this was reported from.
-        const TURN_STARTED: &str = r#"{"type":"turn.started"}"#;
-        const THREAD_STARTED: &str =
-            r#"{"type":"thread.started","thread_id":"01a0c54b-332d-7461-bdeb-648f2b2f9c10"}"#;
+        // Since M93 a codex child reports through hooks, as a claude one does: the frame below
+        // is the shape its `UserPromptSubmit` hook sends.
+        let prompt = cide_claude::HookFrame::new(
+            "UserPromptSubmit",
+            serde_json::json!({"session_id": "01a0c54b-332d-7461-bdeb-648f2b2f9c10"}),
+        );
 
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
@@ -9210,13 +9317,9 @@ mod tests {
         registry.bind_session(run, session);
         assert_eq!(state_of(&registry, run), RunState::Starting);
 
-        // The registry still holds the file's answer: opencode's machine, codex's words.
+        // The registry still holds the file's answer: opencode's machine, which reads no hooks.
         assert_eq!(
-            registry.observe(None, session, Observation::Line(TURN_STARTED)),
-            None,
-        );
-        assert_eq!(
-            registry.observe(None, session, Observation::Line(THREAD_STARTED)),
+            registry.observe(None, session, Observation::Hook(&prompt)),
             None,
         );
         assert_eq!(state_of(&registry, run), RunState::Starting);
@@ -9224,7 +9327,7 @@ mod tests {
         // What `start_child` now does once the override has been resolved.
         registry.note_harness(run, Harness::Codex);
         assert_eq!(
-            registry.observe(None, session, Observation::Line(TURN_STARTED)),
+            registry.observe(None, session, Observation::Hook(&prompt)),
             Some((run, RunState::Running)),
         );
         assert_eq!(state_of(&registry, run), RunState::Running);

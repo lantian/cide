@@ -894,19 +894,7 @@
 }
 
 .primary {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: var(--bg);
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.primary:hover:not(:disabled) {
-  background: var(--accent-hi);
-  border-color: var(--accent-hi);
-  color: var(--bg);
+  composes: primary from '../styles/buttons.module.css';
 }
 
 .reviewLine { color: inherit; font: inherit; padding: 0; border: 0; background: transparent; cursor: pointer; width: 100%; text-align: right; }

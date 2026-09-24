@@ -224,19 +224,10 @@
   border-color: var(--border-soft);
 }
 
-/* Nothing in this dialog destroys anything, so the accent-filled button is the one that
-   acts — unlike `CloseConfirm`, where the prominent button is the one that backs out. */
-.buttonPrimary:not(:disabled) {
-  background: var(--accent);
-  border-color: var(--accent);
-  /* `--bg`, not a literal: the accent is light in one theme and dark in the other, and a
-     fixed label colour fails contrast in one of the two. */
-  color: var(--bg);
-  font-weight: 500;
-}
-
-.buttonPrimary:hover:not(:disabled) {
-  background: var(--accent-hi);
-  border-color: var(--accent-hi);
-  color: var(--bg);
+/* Nothing in this dialog destroys anything, so the primary button is the one that acts —
+   unlike `CloseConfirm`, where the prominent button is the one that backs out. It used to be
+   filled only while enabled; the shared class fades a disabled one instead, which still says
+   which button would act. */
+.buttonPrimary {
+  composes: primary from '../../styles/buttons.module.css';
 }

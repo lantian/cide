@@ -1,7 +1,8 @@
 import { UserLink } from './UserLink'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api, refreshBoard, startGitLab, useGitLab } from './store'
-import { message } from './model'
+import { message, repositoryOfMr } from './model'
+import type { GitLabReviewPrompt } from '@/ipc/generated'
 import styles from './GitLab.module.css'
 export function GitLabSettings() {
   const { board } = useGitLab()
@@ -19,6 +20,35 @@ export function GitLabSettings() {
     () => setPatterns(board.preferences.excludedFiles.join('\n')),
     [board.preferences.excludedFiles],
   )
+  const [reviewPrompt, setReviewPrompt] = useState(board.preferences.reviewPrompt)
+  const [reviewPrompts, setReviewPrompts] = useState<GitLabReviewPrompt[]>(
+    board.preferences.reviewPrompts,
+  )
+  useEffect(
+    () => setReviewPrompt(board.preferences.reviewPrompt),
+    [board.preferences.reviewPrompt],
+  )
+  useEffect(
+    () => setReviewPrompts(board.preferences.reviewPrompts),
+    [board.preferences.reviewPrompts],
+  )
+  // The repositories of the MRs already open, offered as the repository field's suggestions.
+  const knownRepositories = useMemo(
+    () =>
+      [
+        ...new Set(
+          board.reviews.flatMap((r) => {
+            const repo = repositoryOfMr(r.url)
+            return repo ? [repo.path] : []
+          }),
+        ),
+      ].sort(),
+    [board.reviews],
+  )
+  const editPrompt = (at: number, patch: Partial<GitLabReviewPrompt>) =>
+    setReviewPrompts((rows) =>
+      rows.map((row, i) => (i === at ? { ...row, ...patch } : row)),
+    )
   async function run(work: () => Promise<unknown>) {
     setBusy(true)
     setError('')
@@ -127,6 +157,77 @@ export function GitLabSettings() {
       >
         Save patterns
       </button>
+      <h3>Agent review instructions</h3>
+      <span className={styles.muted}>
+        What the instructions box of Review with an agent starts with. A repository&apos;s own
+        entry wins over the default; you can still edit the text before starting a review. Line
+        breaks become spaces when the review starts.
+      </span>
+      <textarea
+        aria-label="Default review instructions"
+        value={reviewPrompt}
+        onChange={(e) => setReviewPrompt(e.target.value)}
+        placeholder="For every repository — e.g. focus on correctness and missing tests."
+      />
+      {reviewPrompts.map((row, i) => (
+        <div key={i} className={styles.reviewPromptRow}>
+          <div className={styles.row}>
+            <input
+              aria-label="Repository"
+              list="gitlab-review-prompt-repositories"
+              value={row.repository}
+              onChange={(e) => editPrompt(i, { repository: e.target.value })}
+              placeholder="group/repo"
+              spellCheck={false}
+            />
+            <button
+              disabled={busy}
+              onClick={() =>
+                setReviewPrompts((rows) => rows.filter((_, j) => j !== i))
+              }
+            >
+              Remove
+            </button>
+          </div>
+          <textarea
+            aria-label={`Review instructions for ${row.repository || 'this repository'}`}
+            value={row.prompt}
+            onChange={(e) => editPrompt(i, { prompt: e.target.value })}
+          />
+        </div>
+      ))}
+      <datalist id="gitlab-review-prompt-repositories">
+        {knownRepositories.map((r) => (
+          <option key={r} value={r} />
+        ))}
+      </datalist>
+      <div className={styles.row}>
+        <button
+          disabled={busy}
+          onClick={() =>
+            setReviewPrompts((rows) => [...rows, { repository: '', prompt: '' }])
+          }
+        >
+          Add repository
+        </button>
+        <button
+          disabled={busy}
+          onClick={() =>
+            void run(() =>
+              api({
+                kind: 'preferences',
+                preferences: {
+                  ...board.preferences,
+                  reviewPrompt,
+                  reviewPrompts,
+                },
+              }),
+            )
+          }
+        >
+          Save review instructions
+        </button>
+      </div>
       {error && (
         <div role="alert" className={styles.error}>
           {error}

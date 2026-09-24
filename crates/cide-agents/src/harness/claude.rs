@@ -658,7 +658,7 @@ fn assemble(
 ///
 /// `Queued` maps to `Spawning` for completeness rather than because it happens: a queued run has
 /// no child, so no frame can name it.
-fn session_state_of(state: &RunState) -> Option<SessionState> {
+pub(super) fn session_state_of(state: &RunState) -> Option<SessionState> {
     match state {
         RunState::Queued | RunState::Starting => Some(SessionState::Spawning),
         RunState::Running => Some(SessionState::Busy),
@@ -706,7 +706,7 @@ fn session_state_of(state: &RunState) -> Option<SessionState> {
 /// second run of the same role into the same worktree. The slot is held from dispatch and
 /// released when a run *leaves* the working set, which is a fact about the run's history rather
 /// than about its current phase; the registry owns that and this function cannot.
-fn run_state_of(state: SessionState) -> Option<RunState> {
+pub(super) fn run_state_of(state: SessionState) -> Option<RunState> {
     match state {
         SessionState::Spawning | SessionState::Splash => Some(RunState::Starting),
         SessionState::Busy => Some(RunState::Running),
@@ -878,6 +878,7 @@ mod tests {
             env: Vec::new(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
+            codex: cide_ipc::CodexSettings::default(),
             llm: cide_ipc::LlmSettings::default(),
             choice: None,
             harness: agent.def.harness,

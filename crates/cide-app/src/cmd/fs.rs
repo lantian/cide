@@ -489,6 +489,44 @@ pub async fn fs_collapse(
     .await?
 }
 
+/// *Expand all* in the Explorer header. Returns the new row count. (M96)
+///
+/// Opens every walked directory that [`cide_fs::Filter::watchable`] admits, so with *Show
+/// ignored files* on it does not flood the tree with `target/`. The synthetic groups are left
+/// as they are: opening *External Libraries* runs `cargo metadata`, which is too expensive a
+/// side effect for one click. [`cide_fs::Index::set_all_expanded`] explains both.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_expand_all(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<u32, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_expand_all", move || {
+        prepare(&fs, None);
+        let filter = fs.filter();
+        fs.with_index_mut(|index| index.set_all_expanded(true, |p| filter.watchable(p, true)));
+        Ok(tree_count(&fs) as u32)
+    })
+    .await?
+}
+
+/// *Collapse all* in the Explorer header: every directory and every group, the roots excepted.
+/// Returns the new row count. (M96)
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_collapse_all(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<u32, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_collapse_all", move || {
+        prepare(&fs, None);
+        fs.with_index_mut(|index| index.set_all_expanded(false, |_| true));
+        fs.groups().collapse_all();
+        Ok(tree_count(&fs) as u32)
+    })
+    .await?
+}
+
 /// Re-scan everything under one folder against the disk, and answer the new row count.
 /// The file tree's *Refresh* menu item.
 ///

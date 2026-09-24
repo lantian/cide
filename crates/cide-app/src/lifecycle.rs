@@ -1449,7 +1449,10 @@ fn plan_restore_in(
     // **Resume this conversation** and then silently start a *new* one — a button that lies
     // about what it does is worse than a pane that opens fresh and says so. A transcript that
     // still exists is not the question here; whether cide will name it is.
-    let resume_enabled = ws.settings.claude.cli.inject.resume.enabled;
+    let resume_enabled = Resume {
+        claude: ws.settings.claude.cli.inject.resume.enabled,
+        codex: ws.settings.codex.cli.inject.resume,
+    };
 
     for (id, project) in &ws.projects {
         if only.is_some_and(|wanted| wanted != *id) {
@@ -1517,7 +1520,7 @@ fn entry_for(
     cwd: &Path,
     projects_dir: Option<&Path>,
     resume_all: bool,
-    resume_enabled: bool,
+    resume_enabled: Resume,
 ) -> Option<PaneRestore> {
     // A diff or an editor pane has nothing to spawn, and listing it would leave the
     // frontend to filter out entries it can only ignore.
@@ -1554,21 +1557,42 @@ fn entry_for(
     })
 }
 
+/// The resume switch of each console CLI, as Settings holds them. (M93)
+#[derive(Debug, Clone, Copy)]
+struct Resume {
+    claude: bool,
+    codex: bool,
+}
+
 fn restore_for(
     pane: &Pane,
     cwd: &Path,
     projects_dir: Option<&Path>,
-    resume_enabled: bool,
+    resume_enabled: Resume,
 ) -> SessionRestore {
     // A shell's scrollback died with its process. There is nothing to resume and nothing to
     // replay, and the frontend says so rather than showing a stale screen.
     if pane.kind != PaneKind::Claude {
         return SessionRestore::Fresh;
     }
+    // A codex console (M93) is resumable by its **thread**, which only its hooks ever named —
+    // `pane.session` is cide's routing id and no codex conversation has it. The rollout is found
+    // by id alone, from any directory: codex does not file a thread under its cwd. Its own
+    // resume switch, not claude's.
+    if cide_core::workspace::pane_harness(pane) == cide_ipc::Harness::Codex {
+        return match pane.conversation {
+            Some(thread)
+                if cide_core::codex_cli::resumable(&thread.to_string(), resume_enabled.codex) =>
+            {
+                SessionRestore::Resumable { session: thread }
+            }
+            _ => SessionRestore::Fresh,
+        };
+    }
     // cide has been told not to pass `--resume`. The transcript may well still be there, and
     // saying `Resumable` would still produce a pane — a pane holding a *new* conversation,
     // under a heading promising the old one.
-    if !resume_enabled {
+    if !resume_enabled.claude {
         return SessionRestore::Fresh;
     }
     let Some(session) = pane.session else {
@@ -2588,6 +2612,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "secondary : claude".into(),
                 docker: None,
             },
@@ -2606,6 +2631,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "fixture : bash".into(),
                 docker: None,
             },

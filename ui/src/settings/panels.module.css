@@ -176,25 +176,15 @@
 }
 
 .primary {
+  composes: primary from '../styles/buttons.module.css';
   height: calc(22px * var(--ui-scale));
   padding: 0 10px;
   margin-left: 4px;
-  border: 1px solid var(--accent);
+  border: 1px solid transparent;
   border-radius: var(--r-2);
-  background: var(--accent);
-  color: var(--on-accent);
   font-family: var(--font-ui);
   font-size: var(--fs-ui-11);
   cursor: pointer;
-}
-
-.primary:hover:not(:disabled) {
-  filter: brightness(1.08);
-}
-
-.primary:disabled {
-  opacity: 0.4;
-  cursor: default;
 }
 
 /*

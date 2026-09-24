@@ -23,6 +23,7 @@ import { useMilestones } from '@/sidebar/milestonesStore'
 import styles from './MilestonesPanel.module.css'
 import panelStyles from './TasksPanel.module.css'
 import { TaskMarkdown } from './TaskMarkdown'
+import { useEscapeClose } from './escapeClose'
 
 export function ProposalModal({
   project,
@@ -55,9 +56,11 @@ export function ProposalModal({
   }
 
   const change = proposal.change
+  const dismiss = busy ? () => {} : onClose
+  const escape = useEscapeClose(dismiss)
   return (
-    <OverlayCard label={`Proposal ${proposal.id}`} onDismiss={busy ? () => {} : onClose}>
-      <div className={styles.modal} data-audit="proposalModal">
+    <OverlayCard label={`Proposal ${proposal.id}`} onDismiss={dismiss}>
+      <div className={styles.modal} data-audit="proposalModal" {...escape}>
         <h2 className={styles.modalTitle}>
           {proposal.id} · {proposal.title}
         </h2>

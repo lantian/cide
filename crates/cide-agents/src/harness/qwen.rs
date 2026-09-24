@@ -609,6 +609,7 @@ mod tests {
             env: Vec::new(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
+            codex: cide_ipc::CodexSettings::default(),
             llm: cide_ipc::LlmSettings::default(),
             choice: None,
             harness: agent.def.harness,

@@ -183,6 +183,156 @@ fn program_is_claude(program: &str) -> bool {
 /// `ui/src/ipc/client.ts`, the way `project.close` and `git.status` do for their flags. It
 /// fixes the same call sites, but only until the next caller forgets, and this side is the
 /// one that has to be right for callers it has not met.
+/// Which console CLI the frontend (or a continuation) asked for by name, if any. (M93)
+///
+/// A file-name match on what was *asked for*, before the configured binary is substituted —
+/// `program_is_claude`'s rule and its reason. `claude` means "a console": which CLI it becomes is
+/// [`ConsoleSpawn::decide`]'s answer.
+fn console_program(program: &str) -> Option<cide_ipc::ConsoleHarness> {
+    if program_is_claude(program) {
+        return Some(cide_ipc::ConsoleHarness::Claude);
+    }
+    std::path::Path::new(program)
+        .file_name()
+        .is_some_and(|n| n == "codex")
+        .then_some(cide_ipc::ConsoleHarness::Codex)
+}
+
+/// Which CLI a console spawn runs, and — for codex — the thread it resumes. (M93)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConsoleSpawn {
+    harness: cide_ipc::ConsoleHarness,
+    /// The conversation a resume or a fork continues, in the CLI's own terms: for codex, the
+    /// thread its hooks reported, which is never cide's routing id.
+    thread: Option<SessionId>,
+}
+
+impl ConsoleSpawn {
+    /// The one rule that decides which CLI a console runs.
+    ///
+    /// * **A continuation** runs the harness that owns it — its `ContinueSpec` named the program.
+    /// * **A resume or a fork** runs the CLI of the pane that holds the conversation, whatever
+    ///   the setting says *now*: a claude transcript cannot be resumed by codex, nor a codex
+    ///   thread by claude. This is what keeps an open console, its Resume button and its restore
+    ///   after restart on the CLI it was started with.
+    /// * **A fresh spawn** — a new pane, Restart session, a restored pane whose conversation is
+    ///   gone — runs Settings → Harness. It is the only road by which the setting reaches a
+    ///   pane, and the one the user was told about.
+    fn decide(
+        ws: &cide_ipc::Workspace,
+        asked: cide_ipc::ConsoleHarness,
+        continues: &Option<cide_ipc::HarnessSession>,
+        resume: Option<SessionId>,
+    ) -> Self {
+        let harness = if continues.is_some() {
+            asked
+        } else if let Some(id) = resume {
+            cide_core::workspace::harness_holding(ws, id)
+                .and_then(cide_ipc::ConsoleHarness::of)
+                .unwrap_or(asked)
+        } else if asked == cide_ipc::ConsoleHarness::Claude {
+            ws.settings.console_harness
+        } else {
+            asked
+        };
+        let thread = match harness {
+            cide_ipc::ConsoleHarness::Codex => {
+                resume.and_then(|id| cide_core::workspace::codex_thread_of(ws, id))
+            }
+            cide_ipc::ConsoleHarness::Claude => resume,
+        };
+        Self { harness, thread }
+    }
+}
+
+/// Everything [`codex_console_argv`] needs, gathered by `spawn_session`. (M93)
+pub(crate) struct CodexConsole {
+    /// The user's surviving arguments, Settings → Harness → Codex.
+    pub(crate) user_args: Vec<String>,
+    pub(crate) cwd: String,
+    pub(crate) inject: cide_core::codex_cli::Injected,
+    /// The thread a resume or fork continues.
+    pub(crate) thread: Option<SessionId>,
+    pub(crate) fork: bool,
+    /// The roster paragraph, when this project has subagents.
+    pub(crate) paragraph: Option<String>,
+    /// The absolute path to `cide-hook`, or `None` when it could not be found.
+    pub(crate) hook: Option<String>,
+    /// The routing id this child is filed under, handed to cide's MCP server.
+    pub(crate) session: SessionId,
+    pub(crate) agent_sock: Option<String>,
+    /// An opening prompt, the very last token.
+    pub(crate) prompt: Option<String>,
+}
+
+/// A codex console's argv, after the program. (M93)
+///
+/// `codex [resume|fork] <user args> -C <cwd> <quiet start> [-c developer_instructions]
+/// [<hooks> --dangerously-bypass-hook-trust] [-c mcp_servers.cide.*] [<thread>]`. The
+/// subcommand first, because the options must come after it to be parsed by it (measured:
+/// `resume` and `fork` accept every TUI option); the user's before cide's, as for claude; the
+/// thread last, because it is a positional and nothing may follow it.
+///
+/// * **No sandbox or approval flags.** The console is a person's TUI, like a claude console
+///   that is given no `--permission-mode`: the user's own `config.toml` decides, and codex asks
+///   them in the pane.
+/// * **A fork with the fork switch off starts fresh**, not a plain resume — claude's switch
+///   degrades to a resume, which `AlreadyOpen` makes safe there; two TUIs writing one codex
+///   thread would have nothing to stop them.
+/// * **`--include-non-interactive` on a resume**, because a thread an agent run started under
+///   M44's `codex exec` is non-interactive, and a picker-less resume of one is the only way back
+///   into it that the flag's help does not rule out.
+pub(crate) fn codex_console_argv(c: &CodexConsole) -> Vec<String> {
+    use cide_core::codex_cli;
+
+    let continues = match (c.thread, c.fork) {
+        (Some(thread), true) if c.inject.fork => Some(("fork", thread)),
+        (Some(_), true) => None,
+        (Some(thread), false) if c.inject.resume => Some(("resume", thread)),
+        _ => None,
+    };
+
+    let mut args = Vec::new();
+    if let Some((subcommand, _)) = continues {
+        args.push(subcommand.to_string());
+    }
+    args.extend(c.user_args.iter().cloned());
+    args.push("-C".into());
+    args.push(c.cwd.clone());
+    args.extend(codex_cli::quiet_start());
+    if c.inject.developer_instructions
+        && let Some(paragraph) = &c.paragraph
+    {
+        args.extend(codex_cli::developer_instructions(paragraph));
+    }
+    if let Some(hook) = &c.hook {
+        if c.inject.hooks {
+            let events: Vec<&str> = cide_claude::HookEvent::CODEX
+                .iter()
+                .map(|e| e.as_str())
+                .collect();
+            args.extend(codex_cli::hook_overrides(hook, &events));
+        }
+        if c.inject.mcp_config {
+            let mut env = vec![("CIDE_SESSION", c.session.to_string())];
+            if let Some(sock) = &c.agent_sock {
+                env.push(("CIDE_AGENT_SOCK", sock.clone()));
+            }
+            args.extend(codex_cli::mcp_overrides(hook, &env));
+        }
+    }
+    if let Some((subcommand, thread)) = continues {
+        if subcommand == "resume" {
+            args.push("--include-non-interactive".into());
+        }
+        args.push(thread.to_string());
+    }
+    if let Some(prompt) = &c.prompt {
+        args.push(prompt.clone());
+    }
+    args
+}
+
 fn wants_fork(fork: Option<bool>) -> bool {
     fork.unwrap_or(false)
 }
@@ -512,8 +662,8 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<
              tasks, hand each one to a role, and check the result."
         }
         Voice::Pane => {
-            "This is a Claude pane of a project in cide that has subagents, and you can hand \
-             work to its roles exactly as the project's product owner — its primary Claude pane \
+            "This is a console pane of a project in cide that has subagents, and you can hand \
+             work to its roles exactly as the project's product owner — its primary console pane \
              — does: decompose a goal into tasks, hand each one to a role, and check the result."
         }
         Voice::Acting => {
@@ -596,7 +746,7 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<
          which picks that task's branch — and set the task done, or comment what to change and \
          hand it back. Watch runs with `mcp__cide__cide_agent_runs`; stop one going the wrong \
          way with `mcp__cide__cide_agent_stop`. When a run hands its turn back or ends, cide \
-         types one line about it into a Claude pane, and `notify` on \
+         types one line about it into a console pane, and `notify` on \
          `mcp__cide__cide_agent_dispatch` says which: `here` (this pane, the default), `main` \
          (the project's primary pane) or `none` (nothing is typed — poll \
          `mcp__cide__cide_agent_runs` with includeFinished and read the task); a run started by \
@@ -775,6 +925,8 @@ pub async fn session_spawn(
             // to set arbitrary variables on a `claude` sets them on a process that inherits
             // cide's own authentication.
             env: Vec::new(),
+            // A webview's console types its own first line.
+            prompt: None,
         },
     )
     .await
@@ -803,6 +955,12 @@ pub(crate) struct SpawnRequest {
     /// function's body from a second spawn path — is the duplication the extraction removed. A
     /// variable set here outranks every pass above it; see the fold at the end of the body.
     pub env: Vec<(String, String)>,
+    /// An opening prompt for the child's argv, for a CLI that takes one there. (M93)
+    ///
+    /// Codex does: `codex [PROMPT]` starts the TUI and submits it, which is sturdier than typing
+    /// into a TUI whose readiness it never announces. Claude ignores it — a positional after
+    /// the variadic `--mcp-config` would be swallowed, which is why claude's is typed.
+    pub prompt: Option<String>,
 }
 
 /// Spawn a child for a pane. The body of [`session_spawn`], callable from Rust. (M79)
@@ -828,6 +986,7 @@ pub(crate) async fn spawn_session(
         continues,
         voice,
         env: extra_env,
+        prompt: opening,
     } = request;
     let app = app.clone();
     // Read before the blocking closure: `WorkspaceState` is Tauri-managed state and the
@@ -907,7 +1066,13 @@ pub(crate) async fn spawn_session(
     // no `--settings` is attached, and every session runs with no hooks — no token figures, no
     // fast buffer reload, and a close confirm that cannot tell busy from idle. Nothing fails;
     // the features simply are not there.
-    let is_claude = program_is_claude(&spec.program);
+    //
+    // **And since M93 the literal is "a console", not "claude".** The webview sends `claude` for
+    // every console pane it spawns, because it cannot know what Settings → Harness says *now*
+    // or which CLI owns the conversation a restore names; Rust decides, below, once the settings
+    // and the tree are in hand. `codex` is recognised as asked-for by name for the same reason
+    // `claude` is: a continuation's `ContinueSpec` spells it.
+    let asked = console_program(&spec.program);
 
     // Read once, here, rather than inside the proxy pass: this is the only place that knows
     // both the app handle and that a child is about to exist, and `WorkspaceState::with` runs
@@ -921,14 +1086,20 @@ pub(crate) async fn spawn_session(
     // is about to `fork`.
     // The job threshold rides too: one more scalar out of the same lock, converted here so
     // the `!is_claude` branch below has a value and not a second state lookup.
-    let (proxy, claude_settings, job_notify_after) = app
+    //
+    // The console harness rides the same read (M93), with the two facts about the tree a resume
+    // needs: which CLI holds the conversation being resumed, and — for codex — which thread that
+    // is. Read here, under the one lock this function takes, and never again below.
+    let (proxy, claude_settings, codex_settings, job_notify_after, console) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
         .map(|state| {
             state.with(|ws| {
                 (
                     ws.settings.proxy.clone(),
                     ws.settings.claude.clone(),
+                    ws.settings.codex.clone(),
                     crate::lifecycle::job_notify_after(&ws.settings),
+                    asked.map(|asked| ConsoleSpawn::decide(ws, asked, &continues, resume)),
                 )
             })
         })
@@ -936,9 +1107,52 @@ pub(crate) async fn spawn_session(
             (
                 Default::default(),
                 Default::default(),
+                Default::default(),
                 crate::lifecycle::job_notify_after(&cide_ipc::Settings::default()),
+                asked.map(|asked| ConsoleSpawn {
+                    harness: asked,
+                    thread: resume,
+                }),
             )
         });
+    let is_claude = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Claude);
+    let is_codex = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Codex);
+    // Either CLI. Everything that is about "a console" rather than about claude's own argv —
+    // the proxy scope, `CIDE_SESSION`, the task tools' socket, *not* watching jobs or rewriting
+    // output — keys on this.
+    let is_console = console.is_some();
+
+    // The New project wizard's brief (M97), if one is waiting for *this* project's console. Only
+    // for a spawn the webview asked for (`voice: None` — a tab cide opened by itself has its own
+    // prompt), only for the primary console, and taken rather than read, so it is typed once in
+    // the life of the project: see `cmd::new_project`'s header. `take_seed` is a lock on an empty
+    // `Vec` for every launch that never ran the wizard, so nothing here costs the common spawn.
+    let seed = match (
+        is_console && voice.is_none(),
+        project,
+        app.try_state::<crate::workspace_state::WorkspaceState>(),
+    ) {
+        (true, Some(project), Some(state)) => state
+            .with(|ws| {
+                is_primary_console_spawn(ws, registry, project, resume, wants_fork(fork))
+                    .then(|| {
+                        cide_core::workspace::project(ws, project)
+                            .ok()?
+                            .roots
+                            .first()
+                            .map(|root| root.path.clone())
+                    })
+                    .flatten()
+            })
+            .and_then(|root| crate::cmd::new_project::take_seed(&root)),
+        _ => None,
+    };
+    // Codex takes an opening prompt in its argv, which is sturdier than typing; claude's is typed
+    // after the insert below.
+    let opening = match (&seed, is_codex) {
+        (Some(seed), true) if opening.is_none() => Some(seed.clone()),
+        _ => opening,
+    };
 
     // The user's launch configuration, filtered. Enforced *here* as well as on the Settings
     // screen and not instead of it: `workspace.json` is hand-editable and `settings_set` is one
@@ -953,6 +1167,19 @@ pub(crate) async fn spawn_session(
     } else {
         cide_core::claude_cli::Plan::default()
     };
+    // The codex half of the same rule: Settings → Harness → Codex, filtered at the spawn.
+    let codex_plan = if is_codex {
+        cide_core::codex_cli::plan_here(&codex_settings.cli)
+    } else {
+        cide_core::codex_cli::Plan::default()
+    };
+    for refused in codex_plan.refusals() {
+        tracing::warn!(
+            token = %refused.text,
+            "refusing a codex launch argument or variable: {}",
+            refused.verdict.note().unwrap_or_default()
+        );
+    }
     // One line, once, naming what was dropped. A hand-edited `workspace.json` is the case this
     // exists for: there is no screen involved in that path, so the log is the only place the
     // refusal can be seen at all.
@@ -978,6 +1205,16 @@ pub(crate) async fn spawn_session(
             return Err(SessionError::NoClaudeBinary {
                 program: configured.to_string(),
                 message: problem.message(),
+            });
+        }
+        spec.program = configured.to_string();
+    }
+    if is_codex {
+        let configured = codex_settings.cli.binary.trim();
+        if let Err(problem) = cide_core::codex_cli::resolve(configured) {
+            return Err(SessionError::NoClaudeBinary {
+                program: configured.to_string(),
+                message: cide_core::codex_cli::message(&problem),
             });
         }
         spec.program = configured.to_string();
@@ -1037,15 +1274,65 @@ pub(crate) async fn spawn_session(
         spec = spec.arg(a);
     }
 
-    let target = pane_proxy_target(&proxy.scope, is_claude);
+    // Minted here rather than beside the claude conversation below (M93), because the codex argv
+    // needs it first: codex's MCP server is handed `CIDE_SESSION` in its own environment table.
+    // See the long note at the claude half for what this id is and is not.
+    let minted = SessionId::new();
+
+    // The whole codex argv, in one place (M93). `codex_console_argv` is pure and carries the
+    // order; this only gathers what it needs.
+    if is_codex && let Some(console) = console {
+        let inject = codex_plan.inject;
+        let paragraph = if inject.developer_instructions && inject.mcp_config {
+            project.and_then(|project| {
+                orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+            })
+        } else {
+            None
+        };
+        let hook = cide_hook_binary().map(|p| p.to_string_lossy().to_string());
+        if hook.is_none() {
+            tracing::warn!("cannot locate cide-hook; this codex session reports no state");
+        }
+        let agent_sock = app
+            .try_state::<crate::agent_rpc::AgentRpcServer>()
+            .map(|server| server.socket().to_string_lossy().to_string());
+        for a in codex_console_argv(&CodexConsole {
+            user_args: codex_plan.args.clone(),
+            cwd: spec.cwd.to_string_lossy().to_string(),
+            inject,
+            thread: console.thread,
+            fork: wants_fork(fork),
+            paragraph,
+            hook,
+            session: minted,
+            agent_sock,
+            prompt: opening.filter(|p| !p.trim().is_empty()),
+        }) {
+            spec = spec.arg(a);
+        }
+    }
+
+    let target = pane_proxy_target(&proxy.scope, is_console);
     let proxy_env = ProxyEnv::for_target(&proxy, target);
-    let mut spec = apply_proxy(base_env(spec, &claude_settings, plan.env), &proxy_env);
+    let user_env = if is_codex {
+        codex_plan.env.clone()
+    } else {
+        plan.env
+    };
+    let mut spec = apply_proxy(base_env(spec, &claude_settings, user_env), &proxy_env);
     // Redacted, and at debug level: one line per spawn is worth it when a pane cannot reach
     // the network, but it is not worth it on every launch of a machine with no proxy at all.
     tracing::debug!(
         "{}",
         proxy_log_line(
-            if is_claude { "claude" } else { "shell" },
+            if is_claude {
+                "claude"
+            } else if is_codex {
+                "codex"
+            } else {
+                "shell"
+            },
             target,
             &proxy_env
         )
@@ -1071,7 +1358,6 @@ pub(crate) async fn spawn_session(
     // and `cide-hook` echoes it back, so routing no longer depends on the two agreeing.
     // Measured before the fix: 2 session ids arrived from hooks, 12 were held by panes, and
     // the two sets did not intersect at all.
-    let minted = SessionId::new();
     let mut id = minted;
     if is_claude {
         // `plan.inject` and not a fresh resolution: the flags folded here are the same value
@@ -1123,6 +1409,11 @@ pub(crate) async fn spawn_session(
             server.socket().to_string_lossy().to_string(),
         );
 
+        // Both console CLIs get the routing key; a codex hook command inherits it from the TUI
+        // exactly as claude's does (measured, M93). Its hook table is already in the argv.
+        if is_codex {
+            spec = spec.env("CIDE_SESSION", id.to_string());
+        }
         if is_claude {
             // The routing key for every frame this child's hooks send. Set only for Claude
             // panes: a shell pane has no conversation, and a `claude` the user starts by hand
@@ -1204,12 +1495,15 @@ pub(crate) async fn spawn_session(
     // cide's own, so no task tracker and, on the console pane, no subagents. The roster paragraph
     // above is gated on the same switch, or it would be a system prompt naming tools this session
     // does not have.
-    if is_claude && let Some(agents) = app.try_state::<crate::agent_rpc::AgentRpcServer>() {
+    if is_console && let Some(agents) = app.try_state::<crate::agent_rpc::AgentRpcServer>() {
         spec = spec.env(
             "CIDE_AGENT_SOCK",
             agents.socket().to_string_lossy().to_string(),
         );
-        spec = with_task_tools(spec, &plan.inject, agent_mcp_config);
+        // Codex's server is already in its argv, as `-c mcp_servers.cide.*` — `codex_console_argv`.
+        if is_claude {
+            spec = with_task_tools(spec, &plan.inject, agent_mcp_config);
+        }
     }
 
     // A pane standing in one of cide's agent checkouts — a finished run reopened on its
@@ -1249,7 +1543,7 @@ pub(crate) async fn spawn_session(
     // append-only because it has conflicted three rounds running. The field already exists,
     // already means "this pane continues session X", and the two readings differ only in what
     // a program can do with it.
-    let replay_for = (!is_claude).then_some(resume).flatten();
+    let replay_for = (!is_console).then_some(resume).flatten();
 
     // Watch the foreground process group, for a shell and only for a shell.
     //
@@ -1270,7 +1564,7 @@ pub(crate) async fn spawn_session(
     // setting, read above out of the same lock as the proxy. A later settings change reaches
     // this session too: `settings_set` retunes every running watch, so this value is only
     // ever the starting point.
-    if !is_claude {
+    if !is_console {
         spec = spec.watch_jobs(job_notify_after);
         // Structured logs, rendered for a person — and for a shell only, for a reason as
         // firm as the one above. The Claude CLI paints a screen rather than printing lines:
@@ -1310,6 +1604,19 @@ pub(crate) async fn spawn_session(
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
     registry.insert(id, session);
+    // Which CLI this console session runs, for `pane_bind_session` to stamp on the pane. (M93)
+    if let Some(console) = console {
+        registry.note_harness(id, console.harness.harness());
+    }
+
+    // After the insert, for `claude_tab::open_with_prompt`'s reason: the typed line waits on this
+    // session's hook state, which is keyed by the id the registry now knows.
+    if is_claude
+        && let Some(seed) = seed
+        && let (Some(bytes), Some(pty)) = (crate::agent_rpc::submit(&seed), registry.get(id))
+    {
+        crate::agents::type_submitted_line(&app, id, &pty, bytes);
+    }
 
     // This pane is now the real harness on that conversation (M42): the agent registry refuses
     // to start a second harness process on it while this child lives — a respawn, or a Resume
@@ -1846,10 +2153,28 @@ pub fn session_list(registry: State<'_, SessionRegistry>) -> Vec<SessionId> {
 /// client.ts` is untouched.
 #[tauri::command(rename_all = "camelCase")]
 pub fn session_resumable(app: tauri::AppHandle, cwd: String, session: SessionId) -> bool {
-    let resume_enabled = app
+    // A codex console (M93) answers by the thread its hooks named, found by id under
+    // `$CODEX_HOME/sessions`; `session` is cide's routing id and names no codex conversation.
+    let (resume_enabled, codex) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
-        .map(|state| state.with(|ws| ws.settings.claude.cli.inject.resume.enabled))
-        .unwrap_or(true);
+        .map(|state| {
+            state.with(|ws| {
+                let codex = (cide_core::workspace::harness_holding(ws, session)
+                    == Some(cide_ipc::Harness::Codex))
+                .then(|| {
+                    (
+                        cide_core::workspace::codex_thread_of(ws, session),
+                        ws.settings.codex.cli.inject.resume,
+                    )
+                });
+                (ws.settings.claude.cli.inject.resume.enabled, codex)
+            })
+        })
+        .unwrap_or((true, None));
+    if let Some((thread, enabled)) = codex {
+        return thread
+            .is_some_and(|thread| cide_core::codex_cli::resumable(&thread.to_string(), enabled));
+    }
     crate::lifecycle::resumable(std::path::Path::new(&cwd), session, resume_enabled)
 }
 
@@ -2077,9 +2402,10 @@ mod tests {
             console.starts_with("You are the product owner"),
             "{console}"
         );
-        assert!(pane.starts_with("This is a Claude pane"), "{pane}");
+        // "console", not "Claude" (M93): the same paragraph reaches a codex console.
+        assert!(pane.starts_with("This is a console pane"), "{pane}");
         assert!(!pane.contains("You are the product owner"), "{pane}");
-        assert!(pane.contains("primary Claude pane"), "{pane}");
+        assert!(pane.contains("primary console pane"), "{pane}");
 
         let tail = |text: &str| {
             text["...".len()..]
@@ -2105,6 +2431,147 @@ mod tests {
     /// which is the job — and a system prompt meanwhile describing them as a bystander who
     /// *could* orchestrate left the model arguing with itself about whether it was allowed to.
     /// Reported as "the opened console still thinks it isn't an orchestrator, but it is".
+    fn codex_console(thread: Option<SessionId>, fork: bool) -> CodexConsole {
+        CodexConsole {
+            user_args: vec!["--search".into()],
+            cwd: "/repo".into(),
+            inject: cide_core::codex_cli::Injected::from(&cide_ipc::CodexInjections::default()),
+            thread,
+            fork,
+            paragraph: Some("roster".into()),
+            hook: Some("/opt/cide/cide-hook".into()),
+            session: SessionId::new(),
+            agent_sock: Some("/run/cide-agents.sock".into()),
+            prompt: None,
+        }
+    }
+
+    /// (M93) A fresh codex console: the user's arguments first, then cide's — the directory, the
+    /// quiet start, the roster as developer instructions, the hooks with their trust bypass and
+    /// the task tools with this pane's session — and no positional at all.
+    #[test]
+    fn a_fresh_codex_console_carries_hooks_tools_and_the_roster() {
+        let c = codex_console(None, false);
+        let args = codex_console_argv(&c);
+        assert_eq!(args[0], "--search", "the user's arguments come first");
+        assert!(args.windows(2).any(|w| w == ["-C", "/repo"]));
+        assert!(
+            args.iter()
+                .any(|a| a == "check_for_update_on_startup=false")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == r#"developer_instructions="roster""#)
+        );
+        assert!(args.iter().any(|a| a.starts_with("hooks.SessionStart=")));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("hooks.PermissionRequest="))
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == cide_core::codex_cli::BYPASS_HOOK_TRUST)
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == &format!(r#"mcp_servers.cide.env.CIDE_SESSION="{}""#, c.session))
+        );
+        assert!(!args.iter().any(|a| a == "resume" || a == "fork"));
+        assert!(
+            !args.iter().any(|a| a == "-s" || a == "-a"),
+            "a person's console: their config decides"
+        );
+    }
+
+    /// (M93) A resume puts the subcommand first and the thread last; a fork likewise; a fork with
+    /// its switch off starts fresh rather than putting two TUIs on one thread.
+    #[test]
+    fn a_codex_resume_or_fork_names_the_thread_last() {
+        let thread = SessionId::new();
+        let resume = codex_console_argv(&codex_console(Some(thread), false));
+        assert_eq!(resume[0], "resume");
+        assert_eq!(resume.last(), Some(&thread.to_string()));
+        assert!(resume.iter().any(|a| a == "--include-non-interactive"));
+
+        let fork = codex_console_argv(&codex_console(Some(thread), true));
+        assert_eq!(fork[0], "fork");
+        assert_eq!(fork.last(), Some(&thread.to_string()));
+
+        let mut off = codex_console(Some(thread), true);
+        off.inject.fork = false;
+        let fresh = codex_console_argv(&off);
+        assert!(
+            !fresh
+                .iter()
+                .any(|a| a == "fork" || a == "resume" || *a == thread.to_string())
+        );
+
+        let mut prompted = codex_console(None, false);
+        prompted.prompt = Some("Review task t-3.".into());
+        let args = codex_console_argv(&prompted);
+        assert_eq!(args.last().map(String::as_str), Some("Review task t-3."));
+    }
+
+    /// (M93) Which CLI a console spawn runs: the setting for a fresh one, the owning pane's for a
+    /// resume, whatever the setting says now.
+    #[test]
+    fn a_fresh_console_follows_the_setting_and_a_resume_follows_its_pane() {
+        let mut ws = cide_ipc::Workspace::default();
+        let project = cide_core::workspace::open_project(
+            &mut ws,
+            vec![std::path::PathBuf::from("/repo")],
+            None,
+        )
+        .expect("opens");
+        let tab = ws.projects[&project].tabs[0].id;
+        let pane = ws.projects[&project].tabs[0].tree.focused;
+        let session = SessionId::new();
+        cide_core::workspace::bind_session(
+            &mut ws,
+            project,
+            tab,
+            pane,
+            session,
+            Some(cide_ipc::Harness::Claude),
+        )
+        .expect("binds");
+
+        ws.settings.console_harness = cide_ipc::ConsoleHarness::Codex;
+        let claude = cide_ipc::ConsoleHarness::Claude;
+        assert_eq!(
+            ConsoleSpawn::decide(&ws, claude, &None, None).harness,
+            cide_ipc::ConsoleHarness::Codex,
+            "a fresh console is whatever Settings → Harness says"
+        );
+        assert_eq!(
+            ConsoleSpawn::decide(&ws, claude, &None, Some(session)).harness,
+            cide_ipc::ConsoleHarness::Claude,
+            "a claude conversation is resumed by claude, whatever the setting says now"
+        );
+
+        // The pane moves to codex, and its hooks name a thread.
+        let codex_session = SessionId::new();
+        cide_core::workspace::bind_session(
+            &mut ws,
+            project,
+            tab,
+            pane,
+            codex_session,
+            Some(cide_ipc::Harness::Codex),
+        )
+        .expect("binds");
+        let thread = SessionId::new();
+        cide_core::workspace::note_conversation(&mut ws, codex_session, thread, 1);
+        ws.settings.console_harness = cide_ipc::ConsoleHarness::Claude;
+        let resumed = ConsoleSpawn::decide(&ws, claude, &None, Some(codex_session));
+        assert_eq!(resumed.harness, cide_ipc::ConsoleHarness::Codex);
+        assert_eq!(
+            resumed.thread,
+            Some(thread),
+            "codex resumes the thread, not cide's id"
+        );
+    }
+
     #[test]
     fn a_tab_cide_opened_is_told_it_is_acting_as_the_product_owner() {
         let developer = role("developer", "Implements one task end to end.");

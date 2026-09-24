@@ -23,6 +23,7 @@ import type { ReactNode } from 'react'
 import type { Tab, TabKind } from '@/ipc/client'
 import { WindowLights } from '@/chrome/AppHeader'
 import { currentUserAgent, windowControlLayout } from '@/chrome/windowControls'
+import { consoleName } from '@/chrome/consoleName'
 import styles from './DetachedPaneWindow.module.css'
 
 const CONTROLS = windowControlLayout(currentUserAgent())
@@ -35,10 +36,10 @@ const CONTROLS = windowControlLayout(currentUserAgent())
  * which need the strip's stylesheet. Exhaustive on purpose: a `TabKind` variant added later
  * fails to compile here rather than falling back to a blank header.
  */
-function tabTitle(kind: TabKind): string {
+function tabTitle(kind: TabKind, console: string): string {
   switch (kind.kind) {
     case 'claudeHome':
-      return 'Claude'
+      return console
     case 'claudeFull':
       return kind.title
     case 'file':
@@ -72,7 +73,7 @@ export interface DetachedTabHeaderProps {
 }
 
 export function DetachedTabHeader({ tab, onRedock }: DetachedTabHeaderProps): ReactNode {
-  const title = tab === null ? 'cide' : tabTitle(tab.kind)
+  const title = tab === null ? 'cide' : tabTitle(tab.kind, consoleName(tab))
   return (
     <div className={styles.header} data-audit="detachedHeader">
       {CONTROLS.side === 'left' ? <WindowLights /> : null}

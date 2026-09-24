@@ -65,6 +65,7 @@ import { overflowEntries, tabMenuEntries } from './menuModel'
 import { clippedTabs, overflowHint } from './tabOverflow'
 import { useTabDrag } from './useTabDrag'
 import { Icon } from '@/icons/Icon'
+import { consoleName, type ConsoleName } from './consoleName'
 
 import styles from './TabStrip.module.css'
 
@@ -449,7 +450,7 @@ interface TabItemProps {
 }
 
 function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }: TabItemProps) {
-  const view = viewFor(tab.kind)
+  const view = viewFor(tab.kind, consoleName(tab))
   const shell = active ? `${styles.tab} ${styles.tabActive}` : styles.tab
   const label = view.closable ? styles.label : `${styles.label} ${styles.labelPinned}`
 
@@ -561,7 +562,7 @@ interface TabView {
   audit: string | undefined
 }
 
-function viewFor(kind: TabKind): TabView {
+function viewFor(kind: TabKind, console: ConsoleName): TabView {
   switch (kind.kind) {
     case 'claudeHome':
       return {
@@ -569,12 +570,12 @@ function viewFor(kind: TabKind): TabView {
         body: (
           <>
             <span className={styles.swatch} data-audit="consoleSwatch" />
-            <span>Claude</span>
+            <span>{console}</span>
           </>
         ),
         closable: false,
         dirty: false,
-        hint: 'Claude console (pinned)',
+        hint: `${console} console (pinned)`,
         audit: 'consoleTab',
       }
 

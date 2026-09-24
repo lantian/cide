@@ -57,6 +57,14 @@ export interface ExplorerProps {
    */
   onSelectOpened?: (() => void) | undefined
   /**
+   * *Expand all* / *Collapse all* — the two fold buttons beside ⌖. (M96)
+   *
+   * Routed through `file.expandAll` / `file.collapseAll` by the host, for [`onSelectOpened`]'s
+   * reason, and not drawn without it for the same one.
+   */
+  onExpandAll?: (() => void) | undefined
+  onCollapseAll?: (() => void) | undefined
+  /**
    * A **pinned** row was opened — today that is *Project Notes*, and the argument is its id.
    *
    * An id rather than a path, because a pin has no path: the row carries a `cide://group/…`
@@ -93,6 +101,8 @@ function ExplorerImpl({
   onOpenFileToSide,
   openedFile = null,
   onSelectOpened,
+  onExpandAll,
+  onCollapseAll,
   onOpenPin,
   onShowHistory,
 }: ExplorerProps) {
@@ -284,6 +294,30 @@ function ExplorerImpl({
             onClick={onSelectOpened}
           >
             <Icon name="crosshair" size={1} />
+          </button>
+        )}
+        {onExpandAll !== undefined && (
+          <button
+            type="button"
+            className={styles.headerAction}
+            data-audit="explorerExpandAll"
+            title="Expand all folders"
+            aria-label="Expand all folders"
+            onClick={onExpandAll}
+          >
+            <Icon name="chevrons-up-down" size={1} />
+          </button>
+        )}
+        {onCollapseAll !== undefined && (
+          <button
+            type="button"
+            className={styles.headerAction}
+            data-audit="explorerCollapseAll"
+            title="Collapse all folders"
+            aria-label="Collapse all folders"
+            onClick={onCollapseAll}
+          >
+            <Icon name="chevrons-down-up" size={1} />
           </button>
         )}
       </div>

@@ -89,31 +89,22 @@
   border-color: var(--accent);
 }
 
-.button {
-  flex: none;
-  height: calc(26px * var(--ui-scale));
-  padding: 0 12px;
-  border: 1px solid var(--accent);
-  border-radius: var(--r-2);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-}
-
-.button:hover:not(:disabled) {
-  filter: brightness(1.08);
-}
-
 /*
  * Disabled is the *normal* state of this button — the field opens prefilled and valid, but every
  * keystroke that leaves it unparseable greys it — so it has to read as "not yet" rather than as
- * "broken". Dimmed and non-interactive, keeping the accent hue.
+ * "broken". The shared primary class does exactly that: faded and non-interactive, keeping the
+ * gradient, which is why this rule no longer carries a `:disabled` of its own.
  */
-.button:disabled {
-  opacity: 0.4;
-  cursor: default;
+.button {
+  composes: primary from '../styles/buttons.module.css';
+  flex: none;
+  height: calc(26px * var(--ui-scale));
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--r-2);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
 }
 
 /*

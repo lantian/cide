@@ -67,9 +67,11 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
             // A Qwen Code TUI is `claude`'s shape without cide's hooks: a program in a
             // terminal, so a Shell-kind pane like opencode's. (M43)
             cide_ipc::Harness::Qwen => (PaneKind::Shell, "qwen"),
-            // A codex conversation re-opened is `codex resume <id>`: opencode's shape, a
-            // program in a terminal. (M44)
-            cide_ipc::Harness::Codex => (PaneKind::Shell, "codex"),
+            // A codex conversation re-opened is a codex **console** since M93: the TUI with
+            // cide's hooks and task tools, exactly as a claude conversation re-opened is a
+            // Claude pane. Until then it was `codex resume <id>` in a Shell pane — opencode's
+            // shape, because a codex TUI could carry no hooks.
+            cide_ipc::Harness::Codex => (PaneKind::Claude, "codex"),
             // MiMo Code is an opencode fork, and its TUI is re-opened the same way. (M81)
             cide_ipc::Harness::Mimo => (PaneKind::Shell, "mimo"),
         },
@@ -128,6 +130,9 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
             SplitIntent::Continue { conversation } => Some(conversation.clone()),
             _ => None,
         },
+        // Stamped when a spawn binds, from what it actually ran — see `Pane::harness`. A mirror
+        // is bound to its source's session and learns nothing new by being a mirror.
+        harness: None,
         docker: match intent {
             SplitIntent::Docker {
                 container,
@@ -448,8 +453,11 @@ pub fn pane_bind_session(
     pane: PaneId,
     session: SessionId,
 ) -> Result<Mutated, CoreError> {
+    // Which CLI the spawn ran, when it was a console's (M93): the registry heard it from
+    // `spawn_session`, and this is the first moment the pane is known to stamp it on.
+    let harness = registry.harness_of(session);
     let out = state
-        .update(|ws| workspace::bind_session(ws, project, tab, pane, session))
+        .update(|ws| workspace::bind_session(ws, project, tab, pane, session, harness))
         .map(|()| Mutated { rev: state.rev() })?;
 
     // This is the only point at which a pid and a pane are both known, which is what the IDE
@@ -572,6 +580,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "cide : claude".into(),
             docker: None,
         };

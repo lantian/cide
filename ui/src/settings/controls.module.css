@@ -249,6 +249,17 @@
   margin: 0 0 6px;
 }
 
+/* A heading over one CLI's half of a section that covers two — Settings → Harness (M93). One
+   step above `.groupTitle`, because what it heads is several groups. */
+.part {
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
+  margin: 36px 0 14px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
 /* A block of prose or a warning inside a section. */
 .note {
   border: 1px solid var(--border);

@@ -223,6 +223,27 @@ pub async fn agents_config_set(
     Ok(config)
 }
 
+/// Switch subagents on for the project at `root`, before any project is open over it. (M97)
+///
+/// The enabling half of [`agents_config_set`], for the New project wizard: the same
+/// read-modify-write through `config::write` and **the same worktree refusal**, so a directory the
+/// wizard was told not to `git init` is refused here with the sentence the panel would have shown,
+/// rather than enabled into the shared-tree clobbering that refusal exists to prevent. No emit:
+/// nothing has a roster of this project yet, and the open that follows reads the file fresh.
+/// Blocking; callers run it on the blocking pool.
+pub(crate) fn enable_at(root: &Path) -> Result<()> {
+    let mut file: CideConfig = config::load(root);
+    file.agents.apply(OrchestrationPatch {
+        enabled: Some(true),
+        ..Default::default()
+    });
+    if let Some(why) = worktree_refusal(root, &file) {
+        return Err(CoreError::Io(why));
+    }
+    config::write(root, &file)?;
+    Ok(())
+}
+
 // ==========================================================================================
 // Editing them, which until now meant editing markdown by hand.
 // ==========================================================================================

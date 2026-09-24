@@ -121,6 +121,17 @@
      width alone would leave a 0px flex item still taking a gap on each side. */
   --awaiting-w: calc(18px * var(--ui-scale));
   --awaiting-slot: calc(var(--sp-4) + var(--awaiting-w));
+  /* And the running chip's, an independent pair rather than a second reader of the two above.
+     The chips light for unrelated reasons and collapse separately — a project with an agent
+     working and nothing waiting must not draw an 18px hole where the amber chip is not.
+
+     Wider than the amber chip because it holds a turning mark as well as a number: 12px of
+     `--icon-0` plus a 2px gap, both of which are **unscaled** because `--icon-0` is (an SVG
+     does not grow with a type scale, per its declaration in `tokens.css`), plus 20px of scaled
+     room for the text. At scale 1 that is 34px against a `9+` advance of 13.2px and a 1px rule
+     on each side, so 4.8px of slack — `check:running` holds it above 3. */
+  --running-w: calc(20px * var(--ui-scale) + 14px);
+  --running-slot: calc(var(--sp-4) + var(--running-w));
   display: flex;
   align-items: center;
   gap: var(--sp-4);
@@ -140,6 +151,12 @@
 .tab[data-awaiting='false'] {
   --awaiting-w: 0px;
   --awaiting-slot: 0px;
+}
+
+/* Same rule, its own pair. Nothing running, no box and no gap. */
+.tab[data-running='false'] {
+  --running-w: 0px;
+  --running-slot: 0px;
 }
 
 .tab:hover {
@@ -179,8 +196,8 @@
   gap: 9px;
   height: 100%;
   margin-left: -14px;
-  margin-right: calc(-1 * (var(--awaiting-slot) + var(--sp-4)));
-  padding: 0 calc(var(--awaiting-slot) + var(--sp-4)) 0 14px;
+  margin-right: calc(-1 * (var(--awaiting-slot) + var(--running-slot) + var(--sp-4)));
+  padding: 0 calc(var(--awaiting-slot) + var(--running-slot) + var(--sp-4)) 0 14px;
   background: transparent;
   border: 0;
   color: inherit;
@@ -304,6 +321,100 @@
   background: var(--yellow);
   color: var(--panel);
   font-weight: 600;
+}
+
+/*
+ * "This much is working in this project" — the count of agent runs and console panes, with a
+ * turning mark in front of it.
+ *
+ * # Why it is a mark *and* a number, where the chip beside it is a number alone
+ *
+ * Because the two answer different kinds of question. *Waiting* is a state: it is true until
+ * somebody deals with it, and a number is the whole of what there is to say. *Working* is a
+ * process, and a user glancing at a header tab for a background project is asking whether
+ * anything is happening in there at all — which a static `2` cannot distinguish from a `2` that
+ * has been stuck since a crash. The turning mark says "now"; the number says how much, and that
+ * it is coming down as runs finish, which is the progress signal a dot could never carry.
+ *
+ * `loader-circle` is deliberately the same glyph `AgentsPanel` turns for a run in `running`
+ * (its `SPINNING_GLYPH`), so a user who learns the mark in the panel reads it in the header.
+ *
+ * # The geometry
+ *
+ * Same height, same radius, same mono tabular figures as `.awaiting`, under its own custom
+ * properties — the two chips are one shape language and two independent collapses. It is wider
+ * because of the mark: see `--running-w` on `.tab` for the arithmetic and the slack.
+ *
+ * `overflow: hidden` and a fixed width rather than `min-width`, for `.awaiting`'s reason: a
+ * chip that grew would move every tab after it sideways, under the pointer. `pointer-events:
+ * none` keeps the tab one box the pointer can hit anywhere — `.tabOpen` reaches over both
+ * slots, and this box paints on top of that padding.
+ */
+.running {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  width: var(--running-w);
+  /* Zero while lit; `-1 * --sp-4` while empty, cancelling the container gap the empty box
+     would otherwise keep. Derived from the slot rather than written as literals so the
+     collapse cannot zero the box and leave its gap. `.awaiting` says the same. */
+  margin-left: calc(var(--running-slot) - var(--running-w) - var(--sp-4));
+  height: calc(16px * var(--ui-scale));
+  overflow: hidden;
+  border-radius: var(--r-full);
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+  line-height: calc(16px * var(--ui-scale));
+  text-align: center;
+  letter-spacing: 0;
+}
+
+/*
+ * Outlined and dim, **not** filled — and this is the one decision on the chip that is about the
+ * chip beside it rather than about itself.
+ *
+ * Amber-filled means *come back here*: it is the mark whose entire job is to be noticed on a
+ * project the user is not in. Working is the ordinary state of a project somebody is using, so
+ * a second filled chip would be lit on most tabs most of the time, and a 34px bar carrying a
+ * permanent block of colour is a bar where the mark that is meant to be noticed has to compete
+ * with the one that is always there. Outlined reads as *state*; fill stays meaning *act*.
+ *
+ * A `border` and not an inset `box-shadow`, because `tokens.css` sets `box-sizing: border-box`
+ * globally — so the rule costs the box no width and the collapse arithmetic above is unchanged.
+ */
+.runningOn {
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-weight: 500;
+}
+
+/*
+ * The mark, turning. `AgentsPanel.module.css`'s `.glyphSpin` verbatim, including the reduced-
+ * motion answer: an infinite animation at a zeroed `--dur-1` strobes, which is the opposite of
+ * what the setting asks for, so loops **pause** through `--motion-loop` instead. The 0% frame
+ * is the arc at rest, which is a legible static "working" mark and is exactly what this draws
+ * for a user who has asked for less motion.
+ *
+ * It only exists while the chip is lit — the element is not rendered otherwise — so a header
+ * over quiet projects animates nothing at all rather than turning inside a 0px box.
+ */
+.runningSpin {
+  animation: header-running-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes header-running-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .path {

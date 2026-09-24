@@ -407,7 +407,7 @@ pub async fn project_open_recent(
 /// A `RecvError` means the closure was dropped without answering — the main loop is gone, i.e. the
 /// app is on its way out. Reported rather than swallowed, because "the project did not open" with
 /// no message is precisely the failure this file keeps finding.
-async fn open_project_on_main_thread(
+pub(crate) async fn open_project_on_main_thread(
     app: tauri::AppHandle,
     roots: Vec<PathBuf>,
     name: Option<String>,
@@ -1169,6 +1169,7 @@ pub fn tab_new_claude(
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: format!("{name} : claude"),
                 docker: None,
             },
@@ -1636,6 +1637,25 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
     }
 }
 
+/// What is running in each project, as this process currently computes it. (M94)
+///
+/// `cide://project-running` is a *change* notification, so a window that opened between two
+/// changes has heard nothing — and unlike the awaiting set there is nothing it could derive for
+/// itself, because every fact behind the number lives in a registry a webview cannot reach.
+/// A window built by a detach is exactly such a window.
+///
+/// Computed fresh rather than read back off the last broadcast, which is safe because Rust owns
+/// every input; `crate::running::last` holds what was *sent*, which is a different question. The
+/// `at` on the answer is what protects the caller from a broadcast that overtook this reply —
+/// see `ProjectRunningSet`.
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_running_counts(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+) -> cide_ipc::ProjectRunningSet {
+    crate::running::compute(&app, &state.snapshot())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,6 +1683,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "p : claude".into(),
             docker: None,
         };
@@ -1735,6 +1756,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "p : bash".into(),
             docker: None,
         };
@@ -1792,9 +1814,11 @@ mod tests {
         for (at, _) in src.match_indices("async fn ") {
             // `pub async fn` matches at the same place through its own `async fn`; only take
             // the ones that begin a line (possibly after `pub `), so a mention inside a comment
-            // — of which this module has several — is not read as a definition.
+            // — of which this module has several — is not read as a definition. `pub(crate) `
+            // since M97, when `cmd::new_project` became the second caller of the bridge: a
+            // prefix this list does not know makes the bridge invisible and the count below 0.
             let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            if !matches!(&src[line_start..at], "" | "pub ") {
+            if !matches!(&src[line_start..at], "" | "pub " | "pub(crate) ") {
                 continue;
             }
             let rest = &src[at + "async fn ".len()..];
@@ -1941,6 +1965,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "f".into(),
                 docker: None,
             },
@@ -2009,6 +2034,7 @@ mod tests {
                     conversation: None,
                     conversation_since: None,
                     continues: None,
+                    harness: None,
                     title: "f".into(),
                     docker: None,
                 },
@@ -2183,6 +2209,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "lib.rs".into(),
                 docker: None,
             }),
@@ -2207,6 +2234,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "lib.rs".into(),
                 docker: None,
             },
@@ -2248,6 +2276,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "a.rs".into(),
                 docker: None,
             }),

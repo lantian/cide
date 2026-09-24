@@ -20,6 +20,7 @@
 pub mod check;
 pub mod child_env;
 pub mod claude_cli;
+pub mod codex_cli;
 pub mod commands;
 pub mod diagnostics;
 pub mod document;

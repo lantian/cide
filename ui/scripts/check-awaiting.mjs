@@ -791,10 +791,12 @@ try {
   //     being watched simply never notifies again, and a Claude pane that starts being
   //     watched gets a second, contradictory opinion about its own state on every tool call.
   const spawn = rust('crates/cide-app/src/cmd/session.rs')
-  if (!/if !is_claude \{\s*\n\s*spec = spec\.watch_jobs\(/.test(spawn)) {
+  // `is_console` since M93: a codex console reports through hooks exactly as a claude one does,
+  //     so neither may be watched — the gate is "any console", not "claude".
+  if (!/if !is_console \{\s*\n\s*spec = spec\.watch_jobs\(/.test(spawn)) {
     console.error(
       'FAIL a shell pane watches its foreground process group, and a Claude pane does not\n' +
-        '  cmd/session.rs no longer gates `watch_jobs` on `!is_claude` — either a finished ' +
+        '  cmd/session.rs no longer gates `watch_jobs` on `!is_console` — either a finished ' +
         '`make` notifies nobody, or the pgid watcher is fighting the hooks for one SessionState',
     )
     failed++

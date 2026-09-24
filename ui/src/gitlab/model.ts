@@ -185,3 +185,50 @@ export function fileDiscussions(
   }
   return { resolved, unresolved }
 }
+
+/**
+ * The repository an MR belongs to, from its `web_url`: `host` and the project path before
+ * `/-/merge_requests/`. `null` for anything else — the caller then falls back to the global
+ * instructions rather than guessing a repository from half a URL.
+ */
+export function repositoryOfMr(
+  webUrl: string | undefined,
+): { host: string; path: string } | null {
+  if (!webUrl) return null
+  const match = /^[a-z]+:\/\/([^/]+)\/(.+?)\/-\/merge_requests\b/i.exec(webUrl)
+  return match ? { host: match[1]!, path: match[2]! } : null
+}
+
+/**
+ * What "Review with an agent"'s instructions box starts with. A repository entry names the MR's
+ * repository as `group/repo`, `host/group/repo`, or — for a GitLab served under a subpath, whose
+ * project path carries that subpath — any whole-segment tail of it with a `/` in it; the first
+ * entry with a non-blank prompt wins, then the global prompt. A blank entry falls through rather
+ * than meaning "no instructions here": the settings screen has no way to show the difference.
+ * The entries are already normalised by `cide_gitlab::normalise_review_prompts` when saved; the
+ * lower-casing here is because GitLab paths are case-insensitive and users type them freely.
+ */
+export function defaultReviewPrompt(
+  preferences: {
+    reviewPrompt: string
+    reviewPrompts: readonly { repository: string; prompt: string }[]
+  },
+  webUrl: string | undefined,
+): string {
+  const repo = repositoryOfMr(webUrl)
+  if (repo) {
+    const path = repo.path.toLowerCase()
+    const full = `${repo.host.toLowerCase()}/${path}`
+    for (const entry of preferences.reviewPrompts) {
+      const key = entry.repository.trim().replace(/^\/+|\/+$/g, '').toLowerCase()
+      if (!key || !entry.prompt.trim()) continue
+      if (
+        key === path ||
+        key === full ||
+        (key.includes('/') && `/${path}`.endsWith(`/${key}`))
+      )
+        return entry.prompt
+    }
+  }
+  return preferences.reviewPrompt.trim() ? preferences.reviewPrompt : ''
+}

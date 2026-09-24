@@ -440,24 +440,29 @@
   border-color: color-mix(in srgb, var(--yellow) 32%, transparent);
   background: color-mix(in srgb, var(--yellow) 7%, var(--panel));
 }
+/* The shared primary look, composed on the bare class because `composes` only works there. */
+.approvalAction {
+  composes: primary from '../styles/buttons.module.css';
+}
+/* `font: inherit` resets the weight, and it sits at the shared class's specificity, so the
+   weight is restated rather than left to which stylesheet the bundle emits last. */
 .reviewPanel .approvalAction {
   display: inline-flex;
   justify-content: center;
   align-items: center;
   gap: 5px;
   font: inherit;
-  font-weight: 500;
-  color: var(--on-accent);
-  background: var(--accent);
-  border-color: var(--accent);
+  font-weight: 600;
 }
-.reviewPanel .approvalAction:hover:not(:disabled) {
-  background: var(--accent-hi);
-}
-.reviewPanel .approvalAction[data-approved='true'] {
+/* Already approved: the button now withdraws, which is not the primary act, so it drops the
+   fill. The hover selector is listed because the shared hover rule is (0,4,0) and would
+   otherwise paint the gradient back under the pointer. */
+.reviewPanel .approvalAction[data-approved='true'],
+.reviewPanel .approvalAction[data-approved='true']:hover:not(:disabled) {
   color: var(--dim);
   border-color: var(--border);
   background: var(--panel);
+  box-shadow: none;
 }
 .reviewActions {
   display: grid;

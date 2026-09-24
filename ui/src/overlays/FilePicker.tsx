@@ -255,7 +255,7 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
           <Hint keys="↑↓">navigate</Hint>
           <Hint keys="⏎">open</Hint>
           <Hint keys="⇧⏎">open in split</Hint>
-          <Hint keys="⌥⏎">send path to Claude</Hint>
+          <Hint keys="⌥⏎">send path to Harness</Hint>
           {/* One element that documents the chord *and* is the mouse target, which is what
               stops this being either an undiscoverable keystroke or a button whose keyboard
               equivalent nobody knows. It sits in the footer rather than beside the counter

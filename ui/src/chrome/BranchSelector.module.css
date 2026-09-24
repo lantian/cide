@@ -219,13 +219,11 @@
   border-color: var(--border-soft);
 }
 
-/* The default action of whichever panel is open. `--grad-accent-ink` is the gradient whose
-   stops both clear AA against `--on-accent`; `--grad-accent` is decorative and would put a
-   2.4:1 label on the orange end. */
+/* The default action of whichever panel is open, in the app's one primary look. This rule was
+   where `--grad-accent-ink` was first chosen over the decorative `--grad-accent`, for the 2.4:1
+   label the latter puts on its orange end; `styles/buttons.module.css` carries that forward. */
 .primary {
-  background: var(--grad-accent-ink);
-  border-color: transparent;
-  color: var(--on-accent);
+  composes: primary from '../styles/buttons.module.css';
 }
 
 /* Deleting an unmerged branch — the one action here that can lose commits. */

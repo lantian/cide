@@ -18,6 +18,7 @@ import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
 
 import { decorateCheckLog } from './checkLogModel'
+import { useEscapeClose } from './escapeClose'
 import styles from './MilestonesPanel.module.css'
 import panelStyles from './TasksPanel.module.css'
 
@@ -117,9 +118,10 @@ export function CheckLogModal({
   running: boolean
   onClose: () => void
 }) {
+  const escape = useEscapeClose(onClose)
   return (
     <OverlayCard label={target.title} onDismiss={onClose}>
-      <div className={`${styles.modal} ${styles.wide}`} data-audit="checkLogModal">
+      <div className={`${styles.modal} ${styles.wide}`} data-audit="checkLogModal" {...escape}>
         <h2 className={styles.modalTitle}>
           {target.title}
           {running ? ' · running' : ''}

@@ -439,6 +439,21 @@ pub trait Harness: Send + Sync + 'static {
     ///   the only observation carrying ground truth about the child.
     fn observe(&self, current: RunState, ob: Observation<'_>) -> Option<RunState>;
 
+    /// The harness's own conversation id, when this hook frame is the one that names it. (M93)
+    ///
+    /// For a harness that is bound by the caller ([`SessionBinding::Caller`]: cide mints the
+    /// routing id and hands it over as `CIDE_SESSION`) but whose *conversation* is still minted
+    /// by the CLI — codex, whose TUI cannot be given an id and announces its thread in the
+    /// `SessionStart` payload. The app records the answer as the run's harness session, which
+    /// is what `codex resume <thread>` takes, exactly as it records a stdout-bound harness's
+    /// captured id.
+    ///
+    /// Defaulted to `None`, and honestly so: claude's conversation *is* its routing id, and a
+    /// stdout-bound harness has no hooks.
+    fn capture_hook(&self, _frame: &cide_claude::HookFrame) -> Option<String> {
+        None
+    }
+
     /// The model ids this harness can offer the role form, in the order it names them.
     ///
     /// A **suggestion** set and never a closed one. `AgentDraft::model` is passed through and
@@ -663,6 +678,10 @@ pub struct RunPlan<'a> {
     /// `CLAUDE_CODE_*` switches. A subagent is a Claude child and gets the same treatment a pane
     /// does, for the same reason `terminal_child_env` is shared rather than copied.
     pub claude: cide_ipc::ClaudeSettings,
+    /// Settings → Harness → Codex: which `codex` runs, and with what. (M93) Read by the codex
+    /// harness only, as [`Self::claude`] is read by the claude one — so a wrapper configured
+    /// for the console is the codex every run of a `harness: codex` role runs too.
+    pub codex: cide_ipc::CodexSettings,
     /// The provider configuration this child is given, resolved by the caller for
     /// [`Self::claude`]'s reason — nothing in this crate reads a workspace. Emitted into
     /// `OPENCODE_CONFIG_CONTENT`; inert for every other harness. (M45)
@@ -1173,6 +1192,7 @@ mod tests {
                     env,
                     geometry: Geometry::default(),
                     claude: cide_ipc::ClaudeSettings::default(),
+                    codex: cide_ipc::CodexSettings::default(),
                     llm: cide_ipc::LlmSettings::default(),
                     choice: None,
                     harness: kind,
@@ -1560,6 +1580,7 @@ mod tests {
                 env: Vec::new(),
                 geometry: Geometry::default(),
                 claude: cide_ipc::ClaudeSettings::default(),
+                codex: cide_ipc::CodexSettings::default(),
                 llm: cide_ipc::LlmSettings::default(),
                 choice: None,
                 harness: agent.def.harness,

@@ -608,22 +608,15 @@
 /* --- save, and the state of the form --- */
 
 .save {
+  composes: primary from '../styles/buttons.module.css';
   height: calc(26px * var(--ui-scale));
   padding: 0 14px;
-  border: 1px solid var(--accent);
+  border: 1px solid transparent;
   border-radius: var(--r-2);
-  background: var(--accent);
-  color: var(--on-accent);
   font: inherit;
   font-size: var(--fs-ui-12);
+  font-weight: 600;
   cursor: pointer;
-}
-
-.save:disabled {
-  background: transparent;
-  border-color: var(--border);
-  color: var(--faint);
-  cursor: default;
 }
 
 .quiet {

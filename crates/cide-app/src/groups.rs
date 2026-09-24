@@ -160,6 +160,10 @@ impl ProjectGroups {
         self.rows.write().collapse(path)
     }
 
+    pub fn collapse_all(&self) {
+        self.rows.write().collapse_all()
+    }
+
     pub fn reveal(&self, path: &Path) -> Option<usize> {
         self.rows.write().reveal(path)
     }

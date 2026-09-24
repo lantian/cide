@@ -185,7 +185,7 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
  * answers it badly. The split is positional rather than semantic: everything up to the first
  * token cide adds is the user's, which is exactly the ordering guarantee the argv is built on.
  */
-function Argv({ parts }: { parts: { text: string; ours: boolean }[] }) {
+export function Argv({ parts }: { parts: { text: string; ours: boolean }[] }) {
   return (
     <pre className={styles.argv}>
       {parts.map((part, i) => (
@@ -546,7 +546,7 @@ function PairList({
  * `role="note"` rather than `alert`: the row is already marked visually and by its input's
  * class, and the user is reading a settings screen rather than being interrupted by it.
  */
-function Why({ text }: { text: string | null }) {
+export function Why({ text }: { text: string | null }) {
   if (text === null) return null
   return (
     <p className={styles.why} role="note">
@@ -555,7 +555,7 @@ function Why({ text }: { text: string | null }) {
   )
 }
 
-function Add({ label, onClick }: { label: string; onClick: () => void }) {
+export function Add({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <button type="button" className={styles.add} onClick={onClick}>
       + {label}
@@ -563,7 +563,7 @@ function Add({ label, onClick }: { label: string; onClick: () => void }) {
   )
 }
 
-function Remove({ label, onClick }: { label: string; onClick: () => void }) {
+export function Remove({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <button type="button" className={styles.remove} aria-label={label} onClick={onClick}>
       <Icon name="x" size={1} />
@@ -578,7 +578,7 @@ function Remove({ label, onClick }: { label: string; onClick: () => void }) {
  * their commit rules — this one has no draft state because a program name is short enough that
  * Escape-to-abandon buys nothing, where a half-typed proxy password is worth protecting.
  */
-function TextField({
+export function TextField({
   label,
   hint,
   value,

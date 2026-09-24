@@ -1240,6 +1240,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: format!("{name} : claude"),
             docker: None,
         };
@@ -1258,6 +1259,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: format!("{name} : bash"),
                 docker: None,
             };
@@ -1285,6 +1287,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "settings".into(),
             docker: None,
         };
@@ -1955,6 +1958,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "main.rs — diff".into(),
             docker: None,
         };
@@ -2028,6 +2032,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "shop : shop-db-1".into(),
             docker: Some(cide_ipc::workspace::DockerPane {
                 container: "c".repeat(64),
@@ -2375,6 +2380,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "cide : claude".into(),
             docker: None,
         };
@@ -2462,6 +2468,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "main.rs".into(),
             docker: None,
         };

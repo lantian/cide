@@ -115,12 +115,7 @@
 }
 
 .primary {
-  border-color: var(--accent-dim);
-  color: var(--accent);
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  composes: primary from '../styles/buttons.module.css';
 }
 
 .primary:hover:not(:disabled),

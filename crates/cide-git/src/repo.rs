@@ -68,6 +68,29 @@ pub fn discover_root(path: &Path) -> Option<PathBuf> {
     repo.workdir().map(canonical)
 }
 
+/// Make `path` a repository of its own, as `git init` would, and answer its work tree. (M97)
+///
+/// Through libgit2 rather than a `git` child: the New project wizard runs this on a directory it
+/// has just created, and a child would need the whole `child_env` treatment (bundle scrub, parent
+/// death signal, a thread that outlives it) for a call that forks nothing interesting. libgit2
+/// reads `init.defaultBranch` from the user's config, so the branch is the one a `git init` in a
+/// terminal would have named.
+///
+/// A directory that already *is* a work tree is answered as it is and not re-initialised —
+/// `Repository::init` on one is harmless in git's own semantics, but it is also a write into a
+/// `.git/` the user did not ask cide to touch. A directory merely *inside* someone else's work
+/// tree is initialised: that is the case the wizard asks for, a new project that is its own repo.
+pub fn init(path: &Path) -> Result<PathBuf> {
+    if path.join(".git").exists() {
+        return Ok(canonical(path));
+    }
+    let repo = Repository::init(path).wrap()?;
+    Ok(repo
+        .workdir()
+        .map(canonical)
+        .unwrap_or_else(|| canonical(path)))
+}
+
 /// The repository at each root, opening nothing and descending into no submodule.
 ///
 /// Split out of [`discover`] because it is the entire answer on the hot path, and the half that

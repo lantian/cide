@@ -107,6 +107,16 @@
   width: 100%;
   box-sizing: border-box;
 }
+.reviewPromptRow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border, #8884);
+}
+.reviewPromptRow input {
+  flex: 1;
+}
 .review {
   display: flex;
   flex-direction: column;
@@ -605,9 +615,10 @@
   gap: 8px;
   margin-top: 8px;
 }
-.openDialog .primary {
-  background: var(--accent);
-  color: var(--panel);
+/* The dialogs' acting button, in the app's one primary look. It beats `.openDialog button`
+   (0,1,1) on specificity; see `styles/buttons.module.css`. */
+.primary {
+  composes: primary from '../styles/buttons.module.css';
 }
 .infoModal {
   height: min(78vh, 850px);
@@ -841,4 +852,38 @@
 }
 .launch textarea {
   min-height: 90px;
+}
+/*
+ * Expand all / Collapse all above the MR tree. (M96)
+ *
+ * Sticky, because the strip lives inside `.sidebarTree`'s scroller: a reviewer deep in a long
+ * tree is the one who wants to fold it, and a strip that scrolled away with the first rows
+ * would be out of reach exactly then.
+ */
+.treeActions {
+  position: sticky;
+  top: -5px;
+  z-index: 1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+  margin-top: -5px;
+  padding: 2px 6px;
+  background: var(--panel);
+}
+.treeAction {
+  width: 22px;
+  height: 22px;
+  padding: 3px;
+  border: 0;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--dim);
+}
+.treeAction:hover {
+  background: var(--panel-2);
+  color: var(--text);
 }

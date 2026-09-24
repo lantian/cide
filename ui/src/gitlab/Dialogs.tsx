@@ -13,7 +13,7 @@ import { gitlab } from '@/ipc/client'
 import type { GitLabReviewHarness, Harness } from '@/ipc/generated'
 import { Drafts } from './Drafts'
 import { HARNESS_LABEL, startAgentReview } from './agentReview'
-import { message } from './model'
+import { defaultReviewPrompt, message } from './model'
 import { Markdown } from './Markdown'
 import { UserLink, Users } from './UserLink'
 import { Discussions } from './Discussions'
@@ -274,13 +274,24 @@ export function ReviewInfoDialog() {
  * GitLab MR otherwise reads as something that posts.
  */
 export function LaunchReviewDialog() {
-  const { launch } = useGitLab()
+  const { launch, board } = useGitLab()
   const d = launch ? data.get(launch) : undefined
   const [harnesses, setHarnesses] = useState<GitLabReviewHarness[] | null>(
     null,
   )
   const [harness, setHarness] = useState<Harness | ''>('')
-  const [prompt, setPrompt] = useState('')
+  /*
+   * Pre-filled from Settings → Git → Agent review instructions: the MR's repository's entry, else
+   * the global one. Re-applied while the user has not typed, because the dialog can mount before
+   * the board's preferences (or a new launch's MR) arrive — and never after, so a late refresh
+   * cannot overwrite what the user wrote.
+   */
+  const fallback = defaultReviewPrompt(board.preferences, d?.mr.web_url)
+  const [prompt, setPrompt] = useState(fallback)
+  const [touched, setTouched] = useState(false)
+  useEffect(() => {
+    if (!touched) setPrompt(fallback)
+  }, [touched, fallback])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   useEffect(() => {
@@ -355,7 +366,10 @@ export function LaunchReviewDialog() {
           className={styles.comment}
           placeholder="What to focus on — e.g. concurrency in the new cache, or the migration's rollback."
           value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
+          onChange={(e) => {
+            setTouched(true)
+            setPrompt(e.target.value)
+          }}
         />
         {error && (
           <div role="alert" className={styles.error}>

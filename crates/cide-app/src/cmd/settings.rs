@@ -260,6 +260,8 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         terminal,
         graphics,
         claude,
+        console_harness,
+        codex,
         proxy,
         sidebar,
         explorer,
@@ -312,6 +314,14 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     }
     if let Some(v) = claude {
         settings.claude = v;
+    }
+    // Stored and nothing more: the setting is read when a console spawns fresh, so no open
+    // pane is touched by a switch. See `Settings::console_harness`.
+    if let Some(v) = console_harness {
+        settings.console_harness = v;
+    }
+    if let Some(v) = codex {
+        settings.codex = v;
     }
     // Stored verbatim, credentials and all: a proxy that needs a password cannot be used
     // without one, and cide has no keyring yet. What is guarded is where the value can go
@@ -420,6 +430,7 @@ pub fn tab_open_settings(
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "settings".into(),
                 docker: None,
             },
@@ -793,7 +804,36 @@ pub async fn claude_headless(
     request: HeadlessRequest,
 ) -> Result<HeadlessResult, HeadlessError> {
     let cwd = project_root(&state, project)?;
+    // The lane follows Settings → Harness (M93): a user who chose codex for their console gets a
+    // codex one-shot, and does not need claude installed for a commit message.
+    let (harness, codex) =
+        state.with(|ws| (ws.settings.console_harness, ws.settings.codex.cli.clone()));
+    if harness == cide_ipc::ConsoleHarness::Codex {
+        return run_headless_codex(cwd, request, claude_proxy(&state), codex).await;
+    }
     run_headless(cwd, request, claude_proxy(&state), claude_cli(&state)).await
+}
+
+/// [`run_headless`] on codex: the configured binary and environment, cide's own argv. (M93)
+///
+/// The proxy is `ProxyScope::claude`'s, which the Settings screen labels as the console's scope
+/// — a one-shot is a console's CLI asked one thing, whichever CLI that is.
+async fn run_headless_codex(
+    cwd: PathBuf,
+    request: HeadlessRequest,
+    proxy: cide_core::proxy::ProxyEnv,
+    cli: cide_ipc::CodexCli,
+) -> Result<HeadlessResult, HeadlessError> {
+    let plan = cide_core::codex_cli::plan_here(&cli);
+    let program = PathBuf::from(cli.binary.trim());
+    let run = cide_claude::Headless::new(request, cwd)
+        .proxy(proxy)
+        .env(plan.env);
+    tauri::async_runtime::spawn_blocking(move || cide_claude::headless::run_codex(&program, &run))
+        .await
+        .map_err(|e| HeadlessError::NotInstalled {
+            detail: format!("the headless worker did not finish: {e}"),
+        })?
 }
 
 /// The proxy environment a `claude` one-shot is spawned with.
@@ -1160,6 +1200,125 @@ pub struct ClaudeCliSupport {
     /// elsewhere on the screen, where it means something else and has a different sentence.
     /// Empty in the common case: a rename that survived says nothing.
     pub inject_reasons: Vec<CliReason>,
+}
+
+/// One row of the user's codex launch configuration, and what became of it. (M93)
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCliNote {
+    /// The row's index in the stored list.
+    pub index: usize,
+    /// Refused rows never reach the child; a warned one does, with a sentence.
+    pub refused: bool,
+    pub reason: Option<String>,
+}
+
+/// One token of the command line a codex console is spawned with.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArgvPart {
+    pub text: String,
+    /// Added by cide rather than typed by the user.
+    pub ours: bool,
+}
+
+/// Settings → Harness → Codex's whole readout, computed where the rules live. (M93)
+///
+/// Unlike [`ClaudeCliSupport`], this carries the verdict on **every row** and the resolved argv
+/// itself, rather than sentences for a TypeScript port of the rules to look up. The claude
+/// screen had a port first and a gate that proves it agrees with `claude_cli.rs`
+/// (`check-claude-cli.mjs`); codex's screen has no second copy to drift, at the cost of a
+/// round trip per committed edit — which the field pays anyway, since it commits on blur.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCliSupport {
+    /// The configured binary this verdict is about, echoed back.
+    pub binary: String,
+    pub resolved: Option<String>,
+    /// Why it cannot be run, or `None`.
+    pub problem: Option<String>,
+    /// What `--version` printed, verbatim, or `None`.
+    pub version: Option<String>,
+    pub arg_notes: Vec<CodexCliNote>,
+    pub env_notes: Vec<CodexCliNote>,
+    /// A fresh codex console's argv, program first, with placeholders for what only a spawn
+    /// knows (the project directory, the pane's session, cide's socket).
+    pub argv: Vec<ArgvPart>,
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn codex_cli_support(app: AppHandle) -> CodexCliSupport {
+    let cli = app
+        .try_state::<WorkspaceState>()
+        .map(|state| state.with(|ws| ws.settings.codex.cli.clone()))
+        .unwrap_or_default();
+    let fallback = cli.clone();
+    tauri::async_runtime::spawn_blocking(move || codex_support(&cli, true))
+        .await
+        .unwrap_or_else(|_| codex_support(&fallback, false))
+}
+
+/// The readout, probing the binary only when `probe` — the fallback path must not fork.
+fn codex_support(cli: &cide_ipc::CodexCli, probe: bool) -> CodexCliSupport {
+    let plan = cide_core::codex_cli::plan_here(cli);
+    let resolved = cide_core::codex_cli::resolve(&cli.binary);
+    let version = match (&resolved, probe) {
+        (Ok(path), true) => cide_claude::version::probe(path),
+        _ => None,
+    };
+    let notes = |judged: &[cide_core::claude_cli::Judged]| {
+        judged
+            .iter()
+            .map(|j| CodexCliNote {
+                index: j.index,
+                refused: j.verdict.is_refused(),
+                reason: j.verdict.note().map(str::to_string),
+            })
+            .collect()
+    };
+    let user = plan.args.len();
+    let tokens = crate::cmd::session::codex_console_argv(&crate::cmd::session::CodexConsole {
+        user_args: plan.args.clone(),
+        cwd: "<project>".into(),
+        inject: plan.inject,
+        thread: None,
+        fork: false,
+        paragraph: Some("<roster paragraph>".into()),
+        hook: Some("<cide-hook>".into()),
+        session: cide_ipc::SessionId::new(),
+        agent_sock: Some("<agent socket>".into()),
+        prompt: None,
+    });
+    let mut argv = vec![ArgvPart {
+        text: match cli.binary.trim() {
+            "" => "codex".to_string(),
+            b => b.to_string(),
+        },
+        ours: false,
+    }];
+    argv.extend(tokens.into_iter().enumerate().map(|(i, text)| ArgvPart {
+        // The session id is minted per spawn; say so rather than print a uuid nobody will see.
+        text: if text.starts_with("mcp_servers.cide.env.CIDE_SESSION=") {
+            "mcp_servers.cide.env.CIDE_SESSION=\"<pane session>\"".to_string()
+        } else {
+            text
+        },
+        ours: i >= user,
+    }));
+    CodexCliSupport {
+        binary: cli.binary.clone(),
+        resolved: resolved
+            .as_ref()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        problem: resolved
+            .err()
+            .map(|problem| cide_core::codex_cli::message(&problem)),
+        version,
+        arg_notes: notes(&plan.arg_notes),
+        env_notes: notes(&plan.env_notes),
+        argv,
+    }
 }
 
 /// Whether the configured CLI can be run, and whether this build's IDE protocol was ever

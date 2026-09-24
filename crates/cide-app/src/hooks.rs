@@ -46,6 +46,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use cide_claude::{HookEvent, HookFrame};
 use cide_ipc::{SessionId, SessionState};
@@ -62,6 +63,35 @@ pub struct HookServer {
     /// id. Deduped here rather than against `workspace.json` because every frame of a busy
     /// turn repeats it, and each write there bumps `rev` and schedules a disk write.
     conversations: Arc<DashMap<SessionId, SessionId>>,
+}
+
+/// How long a `Busy` session must have sent nothing before [`sweep`] asks the CLI about it.
+///
+/// Long enough that no ordinary turn trips it on hooks alone — a turn that is actually running
+/// sends a frame per tool call — and the CLI's own `busy` covers the turns that go quiet for
+/// minutes on one long tool or one long think. Short enough that a stuck reviewer is released
+/// within a spinner poll or two rather than never.
+const STALE_BUSY: Duration = Duration::from_secs(60);
+
+/// How often [`sweep`] looks. Coarse, like the spinner's own poll: what it repairs has been
+/// wrong for a minute already, and each pass that finds a candidate reads a directory.
+const SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// What the one applier thread is handed.
+///
+/// The sweeper's verdict travels down the **same** channel as real frames rather than being
+/// applied from the sweeper's thread, because the module header's ordering argument applies to
+/// it exactly: a synthesised `Stop` computed from a `Busy` that a real `UserPromptSubmit` has
+/// just replaced would end a turn that has only begun.
+enum Inbound {
+    Frame(HookFrame),
+    /// "This session looked stuck at `seen`, and the CLI says it is idle." Re-checked on the
+    /// applier thread against `seen` before anything is done, for the race above.
+    Stale {
+        session: SessionId,
+        conversation: SessionId,
+        seen: Instant,
+    },
 }
 
 impl HookServer {
@@ -91,23 +121,93 @@ impl HookServer {
         let apply_states = Arc::clone(&states);
         let conversations: Arc<DashMap<SessionId, SessionId>> = Arc::new(DashMap::new());
         let apply_conversations = Arc::clone(&conversations);
+        // When each session's last frame was applied. Written by the applier only, read by the
+        // sweeper — which is why it is an `Instant` per session and not a guess from state.
+        let last_frame: Arc<DashMap<SessionId, Instant>> = Arc::new(DashMap::new());
+        let apply_last = Arc::clone(&last_frame);
 
         // The serialising channel. Unbounded, and deliberately: a hook process is blocked on
         // its own `write` until this side reads the line, so back-pressure here would be
         // back-pressure on `claude` itself — a slow `emit` would stall the CLI mid-turn.
         // Frames are two small strings and a `Value`, and they arrive at the rate a human
         // prompts, not at the rate a terminal prints.
-        let (frames, inbox) = std::sync::mpsc::channel::<HookFrame>();
+        let (frames, inbox) = std::sync::mpsc::channel::<Inbound>();
 
         thread::Builder::new()
             .name("cide-hook-apply".into())
             .spawn(move || {
                 // Ends when every sender has gone, which is when the accept loop below has
                 // ended and no connection thread is left holding a clone.
-                for frame in inbox {
-                    apply(&frame, &app, &apply_states, &apply_conversations);
+                for inbound in inbox {
+                    match inbound {
+                        Inbound::Frame(frame) => {
+                            if let Some(session) =
+                                frame.owner().and_then(|raw| raw.parse::<SessionId>().ok())
+                            {
+                                apply_last.insert(session, Instant::now());
+                            }
+                            apply(&frame, &app, &apply_states, &apply_conversations);
+                        }
+                        Inbound::Stale {
+                            session,
+                            conversation,
+                            seen,
+                        } => {
+                            // Still `Busy`, and nothing has arrived since the sweeper looked:
+                            // only then is the CLI's `idle` still the latest word.
+                            let still_stuck = apply_states
+                                .get(&session)
+                                .is_some_and(|s| *s == SessionState::Busy)
+                                && apply_last.get(&session).is_some_and(|t| *t == seen);
+                            if !still_stuck {
+                                continue;
+                            }
+                            tracing::info!(
+                                %session,
+                                cli = %conversation,
+                                silent_secs = seen.elapsed().as_secs(),
+                                "hook: busy with no frames and the CLI says idle; ending the turn"
+                            );
+                            let mut stop = HookFrame::new(
+                                "Stop",
+                                serde_json::json!({ "session_id": conversation.to_string() }),
+                            );
+                            stop.spawned_as = Some(session.to_string());
+                            apply(&stop, &app, &apply_states, &apply_conversations);
+                        }
+                    }
                 }
             })?;
+
+        {
+            let states = Arc::clone(&states);
+            let conversations = Arc::clone(&conversations);
+            let frames = frames.clone();
+            // A failure costs the repair, not the hook server: everything worked this way
+            // before the sweeper existed.
+            if let Err(error) =
+                thread::Builder::new()
+                    .name("cide-hook-sweep".into())
+                    .spawn(move || {
+                        loop {
+                            thread::sleep(SWEEP_EVERY);
+                            for stale in sweep(
+                                &states,
+                                &last_frame,
+                                &conversations,
+                                Instant::now(),
+                                cide_claude::session_statuses,
+                            ) {
+                                if frames.send(stale).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    })
+            {
+                tracing::warn!(%error, "no hook sweeper; a session stuck busy stays busy");
+            }
+        }
 
         thread::Builder::new()
             .name("cide-hook-accept".into())
@@ -205,7 +305,7 @@ fn socket_path() -> PathBuf {
 ///
 /// Parsing stays here, on the connection's own thread, so a malformed or enormous payload
 /// costs that hook and nothing else. Only the decision is serialised.
-fn handle(stream: UnixStream, frames: &std::sync::mpsc::Sender<HookFrame>) {
+fn handle(stream: UnixStream, frames: &std::sync::mpsc::Sender<Inbound>) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { return };
@@ -218,11 +318,72 @@ fn handle(stream: UnixStream, frames: &std::sync::mpsc::Sender<HookFrame>) {
             // A send that fails means the applier thread has gone, which only happens on the
             // way out. Nothing to report and nowhere left to report it.
             Ok(frame) => {
-                let _ = frames.send(frame);
+                let _ = frames.send(Inbound::Frame(frame));
             }
             Err(error) => tracing::debug!(%error, "unparseable hook frame"),
         }
     }
+}
+
+/// Sessions stuck `Busy` that the CLI itself says are idle.
+///
+/// # The failure
+///
+/// `Busy` is left only by a `Stop` (or a permission prompt, or the child exiting). A frame that
+/// lands *after* a turn's `Stop` — tool traffic from something the CLI does once the turn is
+/// over — moves the session back to `Busy` (`next_state` reads tool traffic as liveness on
+/// purpose), and no `Stop` follows it. From then on cide believes the conversation is mid-turn
+/// for as long as it lives. On selfcraft that was the t-263 review tab: a stray frame at
+/// 11:10:23, three seconds after its `Stop`, and then `note_to_reviewer` held the task's
+/// re-review for ever ("the task's reviewer is mid-turn; holding") and the spinner counted a
+/// busy pane and never woke the project. Nothing logged named the frame; the state-change line
+/// now carries `event` so the next one does.
+///
+/// # The repair, and why it is a second opinion
+///
+/// A `Busy` session silent for [`STALE_BUSY`] is asked about through the CLI's own
+/// `~/.claude/sessions/<pid>.json` (`cide_claude::session_statuses`). That file is not a
+/// documented interface, so it can only ever *release* a session hooks already left stale — it
+/// never makes one busy, and an absent or unfamiliar answer does nothing. Only `idle` counts.
+/// The release is a synthesised `Stop` through [`apply`], so everything a real one drives —
+/// the webview, the run registry, a held nudge — follows without a second code path.
+///
+/// Pure over its inputs, `statuses` included, so every rule is a test. `statuses` is called at
+/// most once per pass and only when there is a candidate: the common pass reads no directory.
+fn sweep(
+    states: &DashMap<SessionId, SessionState>,
+    last_frame: &DashMap<SessionId, Instant>,
+    conversations: &DashMap<SessionId, SessionId>,
+    now: Instant,
+    statuses: impl FnOnce() -> std::collections::HashMap<String, String>,
+) -> Vec<Inbound> {
+    let candidates: Vec<(SessionId, Instant)> = states
+        .iter()
+        .filter(|e| *e.value() == SessionState::Busy)
+        .filter_map(|e| {
+            let seen = *last_frame.get(e.key())?;
+            (now.saturating_duration_since(seen) >= STALE_BUSY).then_some((*e.key(), seen))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let statuses = statuses();
+    candidates
+        .into_iter()
+        .filter_map(|(session, seen)| {
+            // The CLI files itself under the conversation it is on, which is the pane's own id
+            // until a `/clear` or a resume moves it.
+            let conversation = conversations.get(&session).map(|c| *c).unwrap_or(session);
+            (statuses.get(&conversation.to_string()).map(String::as_str) == Some("idle")).then(
+                || Inbound::Stale {
+                    session,
+                    conversation,
+                    seen,
+                },
+            )
+        })
+        .collect()
 }
 
 /// What one frame means for the frontend.
@@ -414,9 +575,14 @@ fn decide(
         // `cli` is logged separately from `session` because the two diverging is the failure
         // this whole path was rebuilt around: when they differ, the CLI has moved to another
         // conversation (a resume, or `/clear`) and only `session` addresses a pane.
+        //
+        // `event` is which frame caused it. Without it, a session that went `Busy` three
+        // seconds after its `Stop` and stayed there (selfcraft's t-263 reviewer, 2026-09-24)
+        // left a log that said *that* it changed and nothing about *why* — see [`sweep`].
         tracing::info!(
             session = raw,
             cli = frame.session_id().unwrap_or("-"),
+            event = %frame.event,
             ?next,
             "hook: session state changed"
         );
@@ -834,7 +1000,7 @@ mod tests {
         use std::io::Write;
 
         let (mut writer, reader) = UnixStream::pair().expect("a socket pair");
-        let (frames, inbox) = std::sync::mpsc::channel::<HookFrame>();
+        let (frames, inbox) = std::sync::mpsc::channel::<Inbound>();
         let session = SessionId::new().to_string();
 
         for line in [
@@ -851,11 +1017,104 @@ mod tests {
         handle(reader, &frames);
         drop(frames);
 
-        let seen: Vec<String> = inbox.into_iter().map(|f| f.event).collect();
+        let seen: Vec<String> = inbox
+            .into_iter()
+            .map(|inbound| match inbound {
+                Inbound::Frame(f) => f.event,
+                Inbound::Stale { .. } => panic!("a connection only ever carries frames"),
+            })
+            .collect();
         assert_eq!(
             seen,
             vec!["UserPromptSubmit", "PostToolUse", "Stop"],
             "order is the whole point, and the bad line must cost exactly itself"
+        );
+    }
+
+    /// Who [`sweep`] releases: only a `Busy` session silent for [`STALE_BUSY`] whose CLI says
+    /// `idle`, looked up under the conversation the CLI is actually on.
+    ///
+    /// Each rejected row is a way the repair could end a real turn: a session that sent a frame
+    /// recently is working; one whose CLI says `busy` is on a long tool or a long think; one with
+    /// no CLI record at all gives no opinion, and no opinion must never release anything.
+    #[test]
+    fn the_sweep_releases_only_a_silent_busy_session_the_cli_calls_idle() {
+        let now = Instant::now();
+        let long_ago = now - STALE_BUSY - Duration::from_secs(1);
+        let states = DashMap::new();
+        let last = DashMap::new();
+        let conversations = DashMap::new();
+
+        let stuck = SessionId::new();
+        let working = SessionId::new();
+        let long_tool = SessionId::new();
+        let unknown = SessionId::new();
+        let idle = SessionId::new();
+        let moved = SessionId::new();
+        let moved_to = SessionId::new();
+
+        for (session, state, seen) in [
+            (stuck, SessionState::Busy, long_ago),
+            (working, SessionState::Busy, now),
+            (long_tool, SessionState::Busy, long_ago),
+            (unknown, SessionState::Busy, long_ago),
+            (idle, SessionState::AwaitingInput, long_ago),
+            (moved, SessionState::Busy, long_ago),
+        ] {
+            states.insert(session, state);
+            last.insert(session, seen);
+        }
+        conversations.insert(moved, moved_to);
+
+        let cli = std::collections::HashMap::from([
+            (stuck.to_string(), "idle".to_string()),
+            (working.to_string(), "idle".to_string()),
+            (long_tool.to_string(), "busy".to_string()),
+            (idle.to_string(), "idle".to_string()),
+            // Filed under the conversation, not the pane: a `/clear` moved it.
+            (moved_to.to_string(), "idle".to_string()),
+            (moved.to_string(), "busy".to_string()),
+        ]);
+
+        let mut released: Vec<(SessionId, SessionId)> =
+            sweep(&states, &last, &conversations, now, || cli)
+                .into_iter()
+                .map(|inbound| match inbound {
+                    Inbound::Stale {
+                        session,
+                        conversation,
+                        seen,
+                    } => {
+                        assert_eq!(seen, long_ago, "the instant the applier re-checks");
+                        (session, conversation)
+                    }
+                    Inbound::Frame(_) => panic!("the sweep never makes frames"),
+                })
+                .collect();
+        released.sort_by_key(|(s, _)| s.to_string());
+        let mut want = vec![(stuck, stuck), (moved, moved_to)];
+        want.sort_by_key(|(s, _)| s.to_string());
+        assert_eq!(released, want);
+    }
+
+    /// A pass with nothing stuck reads no directory. The sweeper runs every thirty seconds for
+    /// the life of the app, and almost every pass is this one.
+    #[test]
+    fn a_sweep_with_no_candidate_does_not_ask_the_cli() {
+        let states = DashMap::new();
+        let last = DashMap::new();
+        let session = SessionId::new();
+        states.insert(session, SessionState::Busy);
+        last.insert(session, Instant::now());
+        let asked = std::cell::Cell::new(false);
+        let out = sweep(&states, &last, &DashMap::new(), Instant::now(), || {
+            asked.set(true);
+            std::collections::HashMap::new()
+        });
+        assert!(out.is_empty());
+        assert!(
+            !asked.get(),
+            "no candidate, so no read of ~/.claude/sessions"
         );
     }
 }

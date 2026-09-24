@@ -217,6 +217,11 @@ export function NumberField({ value, min, max, step, onChange, label }: NumberFi
 }
 
 /** A titled block of rows. */
+/** A heading over one part of a section that covers several subjects. (M93) */
+export function Part({ title }: { title: string }) {
+  return <h2 className={styles.part}>{title}</h2>
+}
+
 export function Group({ title, children }: { title?: string | undefined; children: ReactNode }) {
   return (
     <section className={styles.group}>

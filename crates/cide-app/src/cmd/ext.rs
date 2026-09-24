@@ -342,6 +342,7 @@ pub async fn tab_open_extension(
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "extension".into(),
                 docker: None,
             },

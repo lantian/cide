@@ -99,6 +99,7 @@ pub(crate) fn open_file_tab(
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title,
                 docker: None,
             },
@@ -662,6 +663,7 @@ pub(super) fn diff_pane(title: String) -> Pane {
         conversation: None,
         conversation_since: None,
         continues: None,
+        harness: None,
         title,
         docker: None,
     }
@@ -1075,6 +1077,7 @@ fn revision_pane(title: String) -> Pane {
         conversation: None,
         conversation_since: None,
         continues: None,
+        harness: None,
         title,
         docker: None,
     }
@@ -1977,6 +1980,76 @@ impl serde::Serialize for ClaudeSendError {
     }
 }
 
+/// The `@`-mention for a codex console, typed rather than sent. (M93) `None` when `pane` is not
+/// a codex console, which leaves the IDE road to answer.
+fn mention_into_codex(
+    app: &tauri::AppHandle,
+    state: &WorkspaceState,
+    project: cide_ipc::ProjectId,
+    pane: cide_ipc::PaneId,
+    path: &str,
+    line_start: Option<u32>,
+    line_end: Option<u32>,
+) -> Option<std::result::Result<ClaudeSendTarget, ClaudeSendError>> {
+    let (session, root, title) = state.with(|ws| {
+        let project_ref = cide_core::workspace::project(ws, project).ok()?;
+        let target = project_ref
+            .tabs
+            .iter()
+            .flat_map(|t| t.tree.panes.values())
+            .chain(project_ref.detached.values())
+            .find(|p| p.id == pane)?;
+        (target.kind == cide_ipc::PaneKind::Claude
+            && cide_core::workspace::pane_harness(target) == cide_ipc::Harness::Codex)
+            .then(|| {
+                (
+                    target.session,
+                    project_ref.roots.first().map(|r| r.path.clone()),
+                    target.title.clone(),
+                )
+            })
+    })?;
+    let pty = session.and_then(|session| {
+        app.try_state::<crate::state::SessionRegistry>()?
+            .get(session)
+            .filter(|pty| !pty.has_exited())
+    });
+    let Some(pty) = pty else {
+        // A codex pane with no live child: nothing can receive the mention, and "not connected"
+        // is the honest sentence the webview already has.
+        return Some(Err(ClaudeSendError::NotConnected { connections: 0 }));
+    };
+    pty.write(codex_mention(path, root.as_deref(), line_start, line_end));
+    Some(Ok(ClaudeSendTarget {
+        pane,
+        title,
+        fallback: false,
+    }))
+}
+
+/// `@path` — relative to the project root when the file is inside it, as codex's own file
+/// picker writes it — with the lines after it, as a bracketed paste and nothing more.
+fn codex_mention(
+    path: &str,
+    root: Option<&std::path::Path>,
+    line_start: Option<u32>,
+    line_end: Option<u32>,
+) -> Vec<u8> {
+    let shown = root
+        .and_then(|root| std::path::Path::new(path).strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let lines = match (line_start, line_end) {
+        (Some(a), Some(b)) if a != b => format!(" (lines {a}-{b})"),
+        (Some(a), _) => format!(" (line {a})"),
+        _ => String::new(),
+    };
+    let mut bytes = b"\x1b[200~".to_vec();
+    bytes.extend_from_slice(format!("@{shown}{lines} ").as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
 /// *Send lines to Claude* — the editor's gesture, reported when it cannot land.
 ///
 /// # What the gesture does, and why this shape
@@ -2072,6 +2145,16 @@ pub fn claude_send_lines(
 
     // The wire's 0-based numbering, applied once, to both notifications from the same source
     // values — so the range Claude highlights and the range it is told about cannot disagree.
+    // A codex console (M93) has no IDE connection to receive a mention over — codex speaks no
+    // `claude --ide` protocol — so the mention is **typed into its composer** as codex's own
+    // `@path` reference, as a paste and without an Enter: what the IDE road does for claude,
+    // which inserts and does not submit. Only for the pane the user aimed at; the fallback below
+    // chooses among IDE-connected panes, which a codex pane never is.
+    if let Some(sent) = mention_into_codex(&app, &state, project, pane, &path, line_start, line_end)
+    {
+        return sent;
+    }
+
     let start = line_start.map(|l| l.saturating_sub(1));
     let end = line_end.map(|l| l.saturating_sub(1));
 
@@ -2212,11 +2295,39 @@ pub fn claude_session_names(
     state: State<'_, WorkspaceState>,
 ) -> std::collections::HashMap<String, String> {
     let cutoffs = state.with(cide_core::workspace::claude_name_cutoffs);
-    cide_claude::roster::names()
+    let mut names: std::collections::HashMap<String, String> = cide_claude::roster::names()
         .into_iter()
         .filter(|(id, named)| cutoffs.get(id).is_none_or(|cutoff| named.since > *cutoff))
         .map(|(id, named)| (id, named.name))
-        .collect()
+        .collect();
+    // A codex console's name is its thread's (M93): codex titles a thread itself and `/rename`
+    // rewrites it, both into `$CODEX_HOME/session_index.jsonl`, keyed by the thread id — which is
+    // the conversation id the pane holds, so the webview's lookup finds it where it finds a
+    // claude name. Only the threads open in a pane are read out of the index.
+    let threads: Vec<String> = state.with(|ws| {
+        ws.projects
+            .values()
+            .flat_map(|p| {
+                p.tabs
+                    .iter()
+                    .flat_map(|t| t.tree.panes.values())
+                    .chain(p.detached.values())
+            })
+            .filter(|p| cide_core::workspace::pane_harness(p) == cide_ipc::Harness::Codex)
+            .filter_map(|p| p.conversation.map(|c| c.to_string()))
+            .collect()
+    });
+    if !threads.is_empty()
+        && let Some(home) = cide_core::codex_cli::codex_home()
+    {
+        let index = cide_core::codex_cli::thread_names(&home);
+        for thread in threads {
+            if let Some(name) = index.get(&thread) {
+                names.insert(thread, name.clone());
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]
@@ -3063,6 +3174,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: title.into(),
             docker: None,
         }
@@ -3077,6 +3189,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: title.into(),
             docker: None,
         }
@@ -3300,6 +3413,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "main.rs".into(),
                 docker: None,
             },

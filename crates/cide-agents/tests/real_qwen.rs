@@ -81,6 +81,7 @@ fn a_real_turn_ends_in_a_result_event_and_the_child_stays_interactive() {
         env: Vec::new(),
         geometry: Geometry::default(),
         claude: cide_ipc::ClaudeSettings::default(),
+        codex: cide_ipc::CodexSettings::default(),
         llm: cide_ipc::LlmSettings::default(),
         choice: None,
         harness: agent.def.harness,

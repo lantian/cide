@@ -154,6 +154,21 @@ Claude is hosted three ways at once (ADR 0005): a real PTY, the IDE-integration 
   `on_spawn_thread` is for, and why a language server is never spawned from a Tauri command
   worker. A new `Command::new`/`SpawnSpec` anywhere in the workspace needs both lines.
 
+**The console may be codex (M93).** Settings → Harness picks the CLI a *fresh* console runs.
+Each console pane records the CLI it actually runs (`Pane::harness`, stamped by
+`bind_session` from `SessionRegistry::note_harness`), and a resume or fork goes to that CLI
+whatever the setting says now (`cmd::session::ConsoleSpawn::decide`).
+
+Codex is hosted two of the three ways:
+- a real PTY;
+- hooks, handed over as `-c hooks.*` overrides with `--dangerously-bypass-hook-trust`, which
+  send the same frames through the same `cide-hook` into the same state machine.
+
+It has no IDE MCP client, so `openDiff`, diagnostics and the selection stream are claude-only.
+Its thread id is never cide's `SessionId`: it arrives by hook into `Pane::conversation`.
+`cide_core::codex_cli` holds the launch rules; codex agent runs use the same TUI hosting
+(`harness/codex.rs`).
+
 A `SessionId` *is* the value passed to `claude --session-id`, which is what makes resume free.
 Shutdown is a ladder — SIGHUP, SIGTERM, SIGKILL — so a `claude` finishes writing the transcript
 that resume depends on; signals arrive through a self-pipe because taking the workspace lock in

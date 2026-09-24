@@ -49,9 +49,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cide_agents::config::AgentsConfig;
-use cide_ipc::{ProjectId, RunState, SessionId, SessionState, TaskBoard, TaskStatus};
+use cide_ipc::{ProjectId, TaskRow, TaskStatus};
 use tauri::{AppHandle, Manager};
 
+use crate::running::{counts_for, rows_of};
 use crate::workspace_state::WorkspaceState;
 
 /// How often the dwell is re-examined.
@@ -75,9 +76,14 @@ const POLL: Duration = Duration::from_secs(30);
 pub(crate) struct Quiet {
     /// `AgentRegistry::dispatching`: is the queue open, or has somebody pressed Pause.
     pub dispatching: bool,
-    /// Runs that hold a child or are about to get one. See [`counts_as_busy`].
+    /// Runs that hold a child or are about to get one. See [`crate::running::run_is_busy`].
     pub live_runs: usize,
     /// Claude panes of this project whose session is mid-turn, blocked, or still starting.
+    /// See [`crate::running::pane_is_busy`].
+    ///
+    /// Both numbers come from [`crate::running::counts_for`], which is also what the header's
+    /// project-tab badge draws. One arithmetic on purpose: a timer and a badge that disagreed
+    /// about whether a project is working would each be evidence against the other.
     pub busy_panes: usize,
     /// Tasks whose status is not [`TaskStatus::Done`].
     pub open_tasks: usize,
@@ -130,72 +136,6 @@ pub(crate) fn should_spin(quiet: &Quiet, config: &AgentsConfig) -> bool {
         && quiet.quiet_for >= config.spin_after()
 }
 
-/// Whether a run means "this project is working".
-///
-/// Everything with a child or a claim on one: `Queued` has no child yet but has a place in the
-/// queue, `Paused` is frozen but holds its worktree, `Idle` is alive between turns. Only the
-/// three that are genuinely over — `Finished`, `Failed`, and `Interrupted`, whose child died
-/// with a previous cide — say nothing about now.
-///
-/// Wider than `RunState::counts_as_work`, and that is the point: that predicate answers *is this
-/// run accruing time*, which is a billing question. This one answers *is there anything in
-/// flight*, and an `Idle` run is not accruing time and very much is in flight.
-///
-/// # Except an idle run whose task is in review
-///
-/// A claude run hands its turn back, its task goes to `review`, and the child stays alive at
-/// its prompt so a send-back has somewhere to land — `AgentRegistry::retire_done` ends it only
-/// once the task is `done`. A review nobody finishes therefore left an `Idle` run alive for the
-/// rest of the session, and the project never looked quiet: one stuck task switched the
-/// *Quiet for* timer off without a word. Such a run has finished its work; waiting on it is
-/// waiting on a person, which is exactly the situation the wake exists for, and its prompt
-/// tells the planner to read what is sitting in review. `task_in_review` is read off the board
-/// at the tick.
-fn counts_as_busy(state: &RunState, task_in_review: bool) -> bool {
-    match state {
-        RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted => false,
-        RunState::Idle => !task_in_review,
-        _ => true,
-    }
-}
-
-/// Whether a Claude pane's session means somebody is working.
-///
-/// The inverse of `agent_rpc::may_be_typed_into`, widened by `Exited`: a pane whose child has
-/// gone is not work in progress, it is an empty pane. `Spawning` counts as busy, which also
-/// closes the window between [`tick`] opening a tab and the new child's first hook frame —
-/// `HookServer::state` answers `Spawning` for a session it has never seen, so the tab this
-/// function just created makes its own project busy immediately, and no second tab can follow
-/// it. `a_just_spun_project_is_busy_by_its_own_new_pane` is the test for that.
-///
-/// # Only a live child that is not a run's
-///
-/// That same `Spawning`-for-the-unknown answer is also what the hook server says about every
-/// session it will **never** hear from, and reading it as busy there kept a project busy for the
-/// rest of the process — the *Quiet for* timer simply never fired, with nothing logged. Two
-/// shapes of it were on a real board:
-///
-/// * **A pane whose child has exited.** `lifecycle::report_exit` calls `HookServer::forget`, so
-///   an exited session has no entry and reads as `Spawning`, not `Exited`. A Claude pane left
-///   open over a dead conversation made its project permanently busy.
-/// * **A run's session shown in a Claude pane.** terrastrike's third pane was an opencode run's
-///   mirror, and opencode sends no Claude hooks at all. Runs are already counted — with the right
-///   state machine — by `live_runs`, so a session the agent registry owns is left to that count
-///   rather than read a second time through hooks that do not describe it.
-///
-/// `alive` is asked of the `SessionRegistry` at the tick, never remembered, and `owned_by_run`
-/// of `AgentRegistry::owns_session`. The just-spun tab is still covered: `claude_tab` forks the
-/// child before the pane exists (session first, tab second), so it is alive and unowned, and
-/// reads `Spawning` until its first hook.
-fn pane_is_busy(alive: bool, owned_by_run: bool, state: SessionState) -> bool {
-    alive
-        && !owned_by_run
-        && !matches!(
-            state,
-            SessionState::Idle | SessionState::AwaitingInput | SessionState::Exited { .. }
-        )
-}
-
 /// When each project was last seen *not* quiet.
 ///
 /// A `std::sync::Mutex` and not `parking_lot`'s: this is touched once every [`POLL`] by one
@@ -231,7 +171,12 @@ fn tick(app: &AppHandle) {
     let Some(state) = app.try_state::<WorkspaceState>() else {
         return;
     };
-    let projects: Vec<ProjectId> = state.with(|ws| ws.projects.keys().copied().collect());
+    // One clone of the tree for the whole pass, rather than a `with` per project. `facts` reads
+    // three registries and this module's own rule is that no lock is held across another, so the
+    // workspace has to be let go of before any of them — and at a thirty-second poll a snapshot
+    // taken at the top of the tick is indistinguishable from one taken per project.
+    let ws = state.snapshot();
+    let projects: Vec<ProjectId> = ws.projects.keys().copied().collect();
     if projects.is_empty() {
         return;
     }
@@ -245,7 +190,7 @@ fn tick(app: &AppHandle) {
 
     let now = Instant::now();
     for project in projects {
-        let Some(quiet) = facts(app, &state, project, now) else {
+        let Some(quiet) = facts(app, &state, &ws, project, now) else {
             continue;
         };
         // Read fresh, per project, per tick. `.cide/config.json` is committed, so a `git
@@ -274,7 +219,7 @@ fn tick(app: &AppHandle) {
         let spawned = std::thread::Builder::new()
             .name("cide-spin".into())
             .spawn(move || {
-                if let Err(error) = wake(&app, project, &root, &config) {
+                if let Err(error) = wake(&app, project, &root, &config, Caller::Timer) {
                     tracing::info!(%project, %error, "the quiet project was not woken");
                 }
             });
@@ -284,13 +229,34 @@ fn tick(app: &AppHandle) {
     }
 }
 
+/// Who is asking [`wake`] to plan. The two differ in how much the milestone gate may say.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Caller {
+    /// The spinner's own timer. Runs a stale gate first, and stands down on a pass when the
+    /// milestone has nothing left open under it.
+    Timer,
+    /// The Tasks panel's **Plan tasks** button. Never runs the gate and never stands down on it:
+    /// see [`plan_now`].
+    Button,
+}
+
 /// Open the planning tab, having first asked the gate. (M83)
 ///
 /// With milestones, the planning turn is told where the active one stands — facts cide computed,
-/// in one line after the prompt — and a gate that has not run against what is checked out now is
-/// run first, so the plan is made from today's answer rather than yesterday's. A gate that passes
-/// here moves the milestone to review (`milestones::announce_met`) and nothing is planned: that
-/// was the question the planning turn would have been asking.
+/// in one line after the prompt. For the timer, a gate that has not run against what is checked
+/// out now is run first, so the plan is made from today's answer rather than yesterday's; a gate
+/// that passes there moves the milestone to review (`milestones::announce_met`), and **if nothing
+/// is left open under the milestone's goal** nothing is planned: that was the question the
+/// planning turn would have been asking.
+///
+/// A pass with open tasks under the goal is *not* "nothing to plan". Until this was split, any
+/// pass refused, and a milestone whose gate went green before its last tasks were closed — in
+/// selfcraft, `slice` with tasks still in todo, doing and review — could not be planned at all,
+/// not even from the button, which answered "waiting for you in review" while the board said
+/// otherwise. The gate is a check the plan is made *from*; the open tasks are what it is made of.
+///
+/// The button ([`Caller::Button`]) skips the gate entirely: it reads whatever verdict is already
+/// known, for the facts line only, and never refuses on it.
 ///
 /// `Ok(())` once the tab is open; `Err` with a sentence for why none was, which the timer logs and
 /// the Tasks panel's **Plan tasks** button shows ([`plan_now`]).
@@ -299,21 +265,40 @@ fn wake(
     project: ProjectId,
     root: &std::path::Path,
     config: &AgentsConfig,
+    caller: Caller,
 ) -> Result<(), String> {
     let plan = cide_agents::config::load_milestones(root);
     let mut prompt = config.spin_prompt().to_string();
     if let Some(current) = plan.current() {
+        let rows = app
+            .try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>()
+            .and_then(|stores| stores.get(project))
+            .map(|store| store.list())
+            .unwrap_or_default();
         let checks = app.try_state::<std::sync::Arc<crate::milestones::Checks>>();
-        let head = cide_core::check::head_of(root);
-        let stale = checks
-            .as_ref()
-            .is_none_or(|c| c.gate_is_stale(root, &current.id, head.as_deref()));
-        let gate = if stale {
-            crate::milestones::run_gate_now(app, project)
-        } else {
-            checks.as_ref().and_then(|c| c.last_gate(root, &current.id))
+        let known = || checks.as_ref().and_then(|c| c.last_gate(root, &current.id));
+        let gate = match caller {
+            // A verdict about an older commit is still the best thing to tell the planner, and
+            // the facts line says pass or fail rather than "at HEAD", so it is not a false claim.
+            Caller::Button => known(),
+            Caller::Timer => {
+                let head = cide_core::check::head_of(root);
+                let stale = checks
+                    .as_ref()
+                    .is_none_or(|c| c.gate_is_stale(root, &current.id, head.as_deref()));
+                if stale {
+                    crate::milestones::run_gate_now(app, project)
+                } else {
+                    known()
+                }
+            }
         };
-        if gate.as_ref().is_some_and(|g| g.passed) {
+        if caller == Caller::Timer
+            && gate_blocks_planning(
+                gate.as_ref().is_some_and(|g| g.passed),
+                open_under_goal(&rows, current),
+            )
+        {
             tracing::info!(%project, milestone = %current.id, "the gate passes; not planning past it");
             return Err(format!(
                 "Milestone {} already passes its gate and is waiting for you in review, so \
@@ -321,11 +306,6 @@ fn wake(
                 current.id
             ));
         }
-        let rows = app
-            .try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>()
-            .and_then(|stores| stores.get(project))
-            .map(|store| store.list())
-            .unwrap_or_default();
         if let Some(facts) = cide_agents::milestones::facts_line(&plan, &rows, gate.as_ref()) {
             // One line: this is typed into a terminal, where a newline is another Enter.
             let facts = facts.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -368,8 +348,11 @@ fn wake(
 /// consent all of those stand in for. `enabled` is kept, because the whole output of the tab is
 /// work put on roles, and a project with subagents off has none to put it on.
 ///
-/// **Blocking, and minutes long at worst**: a stale milestone gate is run before the plan is
-/// made. The caller is a command on the blocking pool; see `cmd::agents::agents_plan_now`.
+/// **The gate is not run and cannot refuse** (see [`Caller::Button`]). It used to be: a stale
+/// gate was run first, which held the button for minutes, and a pass refused the plan outright
+/// even with open tasks under the milestone. Pressing the button is the ask to plan now; whether
+/// the milestone is finished is the gate's question and the user's, not a reason to say no.
+/// Still called on the blocking pool (`cmd::agents::agents_plan_now`): opening a tab forks.
 ///
 /// Restarts the timer's dwell, or a project whose owner just planned by hand would be planned
 /// again by the timer a minute later.
@@ -387,85 +370,43 @@ pub(crate) fn plan_now(app: &AppHandle, project: ProjectId) -> Result<(), String
         );
     }
     mark_busy(project, Instant::now());
-    wake(app, project, &root, &config)
+    wake(app, project, &root, &config, Caller::Button)
 }
 
 /// Gather one project's facts, and update its dwell.
 ///
 /// `None` when the project has gone between the snapshot and here, which a close can do.
+///
+/// The two counts are **not computed here**: [`crate::running::counts_for`] owns them, because
+/// the header's project-tab badge draws the same two numbers and a badge that disagreed with
+/// this timer would make both untrustworthy. What stays here is everything the badge has no
+/// opinion about — the board's open work, the milestone gate, and the dwell itself.
 fn facts(
     app: &AppHandle,
     state: &WorkspaceState,
+    ws: &cide_ipc::Workspace,
     project: ProjectId,
     now: Instant,
 ) -> Option<Quiet> {
     let registry = app.try_state::<std::sync::Arc<crate::agents::AgentRegistry>>()?;
-    // `get`, never `ensure` — `note_death`'s rule. A project whose tracker has never been opened
-    // has no board on screen and nothing to plan from, and parsing the file on nobody's behalf
-    // would be disk work on every tick for every project for ever. Such a project reads as
-    // having no open work and is never spun, which is correct: cide has not been asked to look.
-    let board = app
-        .try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>()
-        .and_then(|stores| stores.get(project))
-        .map(|store| store.board());
-    let tasks: &[cide_ipc::TaskRow] = match &board {
-        Some(TaskBoard::Ready { tasks, .. }) => tasks,
-        _ => &[],
-    };
-    let in_review = |task: &Option<cide_ipc::TaskId>| {
-        task.as_ref().is_some_and(|id| {
-            tasks
-                .iter()
-                .any(|row| &row.id == id && row.status == TaskStatus::Review)
-        })
-    };
-    let live_runs = registry
-        .runs_for(project)
-        .iter()
-        .filter(|run| counts_as_busy(&run.state, in_review(&run.task)))
-        .count();
+    // `get`, never `ensure` — `note_death`'s rule, and `running::board_of` is where it now lives.
+    // A project whose tracker has never been opened has no board on screen and nothing to plan
+    // from, and parsing the file on nobody's behalf would be disk work on every tick for every
+    // project for ever. Such a project reads as having no open work and is never spun, which is
+    // correct: cide has not been asked to look.
+    let board = crate::running::board_of(app, project);
+    let tasks = rows_of(&board);
     let dispatching = registry.dispatching(project);
 
-    // Every Claude session this project draws, including detached panes — a pane torn into its
-    // own window is still this project's conversation and still somebody working.
-    let sessions: Vec<SessionId> = state.with(|ws| {
-        let Ok(project) = cide_core::workspace::project(ws, project) else {
-            return Vec::new();
-        };
-        project
-            .tabs
-            .iter()
-            .flat_map(|tab| tab.tree.panes.values())
-            .chain(project.detached.values())
-            .filter(|pane| pane.kind == cide_ipc::PaneKind::Claude)
-            .filter_map(|pane| pane.session)
-            .collect()
-    });
-    let ptys = app.try_state::<crate::state::SessionRegistry>();
-    let alive = |session: SessionId| {
-        ptys.as_ref()
-            .and_then(|ptys| ptys.get(session))
-            .is_some_and(|pty| !pty.has_exited())
-    };
-    let busy_panes = match app.try_state::<crate::hooks::HookServer>() {
-        Some(hooks) => sessions
-            .iter()
-            .filter(|session| {
-                pane_is_busy(
-                    alive(**session),
-                    registry.owns_session(**session),
-                    hooks.state(**session),
-                )
-            })
-            .count(),
-        // No hook server means no session state for anything, and `HookServer::state`'s own
-        // unknown answer is `Spawning`. Counting every live pane as busy is the same
-        // conservative direction: a build that cannot tell does not spin.
-        None => sessions
-            .iter()
-            .filter(|session| alive(**session) && !registry.owns_session(**session))
-            .count(),
-    };
+    // Wall clock rather than the `Instant` above, because the grace on a silent session is
+    // compared against `SessionRegistry::started`, which is a `SystemTime`.
+    // `Claimed`, which is this module's own question and the wider of the two: a queued run, a
+    // frozen one and a console at a splash all mean *do not open a planning tab here*, even
+    // though none of them is executing and the header's chip therefore does not count them.
+    // `Busy`'s doc carries the split.
+    let running = counts_for(app, ws, project, tasks, crate::running::Busy::Claimed);
+    let live_runs = running.runs as usize;
+    let busy_panes = running.panes as usize;
 
     let open_tasks = tasks
         .iter()
@@ -490,7 +431,7 @@ fn facts(
     // Read per tick like the config: the plan is committed and the gate's verdict is in memory.
     let milestone_waiting = crate::tasks_state::project_root(state, project)
         .ok()
-        .is_some_and(|root| milestone_ready(app, &root));
+        .is_some_and(|root| milestone_ready(app, &root, tasks));
 
     Some(Quiet {
         dispatching,
@@ -517,7 +458,11 @@ fn facts(
 /// and treating it as ready would park the project until something happened to re-run the gate.
 /// Letting it through is safe: [`wake`] re-runs a stale gate before planning and stops there
 /// if it passes. The `git rev-parse` is only paid when the last verdict passed, which is rare.
-fn milestone_ready(app: &AppHandle, root: &std::path::Path) -> bool {
+///
+/// **And nothing left open under the milestone's goal** ([`gate_blocks_planning`]). A green gate
+/// with tasks still in todo, doing or review is a milestone with work to plan around, and
+/// parking it on the user would leave those tasks idle until someone accepted by hand.
+fn milestone_ready(app: &AppHandle, root: &std::path::Path, rows: &[TaskRow]) -> bool {
     let plan = cide_agents::config::load_milestones(root);
     let Some(current) = plan.current() else {
         return false;
@@ -531,8 +476,28 @@ fn milestone_ready(app: &AppHandle, root: &std::path::Path) -> bool {
     {
         return false;
     }
+    if !gate_blocks_planning(true, open_under_goal(rows, current)) {
+        return false;
+    }
     let head = cide_core::check::head_of(root);
     !checks.gate_is_stale(root, &current.id, head.as_deref())
+}
+
+/// Tasks in todo, doing or review under the milestone's goal task. A milestone with no goal task
+/// has nothing the board can say is under it, so it counts none.
+fn open_under_goal(rows: &[TaskRow], milestone: &cide_ipc::Milestone) -> usize {
+    milestone
+        .task
+        .as_ref()
+        .map(|goal| cide_agents::milestones::open_under(rows, goal))
+        .unwrap_or(0)
+}
+
+/// Whether a milestone's gate stops the timer from planning: it passed, **and** nothing is left
+/// open under the milestone. One rule for [`wake`] and [`milestone_ready`], so the timer that
+/// decides to wake and the wake that decides to plan cannot disagree about the same board.
+fn gate_blocks_planning(gate_passed: bool, open_under_goal: usize) -> bool {
+    gate_passed && open_under_goal == 0
 }
 
 /// How long this project has looked quiet, updating the record.
@@ -593,6 +558,20 @@ mod tests {
             auto_spin: true,
             ..AgentsConfig::default()
         }
+    }
+
+    /// A green gate stands the timer down only when the milestone has nothing left open; a red
+    /// or unknown one never does. The case that was wrong: `slice` passing with tasks in todo,
+    /// doing and review, and the planner refusing as if it were finished.
+    #[test]
+    fn a_passing_gate_blocks_only_an_empty_milestone() {
+        assert!(gate_blocks_planning(true, 0));
+        assert!(
+            !gate_blocks_planning(true, 3),
+            "open tasks under the goal are work to plan"
+        );
+        assert!(!gate_blocks_planning(false, 0));
+        assert!(!gate_blocks_planning(false, 3));
     }
 
     #[test]
@@ -703,85 +682,6 @@ mod tests {
             ..ready()
         };
         assert!(should_spin(&past_the_floor, &config));
-    }
-
-    /// An `Idle` run is a live child holding its role's only worktree, so the project is not
-    /// quiet — `counts_as_busy`'s argument, asserted rather than left to the reader.
-    #[test]
-    fn only_the_three_states_with_no_child_read_as_quiet() {
-        let busy = [
-            RunState::Queued,
-            RunState::Starting,
-            RunState::Running,
-            RunState::Idle,
-            RunState::AwaitingPermission,
-            RunState::Paused { since_unix_ms: 1 },
-        ];
-        for state in busy {
-            assert!(
-                counts_as_busy(&state, false),
-                "{state:?} should hold the spinner off"
-            );
-        }
-        let over = [
-            RunState::Finished { code: 0 },
-            RunState::Failed { reason: "x".into() },
-            RunState::Interrupted,
-        ];
-        for state in over {
-            assert!(
-                !counts_as_busy(&state, false),
-                "{state:?} is over and says nothing about now"
-            );
-        }
-    }
-
-    /// An idle run whose task sits in review has done its work and is waiting on a person; a
-    /// review nobody finishes must not switch the *Quiet for* timer off for the session. Only
-    /// `Idle` gets the exemption — a run still working on a task that says `review` is working.
-    #[test]
-    fn an_idle_run_on_a_task_in_review_does_not_hold_the_spinner_off() {
-        assert!(!counts_as_busy(&RunState::Idle, true));
-        assert!(counts_as_busy(&RunState::Running, true));
-        assert!(counts_as_busy(&RunState::AwaitingPermission, true));
-        assert!(counts_as_busy(&RunState::Paused { since_unix_ms: 1 }, true));
-    }
-
-    /// **The window between opening a tab and its child's first hook frame is closed by
-    /// `Spawning` counting as busy.**
-    ///
-    /// `HookServer::state` answers `Spawning` for a session it has never seen, which is exactly
-    /// what the tab this module just opened looks like for the first second or so of its life.
-    /// If that read as quiet, the next tick — thirty seconds later, with the dwell already
-    /// satisfied — would open a second planning tab over the first, and a third after that.
-    /// `mark_busy` is the other half of the guard; this is the half that does not depend on it.
-    #[test]
-    fn a_just_spun_project_is_busy_by_its_own_new_pane() {
-        let busy = |state| pane_is_busy(true, false, state);
-        assert!(busy(SessionState::Spawning));
-        assert!(busy(SessionState::Splash));
-        assert!(busy(SessionState::Busy));
-        assert!(busy(SessionState::AwaitingPermission));
-        assert!(busy(SessionState::Paused));
-        // And the three that genuinely mean nobody is working.
-        assert!(!busy(SessionState::Idle));
-        assert!(!busy(SessionState::AwaitingInput));
-        assert!(!busy(SessionState::Exited { code: 0 }));
-    }
-
-    /// The *Quiet for* timer that never fired. `HookServer::state` answers `Spawning` for a
-    /// session it has no entry for — which is every exited one (`report_exit` forgets it) and
-    /// every opencode run's (no hooks at all) — so a pane over either kept its project busy for
-    /// ever. Neither may count, whatever the hook server says.
-    #[test]
-    fn a_pane_nobody_is_behind_does_not_keep_the_project_busy() {
-        // A Claude pane whose child has gone: forgotten, so it reads as `Spawning`.
-        assert!(!pane_is_busy(false, false, SessionState::Spawning));
-        // An opencode run's mirror: alive, silent to hooks, owned by the registry — which
-        // counts it through `live_runs` instead.
-        assert!(!pane_is_busy(true, true, SessionState::Spawning));
-        // A claude run's mirror mid-turn is the registry's to count too, not a second time here.
-        assert!(!pane_is_busy(true, true, SessionState::Busy));
     }
 
     /// A closed project's dwell is dropped, so reopening it starts the clock again rather than

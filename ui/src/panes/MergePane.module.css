@@ -75,15 +75,7 @@
 }
 
 .primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--bg);
-}
-
-.primary:disabled {
-  background: transparent;
-  border-color: var(--border);
-  color: var(--faint);
+  composes: primary from '../styles/buttons.module.css';
 }
 
 /* Three columns, equal, with a hairline between them rather than a gap: the panes are three

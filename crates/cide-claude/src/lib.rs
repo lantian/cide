@@ -37,6 +37,7 @@ pub use hook::{HookEvent, HookFrame};
 pub use orphans::{arm, on_spawn_thread, sweep_hook_sockets};
 pub use roster::claude_dir;
 pub use roster::names as session_names;
+pub use roster::statuses as session_statuses;
 pub use session::conversation;
 pub use settings::{ClaudeTheme, StatusLine, inline_settings};
 pub use state::{is_permission_request, next_state};

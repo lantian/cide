@@ -149,6 +149,25 @@ pub fn line(root: &Path, name: &str) -> Option<String> {
 /// the restart rather than sending a line that cannot work. Deliberately the file's own mtime
 /// and not "did cide run init this session": a project set up by hand in a terminal, or by an
 /// agent, is the same failure and this sees it.
+/// The file that defines `name` — a `SKILL.md` or a slash command's markdown — relative to
+/// `root`, when this project has one. (M93)
+///
+/// For a console that cannot type a Claude Code command: a codex console is handed the file
+/// to follow instead, since the skill *is* its instructions, written as prose for a model.
+pub fn file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+    if !valid_name(name) {
+        return None;
+    }
+    SURFACES.iter().find_map(|surface| {
+        let path = entry_path(root, surface, &surface.spelling(name));
+        path.is_file().then(|| {
+            path.strip_prefix(root)
+                .map(Path::to_path_buf)
+                .unwrap_or(path)
+        })
+    })
+}
+
 pub fn installed_at(root: &Path, name: &str) -> Option<std::time::SystemTime> {
     if !valid_name(name) {
         return None;

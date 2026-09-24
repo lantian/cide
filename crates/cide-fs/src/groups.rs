@@ -516,6 +516,27 @@ impl Groups {
         Some(())
     }
 
+    /// *Collapse all*: fold every header and every directory inside one.
+    ///
+    /// There is no `expand_all` on purpose. Opening *External Libraries* starts a `cargo
+    /// metadata` resolution and opening every package reads every package directory, which is
+    /// a lot of disk activity for one click in the Explorer header. Like [`Groups::collapse`],
+    /// this keeps everything already read.
+    pub fn collapse_all(&mut self) {
+        fn fold(list: &mut [Node]) {
+            for node in list {
+                node.expanded = false;
+                if let Some(children) = node.children.as_mut() {
+                    fold(children);
+                }
+            }
+        }
+        for group in &mut self.groups {
+            group.expanded = false;
+            fold(&mut group.children);
+        }
+    }
+
     /// Expand everything above `path` and answer the row it now sits on.
     ///
     /// **This materialises a chain that has never been expanded**, one `read_dir` per level,
@@ -943,6 +964,16 @@ mod tests {
         let mut groups = shown();
         groups.show(ID, "External Libraries");
         assert_eq!(groups.count(), 1);
+    }
+
+    #[test]
+    fn collapse_all_folds_every_header() {
+        let mut groups = shown();
+        groups.expand(&group_path(ID));
+        assert!(groups.rows(0, 10)[0].expanded);
+        groups.collapse_all();
+        assert_eq!(groups.count(), 1);
+        assert!(!groups.rows(0, 10)[0].expanded);
     }
 
     const PIN: &str = "projectNotes";

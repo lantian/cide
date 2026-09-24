@@ -21,6 +21,8 @@ import { projectMenu } from '@/ipc/client'
 import type { Pane as GeneratedPane, SplitIntent, Tab as GeneratedTab } from '@/ipc/generated'
 import { useAwaitingInProject } from '@/panes/awaiting'
 import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
+import { useRunningInProject, useRunsInProject } from '@/panes/running'
+import { runningBadge, runningHint } from '@/panes/runningRule'
 import { projectTabEntries } from './menuModel'
 import { ProjectMenu } from './ProjectMenu'
 import { RowControls } from './RowControls'
@@ -396,6 +398,14 @@ function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItem
   const waiting = useAwaitingInProject(project)
   const badge = awaitingBadge(waiting)
   const hint = awaitingHint(waiting, 'project')
+  // Keyed by **id**, and that is the whole difference from the three lines above: the awaiting
+  // count is a fold over sessions held by panes in this window's tree, while this one is Rust's
+  // answer over three registries and over panes that may be in no window at all. Which is also
+  // what makes it right for a background project, where nothing else on screen says anything.
+  const running = useRunningInProject(project.id)
+  const runs = useRunsInProject(project.id)
+  const runBadge = runningBadge(running)
+  const runHint = runningHint(runs, running - runs, 'project')
 
   return (
     <div
@@ -406,15 +416,16 @@ function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItem
       data-project-id={project.id}
       data-active={active ? 'true' : 'false'}
       data-awaiting={waiting > 0 ? String(waiting) : 'false'}
+      data-running={running > 0 ? String(running) : 'false'}
       onDoubleClick={onTabDoubleClick}
     >
       <button
         type="button"
         className={styles.tabOpen}
-        // The badge is `pointer-events: none` so the tab stays one box the pointer can hit
-        // anywhere, so it cannot carry its own tooltip — the tab's does, and it is also the
-        // only place a user with eleven waiting sessions learns that `9+` means eleven.
-        title={hint ? `${project.displayPath} — ${hint}` : project.displayPath}
+        // Both chips are `pointer-events: none` so the tab stays one box the pointer can hit
+        // anywhere, so neither can carry its own tooltip — this one carries both sentences, and
+        // it is also the only place a user with eleven of either learns that `9+` means eleven.
+        title={[project.displayPath, hint, runHint].filter(Boolean).join(' — ')}
         // Which project is open is otherwise carried by colour and a 2px rule alone,
         // neither of which a screen reader reports.
         aria-current={active}
@@ -446,6 +457,32 @@ function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItem
         aria-hidden={badge ? undefined : true}
       >
         {badge}
+      </span>
+      {/*
+       * The running chip, **after** the amber one rather than before it. Both lay out left to
+       * right, so a chip placed first would shove the amber one sideways every time an agent
+       * started working — and the amber one's whole job is to be findable in the same place
+       * twice. This one moves; that one does not.
+       *
+       * A turning mark *and* a number. The mark is `loader-circle`, which is exactly what the
+       * Agents panel turns for a run in `running` (`AgentsPanel/model.ts::SPINNING_GLYPH`), so
+       * one glyph means one thing in both places; the number is what a dot could never say —
+       * how much, and that it is going down as runs finish. Rendered only when lit, so a quiet
+       * header animates nothing at all.
+       *
+       * `role` on the empty box, and `aria-hidden` flipping rather than the element appearing:
+       * the reason is the one the awaiting chip states above.
+       */}
+      <span
+        className={runBadge ? `${styles.running} ${styles.runningOn}` : styles.running}
+        role="status"
+        aria-label={runHint}
+        aria-hidden={runBadge ? undefined : true}
+      >
+        {runBadge !== '' && (
+          <Icon name="loader-circle" size={0} className={styles.runningSpin} />
+        )}
+        {runBadge}
       </span>
       <button
         type="button"

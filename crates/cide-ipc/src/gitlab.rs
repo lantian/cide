@@ -33,14 +33,36 @@ pub struct GitLabReview {
 pub struct GitLabPreferences {
     pub exclude_enabled: bool,
     pub excluded_files: Vec<String>,
+    /// What "Review with an agent"'s instructions box starts with when no entry of
+    /// [`Self::review_prompts`] names the MR's repository. Blank means an empty box, as before.
+    pub review_prompt: String,
+    /// Per GitLab repository, in the user's order; first non-blank match wins over
+    /// [`Self::review_prompt`]. Keyed by the *GitLab* repository rather than the cide project
+    /// hosting the run: a review may be hosted by any open project, and what to look for belongs
+    /// to the code under review. Matched in `ui/src/gitlab/model.ts::defaultReviewPrompt`.
+    /// A list, not a map, so the settings screen keeps the order the user wrote them in.
+    pub review_prompts: Vec<GitLabReviewPrompt>,
 }
 impl Default for GitLabPreferences {
     fn default() -> Self {
         Self {
             exclude_enabled: true,
             excluded_files: vec!["**/*.pb.go".into(), "**/*_grpc.pb.go".into()],
+            review_prompt: String::new(),
+            review_prompts: Vec::new(),
         }
     }
+}
+
+/// One repository's default review instructions. `repository` is `group/repo` or
+/// `host/group/repo`, normalised by `cide_gitlab` when saved (no scheme, no slashes at either
+/// end, no `.git`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct GitLabReviewPrompt {
+    pub repository: String,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

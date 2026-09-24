@@ -208,9 +208,10 @@
   outline-offset: 2px;
 }
 
+/* Every primary action in the panel, in the app's one primary look (`styles/buttons.module.css`):
+   filled, where it used to be only accent-bordered, so it matches every other primary button. */
 .actionPrimary {
-  border-color: var(--accent);
-  color: var(--accent);
+  composes: primary from '../../styles/buttons.module.css';
 }
 
 /*
@@ -2063,11 +2064,8 @@ button.linkRowMain {
   flex: 1 1 auto;
 }
 
-/* The one control that starts work. Emphasis, not colour — `--red` is spoken for. */
-.actionPrimary {
-  border-color: var(--accent);
-  color: var(--accent);
-}
+/* Approve, the one control that starts work, is `.actionPrimary` — defined once with `.action`
+   near the top of this file, where it takes the shared primary look. */
 
 .targets {
   list-style: none;

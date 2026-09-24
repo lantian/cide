@@ -1995,6 +1995,7 @@ mod tests {
             env: Vec::new(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
+            codex: cide_ipc::CodexSettings::default(),
             // Empty in the fixture, so every existing assertion is about the document as it was
             // before providers existed. The provider tests build their own.
             llm: cide_ipc::LlmSettings::default(),
@@ -2574,7 +2575,8 @@ mod tests {
     /// The fixture is a measured line, and its own `total` is the oracle: `5725` is
     /// `5696 + 4 + 25`, so opencode's `input` is the *uncached* prompt and its cache reads are
     /// counted beside it, not inside it. That is exactly the shape `TokenUsage` asks for, which
-    /// is why nothing is subtracted here and everything is in `codex::usage`.
+    /// is why nothing is subtracted here — codex's `exec` stream (until M93) counted its cache
+    /// reads *inside* `input` and had to subtract them.
     #[test]
     fn a_step_finish_reports_what_it_spent() {
         let spent = usage(STEP_FINISH).expect("a step_finish carries its tokens");

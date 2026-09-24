@@ -36,6 +36,7 @@ import { useSwitcher } from '@/keys/switcherStore'
 import { useWorkspace } from '@/store/workspace'
 import { hintFor, selection } from '@/keys/switcher'
 import type { Project, Tab } from '@/ipc/client'
+import { consoleName } from './consoleName'
 import { Icon, type IconName } from '@/icons/Icon'
 
 import styles from './Switcher.module.css'
@@ -133,7 +134,7 @@ function tabRow(tab: Tab | undefined): Row | null {
   if (tab === undefined) return null
   switch (tab.kind.kind) {
     case 'claudeHome':
-      return { dot: null, mark: 'message-square', name: 'Claude', detail: 'console' }
+      return { dot: null, mark: 'message-square', name: consoleName(tab), detail: 'console' }
     case 'claudeFull':
       return { dot: null, mark: 'message-square', name: tab.kind.title, detail: 'session' }
     case 'file':

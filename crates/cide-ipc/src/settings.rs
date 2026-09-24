@@ -86,6 +86,22 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     pub graphics: GraphicsSettings,
     pub claude: ClaudeSettings,
+    /// Which CLI a **new** console runs: Settings → Harness. (M93)
+    ///
+    /// Read at exactly one moment — when a console pane spawns a *fresh* conversation — and
+    /// never again for that pane. A running console keeps what it was started with, and so does
+    /// its Resume: the harness a pane runs is stamped on the pane itself
+    /// ([`crate::Pane::harness`]) the moment the spawn binds, because resuming a codex thread
+    /// with `claude --resume` (or the other way round) is a conversation the other CLI has never
+    /// heard of. Restart session is a fresh spawn, which is how a user moves an open console onto
+    /// the harness this now names.
+    ///
+    /// **Not a default for agent runs.** A role runs the harness its definition (or the
+    /// project's `agents.harness`) names, which stays Claude when nothing names one — codex runs
+    /// only where somebody chose it, here or there.
+    pub console_harness: ConsoleHarness,
+    /// Which `codex` is launched, and with what: Settings → Harness → Codex. (M93)
+    pub codex: CodexSettings,
     pub proxy: ProxySettings,
     pub sidebar: SidebarSettings,
     pub explorer: ExplorerSettings,
@@ -123,6 +139,8 @@ impl Default for Settings {
             terminal: TerminalSettings::default(),
             graphics: GraphicsSettings::default(),
             claude: ClaudeSettings::default(),
+            console_harness: ConsoleHarness::default(),
+            codex: CodexSettings::default(),
             proxy: ProxySettings::default(),
             sidebar: SidebarSettings::default(),
             explorer: ExplorerSettings::default(),
@@ -1035,6 +1053,166 @@ impl Default for ClaudeSettings {
             // field's note and `base_env`'s.
             scroll_speed: 3,
             cli: ClaudeCli::default(),
+        }
+    }
+}
+
+/// The CLI a project's console runs. (M93)
+///
+/// Two, and deliberately not [`crate::Harness`]: a console is an interactive TUI that cide
+/// installs hooks into from the command line, types into, resumes and restores, and only these
+/// two CLIs take all of that on the command line (claude through `--settings`, codex through
+/// `-c hooks.*` plus `--dangerously-bypass-hook-trust`). Offering opencode here would be a
+/// switch whose other positions spawn a console with no state, no task tools and no resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ConsoleHarness {
+    /// Claude Code. The default, and what every workspace written before this setting runs.
+    #[default]
+    Claude,
+    /// OpenAI's Codex CLI, as an interactive TUI.
+    Codex,
+}
+
+impl ConsoleHarness {
+    /// The agent-harness identity of the same CLI, which is what a pane records.
+    #[must_use]
+    pub const fn harness(self) -> crate::Harness {
+        match self {
+            Self::Claude => crate::Harness::Claude,
+            Self::Codex => crate::Harness::Codex,
+        }
+    }
+
+    /// The console harness a pane's recorded harness means, or `None` for one that cannot be
+    /// a console (a pane opened onto an opencode run's conversation is a shell pane).
+    #[must_use]
+    pub const fn of(harness: crate::Harness) -> Option<Self> {
+        match harness {
+            crate::Harness::Claude => Some(Self::Claude),
+            crate::Harness::Codex => Some(Self::Codex),
+            crate::Harness::Opencode | crate::Harness::Qwen | crate::Harness::Mimo => None,
+        }
+    }
+
+    /// The bare program name, which is also what the webview sends for a console pane.
+    #[must_use]
+    pub const fn program(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+/// Everything about how `codex` is launched: Settings → Harness → Codex. (M93)
+///
+/// One sub-struct for the same reason [`ClaudeSettings::cli`] is one: the fields travel
+/// together in a patch and `cide_core::codex_cli` wants one thing to take a reference to. No
+/// environment toggles beside it, unlike [`ClaudeSettings`] — every one of those is a
+/// `CLAUDE_CODE_*` variable that means nothing to codex.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct CodexSettings {
+    pub cli: CodexCli,
+}
+
+/// The user's own launch configuration for `codex`: the binary, extra arguments, extra
+/// environment, and which of cide's own additions it still makes. (M93)
+///
+/// [`ClaudeCli`]'s twin, and everything that type's header says holds here: stored verbatim and
+/// filtered at the spawn (`cide_core::codex_cli`), a bare name resolved by the OS at each spawn,
+/// one token per argument, `env` as a vector of pairs, and a hand-written `Debug` so a value the
+/// user typed — a key for their own MCP server — never reaches a log line.
+///
+/// **Every place codex starts reads this**: a codex console, a Claude-shaped tab cide opens by
+/// itself, and an agent run whose role names `harness: codex`. A wrapper script configured here
+/// is therefore the one codex cide runs, which is the point of having it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct CodexCli {
+    /// `"codex"` by default. See [`ClaudeCli::binary`]; the same argument applies word for word,
+    /// and one more: the standalone installer updates codex in place under
+    /// `~/.codex/packages/standalone/releases/<version>` and moves the `~/.local/bin/codex`
+    /// symlink, so pinning a resolved path at launch would pin a release it may since have
+    /// deleted.
+    pub binary: String,
+    /// Extra arguments, one token per entry, placed before every argument cide adds. Refused
+    /// tokens: `cide_core::codex_cli::REFUSED_ARGS`.
+    pub args: Vec<String>,
+    /// Extra environment variables for `codex` children.
+    pub env: Vec<ClaudeEnvVar>,
+    /// Which of cide's own additions are still made. See [`CodexInjections`].
+    pub inject: CodexInjections,
+}
+
+impl Default for CodexCli {
+    fn default() -> Self {
+        Self {
+            binary: "codex".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            inject: CodexInjections::default(),
+        }
+    }
+}
+
+impl fmt::Debug for CodexCli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every field by name, values of `env` redacted by `ClaudeEnvVar`'s own `Debug` — the
+        // same arrangement, and the same guard, as `ClaudeCli`'s.
+        f.debug_struct("CodexCli")
+            .field("binary", &self.binary)
+            .field("args", &self.args)
+            .field("env", &self.env)
+            .field("inject", &self.inject)
+            .finish()
+    }
+}
+
+/// What cide adds to a codex command line, each independently switchable. (M93)
+///
+/// Booleans rather than [`ClaudeInjection`]'s `{ enabled, flag }`, because nothing here *is* a
+/// flag a wrapper could spell differently: three are `-c key=value` config overrides whose key
+/// is codex's configuration schema, and `resume`/`fork` are subcommands. A re-spelling field
+/// would be a text box that can only break the argv.
+///
+/// **Every field defaults to `true`, by hand**, for [`ClaudeInjection`]'s reason: the container
+/// is `#[serde(default)]`, and a derived `Default` would give a stored block that predates a
+/// field `false` for it — a feature that silently stops on upgrade.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct CodexInjections {
+    /// `-c hooks.<Event>=…` for every event cide subscribes to, plus
+    /// `--dangerously-bypass-hook-trust` so the TUI runs hooks it has no persisted trust for.
+    /// Off: **no state at all** — the pane never goes busy or awaiting, the thread id is never
+    /// learned (so Resume and a restore after restart cannot find the conversation), and a line
+    /// typed into the pane by cide waits for a readiness it will never hear.
+    pub hooks: bool,
+    /// `-c mcp_servers.cide.*`, attaching cide's own MCP server. Off: no `mcp__cide__*` tools,
+    /// so no task tracker and, on a console, no subagents.
+    pub mcp_config: bool,
+    /// `-c developer_instructions=<text>`: the console's roster paragraph, or a run's brief.
+    /// Off: the model is not told what cide's tools are for.
+    pub developer_instructions: bool,
+    /// `codex resume <thread>`. Off: a restored or resumed pane starts a new conversation.
+    pub resume: bool,
+    /// `codex fork <thread>`. Off: Split → fork resumes the parent instead of branching it.
+    pub fork: bool,
+}
+
+impl Default for CodexInjections {
+    fn default() -> Self {
+        Self {
+            hooks: true,
+            mcp_config: true,
+            developer_instructions: true,
+            resume: true,
+            fork: true,
         }
     }
 }

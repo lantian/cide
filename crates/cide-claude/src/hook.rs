@@ -49,6 +49,14 @@ pub enum HookEvent {
     SessionEnd,
     /// Something wants the user's attention — most importantly a permission prompt.
     Notification,
+    /// **Codex only**: the turn is blocked on an approval prompt. (M93)
+    ///
+    /// Codex has no `Notification` event, and it does not need one for this: it names the
+    /// moment itself, which is better than the substring match [`crate::is_permission_request`]
+    /// has to make of a Claude notification's prose. Read out of the 0.155.1 binary
+    /// (`hooks/src/events/permission_request.rs`); never subscribed to for `claude`, whose own
+    /// set is [`Self::ALL`] and stays exactly what it was.
+    PermissionRequest,
 }
 
 impl HookEvent {
@@ -66,6 +74,24 @@ impl HookEvent {
         Self::Notification,
     ];
 
+    /// Every event a **codex** child is subscribed to. (M93)
+    ///
+    /// Measured on 0.155.1/0.156.1 rather than assumed from Claude's list, and the two differ in
+    /// both directions: codex has no `PostToolBatch`, `SubagentStop` or `Notification` (a hook
+    /// keyed on a name it does not know simply never fires), and it has
+    /// [`Self::PermissionRequest`], which Claude does not. `SessionEnd` is subscribed but did
+    /// not fire on `SIGTERM` in the probe; nothing depends on it — the PTY reaper reports exits.
+    pub const CODEX: &'static [HookEvent] = &[
+        Self::SessionStart,
+        Self::UserPromptSubmit,
+        Self::PreToolUse,
+        Self::PermissionRequest,
+        Self::PostToolUse,
+        Self::Stop,
+        Self::PreCompact,
+        Self::SessionEnd,
+    ];
+
     /// The CLI's own spelling, which is the settings-file key.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -79,11 +105,18 @@ impl HookEvent {
             Self::PreCompact => "PreCompact",
             Self::SessionEnd => "SessionEnd",
             Self::Notification => "Notification",
+            Self::PermissionRequest => "PermissionRequest",
         }
     }
 
+    /// Either CLI's spelling. A frame is parsed without knowing which CLI sent it — the socket
+    /// is shared — so this answers for the union of [`Self::ALL`] and [`Self::CODEX`].
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|e| e.as_str() == s)
+        Self::ALL
+            .iter()
+            .chain(Self::CODEX)
+            .copied()
+            .find(|e| e.as_str() == s)
     }
 }
 
@@ -189,6 +222,26 @@ mod tests {
             assert_eq!(HookEvent::parse(e.as_str()), Some(*e));
         }
         assert_eq!(HookEvent::ALL.len(), 10);
+        for e in HookEvent::CODEX {
+            assert_eq!(HookEvent::parse(e.as_str()), Some(*e));
+        }
+    }
+
+    #[test]
+    fn claude_is_never_subscribed_to_the_codex_only_event() {
+        // `claude`'s `--settings` is built from `ALL`, and a key it does not know in that
+        // document is a hook that never fires at best — so the codex addition stays out of it.
+        assert!(!HookEvent::ALL.contains(&HookEvent::PermissionRequest));
+        assert!(HookEvent::CODEX.contains(&HookEvent::PermissionRequest));
+        // …and the codex list names nothing codex lacks: every one of these would be a
+        // subscription to silence.
+        for absent in [
+            HookEvent::PostToolBatch,
+            HookEvent::SubagentStop,
+            HookEvent::Notification,
+        ] {
+            assert!(!HookEvent::CODEX.contains(&absent), "{absent}");
+        }
     }
 
     #[test]

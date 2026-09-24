@@ -34,7 +34,49 @@ try {
     fileDiscussions,
     threadResolved,
     approvalStatus,
+    repositoryOfMr,
+    defaultReviewPrompt,
   } = await import(join(out, 'model.js'))
+  {
+    const url = 'https://git.example/Group/Sub/Repo/-/merge_requests/7'
+    assert.deepEqual(repositoryOfMr(url), {
+      host: 'git.example',
+      path: 'Group/Sub/Repo',
+    })
+    assert.equal(repositoryOfMr('https://git.example/group/repo'), null)
+    const prefs = (reviewPrompts, reviewPrompt = 'global') => ({
+      reviewPrompt,
+      reviewPrompts,
+    })
+    const row = (repository, prompt) => ({ repository, prompt })
+    assert.equal(defaultReviewPrompt(prefs([row('group/sub/repo', 'p')]), url), 'p')
+    assert.equal(
+      defaultReviewPrompt(prefs([row('git.example/group/sub/repo', 'h')]), url),
+      'h',
+    )
+    // A subpath install: the tail of the path still names the repository.
+    assert.equal(
+      defaultReviewPrompt(
+        prefs([row('group/repo', 's')]),
+        'https://host/gitlab/group/repo/-/merge_requests/1',
+      ),
+      's',
+    )
+    // A bare last segment is too loose to count; neither is a partial segment.
+    assert.equal(defaultReviewPrompt(prefs([row('repo', 'x')]), url), 'global')
+    assert.equal(defaultReviewPrompt(prefs([row('b/repo', 'x')]), url), 'global')
+    // Blank rows fall through to the next match, then to the global prompt.
+    assert.equal(
+      defaultReviewPrompt(
+        prefs([row('group/sub/repo', ' '), row('sub/repo', 'second')]),
+        url,
+      ),
+      'second',
+    )
+    assert.equal(defaultReviewPrompt(prefs([row('other/repo', 'o')]), url), 'global')
+    assert.equal(defaultReviewPrompt(prefs([], '  '), url), '')
+    assert.equal(defaultReviewPrompt(prefs([row('group/sub/repo', 'p')]), undefined), 'global')
+  }
   const approval = {
     approved_by: [{ user: { id: 1 } }],
     approvals_required: 2,

@@ -56,7 +56,10 @@ export interface ProxyValues {
 
 /** The three children the scope answers for, in the order the screen draws them. */
 export const TARGETS: readonly { key: keyof ProxyScopeValues; label: string }[] = [
-  { key: 'claude', label: 'claude' },
+  // The wire key is `claude` for history's sake (M16); since M93 the same field answers for
+  // every console — claude or codex — every agent run whatever its harness, and the one-shots.
+  // Those are the children that talk to a model provider, which is what the row is about.
+  { key: 'claude', label: 'Consoles and agents' },
   { key: 'shells', label: 'Shell panes' },
   { key: 'git', label: 'cide’s own Git' },
 ]

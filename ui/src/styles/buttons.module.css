@@ -1,0 +1,60 @@
+/*
+ * The one look a primary button has, wherever it sits.
+ *
+ * Until this existed every surface drew its own: flat `--accent` fills labelled `--bg` in some
+ * dialogs and `--on-accent` in others, an `--accent-hi` hover in some and none in others, the
+ * branch popup on a gradient, and the sidebar rows' primary actions only outlined — so "the
+ * button that does the thing" looked different in every place it appeared. The look here is the
+ * New Project wizard's Continue, which the user picked as the one to keep, and a site takes it
+ * with `composes: primary from '…/styles/buttons.module.css'`.
+ *
+ * `--grad-accent-ink`, not the `--grad-accent` Continue was first drawn with: that one is
+ * decorative (`tokens.css` says why) and put a 2.4:1 white label on its orange end in the light
+ * theme. The ink stops both clear AA against `--on-accent` in both themes, which is also why the
+ * label is `--on-accent` and never `--bg` — `--bg` was right for the flat accent and is not for
+ * this fill.
+ *
+ * Look only — no height, padding, radius or font-size. A button in a dense sidebar row and the
+ * wizard's footer button must stay the size their row needs, so each site keeps those and this
+ * class never fights them.
+ *
+ * Every rule is written `.primary.primary` and every state restates the whole fill. The button
+ * almost always also carries its site's base class — `.action`, `.button` — whose own
+ * `:hover:not(:disabled)` and `:disabled` rules repaint the border and label, and whose base
+ * rule sets a `--panel` background at the same specificity as a single class. With one class
+ * here the winner would be whichever stylesheet the bundle happened to emit last, and hovering
+ * the Push button would turn its label `--text-hi` on the gradient. Doubling the class is (0,2,0)
+ * against the base rule's (0,1,0), and (0,4,0) against the site hover's (0,3,0); restating the
+ * fill in each state is what makes the win cover every property a site might touch.
+ */
+.primary.primary {
+  border-color: transparent;
+  background: var(--grad-accent-ink);
+  color: var(--on-accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+  transition: box-shadow var(--dur-1) var(--ease-out);
+}
+
+.primary.primary:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--grad-accent-ink);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-2);
+}
+
+/* Faded rather than recoloured: a greyed gradient reads as a different kind of button, and a
+   faded one still says which button would act once it is allowed to. */
+.primary.primary:disabled {
+  border-color: transparent;
+  background: var(--grad-accent-ink);
+  color: var(--on-accent);
+  opacity: 0.45;
+  box-shadow: none;
+  cursor: default;
+}
+
+.primary.primary:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}

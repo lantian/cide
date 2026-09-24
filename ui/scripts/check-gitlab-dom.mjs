@@ -129,7 +129,15 @@ window.__TAURI_INTERNALS__ = {
               },
             ],
             reviews: [review],
-            preferences: { excludeEnabled: true, excludedFiles: ['*.pb.go'] },
+            preferences: {
+              excludeEnabled: true,
+              excludedFiles: ['*.pb.go'],
+              reviewPrompt: 'look everywhere',
+              reviewPrompts: [
+                { repository: 'other/repo', prompt: 'not this one' },
+                { repository: 'p', prompt: 'check the cache' },
+              ],
+            },
           },
           nextPage: null,
         }
@@ -405,6 +413,47 @@ try {
     0,
     'ordinary rerenders do not move the sidebar scroll',
   )
+  // Expand all / Collapse all (M96): the tree, not each row, holds what is open.
+  const expandAll = () => container.querySelector('[aria-label="Expand all"]')
+  const collapseAll = () => container.querySelector('[aria-label="Collapse all"]')
+  await click(expandAll())
+  assert.ok(
+    container.querySelector('[title="Alpha/zeta/file.go"]') &&
+      container.querySelector('[title="zeta/file.go"]'),
+    'Expand all opens every folder, nested ones included',
+  )
+  await click(collapseAll())
+  assert.deepEqual(
+    [...container.querySelectorAll('[role="treeitem"][aria-expanded]')].map(
+      (row) => [row.title, row.getAttribute('aria-expanded')],
+    ),
+    [
+      ['Alpha', 'false'],
+      ['zeta', 'false'],
+    ],
+    'Collapse all folds every folder',
+  )
+  await renderTree('zeta/file.go')
+  assert.ok(
+    container.querySelector('[title="zeta/file.go"]'),
+    'a new selection after Collapse all still opens its folder',
+  )
+  await render(
+    React.createElement(FileTree, {
+      // Keyed: the prop is read once, which is why ReviewPanel keys the tree on its mode.
+      key: 'expanded',
+      files: sortedFiles,
+      selected: null,
+      label: 'Files',
+      defaultExpanded: true,
+      onOpen: () => {},
+    }),
+  )
+  assert.ok(
+    container.querySelector('[title="Alpha/zeta/file.go"]'),
+    'defaultExpanded draws nested files on the first render',
+  )
+  await renderTree('Alpha/zeta/file.go')
   await renderTree('apple.go')
   assert.equal(
     scrolls.at(-1).element.title,
@@ -619,9 +668,6 @@ try {
     container.querySelector('[aria-label="1 unpublished drafts"]'),
     'the changed file shows its draft count',
   )
-  // Folded again: the source tree below starts from the folders as the user left them.
-  if (changedApi?.getAttribute('aria-expanded') === 'true')
-    await click(changedApi)
   await click(
     [
       ...container.querySelectorAll('[aria-label="MR information"] button'),
@@ -661,6 +707,11 @@ try {
     harness.querySelector('option[value="opencode"]')?.disabled,
     true,
     'an unavailable harness is disabled',
+  )
+  assert.equal(
+    document.querySelector('#gitlab-review-prompt')?.value,
+    'check the cache',
+    "the instructions start as the MR repository's saved default, not the global one",
   )
   assert.match(
     document.querySelector('[role="dialog"]')?.textContent ?? '',

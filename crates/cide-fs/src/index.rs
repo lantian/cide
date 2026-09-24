@@ -320,6 +320,33 @@ impl Index {
         self.set_expanded(path, false)
     }
 
+    /// *Expand all* / *Collapse all*: set every directory at once. Returns the new row count.
+    ///
+    /// `keep` decides which directories an expand may open. The app passes
+    /// [`crate::Filter::watchable`], the test [`Index::watch_dirs`] makes, so with *Show ignored
+    /// files* on an *Expand all* does not open `target/` and `node_modules/` and bury the
+    /// project under a build's worth of rows. A collapse closes everything regardless.
+    ///
+    /// **The roots stay expanded.** A lone root is not drawn at all (see [`Index::empty`]), so
+    /// collapsing it would leave an Explorer with no rows and no row to click to get them back.
+    ///
+    /// One [`Index::recompute_all`] rather than a [`Index::set_expanded`] per directory:
+    /// `recompute_up` climbs to the root each time, which on a 100k-entry tree is a depth's
+    /// worth of child sums per directory where one sum each is enough.
+    pub fn set_all_expanded(&mut self, expanded: bool, keep: impl Fn(&Path) -> bool) -> usize {
+        for (path, &id) in &self.by_path {
+            let node = &mut self.nodes[id as usize];
+            if !matches!(node.kind, TreeRowKind::Dir) || self.root_nodes.contains(&id) {
+                continue;
+            }
+            if !expanded || keep(path) {
+                node.expanded = expanded;
+            }
+        }
+        self.recompute_all();
+        self.count()
+    }
+
     /// Expand everything above `path` and return the row it now occupies.
     ///
     /// `None` when the path is not in the index — ignored, deleted, or outside every root.
@@ -1566,6 +1593,52 @@ mod tests {
         assert_eq!(rows[1].depth, 1);
         assert_eq!(index.collapse(&dir.join("src")), Some(2));
         assert_eq!(index.count(), 2);
+    }
+
+    /// *Expand all* opens every walked directory except an ignored one, *Collapse all* closes
+    /// everything but the root, and the counts agree with the rows either way.
+    #[test]
+    fn expand_all_skips_what_keep_refuses_and_collapse_all_keeps_the_root() {
+        let dir = scratch("index-expand-all");
+        tree(&dir);
+        let visibility = Visibility {
+            hidden: true,
+            ignored: true,
+        };
+        let mut index = Index::build(
+            vec![Root::new(dir.path())],
+            BuildOptions {
+                visibility,
+                ..BuildOptions::default()
+            },
+            &|_: &[WalkItem]| {},
+        );
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            index.dir_paths().iter().map(|p| p.as_path()),
+            visibility,
+        );
+        let count = index.set_all_expanded(true, |p| filter.watchable(p, true));
+        let rows = index.rows(0, 100);
+        assert_eq!(count, rows.len());
+        let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"mod.rs"), "nested folders open: {names:?}");
+        assert!(
+            names.contains(&"target"),
+            "the ignored folder is still a row"
+        );
+        assert!(
+            !names.contains(&"debug"),
+            "but an ignored folder is not opened: {names:?}"
+        );
+
+        let count = index.set_all_expanded(false, |_| true);
+        assert!(index.rows(0, 100).iter().all(|r| !r.expanded));
+        assert_eq!(count, index.rows(0, 100).len());
+        assert!(
+            count > 0,
+            "the lone root stays open, so its children are still rows"
+        );
     }
 
     #[test]

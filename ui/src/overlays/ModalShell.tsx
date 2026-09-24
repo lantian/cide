@@ -188,10 +188,17 @@ export function OverlayCard({
   label,
   onDismiss,
   children,
+  className,
 }: {
   label: string
   onDismiss: () => void
   children: ReactNode
+  /**
+   * Added to the card's own class, for a dialog that needs a different width than the 620px every
+   * other one shares — the New project wizard's two columns (M97). Everything else about the card
+   * — the scrim, the portal, the radius, the elevation — stays this component's.
+   */
+  className?: string | undefined
 }) {
   return createPortal(
     // Click-through to dismiss is on the scrim only; `stopPropagation` on the card keeps a
@@ -201,7 +208,7 @@ export function OverlayCard({
     // one of them (`settings/AgentsSection.tsx`) has a reason it must not be the first control.
     <div className={styles.scrim} data-audit="overlayScrim" onMouseDown={onDismiss}>
       <div
-        className={styles.card}
+        className={className === undefined ? styles.card : `${styles.card} ${className}`}
         data-audit="overlayCard"
         role="dialog"
         aria-modal="true"

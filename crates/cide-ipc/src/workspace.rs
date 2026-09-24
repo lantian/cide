@@ -1292,6 +1292,25 @@ pub struct Pane {
     /// so a `workspace.json` written before this field loads unchanged.
     #[serde(default)]
     pub continues: Option<crate::HarnessSession>,
+    /// Which CLI this console pane's child is, once one has bound to it. (M93)
+    ///
+    /// `None` means Claude, and that is not a shortcut: it is what every `workspace.json`
+    /// written before codex could be a console says, and every one of those panes *is* a
+    /// Claude pane. Stamped by `cide_core::workspace::bind_session` from what the spawn actually
+    /// ran — never from Settings → Harness directly — because the setting describes the *next*
+    /// fresh console and this field describes the one that exists. A resume, a fork, a restore
+    /// after restart and the Resume button all read it so the conversation goes back to the CLI
+    /// that owns it; only a fresh spawn (a new pane, Restart session) consults the setting.
+    ///
+    /// Meaningful only on a [`PaneKind::Claude`] pane. [`Self::conversation`] holds the codex
+    /// thread id for a codex console: a codex conversation cannot be handed cide's id the way
+    /// `claude --session-id` can, so its id always arrives by hook and always differs.
+    ///
+    /// Not written when `None`, so a workspace that has only ever run claude is byte-identical
+    /// on disk to what it was before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub harness: Option<crate::Harness>,
     /// e.g. `cide : claude`, `cide : bash`, `cide : claude — diff`.
     pub title: String,
     /// The container this pane's bytes come from, when they come from one. (M42)

@@ -1714,6 +1714,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: title.into(),
             docker: None,
         }

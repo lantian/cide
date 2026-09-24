@@ -31,6 +31,7 @@ import { restartOffer, type RestartMode, type RestartOffer } from './restartRule
 import { TerminalFindBar } from './TerminalFindBar'
 import { openTerminalFind } from '@/terminal/findStore'
 import findStyles from './TerminalFindBar.module.css'
+import buttonStyles from '@/styles/buttons.module.css'
 import { registerRestarter } from './paneRestart'
 import { acknowledge } from './awaiting'
 import { acknowledgesKey } from './awaitingRule'
@@ -1171,16 +1172,25 @@ const statusStyle: CSSProperties = {
   whiteSpace: 'nowrap',
 }
 
+/*
+ * Geometry for both buttons, colour only for the plain one. The accented one takes its colour from
+ * `buttonStyles.primary`, and an inline `borderColor`/`background`/`color` would beat that class
+ * whatever its specificity, so the accent branch must leave them unset rather than restate them.
+ */
 function actionStyle(accent: boolean): CSSProperties {
   return {
     padding: '3px 10px',
     borderRadius: 6,
     borderWidth: 1,
     borderStyle: 'solid',
-    borderColor: accent ? 'var(--accent)' : 'var(--border)',
-    background: 'transparent',
-    color: accent ? 'var(--text-hi)' : 'var(--text)',
-    font: 'inherit',
+    ...(accent
+      ? {}
+      : { borderColor: 'var(--border)', background: 'transparent', color: 'var(--text)' }),
+    // Longhands, not `font: 'inherit'`: the shorthand resets the weight too, inline, and the
+    // primary class's 600 would lose to it.
+    fontFamily: 'inherit',
+    fontSize: 'inherit',
+    lineHeight: 'inherit',
     cursor: 'pointer',
     flex: 'none',
   }
@@ -1216,7 +1226,12 @@ function ExitedBar({
           {secondary.label}
         </button>
       )}
-      <button type="button" style={actionStyle(true)} onClick={() => onRun(offer.primary.mode)}>
+      <button
+        type="button"
+        className={buttonStyles.primary}
+        style={actionStyle(true)}
+        onClick={() => onRun(offer.primary.mode)}
+      >
         {offer.primary.label}
       </button>
     </div>

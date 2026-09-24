@@ -75,6 +75,8 @@ let snapshot: Snapshot = {
     preferences: {
       excludeEnabled: true,
       excludedFiles: ['**/*.pb.go', '**/*_grpc.pb.go'],
+      reviewPrompt: '',
+      reviewPrompts: [],
     },
   },
   editor: null,

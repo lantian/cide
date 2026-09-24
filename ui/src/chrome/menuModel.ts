@@ -62,6 +62,8 @@ export interface RecentLike {
 
 export interface RecentActions {
   browse: () => void
+  /** The New project wizard (M97), right under *Open folder…*. */
+  create: () => void
   reopen: (path: string) => void
   forgetMissing: () => void
   clear: () => void
@@ -85,6 +87,7 @@ export function recentEntries(
 ): MenuEntry[] {
   const items: MenuEntry[] = [
     { id: 'browse', label: 'Open folder…', run: actions.browse },
+    { id: 'new', label: 'New project…', run: actions.create },
     { kind: 'separator' },
   ]
 
@@ -440,7 +443,14 @@ export interface OverflowActions {
 function overflowLabel(tab: Tab): string {
   switch (tab.kind.kind) {
     case 'claudeHome':
-      return 'Claude'
+      // `chrome/consoleName.ts`'s rule, restated for this file's reason above: a check compiles
+      // it alone and runs it under Node, where a value import does not resolve. (M93)
+      // Read through `?.`: the check's fixtures build tabs without a tree.
+      return Object.values(tab.tree?.panes ?? {}).some(
+        (pane) => pane?.role === 'primary' && pane.harness === 'codex',
+      )
+        ? 'Codex'
+        : 'Claude'
     case 'claudeFull':
       return tab.kind.title
     case 'file':

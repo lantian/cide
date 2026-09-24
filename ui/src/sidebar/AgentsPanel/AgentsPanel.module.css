@@ -249,12 +249,13 @@
   outline-offset: 2px;
 }
 
-/* The one affirmative control on the disabled screen. Accent-bordered rather than
-   accent-filled: it commits a file to a repository, and a filled primary button on a
-   default-off feature invites the click before the paragraph above it has been read. */
+/* The one affirmative control on the disabled screen. This was accent-bordered rather than
+   filled, on the argument that it commits a file to a repository and a filled button on a
+   default-off feature invites the click before the paragraph above it has been read. It now
+   takes the shared primary look, because the user asked for every primary button to match;
+   the paragraph still comes first in reading order, and the button still sits under it. */
 .actionPrimary {
-  border-color: var(--accent);
-  color: var(--accent);
+  composes: primary from '../../styles/buttons.module.css';
 }
 
 /*

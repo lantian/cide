@@ -207,8 +207,7 @@
 }
 
 .primary {
-  border-color: var(--accent);
-  color: var(--accent);
+  composes: primary from '../../styles/buttons.module.css';
 }
 
 /*

@@ -140,6 +140,14 @@ pub fn session_state(app: &AppHandle, session: &str, state: cide_ipc::SessionSta
     if let Ok(session) = session.parse::<cide_ipc::SessionId>() {
         tee(|| cide_remote::RemoteEvent::SessionState { session, state });
     }
+    // The single funnel for "a session moved", and the reason the header's badge is marked from
+    // here rather than from each emitter. There are five of those today — `hooks::apply`,
+    // `lifecycle::watch_jobs`, `lifecycle::report_exit` and the pause/thaw pair in `agents.rs` —
+    // and a sixth is the ordinary way a feature like this goes quietly stale.
+    //
+    // `mark` is one mutex and two `Option<Instant>`s, which it has to stay: the hook applier is
+    // a single ordered thread whose ordering is a correctness requirement, and this is on it.
+    crate::running::mark(app);
 }
 
 pub fn session_status(app: &AppHandle, session: &str, status: serde_json::Value) {
@@ -188,6 +196,32 @@ pub fn session_awaiting(app: &AppHandle, sessions: Vec<cide_ipc::SessionId>) {
     tee(|| cide_remote::RemoteEvent::Awaiting {
         entries: crate::windows::awaiting_since(),
     });
+}
+
+/// What is *working* in each project — the header project tab's badge. (M94)
+///
+/// The whole set, every time, to every window, on [`SESSION_AWAITING`]'s two reasons one level
+/// up: a window that opened after a run started has no history to derive it from, and the set is
+/// one small entry per open project. Projects with nothing running are omitted, so absence is
+/// the message.
+///
+/// Unlike the awaiting set, **Rust decides membership here as well as aggregating it**. A count
+/// of runs and console panes needs the agent registry, the session registry and the hook states,
+/// none of which a webview has, and needs them for projects that window is not drawing — which
+/// is the whole point of the badge. `cide_app::running`'s header carries the argument.
+///
+/// Still only a *change* notification, so `cmd::project::project_running_counts` is the other
+/// half, and `crate::running::flush` drops a recomputation that moved nothing rather than
+/// broadcasting it.
+///
+/// Not teed to a device: a phone has no project tab strip, and the facts behind this number
+/// reach it through `RemoteEvent::SessionState` already.
+pub const PROJECT_RUNNING: &str = "cide://project-running";
+
+pub fn project_running(app: &AppHandle, set: &cide_ipc::ProjectRunningSet) {
+    if let Err(error) = app.emit(PROJECT_RUNNING, set) {
+        tracing::debug!(%error, "project-running reached no window");
+    }
 }
 
 pub fn session_tool(app: &AppHandle, session: &str, paths: Vec<String>) {
@@ -963,6 +997,22 @@ fn tee(make: impl FnOnce() -> cide_remote::RemoteEvent) {
         // Expected under load and handled downstream by a `Desync` to the device. Not a warning:
         // it would be one per dropped frame, from the thread least able to afford them.
         tracing::debug!(%error, "remote tee: an event was dropped");
+    }
+}
+
+// --- the New project wizard (M97) -----------------------------------------------------------
+
+/// A step of `project_new` started, finished or failed.
+///
+/// To every window rather than the one that asked: the wizard lives in whichever window the
+/// gesture came from, and `emit_to` would need that window's label threaded through a command
+/// that otherwise has no reason to know it. A second window with no wizard open has no listener
+/// and drops it, which is the whole cost. Not teed to the remote surface — a device has no wizard.
+pub const PROJECT_NEW_PROGRESS: &str = "cide://project-new-progress";
+
+pub fn project_new_progress(app: &AppHandle, progress: &cide_ipc::NewProjectProgress) {
+    if let Err(error) = app.emit(PROJECT_NEW_PROGRESS, progress.clone()) {
+        tracing::debug!(%error, "project-new-progress reached no window");
     }
 }
 

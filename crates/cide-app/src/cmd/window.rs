@@ -617,6 +617,16 @@ fn named(project: &str, subject: Option<String>) -> String {
 /// the pinned console, the *file name* (never the path) for a file, `Settings`, and the stored
 /// titles a diff and a revision tab already carry.
 fn subject(tab: &cide_ipc::Tab) -> String {
+    // The console is named for the CLI its console pane runs (M93), as the strip names it
+    // (`ui/src/chrome/consoleName.ts`): the pane's recorded harness, not the setting.
+    if matches!(tab.kind, cide_ipc::TabKind::ClaudeHome)
+        && tab.tree.panes.values().any(|pane| {
+            pane.role == cide_ipc::PaneRole::Primary
+                && pane.harness == Some(cide_ipc::Harness::Codex)
+        })
+    {
+        return "Codex".into();
+    }
     tab.kind.title()
 }
 
@@ -1052,6 +1062,7 @@ mod tests {
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "Cargo.toml".into(),
                 docker: None,
             },
@@ -1098,6 +1109,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "atlas : claude — mirror".into(),
             docker: None,
         };
@@ -1158,6 +1170,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "atlas : claude".into(),
             docker: None,
         };
@@ -1209,6 +1222,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "atlas : claude".into(),
             docker: None,
         };
@@ -1288,7 +1302,7 @@ mod tests {
     #[test]
     fn a_shell_holding_several_projects_is_titled_after_the_active_one() {
         let mut ws = Workspace::default();
-        workspace::open_project(&mut ws, vec!["/home/dev/a".into()], None).expect("opens");
+        let a = workspace::open_project(&mut ws, vec!["/home/dev/a".into()], None).expect("opens");
         let b = workspace::open_project(&mut ws, vec!["/home/dev/b".into()], None).expect("opens");
 
         let shell = ws
@@ -1297,15 +1311,17 @@ mod tests {
             .find_map(|(l, r)| matches!(r, WindowRole::Shell { .. }).then(|| l.clone()))
             .expect("a fresh workspace names a shell");
 
-        // `rebuild_windows` keeps whichever project was active across an open, so the window
-        // is still showing the first one — and says so, where before it said `cide`.
-        assert_eq!(title_for(&ws, &ws.windows[&shell].clone()), "a - Claude");
+        // An open brings the project to the front (M97), so the window is showing the second
+        // one — and says so, where before it said `cide`.
+        assert_eq!(title_for(&ws, &ws.windows[&shell].clone()), "b - Claude");
 
-        workspace::activate_project(&mut ws, b);
+        workspace::activate_project(&mut ws, a);
         assert_eq!(
             title_for(&ws, &ws.windows[&shell].clone()),
-            "b - Claude",
+            "a - Claude",
             "clicking a header tab renames the window, because that is what changed on screen"
         );
+        workspace::activate_project(&mut ws, b);
+        assert_eq!(title_for(&ws, &ws.windows[&shell].clone()), "b - Claude");
     }
 }

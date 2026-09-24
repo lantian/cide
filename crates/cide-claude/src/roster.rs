@@ -77,6 +77,9 @@ struct Record {
     /// live processes naming one conversation.
     #[serde(default)]
     updated_at: u64,
+    /// What the CLI says it is doing: `idle`, `busy`, and whatever a later release adds. Read
+    /// only by [`statuses`], as a second opinion when cide's own hook-driven state looks stuck.
+    status: Option<String>,
 }
 
 /// A name, and when it was given.
@@ -145,6 +148,53 @@ pub fn names() -> HashMap<String, Named> {
 
 /// [`names`], against a directory named explicitly. The half a test can drive.
 pub fn names_in(dir: &std::path::Path) -> HashMap<String, Named> {
+    newest_live(dir, |record| {
+        let name = record.name.clone().filter(|n| !n.trim().is_empty())?;
+        Some(Named {
+            name,
+            since: record.name_since,
+        })
+    })
+}
+
+/// Conversation id → the status the CLI last wrote for it (`idle`, `busy`, …), for every live
+/// session on this machine.
+///
+/// A **second opinion**, never the first. cide's session state comes from hooks, which are
+/// pushed, ordered and immediate; this file is polled, undocumented and written whenever the
+/// CLI gets round to it. It exists for one failure: a hook frame that arrives *after* a turn's
+/// `Stop` with no `Stop` behind it, which leaves the session `Busy` in cide for good while the
+/// CLI sits at its prompt. Measured on selfcraft's review tab: `Stop` at 11:10:20, one stray
+/// frame at 11:10:23, and `"status":"idle"` in this file from 11:10:20 on — while cide held the
+/// task's re-review and the spinner for the next hour. `crate::hooks`' caller in `cide-app`
+/// only asks this about a session that has been silent long enough for that to be the story.
+///
+/// Same walk and same rules as [`names`]: dead pids skipped, the newest live record wins, and
+/// every way of being wrong is an absent entry, which the caller reads as "no opinion".
+pub fn statuses() -> HashMap<String, String> {
+    match sessions_dir() {
+        Some(dir) => statuses_in(&dir),
+        None => HashMap::new(),
+    }
+}
+
+/// [`statuses`], against a directory named explicitly. The half a test can drive.
+pub fn statuses_in(dir: &std::path::Path) -> HashMap<String, String> {
+    newest_live(dir, |record| {
+        record.status.clone().filter(|s| !s.trim().is_empty())
+    })
+}
+
+/// One walk of the directory: for each conversation, `pick` of the newest live record that
+/// `pick` has an answer for.
+///
+/// Shared by [`names_in`] and [`statuses_in`] so the liveness and recency rules in the module
+/// header are written once — a second copy is a second place for a dead pid's file to start
+/// winning again.
+fn newest_live<T>(
+    dir: &std::path::Path,
+    pick: impl Fn(&Record) -> Option<T>,
+) -> HashMap<String, T> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         // No directory at all is the ordinary state on a machine where `claude` has never
         // run, and it is not worth a log line at any level a user would see.
@@ -153,7 +203,7 @@ pub fn names_in(dir: &std::path::Path) -> HashMap<String, Named> {
 
     // Keyed by conversation, holding the `updatedAt` that won it, so the newest live record
     // for each conversation is what survives the walk.
-    let mut best: HashMap<String, (u64, Named)> = HashMap::new();
+    let mut best: HashMap<String, (u64, T)> = HashMap::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -170,7 +220,7 @@ pub fn names_in(dir: &std::path::Path) -> HashMap<String, Named> {
         let Ok(record) = serde_json::from_str::<Record>(&text) else {
             continue;
         };
-        let Some(name) = record.name.filter(|n| !n.trim().is_empty()) else {
+        let Some(value) = pick(&record) else {
             continue;
         };
         let Some(pid) = record.pid else {
@@ -182,17 +232,13 @@ pub fn names_in(dir: &std::path::Path) -> HashMap<String, Named> {
         match best.get(&record.session_id) {
             Some((seen, _)) if *seen >= record.updated_at => {}
             _ => {
-                let named = Named {
-                    name,
-                    since: record.name_since,
-                };
-                best.insert(record.session_id, (record.updated_at, named));
+                best.insert(record.session_id, (record.updated_at, value));
             }
         }
     }
 
     best.into_iter()
-        .map(|(id, (_, named))| (id, named))
+        .map(|(id, (_, value))| (id, value))
         .collect()
 }
 
@@ -321,6 +367,40 @@ mod tests {
             })
         );
         assert_eq!(names.get("unstamped").map(|n| n.since), Some(0));
+    }
+
+    /// The status is read by the same rules as the name: live only, newest wins, blank absent.
+    ///
+    /// The dead record is the one that matters. A `claude` that died mid-turn leaves `busy`
+    /// in its file for ever, and letting it answer would keep a stale state stale; one that
+    /// died idle would release a session another live process is still working in.
+    #[test]
+    fn a_status_comes_from_the_newest_live_record() {
+        let dir = tempdir();
+        let pid = me();
+        write(
+            &dir,
+            "30.json",
+            &format!(r#"{{"pid":{pid},"sessionId":"s","status":"busy","updatedAt":100}}"#),
+        );
+        write(
+            &dir,
+            "31.json",
+            &format!(r#"{{"pid":{pid},"sessionId":"s","status":"idle","updatedAt":200}}"#),
+        );
+        write(
+            &dir,
+            "32.json",
+            r#"{"pid":2147483647,"sessionId":"s","status":"busy","updatedAt":999}"#,
+        );
+        write(
+            &dir,
+            "33.json",
+            &format!(r#"{{"pid":{pid},"sessionId":"blank","status":" ","updatedAt":1}}"#),
+        );
+        let statuses = statuses_in(&dir);
+        assert_eq!(statuses.get("s").map(String::as_str), Some("idle"));
+        assert!(!statuses.contains_key("blank"), "{statuses:?}");
     }
 
     /// A directory that is not there answers empty rather than failing.

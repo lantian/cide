@@ -234,6 +234,7 @@ pub async fn tab_open_docs(
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "docs".into(),
                 docker: None,
             },

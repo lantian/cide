@@ -90,7 +90,7 @@ try {
     tabMenuEntries,
   } = await import(`file://${join(out, 'chrome/menuModel.js')}`)
 
-  const NOTHING = { browse() {}, reopen() {}, forgetMissing() {}, clear() {} }
+  const NOTHING = { browse() {}, create() {}, reopen() {}, forgetMissing() {}, clear() {} }
   const recent = (path, exists) => ({
     project: { path, displayPath: path, name: path, openedAt: 0n },
     exists,
@@ -137,7 +137,12 @@ try {
     // The empty list must still be an *answer*. `useContextMenu` refuses to open a menu with
     // no items at all, so returning `[]` here would make the caret look broken on first launch.
     const entries = recentEntries([], NOTHING)
-    eq(shape(entries), ['browse', '--', 'empty'], 'an empty list still offers Open folder…')
+    eq(
+      shape(entries),
+      ['browse', 'new', '--', 'empty'],
+      'an empty list still offers Open folder…, and New project… right after it (M97)',
+    )
+    ok(typeof item(entries, 'new').run === 'function', 'New project… is always live')
     eq(item(entries, 'empty').disabledReason, NO_RECENTS_REASON, 'and says why it is empty')
     ok(typeof item(entries, 'browse').run === 'function', 'Open folder… is always live')
   }

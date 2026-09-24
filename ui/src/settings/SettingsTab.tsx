@@ -18,10 +18,12 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   agentDefs,
   claudeTasks,
+  codexCli,
   openLogDir,
   settings as settingsApi,
   type AgentModels,
   type ClaudeCliSupport,
+  type CodexCliSupport,
   type ProjectId,
   type SettingsSection,
 } from '@/ipc/client'
@@ -122,6 +124,25 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
       live = false
     }
   }, [configuredBinary, configuredInjections])
+
+  /**
+   * Settings → Harness → Codex's readout (M93), re-asked whenever the stored codex launch
+   * configuration changes. Keyed on the whole configuration serialised, for `cliSupport`'s reason
+   * above: every verdict on the codex screen comes from Rust, so any committed edit — a row, a
+   * switch, the binary — is a question only this fetch answers.
+   */
+  const configuredCodex = settings === null ? undefined : JSON.stringify(settings.codex)
+  const [codexSupport, setCodexSupport] = useState<CodexCliSupport | null>(null)
+  useEffect(() => {
+    if (configuredCodex === undefined) return
+    let live = true
+    void codexCli.support().then((support) => {
+      if (live) setCodexSupport(support)
+    })
+    return () => {
+      live = false
+    }
+  }, [configuredCodex])
 
   /**
    * What `opencode models` reports, with cide's provider document injected. (M45)
@@ -262,6 +283,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
               version,
               claudeVersion,
               cliSupport,
+              codexSupport,
               openLogDir: revealLogDir,
               logDir,
               opencodeModels,

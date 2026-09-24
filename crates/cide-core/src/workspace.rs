@@ -129,6 +129,7 @@ pub fn open_project(
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: format!("{name} : claude"),
             docker: None,
         }),
@@ -161,6 +162,7 @@ pub fn open_project(
     );
 
     rebuild_windows(ws);
+    front(ws, id);
     bump(ws);
     Ok(id)
 }
@@ -597,8 +599,28 @@ pub fn reopen_project(
 
     ws.projects.insert(id, project);
     rebuild_windows(ws);
+    front(ws, id);
     bump(ws);
     Ok(id)
+}
+
+/// Make a project that was just opened the active one of the shell that holds it.
+///
+/// `rebuild_windows` keeps whatever the stacked shell had active before, which is right for
+/// every *other* rebuild (a close, a mode switch) and was wrong here: a project opened from the
+/// `+`, the recents list, the palette or the New project wizard was added to the header as a
+/// tab and left behind the one the user was already looking at, so the gesture seemed to do
+/// nothing. Opening is asking to see it. The already-open branch of both callers says the same
+/// thing through [`activate_project`]; this is the new-project half of that rule. No bump of
+/// its own — the caller bumps once for the whole open.
+fn front(ws: &mut Workspace, project: ProjectId) {
+    for role in ws.windows.values_mut() {
+        if let WindowRole::Shell { projects, active } = role
+            && projects.contains(&project)
+        {
+            *active = Some(project);
+        }
+    }
 }
 
 /// The layout half of [`reopen_project`]: everything that is decided from the record alone.
@@ -1795,12 +1817,14 @@ pub fn bind_session(
     tab: TabId,
     pane: PaneId,
     session: SessionId,
+    harness: Option<cide_ipc::Harness>,
 ) -> Result<()> {
     // The detached map first only when the tab does not hold it: an id is in one place or the
     // other, never both, and preferring the tab keeps the ordinary path a single lookup.
     if let Ok(t) = tab_mut(ws, project, tab)
         && let Some(p) = t.tree.panes.get_mut(&pane)
     {
+        stamp_harness(p, harness);
         p.session = Some(session);
         let primary = p.role == PaneRole::Primary;
         if primary {
@@ -1813,6 +1837,7 @@ pub fn bind_session(
     let Some(p) = proj.detached.get_mut(&pane) else {
         return Err(CoreError::NoSuchPane(pane));
     };
+    stamp_harness(p, harness);
     p.session = Some(session);
     // The console keeps its claim while detached — it is still the project's primary pane, it
     // is merely being shown somewhere else, and re-docking must not find the field stale.
@@ -1820,6 +1845,102 @@ pub fn bind_session(
         proj.primary_session = session;
     }
     Ok(())
+}
+
+/// Record which CLI a console pane now runs, as a spawn that just bound to it reported. (M93)
+///
+/// `None` leaves the pane as it was: a shell, a mirror, anything that is not a console spawn.
+/// Moving from one CLI to the other — Restart session after Settings → Harness changed — also
+/// forgets the conversation the *previous* CLI was on. That id names a claude transcript or a
+/// codex thread, and the new CLI has never heard of it: left in place, the next launch's restore
+/// would ask codex to resume a claude conversation, fail, and start fresh in a pane that said
+/// "Resume".
+fn stamp_harness(pane: &mut Pane, harness: Option<cide_ipc::Harness>) {
+    let Some(harness) = harness else {
+        return;
+    };
+    let was = pane.harness.unwrap_or(cide_ipc::Harness::Claude);
+    if was != harness {
+        pane.conversation = None;
+        pane.conversation_since = None;
+    }
+    // `None` for Claude, which is what every pane written before M93 says, so a workspace that
+    // only ever ran claude is byte-identical on disk.
+    pane.harness = (harness != cide_ipc::Harness::Claude).then_some(harness);
+    // The title's program word follows, when it is the word cide wrote: `cide : claude` becomes
+    // `cide : codex`. A title the user renamed says something else and is left alone.
+    let word = |h: cide_ipc::Harness| match h {
+        cide_ipc::Harness::Codex => "codex",
+        _ => "claude",
+    };
+    let (from, to) = (format!(" : {}", word(was)), format!(" : {}", word(harness)));
+    if from != to
+        && let Some(stem) = pane.title.strip_suffix(&from)
+    {
+        pane.title = format!("{stem}{to}");
+    }
+}
+
+/// The CLI a console pane runs. `None` in the field is Claude — see [`Pane::harness`].
+pub fn pane_harness(pane: &Pane) -> cide_ipc::Harness {
+    pane.harness.unwrap_or(cide_ipc::Harness::Claude)
+}
+
+/// The console harness of whichever pane holds `id`, as its session or as the conversation its
+/// CLI is on. (M93)
+///
+/// What a resume or a fork asks before it spawns: the conversation belongs to one CLI, and the
+/// pane that holds it is where that fact is recorded. `None` when no pane holds the id — a
+/// caller then keeps whatever program it was asked for.
+pub fn harness_holding(ws: &Workspace, id: SessionId) -> Option<cide_ipc::Harness> {
+    ws.projects
+        .values()
+        .flat_map(|project| {
+            project
+                .tabs
+                .iter()
+                .flat_map(|t| t.tree.panes.values())
+                .chain(project.detached.values())
+        })
+        .find(|pane| {
+            pane.kind == PaneKind::Claude
+                && (pane.session == Some(id) || pane.conversation == Some(id))
+        })
+        .map(pane_harness)
+}
+
+/// The codex thread a resume of `id` means. (M93)
+///
+/// A codex console's `session` is cide's routing id and never a codex thread — the TUI cannot
+/// be handed one — so a resume of a pane's session is a resume of the thread its hooks reported
+/// (`conversation`). An id that is already a thread (a restore plan names the conversation) is
+/// answered as itself.
+///
+/// A pane whose `continues` names `id` counts too: that is how a codex tab cide opened in a
+/// worktree is restored — `continues` pins the directory, under the id the tab was first spawned
+/// as, and the thread is whatever its hooks have reported since.
+pub fn codex_thread_of(ws: &Workspace, id: SessionId) -> Option<SessionId> {
+    let text = id.to_string();
+    let holder = ws
+        .projects
+        .values()
+        .flat_map(|project| {
+            project
+                .tabs
+                .iter()
+                .flat_map(|t| t.tree.panes.values())
+                .chain(project.detached.values())
+        })
+        .find(|pane| {
+            pane.session == Some(id)
+                || pane.conversation == Some(id)
+                || pane.continues.as_ref().is_some_and(|c| c.id.trim() == text)
+        });
+    match holder {
+        Some(pane) if pane.session == Some(id) => pane.conversation,
+        Some(pane) if pane.conversation != Some(id) => pane.conversation.or(Some(id)),
+        _ => Some(id),
+    }
 }
 
 /// Locate the tab that owns a pane.
@@ -2512,6 +2633,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         conversation: None,
         conversation_since: None,
         continues: None,
+        harness: None,
         title: title.to_string(),
         docker: None,
     }
@@ -2625,7 +2747,7 @@ mod tests {
         let before = project(&ws, id).expect("exists").primary_session;
 
         let restarted = SessionId::new();
-        bind_session(&mut ws, id, console, pane, restarted).expect("the pane binds");
+        bind_session(&mut ws, id, console, pane, restarted, None).expect("the pane binds");
 
         let p = project(&ws, id).expect("exists");
         assert_eq!(p.tabs[0].tree.panes[&pane].session, Some(restarted));
@@ -2637,6 +2759,84 @@ mod tests {
             before, restarted,
             "the fixture only means anything if it moved"
         );
+        validate(&ws).expect("still valid");
+    }
+
+    /// A console pane records the CLI a spawn ran, and moving it to the other CLI forgets the
+    /// conversation the first one was on — and renames `: claude` to `: codex`. (M93)
+    #[test]
+    fn a_console_moved_to_codex_forgets_its_claude_conversation() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("a console exists");
+        let pane = project(&ws, id).expect("exists").tabs[0].tree.focused;
+        let first = SessionId::new();
+        bind_session(
+            &mut ws,
+            id,
+            console,
+            pane,
+            first,
+            Some(cide_ipc::Harness::Claude),
+        )
+        .expect("binds");
+        let claude_conversation = SessionId::new();
+        assert!(note_conversation(&mut ws, first, claude_conversation, 1));
+        let title = |ws: &Workspace| {
+            project(ws, id).expect("exists").tabs[0].tree.panes[&pane]
+                .title
+                .clone()
+        };
+        assert!(title(&ws).ends_with(" : claude"), "{}", title(&ws));
+        assert_eq!(
+            harness_holding(&ws, claude_conversation),
+            Some(cide_ipc::Harness::Claude)
+        );
+
+        let second = SessionId::new();
+        bind_session(
+            &mut ws,
+            id,
+            console,
+            pane,
+            second,
+            Some(cide_ipc::Harness::Codex),
+        )
+        .expect("binds");
+        let p = &project(&ws, id).expect("exists").tabs[0].tree.panes[&pane];
+        assert_eq!(p.harness, Some(cide_ipc::Harness::Codex));
+        assert_eq!(
+            p.conversation, None,
+            "a claude transcript is nothing codex can resume"
+        );
+        assert!(p.title.ends_with(" : codex"), "{}", p.title);
+
+        // The codex thread arrives by hook; a resume of the pane's session means that thread.
+        let thread = SessionId::new();
+        assert!(note_conversation(&mut ws, second, thread, 2));
+        assert_eq!(codex_thread_of(&ws, second), Some(thread));
+        assert_eq!(codex_thread_of(&ws, thread), Some(thread));
+        assert_eq!(harness_holding(&ws, second), Some(cide_ipc::Harness::Codex));
+
+        // A non-console bind (`None`) changes nothing it does not own.
+        bind_session(&mut ws, id, console, pane, second, None).expect("binds");
+        let p = &project(&ws, id).expect("exists").tabs[0].tree.panes[&pane];
+        assert_eq!(p.harness, Some(cide_ipc::Harness::Codex));
+        assert_eq!(p.conversation, Some(thread));
+
+        // And back: Claude is stored as `None`, so a claude-only workspace is unchanged on disk.
+        bind_session(
+            &mut ws,
+            id,
+            console,
+            pane,
+            first,
+            Some(cide_ipc::Harness::Claude),
+        )
+        .expect("binds");
+        let p = &project(&ws, id).expect("exists").tabs[0].tree.panes[&pane];
+        assert_eq!(p.harness, None);
+        assert_eq!(p.conversation, None);
         validate(&ws).expect("still valid");
     }
 
@@ -2758,7 +2958,7 @@ mod tests {
         let second = split_console(&mut ws, id);
         let primary = project(&ws, id).expect("exists").primary_session;
 
-        bind_session(&mut ws, id, console, second, SessionId::new()).expect("the pane binds");
+        bind_session(&mut ws, id, console, second, SessionId::new(), None).expect("the pane binds");
 
         assert_eq!(project(&ws, id).expect("exists").primary_session, primary);
     }
@@ -2782,7 +2982,7 @@ mod tests {
         );
 
         let respawned = SessionId::new();
-        bind_session(&mut ws, id, console, extra, respawned).expect("a detached pane binds");
+        bind_session(&mut ws, id, console, extra, respawned, None).expect("a detached pane binds");
         assert_eq!(
             ws.projects[&id].detached[&extra].session,
             Some(respawned),
@@ -2797,7 +2997,7 @@ mod tests {
         let console = console_tab(&ws, id).expect("a console exists");
         let ghost = PaneId::new();
         assert_eq!(
-            bind_session(&mut ws, id, console, ghost, SessionId::new()),
+            bind_session(&mut ws, id, console, ghost, SessionId::new(), None),
             Err(CoreError::NoSuchPane(ghost)),
         );
     }
@@ -3476,11 +3676,11 @@ mod tests {
         assert_eq!(ws.rev, before, "no bump, so no broadcast");
 
         // And a real switch still moves rev, which is what a second window follows.
-        // (Opening a second project does not activate it — `rebuild_windows` keeps the
-        // previously active one — so switching *to* it is the genuine change here.)
-        let other = open(&mut ws, "/home/dev/work/other");
+        // (Opening a second project brings it to the front — see `front` — so switching
+        // *back* to the first is the genuine change here.)
+        let _other = open(&mut ws, "/home/dev/work/other");
         let before = ws.rev;
-        activate_project(&mut ws, other);
+        activate_project(&mut ws, id);
         assert_eq!(
             ws.rev,
             before + 1,
@@ -3809,8 +4009,8 @@ mod tests {
 
         let stays = SessionId::new();
         let goes = SessionId::new();
-        bind_session(&mut ws, id, console, docked, stays).expect("binds");
-        bind_session(&mut ws, id, console, extra, goes).expect("binds");
+        bind_session(&mut ws, id, console, docked, stays, None).expect("binds");
+        bind_session(&mut ws, id, console, extra, goes, None).expect("binds");
         detach_pane(&mut ws, id, console, extra).expect("detaches");
 
         let found = session_panes(&ws, None);
@@ -3847,8 +4047,8 @@ mod tests {
         let there = console_tab(&ws, theirs).expect("exists");
         let here_pane = tab(&ws, mine, here).expect("exists").tree.focused;
         let there_pane = tab(&ws, theirs, there).expect("exists").tree.focused;
-        bind_session(&mut ws, mine, here, here_pane, SessionId::new()).expect("binds");
-        bind_session(&mut ws, theirs, there, there_pane, SessionId::new()).expect("binds");
+        bind_session(&mut ws, mine, here, here_pane, SessionId::new(), None).expect("binds");
+        bind_session(&mut ws, theirs, there, there_pane, SessionId::new(), None).expect("binds");
 
         let narrowed = session_panes(&ws, Some(mine));
         assert_eq!(narrowed.len(), 1);
@@ -4475,7 +4675,11 @@ mod tests {
             panic!("stacked mode builds one shell window");
         };
         assert_eq!(projects, &vec![a, b]);
-        assert_eq!(*active, Some(a));
+        assert_eq!(
+            *active,
+            Some(b),
+            "the project opened last is the one in front"
+        );
         validate(&ws).expect("valid");
     }
 
@@ -4607,8 +4811,15 @@ mod tests {
         validate(&ws).expect("valid");
     }
 
+    /// Opening a project is asking to see it. (M97)
+    ///
+    /// This test said the opposite until M97 — *opening a project does not steal the focus* — and
+    /// the user-visible result was that every open, from the `+`, the recents list, the palette
+    /// or the New project wizard, added a header tab and left the window on the old project, so
+    /// the gesture looked as though it had done nothing. Every caller of `open_project` in the
+    /// app is a user gesture; nothing opens a project in the background on its own.
     #[test]
-    fn stacked_mode_keeps_the_active_project_it_already_had() {
+    fn stacked_mode_brings_a_newly_opened_project_to_the_front() {
         let mut ws = Workspace::default();
         let a = open(&mut ws, "/home/dev/a");
         let b = open(&mut ws, "/home/dev/b");
@@ -4624,14 +4835,22 @@ mod tests {
             },
         );
 
-        open(&mut ws, "/home/dev/c");
+        let c = open(&mut ws, "/home/dev/c");
+        let Some(WindowRole::Shell { active, .. }) = ws.windows.values().next() else {
+            panic!("one shell window");
+        };
+        assert_eq!(*active, Some(c), "the project just opened is the one shown");
+
+        // And a close afterwards still keeps whatever is active, which is the half of
+        // `rebuild_windows`' memory that was always right.
+        close_project(&mut ws, a, false).expect("closes");
         let Some(WindowRole::Shell { active, .. }) = ws.windows.values().next() else {
             panic!("one shell window");
         };
         assert_eq!(
             *active,
-            Some(b),
-            "opening a project does not steal the focus"
+            Some(c),
+            "closing another project leaves the front one alone"
         );
     }
 

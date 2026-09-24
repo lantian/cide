@@ -20,6 +20,8 @@ import type { ReactNode } from 'react'
 import type {
   ClaudeCliSupport,
   ClaudeSettings,
+  CodexCliSupport,
+  ConsoleHarness,
   EditorSettings,
   ExplorerSettings,
   GitSettings,
@@ -39,6 +41,7 @@ import {
   Group,
   NumberField,
   Note,
+  Part,
   PathReadout,
   Readout,
   Row,
@@ -56,6 +59,7 @@ import { FormattersSection } from './FormattersSection'
 import { MAX_UI_FONT_SIZE, MIN_UI_FONT_SIZE } from './fontScale'
 import { badge, handshakeNote, sentence } from './cliHandshake'
 import { ClaudeCliSection } from './ClaudeCliSection'
+import { CodexCliSection } from './CodexCliSection'
 import { ModelsSection } from './ModelsSection'
 import { ColorSchemeRow } from './ColorSchemeRow'
 import { GraphicsLadder } from './GraphicsLadder'
@@ -83,9 +87,12 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
       'Defaults are compiled in; your overrides layer on top. Conflicts are reported, never resolved for you.',
   },
   {
+    // The id is API and keeps its M16 spelling; the section has been about more than claude
+    // since M93, when codex became a console too.
     id: 'claudeSessions',
-    title: 'Claude sessions',
-    description: 'Which claude is launched, and the arguments and environment it is given.',
+    title: 'Harness',
+    description:
+      'Which CLI a console runs — Claude Code or Codex — and how each is launched: the binary, its arguments and environment.',
   },
   { id: 'editor', title: 'Editor', description: 'The code buffer.' },
   {
@@ -155,6 +162,8 @@ export interface SectionProps {
    * range it is measured against lives in Rust — see `cide_claude::version`.
    */
   cliSupport: ClaudeCliSupport | null
+  /** Settings → Harness → Codex's readout, computed in Rust. (M93) `null` before it answers. */
+  codexSupport: CodexCliSupport | null
   /** Reveal the log directory. Resolves to the path, whether or not a file manager opened. */
   openLogDir: () => void
   /** The log directory once it has been resolved, so it can be shown and copied. */
@@ -334,6 +343,59 @@ function CliHandshakeRow({ support }: { support: ClaudeCliSupport }) {
   const note = handshakeNote(support, Date.now())
   return (
     <Row label="Last handshake" hint={sentence(note)} control={<span>{badge(support)}</span>} />
+  )
+}
+
+const HARNESSES: readonly { value: ConsoleHarness; label: string }[] = [
+  { value: 'claude', label: 'Claude Code' },
+  { value: 'codex', label: 'Codex' },
+]
+
+/**
+ * Which CLI a console runs. (M93)
+ *
+ * Read at one moment only — when a console spawns a *fresh* conversation — so the hint says
+ * exactly that: an open console keeps the CLI it was started with, and so does its Resume, and
+ * Restart session is how a user moves one over. Agent runs are not governed by it: a role runs
+ * the harness its definition names.
+ */
+function HarnessChoice({ settings, patch }: SectionProps) {
+  return (
+    <Group title="Console">
+      <Row
+        label="Harness"
+        hint="Which CLI a new console runs — the project’s pinned tab, a new pane, a tab cide opens by itself, and the one-shots behind Generate commit message. A console that is already running keeps its CLI and its Resume; Restart session starts the one chosen here. Agent roles are not affected: each runs the harness its definition names, Claude Code when it names none."
+        control={
+          <Segmented
+            label="Console harness"
+            value={settings.consoleHarness}
+            options={HARNESSES}
+            onChange={(consoleHarness) => patch({ consoleHarness })}
+          />
+        }
+      />
+    </Group>
+  )
+}
+
+function CodexSessionsSection({ settings, patch, codexSupport }: SectionProps) {
+  const codex = settings.codex
+  return (
+    <>
+      <Note title={codexSupport?.version ?? (codexSupport?.problem != null ? 'codex cannot be run' : 'Codex')}>
+        cide never sets OPENAI_API_KEY or CODEX_API_KEY: a key outranks a ChatGPT login and moves
+        billing to API credits. A codex console gets cide’s hooks, task tools and roster through{' '}
+        <code>-c</code> overrides on its own command line — nothing is written to your{' '}
+        <code>~/.codex/config.toml</code> or the project’s <code>.codex/</code>. What codex has
+        no equivalent for: the inline diffs and diagnostics of Claude Code’s IDE protocol, and the
+        token and cost readout of its statusline.
+      </Note>
+      <CodexCliSection
+        cli={codex.cli}
+        onChange={(cli) => patch({ codex: { ...codex, cli } })}
+        support={codexSupport}
+      />
+    </>
   )
 }
 
@@ -745,7 +807,23 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       // `SECTIONS` entry, and a `case` here.
       return (
         <>
-          <ClaudeSessionsSection {...props} />
+          <HarnessChoice {...props} />
+          {/* Only the chosen CLI's options (M93): two full launch configurations one under the
+              other read as one long form whose half is inert, and the user asked to see the one
+              the switch names. The other half is still stored and still used — a role whose
+              harness is codex runs Settings → Harness → Codex whatever the console is — and
+              flipping the switch shows it. */}
+          {props.settings.consoleHarness === 'codex' ? (
+            <>
+              <Part title="Codex" />
+              <CodexSessionsSection {...props} />
+            </>
+          ) : (
+            <>
+              <Part title="Claude Code" />
+              <ClaudeSessionsSection {...props} />
+            </>
+          )}
           <ProxySection proxy={props.settings.proxy} patch={props.patch} />
         </>
       )

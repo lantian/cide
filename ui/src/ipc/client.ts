@@ -622,6 +622,14 @@ export const fs = {
   collapse: (projectId: ProjectId, path: string) =>
     invoke<number>('fs_collapse', { project: projectId, path }),
 
+  /** *Expand all*: every walked directory the watcher would watch, so never `target/`. (M96) */
+  expandAll: (projectId: ProjectId) =>
+    invoke<number>('fs_expand_all', { project: projectId }),
+
+  /** *Collapse all*: every directory and group, the roots excepted. (M96) */
+  collapseAll: (projectId: ProjectId) =>
+    invoke<number>('fs_collapse_all', { project: projectId }),
+
   /**
    * Re-scan everything under one folder against the disk. The tree's *Refresh* menu item,
    * and the manual answer to the corner the watcher deliberately leaves dark: an ignored
@@ -5214,4 +5222,120 @@ export const pools = {
   /** Clear one target's bench, or every bench with `null`, and rewind the runs waiting past it. */
   reset: (entry: import('./generated').PoolEntry | null) =>
     invoke<void>('llm_pool_reset', { entry }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Settings → Harness → Codex. (M93)
+ *
+ * The codex launch configuration's whole readout, computed in Rust (`cmd::settings::
+ * codex_cli_support`): the binary's verdict, what `--version` printed, a verdict per argument and
+ * per environment row, and the resolved argv. Hand-mirrored like `ClaudeCliSupport`, because the
+ * Rust type is a plain `serde::Serialize` local to that module.
+ *
+ * Unlike the claude screen there is no TypeScript port of the rules to strike tokens out as they
+ * are typed — every verdict arrives here, one round trip per committed edit — so there is no
+ * second copy of `cide_core::codex_cli` to drift.
+ * --------------------------------------------------------------------------------------- */
+export interface CodexCliNote {
+  /** The row's index in the stored list. */
+  index: number
+  /** Refused rows never reach the child. */
+  refused: boolean
+  /** Why, or what to know. */
+  reason: string | null
+}
+
+export interface CodexCliSupport {
+  /** The configured binary this verdict is about, echoed back. Empty before the first answer. */
+  binary: string
+  resolved: string | null
+  problem: string | null
+  version: string | null
+  argNotes: CodexCliNote[]
+  envNotes: CodexCliNote[]
+  /** A fresh codex console's argv, program first; `ours` marks what cide adds. */
+  argv: { text: string; ours: boolean }[]
+}
+
+export const codexCli = {
+  /** Degrades to an empty readout rather than throwing: it renders inside a settings section. */
+  support: (): Promise<CodexCliSupport> =>
+    pendingCommand<CodexCliSupport>(
+      'codex_cli_support',
+      () => invoke<CodexCliSupport>('codex_cli_support'),
+      {
+        binary: '',
+        resolved: null,
+        problem: null,
+        version: null,
+        argNotes: [],
+        envNotes: [],
+        argv: [],
+      },
+    ),
+}
+
+/* ------------------------------------------------------------------------------------------
+ * What is *working* in each project — the header project tab's badge. (M94)
+ *
+ * A standalone block with its own type import at the end of the file, which is this file's
+ * house rule for a new capability: `onSessionAwaiting`'s block above does the same, and
+ * reaching into the big literals at the top to add one line is how two features end up
+ * conflicting in a merge over a surface neither of them touched.
+ *
+ * There is deliberately **no setter half** here, where `awaiting` has one. That feature needs
+ * the webview to report acknowledgement, which is a click Rust never sees; this one needs
+ * nothing from this end at all — every fact behind the number is in a Rust registry, for every
+ * project, including the ones this window is not drawing. See `panes/running.ts`.
+ * --------------------------------------------------------------------------------------- */
+import type { ProjectRunning, ProjectRunningSet } from './generated'
+
+export const running = {
+  /**
+   * The counts as Rust currently computes them.
+   *
+   * `cide://project-running` below is a *change* notification, so a window that opens between
+   * two changes has heard nothing — and a window built by a detach is exactly that. The `at` on
+   * the answer is what lets the caller drop a reply a broadcast overtook.
+   */
+  current: () => invoke<ProjectRunningSet>('project_running_counts'),
+}
+
+/**
+ * Subscribe to the counts. The whole set every time, and projects with nothing running are
+ * omitted rather than carried as zeroes — absence is the message.
+ */
+export const onProjectRunning = (handler: (projects: ProjectRunning[], at: number) => void) =>
+  listen<ProjectRunningSet>('cide://project-running', (e) =>
+    handler(e.payload.projects, e.payload.at),
+  )
+
+/* -----------------------------------------------------------------------------------------
+ * The New project wizard. (M97)
+ *
+ * Its own block at the end, per the append-only rule. Three commands and one event, all
+ * `cmd::new_project`'s — see its header for what each step does and which failures stop it.
+ * --------------------------------------------------------------------------------------- */
+import type {
+  NewProjectOutcome,
+  NewProjectProbe,
+  NewProjectProgress,
+  NewProjectRequest,
+} from './generated'
+
+export const newProjectApi = {
+  /** What is at a typed path: exists, empty, a repository, OpenSpec already, the CLI missing. */
+  probe: (path: string) => invoke<NewProjectProbe>('project_new_probe', { path }),
+  /**
+   * One folder, from the parented picker with a New Folder row. `null` means cancelled.
+   *
+   * Not `projectMenu.browse` — that one is multi-select and says *Open* — and never the dialog
+   * plugin's `open()`, for the reason `projectMenu.browse` gives.
+   */
+  pickLocation: () => invoke<string | null>('project_pick_location'),
+  /** Create and open. Resolves with every failed step even when the project opened. */
+  create: (request: NewProjectRequest) => invoke<NewProjectOutcome>('project_new', { request }),
+  /** A step started, finished or failed. Sent to every window; only a wizard listens. */
+  onProgress: (handler: (progress: NewProjectProgress) => void) =>
+    listen<NewProjectProgress>('cide://project-new-progress', (e) => handler(e.payload)),
 }

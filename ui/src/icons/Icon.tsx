@@ -45,7 +45,14 @@ import type { IconSize } from './iconElement'
 type Common = {
   /** Defaults to `2` — a 16px box, which is the row-and-toolbar size most of the app wants. */
   size?: IconSize
-  className?: string
+  /**
+   * `| undefined` explicitly, because `exactOptionalPropertyTypes` is on and Vite types every
+   * `*.module.css` as `Record<string, string>` under `noUncheckedIndexedAccess` — so
+   * `styles.foo` is `string | undefined` and a bare `className?: string` cannot be handed one.
+   * Every DOM element in the app types it this way, which is why no caller had hit it until a
+   * mark needed a class of its own (`chrome/AppHeader.module.css`'s spinning chip).
+   */
+  className?: string | undefined
   /** Supply only when the icon is the sole content and nothing around it carries the name. */
   label?: string
 }

@@ -721,6 +721,7 @@ fn open_diff_tab(app: &AppHandle, project: ProjectId, broker: &DiffBroker, reque
         conversation: None,
         conversation_since: None,
         continues: None,
+        harness: None,
         title,
         docker: None,
     };
@@ -894,6 +895,9 @@ mod tests {
         let beacon =
             cide_core::workspace::open_project(&mut ws, vec!["/home/dev/beacon".into()], None)
                 .expect("a rooted project opens");
+        // On the first, so the active-first rule and header order agree and the assertion is
+        // about the *set*. An open brings its project to the front (M97).
+        cide_core::workspace::activate_project(&mut ws, atlas);
 
         let served: Vec<ProjectId> = servable_projects(&ws)
             .into_iter()
@@ -938,14 +942,20 @@ mod tests {
     #[test]
     fn a_workspace_full_of_projects_is_capped() {
         let mut ws = Workspace::default();
-        for i in 0..40 {
-            cide_core::workspace::open_project(
-                &mut ws,
-                vec![format!("/home/dev/p{i}").into()],
-                None,
-            )
-            .expect("a rooted project opens");
-        }
+        let ids: Vec<ProjectId> = (0..40)
+            .map(|i| {
+                cide_core::workspace::open_project(
+                    &mut ws,
+                    vec![format!("/home/dev/p{i}").into()],
+                    None,
+                )
+                .expect("a rooted project opens")
+            })
+            .collect();
+        // Showing the leftmost, so header order is the whole story here; the visible project
+        // jumping the queue has its own test below. An open brings its project to the front
+        // (M97), so the fortieth would otherwise be the one on screen.
+        cide_core::workspace::activate_project(&mut ws, ids[0]);
 
         let served = servable_projects(&ws);
         assert_eq!(served.len(), 32);
@@ -973,8 +983,9 @@ mod tests {
                 .expect("a rooted project opens")
             })
             .collect();
-        // Through the real gesture: `rebuild_windows` leaves `active` on the first project
-        // opened, and clicking the fortieth header tab is what moves it.
+        // Through the real gesture: the first project is clicked back to the front (an open
+        // brings the newest there, M97), then the fortieth header tab is clicked.
+        cide_core::workspace::activate_project(&mut ws, ids[0]);
         let on_screen = ids[39];
         cide_core::workspace::activate_project(&mut ws, on_screen);
 

@@ -14,6 +14,8 @@
   "cide://keymap-changed",
   "cide://milestones-changed",
   "cide://mouse-nav",
+  "cide://project-new-progress",
+  "cide://project-running",
   "cide://remote-changed",
   "cide://remote-scroll",
   "cide://schemes-changed",

@@ -39,6 +39,12 @@ pub mod ext_assets;
 /// One store and not one per project — an extension is a tool the user chose, not a fact about a
 /// repository. `ext_state.rs`'s header argues it, and `cide_ext::config`'s argues the file layout.
 pub mod ext_state;
+/// What is working in each project, for the header's project-tab badge — and the arithmetic
+/// [`spinner`] reads to decide a project has gone quiet. (M94)
+///
+/// One definition of *busy* serving both, deliberately: its header says why a second would be
+/// wrong, and why this one is Rust's to compute rather than the webview's.
+pub mod running;
 mod spec_reveal;
 mod spec_state;
 mod spec_triggers;
@@ -564,6 +570,9 @@ pub fn run() {
             cmd::project::project_close,
             cmd::project::project_reorder,
             cmd::project::project_pick,
+            cmd::new_project::project_new_probe,
+            cmd::new_project::project_pick_location,
+            cmd::new_project::project_new,
             cmd::project::project_recent,
             cmd::project::project_open_recent,
             cmd::project::project_forget_recent,
@@ -600,6 +609,7 @@ pub fn run() {
             cmd::settings::claude_commit_message,
             cmd::settings::claude_explain_selection,
             cmd::settings::claude_cli_support,
+            cmd::settings::codex_cli_support,
             cmd::settings::app_open_log_dir,
             cmd::settings::scheme_import,
             cmd::settings::scheme_remove,
@@ -620,6 +630,7 @@ pub fn run() {
             cmd::remote::remote_device_forget,
             cmd::remote::remote_device_rename,
             cmd::window::window_awaiting_sessions,
+            cmd::project::project_running_counts,
             cmd::fs::fs_index,
             cmd::fs::fs_close,
             cmd::fs::fs_status,
@@ -630,6 +641,8 @@ pub fn run() {
             cmd::fs::fs_expand,
             cmd::fs::fs_refresh,
             cmd::fs::fs_collapse,
+            cmd::fs::fs_collapse_all,
+            cmd::fs::fs_expand_all,
             cmd::fs::fs_reveal,
             cmd::fs::fs_show_in_manager,
             cmd::fs::fs_paths_exist,

@@ -1671,6 +1671,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "cide : claude".into(),
             docker: None,
         }
@@ -1685,6 +1686,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "cide : bash".into(),
             docker: None,
         }
@@ -3073,6 +3075,7 @@ mod tests {
             conversation: None,
             conversation_since: None,
             continues: None,
+            harness: None,
             title: "workspace.rs".into(),
             docker: None,
         };

@@ -524,20 +524,14 @@
  * are offering it.
  */
 .primary {
+  composes: primary from '../../styles/buttons.module.css';
   appearance: none;
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  color: var(--on-accent);
+  border: 1px solid transparent;
   font: inherit;
   font-size: var(--fs-ui-11);
   padding: 2px 9px;
   border-radius: var(--r-2);
   cursor: pointer;
-}
-
-.primary:hover:not(:disabled) {
-  background: var(--accent-hi);
-  border-color: var(--accent-hi);
 }
 
 .action {
@@ -561,13 +555,11 @@
   color: var(--text);
 }
 
-.primary:disabled,
 .action:disabled {
   opacity: 0.4;
   cursor: default;
 }
 
-.primary:focus-visible,
 .action:focus-visible {
   outline: var(--focus-ring);
   outline-offset: 2px;

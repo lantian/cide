@@ -1,0 +1,716 @@
+/*
+ * The New project wizard. (M97)
+ *
+ * Two columns inside `OverlayCard`: a rail with the steps of the chosen road, and the step
+ * itself over a footer. Every size around text follows `--ui-scale` (literal first, per
+ * `check:ui-scale`), every type size is a rung of the ladder, and the only things that move are
+ * paint properties on `--dur-*` — `check:motion`'s two rules.
+ */
+
+/*
+ * Wider than the 620px every other card shares: three type cards side by side need it. The
+ * attribute raises the specificity above `Overlay.module.css`'s `.card`, whose load order
+ * relative to this sheet is the bundler's business, not something to rely on.
+ */
+.card[role='dialog'] {
+  width: calc(880px * var(--ui-scale));
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: calc(196px * var(--ui-scale)) minmax(0, 1fr);
+  flex: 1 1 auto;
+  /* The card caps its own height at the window; below that cap the wizard keeps one height for
+     every step, so Continue does not make the card jump. */
+  min-height: min(calc(540px * var(--ui-scale)), calc(100vh - 128px));
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* --- the rail ---------------------------------------------------------------------------- */
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--grad-accent-soft), var(--panel-2);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-7) var(--sp-6) var(--sp-6);
+}
+
+.brandMark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(26px * var(--ui-scale));
+  height: calc(26px * var(--ui-scale));
+  border-radius: var(--r-2);
+  background: var(--grad-accent);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-1);
+}
+
+.brandText {
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.stepper {
+  list-style: none;
+  margin: 0;
+  padding: var(--sp-3) var(--sp-6);
+}
+
+.stepItem {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  padding: var(--sp-3) 0;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+/* The thread between two dots. */
+.stepItem:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  left: calc(11px * var(--ui-scale));
+  top: calc(30px * var(--ui-scale));
+  bottom: -6px;
+  width: 1px;
+  background: var(--border);
+}
+
+.stepItem[data-state='done']:not(:last-child)::after {
+  background: var(--accent-dim);
+}
+
+.stepDot {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(22px * var(--ui-scale));
+  height: calc(22px * var(--ui-scale));
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  background: var(--panel);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  color: var(--dim);
+  transition:
+    background-color var(--dur-2) var(--ease-out),
+    border-color var(--dur-2) var(--ease-out),
+    color var(--dur-2) var(--ease-out);
+}
+
+.stepItem[data-state='current'] .stepDot {
+  border-color: transparent;
+  background: var(--grad-accent);
+  color: var(--on-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.stepItem[data-state='current'] .stepName {
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.stepItem[data-state='done'] .stepDot {
+  border-color: var(--accent-dim);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  color: var(--accent);
+}
+
+.stepItem[data-state='done'] .stepName {
+  color: var(--text);
+}
+
+.railNote {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-6);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--faint);
+}
+
+/* --- the step ---------------------------------------------------------------------------- */
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-7) calc(28px * var(--ui-scale)) var(--sp-6);
+  /*
+   * A step arrives with a short rise. An animation rather than a transition because the node is
+   * new — `key={step}` remounts it — and a transition needs a before. On `--dur-2`, so reduced
+   * motion (which zeroes it in `tokens.css`) shows the step at once.
+   */
+  animation: new-project-enter var(--dur-2) var(--ease-out);
+}
+
+@keyframes new-project-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.heading {
+  margin-bottom: var(--sp-6);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--fs-ui-16);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.lead {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-ui-13);
+  line-height: 1.5;
+  color: var(--dim);
+  max-width: calc(600px * var(--ui-scale));
+}
+
+.banner {
+  height: calc(118px * var(--ui-scale));
+  margin-bottom: var(--sp-6);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-3);
+  background: var(--grad-accent-soft), var(--panel-2);
+}
+
+/* --- step 1: the three types ------------------------------------------------------------- */
+
+.kinds {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-5);
+}
+
+.kind {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out),
+    background-color var(--dur-1) var(--ease-out);
+}
+
+.kind:hover {
+  border-color: var(--accent-dim);
+  box-shadow: var(--shadow-2);
+}
+
+.kind:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.kind[data-on='true'] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel));
+  box-shadow:
+    0 0 0 1px var(--accent),
+    var(--shadow-2);
+}
+
+.kindArt {
+  display: block;
+  height: calc(112px * var(--ui-scale));
+  padding: var(--sp-3);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--grad-accent-soft), var(--panel-2);
+}
+
+.kindTitle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-5) var(--sp-5) var(--sp-2);
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.kindCheck {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(18px * var(--ui-scale));
+  height: calc(18px * var(--ui-scale));
+  border-radius: var(--r-full);
+  background: var(--grad-accent);
+  color: var(--on-accent);
+}
+
+.kindPitch {
+  padding: 0 var(--sp-5);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+.points {
+  margin: var(--sp-4) 0 0;
+  padding: 0 var(--sp-5) var(--sp-5) calc(26px * var(--ui-scale));
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.points li::marker {
+  color: var(--accent);
+}
+
+/* --- fields ------------------------------------------------------------------------------ */
+
+.label {
+  display: block;
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.optional {
+  margin-left: var(--sp-3);
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.pathRow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+}
+
+.pathIcon {
+  position: absolute;
+  left: calc(10px * var(--ui-scale));
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  color: var(--dim);
+  pointer-events: none;
+}
+
+.pathInput,
+.textarea {
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--bg);
+  color: var(--text-hi);
+  font-family: inherit;
+  font-size: var(--fs-ui-13);
+  -webkit-user-select: text;
+  user-select: text;
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
+}
+
+.pathInput {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: calc(32px * var(--ui-scale));
+  padding: 0 var(--sp-5) 0 calc(34px * var(--ui-scale));
+  font-family: var(--font-mono);
+}
+
+.textarea {
+  display: block;
+  width: 100%;
+  min-height: calc(96px * var(--ui-scale));
+  padding: var(--sp-5) var(--sp-5);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.pathInput:focus,
+.textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.pathInput::placeholder,
+.textarea::placeholder {
+  color: var(--faint);
+}
+
+.fieldHint {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.verdict {
+  min-height: calc(30px * var(--ui-scale));
+  margin-top: var(--sp-4);
+}
+
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border-radius: var(--r-2);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+}
+
+.note > svg {
+  flex: none;
+  margin-top: calc(2px * var(--ui-scale));
+}
+
+.note[data-tone='ok'] {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+}
+
+.note[data-tone='warn'] {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 12%, transparent);
+}
+
+.note[data-tone='bad'] {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+}
+
+.note[data-tone='info'] {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.fact {
+  margin: 0 0 var(--sp-2) var(--sp-2);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-5);
+  margin-top: var(--sp-6);
+  padding: var(--sp-5) var(--sp-6);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-3);
+  background: var(--panel);
+  cursor: pointer;
+  transition: border-color var(--dur-1) var(--ease-out);
+}
+
+.toggle:hover {
+  border-color: var(--accent-dim);
+}
+
+.toggle[data-disabled='true'] {
+  cursor: default;
+}
+
+.toggle input {
+  margin: calc(2px * var(--ui-scale)) 0 0;
+  accent-color: var(--accent);
+}
+
+.toggle strong {
+  display: block;
+  font-size: var(--fs-ui-13);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.toggleHint {
+  display: block;
+  margin-top: var(--sp-1);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+/* --- subagents, the brief ---------------------------------------------------------------- */
+
+.features {
+  list-style: none;
+  display: grid;
+  gap: var(--sp-5);
+  margin: 0 0 var(--sp-6);
+  padding: 0;
+}
+
+.features li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-5);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+.features li > svg {
+  flex: none;
+  color: var(--accent);
+}
+
+.features strong {
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.plan {
+  margin-top: var(--sp-6);
+  padding: var(--sp-5) var(--sp-6);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-3);
+}
+
+.planTitle {
+  display: block;
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.planList {
+  margin: 0;
+  padding-left: calc(18px * var(--ui-scale));
+  font-size: var(--fs-ui-12);
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.planList li::marker {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* --- create ------------------------------------------------------------------------------ */
+
+.summary {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  overflow: hidden;
+}
+
+.summaryRow {
+  display: grid;
+  grid-template-columns: calc(110px * var(--ui-scale)) minmax(0, 1fr);
+  gap: var(--sp-5);
+  padding: var(--sp-4) var(--sp-6);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-12);
+}
+
+.summaryRow:last-child {
+  border-bottom: none;
+}
+
+.summaryRow:nth-child(odd) {
+  background: var(--panel);
+}
+
+.summaryRow dt {
+  color: var(--dim);
+}
+
+.summaryRow dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-hi);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-5);
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-13);
+  color: var(--faint);
+  transition: color var(--dur-2) var(--ease-out);
+}
+
+.check:last-child {
+  border-bottom: none;
+}
+
+.checkMark {
+  flex: none;
+  display: flex;
+}
+
+.checkBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.checkDetail {
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--dim);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.check[data-state='running'] {
+  color: var(--text-hi);
+}
+
+.check[data-state='running'] .checkMark {
+  color: var(--accent);
+}
+
+.check[data-state='done'] {
+  color: var(--text);
+}
+
+.check[data-state='done'] .checkMark {
+  color: var(--green);
+}
+
+.check[data-state='failed'] {
+  color: var(--text-hi);
+}
+
+.check[data-state='failed'] .checkMark {
+  color: var(--red);
+}
+
+/* A loop, so reduced motion is answered through `--motion-loop`, `AgentsPanel`'s `.glyphSpin`
+   rule: a zeroed duration on an infinite animation strobes. */
+.spin {
+  animation: new-project-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes new-project-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* --- footer and buttons ------------------------------------------------------------------ */
+
+.foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-5) calc(28px * var(--ui-scale));
+  border-top: 1px solid var(--border);
+}
+
+.footNote {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.primary,
+.ghost {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: calc(30px * var(--ui-scale));
+  padding: 0 var(--sp-6);
+  border-radius: var(--r-2);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+/* The app's one primary look started here; it now lives in `styles/buttons.module.css` so every
+   other primary button can take it, and Continue takes it back from there. */
+.primary {
+  composes: primary from '../../styles/buttons.module.css';
+  border: 1px solid transparent;
+}
+
+.ghost {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out);
+}
+
+.ghost:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  background: var(--panel-2);
+}
+
+.ghost:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.ghost:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}

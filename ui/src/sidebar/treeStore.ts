@@ -306,6 +306,12 @@ interface FileTreeStore {
   /** Expand or collapse a directory row. */
   toggle: (row: TreeRow) => Promise<void>
   /**
+   * The Explorer header's *Expand all* / *Collapse all* (M96). Rust decides what "all" means
+   * — `Index::set_all_expanded` leaves ignored folders shut and the roots open — and this
+   * drops every cached chunk, since every row below the first folder may have moved.
+   */
+  setAllExpanded: (expanded: boolean) => Promise<void>
+  /**
    * Re-scan everything under one folder against the disk — the context menu's *Refresh*.
    *
    * Not [`refresh`], which revalidates the rows the index already holds: this one tells the
@@ -713,6 +719,22 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     retainCacheBelow(keepBelow)
     const kept = new Map([...get().chunks].filter(([index]) => index < keepBelow))
     set({ count, chunks: kept, degraded: isDegraded(name) })
+  },
+
+  async setAllExpanded(expanded) {
+    const { project } = get()
+    if (project === null) return
+    const name = expanded ? 'fs_expand_all' : 'fs_collapse_all'
+    const count = await tree(
+      name,
+      () => (expanded ? fsApi.expandAll(project) : fsApi.collapseAll(project)),
+      get().count,
+    )
+    // `refreshDir`'s guard: a project swapped out under the round trip must not be sized by
+    // this one's count.
+    if (get().project !== project) return
+    resetCache()
+    set({ count, chunks: new Map(), degraded: isDegraded(name) })
   },
 
   async refreshDir(path) {

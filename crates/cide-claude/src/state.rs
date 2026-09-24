@@ -94,6 +94,11 @@ pub fn next_state(current: SessionState, event: HookEvent) -> Option<SessionStat
         // The exit code is not in the hook payload; the PTY reaper supplies it. Reporting 0
         // here would claim a clean exit for a session that may have crashed.
         HookEvent::SessionEnd => return None,
+
+        // Codex names the approval prompt itself (M93), so unlike a Claude `Notification`
+        // there is no prose to read: this *is* the turn blocked on a human. The next tool
+        // traffic or `Stop` moves it on, exactly as it does after a Claude permission prompt.
+        HookEvent::PermissionRequest => SessionState::AwaitingPermission,
     };
 
     if next == current { None } else { Some(next) }
@@ -207,6 +212,22 @@ mod tests {
             &json!({"message": "Claude is waiting for your input"})
         ));
         assert!(!is_permission_request(&json!({})));
+    }
+
+    #[test]
+    fn a_codex_approval_prompt_is_awaiting_permission_and_tool_traffic_ends_it() {
+        let s = next_state(SessionState::Busy, HookEvent::PermissionRequest)
+            .expect("busy -> awaiting permission");
+        assert_eq!(s, SessionState::AwaitingPermission);
+        assert!(
+            s.is_live(),
+            "a prompt blocked on a human must confirm on close"
+        );
+        assert_eq!(
+            next_state(s, HookEvent::PostToolUse),
+            Some(SessionState::Busy),
+            "the approved tool ran: the turn is working again"
+        );
     }
 
     #[test]

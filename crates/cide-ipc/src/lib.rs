@@ -27,6 +27,8 @@ pub mod image;
 pub mod keymap;
 pub mod llm;
 pub mod milestones;
+/// The New project wizard: a probe of a path, a request, a checklist. (M97)
+pub mod new_project;
 pub mod overrides;
 /// Per-file view memory. Its own module, and deliberately not part of [`workspace`] — the
 /// header of `positions.rs` says why at length.
@@ -54,6 +56,10 @@ pub use milestones::{
     CheckResult, GateState, Milestone, MilestonePlan, MilestoneTask, MilestoneTasks,
     MilestonesView, VerifyState,
 };
+pub use new_project::{
+    NewProjectKind, NewProjectOutcome, NewProjectProbe, NewProjectProgress, NewProjectRequest,
+    NewProjectStep, NewProjectStepState,
+};
 pub use overrides::{AgentOverride, AgentOverrides, ProjectOverrides};
 pub use positions::{MarkdownView, ViewPosition};
 pub use properties::{
@@ -61,13 +67,14 @@ pub use properties::{
 };
 pub use proposals::{Proposal, ProposalChange, ProposedFile};
 pub use settings::{
-    ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
-    DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,
-    GraphicsSettings, HighlightLevel, InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS,
-    MAX_UI_FONT_SIZE, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, ProxyMode,
-    ProxyScope, ProxySettings, ProxyTarget, RemoteBind, RemoteSettings, SIDEBAR_MAX_WIDTH,
-    SIDEBAR_MIN_WIDTH, Settings, SeverityFilter, SidebarSettings, TerminalRenderer,
-    TerminalSettings, clamp_font_size, clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
+    ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings, CodexCli,
+    CodexInjections, CodexSettings, ConsoleHarness, DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE,
+    EditorSettings, ExplorerSettings, GitSettings, GraphicsSettings, HighlightLevel,
+    InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MAX_UI_FONT_SIZE,
+    MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, ProxyMode, ProxyScope,
+    ProxySettings, ProxyTarget, RemoteBind, RemoteSettings, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    Settings, SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, clamp_font_size,
+    clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem, KeymapReport,
@@ -726,6 +733,68 @@ pub struct SessionSummary {
     pub project_name: String,
     pub pane_title: String,
     pub state: SessionState,
+}
+
+/// How much of one project is *working* right now — the header project tab's badge. (M94)
+///
+/// Two numbers rather than one, because the tooltip has to name both halves: "2 running" over a
+/// project with two agent runs and a console the user is typing in is a number they cannot act
+/// on, and the chip itself is capped at `9+` so the sentence is the only place the real figure
+/// appears.
+///
+/// # Working, not merely alive
+///
+/// `crate::app`'s two predicates decide it (`cide_app::running`), and they are the spinner's own
+/// — a badge computed from a fourth definition of *busy* would disagree with the auto-spin timer
+/// on exactly the days the exceptions matter. An idle console at a prompt is not counted, and
+/// neither is a session that has finished its turn and is waiting for the user: that is the
+/// *awaiting* marker's job (`cide://session-awaiting`), and the two chips sit side by side on one
+/// tab. They must never describe the same session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ProjectRunning {
+    pub project: ProjectId,
+    /// Agent runs holding a child or a claim on one.
+    pub runs: u32,
+    /// Console panes mid-turn, at a permission prompt, frozen, or still starting.
+    ///
+    /// **De-duplicated by session**: a mirrored pane is two panes showing one child, and a
+    /// count that said `2` about it would be counting windows onto a thing rather than the
+    /// thing — `ui/src/panes/awaitingRule.ts` argues the same point for the marker beside it.
+    pub panes: u32,
+}
+
+/// Every project with something running, and the generation that produced the answer.
+///
+/// One type for the event payload **and** the catch-up command's reply, so a window cannot parse
+/// the broadcast and the answer differently.
+///
+/// **Projects with nothing running are omitted.** [`crate::SessionSummary`]'s neighbour
+/// `cide://session-awaiting` established the rule and it is the same one: the set is complete by
+/// construction, so absence is the message "nothing running here", and the reader needs no
+/// second notion of *unknown*.
+///
+/// # Why there is a generation on it
+///
+/// `at` is a process-wide counter, not a clock. `cide://project-running` is a *change*
+/// notification, so a window that opened between two changes has heard nothing and must ask —
+/// and the reply describes the set as it was when the question landed, which a broadcast can
+/// overtake on the way back. Without a number to compare, such a window settles on a stale count
+/// and stays there until the next genuine change, which for a long-running agent is many minutes
+/// of a wrong badge with nothing logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ProjectRunningSet {
+    pub projects: Vec<ProjectRunning>,
+    /// `number` and not ts-rs' default `bigint` for a `u64`, which is the right call here and
+    /// not everywhere: this one is *compared*, on the receiving side, against a sentinel the
+    /// frontend starts at `-1`, and a `bigint < number` comparison is a `TypeError` at runtime
+    /// rather than a type error at build. It is a counter that would take a million years at
+    /// one bump a microsecond to leave the exact-integer range, so nothing is lost.
+    #[ts(type = "number")]
+    pub at: u64,
 }
 
 /// A file tab whose buffer holds edits that have not been written to disk.

@@ -110,6 +110,7 @@ import { LogDetailCard } from '@/chrome/LogDetailCard'
 import { PullStrategyGate } from '@/chrome/PullStrategyGate'
 import { FileProperties } from '@/chrome/FileProperties'
 import { PushDialog } from '@/chrome/PushDialog'
+import { NewProjectWizard } from '@/chrome/newProject/NewProjectWizard'
 import { ConflictsDialog } from '@/chrome/ConflictsDialog'
 import { requestOutsideOpen } from '@/chrome/outsideOpenStore'
 import { outsideAsk } from '@/terminal/outsideOpen'
@@ -1293,6 +1294,8 @@ export function App() {
     [runCommand],
   )
   const onSelectOpened = useCallback(() => runCommand('file.reveal', null), [runCommand])
+  const onExpandAll = useCallback(() => runCommand('file.expandAll', null), [runCommand])
+  const onCollapseAll = useCallback(() => runCommand('file.collapseAll', null), [runCommand])
   const onOpenPin = useCallback(
     (id: string) => {
       if (id === PROJECT_NOTES) runCommand('file.projectNotes', null)
@@ -1535,6 +1538,9 @@ export function App() {
         <LogDetailCard />
         <PullStrategyGate />
         <PushDialog />
+        {/* New project (M97): in both window kinds, `PushDialog`'s reason, and outside
+            `OverlayHost` because it must open with no project at all. */}
+        <NewProjectWizard />
         <ConflictsDialog />
         {/*
           * The properties card, and `onOpenHistory` is deliberately **not** passed here.
@@ -1747,6 +1753,9 @@ export function App() {
                    */
                   openedFile={focusedTabPath(boot)}
                   onSelectOpened={onSelectOpened}
+                  // The header's fold buttons, through the command for `onSelectOpened`'s reason.
+                  onExpandAll={onExpandAll}
+                  onCollapseAll={onCollapseAll}
                   /*
                    * A pinned row's open, routed through the **command** for the same reason
                    * `onSelectOpened` above is: the double-click, the palette row and any chord a
@@ -2194,6 +2203,9 @@ export function App() {
         <LogDetailCard />
         <PullStrategyGate />
         <PushDialog />
+        {/* New project (M97): in both window kinds, `PushDialog`'s reason, and outside
+            `OverlayHost` because it must open with no project at all. */}
+        <NewProjectWizard />
         <ConflictsDialog />
         {/* The shell has a tool window, so here the card may offer the way into it. The repo and
             the repo-relative path come off the answer the card already holds, so this route does

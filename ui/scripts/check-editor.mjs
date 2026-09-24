@@ -2273,15 +2273,15 @@ try {
     // A selection dragged upwards hands its head and anchor over in the other order.
     eq(send.rangeOf('x\ny', 13, 12), { lineStart: 12, lineEnd: 13 }, 'a backwards drag')
 
-    eq(send.sendLabel(null), 'Send this file to Claude', 'no selection sends the file')
+    eq(send.sendLabel(null), 'Send this file to Harness', 'no selection sends the file')
     eq(
       send.sendLabel({ lineStart: 12, lineEnd: 12 }),
-      'Send line 12 to Claude',
+      'Send line 12 to Harness',
       'one line is singular — "lines 12–12" is how a user learns not to read the label',
     )
     eq(
       send.sendLabel({ lineStart: 12, lineEnd: 20 }),
-      'Send lines 12–20 to Claude',
+      'Send lines 12–20 to Harness',
       'a span names both ends',
     )
 

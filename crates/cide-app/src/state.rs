@@ -24,6 +24,8 @@ pub struct SessionRegistry {
     applied_write: DashMap<WriterKey, WriteMark>,
     /// When each live session's child was forked. See [`Self::started`].
     started: DashMap<SessionId, std::time::SystemTime>,
+    /// Which CLI each **console** session runs. (M93) See [`Self::harness_of`].
+    harnesses: DashMap<SessionId, cide_ipc::Harness>,
 }
 
 /// Who minted a write sequence number.
@@ -124,6 +126,21 @@ impl SessionRegistry {
         self.started.get(&id).map(|at| *at)
     }
 
+    /// Record which CLI a console session runs. (M93)
+    ///
+    /// Written by `spawn_session`, which is the only place that knows — it chose between claude
+    /// and codex — and read by `pane_bind_session`, which is the only place that knows the pane.
+    /// The two never meet in one call (a session exists before it belongs to a pane), so the
+    /// fact waits here in between, beside the session it describes.
+    pub fn note_harness(&self, id: SessionId, harness: cide_ipc::Harness) {
+        self.harnesses.insert(id, harness);
+    }
+
+    /// Which CLI a console session runs, or `None` for a session that is not a console's.
+    pub fn harness_of(&self, id: SessionId) -> Option<cide_ipc::Harness> {
+        self.harnesses.get(&id).map(|h| *h)
+    }
+
     pub fn get(&self, id: SessionId) -> Option<Arc<PtySession>> {
         self.sessions.get(&id).map(|r| Arc::clone(r.value()))
     }
@@ -177,6 +194,7 @@ impl SessionRegistry {
         // long before it reaches a watermark, so keeping them would only be dead entries.
         self.applied_write.retain(|k, _| k.session != id);
         self.started.remove(&id);
+        self.harnesses.remove(&id);
         self.sessions.remove(&id).map(|(_, v)| v)
     }
 

@@ -610,3 +610,260 @@ mod tests {
         assert_eq!(tail("hé", 10), "hé");
     }
 }
+
+// ==========================================================================================
+// The same lane on codex. (M93)
+// ==========================================================================================
+
+/// The one-shot lane on codex, for a user whose Settings → Harness is Codex: `codex exec`, one
+/// turn, the prompt on stdin, the answer read off its JSONL. (M93)
+///
+/// The lane is "cide asks a model one thing" — a commit message — and a user who chose codex as
+/// their console should not need claude installed for it. `exec`'s shape was measured in M44
+/// (`cide_agents::harness::codex`'s history): `thread.started`, `turn.started`,
+/// `item.completed` carrying the agent's message as `item.type == "agent_message"`,
+/// `turn.completed` or `turn.failed`/`error` last.
+///
+/// * `--ephemeral`: no rollout on disk, the `--no-session-persistence` of this lane.
+/// * `-s read-only`: the lane's `ToolAccess::None` — codex has no "no tools" switch, and a
+///   read-only sandbox is the closest thing, since reading is what the model may want to do.
+///   `Inherit` and `Only` keep the user's own sandbox.
+/// * the schema, when there is one, goes to `--output-schema <file>`, which is the one flag here
+///   that wants a file: written beside nothing else, removed afterwards.
+/// * no budget: codex has no `--max-budget-usd`.
+pub fn codex_argv(run: &Headless, schema_file: Option<&Path>) -> Vec<String> {
+    let mut args = vec![
+        "exec".to_string(),
+        "--json".into(),
+        "--ephemeral".into(),
+        "--skip-git-repo-check".into(),
+        "--color".into(),
+        "never".into(),
+        "-C".into(),
+        run.cwd.to_string_lossy().into_owned(),
+    ];
+    args.extend(cide_core::codex_cli::quiet_start());
+    if matches!(run.tools, ToolAccess::None) {
+        args.push("-s".into());
+        args.push("read-only".into());
+    }
+    if let Some(model) = &run.request.model {
+        args.push("-m".into());
+        args.push(model.clone());
+    }
+    if let Some(file) = schema_file {
+        args.push("--output-schema".into());
+        args.push(file.to_string_lossy().into_owned());
+    }
+    args
+}
+
+/// [`run`], on codex. Same environment rules, same deadline, same errors.
+pub fn run_codex(program: &Path, run: &Headless) -> Result<HeadlessResult, HeadlessError> {
+    let schema_file = match &run.request.json_schema {
+        Some(schema) => {
+            let file = std::env::temp_dir().join(format!(
+                "cide-codex-schema-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::write(&file, schema.to_string()).map_err(|e| HeadlessError::NotInstalled {
+                detail: format!("could not write the output schema for codex: {e}"),
+            })?;
+            Some(file)
+        }
+        None => None,
+    };
+    let result = run_codex_with(program, run, schema_file.as_deref());
+    if let Some(file) = schema_file {
+        let _ = std::fs::remove_file(file);
+    }
+    result
+}
+
+fn run_codex_with(
+    program: &Path,
+    run: &Headless,
+    schema_file: Option<&Path>,
+) -> Result<HeadlessResult, HeadlessError> {
+    let mut command = Command::new(program);
+    command
+        .args(codex_argv(run, schema_file))
+        .current_dir(&run.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    scrub_env(&mut command);
+    for (name, value) in &run.env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    run.proxy.apply(&mut command);
+    crate::orphans::arm(&mut command);
+
+    let mut child = command.spawn().map_err(|e| HeadlessError::NotInstalled {
+        detail: e.to_string(),
+    })?;
+    // No positional prompt: `exec` reads its instructions from stdin when given none, which
+    // keeps a long diff out of the argv (and out of `ps`).
+    let prompt = run.request.prompt.clone();
+    let mut stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut pipe) = stdin.take() {
+            let _ = pipe.write_all(prompt.as_bytes());
+        }
+    });
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let status = wait_with_deadline(&mut child, run.timeout)?;
+    let _ = writer.join();
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+
+    match parse_codex(&stdout, run.request.json_schema.is_some()) {
+        Ok(result) => Ok(result),
+        Err(malformed) => {
+            if status.success() {
+                Err(malformed)
+            } else {
+                Err(HeadlessError::Exited {
+                    code: status.code(),
+                    stderr: tail(&stderr, STDERR_KEEP),
+                })
+            }
+        }
+    }
+}
+
+/// The answer in a `codex exec --json` stream: the **last** agent message, the thread, and
+/// whether the turn failed. `structured` is the message parsed as JSON when a schema was asked
+/// for, which is what `--output-schema` makes the message.
+pub fn parse_codex(stdout: &str, structured: bool) -> Result<HeadlessResult, HeadlessError> {
+    let mut text: Option<String> = None;
+    let mut thread: Option<String> = None;
+    let mut failure: Option<String> = None;
+    let mut completed = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("thread.started") => {
+                thread = event
+                    .get("thread_id")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string);
+            }
+            Some("item.completed") => {
+                let item = event.get("item");
+                if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                    == Some("agent_message")
+                    && let Some(said) = item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
+                {
+                    text = Some(said.to_string());
+                }
+            }
+            Some("turn.completed") => completed = true,
+            Some("turn.failed") | Some("error") => {
+                failure = event
+                    .get("error")
+                    .and_then(|e| e.get("message").or(Some(e)))
+                    .or_else(|| event.get("message"))
+                    .map(|m| {
+                        m.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| m.to_string())
+                    });
+            }
+            _ => {}
+        }
+    }
+    if text.is_none() && failure.is_none() && !completed {
+        return Err(HeadlessError::Malformed {
+            detail: "codex printed no agent message and no turn end".to_string(),
+            head: stdout.chars().take(HEAD_KEEP).collect(),
+        });
+    }
+    let text = text.or_else(|| failure.clone()).unwrap_or_default();
+    Ok(HeadlessResult {
+        structured: if structured {
+            serde_json::from_str(&text).ok()
+        } else {
+            None
+        },
+        is_error: failure.is_some(),
+        subtype: if failure.is_some() {
+            "error"
+        } else {
+            "success"
+        }
+        .to_string(),
+        session: thread,
+        cost_usd: None,
+        duration_ms: None,
+        num_turns: Some(1),
+        text,
+    })
+}
+
+#[cfg(test)]
+mod codex_tests {
+    use super::*;
+
+    #[test]
+    fn the_codex_lane_is_one_ephemeral_read_only_exec_with_the_prompt_on_stdin() {
+        let mut request = HeadlessRequest::new("write a commit message");
+        request.model = Some("gpt-5.5".into());
+        let run = Headless::new(request, "/repo");
+        let args = codex_argv(&run, Some(Path::new("/tmp/s.json")));
+        assert_eq!(&args[..3], ["exec", "--json", "--ephemeral"]);
+        assert!(args.windows(2).any(|w| w == ["-s", "read-only"]));
+        assert!(args.windows(2).any(|w| w == ["-C", "/repo"]));
+        assert!(args.windows(2).any(|w| w == ["-m", "gpt-5.5"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--output-schema", "/tmp/s.json"])
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("commit message")),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_agent_message_is_the_answer() {
+        let stream = r#"{"type":"thread.started","thread_id":"t-1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"i0","type":"reasoning","text":"thinking"}}
+{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"first"}}
+{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"{\"subject\":\"Fix it\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":1}}"#;
+        let result = parse_codex(stream, true).expect("parsed");
+        assert_eq!(result.text, "{\"subject\":\"Fix it\"}");
+        assert_eq!(
+            result.structured,
+            Some(serde_json::json!({"subject": "Fix it"}))
+        );
+        assert_eq!(result.session.as_deref(), Some("t-1"));
+        assert!(!result.is_error);
+
+        let failed = parse_codex(
+            r#"{"type":"turn.failed","error":{"message":"quota exceeded"}}"#,
+            false,
+        )
+        .expect("a failure is an answer");
+        assert!(failed.is_error);
+        assert_eq!(failed.text, "quota exceeded");
+
+        assert!(parse_codex("codex: some banner\n", false).is_err());
+    }
+}

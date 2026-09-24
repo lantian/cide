@@ -369,6 +369,8 @@ export function ReviewPanel({
       </div>
       <div className={styles.sidebarTree}>
         <FileTree
+          key={source ? 'source' : 'changes'}
+          defaultExpanded={!source}
           theme={theme}
           label={source ? 'MR source files' : 'MR changed files'}
           selected={snap.editor?.review === review ? snap.editor.path : null}

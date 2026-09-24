@@ -26,6 +26,7 @@ import { useContextMenu } from '@/menus'
 import { projectMenu, type RecentEntry } from '@/ipc/client'
 import { recentEntries } from './menuModel'
 import { browseForProject } from './projectOpen'
+import { requestNewProject } from './newProject/newProjectStore'
 import { Icon } from '@/icons/Icon'
 
 import styles from './AppHeader.module.css'
@@ -63,6 +64,7 @@ export function ProjectMenu() {
     items: () =>
       recentEntries(recents.current, {
         browse,
+        create: requestNewProject,
         reopen: (path) => {
           // `void` on purpose: a rejection — the folder went away between the fetch and the
           // click — is caught by `Failures`, which is the surface that exists to say so.

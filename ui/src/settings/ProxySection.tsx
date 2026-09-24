@@ -102,13 +102,17 @@ const TARGET_OPTIONS: readonly { value: ProxyTarget; label: string }[] = [
  * true of neither.
  */
 const TARGET_HINT: Record<keyof ProxyScope, Record<ProxyTargetName, string>> = {
+  // Every child that talks to a model provider: the console whichever CLI Settings → Harness
+  // names, every agent run whatever its role's harness, and the one-shot lane. One field for all
+  // of them because to a user they are one thing — "my AI tools" — and a corporate proxy that
+  // reached the claude console but not a codex run would be a failure nobody could place.
   claude: {
     configured:
-      'claude panes and the one-shots behind Generate commit message and Explain selection both get the proxy above.',
+      'Consoles (Claude Code or Codex), every agent run whatever its harness, and the one-shots behind Generate commit message and Explain selection all get the proxy above.',
     untouched:
-      'cide adds and removes nothing for claude. It inherits whatever cide itself was launched with — which is a proxy, if your login profile exports one.',
+      'cide adds and removes nothing for consoles and agent runs. They inherit whatever cide itself was launched with — which is a proxy, if your login profile exports one.',
     direct:
-      'Every proxy variable is removed from claude, whatever the mode above says and whatever cide inherited.',
+      'Every proxy variable is removed from consoles and agent runs, whatever the mode above says and whatever cide inherited.',
   },
   shells: {
     configured:
@@ -246,8 +250,9 @@ export function ProxySection({ proxy, patch }: ProxySectionProps) {
       </Note>
 
       {claudeOnly && (
-        <Note title="claude only">
-          The proxy above reaches <code>claude</code> and nothing else cide starts.{' '}
+        <Note title="Consoles and agents only">
+          The proxy above reaches the consoles, the agent runs and the one-shots — Claude Code
+          and Codex alike — and nothing else cide starts.{' '}
           {claudeOnlyNote(proxy)}
         </Note>
       )}

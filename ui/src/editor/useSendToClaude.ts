@@ -172,8 +172,8 @@ export function useSendToClaude(): SendToClaude {
     (view: EditorView, path: string, pane: PaneId | null, exact: boolean) => {
       if (target === null) {
         return report(
-          'There is no Claude session in this project to send to. Open the project console, ' +
-            'or split a Claude pane, and try again.',
+          'There is no console session in this project to send to. Open the project console, ' +
+            'or split a console pane, and try again.',
         )
       }
       const to_ = pane ?? target.pane
@@ -249,7 +249,7 @@ export function useSendToClaude(): SendToClaude {
            * hand from what it says — and names the conversation too when it was not the one
            * asked for, because then "find it by hand" needs to say which hand.
            */
-          const where = sent.fallback ? `‘${sent.title}’` : 'Claude'
+          const where = sent.fallback ? `‘${sent.title}’` : 'the console'
           report(`Sent ${mentionLabel(path, span)} to ${where} — but ${stuck}.`)
           return
         }
@@ -312,7 +312,7 @@ export function useSendToClaude(): SendToClaude {
     // that refuses a send which would have worked is worse than a send that explains itself —
     // so that half is reported by the rejection instead. Both halves are covered; they are
     // just covered by the surface that can be right about them.
-    unavailable: target === null ? 'No Claude session in this project to send to' : null,
+    unavailable: target === null ? 'No console session in this project to send to' : null,
     range,
     send,
     sessions,

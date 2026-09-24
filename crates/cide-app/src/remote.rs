@@ -1124,7 +1124,7 @@ mod tests {
             .expect("exists")
             .tree
             .focused;
-        cide_core::workspace::bind_session(&mut ws, project, console, pane, SessionId::new())
+        cide_core::workspace::bind_session(&mut ws, project, console, pane, SessionId::new(), None)
             .expect("binds");
 
         ws.settings.llm = LlmSettings {

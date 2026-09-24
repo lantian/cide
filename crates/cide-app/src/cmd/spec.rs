@@ -245,17 +245,7 @@ pub async fn spec_init(
     let root = tasks_state::project_root(&state, project)?;
     let boards = Arc::clone(&boards);
     let board = blocking(move || {
-        open(root.clone())?
-            .init()
-            .map_err(|error| CoreError::Io(error.to_string()))?;
-        // Only when there is something to write. `tidy_block` turns a textarea the user tabbed
-        // through and left alone into `None`, which writes no key at all — a `context: ""` in a
-        // committed file is worse than no key, because the commented example that would have
-        // told the next person what the key is for is then sitting under a key that exists.
-        if let Some(context) = context.as_deref().map(tidy_block).filter(|c| !c.is_empty()) {
-            cide_spec::config::apply(&root, &[cide_spec::config::Edit::Context(Some(context))])
-                .map_err(|error| CoreError::Io(error.to_string()))?;
-        }
+        init_at(&root, context.as_deref())?;
         Ok(crate::spec_state::read_at(&root))
     })
     .await?;
@@ -264,6 +254,29 @@ pub async fn spec_init(
     // what makes them agree with this one immediately.
     boards.mark_changed(&app, project);
     Ok(board)
+}
+
+/// `openspec init` in `root`, then the optional `context:` — the body of [`spec_init`], callable
+/// before a project exists. (M97)
+///
+/// Split out for the New project wizard, which sets OpenSpec up in a directory it has just
+/// created and has not opened yet: there is no `ProjectId` to hand [`spec_init`], and a second
+/// copy of the init-then-apply ordering (see that command's doc for why the order matters) is
+/// the copy that would drift. Blocking — it spawns a Node process — so callers run it on the
+/// blocking pool.
+pub(crate) fn init_at(root: &Path, context: Option<&str>) -> Result<()> {
+    open(root.to_path_buf())?
+        .init()
+        .map_err(|error| CoreError::Io(error.to_string()))?;
+    // Only when there is something to write. `tidy_block` turns a textarea the user tabbed
+    // through and left alone into `None`, which writes no key at all — a `context: ""` in a
+    // committed file is worse than no key, because the commented example that would have
+    // told the next person what the key is for is then sitting under a key that exists.
+    if let Some(context) = context.map(tidy_block).filter(|c| !c.is_empty()) {
+        cide_spec::config::apply(root, &[cide_spec::config::Edit::Context(Some(context))])
+            .map_err(|error| CoreError::Io(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Propose a change: scaffold it, and give it a proposal.
@@ -435,6 +448,11 @@ pub async fn spec_run_command(
 
     let registry = app.try_state::<crate::state::SessionRegistry>();
 
+    // A codex console (M93) is handed the skill's file instead of the command — see
+    // [`for_console`] — and reads it when told to, so the "installed after this conversation
+    // started" refusal below does not apply to it.
+    let codex = console_is_codex(&state, session);
+
     // ---------------------------------------------------------------------------------------
     // Is this conversation old enough to have missed the command?
     //
@@ -454,7 +472,8 @@ pub async fn spec_run_command(
     // `started` past `installed_at`. This refusal is the backstop for every road that respawn
     // cannot cover — `openspec init` run in a terminal pane, a detached console whose restarter
     // lives in another window's realm, or a respawn that itself failed.
-    if let Some(installed_at) = cide_spec::claude::installed_at(&root, &command)
+    if !codex
+        && let Some(installed_at) = cide_spec::claude::installed_at(&root, &command)
         && let Some(started) = registry.as_ref().and_then(|reg| reg.started(session))
         && installed_at > started
     {
@@ -479,6 +498,7 @@ pub async fn spec_run_command(
         Some(text) => format!("{invocation} {text}"),
         None => invocation,
     };
+    let line = for_console(codex, &root, line);
     let Some(bytes) = crate::agent_rpc::submit(&line) else {
         return Err(CoreError::Io(
             "this build cannot compose a line for the Claude CLI".into(),
@@ -555,6 +575,7 @@ pub(crate) fn open_subject_tab(
                 conversation: None,
                 conversation_since: None,
                 continues: None,
+                harness: None,
                 title: "openspec".into(),
                 docker: None,
             },
@@ -671,8 +692,11 @@ pub async fn spec_propose_for_task(
         .unwrap_or(primary);
 
     // `spec_run_command`'s rule, and its whole argument: Claude Code reads a project's skills
-    // once, at startup, so a conversation older than the file answers `Unknown command`.
-    if let Some(installed_at) = cide_spec::claude::installed_at(&root, "propose")
+    // once, at startup, so a conversation older than the file answers `Unknown command`. Not a
+    // codex console's (M93), which is handed the file and reads it then.
+    let codex = console_is_codex(&state, session);
+    if !codex
+        && let Some(installed_at) = cide_spec::claude::installed_at(&root, "propose")
         && let Some(started) = registry
             .as_ref()
             .and_then(|registry| registry.started(session))
@@ -701,6 +725,7 @@ pub async fn spec_propose_for_task(
          folder name under openspec/changes/, so the task and the change are linked, then comment \
          on the task saying what you proposed.)"
     ));
+    let line = for_console(codex, &root, line);
 
     let Some(bytes) = crate::agent_rpc::submit(&line) else {
         return Err(CoreError::Io(
@@ -1020,6 +1045,7 @@ pub async fn spec_dispatch_to_session(
         Some((invocation, change)) => format!("{invocation} {change}. {rules}"),
         None => rules,
     };
+    let line = for_console(console_is_codex(&state, session), &root, line);
     let Some(bytes) = crate::agent_rpc::submit(&line) else {
         return Err(CoreError::Io(
             "this build cannot compose a line for the Claude CLI".into(),
@@ -1620,8 +1646,84 @@ fn default_schema() -> SpecSchema {
     }
 }
 
+/// Whether the console `session` belongs to runs codex. (M93)
+fn console_is_codex(state: &WorkspaceState, session: cide_ipc::SessionId) -> bool {
+    state.with(|ws| {
+        cide_core::workspace::harness_holding(ws, session) == Some(cide_ipc::Harness::Codex)
+    })
+}
+
+/// A line about to be typed into a console, made followable by the CLI behind it. (M93)
+///
+/// A Claude Code console types an OpenSpec command as itself: `/openspec-propose <input>`. A
+/// codex console cannot — the command is a skill Claude Code loads from `.claude/skills/`, and
+/// codex's composer answers an unknown slash command with an error — but what a skill *is* is
+/// prose instructions for a model, so a codex console is told to follow the file, with the same
+/// input. Any other line, and any line for claude, is returned as it was.
+fn for_console(codex: bool, root: &std::path::Path, line: String) -> String {
+    if !codex {
+        return line;
+    }
+    let Some(first) = line
+        .split_whitespace()
+        .next()
+        .filter(|w| w.starts_with('/'))
+    else {
+        return line;
+    };
+    let Some(command) = cide_spec::claude::installed(root)
+        .into_iter()
+        .find(|command| command.line == first)
+    else {
+        return line;
+    };
+    let Some(file) = cide_spec::claude::file(root, &command.name) else {
+        return line;
+    };
+    let rest = line[line.find(first).map_or(0, |at| at + first.len())..].trim();
+    if rest.is_empty() {
+        format!(
+            "Follow the OpenSpec instructions in `{}` exactly, as if they had been invoked as \
+             `{first}`.",
+            file.display()
+        )
+    } else {
+        format!(
+            "Follow the OpenSpec instructions in `{}` exactly, as if they had been invoked as \
+             `{first}`, with this input: {rest}",
+            file.display()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// (M93) A codex console is told to follow the skill's file, with the command's input; a
+    /// Claude console's line, and any line that is not a command, pass through untouched.
+    #[test]
+    fn a_codex_console_is_handed_the_skill_file_instead_of_the_command() {
+        let root = std::env::temp_dir().join(format!("cide-spec-codex-{}", std::process::id()));
+        let skill = root.join(".claude/skills/openspec-propose");
+        std::fs::create_dir_all(&skill).expect("mkdir");
+        std::fs::write(skill.join("SKILL.md"), "# propose").expect("write");
+
+        let line = "/openspec-propose Add dark mode".to_string();
+        assert_eq!(super::for_console(false, &root, line.clone()), line);
+        let codex = super::for_console(true, &root, line);
+        assert!(
+            codex.starts_with(
+                "Follow the OpenSpec instructions in `.claude/skills/openspec-propose/SKILL.md`"
+            ),
+            "{codex}"
+        );
+        assert!(codex.ends_with("with this input: Add dark mode"), "{codex}");
+        assert_eq!(
+            super::for_console(true, &root, "plain words".into()),
+            "plain words"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
     use std::path::Path;
 

@@ -55,31 +55,15 @@
 }
 
 /* `CloseConfirm`'s primary button, byte for byte where it can be: the two dialogs share a
-   ground and should share a button. `--bg` for the label, not a literal white — the accent is a
-   light orange in the dark theme and a darker one in the light theme, and the ground inverts
-   in exactly the direction needed. */
+   ground and should share a button. The look is the shared primary class; the geometry is
+   `CloseConfirm`'s `.button`. */
 .button {
+  composes: primary from '../styles/buttons.module.css';
   font-family: var(--font-ui);
   font-size: var(--fs-ui-13);
-  font-weight: 500;
   line-height: 1;
   padding: 7px 13px;
   border-radius: var(--r-2);
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  color: var(--bg);
+  border: 1px solid transparent;
   cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out);
-}
-
-.button:hover {
-  background: var(--accent-hi);
-  border-color: var(--accent-hi);
-}
-
-.button:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
 }

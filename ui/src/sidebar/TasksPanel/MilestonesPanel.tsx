@@ -45,6 +45,7 @@ import { Icon, asIcon } from '@/icons/Icon'
 import fieldStyles from '@/settings/controls.module.css'
 
 import { CheckLogModal, CheckLogView, type CheckLogTarget } from './CheckLogModal'
+import { useEscapeClose } from './escapeClose'
 import { TONE_CLASS, cx } from './TaskDetail'
 import { statusGlyph, statusTone } from './model'
 import { ProposalModal } from './ProposalModal'
@@ -207,12 +208,20 @@ export function MilestonesPanel({
     if (project === null) return
     void milestonesApi.runGate(project).catch((e: unknown) => setError(errorText(e)))
   }
+  /** Accept the current milestone; resolves with the error sentence, or `null` when accepted. */
+  const acceptCurrent = useCallback(async (): Promise<string | null> => {
+    if (project === null) return 'no project is open'
+    try {
+      setView(await milestonesApi.accept(project))
+      return null
+    } catch (e: unknown) {
+      return errorText(e)
+    }
+  }, [project])
   const accept = () => {
-    if (project === null) return
-    void milestonesApi
-      .accept(project)
-      .then(setView)
-      .catch((e: unknown) => setError(errorText(e)))
+    void acceptCurrent().then((refused) => {
+      if (refused !== null) setError(refused)
+    })
   }
 
   return (
@@ -233,7 +242,33 @@ export function MilestonesPanel({
         ) : (
           <>
             {/*
-              * Proposals first (M83): they are the one thing on this tab waiting on the user, and
+              * The tab's own actions lead it, as the Tasks tab's do: they act on the whole plan,
+              * and under a long list they were a scroll away. Accept is not among them — it is
+              * about one milestone, so it sits on that milestone's card, and only once there is
+              * something to accept (the gate passes). Offered before that, it read as the next
+              * step and let a click skip the gate it exists to respect.
+              */}
+            <div className={`${panelStyles.actions} ${styles.topActions}`}>
+              <button
+                type="button"
+                className={`${panelStyles.action} ${panelStyles.actionPrimary}`}
+                onClick={() => setEditing({ kind: 'milestone', index: null })}
+              >
+                Add milestone
+              </button>
+              {current !== null && (
+                <button
+                  type="button"
+                  className={panelStyles.action}
+                  disabled={currentGate?.running === true}
+                  onClick={runGate}
+                >
+                  Run gate
+                </button>
+              )}
+            </div>
+            {/*
+              * Proposals before the milestones (M83): they are the one thing on this tab waiting on the user, and
               * an agent that proposed a gate change is working around it until they answer.
               */}
             {(view?.proposals.length ?? 0) > 0 && (
@@ -285,8 +320,15 @@ export function MilestonesPanel({
                   const accepted = view?.accepted.includes(m.id) === true
                   const active = current?.id === m.id && !accepted
                   const gate = gateOf(m.id)
+                  // `accept` takes no id: Rust accepts the current milestone, so only the
+                  // active card can offer it, and only once its gate has passed.
+                  const ready = readyToAccept(active, gate?.running === true, gate?.last, tasksOf(m.id))
                   return (
-                    <li key={`${index}:${m.id}`}>
+                    <li
+                      key={`${index}:${m.id}`}
+                      className={styles.card}
+                      data-state={accepted ? 'accepted' : active ? 'active' : 'later'}
+                    >
                       <button
                         type="button"
                         className={styles.row}
@@ -315,42 +357,34 @@ export function MilestonesPanel({
                           {gateLine(gate?.running === true, gate?.last)}
                         </span>
                       </button>
+                      {ready && (
+                        <div className={styles.cardFoot}>
+                          <button
+                            type="button"
+                            className={`${panelStyles.action} ${panelStyles.actionPrimary}`}
+                            data-audit="milestoneAccept"
+                            onClick={accept}
+                          >
+                            Accept
+                          </button>
+                        </div>
+                      )}
                     </li>
                   )
                 })}
               </ol>
             )}
 
-            <div className={panelStyles.actions}>
-              <button
-                type="button"
-                className={`${panelStyles.action} ${panelStyles.actionPrimary}`}
-                onClick={() => setEditing({ kind: 'milestone', index: null })}
-              >
-                Add milestone
-              </button>
-              {current !== null && (
-                <button
-                  type="button"
-                  className={panelStyles.action}
-                  disabled={currentGate?.running === true}
-                  onClick={runGate}
-                >
-                  Run gate
-                </button>
-              )}
-              {current !== null && view?.accepted.includes(current.id) !== true && (
-                <button type="button" className={panelStyles.action} onClick={accept}>
-                  Accept {current.id}
-                </button>
-              )}
-            </div>
             {current !== null &&
               currentGate?.last?.passed === true &&
               view?.accepted.includes(current.id) !== true && (
                 <p className={styles.note}>
                   The gate passes. cide will not wake this project to plan until you accept{' '}
                   {current.id} — or tighten its gate if this is not what you meant.
+                  {openWork(tasksOf(current.id)) > 0 &&
+                    ` Accept waits for its ${openWork(tasksOf(current.id))} open task${
+                      openWork(tasksOf(current.id)) === 1 ? '' : 's'
+                    } to be done.`}
                 </p>
               )}
 
@@ -402,6 +436,7 @@ export function MilestonesPanel({
           active={editing.index !== null && current?.id === plan.items[editing.index]?.id}
           tasks={editing.index === null ? NO_TASKS : tasksOf(plan.items[editing.index]?.id ?? '')}
           onWrite={write}
+          onAccept={acceptCurrent}
           onClose={() => setEditing(null)}
         />
       )}
@@ -437,6 +472,7 @@ function MilestoneModal({
   project,
   initialTab,
   onWrite,
+  onAccept,
   onClose,
 }: {
   plan: MilestonePlan
@@ -450,6 +486,8 @@ function MilestoneModal({
   active: boolean
   tasks: readonly MilestoneTask[]
   onWrite: (plan: MilestonePlan) => Promise<string | null>
+  /** Accept the current milestone — offered only when this one is it and its gate passed. */
+  onAccept: () => Promise<string | null>
   onClose: () => void
 }) {
   const original: Milestone =
@@ -468,6 +506,17 @@ function MilestoneModal({
     setBusy(false)
     if (refused === null) onClose()
     else setError(refused)
+  }
+
+  // The card's rule (see the list): only the active milestone, only once its gate has passed.
+  // The modal stays open on accept — the title turns to "accepted" and the button goes, which
+  // says it happened; closing would leave the user to find that out from the list.
+  const ready = index !== null && !accepted && readyToAccept(active, gateRunning, gate, tasks)
+  const accept = async () => {
+    setBusy(true)
+    const refused = await onAccept()
+    setBusy(false)
+    setError(refused)
   }
 
   const edited = (): Milestone => {
@@ -499,6 +548,9 @@ function MilestoneModal({
     void send({ ...plan, items })
   }
 
+  const dismiss = busy ? () => {} : onClose
+  const escape = useEscapeClose(dismiss)
+
   // Three tabs (M83): the log drawn under the form ran into it, and a long task list pushed the
   // actions off the card. A new milestone has nothing to list and nothing logged — one tab.
   const [tab, setTab] = useState<'overview' | 'tasks' | 'log'>(
@@ -508,9 +560,9 @@ function MilestoneModal({
   return (
     <OverlayCard
       label={index === null ? 'New milestone' : `Milestone ${original.id}`}
-      onDismiss={busy ? () => {} : onClose}
+      onDismiss={dismiss}
     >
-      <div className={`${styles.modal} ${styles.wide}`} data-audit="milestoneModal">
+      <div className={`${styles.modal} ${styles.wide}`} data-audit="milestoneModal" {...escape}>
         <h2 className={styles.modalTitle}>
           {index === null ? 'New milestone' : `Milestone ${original.id}`}
           {accepted ? ' · accepted' : active ? ' · active' : ''}
@@ -651,6 +703,17 @@ function MilestoneModal({
             </>
           )}
           <span className={styles.spacer} />
+          {ready && (
+            <button
+              type="button"
+              className={`${panelStyles.action} ${panelStyles.actionPrimary}`}
+              data-audit="milestoneModalAccept"
+              disabled={busy}
+              onClick={() => void accept()}
+            >
+              Accept
+            </button>
+          )}
           <button type="button" className={panelStyles.action} disabled={busy} onClick={onClose}>
             {tab === 'overview' ? 'Cancel' : 'Close'}
           </button>
@@ -748,9 +811,12 @@ function ChecksModal({
     else setError(refused)
   }
 
+  const dismiss = busy ? () => {} : onClose
+  const escape = useEscapeClose(dismiss)
+
   return (
-    <OverlayCard label="Project checks" onDismiss={busy ? () => {} : onClose}>
-      <div className={styles.modal} data-audit="milestoneChecksModal">
+    <OverlayCard label="Project checks" onDismiss={dismiss}>
+      <div className={styles.modal} data-audit="milestoneChecksModal" {...escape}>
         <h2 className={styles.modalTitle}>Project checks</h2>
         <Field
           label="Verify"
@@ -851,6 +917,31 @@ function countLine(tasks: readonly MilestoneTask[]): string {
   if (tasks.length === 0) return 'no tasks'
   const done = tasks.filter((t) => t.status === 'done').length
   return `${tasks.length - done} open · ${done} done`
+}
+
+/**
+ * Work still in flight under a milestone: todo, doing, review. The inbox is not counted — it is
+ * by definition not work yet (`TaskStatus`'s account of it), and holding a milestone open on
+ * something nobody decided to do would let any passing observation block it.
+ */
+function openWork(tasks: readonly MilestoneTask[]): number {
+  return tasks.filter((t) => t.status !== 'done' && t.status !== 'inbox').length
+}
+
+/**
+ * Whether Accept is offered — the card's and the modal's one rule. The active milestone only
+ * (`accept` takes no id; Rust accepts the current one), its gate's last run passed and none is
+ * running, and nothing under it is still open. The gate alone was the first version, and it
+ * offered Accept on a milestone with tasks in doing: a gate that passed an hour ago says nothing
+ * about work started since, and accepting marks the milestone's task done over its open subtasks.
+ */
+function readyToAccept(
+  active: boolean,
+  gateRunning: boolean,
+  gate: CheckResult | undefined,
+  tasks: readonly MilestoneTask[],
+): boolean {
+  return active && !gateRunning && gate?.passed === true && openWork(tasks) === 0
 }
 
 /** Open a task's card — the same selection the board's rows make — and close this modal. */

@@ -676,6 +676,10 @@ impl GitLab {
                     }
                     globset::Glob::new(p).map_err(|e| format!("Invalid file pattern: {e}"))?;
                 }
+                let preferences = GitLabPreferences {
+                    review_prompts: normalise_review_prompts(preferences.review_prompts)?,
+                    ..preferences
+                };
                 let mut saved = self.saved.lock();
                 saved.preferences = preferences;
                 self.save(&mut saved)?;
@@ -1004,6 +1008,48 @@ impl GitLab {
         self.request(&c, method, &path, &params, body, raw)
     }
 }
+/// The per-repository review instructions as they are kept: each `repository` in one spelling
+/// (`group/repo` or `host/group/repo` — no scheme, no slash at either end, no `.git`, which is
+/// how a pasted clone or browser URL arrives), rows blank on both sides dropped (an "Add
+/// repository" the user never filled in), and two refusals. A prompt with no repository would
+/// sit in the file matching nothing, and two rows for one repository would make the second one
+/// silently dead, since the first match wins — both read as saved and neither would ever show.
+fn normalise_review_prompts(rows: Vec<GitLabReviewPrompt>) -> Result<Vec<GitLabReviewPrompt>> {
+    let mut kept: Vec<GitLabReviewPrompt> = Vec::new();
+    for row in rows {
+        let mut repository = row.repository.trim();
+        for scheme in ["https://", "http://"] {
+            if let Some(rest) = repository.strip_prefix(scheme) {
+                repository = rest;
+            }
+        }
+        let repository = repository.trim_matches('/');
+        let repository = repository.strip_suffix(".git").unwrap_or(repository);
+        let repository = repository.trim_matches('/').to_string();
+        if repository.is_empty() {
+            if row.prompt.trim().is_empty() {
+                continue;
+            }
+            return Err(
+                "Each repository's review instructions need a repository, such as group/repo"
+                    .into(),
+            );
+        }
+        if kept
+            .iter()
+            .any(|k| k.repository.eq_ignore_ascii_case(&repository))
+        {
+            return Err(format!(
+                "{repository} has review instructions twice; keep one row per repository"
+            ));
+        }
+        kept.push(GitLabReviewPrompt {
+            repository,
+            prompt: row.prompt,
+        });
+    }
+    Ok(kept)
+}
 fn validate_relative(path: &str) -> Result<()> {
     if path.is_empty()
         || path.contains('\\')
@@ -1053,6 +1099,33 @@ mod tests {
             assert!(validate_relative(p).is_err());
         }
         assert!(validate_relative("a/b.go").is_ok());
+    }
+    fn row(repository: &str, prompt: &str) -> GitLabReviewPrompt {
+        GitLabReviewPrompt {
+            repository: repository.into(),
+            prompt: prompt.into(),
+        }
+    }
+    #[test]
+    fn review_prompts_are_kept_in_one_spelling() {
+        let kept = normalise_review_prompts(vec![
+            row(" https://gitlab.example/group/repo.git/ ", "check locking"),
+            row("", "  "),
+            row("/other/repo/", ""),
+        ])
+        .unwrap();
+        assert_eq!(
+            kept,
+            vec![
+                row("gitlab.example/group/repo", "check locking"),
+                row("other/repo", "")
+            ]
+        );
+        assert!(normalise_review_prompts(vec![row(" ", "orphan prompt")]).is_err());
+        assert!(
+            normalise_review_prompts(vec![row("Group/Repo", "a"), row("group/repo.git", "b")])
+                .is_err()
+        );
     }
 }
 

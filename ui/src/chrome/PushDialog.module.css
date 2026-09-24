@@ -234,9 +234,7 @@
  * Enter already in flight when the dialog appeared must back out, not send.
  */
 .primary {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: var(--bg);
+  composes: primary from '../styles/buttons.module.css';
 }
 
 /*

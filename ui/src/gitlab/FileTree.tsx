@@ -1,7 +1,14 @@
 import { Icon } from '@/icons/Icon'
 import { FileIcon } from '@/icons/FileIcon'
 import type { IconTheme } from '@/icons/iconFor'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import styles from './GitLab.module.css'
 export interface TreeFile {
   path: string
@@ -55,27 +62,60 @@ function build(files: readonly TreeFile[]): Node {
   }
   return root
 }
+/**
+ * Which folders are open, held by the tree rather than by each row. (M96)
+ *
+ * It used to be a `useState` per `Entry`, which is the shape that cannot answer *Collapse all*:
+ * no one above the rows knew what was open. `base` is what a folder does by default and
+ * `toggled` is the set of folders the user flipped against it, so the two bulk actions are
+ * "reset `toggled`, set `base`" — and a folder that appears *after* one (typing in the filter
+ * re-builds the tree) follows the last bulk action instead of snapping back to the prop.
+ */
+interface Folding {
+  base: boolean
+  toggled: ReadonlySet<string>
+}
+function isOpen(folding: Folding, path: string): boolean {
+  return folding.base !== folding.toggled.has(path)
+}
+function withOpen(folding: Folding, path: string, open: boolean): Folding {
+  if (isOpen(folding, path) === open) return folding
+  const toggled = new Set(folding.toggled)
+  if (toggled.has(path)) toggled.delete(path)
+  else toggled.add(path)
+  return { base: folding.base, toggled }
+}
+/** Open every folder above `selected`, answering the same object when nothing changes. */
+function revealed(folding: Folding, selected: string | null): Folding {
+  if (!selected) return folding
+  const parts = selected.split('/')
+  let next = folding
+  for (let i = 1; i < parts.length; i++)
+    next = withOpen(next, parts.slice(0, i).join('/'), true)
+  return next
+}
 function Entry({
   node,
   depth,
   selected,
   onOpen,
   theme,
+  folding,
+  setOpen,
 }: {
   theme: IconTheme
   node: Node
   depth: number
   selected: string | null
   onOpen: (path: string) => void
+  folding: Folding
+  setOpen: (path: string, open: boolean) => void
 }) {
   const folder = node.children.size > 0
   const isSelected = !folder && selected === node.path
   const row = useRef<HTMLButtonElement>(null)
-  const containsSelected = folder && !!selected?.startsWith(node.path + '/')
-  const [expanded, setExpanded] = useState(containsSelected)
-  useEffect(() => {
-    if (containsSelected) setExpanded(true)
-  }, [containsSelected, selected])
+  const expanded = folder && isOpen(folding, node.path)
+  const setExpanded = (open: boolean) => setOpen(node.path, open)
   // Run on the row itself so newly expanded ancestors have mounted it before scrolling.
   // Keep keyboard focus in the diff, where the next/previous file shortcuts remain active.
   useLayoutEffect(() => {
@@ -156,6 +196,8 @@ function Entry({
                 depth={depth + 1}
                 selected={selected}
                 onOpen={onOpen}
+                folding={folding}
+                setOpen={setOpen}
               />
             ))}
         </div>
@@ -169,14 +211,88 @@ export function FileTree({
   onOpen,
   label,
   theme = 'dark',
+  defaultExpanded = false,
 }: {
   theme?: IconTheme
   files: readonly TreeFile[]
   selected: string | null
   onOpen: (path: string) => void
   label: string
+  /**
+   * Whether a folder starts open. The MR's *changed* files pass `true` — a review is read
+   * file by file and a tree of closed folders hides exactly the list the reviewer came for —
+   * while *Browse MR source*, the whole repository, stays closed. Read once; the host keys the
+   * tree on the mode so switching modes starts from that mode's default.
+   */
+  defaultExpanded?: boolean
 }) {
   const root = useMemo(() => build(files), [files])
+  // The initial state already holds the reveal, so a tree opened on a selected file draws it
+  // on the first frame instead of one frame later.
+  const [folding, setFolding] = useState<Folding>(() =>
+    revealed({ base: defaultExpanded, toggled: new Set() }, selected),
+  )
+  // Only a *new* selection reveals: a rerender with the same one must leave a folder the user
+  // closed around it closed.
+  useEffect(() => {
+    setFolding((f) => revealed(f, selected))
+  }, [selected])
+  const setOpen = useCallback(
+    (path: string, open: boolean) =>
+      setFolding((f) => withOpen(f, path, open)),
+    [],
+  )
+  return (
+    <>
+      <div className={styles.treeActions}>
+        <button
+          type="button"
+          className={styles.treeAction}
+          title="Expand all"
+          aria-label="Expand all"
+          onClick={() => setFolding({ base: true, toggled: new Set() })}
+        >
+          <Icon name="chevrons-up-down" size={1} />
+        </button>
+        <button
+          type="button"
+          className={styles.treeAction}
+          title="Collapse all"
+          aria-label="Collapse all"
+          onClick={() => setFolding({ base: false, toggled: new Set() })}
+        >
+          <Icon name="chevrons-down-up" size={1} />
+        </button>
+      </div>
+      <FileRows
+        root={root}
+        label={label}
+        theme={theme}
+        selected={selected}
+        onOpen={onOpen}
+        folding={folding}
+        setOpen={setOpen}
+      />
+    </>
+  )
+}
+function FileRows({
+  root,
+  label,
+  theme,
+  selected,
+  onOpen,
+  folding,
+  setOpen,
+}: {
+  root: Node
+  label: string
+  theme: IconTheme
+  selected: string | null
+  onOpen: (path: string) => void
+  folding: Folding
+  setOpen: (path: string, open: boolean) => void
+}) {
   return (
     <div
       role="tree"
@@ -209,6 +325,8 @@ export function FileTree({
             depth={0}
             selected={selected}
             onOpen={onOpen}
+            folding={folding}
+            setOpen={setOpen}
           />
         ))}
     </div>

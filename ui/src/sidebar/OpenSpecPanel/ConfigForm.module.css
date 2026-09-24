@@ -251,16 +251,10 @@
 }
 
 .primary {
+  composes: primary from '../../styles/buttons.module.css';
   padding: var(--sp-2) var(--sp-5);
   border: 1px solid transparent;
-  background: var(--accent);
-  color: var(--on-accent);
   font-size: var(--fs-ui-12);
-  font-weight: 600;
-}
-
-.primary:hover:not(:disabled) {
-  background: var(--accent-hi);
 }
 
 .secondary {

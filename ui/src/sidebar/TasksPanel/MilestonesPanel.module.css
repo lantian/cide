@@ -31,6 +31,11 @@
   outline-offset: 1px;
 }
 
+/* The Add / Run gate row leads the tab now; the list under it has no top margin of its own. */
+.topActions {
+  margin-bottom: var(--sp-3);
+}
+
 .quiet {
   margin: 0 0 var(--sp-3);
   font-size: var(--fs-ui-12);
@@ -90,6 +95,30 @@
 
 .row[data-state='accepted'] {
   opacity: 0.75;
+}
+
+/*
+ * A milestone's row sits in a card so an action can hang under it (Accept, once the gate passes)
+ * without nesting a button in the row's button. The card carries the border; the row inside it
+ * drops its own, or the two would draw a box in a box.
+ */
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+}
+
+.card[data-state='active'] {
+  border-color: var(--yellow);
+}
+
+.card > .row {
+  border: none;
+}
+
+.cardFoot {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 var(--sp-3) var(--sp-2);
 }
 
 .rowHead {
@@ -182,6 +211,14 @@
   padding: var(--sp-5);
   max-height: 80vh;
   overflow-y: auto;
+}
+
+/*
+ * The card takes focus on open so Escape reaches it (`escapeClose.ts`); that focus is for the
+ * keyboard, not a place — a ring around the whole card would read as a selection.
+ */
+.modal:focus {
+  outline: none;
 }
 
 .modalTitle {

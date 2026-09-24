@@ -658,6 +658,23 @@ fn build() -> Vec<Command> {
             "browse",
             "load",
         ]),
+        // (M97) Creating one: the New project wizard — kind, location, OpenSpec, subagents, a
+        // brief for the console. No `when` clause for `project.open`'s reason above: a key bound
+        // to it runs in the empty shell, which is where a first project is made, and the wizard
+        // is mounted beside `PushDialog` in `App.tsx` rather than in `OverlayHost` so that it can
+        // be raised there.
+        //
+        // Not `create`, though it is the word: `git.branch.new` declares it, a tie in the keyword
+        // tier falls to registry order, and this row sits above that one — so `create` would have
+        // started answering with a project wizard, which the two tests pinning `create` to *New
+        // branch…* exist to prevent. `new` is in the title and reaches it a tier higher anyway.
+        Command::new("project.new", "New project…", PROJECT).keywords(&[
+            "scaffold",
+            "init",
+            "wizard",
+            "openspec",
+            "milestones",
+        ]),
         //
         // The *switcher* is Ctrl+` — the key left of `1`, which is what a keyboard reports as
         // `Backquote` on every layout: hold the modifier, walk a popup in most-recently-used
@@ -944,6 +961,24 @@ fn build() -> Vec<Command> {
         Command::new("file.reveal", "Select opened file", FILE)
             .when("shellWindow && fileTabActive")
             .keywords(&["reveal", "locate", "show", "sidebar", "explorer", "tree"]),
+        /*
+         * The Explorer header's *Expand all* / *Collapse all*. (M96)
+         *
+         * Commands rather than bare button handlers, on `file.reveal`'s argument: one code
+         * path for the button, the palette row and any chord a `keymap.json` binds. The clause
+         * is `shellWindow` alone, because only the shell window draws an Explorer and the tree
+         * belongs to the project rather than to whatever tab is active.
+         */
+        Command::new("file.expandAll", "Expand all folders", FILE)
+            .when("shellWindow")
+            .keywords(&[
+                "expand", "unfold", "open", "all", "explorer", "tree", "folders",
+            ]),
+        Command::new("file.collapseAll", "Collapse all folders", FILE)
+            .when("shellWindow")
+            .keywords(&[
+                "collapse", "fold", "close", "all", "explorer", "tree", "folders",
+            ]),
         /*
          * What a file *is*: OS stat, text facts and the git summary, in one card. (M70)
          *

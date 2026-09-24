@@ -119,30 +119,45 @@ pub(crate) fn open_with_prompt(
     // The first root, which is what a Claude pane's `cwd` is everywhere else in this app. A
     // project with none cannot host a `claude` at all, and saying so here is better than
     // forking one into whatever directory cide happens to be in.
-    let (root, name) = state.with(|ws| {
+    // Settings → Harness decides which CLI a tab cide opens runs (M93), exactly as it decides a
+    // fresh console: these tabs *are* consoles, doing the product owner's job.
+    let (root, name, harness) = state.with(|ws| {
         let project = cide_core::workspace::project(ws, project)?;
         let root = project
             .roots
             .first()
             .map(|root| root.path.clone())
             .ok_or(CoreError::NoRoots)?;
-        Ok::<_, CoreError>((root, project.name.clone()))
+        Ok::<_, CoreError>((root, project.name.clone(), ws.settings.console_harness))
     })?;
+    let codex = harness == cide_ipc::ConsoleHarness::Codex;
 
     // One flag, spelled once. `Ask` passes nothing, which is the CLI's own default.
     let mut args: Vec<String> = Vec::new();
-    let permission = match mode.unattended {
-        cide_agents::Unattended::Auto => Some("auto"),
-        cide_agents::Unattended::Bypass => Some(cide_agents::defs::BYPASS_PERMISSIONS),
-        cide_agents::Unattended::Ask => None,
-    };
-    if let Some(permission) = permission {
-        args.push("--permission-mode".into());
-        args.push(permission.into());
-    }
-    if let Some(name) = session_name {
-        args.push("--name".into());
-        args.push(name.into());
+    if codex {
+        // Codex's vocabulary for the same three answers: the sandbox-and-approval pair a run of
+        // that mode gets (`harness::codex::permission_policy`), and nothing for `Ask`, where the
+        // user's own `config.toml` decides and codex asks in the pane. No `--name`: codex has
+        // none, and names a thread by itself.
+        let policy = match mode.unattended {
+            cide_agents::Unattended::Ask => None,
+            unattended => cide_agents::harness::codex::permission_policy(None, unattended).ok(),
+        };
+        args.extend(policy.into_iter().flatten().map(|t| t.to_string()));
+    } else {
+        let permission = match mode.unattended {
+            cide_agents::Unattended::Auto => Some("auto"),
+            cide_agents::Unattended::Bypass => Some(cide_agents::defs::BYPASS_PERMISSIONS),
+            cide_agents::Unattended::Ask => None,
+        };
+        if let Some(permission) = permission {
+            args.push("--permission-mode".into());
+            args.push(permission.into());
+        }
+        if let Some(name) = session_name {
+            args.push("--name".into());
+            args.push(name.into());
+        }
     }
 
     // `Geometry::default()` is 80×24, byte-identical to the webview's own `FALLBACK`, and it
@@ -188,8 +203,14 @@ pub(crate) fn open_with_prompt(
     // `Pane::conversation`.
     let in_worktree = cwd != root;
 
+    // Flattened before anything else touches it. A PTY write is keystrokes, so a newline in here
+    // is a second Enter that submits the tail of the prompt as its own turn — finding 8, and the
+    // rule every prompt path in this codebase inherits. (Codex takes it in the argv, where a
+    // newline would be harmless; flattened anyway, so the two CLIs are told the same thing.)
+    let line = crate::agent_rpc::one_line(prompt);
+
     let request = crate::cmd::session::SpawnRequest {
-        program: "claude".into(),
+        program: harness.program().into(),
         args,
         cwd: cwd.to_string_lossy().into_owned(),
         geometry: Geometry::default(),
@@ -208,6 +229,8 @@ pub(crate) fn open_with_prompt(
         voice: Some(crate::cmd::session::Voice::Acting),
         // Nothing here needs a variable of its own.
         env: Vec::new(),
+        // Codex takes its opening line in the argv; claude's is typed below.
+        prompt: codex.then(|| line.clone()),
     };
 
     let registry = app
@@ -261,11 +284,13 @@ pub(crate) fn open_with_prompt(
                 conversation_since: None,
                 // The id is the one `--session-id` was handed, which is what `--resume` takes.
                 continues: in_worktree.then(|| cide_ipc::HarnessSession {
-                    harness: cide_ipc::Harness::Claude,
+                    harness: harness.harness(),
                     id: session.to_string(),
                     cwd: cwd.clone(),
                 }),
-                title: format!("{name} : claude"),
+                // Written directly, as `session` is: this road never passes `pane_bind_session`.
+                harness: codex.then_some(cide_ipc::Harness::Codex),
+                title: format!("{name} : {}", harness.program()),
                 docker: None,
             },
         )
@@ -299,10 +324,10 @@ pub(crate) fn open_with_prompt(
         servers.bind_pane(project, pid, pane);
     }
 
-    // Flattened before anything else touches it. A PTY write is keystrokes, so a newline in here
-    // is a second Enter that submits the tail of the prompt as its own turn — finding 8, and the
-    // rule every prompt path in this codebase inherits.
-    let line = crate::agent_rpc::one_line(prompt);
+    if codex {
+        // Already submitted, as the argv's last token.
+        return Ok((session, tab));
+    }
     if let (Some(bytes), Some(pty)) = (crate::agent_rpc::submit(&line), registry.get(session)) {
         // Never a plain write: the TUI detects pastes *by length*, so a prompt this long arriving
         // with its `\r` in the same `read` lands in the composer unsubmitted. This writes the

@@ -14012,3 +14012,511 @@ answered it by commit, so no reader could tell that nothing had re-run.
   No model has set these keys through the tool in a real session yet. `isolateEnv` has no
   Settings control: it is set by hand in `.cide/config.json` or by the orchestrator through
   `cide_agents_config`.
+
+## Codex as a console, and codex runs in the real TUI (M93)
+
+> *"Need to add custom support of codex as main console and as agent harness. By default always
+> using claude, but Settings page, section "Claude sessions" should be renamed to "Harness" and
+> should allow to switch between claude and codex."* Plus two follow-ups: codex runs only where
+> the user chose it (no codex defaults anywhere), an open console keeps running as it is and
+> **Restart session** starts the new harness, and a custom codex command (path, args, env)
+> exactly as claude has.
+
+### Measured first, on codex-cli 0.155.1 → 0.156.1
+
+M44 hosted codex as `codex exec --json` because its hooks lived only in config files behind a
+trust hash, and named `-c hooks.… --dangerously-bypass-hook-trust` as the unmeasured upgrade.
+Measured now, in a real TUI in a PTY (one cheap turn):
+
+- **Command-line hooks fire** with `--dangerously-bypass-hook-trust`, one `-c
+  hooks.<Event>=[{matcher="",hooks=[{type="command",command="…"}]}]` per event. The payloads
+  are Claude's shape: `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `turn_id`,
+  `model`, `permission_mode`, and `last_assistant_message` on `Stop`. The hook command inherits
+  the TUI's environment, so `CIDE_SESSION` reached the recorder.
+- **The event set differs from Claude's** in both directions, read out of the binary
+  (`hooks/src/events/*.rs`): `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  **`PermissionRequest`**, `PostToolUse`, `Stop`, `SessionEnd`, `PreCompact`/`PostCompact`,
+  interrupt. There is no `Notification`, `PostToolBatch` or `SubagentStop`. `SessionEnd` did not
+  fire on `SIGTERM`.
+- **`SessionStart` fires with the first prompt, not at startup**: a TUI left at its composer
+  sent nothing. So a codex console sits in `Spawning` until its first turn.
+- **A bracketed paste then `\r` submits.** A paste written at ~8 s while the model was still
+  loading was lost once.
+- **Two startup modals eat keys.** The self-update chooser's first row is *Update now*: an Enter
+  typed to submit a probe prompt **updated the user's codex from 0.155.1 to 0.156.1**. The other
+  is the rate-limit "switch to a cheaper model?" nudge. Both are suppressed per invocation
+  (`check_for_update_on_startup=false`, `notice.hide_rate_limit_model_nudge=true`,
+  `codex_cli::QUIET_START`).
+- **The TUI starts without anybody answering its `ESC[6n`** (it times out and carries on). This
+  matters because a run's PTY usually has no pane attached.
+- **Storage.** The rollout is `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<thread>.jsonl`
+  (the hook's own `transcript_path`), with `token_count` and `task_complete` events.
+  `session_index.jsonl` keeps `{id, thread_name}` per line, and later lines win.
+- **`codex resume` and `codex fork`** accept every TUI option after the subcommand, and take
+  `[SESSION_ID] [PROMPT]` positionally.
+
+### What changed
+
+- **Settings → Harness.** The section formerly titled *Claude sessions* keeps its id
+  (`claudeSessions`). It now has:
+  - a Claude Code | Codex switch (`Settings::console_harness`, `ConsoleHarness`, default Claude);
+  - the Claude block unchanged;
+  - a Codex block (`CodexSettings { cli: CodexCli { binary, args, env, inject } }`) with a
+    `CodexCliSection`.
+
+  Every codex verdict and the resolved argv come from Rust (`codex_cli_support`), so there is
+  no TypeScript port of the rules to drift. The breadcrumbs say *Settings → Harness*.
+- **`cide_core::codex_cli`** is `claude_cli`'s twin:
+  - the refusals: `-C`, the trust bypass, `--remote`, `--no-alt-screen`, `-c` of `hooks.*` /
+    `mcp_servers.cide.*` / `developer_instructions` while cide writes them, and `CODEX_HOME`
+    plus the `CIDE_*` variables;
+  - `toml_string`, moved here from the harness;
+  - `hook_overrides`, `mcp_overrides`, `developer_instructions`, `quiet_start`;
+  - `rollout_of`/`resumable`/`thread_names`.
+- **Each console pane records its CLI** (`Pane::harness`, `None` = Claude, skipped when `None`
+  so a claude-only `workspace.json` is byte-identical):
+  - `spawn_session` decides and the registry remembers (`SessionRegistry::note_harness`);
+    `pane_bind_session` stamps it.
+  - `ConsoleSpawn::decide` is the one rule: a continuation runs its harness, a resume or fork
+    runs the CLI of the pane holding the conversation, and **a fresh spawn runs the setting**.
+    That makes Restart session the road onto a new harness while an open console and its
+    Resume stay on theirs.
+  - Moving a pane to the other CLI forgets the old `conversation` and renames `: claude` ↔
+    `: codex`.
+- **A codex console** (`codex_console_argv`) is:
+  `codex [resume|fork] <user args> -C <cwd> <quiet start> [-c developer_instructions=<roster>]
+  [<hooks> --dangerously-bypass-hook-trust] [-c mcp_servers.cide.{command,args,env.CIDE_SESSION,
+  env.CIDE_AGENT_SOCK}] [<thread>] [<prompt>]`.
+  - It gets no sandbox or approval flags: it is a person's TUI.
+  - Its thread arrives in `SessionStart` and lands in `Pane::conversation` through the existing
+    `Conversation` effect, since a thread id is a uuid.
+  - Restore, Resume and `resume_all_on_launch` find the rollout by id from any directory.
+  - `agent_rpc` scoping, nudges, the close confirm and the awaiting chrome work unchanged, off
+    the same `SessionState`.
+- **Codex agent runs are the TUI now** (`harness/codex.rs` rewritten):
+  - `SessionBinding::Caller` for routing, with the thread captured by the new
+    `Harness::capture_hook` from `SessionStart` into the run's harness session;
+  - `Delivery::Stdin` (a paste and Enter), Esc to interrupt, `codex resume` to respawn;
+  - hooks through `cide_claude::next_state`, with `PermissionRequest` answering
+    `AwaitingPermission`;
+  - `permission_policy` maps to a sandbox *and* an approval policy, always explicit, so
+    `default` is finally expressible;
+  - the configured codex binary and arguments are used (`RunPlan::codex`);
+  - `exec`'s renderer, ring and per-turn usage are gone.
+- **Typing into a codex session** (`agents::type_line`): the line is held until the TUI is up.
+  That is the first hook or `CODEX_BOOT` (6 s) alive. The line is sent as a bracketed paste,
+  idempotently, so a run's already-wrapped follow-up is not wrapped twice. Every existing road
+  now works on a codex console unchanged: nudges, reviewer lines, OpenSpec lines and the
+  dispatch hand-off.
+- **Tabs cide opens by itself** (reviewer, auto-spin) follow the setting. A codex one takes its
+  prompt positionally (`SpawnRequest::prompt`) and its permission via `permission_policy`.
+- **The editor's mention/Send selection** types `@path (lines a-b)` into a codex console's
+  composer (no Enter). The IDE protocol has no codex client.
+- **The one-shot lane** (Generate commit message) follows the setting. On codex it is
+  `codex exec --json --ephemeral -s read-only` with the prompt on stdin, answered by the last
+  `agent_message`, and a schema goes to `--output-schema`.
+- **OpenSpec buttons on a codex console** send *"Follow the OpenSpec instructions in
+  `.claude/skills/openspec-…/SKILL.md` …"* rather than a slash command codex does not have.
+- **Names and labels.**
+  - The session menu reads codex's `session_index.jsonl`.
+  - The pinned tab, overflow menu, switcher, detached header and window title say *Codex* when
+    the console pane runs it (`chrome/consoleName.ts`).
+  - The roster paragraph says "console pane" rather than "Claude pane".
+- **A codex continuation** of a finished run is a console pane (`PaneKind::Claude`, harness
+  Codex), so it has hooks and task tools.
+
+### Checked
+
+- Unit tests:
+  - `cargo test -p cide-core` (`codex_cli`, including rollout lookup and the index);
+  - `cargo test -p cide-core workspace` (`a_console_moved_to_codex_forgets_its_claude_conversation`);
+  - `cargo test -p cide-claude` (the codex events, `PermissionRequest`, the codex headless lane);
+  - `cargo test -p cide-agents` (the rewritten harness tests);
+  - `cargo test -p cide-app`: the console argv, `ConsoleSpawn::decide`, `a_codex_line_is_pasted_once`,
+    `a_codex_console_is_handed_the_skill_file_instead_of_the_command`, and the three tests that
+    pinned the old shape.
+- The workspace suite, clippy, `codegen --check`, `contract-check`, `tsc` and every `check:*`,
+  with `check:awaiting`/`check:claude-cli` updated to the console-level gate.
+- `cargo test -p cide-agents --test real_codex -- --ignored --skip a_real_turn` against the real
+  0.156.1:
+  - the brief decodes as the first developer message;
+  - the server registers with `CIDE_RUN`, `CIDE_SESSION` and `CIDE_AGENT_SOCK`.
+
+### Not confirmed
+
+- **`a_real_turn_…` (the TUI turn, a typed follow-up, and a resume from elsewhere) has not been
+  run.** It spends quota, and the account was under 10% of its weekly limit.
+- **Nothing here has been seen on a display.** Not observed:
+  - the Harness section;
+  - a codex console from launch through restore;
+  - a reviewer tab on codex;
+  - the `CODEX_BOOT` wait in practice.
+- **Whether a fresh worktree opens codex's "trust this folder?" chooser** despite the explicit
+  `-s`/`-a` pair. It is absent in `/tmp` with explicit flags, and unmeasured in a worktree. A
+  codex *console* in an untrusted project will ask, and the person answers.
+- **Gaps with no codex mechanism:**
+  - `openDiff` into native diff tabs, `getDiagnostics` and selection-changed (no IDE client);
+  - the statusline's token and cost readout (rollout `token_count` is where it would come from);
+  - the remote's permission-option reader, which screen-scrapes claude's prompt;
+  - `/rename` names are read, but codex also auto-titles threads, so a codex pane is named
+    without the user asking.
+
+## A project tab says how much is working in there (M94)
+
+> *"In cide header, on project tab need to show badge with count of how much agents + console
+> panels (claude/codex) are currently running in this project."* Plus, mid-implementation:
+> *"can we do for running counter — an animated spinner and number inside?"*
+
+### The gap
+
+The header draws one tab per open project, and until this the only thing it said about a project
+the user was **not** in was M58's amber chip: *N sessions are waiting for you*. There was no
+surface at all for the opposite and equally useful fact — *N things are working in there right
+now*. A user with agents dispatched across three projects had to activate each tab to find out
+which one was busy, which is the hunt the amber chip exists to prevent, one level over.
+
+### The number is Rust's, and that is the whole design
+
+`awaiting.ts`'s header argues at length that the *frontend* must decide who is waiting, because
+acknowledgement — a click or a keystroke into a pane — is a webview event Rust never sees. This
+is the mirror image and the argument runs the other way. Every fact behind a running count lives
+in a Rust registry: a run's state in `AgentRegistry`, whether a child is alive in
+`SessionRegistry`, whether a pane is merely a run's mirror in `AgentRegistry::owns_session`, and
+what the hook server last heard. And it needs all four **for projects the asking window is not
+drawing**, which is the entire point. The webview has no input to contribute, so it contributes
+none: one listener, one catch-up, no report direction.
+
+Two frontend facts made that unavoidable rather than a preference: `sidebar/agentsStore.ts` holds
+exactly one project's roster (the attached one) and drops broadcasts for any other, and
+`awaiting.ts`'s table stores only the awaiting boolean, not the phase.
+
+### One definition of busy, not a fourth
+
+`spinner::should_spin` already answered *is anything in flight in this project*, over the same
+two counts, with two predicates that each carry a paragraph of hard-won exceptions — an `Idle`
+run whose task sits in review (M83's *Quiet for* timer that never fired), and a hook server that
+answers `Spawning` for a session it will never hear from (the pane over a dead conversation, and
+the opencode mirror). A badge computed from its own definition would have disagreed with that
+timer on exactly the days those exceptions matter, and neither number would have been checkable
+against the other.
+
+So both predicates **moved** into a new `cide_app::running`, with their doc comments and their
+tests, and `spinner::facts` now reads `running::counts_for`. The spinner asks "is it zero", the
+header asks "how many", and it is one arithmetic. Three things improved on the way, and the
+spinner wanted all three:
+
+- **De-duplicated by session** (`BTreeSet`, not `Vec`). A mirrored pane is two panes showing one
+  child; the spinner only ever asked whether the count was zero, but a badge saying `2` about one
+  conversation counts windows onto a thing rather than the thing.
+- **`cide_core::workspace::session_panes`** instead of a hand-rolled `tabs` walk — the helper that
+  exists because a walk over `tabs` alone silently drops detached panes (M72's quit dialog).
+- **A 30-second grace on `Spawning`** — which was wrong, and is gone again; see below. `alive`
+  and `owned_by_run` already catch the two shapes that were on a real board, and what is left —
+  a live console that never speaks to the hook socket — turned out to want no grace at all.
+
+### Then the sharing came due, and the report took an hour
+
+> *"I paused subagents and title still shows me that this agents are running."*
+
+Exactly right, and it is the cost of the paragraph above being taken one step too far. Both
+predicates ended in a `_ => true` arm, and that arm hid **three** disagreements rather than the
+one this entry originally admitted to. `AgentRegistry::pause` shuts the queue, sets every live run
+to `Paused` and `SIGSTOP`s its session — the project's own console included — so after it nothing
+in the project is executing, and the chip went on showing the same number. A badge that
+contradicts the button the user just pressed is the fastest possible way to teach somebody to
+ignore a badge, which is the failure `awaitingRule.ts` spends three paragraphs on.
+
+The fix is the one the predicate's own doc already prescribed — a parameter, never a fork — but it
+had to name the *question* rather than a flag, because the two readings differ in three places:
+
+```rust
+enum Busy { Claimed, Working }
+```
+
+`Claimed` is the spinner's: *must I hold off starting new work here?* Anything holding a child, a
+queue slot or a worktree — which is `Queued`, `Paused`, `Idle`, and a pane at a `Splash`. `Working`
+is the header's: *how much is executing right now?* — `Starting`, `Running`, `AwaitingPermission`
+and a young `Spawning`, and nothing else. The spinner's behaviour is bit-identical to what it was;
+only the badge moved.
+
+`Queued` and `Idle` went in the same pass rather than waiting to be reported separately. Pause
+shuts the queue but leaves queued rows queued, so fixing `Paused` alone would have taken the chip
+from wrong to slightly-less-wrong; and an `Idle` run is a live child sitting at a prompt between
+turns, which is the Agents panel's business and not a count of work in flight. All three were
+states the user's own choice of *actively working* had already excluded — the first cut simply
+inherited the spinner's arm without re-reading it.
+
+**Both matches are now exhaustive, with no `_` arm.** A new `RunState` or `SessionState` variant
+fails to compile until somebody has said what it means to each reader, rather than defaulting to
+*working* in a badge. That, not the three arms, is the part worth keeping.
+
+### And then a screenshot, which is why a display is not optional
+
+The second report was a picture: an empty project, `~/work/temp/test2`, whose only content was a
+freshly opened **codex** console sitting at its composer having been asked nothing — and a header
+tab drawing a turning spinner and a `1`.
+
+The mechanism was written down in M93, forty lines up this file: *"`SessionStart` fires with the
+first prompt, not at startup … so a codex console sits in `Spawning` until its first turn."*
+`HookServer::state` answers `Spawning` for any session it has no entry for, and the first cut
+counted `Spawning` as working. Claude has the same shape for its first second or two; codex has
+it for as long as the console is open; a harness that speaks no Claude hooks has it for ever.
+
+The `SPAWNING_GRACE` this entry introduced was a fix for the *symptom* and it is now deleted. It
+made the chip lie for thirty seconds instead of for ever, and it **changed the spinner's
+behaviour to buy that** — narrowing an arm that had been measured and deliberate. Both were the
+wrong trade for a badge.
+
+`Spawning` now counts for `Claimed` and never for `Working`. *Nothing has been heard about this
+session* is not evidence of work, and a badge does not guess: the honest direction is to
+under-report for the moment before a real turn's first hook arrives rather than to over-report
+every console anyone opens. The spinner is back to exactly what it was before M94 touched it,
+`counts_for` no longer needs a clock at all, and `a_console_that_has_never_spoken_is_not_working`
+pins both readings.
+
+Three reports, three arms of one `_ => true`. The lesson is not about `Spawning`: it is that a
+predicate written for *should I start work here* was reused for *what is happening here* on the
+strength of the two questions sounding alike, and every arm where they differ had to be found by
+a user looking at a screen.
+
+### The event is free in the steady state
+
+`cide://project-running` carries the whole map, with a generation, on `cide://session-awaiting`'s
+rule; a project with nothing running is **omitted**, so absence is the message. It is marked from
+three funnels and no individual call site — `emit::session_state`, `AgentRegistry::mark_changed`
+(before its own early return, or a burst's later changes never arrive) and `WorkspaceState::update`'s
+accepted-change tail, next to `retitle` and for `retitle`'s stated reason.
+
+The traffic that could move it is heavy: a hook frame per tool call, a roster emit a second per
+working run. Coalescing alone would still put one whole-map emit into every window every second
+for the life of every run, re-rendering every project tab to draw the same number. So the flusher
+**compares against the last broadcast and drops a recomputation that moved nothing**. That is the
+property, not the debounce, and `a_burst_that_changes_no_count_emits_nothing` is the pin — it is
+what a future "simplification" of the coalescer deletes by accident.
+
+### The chip
+
+A second chip on the tab, to the right of the amber one and never before it: both lay out left to
+right, so a chip placed first would shove the amber one sideways every time an agent started, and
+the amber one's job is to be findable in the same place twice. Its own pair of collapsing custom
+properties (`--running-w`/`--running-slot`), because the two light for unrelated reasons and a
+project with an agent working and nothing waiting must not draw a hole where the amber chip is
+not. `.tabOpen`'s reach-over now names both slots, in the margin *and* the padding.
+
+Outlined and dim rather than filled: amber-filled means *come back here*, working is the ordinary
+state of a project somebody is using, and a second filled chip lit on most tabs most of the time
+would make the mark that is meant to be noticed compete with the one that is always there.
+
+Inside it, a turning `loader-circle` and then the count — the same glyph `AgentsPanel` already
+turns for a run in `running`, so one mark means one thing in both places. A static number cannot
+be told from one stuck since a crash; the mark says *now* and the number says how much and that it
+is coming down. Reduced motion pauses the loop through `--motion-loop`, whose 0% frame is the arc
+at rest. The element is rendered only while lit, so a header over quiet projects animates nothing.
+
+The tooltip names **both halves** — "2 agent runs and 1 console are working in this project" — and
+is the only place an uncapped figure appears, since the chip stops at `9+`. It says "consoles",
+never "sessions", and that is load-bearing: a *shell* pane running a long build is counted by
+neither chip's producer, while `lifecycle::watch_jobs` does raise the amber one when that build
+ends, so a user told "2 sessions" would be right to call the pair inconsistent.
+
+`ui/src/panes/runningRule.ts` is the pure half, import-free and DOM-free like `awaitingRule.ts`,
+driven by a new `check:running` — which also reads the chip's geometry out of the stylesheet (the
+slack around `9+` beside the mark, the paired collapse, and the two-slot reach-over, which is the
+one `check:awaiting` never needed).
+
+`Icon`'s `className` became `string | undefined`. Under `exactOptionalPropertyTypes` with Vite
+typing every CSS module as `Record<string, string>`, `styles.foo` is `string | undefined`, so a
+bare `className?: string` could never be handed one — no caller had hit it until a mark needed a
+class of its own.
+
+### Checked
+
+`cargo fmt --check`, `contract-check` (accepted `+ project_running_counts`,
+`+ cide://project-running`), the workspace build and test suite, clippy `-D warnings`,
+`codegen --check`, `tsc --noEmit`, **every** `check:*` script, and `pnpm build` — all of it again
+after the `Busy` split, with the spinner's own tests unchanged, which is the evidence that only
+the badge moved. The new `check:running` was mutation-tested three ways: deleting the hook call,
+dropping `--running-slot` from `.tabOpen`'s padding, and narrowing the chip — each fails as
+intended.
+
+`cargo test -p cide-app -- running` pins the report itself
+(`a_paused_project_is_working_on_nothing`) and the two arms that would have been reported next
+(`a_queued_or_idle_run_is_not_running`).
+
+### Not confirmed
+
+- **Seen once, in the user's screenshot of the codex bug, and that is the whole of it.** What
+  that picture does confirm: the chip renders in the project tab, at the right size, to the
+  right of the name, with the mark and the count inside it and the tab still laid out correctly
+  around them. Everything else is still unobserved — the amber chip beside it, either collapse at
+  rest, the mark actually turning, the `9+` cap, a background project's count moving, and the
+  catch-up filling a freshly detached window's chip. Both fixes since are tested and neither has
+  been watched. An attempt to screenshot it myself ended with the machine going down hard — do
+  not run `grim` or `spectacle` on this host.
+- **A console mid-turn is under-counted until its first hook lands.** By design now, not by
+  accident — see the `Spawning` section — but the size of that window is measured for nothing
+  except claude, where it is a second or two. For a harness whose hooks cide never receives at
+  all, the console half of the count is simply always zero and the chip says nothing; that is the
+  honest failure, but it is a failure.
+- **Whether a codex console mid-turn is counted at all has not been watched.** M93 established
+  that codex hooks fire with `--dangerously-bypass-hook-trust` and that `SessionStart` arrives
+  with the first prompt, so a prompted codex should report `Busy` and count — reasoned from that
+  entry, not observed.
+
+## Plan tasks plans, whatever the gate says (M95)
+
+Pressing **Plan tasks** on selfcraft answered *"Milestone slice already passes its gate and is
+waiting for you in review, so there is nothing to plan until it is accepted"* while `slice` still
+had tasks in todo, doing and review. `spinner::wake` ran a stale gate first (minutes, holding the
+button) and refused on any pass, for the timer and the button alike.
+
+- **The button never runs the gate and never refuses on it** (`Caller::Button`). It reads the
+  last known verdict, only for the milestone facts line appended to the prompt.
+- **The timer stands down on a pass only when nothing is open under the milestone's goal**
+  (`gate_blocks_planning`, shared by `wake` and `milestone_ready`, so the tick that decides to wake
+  and the wake that decides to plan read the board the same way).
+- Unit test `a_passing_gate_blocks_only_an_empty_milestone`. **Not confirmed on a display**: the
+  button against a green-gated milestone with open tasks was not pressed in a running cide.
+
+## Expand all and Collapse all, and an MR opens with its folders expanded (M96)
+
+Neither the Explorer nor the GitLab MR tree could fold or unfold everything at once. The MR's
+changed-files tree also opened with every folder collapsed, so a reviewer had to click down
+through each folder before seeing which files changed.
+
+- **Explorer**: two header buttons beside ⌖. They run the commands `file.expandAll` and
+  `file.collapseAll`, which are also palette rows and can be bound to keys. Rust handles both
+  with `fs_expand_all` and `fs_collapse_all`, which call `Index::set_all_expanded`: one
+  `recompute_all` pass rather than one `recompute_up` per directory.
+  - *Expand all* skips every directory `Filter::watchable` refuses, so with *Show ignored
+    files* on, `target/` stays shut. It leaves the synthetic groups alone, because opening
+    *External Libraries* runs `cargo metadata`.
+  - *Collapse all* folds the groups too, but never the roots. A lone root is not drawn, so
+    folding it would leave the Explorer empty.
+- **MR tree** (`gitlab/FileTree.tsx`): which folders are open is now stored once for the whole
+  tree, as a default plus the folders the user flipped (`{ base, toggled }`), instead of in each
+  row. That makes the two strip buttons ("reset to all open" / "reset to all closed") possible.
+  A folder that appears after a bulk action follows that action. The changed files start
+  expanded (`defaultExpanded`); *Browse MR source* is the whole repository and still starts
+  collapsed. `ReviewPanel` keys the tree on the mode.
+- Checks: `expand_all_skips_what_keep_refuses_and_collapse_all_keeps_the_root`,
+  `collapse_all_folds_every_header`, and new assertions in `check-gitlab-dom` and
+  `check-gitlab-render`. **Not confirmed on a display**: none of the buttons was clicked in a
+  running cide.
+
+## New project: a wizard for an empty, an OpenSpec-driven or a task-driven project (M97)
+
+Until now cide could only *open* a folder. **New project…** is in the header's `▾` menu right
+under *Open folder…* and in the palette as `project.new`. It opens a two-column wizard: a rail
+listing the steps on the left, the current step on the right, and an illustration on every step
+that describes a feature.
+
+- **Three roads** (`chrome/newProject/wizardModel.ts`, import-free):
+  - *Empty*: type → location → create.
+  - *OpenSpec-driven*: adds an OpenSpec step (optional `context:` for `openspec/config.yaml`,
+    and a notice if the CLI is missing) and a Subagents step (a toggle).
+  - *Task-driven*: subagents always on, plus a Brief step. The console turns the brief into
+    milestones, roles and tasks.
+- **Location step**:
+  - A path field (`~` expands) plus **Browse…** → `project_pick_location`. That is the same
+    parented GTK picker as `project_pick`, single-select, so its New Folder row is there.
+  - `project_new_probe` answers as the user types (debounced; a stale answer is dropped by
+    path) with: will be created / empty / *not empty (n items), nothing is changed* / already
+    a repository / inside another repository / OpenSpec already here / already open.
+  - The git box is forced on whenever subagents are on, because `worktree_refusal` refuses to
+    enable them outside a repository.
+- **`project_new`** (`cmd/new_project.rs`) runs the steps in this order: folder → `git init`
+  (`cide_git::repo::init`, via libgit2) → `openspec init` (`cmd::spec::init_at`, split out of
+  `spec_init`) → enable subagents (`cmd::agents::enable_at`, split out of `agents_config_set`,
+  with the same refusal) → open (`open_project_on_main_thread`, now `pub(crate)`) → brief.
+  - Each step goes out on `cide://project-new-progress`, and the Create step draws them as a
+    live checklist.
+  - Only the folder and the open are fatal. Any other failure is reported, and the outcome
+    lists every failure again for a window that missed an event.
+- **The console brief** (Task-driven road):
+  - The console's `claude` is spawned by the webview when its pane mounts, so the line is not
+    typed from the command. It is left in `new_project::SEEDS` under the canonical root before
+    the open.
+  - `spawn_session` **takes** it when it spawns that project's primary console
+    (`is_primary_console_spawn`, `voice: None` only). Claude gets it through
+    `type_submitted_line`; codex gets it as the argv opening prompt.
+  - Because it is taken, it is typed once: a respawn or a reopen never replays it.
+  - A folder that was already open with a live console is typed into directly.
+  - The line asks for 2–5 milestones through `cide_milestones` define, roles through
+    `cide_agent_create`, and the first milestone's tasks unassigned. It then asks for a
+    go-ahead. With no brief, the console asks the user what to build first.
+- **The wizard is mounted beside `PushDialog` in both window kinds**, not in `OverlayHost`,
+  which mounts only with a project open. The empty shell is where a first project is made.
+  `OverlayCard` gained an optional `className` so this card can be 880px wide.
+- **The illustrations** are inline SVG in `art.tsx` (empty, spec, board, subagents,
+  milestones). Every fill is a token class, so they follow the theme; they are decorative.
+- **`create` is deliberately not a keyword** of `project.new`: it would tie with
+  `git.branch.new` in the keyword tier and win on registry order, breaking two pinned palette
+  tests.
+- Checks:
+  - `cargo test -p cide-app new_project`: probe cases, tilde expansion, a seed taken once and
+    only for its root, and the brief staying one line and naming its tools.
+  - The new `check:new-project`: roads, Continue gating, git forced by subagents, the request
+    per road, checklist order, and both entry points plus both mounts.
+  - `check:menu-model` updated.
+  - `no_async_command_opens_a_project_on_its_own_task` now recognises `pub(crate) async fn`.
+- **The brief is a numbered checklist** after its first real run (`~/work/temp/test3`). That run
+  defined four milestones but created tasks only under the first, so three showed *no tasks*,
+  and it left the repository with no commit, so no worktree could branch. The line now asks for,
+  in order:
+  1. a survey of what already exists;
+  2. gate scripts written *before* `define`, and listed in `guardPaths`;
+  3. roles;
+  4. tasks for **every** milestone, each `subtaskOf` its milestone's task. Later milestones'
+     tasks landing in the inbox is stated as expected.
+  5. a first commit;
+  6. a check of every task's link against the board.
+
+  It still ends by asking before dispatching.
+  `the_brief_asks_for_every_milestones_tasks_a_first_commit_and_a_check` pins the phrases.
+- **An opened project now comes to the front.** In the stacked window mode, `rebuild_windows`
+  kept the shell's previous `active` across an open. So every open — `+`, recents, palette, the
+  wizard — added a header tab behind the project already on screen, and looked as though nothing
+  had happened. `workspace::front` now sets the new project active in both `open_project` and
+  `reopen_project`; every caller of either is a user gesture.
+  `stacked_mode_keeps_the_active_project_it_already_had` became
+  `…_brings_a_newly_opened_project_to_the_front`, and it also pins that a *close* still keeps the
+  front project. Three `cide-app` fixtures that had leaned on "the first one stays active" now
+  activate explicitly. The OS window is not raised or focused here; that is the compositor's,
+  and in per-project mode the new window is what the platform makes of a new toplevel.
+- **Not confirmed on a display**: the wizard has not been opened, the picker has not been used
+  from it, and no console has been seen acting on a brief. `project_new` has not been run end to
+  end against a real `openspec` or `claude`.
+
+
+## Default instructions for an agent's MR review (M98)
+
+Asked for: a default prompt, global or per project, that fills the instructions box when **Review
+with an agent** (the eye icon) opens, instead of the box starting empty every time. "Per
+project" was settled as the **GitLab repository** of the MR, not the cide project hosting the
+run: a review may be hosted by any open project, and what to look for belongs to the code under
+review. Nothing is written into a repository.
+
+- **`GitLabPreferences` gained `reviewPrompt` and `reviewPrompts`** (`[{ repository, prompt }]`, a
+  list so the screen keeps the user's order). The struct is `serde(default)`, so an older
+  `gitlab` save file loads with both empty.
+- **Saved in one spelling** by `cide_gitlab::normalise_review_prompts`: scheme, slashes at either
+  end and `.git` are stripped, so a pasted browser or clone URL works. Rows blank on both sides
+  are dropped; a prompt without a repository and two rows for one repository are refused,
+  because both would sit in the file and never show.
+- **Matched in `ui/src/gitlab/model.ts::defaultReviewPrompt`** against the MR's `web_url`. An entry
+  matches as `group/repo`, as `host/group/repo`, or as a whole-segment tail containing a `/`, for
+  a GitLab served under a subpath. The first entry with a non-blank prompt wins, then the global
+  prompt. A blank entry falls through.
+- **Settings → Git → Agent review instructions**: the default textarea, a row per repository with
+  suggestions from the open MRs, one save button.
+- **`LaunchReviewDialog` pre-fills and keeps re-applying the default until the user types.** The
+  dialog can mount before the board or the MR has arrived. Once the user has typed, a late
+  refresh never overwrites the text. Multi-line prompts are flattened by `mr_review::opening_line`
+  as before, and the settings hint says so.
+- Checks:
+  - `cargo test -p cide-gitlab review_prompts`.
+  - `check:gitlab` covers the matching cases.
+  - `check:gitlab-dom` asserts the dialog opens with the repository's prompt over the global one.
+- **Not confirmed on a display**: the settings block and the pre-filled dialog have not been seen
+  in a running cide.

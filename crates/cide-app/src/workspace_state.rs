@@ -236,6 +236,15 @@ impl WorkspaceState {
             // GTK call is the slowest thing in this function and the webviews should not wait
             // behind it for the snapshot they are about to render.
             crate::cmd::window::retitle(app, &snapshot);
+            // A pane was opened, closed, split, torn out, re-docked or had a session bound to
+            // it; or a project was opened or closed. Every one of those moves the header's
+            // running counts, and the argument for marking here is `retitle`'s above, verbatim:
+            // this is the one place that knows the tree moved, and marking from each mutation
+            // site is the version that goes stale the first time somebody adds one.
+            //
+            // Cheap and coalesced — `running::mark` takes one mutex and returns — so it is safe
+            // on the path every gesture in the app runs through.
+            crate::running::mark(app);
         }
         outcome
     }

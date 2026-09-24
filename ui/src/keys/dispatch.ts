@@ -58,6 +58,7 @@ import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
 import { browseForProject } from '@/chrome/projectOpen'
+import { requestNewProject } from '@/chrome/newProject/newProjectStore'
 // M22. The one seam into the extension host from the key layer: `invoke` posts to a worker and
 // answers whether one was there to hear it, which is what makes a contributed command reportable
 // as unavailable rather than silently inert.
@@ -812,6 +813,14 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return void browseForProject()
 
       /*
+       * The New project wizard (M97). Raised through its store, which both window kinds draw —
+       * `App.tsx` mounts it beside `PushDialog` — so the key works in the empty shell, which is
+       * where a first project gets made.
+       */
+      case 'project.new':
+        return void requestNewProject()
+
+      /*
        * Ctrl+` — the held-modifier switcher over **projects**, in most-recently-used order.
        *
        * It was Ctrl+Tab until the tab switcher above took that chord; `cide_core::keymap` holds
@@ -1150,6 +1159,26 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      case 'file.expandAll':
+      case 'file.collapseAll': {
+        /*
+         * The Explorer header's two fold buttons (M96). The refusal is `file.reveal`'s,
+         * as a sentence and for the same reason: a key bound to this in a detached window
+         * would otherwise be a key that does nothing.
+         */
+        if (!panelHostPresent() || boot()?.role.kind !== 'shell') {
+          notify('This window has no file tree, so there is nothing to expand or collapse.', {
+            kind: 'warn',
+            hint: 'Detached panes are their own window and show no sidebar.',
+          })
+          return
+        }
+        // Shown first, `file.reveal`'s order: folding a tree the user cannot see is a command
+        // that appears to do nothing.
+        requestPanel('files')
+        void useFileTree.getState().setAllExpanded(command === 'file.expandAll')
+        return
+      }
       case 'file.reveal': {
         /*
          * Every refusal below is a *sentence*, and that is the whole of what this arm learned.
