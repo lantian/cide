@@ -13,6 +13,8 @@ name = "cide-headless"
 path = "src/main.rs"
 
 [dependencies]
+# `demo-bootstrap` prints a `Bootstrap` for the screenshot demo (ui/demo.html).
+serde_json = { workspace = true }
 cide-core = { workspace = true }
 cide-ipc = { workspace = true }
 cide-pty = { workspace = true }

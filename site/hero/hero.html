@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>cide hero</title>
+    <!--
+      The README's one image and the site's social card, composed from the demo screenshots.
+      Not a page anyone visits: `pnpm --dir ui demo:shots --hero` loads it in headless Chromium at
+      ?w=&h= and saves the frame to docs/img/hero.png and site/img/og.png. It sets
+      <html data-ready> once every screenshot has decoded, which is what the capture waits for.
+
+      Always the dark renders: the README is read on GitHub in either theme, and the gradient is
+      built to hold both — a light screenshot on it would read as a hole in the picture.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --w: 1600px;
+        --h: 820px;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        width: var(--w);
+        height: var(--h);
+        overflow: hidden;
+        background: #0c0c0e;
+        font-family: 'Inter', system-ui, sans-serif;
+        color: #f2f2f5;
+      }
+      .stage {
+        position: relative;
+        width: var(--w);
+        height: var(--h);
+        overflow: hidden;
+        background:
+          radial-gradient(60% 80% at 100% 0%, rgba(242, 144, 58, 0.55), transparent 60%),
+          radial-gradient(70% 90% at 85% 100%, rgba(225, 29, 72, 0.75), transparent 65%),
+          radial-gradient(55% 70% at 0% 100%, rgba(255, 59, 59, 0.35), transparent 70%),
+          linear-gradient(135deg, #140c10 0%, #1b0b12 45%, #3a0b1a 100%);
+      }
+      /* A fine grid, faded out toward the text, so the gradient reads as a surface, not a fill. */
+      .stage::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+        background-size: 40px 40px;
+        mask-image: linear-gradient(90deg, transparent 5%, #000 60%);
+      }
+      .copy {
+        position: absolute;
+        left: 72px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 560px;
+        z-index: 2;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        font-size: 44px;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+      }
+      .brand svg {
+        width: 50px;
+        height: 50px;
+      }
+      h1 {
+        margin: 26px 0 0;
+        font-size: 60px;
+        line-height: 1.04;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+      }
+      h1 .grad {
+        background: linear-gradient(100deg, #ff5a5f 0%, #ff3b3b 40%, #f2903a 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      p {
+        margin: 22px 0 0;
+        font-size: 21px;
+        line-height: 1.5;
+        color: rgba(242, 242, 245, 0.78);
+      }
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 30px;
+      }
+      .chips span {
+        padding: 8px 15px;
+        border-radius: 999px;
+        font-size: 16px;
+        font-weight: 600;
+        color: #fff;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        backdrop-filter: blur(6px);
+      }
+      .url {
+        margin-top: 34px;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 20px;
+        border-radius: 12px;
+        font-size: 19px;
+        font-weight: 700;
+        background: linear-gradient(135deg, #ff3b3b, #e11d48);
+        box-shadow: 0 16px 40px -14px rgba(255, 59, 59, 0.8);
+      }
+      .shots {
+        position: absolute;
+        left: 640px;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        perspective: 2400px;
+      }
+      .shot {
+        position: absolute;
+        width: 900px;
+        border-radius: 14px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        box-shadow:
+          0 2px 6px rgba(0, 0, 0, 0.4),
+          0 50px 100px -30px rgba(0, 0, 0, 0.85);
+        transform-origin: left center;
+      }
+      .shot img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 10;
+        object-fit: cover;
+        object-position: left top;
+      }
+      .back2 {
+        top: 36px;
+        left: 330px;
+        transform: rotateY(-14deg) scale(0.78);
+      }
+      .back1 {
+        top: 360px;
+        left: 380px;
+        transform: rotateY(-14deg) scale(0.78);
+      }
+      .front {
+        top: 170px;
+        left: 0;
+        transform: rotateY(-14deg) scale(0.8);
+      }
+      /* The social card is smaller and nearly square-ish: one shot, text on top. */
+      .og .copy {
+        left: 56px;
+        width: 520px;
+      }
+      .og h1 {
+        font-size: 50px;
+      }
+      .og p {
+        font-size: 19px;
+      }
+      .og .chips {
+        display: none;
+      }
+      .og .shots {
+        left: 560px;
+      }
+      .og .shot {
+        width: 760px;
+      }
+      .og .back2 {
+        display: none;
+      }
+      .og .front {
+        top: 110px;
+      }
+      .og .back1 {
+        top: 250px;
+        left: 150px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="stage">
+      <div class="copy">
+        <div class="brand">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <defs>
+              <linearGradient id="ramp" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="60" y2="60">
+                <stop offset="0" stop-color="#dc3f28" />
+                <stop offset="0.66" stop-color="#e76831" />
+                <stop offset="1" stop-color="#f2903a" />
+              </linearGradient>
+            </defs>
+            <path d="M10 10 L30 32 L10 54" fill="none" stroke="url(#ramp)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" />
+            <rect x="44" y="4" width="16" height="56" rx="4" fill="url(#ramp)" />
+          </svg>
+          cide
+        </div>
+        <h1>The IDE built around <span class="grad">Claude&nbsp;Code</span></h1>
+        <p>A pinned Claude tab with a tiling grid of sessions, a real IDE around it, and agents that work in their own worktrees.</p>
+        <div class="chips">
+          <span>Claude session grid</span>
+          <span>Agents in worktrees</span>
+          <span>Task board over MCP</span>
+          <span>LSP editor</span>
+          <span>IDEA-style git</span>
+          <span>GitLab review</span>
+        </div>
+        <div class="url">lantian.github.io/cide →</div>
+      </div>
+      <div class="shots">
+        <div class="shot back2"><img data-src="git" alt="" /></div>
+        <div class="shot back1"><img data-src="gitlab" alt="" /></div>
+        <div class="shot front"><img data-src="claude" alt="" /></div>
+      </div>
+    </div>
+    <script>
+      ;(function () {
+        var q = new URLSearchParams(location.search)
+        var w = Number(q.get('w') || 1600)
+        var h = Number(q.get('h') || 820)
+        document.documentElement.style.setProperty('--w', w + 'px')
+        document.documentElement.style.setProperty('--h', h + 'px')
+        if (w < 1400) document.body.classList.add('og')
+        var imgs = Array.prototype.slice.call(document.querySelectorAll('img[data-src]'))
+        var pending = imgs.map(function (img) {
+          return new Promise(function (done) {
+            img.onload = done
+            // A scene not rendered yet falls back to the hero shot rather than a broken image.
+            img.onerror = function () {
+              img.onerror = done
+              img.src = '../img/claude-dark.webp'
+            }
+            img.src = '../img/' + img.dataset.src + '-dark.webp'
+          })
+        })
+        Promise.all(pending.concat(document.fonts.ready)).then(function () {
+          requestAnimationFrame(function () {
+            document.documentElement.dataset.ready = '1'
+          })
+        })
+      })()
+    </script>
+  </body>
+</html>

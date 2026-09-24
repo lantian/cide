@@ -14762,3 +14762,52 @@ fixes followed in four phases, one commit each.
   - the log tab open during an agent run
   - a diff open while an agent edits the file
   - `./run.sh --audit-panes`
+
+## A short README, one hero image, and a feature site rendered from the real UI (M103)
+
+The README had become six full-width screenshots and a page of prose. It is now about fifty lines
+around one image: `docs/img/hero.png`, a gradient card composed from real screenshots, linked to
+the new feature site at <https://lantian.github.io/cide/>. The site is `site/`: plain
+HTML/CSS/JS, no build, English and Russian, and a dark/light switch that swaps **every screenshot**
+to the matching render of the app, not only the page colours. `.github/workflows/pages.yml`
+publishes `site/` as committed. One manual step: Settings → Pages → Source = GitHub Actions.
+
+**The screenshots are not photographs of a window.** Nothing can photograph cide here: `grim`
+hung under KWin and the machine went down right after it once. So `ui/demo.html` boots the real
+`main.tsx` over a fake backend (`ui/src/demo/fakeTauri.ts`, assigning `__TAURI_INTERNALS__` the
+way `treeRefreshSmoke.ts` does, so `client.ts` stays the only `@tauri-apps/api` importer).
+`ui/scripts/demo-shots.mjs` renders nineteen scenes × two themes in headless Chromium, over CDP
+with Node's own `WebSocket`, with no puppeteer and no new dependency.
+- **The base data is the Rust core's.** `cide-headless demo-bootstrap` prints a real `Bootstrap`
+  (keymap, command registry, language table), regenerated on every capture and never committed.
+- **Everything a scene shows is canned wire data** typed against `generated.ts`: the file tree,
+  git state, transcripts, the task board, an MR.
+- **An unmocked command answers the empty value of the type `client.ts` declares for it** and is
+  listed after the ✓.
+- **`check:demo`** holds the scene ids, the site, the hero and `contract/commands.json` together.
+
+**Not verified:**
+- **None of this has been seen in a Tauri window.** The pictures are the real components in the
+  real tokens, but in Chromium, not WebKitGTK, over data no real repository produced.
+- **The site has not been served from GitHub Pages yet.** It was only checked locally, in headless
+  Chromium at 1440 and 390 wide, in both themes and both languages.
+
+**App bugs the scenes ran into, none fixed here.**
+- **`settings/fontScale.ts::codeMetrics` divides a CSS-pixel leading by a device-pixel glyph
+  box.** At any devicePixelRatio ≠ 1 xterm gets a line-height multiplier below 1 and throws
+  ("lineHeight cannot be less than 1"). The demo reports dpr 1 to dodge it.
+  `check:fonts` encodes the same units, so it passes.
+- **`DockerPanel`'s `Body` returns early before its hooks.** React logs "Expected static flag was
+  missing" when the panel mounts on an unread board and then gets a ready one.
+- **`ConflictFile.tooLarge`, and probably `base`/`ours`/`theirs`, are `#[ts(optional)]` without
+  `skip_serializing_if`.** Rust sends `null` where the generated type promises absence.
+  `MergePane` tests `!== null`, so a payload that follows the type would read as "too large".
+- **The log graph never draws a diagonal.** A merge's second parent is a vertical stub.
+- **Unified diff: the per-hunk Keep buttons are white on white in the light theme.**
+  `@codemirror/merge`'s `color: white` outranks `.chunkButton`.
+- **`PaneBody`'s `claudeMcp` diff branch does not check `pane.kind`.** A split Claude diff tab
+  would draw its Claude pane as a second diff.
+- **History (`RunRow`) colours a role by its hashed id, not its declared `color:`.**
+- **Settings → Models: the pool entry's model box is squeezed to one character.**
+- **The Extensions panel truncates a nine-character marketplace name.**
+- **A task card renders `- [x]` checklist items with the box and the text on separate lines.**

@@ -395,9 +395,13 @@
   border-bottom: 1px solid var(--border-soft);
   flex: none;
 }
+/* `justify-content` restated: the shared `:where(button)` rule centres, and a button with no
+   counter (Overview, Activity, Pipelines) drew its label centred beside its left-aligned
+   neighbours, whose counter's `margin-left: auto` happened to take the slack. */
 .reviewPanel .reviewActions button {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: var(--sp-3);
   padding: var(--sp-3);
   font: 11px/1.4 var(--font-ui);

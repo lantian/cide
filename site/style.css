@@ -1,0 +1,767 @@
+/*
+ * The site's palette is cide's own: the values below are copied from ui/src/styles/tokens.css
+ * (light is the bare :root there too, dark the override), so the page around a screenshot is the
+ * same colour as the app inside it. If tokens.css moves, move these.
+ */
+:root {
+  color-scheme: light;
+  --bg: #fbfbfc;
+  --bg-2: #f2f2f5;
+  --panel: #ffffff;
+  --border: #d8d8de;
+  --border-soft: #e9e9ee;
+  --text: #1b1b1f;
+  --text-hi: #0a0a0c;
+  --dim: #56565f;
+  --accent: #dc1f2b;
+  --accent-hi: #b3121d;
+  --on-accent: #ffffff;
+  --grad-from: #ff3b3b;
+  --grad-to: #e11d48;
+  --grad-warm: #f2903a;
+  --glow-a: rgba(255, 59, 59, 0.22);
+  --glow-b: rgba(242, 144, 58, 0.18);
+  --shadow: 0 1px 2px rgba(10, 10, 12, 0.06), 0 12px 40px -12px rgba(10, 10, 12, 0.22);
+  --shadow-lg: 0 2px 4px rgba(10, 10, 12, 0.06), 0 40px 90px -30px rgba(120, 20, 30, 0.35);
+  --code-bg: #f6f6f9;
+  --font-ui: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --radius: 14px;
+  --max: 1200px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --bg: #0c0c0e;
+    --bg-2: #111113;
+    --panel: #151518;
+    --border: #2a2a31;
+    --border-soft: #202027;
+    --text: #d7d7dd;
+    --text-hi: #f2f2f5;
+    --dim: #8c8c97;
+    --accent: #ff5a5f;
+    --accent-hi: #ff8a8d;
+    --glow-a: rgba(255, 59, 59, 0.28);
+    --glow-b: rgba(225, 29, 72, 0.2);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 40px -12px rgba(0, 0, 0, 0.7);
+    --shadow-lg: 0 2px 4px rgba(0, 0, 0, 0.4), 0 40px 100px -30px rgba(255, 59, 59, 0.28);
+    --code-bg: #151518;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0c0c0e;
+  --bg-2: #111113;
+  --panel: #151518;
+  --border: #2a2a31;
+  --border-soft: #202027;
+  --text: #d7d7dd;
+  --text-hi: #f2f2f5;
+  --dim: #8c8c97;
+  --accent: #ff5a5f;
+  --accent-hi: #ff8a8d;
+  --glow-a: rgba(255, 59, 59, 0.28);
+  --glow-b: rgba(225, 29, 72, 0.2);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 40px -12px rgba(0, 0, 0, 0.7);
+  --shadow-lg: 0 2px 4px rgba(0, 0, 0, 0.4), 0 40px 100px -30px rgba(255, 59, 59, 0.28);
+  --code-bg: #151518;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 80px;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 17px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--accent-hi);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+h1,
+h2,
+h3 {
+  color: var(--text-hi);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+}
+
+.skip:focus {
+  left: 16px;
+  top: 16px;
+  z-index: 100;
+  background: var(--panel);
+  padding: 8px 12px;
+  border-radius: 8px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+/* --- nav ------------------------------------------------------------------------------ */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  backdrop-filter: saturate(160%) blur(14px);
+  -webkit-backdrop-filter: saturate(160%) blur(14px);
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.nav-inner {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-hi);
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: -0.02em;
+}
+
+.brand:hover {
+  color: var(--text-hi);
+}
+
+.logo {
+  width: 26px;
+  height: 26px;
+}
+
+.links {
+  display: flex;
+  gap: 22px;
+  font-size: 15px;
+}
+
+.links a {
+  color: var(--dim);
+  font-weight: 500;
+}
+
+.links a:hover {
+  color: var(--text-hi);
+}
+
+.switches {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lang {
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+}
+
+.lang button {
+  border: 0;
+  background: transparent;
+  padding: 4px 11px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.lang button[aria-pressed='true'] {
+  background: linear-gradient(135deg, var(--grad-from), var(--grad-to));
+  color: var(--on-accent);
+}
+
+.theme {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  cursor: pointer;
+}
+
+.theme svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: var(--text-hi);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+
+[data-theme='dark'] .theme .moon,
+[data-theme='light'] .theme .sun {
+  display: none;
+}
+
+/* --- hero ----------------------------------------------------------------------------- */
+
+.hero {
+  position: relative;
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 88px 24px 40px;
+  text-align: center;
+}
+
+.glow {
+  position: absolute;
+  inset: -120px -20vw auto;
+  height: 900px;
+  z-index: -1;
+  background:
+    radial-gradient(40% 45% at 30% 30%, var(--glow-a), transparent 70%),
+    radial-gradient(40% 45% at 72% 40%, var(--glow-b), transparent 70%);
+  filter: blur(10px);
+  pointer-events: none;
+}
+
+.eyebrow {
+  display: inline-block;
+  margin: 0 0 22px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  color: var(--dim);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+h1 {
+  font-size: clamp(40px, 6.4vw, 78px);
+  font-weight: 800;
+  letter-spacing: -0.035em;
+}
+
+h1 span {
+  display: block;
+}
+
+.grad {
+  background: linear-gradient(100deg, var(--grad-from) 0%, var(--grad-to) 55%, var(--grad-warm) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  padding-bottom: 0.08em;
+}
+
+.lead {
+  max-width: 760px;
+  margin: 24px auto 0;
+  font-size: clamp(17px, 1.6vw, 20px);
+  color: var(--dim);
+}
+
+.ctas {
+  margin-top: 34px;
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 22px;
+  border-radius: 12px;
+  font-weight: 600;
+  font-size: 16px;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn svg {
+  width: 20px;
+  height: 20px;
+  fill: currentColor;
+}
+
+.btn.primary {
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--grad-from), var(--grad-to));
+  box-shadow: 0 10px 30px -10px rgba(225, 29, 72, 0.7);
+}
+
+.btn.primary:hover {
+  color: var(--on-accent);
+  transform: translateY(-1px);
+}
+
+.btn.ghost {
+  color: var(--text-hi);
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.btn.ghost:hover {
+  color: var(--text-hi);
+  border-color: var(--dim);
+}
+
+.hero-shot {
+  margin: 64px 0 0;
+}
+
+.hero-shot figcaption {
+  margin-top: 14px;
+  font-size: 14px;
+  color: var(--dim);
+}
+
+.frame {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  overflow: hidden;
+  cursor: zoom-in;
+  box-shadow: var(--shadow);
+}
+
+.frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 10;
+}
+
+.hero-shot .frame {
+  box-shadow: var(--shadow-lg);
+  border-radius: 18px;
+}
+
+/* --- pillars -------------------------------------------------------------------------- */
+
+.pillars {
+  max-width: var(--max);
+  margin: 72px auto 0;
+  padding: 0 24px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+
+.pillars article {
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.pillars h3 {
+  font-size: 20px;
+  margin: 18px 0 10px;
+}
+
+.pillars p {
+  margin: 0;
+  color: var(--dim);
+  font-size: 15.5px;
+}
+
+.pill-icon {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--grad-from), var(--grad-to));
+}
+
+.pill-icon svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: #fff;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* --- chapters ------------------------------------------------------------------------- */
+
+.chapter {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 120px 24px 0;
+}
+
+.chapter-head {
+  max-width: 720px;
+  margin-bottom: 40px;
+}
+
+.chapter-num {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+
+.chapter-head h2 {
+  font-size: clamp(32px, 4.2vw, 50px);
+  font-weight: 800;
+}
+
+.chapter-head p {
+  margin: 14px 0 0;
+  font-size: 19px;
+  color: var(--dim);
+}
+
+.feature {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 8fr);
+  gap: 48px;
+  align-items: center;
+  padding: 44px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.feature:nth-of-type(even) {
+  grid-template-columns: minmax(0, 8fr) minmax(0, 5fr);
+}
+
+.feature:nth-of-type(even) .feature-text {
+  order: 2;
+}
+
+.feature h3 {
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.feature-text p {
+  margin: 14px 0 0;
+  color: var(--dim);
+}
+
+.feature ul,
+.more ul {
+  list-style: none;
+  padding: 0;
+  margin: 20px 0 0;
+}
+
+.feature li {
+  position: relative;
+  padding-left: 26px;
+  margin-top: 9px;
+  font-size: 15.5px;
+}
+
+.feature li::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 0.62em;
+  width: 12px;
+  height: 7px;
+  border-left: 2px solid var(--accent);
+  border-bottom: 2px solid var(--accent);
+  transform: translateY(-50%) rotate(-45deg);
+}
+
+.feature-shot {
+  margin: 0;
+}
+
+/* --- more, install ------------------------------------------------------------ */
+
+.more,
+.install {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 120px 24px 0;
+}
+
+.more h2,
+.install h2 {
+  font-size: clamp(28px, 3.4vw, 40px);
+  font-weight: 800;
+}
+
+.more ul {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px 32px;
+  margin-top: 28px;
+}
+
+.more li {
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  font-size: 15.5px;
+}
+
+.install p {
+  max-width: 760px;
+  color: var(--dim);
+}
+
+.code {
+  position: relative;
+  max-width: 760px;
+  margin: 22px 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--code-bg);
+}
+
+.code pre {
+  margin: 0;
+  padding: 20px 22px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 14.5px;
+  line-height: 1.7;
+  color: var(--text-hi);
+}
+
+.copy {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.note {
+  font-size: 15px;
+}
+
+.textlink {
+  font-weight: 600;
+}
+
+.textlink::after {
+  content: ' →';
+}
+
+/* The last section on the page, so it keeps some room above the footer. */
+.install {
+  padding-bottom: 40px;
+}
+
+/* The hero's buttons are centred; here they sit under a left-aligned paragraph. */
+.install .ctas {
+  justify-content: flex-start;
+  margin-top: 26px;
+}
+
+.source {
+  max-width: 760px;
+  margin-top: 30px;
+}
+
+.source summary {
+  width: fit-content;
+  font-weight: 600;
+  color: var(--text-hi);
+  cursor: pointer;
+}
+
+.source[open] summary {
+  margin-bottom: 14px;
+}
+
+.foot {
+  max-width: var(--max);
+  margin: 80px auto 0;
+  padding: 28px 24px 48px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  font-size: 14px;
+  color: var(--dim);
+}
+
+.foot span:first-child {
+  font-weight: 700;
+  color: var(--text-hi);
+}
+
+/* --- lightbox ------------------------------------------------------------------------- */
+
+.lightbox {
+  max-width: 96vw;
+  max-height: 94vh;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.lightbox::backdrop {
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(4px);
+}
+
+.lightbox img {
+  display: block;
+  max-width: 96vw;
+  max-height: 94vh;
+  width: auto;
+  height: auto;
+}
+
+.lightbox .close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* --- motion --------------------------------------------------------------------------- */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(18px);
+  transition: opacity 0.6s ease, transform 0.6s ease;
+}
+
+.reveal.in {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  body,
+  .btn,
+  .reveal {
+    transition: none;
+  }
+}
+
+/* --- narrow --------------------------------------------------------------------------- */
+
+@media (max-width: 900px) {
+  .pillars {
+    grid-template-columns: 1fr;
+  }
+  .feature,
+  .feature:nth-of-type(even) {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+  .feature:nth-of-type(even) .feature-text {
+    order: 0;
+  }
+  .more ul {
+    grid-template-columns: 1fr;
+  }
+  .chapter,
+  .more,
+  .install {
+    padding-top: 80px;
+  }
+}
+
+@media (max-width: 640px) {
+  body {
+    font-size: 16px;
+  }
+  .nav-inner {
+    padding: 10px 16px;
+    gap: 14px;
+  }
+  .links {
+    display: none;
+  }
+  .hero {
+    padding: 56px 16px 24px;
+  }
+  .hero-shot {
+    margin-top: 40px;
+  }
+  .pillars,
+  .chapter,
+  .more,
+  .install {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .foot {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .feature h3 {
+    font-size: 22px;
+  }
+}

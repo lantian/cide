@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>cide demo</title>
+    <!--
+      The screenshot demo: the real app over a fake backend, for the feature site. See
+      `src/demo/fakeTauri.ts` and `scripts/demo-shots.mjs`. Like `kit.html`, a second page of the
+      Vite project that `vite build` never builds — only `index.html` is an app entry.
+
+      `?scene=<id>&theme=dark|light`. `theme-boot.js` is the app's own, so `?theme=` paints the
+      first frame in the right palette exactly as it does in a cide window.
+    -->
+    <script src="/theme-boot.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/demo/main.tsx"></script>
+  </body>
+</html>

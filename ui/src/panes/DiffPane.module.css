@@ -305,17 +305,20 @@
 }
 
 /*
- * Within a changed line, the characters that actually differ. A 2px underline rather than a
- * fill, matching the base theme's shape, so the line background still reads as the row's
- * add/remove state.
+ * Within a changed line, the characters that actually differ: a stronger fill of the row's own
+ * colour, as IDEA and GitHub draw it. This was a 2px underline, the base theme's shape. It read
+ * as a link or a spell-check squiggle, and a re-indented line underlined its leading whitespace
+ * as a row of bare rules ("______&mut self").
  */
 .body :global(.cm-editor.cm-merge-a .cm-changedText),
 .body :global(.cm-editor .cm-deletedChunk .cm-deletedText) {
-  background: linear-gradient(var(--red), var(--red)) bottom / 100% 2px no-repeat;
+  background: color-mix(in srgb, var(--red) 24%, transparent);
+  border-radius: 2px;
 }
 
 .body :global(.cm-editor.cm-merge-b .cm-changedText) {
-  background: linear-gradient(var(--green), var(--green)) bottom / 100% 2px no-repeat;
+  background: color-mix(in srgb, var(--green) 24%, transparent);
+  border-radius: 2px;
 }
 
 /* The split layout's inline deletion fill, which the base theme paints `#ff000033`. */

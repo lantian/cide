@@ -186,15 +186,27 @@
   padding: var(--sp-3);
   border-right: 1px solid var(--border-soft);
 }
+/*
+ * `justify-content: flex-start` restated because the shared `:where(button)` rule above centres
+ * its content. A file row never noticed: its trailing `+N -M` span takes the free space with
+ * `margin-left: auto`. A folder row has no trailing span, so it drew centred in the column,
+ * deeper than its own children, and the tree read upside down.
+ */
 .file {
   display: flex;
   width: 100%;
   gap: var(--sp-4);
   align-items: center;
+  justify-content: flex-start;
   border: 0 !important;
   border-radius: 0 !important;
   text-align: left;
   white-space: nowrap;
+  font-family: var(--font-ui, sans-serif);
+}
+/* Names in the UI face, like the Explorer's tree; only the `+N -M` column stays monospace, where
+   the digits have to line up down the rows. */
+.file > .muted {
   font-family: var(--font-mono, monospace);
 }
 .file[aria-selected='true'] {
@@ -332,11 +344,17 @@
   flex: 0 0 10px;
   color: var(--dim);
 }
-.file > span:last-child {
-  margin-left: auto;
-}
+/*
+ * The name takes the row's slack, so the draft count, the thread counts and `+N -M` sit together
+ * at the right edge. Each of them used to carry `margin-left: auto` instead. Flex splits the free
+ * space evenly between auto margins, so on a row with all three they floated at thirds of the
+ * width, detached from both the name and the edge.
+ */
 .file > span:nth-child(3) {
-  margin-left: 0;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .userLink,
 .markdown a {
@@ -694,7 +712,6 @@
 .threadCounts {
   display: inline-flex;
   gap: var(--sp-3);
-  margin-left: auto;
   font-family: var(--font-ui, sans-serif);
   font-size: var(--fs-ui-11);
 }

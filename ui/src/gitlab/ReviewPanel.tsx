@@ -168,6 +168,8 @@ export function ReviewPanel({
     icon: IconName
     count?: number | undefined
   }[] = [
+    // Two columns, filled row by row: Activity sits left of Drafts so that every button with a
+    // counter (Discussions, Drafts, Commits) is in the right-hand column and the badges line up.
     { section: 'description', label: 'Overview', icon: 'file-text' },
     {
       section: 'discussions',
@@ -177,8 +179,8 @@ export function ReviewPanel({
         t.notes.some((n) => n.resolvable && !n.resolved),
       ).length,
     },
-    { section: 'drafts', label: 'Drafts', icon: 'pencil', count: d.drafts.length },
     { section: 'activity', label: 'Activity', icon: 'list' },
+    { section: 'drafts', label: 'Drafts', icon: 'pencil', count: d.drafts.length },
     { section: 'pipelines', label: 'Pipelines', icon: 'play' },
     {
       section: 'commits',
@@ -361,7 +363,8 @@ export function ReviewPanel({
           <button key={section} onClick={() => showReviewInfo(review, section)}>
             <Icon name={icon} size={1} />
             {label}
-            {count !== undefined && (
+            {/* A zero draws nothing: three dark "0" discs read as three things needing a look. */}
+            {!!count && (
               <span className={chrome.sectionCount}>
                 <Counter value={count} />
               </span>

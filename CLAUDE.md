@@ -164,6 +164,7 @@ before you change it.
 | [What a local override actually changes, or when the workspace reaches the disk](docs/checks.md#what-a-local-override-actually-changes-or-when-the-workspace-reaches-the-disk) | `cargo test -p cide-agents`, `cargo test -p cide-app -- agents workspace_state`, `check:agents`, `check:settings-agents` |
 | [An agent reviewing a GitLab MR, and its draft comments](docs/checks.md#an-agent-reviewing-a-gitlab-mr-and-its-draft-comments) | `cargo test -p cide-gitlab`, `cargo test -p cide-agents review`, `cargo test -p cide-app -- agent_rpc mr_review`, `check:gitlab`, `check:gitlab-render`, `check:gitlab-dom`, `cargo --locked xtask codegen --check` |
 | [The console harness, or anything that spawns codex](docs/checks.md#the-console-harness-or-anything-that-spawns-codex) | `cargo test -p cide-core -- codex_cli workspace`, `cargo test -p cide-claude`, `cargo test -p cide-agents`, `cargo test -p cide-app -- cmd::session agents spec`, `check:awaiting`, `check:claude-cli`, `check:menu-model`, `check:ext`, `cargo --locked xtask codegen --check`, `cargo test -p cide-agents --test real_codex -- --ignored --skip a_real_turn` |
+| [The screenshot demo and the feature site](docs/checks.md#the-screenshot-demo-and-the-feature-site) | `check:demo`, `pnpm --dir ui demo:shots` |
 | [Added, renamed or moved any file](docs/checks.md#added-renamed-or-moved-any-file) | `check:casing` |
 | [The UI kit, or any new UI](docs/checks.md#the-ui-kit-or-any-new-ui) | `check:kit`, `check:ui-scale`, `check:motion`, `check:theme`, `check:ui-icons`, `check:menus` |
 

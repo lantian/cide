@@ -605,6 +605,17 @@ The MR diff folds unchanged stretches at any size (`presentSegments`' `foldAlway
 - **`as_paste` is idempotent**, because a run's follow-up arrives already wrapped from `CodexHarness::deliver`.
 - **`check:menu-model` compiles `menuModel.ts` alone under Node**, so the console-name rule is restated there rather than imported.
 
+### The screenshot demo and the feature site
+
+**Touches:** `ui/demo.html`, `ui/src/demo/` (the fake backend, the scenes), `ui/scripts/demo-shots.mjs`, `cide-headless demo-bootstrap`, `site/` (the GitHub Pages site and `site/hero/hero.html`), `docs/img/hero.png`
+
+`check:demo`, `pnpm --dir ui exec tsc --noEmit`, and — to see it — `pnpm --dir ui demo:shots` (M103). The demo boots the real `main.tsx` over `demo/fakeTauri.ts` in headless Chromium, off-screen; it never touches the compositor, so it is safe on the KDE/Wayland machine where `grim` is not. Five silent-failure classes.
+- **An unmocked command renders an empty panel, not an error.** It answers the empty value of its type from `client.ts` (`demo/defaults.ts`) and is listed after the ✓. A shot that looks sparse is usually one command short: run the scene with `--strict` or read that list, never trust a ✓ alone.
+- **A scene's data must be the wire's shape**, built from `generated.ts` types, never a panel's view props. `tsc` catches drift in the former and nothing catches it in the latter — the log fixture's header says why.
+- **`bootstrap.gen.json` is regenerated on every capture, never committed.** A committed copy would photograph last month's keymap and command palette. `--no-bootstrap` reuses the file for fast iteration only.
+- **The site names shots by scene id.** Rename a scene and the published page shows a broken image; `check:demo` holds `SCENE_IDS`, `SCENES`, `site/content.js`, `site/index.html` and `hero.html` together, and fails on a handler for a command Rust no longer registers.
+- **The capture reports `devicePixelRatio` 1 to the app.** At 2 `settings/fontScale.ts::codeMetrics` gives xterm a line-height multiplier below 1, which xterm refuses; see `demo/boot.ts`.
+
 ### Added, renamed or moved any file
 
 **Touches:** added, renamed or moved any file

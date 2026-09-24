@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
+    "demo:shots": "node scripts/demo-shots.mjs",
     "check:check-log": "node scripts/check-check-log.mjs",
     "check:agents": "node scripts/check-agents.mjs",
     "check:agents-render": "node scripts/check-agents-render.mjs",
@@ -23,6 +24,7 @@
     "check:commands": "node scripts/check-commands.mjs",
     "check:completion": "node scripts/check-completion.mjs",
     "check:css-prefix": "node scripts/check-css-prefix.mjs",
+    "check:demo": "node scripts/check-demo.mjs",
     "check:detached": "node scripts/check-detached.mjs",
     "check:diff": "node scripts/check-diff-selection.mjs",
     "check:diff-render": "node scripts/check-diff-render.mjs",

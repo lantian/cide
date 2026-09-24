@@ -1,0 +1,45 @@
+name: Pages
+
+# The feature site, https://lantian.github.io/cide/, published from `site/` as it is committed.
+#
+# Nothing is built here, and that is deliberate. The site is plain HTML/CSS/JS, and its
+# screenshots are rendered from the real UI by `pnpm --dir ui demo:shots` (headless Chromium over
+# the demo backend, ui/src/demo/) and committed. Rendering them in CI would put a Rust build, a
+# Vite build and a browser on the critical path of a copy edit, and would publish pictures nobody
+# looked at before they went out.
+#
+# One-time setup, by hand: Settings → Pages → Build and deployment → Source = "GitHub Actions".
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and never cancel one that is already publishing: a half-finished
+# Pages deployment is replaced by the next one anyway, a cancelled one can leave nothing live.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: publish site/
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

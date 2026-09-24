@@ -659,15 +659,16 @@ try {
   )
   await click(document.querySelector('[aria-label="Close MR information"]'))
   // The counts are a kit `Counter` after the label, so a button's text is label + count
-  // ("Discussions0"); the count is pinned separately below. Commits sits beside Pipelines.
+  // ("Drafts1"). A zero draws no Counter at all, so a fixture with no unresolved thread reads
+  // plain "Discussions". Commits sits beside Pipelines.
   const sectionButton = (label) =>
     [
       ...container.querySelectorAll('[aria-label="MR information"] button'),
     ].find((b) => b.firstChild?.nextSibling?.textContent === label || b.textContent === label)
   assert.equal(
     sectionButton('Discussions')?.textContent,
-    'Discussions0',
-    'the unresolved count is drawn as a Counter beside the label',
+    'Discussions',
+    'a zero unresolved count draws no Counter',
   )
   assert.equal(
     sectionButton('Commits')?.textContent,

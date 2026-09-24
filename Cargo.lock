@@ -902,6 +902,7 @@ dependencies = [
  "cide-remote",
  "cide-spec",
  "cide-tasks",
+ "serde_json",
 ]
 
 [[package]]

@@ -171,6 +171,16 @@ const ALLOWED = [
   { file: 'overlays/StructurePicker.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
   { file: 'overlays/UsagesPopup.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
   {
+    file: 'demo/transcripts.ts',
+    chars: '↓⏺⎿▐▛█▜▌▝▘─✻⏵',
+    why: 'Terminal output for the screenshot demo (M103): Claude Code\'s own glyphs — the logo '
+      + 'blocks, the ⏺ tool rows, ⎿ results, the ✻ spinner, the rules — written as bytes into '
+      + 'xterm. Text in a terminal, never a mark in cide\'s chrome.',
+  },
+  { file: 'demo/data/editor.ts', chars: '⸢⸣', why: 'Demo source text shown in the editor (M103) — file content, not chrome.' },
+  { file: 'demo/data/log.ts', chars: '«»', why: 'Demo commit messages (M103) — prose a commit author typed, not a mark.' },
+  { file: 'demo/data/milestones.ts', chars: '✓✗', why: 'Demo verify output and task text (M103) — content the board displays, not a mark it draws.' },
+  {
     file: 'panes/GitDiffPane.tsx',
     chars: '⏎⋯',
     why: 'The ⏎ is a key hint beside a staging control. The ⋯ opens the fold row\'s label — '

@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512" role="img" aria-label="cide">
+  <title>cide</title>
+  <!--
+    THE SOURCE OF TRUTH FOR EVERY ICON IN THIS DIRECTORY.
+
+    Nothing here is hand-drawn twice: `scripts/gen-icons.sh` rasterises this file to all
+    the PNG sizes, and its `check` mode fails when a PNG has drifted from it. Edit this,
+    then re-run the script; never touch the PNGs.
+
+    (No literal double hyphen appears anywhere in these comments. XML forbids it inside a
+    comment and every SVG renderer prints a parse warning when it appears, which is a
+    silly way to make a build look broken.)
+
+    ## The concept
+
+    A shell prompt caret with a live block cursor beside it. cide is not an editor that can
+    also run a terminal; it is a running Claude Code session with an editor pinned next to
+    it, and the two-object composition IS the window layout: agent on the left, document on
+    the right, one gap between them.
+
+    Rejected: a letter in a rounded square. That is what `tauri init` ships, what half the
+    launcher already looks like, and it would have said nothing about the product. Also
+    rejected: a filled play-triangle for the caret, which turned the mark into a media
+    transport control; the chevron is a stroked path precisely so it reads as `>` and not
+    as a play button.
+
+    ## Why the geometry looks like this
+
+    The whole drawing is on a 64-unit grid and every straight edge is on a multiple of 4,
+    because 64/4 = 16: at 16, 32, 48, 64, 128, 256 and 512 pixels every one of those edges
+    lands on a whole pixel. That is not decoration. Rendering this file directly at 16px
+    was compared against rendering it at 128px and downsampling with Lanczos; the direct
+    render is visibly crisper (hard bar edges instead of a two-pixel smear), and only
+    because the edges are snapped. `gen-icons.sh` therefore rasterises each size from this
+    file rather than resizing a master PNG.
+
+    Sizes were chosen against the 16px raster, not the 512px one:
+
+      caret stroke 12 ->  3px      bar width 16 ->  4px
+      gap          8  ->  2px      margin     4 ->  1px
+
+    Anything thinner than 3px broke up under antialiasing; a gap under 2px closed and the
+    two objects merged into one blob.
+
+    The mark occupies (4,4)..(60,60), 87.5% of the canvas. Deliberately generous: KDE's
+    task manager adds its own cell padding and does not need ours, and an icon that pads
+    itself is the one that looks small next to everything else on the panel.
+  -->
+  <defs>
+    <!--
+      One ramp across the whole mark, not one per object, so the caret and the bar read as
+      a single thing seen at two moments rather than as two logos in a row. The axis is the
+      mark's own bounding-box diagonal (4,4)->(60,60): the product's canonical 135deg, and
+      it means the ramp reaches both brand endpoints exactly, wasting no length outside the
+      artwork.
+
+      The middle stop is the exact linear midpoint of the two brand colours, pushed to 66%.
+      That is an easing, not a third colour: it spends two thirds of the mark in the red
+      half of the ramp. #dc3f28 is 4.4:1 on white AND on #111113, whereas #f2903a is 2.4:1
+      on white, so the further the mark leans red the better it survives a white desktop.
+      Measured over the opaque pixels at 128px: 30% of the mark was under 3:1 on white with
+      a straight two-stop ramp, 18% with this one. The remainder is the bottom of the bar,
+      the single largest solid mass in the drawing and the last part that would ever
+      disappear; ui/src/styles/tokens.css already documents this ramp as decorative-only
+      for exactly that reason.
+    -->
+    <linearGradient id="ramp" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="60" y2="60">
+      <stop offset="0" stop-color="#dc3f28"/>
+      <stop offset="0.66" stop-color="#e76831"/>
+      <stop offset="1" stop-color="#f2903a"/>
+    </linearGradient>
+  </defs>
+
+  <!--
+    The prompt caret. Round cap and round join, so the cap radius is half the stroke, 6.
+    Mitred joins were drawn first and the spike at the vertex resolved into a stray dark
+    pixel at 16px, so they lost. The bar's corners are tighter than 6 on purpose (see
+    below); this is the one place the two objects deliberately do not match, because the
+    caret is a drawn stroke and the bar is a solid.
+  -->
+  <path d="M10 10 L30 32 L10 54"
+        fill="none" stroke="url(#ramp)" stroke-width="12"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!--
+    The block cursor. Wider than the caret's stroke on purpose: the live thing in cide is
+    the session, so the session's object carries the most weight. rx 4 and not 8: at 8 it
+    rounded into a capsule and read as a pill, which is a badge, not a cursor.
+  -->
+  <rect x="44" y="4" width="16" height="56" rx="4" fill="url(#ramp)"/>
+</svg>

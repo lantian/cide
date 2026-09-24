@@ -39,6 +39,7 @@ usage:
   cide-headless run [program] [args...]   spawn a program on a PTY, stream it to stdout
   cide-headless tree [--path FILE]        render a persisted workspace as a tree
   cide-headless demo                      render the built-in demo workspace
+  cide-headless demo-bootstrap            the demo workspace as a Bootstrap, as JSON
   cide-headless commands                  list the command registry, grouped
   cide-headless keymap                    list resolved bindings with their layer
   cide-headless tasks <root>              render a project's .cide/tasks.json
@@ -62,6 +63,7 @@ fn main() {
         "run" => run(rest),
         "tree" => tree(rest),
         "demo" => demo(),
+        "demo-bootstrap" => demo_bootstrap(),
         "commands" => commands(),
         "keymap" => keymap(),
         "tasks" => tasks(rest),
@@ -336,6 +338,64 @@ fn tree(args: &[String]) {
 /// Renders the built-in demo workspace, which needs no file on disk.
 fn demo() {
     emit(&render_workspace(&cide_core::workspace::demo_workspace()));
+}
+
+/// The demo workspace as the `Bootstrap` a window would receive, as JSON.
+///
+/// The seed of `ui/demo.html`, the page `ui/scripts/demo-shots.mjs` renders in headless Chromium
+/// to take the feature site's screenshots. The keymap, the command registry and the builtin
+/// language table are the real ones, produced by the same functions `app_get_bootstrap` calls,
+/// because a hand-written copy in the demo would drift the first time a binding moved and the
+/// screenshots would then show a palette the app does not have. It is regenerated on every
+/// capture rather than committed for the same reason: nothing can go stale that is never stored.
+///
+/// The user's own keymap is deliberately *not* layered in — a screenshot is of what cide ships
+/// with, not of what one machine customised — and no extension is resolved for the same reason.
+fn demo_bootstrap() {
+    match serde_json::to_string_pretty(&build_demo_bootstrap()) {
+        Ok(json) => emit(&format!("{json}\n")),
+        Err(e) => fail(e),
+    }
+}
+
+/// The value [`demo_bootstrap`] prints, apart so the test can look at it.
+fn build_demo_bootstrap() -> cide_ipc::Bootstrap {
+    let workspace = cide_core::workspace::demo_workspace();
+    let window = workspace
+        .windows
+        .iter()
+        .find(|(_, role)| matches!(role, WindowRole::Shell { .. }))
+        .map(|(label, _)| label.clone())
+        .unwrap_or_else(cide_ipc::WindowLabel::shell);
+    let role = workspace
+        .windows
+        .get(&window)
+        .cloned()
+        .unwrap_or(WindowRole::Shell {
+            projects: Vec::new(),
+            active: None,
+        });
+    cide_ipc::Bootstrap {
+        window,
+        role,
+        keymap: cide_core::keymap::resolve(&[]),
+        commands: cide_core::commands::registry().to_vec(),
+        capabilities: cide_ipc::Capabilities {
+            // What the app's own `capabilities` says — the crate version, not this binary's name,
+            // which Settings → Appearance would print as "cide cide-headless 0.9.1-dev".
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            claude_version: Some("2.1.247".into()),
+            diagnostics: true,
+            ide_protocol: true,
+        },
+        extensions: cide_ext::contribute::resolve(
+            cide_ipc::lang::builtins(),
+            cide_ipc::lang::builtin_servers(),
+            &[],
+        ),
+        schemes: Vec::new(),
+        workspace,
+    }
 }
 
 /// Lists the command registry, grouped as the palette groups it.
@@ -1797,6 +1857,19 @@ mod tests {
             .find(needle)
             .unwrap_or_else(|| panic!("no {needle:?} in {line:?}"));
         line[..byte].chars().count()
+    }
+
+    /// The screenshot demo boots from this, so an empty keymap or registry would photograph a
+    /// palette with nothing in it and a Keymap page with no rows — and still "work".
+    #[test]
+    fn the_demo_bootstrap_carries_the_real_keymap_registry_and_languages() {
+        let boot = build_demo_bootstrap();
+        assert!(!boot.keymap.is_empty());
+        assert_eq!(boot.commands.len(), cide_core::commands::registry().len());
+        assert!(!boot.extensions.languages.is_empty());
+        assert!(boot.workspace.windows.contains_key(&boot.window));
+        let json = serde_json::to_string(&boot).expect("serialises");
+        assert!(json.contains("\"workspace\""));
     }
 
     #[test]
